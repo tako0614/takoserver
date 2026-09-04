@@ -22,9 +22,6 @@ import {
   historicalWorkerVersionAuthorityProfile,
   inspectCanonicalWorkerVersionWithScriptIdentity,
   type inspectLiveWorkerVersion,
-  inspectSecretCreatedDirectSuccessor,
-  inspectSecretCreatedLineage,
-  type SecretCreatedDirectSuccessor,
   type WorkerState,
   type WorkerVersionAuthorityProfile,
   type WorkerVersionAuthoritySelection,
@@ -36,17 +33,14 @@ import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
-  parseWorkerDeploymentChain,
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
-  workerSecretInventoryIncludes,
 } from "./worker-state.ts";
 
 const PUBLIC_KEYS = ["crv", "kty", "x"] as const;
 const LEGACY_PUBLIC_KEYS = ["crv", "key_ops", "kty", "x"] as const;
 const PRIVATE_KEYS = ["crv", "d", "ext", "key_ops", "kty", "x"] as const;
 const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
-const HOSTED_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN";
 
 export interface SigningPublicKeyRow {
   readonly keyId: string;
@@ -92,6 +86,22 @@ interface PrivateKeyInput {
   readonly jwk: JsonWebKey & { readonly x: string; readonly d: string };
 }
 
+/**
+ * Read one owner-private signing key and prove it is the private half of the
+ * exact active D1 signing row. Route-less authority deploys reuse this
+ * validation without learning any broader signing-rotation behavior.
+ */
+export async function readVerifiedPrivateSigningJwk(
+  path: string,
+  row: SigningPublicKeyRow | null,
+  keyId: string,
+): Promise<string> {
+  const active = requiredActiveRow(row, keyId);
+  const input = readPrivateJwk(path);
+  await provePrivateMatchesRow(input, active);
+  return input.raw;
+}
+
 interface RotationPredecessor {
   readonly history: {
     readonly deploymentId: string;
@@ -101,7 +111,6 @@ interface RotationPredecessor {
   readonly commit: string;
   readonly bundleDigestHex: string;
   readonly scriptEtag: string;
-  readonly hostedBridge: SecretCreatedDirectSuccessor | null;
 }
 
 /** Three disjoint operations: public registration, exact repair, explicit rotation. */
@@ -184,7 +193,11 @@ async function registerPublicKey(
   options: SigningOptions,
 ): Promise<Record<string, unknown>> {
   const keyId = target.signing.nextKeyId ?? target.signing.currentKeyId;
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(target, keyId, undefined, "preflight");
   const existing = await database.readKey(keyId, "preflight");
+  if (existing !== null) {
+    assertOrdinarySigningRowIsSponsorshipExclusive(target, existing, "preflight");
+  }
   if (invocation.action === "status") {
     return {
       kind: "takoserver.signing-key-register-status@v2",
@@ -214,6 +227,12 @@ async function registerPublicKey(
   const publicInput = readPublicJwk(
     options.publicJwkPath ?? requireEnvironment("TAKOSERVER_SIGNING_PUBLIC_JWK_PATH"),
   );
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(
+    target,
+    keyId,
+    publicInput.jwk.x,
+    "preflight",
+  );
   // Race-safe absence recheck immediately before the append-only INSERT.
   if ((await database.readKey(keyId, "preflight")) !== null) {
     throw preflightError(
@@ -230,6 +249,7 @@ async function registerPublicKey(
   ) {
     throw verificationError("D1 did not return the exact inserted active public signing identity");
   }
+  assertOrdinarySigningRowIsSponsorshipExclusive(target, inserted, "verification");
   return {
     kind: "takoserver.signing-key-register-apply@v2",
     surface: invocation.surface,
@@ -255,7 +275,9 @@ async function repairSigningSecret(
   options: SigningOptions,
 ): Promise<Record<string, unknown>> {
   const keyId = target.signing.currentKeyId;
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(target, keyId, undefined, "preflight");
   const row = requiredActiveRow(await database.readKey(keyId, "preflight"), keyId);
+  assertOrdinarySigningRowIsSponsorshipExclusive(target, row, "preflight");
   const authoritySelection =
     target.integrationE2eCredentialAuthority === undefined
       ? undefined
@@ -347,7 +369,7 @@ async function repairSigningSecret(
     options.privateJwkPath ?? requireEnvironment("TAKOSERVER_SIGNING_PRIVATE_JWK_PATH"),
   );
   await provePrivateMatchesRow(privateInput, row);
-  requiredExactRow(await database.readKey(keyId, "preflight"), row, "preflight");
+  requiredExactExclusiveRow(await database.readKey(keyId, "preflight"), row, target, "preflight");
   const mutation = await run(
     wranglerCommand([
       "secret",
@@ -375,7 +397,12 @@ async function repairSigningSecret(
     before.history.versionId,
   );
   assertSecretOnlyAdvance(before, after);
-  requiredExactRow(await database.readKey(keyId, "verification"), row, "verification");
+  requiredExactExclusiveRow(
+    await database.readKey(keyId, "verification"),
+    row,
+    target,
+    "verification",
+  );
   return {
     kind: "takoserver.signing-repair-apply@v2",
     surface: invocation.surface,
@@ -406,20 +433,18 @@ async function rotateSigningKey(
   if (!nextKeyId || nextKeyId === currentKeyId) {
     throw preflightError("signing rotation requires explicit different current and next key ids");
   }
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(target, currentKeyId, undefined, "preflight");
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(target, nextKeyId, undefined, "preflight");
   const current = requiredRotationCurrentRow(
     await database.readKey(currentKeyId, "preflight"),
     currentKeyId,
     invocation.environment,
   );
   const next = requiredActiveRow(await database.readKey(nextKeyId, "preflight"), nextKeyId);
+  assertOrdinarySigningRowIsSponsorshipExclusive(target, current, "preflight");
+  assertOrdinarySigningRowIsSponsorshipExclusive(target, next, "preflight");
   if (invocation.action === "status") {
-    const live = await inspectSigningRotationStatus(
-      target,
-      state,
-      currentKeyId,
-      nextKeyId,
-      invocation.environment,
-    );
+    const live = await inspectSigningRotationStatus(target, state, currentKeyId, nextKeyId);
     return {
       kind: "takoserver.signing-rotation-status@v2",
       surface: invocation.surface,
@@ -435,31 +460,11 @@ async function rotateSigningKey(
       versionId: live.history.versionId,
       previousVersionId: live.history.previousVersionId,
       directSuccessor: live.cutoverState === "next-key-direct-successor",
-      ...(live.hostedBridge === null
-        ? {}
-        : {
-            hostedTransition: "C-to-H",
-            inheritedCommit: live.hostedBridge.predecessorCommit,
-            inheritedBundleDigest: `sha256:${live.hostedBridge.predecessorBundleDigestHex}`,
-            provenance: live.hostedBridge.provenance,
-          }),
-      ...(live.cutoverState === "hosted-token-added-unattributed-successor"
-        ? {
-            repairRequired: true,
-            rotationApplyReady: live.commit === invocation.commit,
-            ready: false,
-          }
-        : { ready: live.commit === invocation.commit }),
+      ready: live.commit === invocation.commit,
       noOverwrite: true,
     };
   }
-  const before = await inspectRotationPredecessor(
-    "preflight",
-    target,
-    state,
-    currentKeyId,
-    invocation.environment,
-  );
+  const before = await inspectRotationPredecessor("preflight", target, state, currentKeyId);
   const source = await qualifySource({
     environment: invocation.environment === "integration" ? "integration" : "production",
     commit: invocation.commit,
@@ -477,8 +482,18 @@ async function rotateSigningKey(
   await provePrivateMatchesRow(privateInput, next);
   // Re-read both immutable identities immediately before building; neither is
   // ever inserted, overwritten, revoked, or deleted by rotation.
-  requiredExactRow(await database.readKey(currentKeyId, "preflight"), current, "preflight");
-  requiredExactRow(await database.readKey(nextKeyId, "preflight"), next, "preflight");
+  requiredExactExclusiveRow(
+    await database.readKey(currentKeyId, "preflight"),
+    current,
+    target,
+    "preflight",
+  );
+  requiredExactExclusiveRow(
+    await database.readKey(nextKeyId, "preflight"),
+    next,
+    target,
+    "preflight",
+  );
   const prepared = await prepareWorkerArtifact({
     root,
     target,
@@ -501,14 +516,23 @@ async function rotateSigningKey(
   // Building and sealing are deliberately outside the mutation window. Re-read
   // both append-only identities and the complete authoritative current Worker
   // closure after that work, immediately before the single upload.
-  requiredExactRow(await database.readKey(currentKeyId, "preflight"), current, "preflight");
-  requiredExactRow(await database.readKey(nextKeyId, "preflight"), next, "preflight");
+  requiredExactExclusiveRow(
+    await database.readKey(currentKeyId, "preflight"),
+    current,
+    target,
+    "preflight",
+  );
+  requiredExactExclusiveRow(
+    await database.readKey(nextKeyId, "preflight"),
+    next,
+    target,
+    "preflight",
+  );
   const requalified = await inspectRotationPredecessor(
     "preflight",
     target,
     state,
     currentKeyId,
-    invocation.environment,
     source.commit,
   );
   if (
@@ -517,8 +541,7 @@ async function rotateSigningKey(
     requalified.history.previousVersionId !== before.history.previousVersionId ||
     requalified.commit !== before.commit ||
     requalified.bundleDigestHex !== before.bundleDigestHex ||
-    requalified.scriptEtag !== before.scriptEtag ||
-    !sameHostedBridge(requalified.hostedBridge, before.hostedBridge)
+    requalified.scriptEtag !== before.scriptEtag
   ) {
     throw preflightError("authoritative current Worker changed while rotation was prepared");
   }
@@ -569,28 +592,18 @@ async function rotateSigningKey(
   ) {
     throw verificationError("signing rotation changed more than the explicit key id and secret");
   }
-  if (before.hostedBridge !== null) {
-    const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
-    const lineage = await inspectSecretCreatedLineage("verification", target, state, {
-      predecessorVersionId: before.hostedBridge.predecessorVersionId,
-      successorVersionId: before.hostedBridge.successorVersionId,
-      expectedCurrentVersionId: after.history.versionId,
-      addedSecret: HOSTED_SECRET,
-      signingKeyId: currentKeyId,
-      selectedCommit: source.commit,
-      ...(authorityProfile === undefined ? {} : { authorityProfile }),
-    });
-    if (
-      lineage.predecessorCommit !== before.hostedBridge.predecessorCommit ||
-      lineage.predecessorBundleDigestHex !== before.hostedBridge.predecessorBundleDigestHex ||
-      lineage.predecessorScriptEtag !== before.hostedBridge.predecessorScriptEtag ||
-      lineage.successorScriptEtag !== before.hostedBridge.successorScriptEtag
-    ) {
-      throw verificationError("signing rotation no longer proves the exact C-to-H lineage");
-    }
-  }
-  requiredExactRow(await database.readKey(currentKeyId, "verification"), current, "verification");
-  requiredExactRow(await database.readKey(nextKeyId, "verification"), next, "verification");
+  requiredExactExclusiveRow(
+    await database.readKey(currentKeyId, "verification"),
+    current,
+    target,
+    "verification",
+  );
+  requiredExactExclusiveRow(
+    await database.readKey(nextKeyId, "verification"),
+    next,
+    target,
+    "verification",
+  );
   return {
     kind: "takoserver.signing-rotation-apply@v2",
     surface: invocation.surface,
@@ -601,14 +614,6 @@ async function rotateSigningKey(
     nextKeyId,
     previousVersionId: before.history.versionId,
     versionId: after.history.versionId,
-    ...(before.hostedBridge === null
-      ? {}
-      : {
-          hostedTransition: "C-to-H-to-S",
-          inheritedCommit: before.hostedBridge.predecessorCommit,
-          inheritedBundleDigest: `sha256:${before.hostedBridge.predecessorBundleDigestHex}`,
-          provenance: before.hostedBridge.provenance,
-        }),
     noOverwrite: true,
     keyPairProof: { keyId: nextKeyId, publicJwkDigest: sha256(next.publicJwk) },
     rollback:
@@ -621,9 +626,7 @@ async function inspectSigningRotationStatus(
   state: WorkerState,
   currentKeyId: string,
   nextKeyId: string,
-  environment: DeployEnvironment,
 ) {
-  const inventory = await state.workerSecrets(target.workerName);
   const history = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
     "preflight",
@@ -634,36 +637,10 @@ async function inspectSigningRotationStatus(
   if (servingKeyId !== currentKeyId && servingKeyId !== nextKeyId) {
     throw preflightError("current Worker does not serve either exact signing rotation key");
   }
-  const hasHostedSecret = workerSecretInventoryIncludes(inventory, HOSTED_SECRET, "preflight");
   const annotation = workerVersionAnnotationProfile(version);
   switch (annotation) {
-    case "secret-created": {
-      if (environment !== "integration" || servingKeyId !== currentKeyId || !hasHostedSecret) {
-        throw preflightError(
-          "secret-created signing successor is an integration-only Hosted bridge",
-        );
-      }
-      if (history.previousVersionId === null) {
-        throw preflightError("secret-created signing successor has no direct predecessor");
-      }
-      const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
-      const hostedBridge = await inspectSecretCreatedDirectSuccessor("preflight", target, state, {
-        addedSecret: HOSTED_SECRET,
-        signingKeyId: currentKeyId,
-        secretInventory: inventory,
-        expectedSuccessorVersionId: history.versionId,
-        ...(authorityProfile === undefined ? {} : { authorityProfile }),
-      });
-      return {
-        history: hostedBridge.history,
-        commit: hostedBridge.predecessorCommit,
-        bundleDigestHex: hostedBridge.predecessorBundleDigestHex,
-        scriptEtag: hostedBridge.successorScriptEtag,
-        cutoverState: "hosted-token-added-unattributed-successor" as const,
-        servingKeyId: currentKeyId,
-        hostedBridge,
-      };
-    }
+    case "secret-created":
+      throw preflightError("current signing Worker is not a canonical public Worker Version");
     case "canonical":
       break;
     case "other":
@@ -680,7 +657,6 @@ async function inspectSigningRotationStatus(
     servingKeyId,
     liveAuthorityProfile,
   );
-  let hostedBridge: SecretCreatedDirectSuccessor | null = null;
   if (servingKeyId === nextKeyId) {
     if (live.history.previousVersionId === null) {
       throw preflightError("next signing key is not served by a direct successor Version");
@@ -690,40 +666,10 @@ async function inspectSigningRotationStatus(
       live.history.previousVersionId,
     );
     switch (workerVersionAnnotationProfile(predecessor)) {
-      case "secret-created": {
-        if (environment !== "integration" || !hasHostedSecret) {
-          throw preflightError("secret-created signing bridge is not allowed outside integration");
-        }
-        const lineageChain = parseWorkerDeploymentChain(
-          await state.workerDeployments(target.workerName),
-          "preflight",
-          { requireUuidVersionIds: true },
+      case "secret-created":
+        throw preflightError(
+          "signing rotation predecessor is not a canonical public Worker Version",
         );
-        const successorIndex = lineageChain.findIndex(
-          (entry) => entry.versionId === live.history.previousVersionId,
-        );
-        const predecessorEntry = lineageChain[successorIndex + 1];
-        if (predecessorEntry === undefined) {
-          throw preflightError("secret-created signing bridge has no direct C predecessor");
-        }
-        const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
-        hostedBridge = await inspectSecretCreatedLineage("preflight", target, state, {
-          successorVersionId: live.history.previousVersionId,
-          expectedCurrentVersionId: live.history.versionId,
-          addedSecret: HOSTED_SECRET,
-          signingKeyId: currentKeyId,
-          secretInventory: inventory,
-          ...(authorityProfile === undefined ? {} : { authorityProfile }),
-        });
-        if (
-          hostedBridge.successorScriptEtag !== live.scriptEtag ||
-          hostedBridge.predecessorCommit !== live.commit ||
-          hostedBridge.predecessorBundleDigestHex !== live.bundleDigestHex
-        ) {
-          throw preflightError("next signing successor does not retain the Hosted bridge identity");
-        }
-        break;
-      }
       case "canonical": {
         const predecessorIdentity = workerVersionIdentity("preflight", predecessor);
         const authorityProfile = canonicalSigningAuthorityProfile(target, predecessorIdentity);
@@ -769,7 +715,6 @@ async function inspectSigningRotationStatus(
         ? ("current-key-serving" as const)
         : ("next-key-direct-successor" as const),
     servingKeyId,
-    hostedBridge,
   };
 }
 
@@ -778,11 +723,8 @@ async function inspectRotationPredecessor(
   target: DeployTarget,
   state: WorkerState,
   currentKeyId: string,
-  environment: DeployEnvironment,
   selectedCommit?: string,
 ): Promise<RotationPredecessor> {
-  const inventory = await state.workerSecrets(target.workerName);
-  const hasHostedSecret = workerSecretInventoryIncludes(inventory, HOSTED_SECRET, phase);
   const history = parseWorkerDeploymentHistory(
     await state.workerDeployments(target.workerName),
     phase,
@@ -793,33 +735,8 @@ async function inspectRotationPredecessor(
   const currentVersion = await state.workerVersion(target.workerName, history.versionId);
   const annotation = workerVersionAnnotationProfile(currentVersion);
   switch (annotation) {
-    case "secret-created": {
-      if (environment !== "integration" || !hasHostedSecret) {
-        throw phaseFailure(
-          phase,
-          "secret-created signing successor is an integration-only Hosted bridge",
-        );
-      }
-      if (history.previousVersionId === null) {
-        throw phaseFailure(phase, "secret-created signing successor has no direct predecessor");
-      }
-      const authorityProfile = historicalWorkerVersionAuthorityProfile(target);
-      const hostedBridge = await inspectSecretCreatedDirectSuccessor(phase, target, state, {
-        addedSecret: HOSTED_SECRET,
-        signingKeyId: currentKeyId,
-        ...(selectedCommit === undefined ? {} : { selectedCommit }),
-        secretInventory: inventory,
-        expectedSuccessorVersionId: history.versionId,
-        ...(authorityProfile === undefined ? {} : { authorityProfile }),
-      });
-      return {
-        history: hostedBridge.history,
-        commit: hostedBridge.predecessorCommit,
-        bundleDigestHex: hostedBridge.predecessorBundleDigestHex,
-        scriptEtag: hostedBridge.successorScriptEtag,
-        hostedBridge,
-      };
-    }
+    case "secret-created":
+      throw phaseFailure(phase, "current signing Worker is not a canonical public Worker Version");
     case "canonical":
       break;
     case "other":
@@ -839,25 +756,7 @@ async function inspectRotationPredecessor(
   if (selectedCommit !== undefined && live.commit !== selectedCommit) {
     throw phaseFailure(phase, "signing rotation predecessor does not match the selected commit");
   }
-  return { ...live, hostedBridge: null };
-}
-
-function sameHostedBridge(
-  left: SecretCreatedDirectSuccessor | null,
-  right: SecretCreatedDirectSuccessor | null,
-): boolean {
-  if (left === null || right === null) return left === right;
-  return (
-    left.history.deploymentId === right.history.deploymentId &&
-    left.history.versionId === right.history.versionId &&
-    left.history.previousVersionId === right.history.previousVersionId &&
-    left.predecessorVersionId === right.predecessorVersionId &&
-    left.successorVersionId === right.successorVersionId &&
-    left.predecessorCommit === right.predecessorCommit &&
-    left.predecessorBundleDigestHex === right.predecessorBundleDigestHex &&
-    left.predecessorScriptEtag === right.predecessorScriptEtag &&
-    left.successorScriptEtag === right.successorScriptEtag
-  );
+  return live;
 }
 
 interface SigningRepairVersion {
@@ -1115,21 +1014,10 @@ export function activePublicJwk(
   return readCanonicalPublicRow(requiredActiveRow(row, keyId));
 }
 
-/** Temporary integration-only verifier for the Hosted token cutover predecessor row. */
-export function activeHostedTokenCutoverPublicJwk(
-  row: SigningPublicKeyRow | null,
-  keyId: string,
-  environment: DeployEnvironment,
-): JsonWebKey & { readonly x: string } {
-  const active = requiredUnparsedActiveRow(row, keyId);
-  if (environment === "integration") {
-    const legacy = readCanonicalLegacyPublicRow(active);
-    if (legacy !== null) return legacy;
-  }
-  return readCanonicalPublicRow(active);
-}
-
-function readPublicJwk(path: string): { readonly canonical: string; readonly jwk: JsonWebKey } {
+function readPublicJwk(path: string): {
+  readonly canonical: string;
+  readonly jwk: JsonWebKey & { readonly x: string };
+} {
   const raw = readOwnedRegular(path, "public signing JWK", false);
   let value: unknown;
   try {
@@ -1143,7 +1031,9 @@ function readPublicJwk(path: string): { readonly canonical: string; readonly jwk
   if (value.kty !== "OKP" || value.crv !== "Ed25519" || !BASE64URL_32.test(String(value.x))) {
     throw preflightError("public signing JWK must be one exact Ed25519 public key");
   }
-  const jwk = { kty: "OKP", crv: "Ed25519", x: value.x as string } satisfies JsonWebKey;
+  const jwk = { kty: "OKP", crv: "Ed25519", x: value.x as string } satisfies JsonWebKey & {
+    readonly x: string;
+  };
   return { canonical: JSON.stringify(jwk), jwk };
 }
 
@@ -1282,6 +1172,66 @@ function requiredExactRow(
     actual.revokedAtEpochSeconds !== expected.revokedAtEpochSeconds
   ) {
     throw phaseFailure(phase, `D1 signing identity ${expected.keyId} changed during operation`);
+  }
+}
+
+function requiredExactExclusiveRow(
+  actual: SigningPublicKeyRow | null,
+  expected: SigningPublicKeyRow,
+  target: DeployTarget,
+  phase: DeployPhase,
+): void {
+  requiredExactRow(actual, expected, phase);
+  assertOrdinarySigningRowIsSponsorshipExclusive(target, expected, phase);
+}
+
+function assertOrdinarySigningRowIsSponsorshipExclusive(
+  target: DeployTarget,
+  row: SigningPublicKeyRow,
+  phase: DeployPhase,
+): void {
+  let value: unknown;
+  try {
+    value = JSON.parse(row.publicJwk);
+  } catch {
+    throw phaseFailure(
+      phase,
+      `ordinary signing key ${row.keyId} cannot prove sponsorship-key separation`,
+    );
+  }
+  if (
+    !isRecord(value) ||
+    value.kty !== "OKP" ||
+    value.crv !== "Ed25519" ||
+    typeof value.x !== "string" ||
+    !BASE64URL_32.test(value.x)
+  ) {
+    throw phaseFailure(
+      phase,
+      `ordinary signing key ${row.keyId} cannot prove sponsorship-key separation`,
+    );
+  }
+  assertOrdinarySigningIdentityIsSponsorshipExclusive(target, row.keyId, value.x, phase);
+}
+
+function assertOrdinarySigningIdentityIsSponsorshipExclusive(
+  target: DeployTarget,
+  keyId: string,
+  publicX: string | undefined,
+  phase: DeployPhase,
+): void {
+  const authority = target.sponsorshipAuthority;
+  if (
+    authority !== undefined &&
+    (keyId === authority.credentialKeyId ||
+      keyId === authority.receiptKeyId ||
+      publicX === authority.credentialPublicJwk.x ||
+      publicX === authority.receiptPublicJwk.x)
+  ) {
+    throw phaseFailure(
+      phase,
+      `ordinary signing key ${keyId} must be cryptographically distinct from sponsorship credential and receipt authorities`,
+    );
   }
 }
 

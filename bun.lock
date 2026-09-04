@@ -13,6 +13,7 @@
         "@biomejs/biome": "^2.2.0",
         "@cloudflare/workers-types": "5.20260903.1",
         "@types/bun": "^1.2.20",
+        "miniflare": "5.20260811.1-alpha",
         "typescript": "^5.9.2",
         "wrangler": "^4.123.0",
       },

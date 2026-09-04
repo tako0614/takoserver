@@ -201,7 +201,11 @@ export {
   type RuntimeInputPublicApply,
   runtimeInputPublicApplyCommitment,
 } from "./runtime-input-preparations.ts";
-export { createSponsorshipRoutes, type SponsorshipRoutes } from "./sponsorship-api.ts";
+export {
+  createSponsorshipAuthority,
+  type SponsorshipAuthority,
+  SponsorshipAuthorityError,
+} from "./sponsorship-authority.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
 export { parseStrictJson, StrictJsonError } from "./strict-json.ts";

@@ -77,8 +77,6 @@ export interface WorkerEnv {
   /** Shared company identity issuer and this product's public OIDC client. */
   readonly TAKOS_ID_ISSUER?: string;
   readonly TAKOS_ID_CLIENT_ID?: string;
-  /** Private sponsorship owner API bearer. */
-  readonly TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN?: string;
   /** Stripe secret key. The deploy target must separately authorize Checkout. */
   readonly STRIPE_SECRET_KEY?: string;
   /** Exact operator intent to expose Stripe Checkout on this deployment. */
@@ -504,9 +502,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...dataServices,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
-    ...(env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN
-      ? { sponsorshipServiceToken: env.TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN }
-      : {}),
     forms: currentCandidates.forms,
     bindings: currentCandidates.bindings,
     hostForms: currentCandidates.forms,

@@ -7,8 +7,8 @@
  * and the dispatcher matched a third set of literals and regular expressions.
  * Two lists that are written by hand and compared to each other cannot disagree
  * about a route neither of them mentions: `DELETE /v1/session` — the Console's
- * sign-out, called from `console/src/api.ts` — and the whole private
- * `/v1/sponsorship/tenants/**` seam were served and documented nowhere.
+ * sign-out, called from `console/src/api.ts` — and an earlier private product
+ * route were served and documented nowhere.
  *
  * This table is that one declaration. The published document is projected from
  * it, and the contract test derives its expectation from it and then goes to
@@ -29,14 +29,6 @@ export interface RouteDeclaration {
    * or a description no route names — is a build-time refusal.
    */
   readonly operation: string;
-  /**
-   * A private product-to-product seam, served only for a caller holding this
-   * Host's sponsorship service credential and answered with `not_found` for
-   * everyone else. It belongs to the surface and is checked for reachability
-   * like any other route, and it is deliberately absent from the published
-   * document: no customer key and no browser may reach it.
-   */
-  readonly internal?: true;
 }
 
 /** Every path this Host answers at, in the order the document publishes them. */
@@ -244,63 +236,6 @@ export const ROUTES: readonly RouteDeclaration[] = [
     method: "get",
     pattern: "/v1/reseller/reservations/{reservationId}/usage-statement",
     operation: "readUsageStatement",
-  },
-
-  // The private sponsorship seam. One first-party product holds the service
-  // credential; every other caller is answered `not_found`.
-  {
-    method: "post",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}",
-    operation: "bindSponsoredTenant",
-    internal: true,
-  },
-  {
-    method: "get",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/wallet",
-    operation: "readSponsoredTenantWallet",
-    internal: true,
-  },
-  {
-    method: "post",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/takoform-run-credentials",
-    operation: "issueSponsoredTakoformRunCredential",
-    internal: true,
-  },
-  {
-    method: "post",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/interface-oauth-resources/authorize",
-    operation: "authorizeSponsoredInterfaceOauthResource",
-    internal: true,
-  },
-  {
-    method: "get",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/inventory",
-    operation: "listSponsoredTenantInventory",
-    internal: true,
-  },
-  {
-    method: "post",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/funding",
-    operation: "fundSponsoredTenant",
-    internal: true,
-  },
-  {
-    method: "get",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/resources",
-    operation: "listSponsoredResources",
-    internal: true,
-  },
-  {
-    method: "put",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/resources/{resourceUid}",
-    operation: "setSponsoredResourceBillingMode",
-    internal: true,
-  },
-  {
-    method: "delete",
-    pattern: "/v1/sponsorship/tenants/{tenantRef}/resources/{resourceUid}",
-    operation: "deleteSponsoredResource",
-    internal: true,
   },
 ];
 

@@ -21,7 +21,6 @@ const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const VERSION_C = "11111111-1111-4111-8111-111111111111";
-const VERSION_H = "22222222-2222-4222-8222-222222222222";
 const VERSION_S = "33333333-3333-4333-8333-333333333333";
 
 const baseTarget = {
@@ -79,6 +78,25 @@ async function keyPair(keyId: string) {
   const exported = await crypto.subtle.exportKey("jwk", pair.publicKey);
   const publicJwk = JSON.stringify({ kty: "OKP", crv: "Ed25519", x: exported.x });
   return { keyId, pair, privateJwk, publicJwk };
+}
+
+function sponsoredTarget(input: {
+  readonly credentialPublicJwk: string;
+  readonly receiptPublicJwk: string;
+  readonly signing?: DeployTarget["signing"];
+}): DeployTarget {
+  return {
+    ...baseTarget,
+    sponsorshipAuthority: {
+      workerName: "takoserver-sponsorship-authority",
+      organizationId: "org_hosted",
+      credentialKeyId: "sponsorship-credential-key",
+      credentialPublicJwk: JSON.parse(input.credentialPublicJwk),
+      receiptKeyId: "sponsorship-receipt-key",
+      receiptPublicJwk: JSON.parse(input.receiptPublicJwk),
+    },
+    signing: input.signing ?? baseTarget.signing,
+  };
 }
 
 function processFixture(input: { readonly afterMessage?: () => string | null } = {}) {
@@ -162,68 +180,7 @@ function workerState(input: {
       return current;
     },
     async workerSecrets() {
-      return [
-        ...(input.target.sponsorship === true
-          ? [{ name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" as const }]
-          : []),
-        { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" as const },
-      ];
-    },
-  };
-}
-
-function hostedRotationState(
-  target: DeployTarget,
-  uploaded: () => boolean,
-  uploadMessage: () => string | null,
-  successorAnnotations?: Readonly<Record<string, string>>,
-  historicalAuthority = false,
-): WorkerState {
-  return {
-    async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: target.workerName }];
-    },
-    async workerDeployments() {
-      return uploaded()
-        ? [
-            deployment("deployment-next", VERSION_S, "2026-08-28T03:00:00Z"),
-            deployment("deployment-hosted", VERSION_H, "2026-08-28T02:00:00Z"),
-            deployment("deployment-canonical", VERSION_C, "2026-08-28T01:00:00Z"),
-          ]
-        : [
-            deployment("deployment-hosted", VERSION_H, "2026-08-28T02:00:00Z"),
-            deployment("deployment-canonical", VERSION_C, "2026-08-28T01:00:00Z"),
-          ];
-    },
-    async workerVersion(_worker, versionId) {
-      if (versionId === VERSION_S) {
-        const version = signingVersion(
-          target,
-          "key-next",
-          uploadMessage() ?? `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`,
-        );
-        return successorAnnotations === undefined
-          ? version
-          : { ...version, annotations: successorAnnotations };
-      }
-      if (versionId === VERSION_H) {
-        return hostedVersion(
-          target,
-          "key-current",
-          historicalAuthority ? { kind: "historical-pre-jit" } : undefined,
-        );
-      }
-      return canonicalPreTokenVersion(
-        target,
-        "key-current",
-        historicalAuthority ? { kind: "historical-pre-jit" } : undefined,
-      );
-    },
-    async workerSecrets() {
-      return [
-        { name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" },
-        { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
-      ];
+      return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" as const }];
     },
   };
 }
@@ -257,10 +214,17 @@ describe("split signing authority surfaces", () => {
     ).toBe("secret-created");
   });
 
-  test("critical C, H, and S fixtures have a literal independent binding closure", () => {
+  test("route-less sponsorship authority does not alter the public signing closure", () => {
     const target = {
       ...baseTarget,
-      sponsorship: true,
+      sponsorshipAuthority: {
+        workerName: "takoserver-sponsorship-authority",
+        organizationId: "org_hosted",
+        credentialKeyId: "sponsorship-credential-key",
+        credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+        receiptKeyId: "receipt-key",
+        receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      },
       signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
     } satisfies DeployTarget;
     const shared = [
@@ -279,21 +243,16 @@ describe("split signing authority surfaces", () => {
       { name: "TAKOSERVER_SIGNING_KEY_ID", type: "plain_text", text: "key-current" },
       { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
     ];
-    const expectedH = [
-      ...shared,
-      { name: "TAKOSERVER_SIGNING_KEY_ID", type: "plain_text", text: "key-current" },
-      { name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" },
-      { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
-    ];
     const expectedS = [
       ...shared,
       { name: "TAKOSERVER_SIGNING_KEY_ID", type: "plain_text", text: "key-next" },
-      { name: "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", type: "secret_text" },
       { name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" },
     ];
 
-    expect(canonicalPreTokenVersion(target, "key-current").resources.bindings).toEqual(expectedC);
-    expect(hostedVersion(target, "key-current").resources.bindings).toEqual(expectedH);
+    expect(
+      signingVersion(target, "key-current", `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`)
+        .resources.bindings,
+    ).toEqual(expectedC);
     expect(
       signingVersion(target, "key-next", `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`).resources
         .bindings,
@@ -385,6 +344,78 @@ describe("split signing authority surfaces", () => {
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.message).toContain("public-only");
       expect(db.inserts).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("registration status and apply reject both sponsorship public keys before mutation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-register-sponsorship-collision-"));
+    try {
+      const credential = await keyPair("sponsorship-credential-key");
+      const receipt = await keyPair("sponsorship-receipt-key");
+      const target = sponsoredTarget({
+        credentialPublicJwk: credential.publicJwk,
+        receiptPublicJwk: receipt.publicJwk,
+      });
+
+      for (const [name, authorityKey] of [
+        ["credential", credential],
+        ["receipt", receipt],
+      ] as const) {
+        const statusDatabase = new FakeDatabase();
+        statusDatabase.rows.set("key-current", row("key-current", authorityKey.publicJwk));
+        const statusProcess = processFixture();
+        const statusFailure = await runSigning(
+          {
+            surface: "takoserver-signing-key-register",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          target,
+          {
+            database: statusDatabase,
+            run: statusProcess.run,
+            outputDirectory: join(root, `${name}-status`),
+          },
+        ).catch((error) => error);
+        expect(statusFailure, `${name}/status`).toBeInstanceOf(DeployError);
+        expect(statusFailure.phase, `${name}/status`).toBe("preflight");
+        expect(statusDatabase.inserts, `${name}/status`).toHaveLength(0);
+        expect(statusProcess.calls, `${name}/status`).toHaveLength(0);
+
+        const publicPath = join(root, `${name}-public.jwk`);
+        writeFileSync(publicPath, `${authorityKey.publicJwk}\n`, { mode: 0o600 });
+        const applyDatabase = new FakeDatabase();
+        const applyProcess = processFixture();
+        const applyFailure = await runSigning(
+          {
+            surface: "takoserver-signing-key-register",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          target,
+          {
+            database: applyDatabase,
+            run: applyProcess.run,
+            publicJwkPath: publicPath,
+            review: "reviewer@example.test",
+            outputDirectory: join(root, `${name}-apply`),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error) => error);
+        expect(applyFailure, `${name}/apply`).toBeInstanceOf(DeployError);
+        expect(applyFailure.phase, `${name}/apply`).toBe("preflight");
+        expect(applyDatabase.inserts, `${name}/apply`).toHaveLength(0);
+        expect(
+          applyProcess.calls.some(
+            ({ command }) => command.includes("secret") || command.includes("deploy"),
+          ),
+          `${name}/apply`,
+        ).toBe(false);
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -702,6 +733,89 @@ describe("split signing authority surfaces", () => {
     }
   });
 
+  test("rotation status and apply reject sponsorship key reuse before a private half can enter the public closure", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-rotation-sponsorship-collision-"));
+    try {
+      const credential = await keyPair("sponsorship-credential-key");
+      const receipt = await keyPair("sponsorship-receipt-key");
+      const ordinaryCurrent = await keyPair("key-current");
+      const ordinaryNext = await keyPair("key-next");
+      const target = sponsoredTarget({
+        credentialPublicJwk: credential.publicJwk,
+        receiptPublicJwk: receipt.publicJwk,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      });
+
+      for (const [authorityName, authorityKey] of [
+        ["credential", credential],
+        ["receipt", receipt],
+      ] as const) {
+        for (const position of ["current", "next"] as const) {
+          for (const action of ["status", "apply"] as const) {
+            const nextKey = position === "next" ? authorityKey : ordinaryNext;
+            const privateRaw = `${JSON.stringify(nextKey.privateJwk)}\n`;
+            const privatePath = join(root, `${authorityName}-${position}-${action}.jwk`);
+            writeFileSync(privatePath, privateRaw, { mode: 0o600 });
+            const database = new FakeDatabase();
+            database.rows.set(
+              "key-current",
+              row(
+                "key-current",
+                position === "current" ? authorityKey.publicJwk : ordinaryCurrent.publicJwk,
+              ),
+            );
+            database.rows.set("key-next", row("key-next", nextKey.publicJwk));
+            const process = processFixture();
+            const uploadedSecrets: string[] = [];
+            let uploaded = false;
+            const run: SigningProcess = async (command, options) => {
+              if (command.includes("deploy") && command.includes("--secrets-file")) {
+                const secretsPath = command[command.indexOf("--secrets-file") + 1];
+                if (secretsPath) uploadedSecrets.push(readFileSync(secretsPath, "utf8"));
+                uploaded = true;
+              }
+              return await process.run(command, options);
+            };
+            const failure = await runSigning(
+              {
+                surface: "takoserver-signing-rotation",
+                action,
+                environment: "integration",
+                commit: COMMIT,
+              },
+              target,
+              {
+                database,
+                state: workerState({
+                  target,
+                  beforeSigning: "key-current",
+                  afterSigning: "key-next",
+                  afterWhen: () => uploaded,
+                }),
+                run,
+                nextPrivateJwkPath: privatePath,
+                review: "reviewer@example.test",
+                outputDirectory: join(root, `${authorityName}-${position}-${action}-work`),
+                cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+              },
+            ).catch((error) => error);
+
+            expect(failure, `${authorityName}/${position}/${action}`).toBeInstanceOf(DeployError);
+            expect(failure.phase, `${authorityName}/${position}/${action}`).toBe("preflight");
+            expect(database.inserts, `${authorityName}/${position}/${action}`).toHaveLength(0);
+            expect(
+              process.calls.filter(({ command }) => command.includes("--secrets-file")),
+              `${authorityName}/${position}/${action}`,
+            ).toHaveLength(0);
+            expect(uploadedSecrets, `${authorityName}/${position}/${action}`).toHaveLength(0);
+          }
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("integration rotation accepts the exact legacy current public row", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-legacy-rotation-"));
     try {
@@ -798,7 +912,14 @@ describe("split signing authority surfaces", () => {
       writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
       const target = {
         ...baseTarget,
-        sponsorship: true,
+        sponsorshipAuthority: {
+          workerName: "takoserver-sponsorship-authority",
+          organizationId: "org_hosted",
+          credentialKeyId: "sponsorship-credential-key",
+          credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+          receiptKeyId: "receipt-key",
+          receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+        },
         signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
       } satisfies DeployTarget;
 
@@ -891,7 +1012,14 @@ describe("split signing authority surfaces", () => {
       writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
       const target = {
         ...baseTarget,
-        sponsorship: true,
+        sponsorshipAuthority: {
+          workerName: "takoserver-sponsorship-authority",
+          organizationId: "org_hosted",
+          credentialKeyId: "sponsorship-credential-key",
+          credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+          receiptKeyId: "receipt-key",
+          receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+        },
         signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
       } satisfies DeployTarget;
       const canonicalMessage = `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`;
@@ -965,386 +1093,6 @@ describe("split signing authority surfaces", () => {
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("integration rotation repairs an exact Hosted successor in one canonical upload", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-rotation-"));
-    try {
-      const current = await keyPair("key-current");
-      const next = await keyPair("key-next");
-      const privatePath = join(root, "next-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
-      const target = {
-        ...baseTarget,
-        sponsorship: true,
-        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-      } satisfies DeployTarget;
-      const db = new FakeDatabase();
-      db.rows.set("key-current", row("key-current", current.publicJwk));
-      db.rows.set("key-next", row("key-next", next.publicJwk));
-      const process = processFixture();
-      let uploaded = false;
-      let uploadMessage: string | null = null;
-      const wrapped: SigningProcess = async (command, options) => {
-        if (command.includes("deploy") && command.includes("--secrets-file")) {
-          uploadMessage = command[command.indexOf("--message") + 1] ?? null;
-          uploaded = true;
-        }
-        return await process.run(command, options);
-      };
-
-      const result = await runSigning(
-        {
-          surface: "takoserver-signing-rotation",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        {
-          database: db,
-          state: hostedRotationState(
-            target,
-            () => uploaded,
-            () => uploadMessage,
-          ),
-          run: wrapped,
-          nextPrivateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-
-      expect(result).toMatchObject({
-        kind: "takoserver.signing-rotation-apply@v2",
-        hostedTransition: "C-to-H-to-S",
-        previousVersionId: VERSION_H,
-        versionId: VERSION_S,
-        inheritedCommit: COMMIT,
-        inheritedBundleDigest: `sha256:${BUNDLE_DIGEST}`,
-      });
-      expect(
-        process.calls.filter(({ command }) => command.includes("--secrets-file")),
-      ).toHaveLength(1);
-      expect(
-        process.calls.filter(
-          ({ command }) => command.includes("deploy") && command.includes("--secrets-file"),
-        ),
-      ).toHaveLength(1);
-      expect(process.calls.filter(({ command }) => command.includes("secret"))).toHaveLength(0);
-      expect(process.calls.filter(({ command }) => command.includes("delete"))).toHaveLength(0);
-      expect(
-        process.calls.filter(
-          ({ command }) =>
-            command.includes("deploy") &&
-            !command.includes("--dry-run") &&
-            !command.includes("--secrets-file"),
-        ),
-      ).toHaveLength(0);
-      expect(db.inserts).toHaveLength(0);
-      expect(JSON.stringify(result)).not.toContain(JSON.parse(current.publicJwk).x);
-      expect(JSON.stringify(result)).not.toContain(JSON.parse(next.publicJwk).x);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("integration H-to-S completion keeps historical C/H pre-JIT and requires JIT on final S", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-jit-rotation-"));
-    try {
-      const current = await keyPair("key-current");
-      const next = await keyPair("key-next");
-      const privatePath = join(root, "next-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
-      const target = {
-        ...integrationE2eTarget,
-        sponsorship: true,
-        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-      } satisfies DeployTarget;
-      const db = new FakeDatabase();
-      db.rows.set("key-current", row("key-current", current.publicJwk));
-      db.rows.set("key-next", row("key-next", next.publicJwk));
-      const process = processFixture();
-      let uploaded = false;
-      let uploadMessage: string | null = null;
-      const wrapped: SigningProcess = async (command, options) => {
-        if (command.includes("deploy") && command.includes("--secrets-file")) {
-          uploadMessage = command[command.indexOf("--message") + 1] ?? null;
-          uploaded = true;
-        }
-        return await process.run(command, options);
-      };
-
-      const result = await runSigning(
-        {
-          surface: "takoserver-signing-rotation",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-        },
-        target,
-        {
-          database: db,
-          state: hostedRotationState(
-            target,
-            () => uploaded,
-            () => uploadMessage,
-            undefined,
-            true,
-          ),
-          run: wrapped,
-          nextPrivateJwkPath: privatePath,
-          review: "reviewer@example.test",
-          outputDirectory: join(root, "work"),
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-        },
-      );
-
-      expect(result).toMatchObject({
-        kind: "takoserver.signing-rotation-apply@v2",
-        hostedTransition: "C-to-H-to-S",
-        previousVersionId: VERSION_H,
-        versionId: VERSION_S,
-        inheritedCommit: COMMIT,
-        inheritedBundleDigest: `sha256:${BUNDLE_DIGEST}`,
-      });
-      expect(
-        process.calls.filter(({ command }) => command.includes("--secrets-file")),
-      ).toHaveLength(1);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("H-to-S completion rejects every noncanonical successor annotation inventory", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-hosted-rotation-postcondition-"));
-    try {
-      const current = await keyPair("key-current");
-      const next = await keyPair("key-next");
-      const privatePath = join(root, "next-private.jwk");
-      writeFileSync(privatePath, `${JSON.stringify(next.privateJwk)}\n`, { mode: 0o600 });
-      const target = {
-        ...baseTarget,
-        sponsorship: true,
-        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-      } satisfies DeployTarget;
-      const message = `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`;
-      const variants = [
-        { name: "message-only", annotations: { "workers/message": message } },
-        {
-          name: "secret-trigger",
-          annotations: { "workers/message": message, "workers/triggered_by": "secret" },
-        },
-        {
-          name: "extra-annotation",
-          annotations: {
-            "workers/message": message,
-            "workers/triggered_by": "version_upload",
-            "workers/extra": "unexpected",
-          },
-        },
-      ] as const;
-
-      for (const variant of variants) {
-        const db = new FakeDatabase();
-        db.rows.set("key-current", row("key-current", current.publicJwk));
-        db.rows.set("key-next", row("key-next", next.publicJwk));
-        const process = processFixture();
-        let uploaded = false;
-        let uploadMessage: string | null = null;
-        const wrapped: SigningProcess = async (command, options) => {
-          if (command.includes("deploy") && command.includes("--secrets-file")) {
-            uploadMessage = command[command.indexOf("--message") + 1] ?? null;
-            uploaded = true;
-          }
-          return await process.run(command, options);
-        };
-
-        const failure = await runSigning(
-          {
-            surface: "takoserver-signing-rotation",
-            action: "apply",
-            environment: "integration",
-            commit: COMMIT,
-          },
-          target,
-          {
-            database: db,
-            state: hostedRotationState(
-              target,
-              () => uploaded,
-              () => uploadMessage,
-              variant.annotations,
-            ),
-            run: wrapped,
-            nextPrivateJwkPath: privatePath,
-            review: "reviewer@example.test",
-            outputDirectory: join(root, variant.name),
-            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          },
-        ).catch((error) => error);
-
-        expect(failure, variant.name).toBeInstanceOf(DeployError);
-        expect(failure.phase, variant.name).toBe("verification");
-        expect(failure.message, variant.name).toContain("canonical annotation inventory");
-        expect(
-          process.calls.filter(({ command }) => command.includes("--secrets-file")),
-          variant.name,
-        ).toHaveLength(1);
-        expect(
-          process.calls.filter(
-            ({ command }) =>
-              command.includes("secret") && (command.includes("put") || command.includes("delete")),
-          ),
-          variant.name,
-        ).toHaveLength(0);
-      }
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  test("integration rotation status recognizes only the exact C-to-H-to-S successor", async () => {
-    const current = await keyPair("key-current");
-    const next = await keyPair("key-next");
-    const target = {
-      ...baseTarget,
-      sponsorship: true,
-      signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-    } satisfies DeployTarget;
-    const db = new FakeDatabase();
-    db.rows.set("key-current", row("key-current", current.publicJwk));
-    db.rows.set("key-next", row("key-next", next.publicJwk));
-    const process = processFixture();
-    const result = await runSigning(
-      {
-        surface: "takoserver-signing-rotation",
-        action: "status",
-        environment: "integration",
-        commit: COMMIT,
-      },
-      target,
-      {
-        database: db,
-        state: hostedRotationState(
-          target,
-          () => true,
-          () => `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`,
-        ),
-        run: process.run,
-        outputDirectory: join(tmpdir(), "takoserver-hosted-rotation-status"),
-      },
-    );
-    expect(result).toMatchObject({
-      kind: "takoserver.signing-rotation-status@v2",
-      cutoverState: "next-key-direct-successor",
-      servingKeyId: "key-next",
-      hostedTransition: "C-to-H",
-      inheritedCommit: COMMIT,
-      versionId: VERSION_S,
-      previousVersionId: VERSION_H,
-      ready: true,
-    });
-    expect(process.calls).toHaveLength(0);
-  });
-
-  test("integration rotation status recognizes the exact Hosted H predecessor without upload", async () => {
-    const current = await keyPair("key-current");
-    const next = await keyPair("key-next");
-    const target = {
-      ...baseTarget,
-      sponsorship: true,
-      signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-    } satisfies DeployTarget;
-    const db = new FakeDatabase();
-    db.rows.set("key-current", row("key-current", current.publicJwk));
-    db.rows.set("key-next", row("key-next", next.publicJwk));
-    const process = processFixture();
-    const result = await runSigning(
-      {
-        surface: "takoserver-signing-rotation",
-        action: "status",
-        environment: "integration",
-        commit: COMMIT,
-      },
-      target,
-      {
-        database: db,
-        state: hostedRotationState(
-          target,
-          () => false,
-          () => null,
-        ),
-        run: process.run,
-        outputDirectory: join(tmpdir(), "takoserver-hosted-current-status"),
-      },
-    );
-    expect(result).toMatchObject({
-      kind: "takoserver.signing-rotation-status@v2",
-      cutoverState: "hosted-token-added-unattributed-successor",
-      hostedTransition: "C-to-H",
-      servingKeyId: "key-current",
-      versionId: VERSION_H,
-      previousVersionId: VERSION_C,
-      inheritedCommit: COMMIT,
-      repairRequired: true,
-      rotationApplyReady: true,
-      ready: false,
-    });
-    expect(process.calls).toHaveLength(0);
-    expect(JSON.stringify(result)).not.toContain(JSON.parse(current.publicJwk).x);
-    expect(JSON.stringify(result)).not.toContain(JSON.parse(next.publicJwk).x);
-  });
-
-  test("rehearsal and production refuse the Hosted bridge for status and apply before any rotation upload", async () => {
-    const current = await keyPair("key-current");
-    const next = await keyPair("key-next");
-    for (const environment of ["rehearsal", "production"] as const) {
-      const target = {
-        ...baseTarget,
-        environment,
-        sponsorship: true,
-        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
-      } satisfies DeployTarget;
-      const db = new FakeDatabase();
-      db.rows.set("key-current", row("key-current", current.publicJwk));
-      db.rows.set("key-next", row("key-next", next.publicJwk));
-      for (const action of ["status", "apply"] as const) {
-        const process = processFixture();
-        const failure = await runSigning(
-          {
-            surface: "takoserver-signing-rotation",
-            action,
-            environment,
-            commit: COMMIT,
-          },
-          target,
-          {
-            database: db,
-            state: hostedRotationState(
-              target,
-              () => false,
-              () => null,
-            ),
-            run: process.run,
-            review: "reviewer@example.test",
-            outputDirectory: join(tmpdir(), `takoserver-hosted-${environment}-${action}`),
-          },
-        ).catch((error) => error);
-        expect(failure, `${environment}/${action}`).toBeInstanceOf(DeployError);
-        expect(failure.phase, `${environment}/${action}`).toBe("preflight");
-        expect(process.calls, `${environment}/${action}`).toHaveLength(0);
-        expect(
-          `${failure.message}\n${failure.detail ?? ""}`,
-          `${environment}/${action}`,
-        ).not.toContain(JSON.parse(current.publicJwk).x);
-        expect(
-          `${failure.message}\n${failure.detail ?? ""}`,
-          `${environment}/${action}`,
-        ).not.toContain(JSON.parse(next.publicJwk).x);
-      }
     }
   });
 
@@ -1884,86 +1632,6 @@ function signingVersion(
     resources: {
       script: { etag: "script-etag" },
       bindings: Object.entries(closure).flatMap(([name, requirement]) =>
-        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
-      ),
-    },
-  };
-}
-
-function canonicalPreTokenVersion(
-  target: DeployTarget,
-  signingKeyId: string,
-  authorityProfile?:
-    | { readonly kind: "historical-pre-jit" }
-    | {
-        readonly kind: "provenance-bound-jit";
-        readonly provenance: {
-          readonly sourceCommit: string;
-          readonly artifactDigest: `sha256:${string}`;
-        };
-      },
-) {
-  const expected = expectedExactBindingClosure(target, {
-    signingKeyId,
-    expectedSecrets: ["TAKOSERVER_SIGNING_KEY"],
-    ...(target.integrationE2eCredentialAuthority === undefined
-      ? {}
-      : {
-          authorityProfile: authorityProfile ?? {
-            kind: "provenance-bound-jit" as const,
-            provenance: {
-              sourceCommit: COMMIT,
-              artifactDigest: `sha256:${BUNDLE_DIGEST}` as const,
-            },
-          },
-        }),
-  });
-  return {
-    annotations: {
-      "workers/message": `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`,
-      "workers/triggered_by": "version_upload",
-    },
-    resources: {
-      script: { etag: "script-etag" },
-      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
-        requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
-      ),
-    },
-  };
-}
-
-function hostedVersion(
-  target: DeployTarget,
-  signingKeyId: string,
-  authorityProfile?:
-    | { readonly kind: "historical-pre-jit" }
-    | {
-        readonly kind: "provenance-bound-jit";
-        readonly provenance: {
-          readonly sourceCommit: string;
-          readonly artifactDigest: `sha256:${string}`;
-        };
-      },
-) {
-  const expected = expectedExactBindingClosure(target, {
-    signingKeyId,
-    ...(target.integrationE2eCredentialAuthority === undefined
-      ? {}
-      : {
-          authorityProfile: authorityProfile ?? {
-            kind: "provenance-bound-jit" as const,
-            provenance: {
-              sourceCommit: COMMIT,
-              artifactDigest: `sha256:${BUNDLE_DIGEST}` as const,
-            },
-          },
-        }),
-  });
-  return {
-    annotations: { "workers/triggered_by": "secret" },
-    resources: {
-      script: { etag: "script-etag" },
-      bindings: Object.entries(expected).flatMap(([name, requirement]) =>
         requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
       ),
     },

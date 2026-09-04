@@ -338,6 +338,72 @@ try {
     "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_d1_fixture'",
     "artifact_consumer_resolution_receipt_durable",
   );
+  await execute(
+    `INSERT INTO sponsorship_credential_issuance_operations
+       (issuance_operation_id, input_sha256, request_sha256,
+        request_nonce_sha256, tenant_ref, org_id, hosted_version_id,
+        issued_at_epoch_seconds, expires_at_epoch_seconds, token_id,
+        credential_key_id, receipt_key_id, authority_version_id,
+        authority_source_commit, authority_artifact_sha256, created_at)
+     VALUES ('sha256:${"8".repeat(64)}', 'sha256:${"9".repeat(64)}',
+             'sha256:${"a".repeat(64)}', 'sha256:${"b".repeat(64)}',
+             'tenant:migration-check', 'org:migration-check',
+             '33333333-3333-4333-8333-333333333333', 100, 400,
+             'tok_sponsor_migration_check', 'credential-key-check',
+             'receipt-key-check', '44444444-4444-4444-8444-444444444444',
+             '${"b".repeat(40)}', 'sha256:${"c".repeat(64)}',
+             '2026-09-04T00:00:00.000Z')`,
+  );
+  await expectExecuteFailure(
+    "UPDATE sponsorship_credential_issuance_operations SET token_id = 'tok_changed'",
+    "sponsorship credential issuance operations are append-only",
+  );
+  const issuance = firstResult(
+    await execute(
+      `SELECT operation.tenant_ref, operation.org_id,
+              (SELECT COUNT(*) FROM sponsorship_tenants AS tenant
+               WHERE tenant.tenant_ref = operation.tenant_ref
+                 AND tenant.org_id = operation.org_id) AS binding_count
+       FROM sponsorship_credential_issuance_operations AS operation`,
+    ),
+  );
+  if (
+    issuance.tenant_ref !== "tenant:migration-check" ||
+    issuance.org_id !== "org:migration-check" ||
+    issuance.binding_count !== 1
+  ) {
+    throw new Error(
+      `D1 sponsorship issuance admission readback failed: ${JSON.stringify(issuance)}`,
+    );
+  }
+  await execute(
+    `INSERT INTO sponsorship_cutover_operation_starts
+       (operation_id, target_sha256, environment, stage, proof_sha256,
+        predecessor_deployment_id, predecessor_version_id,
+        predecessor_topology_sha256, source_commit, bundle_sha256,
+        config_sha256, candidate_identity_sha256, started_at)
+     VALUES ('sha256:${"1".repeat(64)}', 'sha256:${"2".repeat(64)}',
+             'integration', 'public-route-removal', 'sha256:${"3".repeat(64)}',
+             'deployment-predecessor', '11111111-1111-4111-8111-111111111111',
+             'sha256:${"4".repeat(64)}', '${"a".repeat(40)}',
+             'sha256:${"5".repeat(64)}', 'sha256:${"6".repeat(64)}',
+             'sha256:${"7".repeat(64)}', '2026-09-04T00:00:00.000Z')`,
+  );
+  await execute(
+    `INSERT INTO sponsorship_cutover_operation_completions
+       (operation_id, successor_deployment_id, successor_version_id, completed_at)
+     VALUES ('sha256:${"1".repeat(64)}', 'deployment-successor',
+             '22222222-2222-4222-8222-222222222222',
+             '2026-09-04T00:01:00.000Z')`,
+  );
+  await expectExecuteFailure(
+    "UPDATE sponsorship_cutover_operation_starts SET started_at = '2026-09-04T00:02:00.000Z'",
+    "sponsorship cutover starts are append-only",
+  );
+  await expectExecuteFailure(
+    "DELETE FROM sponsorship_cutover_operation_completions",
+    "sponsorship cutover completions are append-only",
+  );
   const raw = await run([
     "d1",
     "execute",
@@ -349,7 +415,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_recovery_candidates', 'tf_artifact_recovery_details', 'tf_artifact_recovery_once', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_credential_issuance_operations', 'sponsorship_cutover_operation_completions', 'sponsorship_cutover_operation_starts', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_recovery_candidates', 'tf_artifact_recovery_details', 'tf_artifact_recovery_once', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -367,6 +433,9 @@ try {
       "runtime_grant_keys",
       "runtime_grant_replays",
       "runtime_resources",
+      "sponsorship_credential_issuance_operations",
+      "sponsorship_cutover_operation_completions",
+      "sponsorship_cutover_operation_starts",
       "sponsorship_resources",
       "sponsorship_tenants",
       "tf_artifact_blob_io_leases",

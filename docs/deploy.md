@@ -18,12 +18,12 @@ The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046>
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
-0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, 0045, and 0046. A
+0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, 0045, 0046, and 0047. A
 selector is accepted only when its predecessor is the current lineage; an
 incomplete wave can resume under the same selector, but cannot skip forward.
 Integration retains only the no-selector fast path for disposable cadence and
@@ -74,7 +74,7 @@ Legacy Hosted-edge retirement is a separately reviewed L→C→T→R sequence. T
 authority surface accepts `--legacy-host-runtime-predecessor-version=<uuid>` to
 publish candidate code while preserving exactly the observed
 `HOST_RUNTIME_MATERIALIZER` service binding and
-`TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN`. Ordinary target realization never carries
+the retired Hosted bearer secret. Ordinary target realization never carries
 either retired field. Retirement applies perform one provider mutation followed
 by authoritative readback; an acknowledgement loss is settled by `--status`,
 never by a blind retry. `--reverse` is accepted only by the authority and
@@ -652,13 +652,14 @@ remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
-| `takoserver-hosted-token-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_HOSTED_TOKEN_PATH` for `--apply` only. |
+| `takoserver-sponsorship-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare deployment credential plus a distinct owned `0600` `TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL` for both; `TAKOSERVER_INDEPENDENT_REVIEW`, `TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH`, and `TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH` for `--apply` only. The deploy target pins the Worker name, organization, and distinct credential/receipt public keys; apply append-only registers and reads back the credential public half before upload. |
+| `takoserver-sponsorship-public-route-retirement` | `--status`, `--apply`; `--reverse` on apply only | integration, production | Resolved Cloudflare deployment credential plus the distinct topology-audit credential; exact `--legacy-host-runtime-predecessor-version=<uuid>` for every action; `TAKOSERVER_INDEPENDENT_REVIEW` and current owner-private proof path/SHA-256 for forward `--apply`. The target-derived remote `STATE_DB` must carry migration `0047_sponsorship_cutover_consumption.sql` after reviewed `0046`; no operator-selectable local replay store exists. Keep proof inputs present for post-acknowledgement `--status` so it can settle the started operation exactly once. Reverse does not erase consumption. |
 | `takoserver-host-runtime-topology-retirement` | `--status`, `--apply` | integration, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
-| `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-hosted-token-retirement` | `--status`, `--apply` | integration, production | Resolved Cloudflare deployment credential plus the distinct topology-audit credential; exact `--legacy-host-runtime-predecessor-version=<uuid>` for every action; `TAKOSERVER_INDEPENDENT_REVIEW`, a current owner-private proof path/SHA-256, migration `0047` in the target-derived remote `STATE_DB`, and an exact completed route-removal operation receipt for `--apply`. Keep proof inputs present for post-acknowledgement `--status` settlement. |
 | `takoserver-worker-retirement-attribution-repair` | `--status`, `--apply` | integration, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-operator-identity` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW`, `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`, and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` for `--apply` only; every action requires `--organization=org_...`. |
 | `takoserver-integration-operator-identity` | `--status`, `--apply` | integration only | Legacy spelling of the canonical surface; resolved Cloudflare credential (explicit token or integration OAuth fallback), same inputs and required `--organization=org_...`, refused in rehearsal and production. |
@@ -1140,74 +1141,71 @@ time-based deletion policy; do not prune them merely to reduce the count.
   secret repair.
 - `takoserver-signing-rotation`: explicit different current and next ids; both
   must already be registered, neither row is overwritten, and the identical
-  Worker code is uploaded with the next id and private secret together. A
-  canonical sponsored current-key Version follows this ordinary strict path;
-  secret presence does not select a bridge. Only integration may select the
-  exact `workers/triggered_by=secret` H profile. Annotation classification is
-  exhaustive: an exact canonical inventory uses the ordinary path, the exact H
-  inventory uses the integration bridge, and every mixed or unknown inventory
-  fails status/apply before build or upload. H status remains `ready: false` and
-  `repairRequired: true`, while `rotationApplyReady` states whether the selected
-  commit is qualified for the one H→S apply. All deployment-history entries must
-  have valid shapes, UUID Version IDs, unique deployment IDs, and one 100 percent
-  Version. Older rollback reuse of a Version is valid outside the inferred
-  transition, while the C→H or C→H→S prefix itself must contain unique Versions.
-- `takoserver-hosted-token-cutover`: while Hosted topology is absent, puts only
-  the Hosted bearer and proves the authenticated sponsorship route returns a
-  credential signed by the current D1 key. Fresh C→H apply is temporary and
-  integration-only. Rehearsal and production may inspect canonical pre-token C,
-  but status reports `cutoverApplyReady: false` and `ready: false`; apply refuses
-  immediately after the minimal Worker-state classification, before source,
-  reviewer, token-file, D1-row, proof-tenant, secret mutation, or HTTP-proof work.
-  Cloudflare may create an unannotated successor when the secret is added. The
-  temporary integration transition accepts that H Version only when it is the
-  exact direct successor of canonical C: C's exact annotation inventory
-  (`workers/message` plus `workers/triggered_by=version_upload`) supplies the
-  selected commit/digest, C's closure is exact without the named secret, H's
-  annotation inventory is exactly `workers/triggered_by=secret`, C/H
-  `resources.script.etag` values match, and the secret/domain inventory plus
-  deployment history are exact and stable. The trigger marker alone is not
-  provenance. Rehearsal and production reject H for both status and apply,
-  including when the D1 row is canonical, without secret mutation or functional
-  proof. A canonically annotated token-present Version remains on the ordinary
-  strict status path; secret presence alone never selects the bridge. That
-  standalone status remains conservative (`functionalProofPending: true`,
-  `ready: false`) and reports `proofApplyReady` only when the selected commit
-  equals the exact source-independent live commit.
-  When that exact canonical token-present Version is current, `--apply` is a
-  proof-only path in integration, rehearsal, and production. It performs no
-  secret put/delete, build, dry-run, Worker upload, or provider configuration
-  mutation, and it writes no D1 proof ledger. The path qualifies the exact
-  local commit plus remote reachability; rehearsal and production use the
-  production-strength clean/source qualification. It then requires the
-  independent reviewer, reads the owned `0600` Hosted token, and validates the
-  exact active current D1 signing row and one stable proof tenant.
-  Immediately before the first secret put, apply re-reads exact C
-  deployment/version/predecessor, commit, digest, script etag,
-  binding/secret/domain closure, the byte-identical D1 row, and the stable proof
-  tenant. Status reports H as unattributed and repair-required. Recovery first
-  qualifies the exact local/remote source commit and independent reviewer, then
-  proves sponsorship without another secret put. Both first apply and recovery
-  finish by re-reading exact H closure/history/secret/domain inventory and the
-  D1 row after proof.
-  Immediately before canonical proof-only HTTP, apply re-reads the exact
-  canonical Version/history, commit, digest, script etag,
-  binding/secret/domain closure, the byte-identical D1 row, and the stable
-  tenant. The one bounded sponsorship response must carry the exact current
-  `kid`, claims and lifetime and verify under that row. Apply then re-reads the
-  final canonical closure/history and exact D1 row and fails on any drift. Its
-  sanitized receipt includes the version, commit, artifact digest, reviewer,
-  key id, public-JWK digest, tenant reference, and lifetime, with
-  `mutationApplied: false`, `functionalProofPending: false`,
-  `repairRequired: false`, and `ready: true`.
-  Before topology cutover its reversal is explicit deletion of that newly added
-  named secret. Canonical proof-only apply has no mutation to reverse.
+  Worker code is uploaded with the next id and private secret together. Only an
+  exact canonical public Worker Version and exact public binding/secret closure
+  are accepted; provider-created secret successors and every mixed or unknown
+  annotation inventory fail before build or upload.
+- `takoserver-sponsorship-authority-worker`: publishes the dedicated
+  route-less RPC authority. Its immutable closure is exactly one `STATE_DB`
+  binding, deploy-pinned organization/issuer, dedicated sponsorship credential
+  key id/public JWK/secret, distinct receipt key id/secret, and Worker version
+  metadata. The credential public key is append-only registered in
+  `runtime_grant_keys` and read back exactly; its owned private half enters only
+  this route-less Worker. The public Worker retains its distinct ordinary
+  run-token secret, exposes no tenant-run mint API, and accepts a tenant-run JWT
+  only when migration `0047` contains the matching immutable admission row and
+  credential key id. The authority has `workers_dev=false`,
+  `preview_urls=false`, no routes or custom domains, no public `fetch`, and
+  exposes only `issueTenantRunCredential`. Status and post-apply readback prove
+  the active Version, script identity, exact binding/secret closure, and empty
+  public topology. Before topology enumeration, an owner-private audit
+  credential reads the exact deployment token's active policy and mechanically
+  proves `Zone Read` plus `Workers Routes Read` over the exact nested all-zones
+  resource for the selected account. `Workers Routes Write` is rejected because
+  this credential performs no route mutation. Only token, policy, and resource digests
+  enter evidence. They intentionally report `functionalProofPending: true`
+  and `rolloutReady: false`: only the subsequently bound Hosted staging flow
+  can supply authenticated issuance/readback proof.
+
+  Migration `0047` also owns the append-only sponsorship issuance admission.
+  One logical Hosted exchange has one stable operation id; its first D1 insert
+  fixes the 300-second issue instant and token id while atomically binding the
+  tenant through the same SQLite statement. An exact RPC retry reconstructs
+  byte-identical Ed25519 bearer and receipt bytes. A changed request conflicts,
+  and an unavailable wallet never reaches either signer. The row stores no raw
+  bearer, Space, or Run value and cannot be updated or deleted.
+
+  The one-time cutover order is fixed: (1) deploy and read back this authority,
+  (2) release Hosted with its exact service binding and no bearer secret,
+  (3) run the bounded authenticated staging E2E and verify the issued
+  tenant/space/run credential and at-most-300-second lifetime, then (4) retire
+  the old public-route topology and its bearer secret. Steps may not be reordered,
+  and no compatibility route or bearer is retained afterward.
+- `takoserver-sponsorship-public-route-retirement`: the only owner lane that
+  may publish the public Worker bytes which remove the sponsorship handlers.
+  Forward apply requires the fresh Hosted-produced staging proof, revalidates
+  its exact observed public Worker predecessor/topology/generation, authority
+  Worker Version/source/artifact/script/receipt key, Hosted
+  Version/source/artifact/config/binding set, sole default-entrypoint service
+  binding, zero Hosted public topology, the distinct signed authority issuance
+  receipt, the matching append-only Hosted receipt, verified signed exact
+  tenant/Space/Run claims, sole audience/scope, at-most-300-second credential,
+  and authenticated Takoform readback. In the target-derived remote `STATE_DB`,
+  it records an append-only phase start immediately before the one upload and a
+  completion only after exact direct-successor readback. The start binds the
+  predecessor, source commit, exact bundle/config, candidate identity, and
+  operation id, so lost acknowledgement cannot bless an interleaved successor.
+  That candidate retains the separately retired legacy Host-runtime
+  binding and bearer; all former public sponsorship routes return the ordinary
+  public 404 regardless of any bearer. `--reverse` restores only the pinned
+  provider-history predecessor and consumes no proof; another forward apply
+  requires a fresh proof.
 - `takoserver-host-runtime-topology-retirement`: C→T transition. It uploads a
   byte-identical candidate Worker exactly once, removes only the observed
   `HOST_RUNTIME_MATERIALIZER` binding, retains the Hosted secret, and proves the
   direct successor. `--reverse` redeploys that exact provider-history Version.
 - `takoserver-hosted-token-retirement`: T→R transition. It deletes only
-  `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` after topology retirement and verifies
+  the retired Hosted bearer secret after topology retirement and verifies
   an exact direct-successor Worker Version with unchanged code identity. If the
   provider-created R has no exact canonical annotation inventory
   (`workers/message` plus `workers/triggered_by=version_upload`), status reports
@@ -1245,23 +1243,150 @@ time-based deletion policy; do not prune them merely to reduce the count.
   carrying that legacy funding binding is refused as unrelated authority;
   replacing or removing it requires its own reviewed transition.
 
-The intended forward order is schema, public-key registration, any required
-authority-sensitive Worker code, signing repair or explicit rotation, Hosted
-token cutover, authority candidate transition (L→C), topology retirement (C→T),
-then token retirement (T→R). If token retirement leaves an unannotated R,
-status must show that exact state before the dedicated attribution repair (R→A).
-For the temporary integration Hosted transition, signing rotation is the sole
-attribution repair: it accepts the exact C→H bridge and performs one canonical
-H→S `deploy --secrets-file` upload, with no classic secret put/delete or second
-mutation, and proves C→H→S with the same script identity and byte-identical D1
-rows. Rehearsal, production, and ordinary signing paths remain canonical-strict.
-This is a temporary integration-only bridge, not a generalized compatibility
-layer; remove it after the integration Worker has completed canonical cutover.
-Status must show the required direct predecessor state before each apply. The
-authority and topology retirement surfaces expose their documented reversals;
-token retirement and attribution repair are forward-only and restoration
-requires a separately reviewed dedicated surface. There is no automatic
-fallback or raw Wrangler reversal.
+The sponsorship cutover is deletion-first and the following owner order is the
+executable contract. Every path shown below is absolute, outside Git, owned by
+the operator, and mode `0600`. Replay and lost-acknowledgement authority is the
+target-derived remote `STATE_DB` under migration `0047`, never a local path or
+checkout.
+
+1. Supply a distinct topology-audit credential through
+   `TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL`. The JSON file has kind
+   `takoserver.cloudflare-topology-audit-credential@v1`, the deployment-token
+   owner (`user` or `account`), and the separate metadata-read token. That
+   audit token needs the corresponding user `API Tokens Read` or account
+   `Account API Tokens Read` authority; it never becomes a Worker binding.
+   The deployment token itself must be active and carry both `Zone Read` and
+   `Workers Routes Read` over the exact all-zones-in-selected-account resource.
+   `Workers Routes Write`, partial-zone, or unverifiable policy fails before a
+   topology claim.
+2. After the exact reviewed `0046` Takoserver lineage is present, expose and
+   apply `0047_sponsorship_cutover_consumption.sql` through the owning
+   `takoserver-d1-schema` surface. This additive migration creates both the
+   issuance-operation CAS needed by the authority RPC and the two cutover
+   consumption receipts. Do not deploy the functional authority/Hosted pair or
+   retire anything from a source tree whose audited schema inventory stops
+   before `0047`.
+3. Deploy `takoserver-sponsorship-authority-worker`, supplying separate owned
+   sponsorship-credential and issuance-receipt private JWKs through
+   `TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH` and
+   `TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH`, then run its `--status`
+   action and retain the exact status JSON. Authority status must report its
+   exact active Version/source/artifact/script, topology-policy digests, and
+   closed D1/two-key signing binding set, exact credential public-key registry
+   readback, `functionalProofPending: true`, and
+   `rolloutReady: false`. This authority deployment is independently allowed
+   first and cannot remove a public route.
+4. In `takosumi-hosted`, apply its additive `0003` issuance-receipt migration
+   as part of the owning release and publish the exact Hosted Version with precisely one
+   `TAKOSERVER_SPONSORSHIP_AUTHORITY` default-entrypoint service binding, no
+   sponsorship bearer secret, and no workers.dev, preview URL, account-zone
+   route, custom domain, or top-level subdomain setting. Its separate
+   `TAKOSUMI_HOSTED_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL` must authenticate the
+   exact deployment token's complete all-zone visibility. Retain the ready
+   ordinary `worker-release-evidence@v3` or successful
+   `worker-release-recovery-evidence@v2` file and the exact realized config.
+5. Before removal, capture
+   `takoserver-sponsorship-public-route-retirement --status` as an owned `0600`
+   public-predecessor evidence file:
+
+   ```sh
+   umask 077
+   bun run deploy -- takoserver-sponsorship-public-route-retirement --status \
+     --environment=<integration-or-production> \
+     --commit=<40-hex-candidate-commit> \
+     --legacy-host-runtime-predecessor-version=<uuid> \
+     > /absolute/operator-private/cutover/public-predecessor-status.json
+   ```
+
+   Then run the
+   existing authenticated Takosumi staging apply E2E through the actual Hosted
+   `exchangeProviderCredential` method. That path calls the service binding and
+   then performs one append-only insert containing only credential/receipt
+   hashes, the signed receipt, Hosted Version, and time in Hosted's dedicated
+   `sponsorship_issuance_receipts`
+   table. It stores no raw credential or tenant value. Capture the structural
+   exchange input/result and the exact deterministic private RPC channel
+   (logical operation id, Hosted Version, request digest, and nonce) in an
+   owner-private `0600` transcript. Generic Hosted
+   routes and the legacy Takoserver HTTP sponsorship route cannot append this
+   row or sign the distinct authority receipt. Do not add runtime logging or a
+   public proof endpoint.
+6. With `CLOUDFLARE_API_TOKEN` available only to the owner process for the
+   exact Hosted D1 read, use Hosted's deploy surface to require the append-only
+   receipt row, verify both Ed25519 signatures, validate the exact issued
+   audience/scope/tenant/Space/Run claims and at-most-300-second lifetime, and
+   perform the bounded bearer-authenticated Takoform Form-list readback:
+
+   ```sh
+   bun run deploy -- takosumi-hosted-sponsorship-cutover-proof \
+     --environment=staging \
+     --authority-evidence=/absolute/operator-private/cutover/authority-status.json \
+     --hosted-evidence=/absolute/operator-private/cutover/hosted-release-evidence.json \
+     --public-predecessor-evidence=/absolute/operator-private/cutover/public-predecessor-status.json \
+     --e2e-transcript=/absolute/operator-private/cutover/staging-e2e-transcript.json \
+     --worker-config=/absolute/operator-private/cutover/hosted-realized-config.json \
+     --out=/absolute/operator-private/cutover/sponsorship-cutover-proof.json
+   ```
+
+7. Confirm the exact raw proof-file digest printed by the create-only Hosted
+   command, then export only its path and digest:
+
+   ```sh
+   export TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_PATH=/absolute/operator-private/cutover/sponsorship-cutover-proof.json
+   export TAKOSERVER_SPONSORSHIP_CUTOVER_PROOF_SHA256=sha256:<exact-raw-proof-digest>
+   ```
+
+8. Run status/apply/status on
+   `takoserver-sponsorship-public-route-retirement`, always with the exact
+   `--legacy-host-runtime-predecessor-version=<uuid>` and selected commit. The
+   forward apply revalidates both currently serving proof-bound Workers twice,
+   consumes `public-route-removal` immediately before its sole upload, and
+   records the exact successor afterward. If upload acknowledgement is lost,
+   run status with these same proof inputs; it may settle only that already
+   started phase, even after the proof's ordinary freshness window, because the
+   durable start fixed the proof digest, predecessor, candidate bundle/config,
+   and start time before mutation. If authoritative readback still shows the
+   unchanged predecessor, the start is explicitly indeterminate: status may
+   report it but neither status nor another apply receives provider-mutation
+   authority. Do not retry apply. Recovery would require a separately reviewed,
+   quiesced rearm/forward-repair state that this cutover does not implement.
+9. Run status/apply/status on
+   `takoserver-host-runtime-topology-retirement` with the same legacy selector
+   to remove the retained Host-runtime service binding without changing code
+   bytes. This is cleanup of a separate historical edge, not a compatibility
+   path.
+10. While the proof is still current, run status/apply/status on
+   `takoserver-hosted-token-retirement` with the same legacy selector. It
+   requires the exact completed route-removal operation in remote `STATE_DB`,
+   revalidates the current proof-bound authority and Hosted Workers, records
+   `legacy-secret-retirement` immediately before its sole secret delete, and
+   completes only after direct-successor readback. A lost acknowledgement is
+   reconciled by status with the same proof inputs, including after expiry when
+   the durable start predates expiry and exact successor readback still matches.
+   If the two-hour proof expired before this stage was started, rerun the
+   authenticated staging E2E and create a new proof bound to the current
+   topology-only successor; the operation id on the route-removing Version and
+   its remote completion remain the order witness. After any reversal, the
+   earlier proof cannot borrow a later proof's replacement route operation to
+   authorize secret retirement: use the proof that admitted that replacement
+   operation, or a still newer proof bound to its exact topology-only successor.
+
+The Hosted proof output is
+`takosumi-hosted.sponsorship-authority-cutover-proof@v1` and has exactly a
+two-hour `completedAt`/`expiresAt` interval. Its terminal stdout exposes only
+kind, ready status, raw proof SHA-256, and self-confirmation. Route and secret
+apply/status evidence include `sponsorshipCutoverProofSha256` only after the
+corresponding proof phase completed or a started mutation was authoritatively
+settled. A terminal route-removed or secret-retired status refuses to report
+readiness without those current proof inputs and the exact remote receipt.
+Missing/stale/mismatched proof, live Version/binding/topology drift,
+missing order receipt, or replay fails closed before another mutation. Machine,
+checkout, or proof-path changes cannot replace the remote replay authority.
+Reverse does not erase a consumed proof; every later forward cutover needs a
+fresh proof bound to the then-current public predecessor. Authority status proves static Cloudflare closure but never substitutes
+for the Hosted-bound functional proof. The retirement and attribution surfaces
+are one-time cleanup, not compatibility paths. There is no automatic fallback
+or raw Wrangler reversal.
 
 For the reviewed Form integration cutover, first deploy the public integration
 Worker through the owning `bun run deploy` entrypoint so it exposes
@@ -1347,8 +1472,9 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` (only while 0043 is pending)
 - `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH`
 - `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH`
+- `TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH`
+- `TAKOSERVER_SPONSORSHIP_RECEIPT_PRIVATE_JWK_PATH`
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`
-- `TAKOSERVER_HOSTED_TOKEN_PATH`
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
 - `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` (operator identity owner proof)
 - `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`
@@ -1521,15 +1647,8 @@ browser, so each one says where it comes from.
   `takoserver-integration-e2e-credentials` is a one-hour smoke credential and
   is never a Worker secret: a release installed with it starts returning `401`
   an hour later.
-- `TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` — **operator-supplied, not
-  Takoserver-issued.** Nothing in this repository mints it and nothing should:
-  it is the private bearer the operator chooses for the sponsorship owner API.
-  `takoserver-hosted-token-cutover` is its install and proof surface — it reads
-  the operator's own value from the owned `0600` `TAKOSERVER_HOSTED_TOKEN_PATH`
-  and proves the authenticated sponsorship route answers with a credential
-  signed by the current D1 key. `takoserver-hosted-token-retirement` removes
-  it. Rotation is another `takoserver-hosted-token-cutover` apply with a new
-  value in that file.
+- Hosted receives no sponsorship bearer. Its sole authority is the exact
+  service binding to the route-less sponsorship authority Worker.
 - `TAKOSERVER_SIGNING_KEY` — registered by `takoserver-signing-key-register`,
   repaired by `takoserver-signing-repair`, rotated by
   `takoserver-signing-rotation`.

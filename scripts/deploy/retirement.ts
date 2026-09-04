@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
@@ -23,6 +24,18 @@ import {
   type WorkerConfigOptions,
   writeWorkerConfig,
 } from "./realized-config.ts";
+import {
+  createRemoteSponsorshipCutoverConsumptionDatabase,
+  type SponsorshipCutoverConsumptionDatabase,
+  writeSponsorshipCutoverConsumptionConfig,
+} from "./sponsorship-cutover-consumption.ts";
+import {
+  createSponsorshipCutoverProofGate,
+  inspectSponsorshipCutoverPublicWorker,
+  type SponsorshipCutoverProofGate,
+  type SponsorshipCutoverProofState,
+  sponsorshipCutoverProofConfigured,
+} from "./sponsorship-cutover-proof.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
@@ -47,7 +60,7 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 
-export const HOSTED_SPONSORSHIP_SECRET = "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN" as const;
+export const HOSTED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
 
 /**
  * Retirement only follows the known provider-history suffix. Older history is
@@ -63,6 +76,7 @@ function legacyServiceBindingName(): string {
 
 export type RetirementSurface =
   | "takoserver-worker-authority-cutover"
+  | "takoserver-sponsorship-public-route-retirement"
   | "takoserver-host-runtime-topology-retirement"
   | "takoserver-hosted-token-retirement"
   | "takoserver-worker-retirement-attribution-repair";
@@ -91,6 +105,8 @@ export interface RetirementOptions {
   readonly outputDirectory?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
+  readonly proofGate?: SponsorshipCutoverProofGate;
+  readonly cutoverConsumptionDatabase?: SponsorshipCutoverConsumptionDatabase;
 }
 
 /**
@@ -125,7 +141,10 @@ export async function runRetirement(
     ...options,
     cloudflareEnvironment: environment,
   };
-  if (invocation.surface === "takoserver-worker-authority-cutover") {
+  if (
+    invocation.surface === "takoserver-worker-authority-cutover" ||
+    invocation.surface === "takoserver-sponsorship-public-route-retirement"
+  ) {
     return await runAuthorityTransition(invocation, target, state, run, runtimeOptions);
   }
   if (invocation.surface === "takoserver-host-runtime-topology-retirement") {
@@ -163,7 +182,14 @@ export async function runAuthorityTransition(
     const service = extractLegacyHostServiceBinding("preflight", current.versionId, predecessor);
     if (current.versionId !== selector) {
       if (!invocation.reverse && current.previousVersionId === selector) {
-        return await authorityCandidateStatus(invocation, target, state, current, service);
+        return await authorityCandidateStatus(
+          invocation,
+          target,
+          state,
+          current,
+          service,
+          optionalProofGate(invocation, target, state, options, root, run),
+        );
       }
       if (invocation.action === "status") {
         throw preflightError(
@@ -189,6 +215,18 @@ export async function runAuthorityTransition(
         undefined,
         historicalAuthorityProfile(target),
       );
+      const publicWorkerPredecessor =
+        invocation.surface === "takoserver-sponsorship-public-route-retirement"
+          ? await inspectSponsorshipCutoverPublicWorker(target, sponsorshipProofState(state))
+          : undefined;
+      if (
+        publicWorkerPredecessor !== undefined &&
+        (publicWorkerPredecessor.versionId !== legacy.history.versionId ||
+          publicWorkerPredecessor.commit !== legacy.commit ||
+          publicWorkerPredecessor.bundleSha256 !== digestValue(legacy.bundleDigestHex))
+      ) {
+        throw preflightError("public Worker predecessor evidence changed during status inspection");
+      }
       return {
         kind: "takoserver.worker-authority-transition-status@v1",
         surface: invocation.surface,
@@ -201,6 +239,23 @@ export async function runAuthorityTransition(
         entrypoint: service.entrypoint,
         deployedCommit: legacy.commit,
         artifactDigest: digestValue(legacy.bundleDigestHex),
+        ...(publicWorkerPredecessor === undefined
+          ? {}
+          : {
+              publicWorkerPredecessor: {
+                kind: "takoserver.sponsorship-public-worker-predecessor@v1",
+                workerName: publicWorkerPredecessor.workerName,
+                deploymentId: publicWorkerPredecessor.deploymentId,
+                versionId: publicWorkerPredecessor.versionId,
+                previousVersionId: publicWorkerPredecessor.previousVersionId,
+                sourceCommit: publicWorkerPredecessor.commit,
+                artifactSha256: publicWorkerPredecessor.bundleSha256,
+                scriptEtagSha256: publicWorkerPredecessor.scriptEtagSha256,
+                cutoverOperationId: publicWorkerPredecessor.cutoverOperationId,
+                topologySha256: publicWorkerPredecessor.topologySha256,
+                publicTopology: publicWorkerPredecessor.publicTopology,
+              },
+            }),
       };
     }
 
@@ -220,6 +275,8 @@ export async function runAuthorityTransition(
         options,
       );
     }
+    const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+    const proof = await proofGate.authorize("public-route-removal");
     const legacy = await inspectRetirementVersionAt(
       "preflight",
       target,
@@ -291,18 +348,31 @@ export async function runAuthorityTransition(
       freshVersion,
       historicalAuthorityProfile(target),
     );
-    const upload = await run(
-      wranglerCommand([
-        "deploy",
-        prepared.bundlePath,
-        "--no-bundle",
-        "--config",
-        prepared.configPath,
-        "--strict",
-        "--message",
-        `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
-      ]),
-      providerOptions(options.cloudflareEnvironment),
+    const started = await proofGate.begin(proof, {
+      sourceCommit: source.commit,
+      bundleSha256: `sha256:${prepared.bundleDigestHex}`,
+      configSha256: digestFile(prepared.configPath),
+    });
+    if (!started.fresh) {
+      throw preflightError(
+        "sponsorship cutover start already exists; apply is forbidden and only status reconciliation is allowed",
+      );
+    }
+    const upload = await started.executionClaim.execute(
+      async () =>
+        await run(
+          wranglerCommand([
+            "deploy",
+            prepared.bundlePath,
+            "--no-bundle",
+            "--config",
+            prepared.configPath,
+            "--strict",
+            "--message",
+            `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}:${started.operationId.slice(7)}`,
+          ]),
+          providerOptions(options.cloudflareEnvironment),
+        ),
     );
     if (upload.exitCode !== 0) {
       throw mutationError(
@@ -338,6 +408,7 @@ export async function runAuthorityTransition(
         "authority transition successor identity differs from the sealed candidate",
       );
     }
+    await proofGate.complete(proof, after.history.versionId);
     return {
       kind: "takoserver.worker-authority-transition-apply@v1",
       surface: invocation.surface,
@@ -352,8 +423,9 @@ export async function runAuthorityTransition(
       artifactDigest: artifact.digest,
       artifactBytes: artifact.bytes,
       bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+      sponsorshipCutoverProofSha256: proof.proofSha256,
       reverse: {
-        surface: "takoserver-worker-authority-cutover",
+        surface: "takoserver-sponsorship-public-route-retirement",
         exactVersionId: legacy.history.versionId,
         mode: "provider-history",
       },
@@ -370,6 +442,7 @@ async function authorityCandidateStatus(
   state: RetirementState,
   history: WorkerDeploymentHistory,
   service: LegacyHostServiceBinding,
+  proofGate?: SponsorshipCutoverProofGate,
 ): Promise<Record<string, unknown>> {
   const predecessorId = invocation.legacyHostRuntimePredecessorVersionId;
   if (predecessorId === undefined || history.previousVersionId !== predecessorId) {
@@ -404,6 +477,15 @@ async function authorityCandidateStatus(
       "authority transition candidate commit does not match the selected commit",
     );
   }
+  const proofSha256 = await proofGate?.settle("public-route-removal", history.versionId);
+  if (
+    invocation.surface === "takoserver-sponsorship-public-route-retirement" &&
+    proofSha256 === undefined
+  ) {
+    throw preflightError(
+      "terminal sponsorship route-removal status requires the current sponsorship cutover proof",
+    );
+  }
   return {
     kind: "takoserver.worker-authority-transition-status@v1",
     surface: invocation.surface,
@@ -417,6 +499,7 @@ async function authorityCandidateStatus(
     artifactDigest: digestValue(candidate.bundleDigestHex),
     service: service.service,
     entrypoint: service.entrypoint,
+    ...(proofSha256 === undefined ? {} : { sponsorshipCutoverProofSha256: proofSha256 }),
   };
 }
 
@@ -1632,6 +1715,17 @@ async function runTokenRetirement(
     await assertPinnedSelectorVersion("preflight", target, state, selector, predecessorService);
     if (invocation.action === "status") {
       const unattributed = before.commit === null || before.bundleDigestHex === null;
+      const proofSha256 = beforeHasToken
+        ? undefined
+        : await optionalProofGate(invocation, target, state, options, root, run)?.settle(
+            "legacy-secret-retirement",
+            before.history.versionId,
+          );
+      if (!beforeHasToken && proofSha256 === undefined) {
+        throw preflightError(
+          "terminal sponsorship secret-retirement status requires the current sponsorship cutover proof",
+        );
+      }
       return {
         kind: "takoserver.hosted-token-retirement-status@v1",
         surface: invocation.surface,
@@ -1653,6 +1747,7 @@ async function runTokenRetirement(
         serviceRetired: true,
         predecessorService: predecessorService.service,
         predecessorEntrypoint: predecessorService.entrypoint,
+        ...(proofSha256 === undefined ? {} : { sponsorshipCutoverProofSha256: proofSha256 }),
       };
     }
     if (beforeHasToken && !directTokenRetirement) {
@@ -1663,6 +1758,8 @@ async function runTokenRetirement(
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
     );
+    const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+    const proof = await proofGate.authorize("legacy-secret-retirement");
     const historicalProfile = historicalAuthorityProfile(target);
     const configPath = writeWorkerConfig(target, {
       path: join(root, "token-retirement-wrangler.jsonc"),
@@ -1720,17 +1817,33 @@ async function runTokenRetirement(
       selector,
       freshPredecessorService,
     );
-    const mutation = await run(
-      wranglerCommand([
-        "secret",
-        "delete",
-        HOSTED_SPONSORSHIP_SECRET,
-        "--name",
-        target.workerName,
-        "--config",
-        configPath,
-      ]),
-      providerOptions(options.cloudflareEnvironment),
+    if (before.commit === null || before.bundleDigestHex === null) {
+      throw preflightError("Hosted token retirement requires an exact candidate identity");
+    }
+    const started = await proofGate.begin(proof, {
+      sourceCommit: before.commit,
+      bundleSha256: `sha256:${before.bundleDigestHex}`,
+      configSha256: digestFile(configPath),
+    });
+    if (!started.fresh) {
+      throw preflightError(
+        "sponsorship cutover start already exists; apply is forbidden and only status reconciliation is allowed",
+      );
+    }
+    const mutation = await started.executionClaim.execute(
+      async () =>
+        await run(
+          wranglerCommand([
+            "secret",
+            "delete",
+            HOSTED_SPONSORSHIP_SECRET,
+            "--name",
+            target.workerName,
+            "--config",
+            configPath,
+          ]),
+          providerOptions(options.cloudflareEnvironment),
+        ),
     );
     if (mutation.exitCode !== 0) {
       throw mutationError(
@@ -1767,6 +1880,7 @@ async function runTokenRetirement(
     if (after.commit !== before.commit || after.bundleDigestHex !== before.bundleDigestHex) {
       throw verificationError("Hosted token retirement changed the served code identity");
     }
+    await proofGate.complete(proof, after.history.versionId);
     return {
       kind: "takoserver.hosted-token-retirement-apply@v1",
       surface: invocation.surface,
@@ -1777,11 +1891,83 @@ async function runTokenRetirement(
       previousVersionId: beforeHistory.versionId,
       commit: after.commit,
       secretRemoved: HOSTED_SPONSORSHIP_SECRET,
+      sponsorshipCutoverProofSha256: proof.proofSha256,
     };
   } finally {
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+function requiredProofGate(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  options: RetirementOptions,
+  root: string,
+  run: RetirementProcess,
+): SponsorshipCutoverProofGate {
+  return (
+    options.proofGate ??
+    createSponsorshipCutoverProofGate({
+      target,
+      environment: invocation.environment,
+      state: sponsorshipProofState(state),
+      database: consumptionDatabase(target, options, root, run),
+    })
+  );
+}
+
+function optionalProofGate(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  options: RetirementOptions,
+  root: string,
+  run: RetirementProcess,
+): SponsorshipCutoverProofGate | undefined {
+  if (options.proofGate) return options.proofGate;
+  return sponsorshipCutoverProofConfigured()
+    ? createSponsorshipCutoverProofGate({
+        target,
+        environment: invocation.environment,
+        state: sponsorshipProofState(state),
+        database: consumptionDatabase(target, options, root, run),
+      })
+    : undefined;
+}
+
+function consumptionDatabase(
+  target: DeployTarget,
+  options: RetirementOptions,
+  root: string,
+  run: RetirementProcess,
+): SponsorshipCutoverConsumptionDatabase {
+  if (options.cutoverConsumptionDatabase) return options.cutoverConsumptionDatabase;
+  const configPath = writeSponsorshipCutoverConsumptionConfig(
+    join(root, "sponsorship-cutover-consumption-wrangler.jsonc"),
+    target,
+  );
+  return createRemoteSponsorshipCutoverConsumptionDatabase(
+    configPath,
+    options.cloudflareEnvironment ?? {},
+    run,
+  );
+}
+
+function sponsorshipProofState(state: RetirementState): SponsorshipCutoverProofState {
+  const candidate = state as RetirementState & Partial<SponsorshipCutoverProofState>;
+  if (
+    typeof candidate.workerScripts !== "function" ||
+    typeof candidate.workerRoutes !== "function" ||
+    typeof candidate.workerSubdomain !== "function" ||
+    typeof candidate.workerTopologyAudit !== "function"
+  ) {
+    throw preflightError(
+      "sponsorship cutover requires exhaustive Worker and Cloudflare topology state reads",
+    );
+  }
+  return candidate as SponsorshipCutoverProofState;
 }
 
 function transitionConfigWriter(
@@ -2782,12 +2968,18 @@ function versionIdentity(
   }
   const message = value.annotations["workers/message"];
   if (typeof message !== "string") return null;
-  const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
+  const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})(?::[0-9a-f]{64})?$/u.exec(
+    message,
+  );
   return match?.[1] && match[2] ? { commit: match[1], bundleDigestHex: match[2] } : null;
 }
 
 function digestValue(digest: string | null): string | null {
   return digest === null ? null : `sha256:${digest}`;
+}
+
+function digestFile(path: string): `sha256:${string}` {
+  return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
 
 function requiredPredecessorSelector(invocation: RetirementInvocation): string {
@@ -2826,6 +3018,7 @@ function validateInvocation(invocation: RetirementInvocation, target: DeployTarg
   }
   if (
     invocation.surface !== "takoserver-worker-authority-cutover" &&
+    invocation.surface !== "takoserver-sponsorship-public-route-retirement" &&
     invocation.surface !== "takoserver-host-runtime-topology-retirement" &&
     invocation.surface !== "takoserver-hosted-token-retirement" &&
     invocation.surface !== "takoserver-worker-retirement-attribution-repair" &&

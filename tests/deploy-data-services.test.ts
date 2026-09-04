@@ -175,7 +175,14 @@ describe("private data service deploy configuration", () => {
           objectBucketSupplies: SUPPLIES,
           edgeSupplies: EDGE_SUPPLIES,
           cloudflareProviderExecutor: CLOUDFLARE_PROVIDER_EXECUTOR,
-          sponsorship: true,
+          sponsorshipAuthority: {
+            workerName: "takoserver-sponsorship-authority",
+            organizationId: "org_hosted",
+            credentialKeyId: "sponsorship-credential-key",
+            credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+            receiptKeyId: "receipt-key",
+            receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+          },
         }),
       );
       const target = loadTarget(path, "production");
@@ -192,7 +199,14 @@ describe("private data service deploy configuration", () => {
       expect(realized.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(JSON.stringify(realized)).not.toContain("TOKEN");
       expect(JSON.stringify(realized)).not.toContain("sk_");
-      expect(target.sponsorship).toBe(true);
+      expect(target.sponsorshipAuthority).toEqual({
+        workerName: "takoserver-sponsorship-authority",
+        organizationId: "org_hosted",
+        credentialKeyId: "sponsorship-credential-key",
+        credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+        receiptKeyId: "receipt-key",
+        receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      });
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -274,7 +288,7 @@ describe("private data service deploy configuration", () => {
       );
       const target = loadTarget(path, "production");
       expect(JSON.stringify(target.edgeSupplies)).toBe(JSON.stringify(EDGE_SUPPLIES));
-      expect(target.sponsorship).toBeUndefined();
+      expect(target.sponsorshipAuthority).toBeUndefined();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

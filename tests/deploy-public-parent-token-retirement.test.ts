@@ -30,11 +30,7 @@ const RETIRED_DEPLOYMENT = "00000000-0000-4000-8000-000000000013";
 const PARENT_TOKEN = "CLOUDFLARE_API_TOKEN";
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
-const PUBLIC_SECRETS = [
-  "TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN",
-  "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
-  "TAKOSERVER_SIGNING_KEY",
-];
+const PUBLIC_SECRETS = ["TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING", "TAKOSERVER_SIGNING_KEY"];
 const LEGACY_SECRETS = [...PUBLIC_SECRETS, PARENT_TOKEN].sort();
 
 const target = {
@@ -50,7 +46,6 @@ const target = {
   publicOrigin: "https://api.integration.example.test",
   edgeSupplies: edgeSuppliesFixture(),
   cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
-  sponsorship: true,
   signing: { currentKeyId: "current-key" },
 } satisfies DeployTarget;
 
@@ -170,7 +165,6 @@ describe("public Cloudflare parent-token retirement", () => {
       ]);
       expect(fixture.mutations[0]).toContain("--no-bundle");
       expect(fixture.mutations[0]).toContain("--strict");
-      expect(fixture.mutations[1]).not.toContain("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN");
       expect(fixture.mutations[1]).not.toContain("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
       expect(fixture.mutations[1]).not.toContain("TAKOSERVER_SIGNING_KEY");
       expect(JSON.stringify(result)).not.toContain("deploy-reader-token");

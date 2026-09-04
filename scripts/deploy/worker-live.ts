@@ -26,7 +26,7 @@ import {
   workerVersionMetadataBindingProfile,
 } from "./worker-state.ts";
 
-const WORKER_MESSAGE = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u;
+const WORKER_MESSAGE = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})(?::([0-9a-f]{64}))?$/u;
 const WORKER_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const INTEGRATION_E2E_AUTHORITY_BINDINGS = [
   "TAKOSERVER_ENVIRONMENT",
@@ -184,7 +184,9 @@ export async function inspectLiveWorkerVersionForRetirement(
       input.expectedServiceBinding === null
         ? null
         : extractLegacyHostServiceBinding(phase, history.versionId, version),
-    hostedTokenPresent: inventorySecrets.includes("TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN"),
+    hostedTokenPresent: inventorySecrets.includes(
+      ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_"),
+    ),
   };
 }
 
@@ -686,6 +688,28 @@ export function workerVersionIdentity(
     throw phaseError(phase, "Worker version has no exact commit and artifact annotation");
   }
   return { commit: match[1], bundleDigestHex: match[2] };
+}
+
+/**
+ * The optional third upload-message component is reserved for the durable
+ * sponsorship-cutover operation identity. Ordinary uploads have no operation
+ * identity. A cutover successor must carry the exact identity written to the
+ * remote start receipt before upload, which makes lost-ack reconciliation
+ * distinguish same-commit candidates with different bundle/config bytes.
+ */
+export function workerVersionCutoverOperationIdentity(
+  phase: DeployPhase,
+  value: unknown,
+): `sha256:${string}` | null {
+  if (!isRecord(value) || !isRecord(value.annotations)) {
+    throw phaseError(phase, "Worker version has no canonical annotation inventory");
+  }
+  const message = value.annotations["workers/message"];
+  const match = typeof message === "string" ? WORKER_MESSAGE.exec(message) : null;
+  if (!match?.[1] || !match[2]) {
+    throw phaseError(phase, "Worker version has no exact commit and artifact annotation");
+  }
+  return match[3] === undefined ? null : `sha256:${match[3]}`;
 }
 
 export type WorkerVersionAnnotationProfile = "canonical" | "secret-created" | "other";

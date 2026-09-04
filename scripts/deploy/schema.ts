@@ -105,6 +105,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0044_artifact_consumer_resolution_receipts.sql",
   "0045_cloudflare_provider_executor_operations.sql",
   "0046_exact_artifact_recovery_receipts.sql",
+  "0047_sponsorship_cutover_consumption.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -200,6 +201,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:7d87cb2eec7a3434ece89f1e5d2ecac470d1e717c0611ee3f47b5390f991f9f2",
   "0046_exact_artifact_recovery_receipts.sql":
     "sha256:e5cd3a0b5a955642a0072b819c5de7148dac03a12c21721e4ecf9013e6d5b189",
+  "0047_sponsorship_cutover_consumption.sql":
+    "sha256:d7629fce50cc6d84a97554e92f32f1f3c6920577565b7fa7d06b773fe4b699c6",
 };
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
@@ -210,6 +213,7 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0044",
   "0045",
   "0046",
+  "0047",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -270,6 +274,12 @@ const SCHEMA_WAVES: Readonly<
     fromMigration: "0045_cloudflare_provider_executor_operations.sql",
     throughCount: 46,
     throughMigration: "0046_exact_artifact_recovery_receipts.sql",
+  },
+  "0047": {
+    fromCount: 46,
+    fromMigration: "0046_exact_artifact_recovery_receipts.sql",
+    throughCount: 47,
+    throughMigration: "0047_sponsorship_cutover_consumption.sql",
   },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
@@ -1313,7 +1323,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0046",
+      "selected D1 wave requires the exact audited source inventory 0001-0047",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1358,7 +1368,7 @@ function assertAuditedMigrationHashes(
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
-        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0046 file",
+        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0047 file",
         `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
       );
     }
