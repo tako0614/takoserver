@@ -1490,14 +1490,26 @@ describe("released edge Form placement", () => {
     expect(uploads).toBe(0);
   });
 
-  test("refuses a customer binding that collides with the reserved operation marker", async () => {
+  test("refuses every public or sensitive binding that collides with an internal Version binding", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     let requests = 0;
+    let runtimeInputCalls = 0;
+    const runtimeInputs: ProviderRuntimeInputLeasePort = {
+      async acquire() {
+        runtimeInputCalls += 1;
+        throw new Error("a reserved binding collision must fail before runtime-input authority");
+      },
+      async recover() {
+        runtimeInputCalls += 1;
+        throw new Error("a reserved binding collision must fail before runtime-input authority");
+      },
+    };
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
       artifacts,
+      runtimeInputs,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
       async fetch() {
@@ -1505,36 +1517,48 @@ describe("released edge Form placement", () => {
         throw new Error("a reserved binding collision must fail before Cloudflare is reached");
       },
     });
-
-    expect(
-      await provider.apply({
-        operationId: "op-version-marker-collision",
-        operationMode: "initial",
-        offering: versionOffering,
-        identity: { ...IDENTITY, name: "version" },
-        spec: {
-          handlers: ["fetch"],
-          vars: { TAKOSERVER_INTERNAL_OPERATION_MARKER: "customer-controlled" },
-        },
-        relations: [
-          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
-            nativeId: "worker:script-name",
-            offeringId: workerOffering.id,
-            providerPackRef: "cloudflare",
-            outputs: { scriptName: "script-name" },
-          }),
-          related(
-            "/bundle",
-            stored("WorkerBundle", "bundle-uid", {
-              manifestDigest: `sha256:${"d".repeat(64)}`,
-            }),
-          ),
-        ],
+    const relations = [
+      related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+        nativeId: "worker:script-name",
+        offeringId: workerOffering.id,
+        providerPackRef: "cloudflare",
+        outputs: { scriptName: "script-name" },
       }),
-    ).toMatchObject({
-      phase: "failed",
-      failure: { code: "invalid_spec", retryable: false },
-    });
+      related(
+        "/bundle",
+        stored("WorkerBundle", "bundle-uid", {
+          manifestDigest: `sha256:${"d".repeat(64)}`,
+        }),
+      ),
+    ];
+    const reservedNames = [
+      "TAKOSERVER_INTERNAL_OPERATION_MARKER",
+      "TAKOSERVER_INTERNAL_ARTIFACT_MANIFEST",
+      "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
+    ];
+    const scenarios = reservedNames.flatMap((name) => [
+      { spec: { handlers: ["fetch"], vars: { [name]: "customer-controlled" } } },
+      { spec: { handlers: ["fetch"], requiredSensitiveVars: [name] } },
+    ]);
+
+    for (const [index, scenario] of scenarios.entries()) {
+      expect(
+        await provider.apply({
+          operationId: `op-version-reserved-collision-${index}`,
+          operationKey: SENSITIVE_OPERATION_KEY,
+          publicApply: SENSITIVE_PUBLIC_APPLY,
+          operationMode: "initial",
+          offering: versionOffering,
+          identity: { ...IDENTITY, uid: "worker-version-reserved-uid", name: "version" },
+          spec: scenario.spec,
+          relations,
+        }),
+      ).toMatchObject({
+        phase: "failed",
+        failure: { code: "invalid_spec", retryable: false },
+      });
+    }
+    expect(runtimeInputCalls).toBe(0);
     expect(requests).toBe(0);
   });
 

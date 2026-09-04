@@ -14,6 +14,20 @@ export {
 } from "./ai-port.ts";
 export { type App, type AppPorts, buildApp, type TickReport } from "./app.ts";
 export {
+  ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT,
+  ARTIFACT_CONSUMER_REPAIR_STATUS_FORMAT,
+  ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT,
+  type ArtifactConsumerProviderDeployment,
+  type ArtifactConsumerProviderReader,
+  type ArtifactConsumerRepair,
+  ArtifactConsumerRepairError,
+  type ArtifactConsumerRepairStatus,
+  type ArtifactConsumerResolutionReceipt,
+  type ArtifactConsumptionReadback,
+  type ArtifactNativeAbsenceReadback,
+  createArtifactConsumerRepair,
+} from "./artifact-consumer-repair.ts";
+export {
   AttachmentError,
   type AttachmentFactory,
   type AttachmentRebinding,

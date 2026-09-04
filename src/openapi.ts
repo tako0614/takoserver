@@ -1,3 +1,8 @@
+import {
+  ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT,
+  ARTIFACT_CONSUMER_REPAIR_STATUS_FORMAT,
+  ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT,
+} from "./artifact-consumer-repair.ts";
 import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
 import { SPACE_ID_MAX_CODE_POINTS, SPACE_ID_PATTERN_SOURCE } from "./takoform/space-id.ts";
 
@@ -200,6 +205,67 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
   },
 } as const;
 
+const ARTIFACT_CONSUMER_REPAIR_PARAMETERS = [
+  {
+    name: "organizationId",
+    in: "path",
+    required: true,
+    schema: IDENTIFIER_SCHEMA,
+  },
+  {
+    name: "deploymentId",
+    in: "path",
+    required: true,
+    schema: IDENTIFIER_SCHEMA,
+  },
+] as const;
+
+const ARTIFACT_CONSUMER_REPAIR_OPERATIONS = {
+  get: {
+    summary: "Read the provider-backed repair plan for one uncertain artifact consumer",
+    description:
+      "Lifecycle-owner surface. This canonicalizes the current database snapshot but performs no provider readback and no mutation.",
+    parameters: ARTIFACT_CONSUMER_REPAIR_PARAMETERS,
+    responses: {
+      "200": artifactConsumerRepairStatusResponse(),
+      "400": errorResponse("Malformed organization or deployment identity"),
+      "401": errorResponse("Organization owner session required"),
+      "404": errorResponse("Organization ownership, deployment, or uncertainty not found"),
+      "503": errorResponse("Lifecycle state unavailable or malformed"),
+    },
+  },
+  post: {
+    summary: "Apply one exact provider-backed artifact-consumer repair plan",
+    description:
+      "Recomputes the plan, obtains fresh provider evidence, rechecks the entire snapshot, and commits through lifecycle-owned CAS. The caller supplies neither an outcome nor evidence.",
+    parameters: [
+      ...ARTIFACT_CONSUMER_REPAIR_PARAMETERS,
+      {
+        name: "Idempotency-Key",
+        in: "header",
+        required: true,
+        schema: OPERATION_KEY_SCHEMA,
+      },
+    ],
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/ArtifactConsumerRepairApply" },
+        },
+      },
+    },
+    responses: {
+      "200": artifactConsumerResolutionReceiptResponse(),
+      "400": errorResponse("Malformed body, plan digest, or idempotency key"),
+      "401": errorResponse("Organization owner session required"),
+      "404": errorResponse("Organization ownership, deployment, or uncertainty not found"),
+      "409": errorResponse("Plan drift, blocked evidence, or idempotency conflict"),
+      "503": errorResponse("Provider or lifecycle authority unavailable"),
+    },
+  },
+} as const;
+
 const OPERATIONS: Record<string, Record<string, unknown>> = {
   console: described("Console", { security: [] }),
   openapiDocument: described("This document", { security: [] }),
@@ -333,6 +399,8 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "503": errorResponse("Absence evidence is unavailable"),
     },
   },
+  readArtifactConsumerRepair: ARTIFACT_CONSUMER_REPAIR_OPERATIONS.get,
+  applyArtifactConsumerRepair: ARTIFACT_CONSUMER_REPAIR_OPERATIONS.post,
   listResourceMigrations: described("List explicit provider migrations for one logical Resource"),
   planResourceMigration: described("Plan a migration against an exact commercial reservation"),
   readResourceMigration: described("Read one Resource Migration"),
@@ -461,6 +529,42 @@ function runtimeInputResponse(description: string) {
   } as const;
 }
 
+function artifactConsumerRepairStatusResponse() {
+  return {
+    description: "Canonical current repair status and plan digest",
+    content: {
+      "application/json": {
+        schema: {
+          type: "object",
+          required: ["repair"],
+          additionalProperties: false,
+          properties: {
+            repair: { $ref: "#/components/schemas/ArtifactConsumerRepairStatus" },
+          },
+        },
+      },
+    },
+  } as const;
+}
+
+function artifactConsumerResolutionReceiptResponse() {
+  return {
+    description: "Durable append-only resolution receipt",
+    content: {
+      "application/json": {
+        schema: {
+          type: "object",
+          required: ["receipt"],
+          additionalProperties: false,
+          properties: {
+            receipt: { $ref: "#/components/schemas/ArtifactConsumerResolutionReceipt" },
+          },
+        },
+      },
+    },
+  } as const;
+}
+
 /** One published operation description, addressed by its operation name. */
 function described(
   summary: string,
@@ -573,6 +677,71 @@ export const openApiDocument = {
               },
             },
           },
+        },
+      },
+      ArtifactConsumerRepairApply: {
+        type: "object",
+        required: ["kind", "planDigest"],
+        additionalProperties: false,
+        properties: {
+          kind: { const: ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT },
+          planDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+        },
+      },
+      ArtifactConsumerResolutionReceipt: {
+        type: "object",
+        required: [
+          "kind",
+          "receiptId",
+          "deploymentId",
+          "uncertaintyFence",
+          "planDigest",
+          "resolution",
+          "createdAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          kind: { const: ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT },
+          receiptId: IDENTIFIER_SCHEMA,
+          deploymentId: IDENTIFIER_SCHEMA,
+          uncertaintyFence: { type: "integer", minimum: 1 },
+          planDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+          resolution: {
+            type: "string",
+            enum: ["terminalized_absent", "attributed_manifest"],
+          },
+          manifestDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+          createdAt: { type: "string", format: "date-time" },
+        },
+      },
+      ArtifactConsumerRepairStatus: {
+        type: "object",
+        required: [
+          "kind",
+          "deploymentId",
+          "state",
+          "planDigest",
+          "uncertaintyFence",
+          "candidateManifestCount",
+        ],
+        additionalProperties: false,
+        properties: {
+          kind: { const: ARTIFACT_CONSUMER_REPAIR_STATUS_FORMAT },
+          deploymentId: IDENTIFIER_SCHEMA,
+          state: { type: "string", enum: ["actionable", "blocked", "resolved"] },
+          planDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+          uncertaintyFence: { type: "integer", minimum: 1 },
+          candidateManifestCount: { type: "integer", minimum: 0 },
+          path: {
+            type: "string",
+            enum: ["retained-closed", "retained-historical", "active-resource"],
+          },
+          action: {
+            type: "string",
+            enum: ["verify-native-absence", "verify-artifact-consumption"],
+          },
+          blocker: { type: "string", minLength: 1, maxLength: 128 },
+          receipt: { $ref: "#/components/schemas/ArtifactConsumerResolutionReceipt" },
         },
       },
       WorkerEndpointOriginReservationLegacyTarget: {

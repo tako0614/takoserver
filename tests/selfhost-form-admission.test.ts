@@ -47,7 +47,10 @@ describe("self-host Form admission", () => {
     } finally {
       fixture.close();
     }
-  });
+    // A clean CI checkout applies the complete migration history before it
+    // can inspect all 17 packages; the default five-second budget is not a
+    // product latency assertion and is too small on shared runners.
+  }, 30_000);
 
   test("applies the admission through the released Core verifier and activates the implemented subset", async () => {
     const fixture = dataRoot();
