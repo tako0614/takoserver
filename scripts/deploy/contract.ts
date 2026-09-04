@@ -230,6 +230,70 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-public-parent-token-retirement",
+      target: "cloudflare-worker-secret:environment-selected-public-parent-token-retirement",
+      covers: [
+        "src",
+        "wrangler.jsonc",
+        "scripts/build-worker.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/public-parent-token-retirement.ts",
+        "scripts/deploy/cloudflare-provider-executor.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/worker-artifact.ts",
+        "scripts/deploy/worker-composition.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/worker-state.ts",
+        "scripts/deploy/wrangler-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler", "flock"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The reviewed takoserver.deploy-target@v2 selected only by environment ` +
+          "fixes the Cloudflare account, public Worker, route-less provider executor and public " +
+          "configuration. Apply runs the owner gate once, composes the target, then seals the exact " +
+          "selected-commit bundle and realized configuration before either effect. Its integration " +
+          "and rehearsal receipt carries the exact source.changedPaths inventory alongside distinct " +
+          "sealed artifact and Worker bundle digests." +
+          inputContract(applyReviewInput),
+        "post-conditions":
+          "Before retirement, authoritative executor readback proves the exact selected-commit " +
+          "route-less service has no route, custom domain, workers.dev endpoint or preview URL. " +
+          "The public Worker must have its exact CLOUDFLARE_PROVIDER_EXECUTOR service binding, " +
+          "selected source/artifact identity, routing closure and otherwise unchanged binding and " +
+          "secret inventory. Apply performs at most one exact binding/code release, then deletes " +
+          "only the public Worker's CLOUDFLARE_API_TOKEN once. It proves the token-free direct " +
+          "successor has the same script identity and every other binding and secret unchanged. " +
+          "Status is value-free and may adopt only an exact token-free canonical state or exact " +
+          "secret-created successor. This lane never reads, changes or removes the provider " +
+          "executor's owner-private credential file or either executor secret.",
+        reversal:
+          "This retirement is forward-only. Restoration of public parent authority requires a " +
+          "separately reviewed dedicated surface; the executor and its owner-private credentials remain.",
+        "failure-handling":
+          `${highRiskFailure} Exact executor and public-Worker same-host kernel leases span binding release, ` +
+          "pre-delete re-fence, secret deletion and final readback. A failed or lost binding-release " +
+          "acknowledgement stops before deletion; a failed or lost deletion acknowledgement stops " +
+          "without retry. Fresh --status distinguishes legacy, bound and exact completed states. " +
+          "Wrong account, Worker, environment, executor identity or exposure, source/version/config " +
+          "drift, extra binding or secret, changing history, and token absence before binding all fail closed. " +
+          "The two leases do not fence dashboard, direct-API or other-host actors; Cloudflare exposes " +
+          "no conditional secret-delete input, so an external change after the last pre-delete read " +
+          "is detected by final verification but cannot be undone by this forward-only lane.",
+        "pre-mutation-proof":
+          "Status and the apply re-fence must prove the exact route-less selected-commit executor, " +
+          "stable public history/routing/configuration, and the public CLOUDFLARE_API_TOKEN still " +
+          "present. If the executor binding is not yet exact, only the sealed exact binding release " +
+          "may precede deletion; token absence before that release is refused unless status proves " +
+          "an exact completed adoption.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-form-authority-identity-probe",
       target: "cloudflare-worker:environment-selected-read-only-public-identity-rpc-probe",
       covers: [

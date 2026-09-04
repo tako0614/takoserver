@@ -25,6 +25,7 @@ async function deploy(args: readonly string[]): Promise<{
 const SURFACES = [
   ["takoserver-worker", []],
   ["takoserver-worker-authority-cutover", ["authority"]],
+  ["takoserver-public-parent-token-retirement", ["irreversible", "authority"]],
   ["takoserver-form-authority-identity-probe", ["authority"]],
   ["takoserver-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-worker", ["authority"]],
@@ -110,6 +111,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     const providerExecutor = contract.surfaces.find(
       ({ surface }) => surface === "cloudflare-provider-executor",
+    );
+    const publicParentTokenRetirement = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-public-parent-token-retirement",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
     const schemaBaseline = contract.surfaces.find(
@@ -247,6 +251,23 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(providerExecutor?.obligations.provenance).toContain(".deploy/target.staging.json");
     expect(providerExecutor?.obligations.provenance).toContain("receiptAuthorityWorkerName");
+    expect(publicParentTokenRetirement?.requiresEnv).toEqual([
+      "CLOUDFLARE_API_TOKEN",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+    ]);
+    expect(publicParentTokenRetirement?.requiresTools).toContain("flock");
+    expect(publicParentTokenRetirement?.obligations["post-conditions"]).toContain(
+      "CLOUDFLARE_PROVIDER_EXECUTOR",
+    );
+    expect(publicParentTokenRetirement?.obligations["post-conditions"]).toContain(
+      "CLOUDFLARE_API_TOKEN",
+    );
+    expect(publicParentTokenRetirement?.obligations.provenance).toContain("source.changedPaths");
+    expect(publicParentTokenRetirement?.obligations["failure-handling"]).toContain("--status");
+    expect(publicParentTokenRetirement?.obligations.reversal).toContain("forward-only");
+    expect(JSON.stringify(publicParentTokenRetirement)).not.toContain(
+      "TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH",
+    );
 
     for (const surface of contract.surfaces) {
       expect(surface.obligations).toMatchObject({
@@ -326,6 +347,44 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("keeps public parent-token retirement fixed to target-derived identity and one action", async () => {
+    const sha = "a".repeat(40);
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      for (const action of ["--status", "--apply"] as const) {
+        const accepted = await deploy([
+          "takoserver-public-parent-token-retirement",
+          action,
+          `--environment=${environment}`,
+          `--commit=${sha}`,
+        ]);
+        expect(accepted.exitCode).toBe(2);
+        expect(accepted.stderr).toContain("deploy target descriptor not found");
+        expect(accepted.stderr).not.toContain("no target was touched");
+      }
+    }
+
+    for (const extra of [
+      "--worker=some-worker",
+      `--account=${"2".repeat(32)}`,
+      "--secret=TAKOSERVER_SIGNING_KEY",
+      "--cwd=/tmp",
+      "--reverse",
+      "--add-secret=UNRELATED_SECRET",
+    ]) {
+      const refused = await deploy([
+        "takoserver-public-parent-token-retirement",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        extra,
+      ]);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
     }
   });
 

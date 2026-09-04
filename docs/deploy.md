@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-four separate mutation surfaces.
+This repository owns one deploy entrypoint and twenty-seven separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -74,6 +74,32 @@ never by a blind retry. `--reverse` is accepted only by the authority and
 topology retirement surfaces. Secret deletion can create an unannotated direct successor; that state
 is never reported as complete and is repaired only through the dedicated
 post-token attribution surface below.
+
+Public Cloudflare parent-token retirement has its own fixed owner surface. It
+accepts no Worker, account, secret-name, cwd, predecessor, transition, or reverse
+selector:
+
+```sh
+bun run deploy -- takoserver-public-parent-token-retirement --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-public-parent-token-retirement --apply --environment=integration --commit=<40-hex-sha>
+```
+
+Run integration first. Rehearsal and production use the same operation through
+their own separately selected v2 targets and normal source-qualification rules;
+an integration result is not evidence or authority for either lane. Status is
+value-free and reports only exact deployment/source identities, whether the
+executor binding exists, whether the public parent token exists, and the
+route-less executor qualification. Apply first releases the selected public
+Worker with its exact `CLOUDFLARE_PROVIDER_EXECUTOR` service binding when that
+binding/source is not already exact. It re-reads both Workers and only then
+deletes the public Worker's `CLOUDFLARE_API_TOKEN` once. The executor's
+owner-private secret file and its own token/seal-key bindings are never read or
+changed by this surface. Receipts keep the sealed release-tree
+`artifactDigest` distinct from the deployed Worker `bundleDigest`; completed
+status also exposes the value-free `scriptContentIdentity`. Integration and
+rehearsal apply receipts include the exact `changedPaths` inventory returned by
+source qualification (production is clean and therefore reports an empty
+array).
 
 ## The forward transition every Worker surface shares
 
@@ -527,6 +553,7 @@ remains unchanged.
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. A target with Cloudflare supplies additionally requires the exact selected-commit provider executor qualification. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
+| `takoserver-public-parent-token-retirement` | `--status`, `--apply` | integration, rehearsal, production | Exact environment-selected v2 target and resolved Cloudflare credential for both actions; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It accepts no additional selector and never reads `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`. |
 | `takoserver-managed-object-receipt-authority` | `--status`, `--apply` | integration, rehearsal, production | The Worker name and provider installation come solely from `target.cloudflareProviderExecutor`; a resolved Cloudflare deploy credential is required for both actions. `--apply` additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH`; only a fresh rehearsal/production `v1` apply reads `TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH`. Status never reads any of those three apply-only inputs. |
 | `takoserver-managed-worker-gateway` | `--status`, `--apply` | integration, rehearsal, production | Exact route, gateway and legacy script, zone, provider, dispatch namespace, and gateway identities plus a resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It reads no managed-object S3/proof secret or receipt-authority evidence. |
 | `cloudflare-provider-executor` | `--status`, `--apply`; `--apply --reverse` | integration, rehearsal, production | `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for every action and contains exactly the parent `CLOUDFLARE_API_TOKEN` and runtime-input seal keyring. Status uses the token only for authoritative readback; forward apply publishes both secret bindings atomically. Apply/reverse additionally require `TAKOSERVER_INDEPENDENT_REVIEW`. Receipt authority, gateway, migration 0045, and the selected target must already be exact. |
@@ -671,6 +698,23 @@ The separate authority and irreversible surfaces are:
   binding closure, re-fences the complete current route-less state before
   moving traffic, and verifies the restored deployment at 100 percent. The
   additive D1 migration remains. A lost acknowledgement is never replayed.
+- `takoserver-public-parent-token-retirement`: the sole owner of the public
+  parent-credential handoff. It requires the exact selected-commit executor to
+  be fully ready and route-less — no route, custom domain, workers.dev endpoint,
+  or preview URL — and fences the public Worker's deployment history, canonical
+  source/artifact identity, complete binding/secret closure, routes, and custom
+  domains. Exact executor and public-Worker same-host kernel leases span at most one exact
+  binding/code release followed by one deletion of only
+  `CLOUDFLARE_API_TOKEN`. The release preserves every existing public secret,
+  including sponsorship, signing, and runtime-input seal keys; the final
+  secret-created successor must retain the identical script identity and exact
+  remaining closure. Token absence before the exact binding is a refusal.
+  Status may adopt only an exact token-free canonical state or the exact direct
+  secret-created successor. The surface is forward-only and never reads or
+  mutates the executor's owner-private credential material. The two leases do
+  not fence dashboard, direct-API, or other-host actors. Cloudflare offers no
+  conditional secret-delete input, so the immediate pre-delete and final
+  authoritative reads detect such a race but cannot roll the deletion back.
 - `takoserver-worker` qualifies that exact executor Version before a public
   publication whenever the target contains a Cloudflare supply. It repeats the
   qualification at the mutation fence and after publication. The required
@@ -1428,6 +1472,17 @@ the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine
 Worker, Console, and Pages output the immediately previous provider-history
 identity; irreversible surfaces state their forward-repair boundary.
+
+For public parent-token retirement, a binding-release acknowledgement failure
+stops before secret deletion and a deletion acknowledgement failure stops
+without another delete. Run
+`takoserver-public-parent-token-retirement --status` with the same environment
+and commit. `legacy-unbound-parent-token` means no qualified binding release is
+visible, `bound-parent-token` means the exact binding/source exists and the
+token remains, and an exact `retired-canonical` or
+`retired-secret-successor` with `ready: true` proves completion. Any other
+history, source, executor, topology, binding, or secret inventory is a refusal;
+do not use raw Wrangler to guess which effect occurred.
 
 For an integration legacy Worker cutover, repeat `--status` with the same
 `--legacy-predecessor-version` after an indeterminate acknowledgement. The

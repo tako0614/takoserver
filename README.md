@@ -300,6 +300,14 @@ target joins the Cloudflare supplies, executor, gateway, and receipt-authority
 identities atomically. The landing-page details are in
 [`docs/deploy-site.md`](docs/deploy-site.md).
 
+The one-time public parent-credential handoff is owned by the fixed
+`takoserver-public-parent-token-retirement` surface. It qualifies the exact
+route-less executor and public Worker closure, releases the exact service
+binding if needed, then removes only the public `CLOUDFLARE_API_TOKEN`; its
+value-free status is the sole lost-acknowledgement/adoption path. It does not
+read or alter the executor's owner-private credential file. Run integration
+first; rehearsal and production remain separate target/source-qualified lanes.
+
 Wasabi has no equivalent private executor. Every Wasabi supply or recovery
 offering therefore fails target parsing/public composition closed; its access
 key, secret key, provider, and parent-backed meter are never public Worker
