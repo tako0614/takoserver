@@ -14,6 +14,7 @@ import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentia
 import { runManagedObjectReceiptAuthority } from "./deploy/managed-object-receipt-authority.ts";
 import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
+import { runPublicParentTokenRetirement } from "./deploy/public-parent-token-retirement.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import {
@@ -82,6 +83,9 @@ const USAGE = `takoserver deploy
   CLOUDFLARE_API_TOKEN and TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING; code and both secret bindings are
   published together. Deploy in dependency order: receipt authority, managed gateway, provider
   executor, then the public Worker. The executor accepts --reverse only with --apply.
+  takoserver-public-parent-token-retirement accepts only the fixed status/apply selector above.
+  It binds the target-selected public Worker to the exact route-less executor before deleting only
+  the public CLOUDFLARE_API_TOKEN. It never reads the executor's owner-private credential file.
 
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
@@ -193,6 +197,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
+  if (surfaceValue === "takoserver-public-parent-token-retirement" && args.length !== 4) {
+    return null;
+  }
   let action: ParsedInvocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
@@ -781,6 +788,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       );
     case "takoserver-hosted-token-cutover":
       return await runHosted(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-public-parent-token-retirement":
+      return await runPublicParentTokenRetirement(
         {
           surface: invocation.surface,
           action: invocation.action,
