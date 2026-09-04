@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -36,6 +36,12 @@ const target = {
   r2: { bucketName: "takoserver-objects-rehearsal" },
   publicOrigin: "https://api.rehearsal.example.test",
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const integration0043Target = {
+  ...target,
+  environment: "integration",
+  artifactBlobIoMode: "pre-0043-quiesced",
 } satisfies DeployTarget;
 
 function migrations(root: string): string {
@@ -73,6 +79,35 @@ function readerSequence(states: readonly D1SchemaState[]): SchemaReader {
     async read() {
       return states[Math.min(reads++, states.length - 1)] as D1SchemaState;
     },
+  };
+}
+
+function integration0043Reader(states: readonly D1SchemaState[]): SchemaReader {
+  let reads = 0;
+  return {
+    async read() {
+      return states[Math.min(reads++, states.length - 1)] as D1SchemaState;
+    },
+    async legacyRuntimeInputPreparationCount() {
+      return 0;
+    },
+    async installRuntimeInputPreparationV2Quiescence() {
+      return { status: "installed", predecessorRowCount: 0 };
+    },
+    async duplicateLiveNativeClaimCount() {
+      return 0;
+    },
+    async activeRootDeletingArtifactCandidateConflictCount() {
+      return 0;
+    },
+  };
+}
+
+function migrationStateThrough(count: number, marker: string): D1SchemaState {
+  return {
+    applied: MIGRATIONS.slice(0, count).map(({ name }) => name),
+    shape: `${marker}\n`,
+    shapeDigest: `sha256:${marker.repeat(64).slice(0, 64)}`,
   };
 }
 
@@ -353,6 +388,78 @@ describe("forward-only D1 schema surface", () => {
         calls.find(({ command }) => command.slice(-3).join(" ") === "auth token --json")?.env,
       ).toEqual({ WRANGLER_WRITE_LOGS: "false" });
       expect(JSON.stringify(wranglerCalls)).not.toContain(oauthToken);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration 0043 dispatch passes the OAuth bearer to compatibility reads only", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-0043-"));
+    try {
+      const oauthToken = "d1-0043-oauth-token-only-in-process";
+      const calls: {
+        readonly command: readonly string[];
+        readonly env: Readonly<Record<string, string>>;
+      }[] = [];
+      const compatibilityReads: {
+        readonly phase: string;
+        readonly bearerToken: string | undefined;
+      }[] = [];
+      const fixture = processFixture("rehearsal");
+      const run: SchemaProcess = async (command, options) => {
+        calls.push({ command: [...command], env: options?.env ?? {} });
+        if (command.slice(-3).join(" ") === "auth token --json") {
+          return ok(JSON.stringify({ type: "oauth", token: oauthToken }));
+        }
+        return await fixture.run(command, options);
+      };
+      const pre = migrationStateThrough(36, "oauth-0043-pre");
+      const post = migrationStateThrough(43, "oauth-0043-post");
+      const result = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integration0043Target,
+        {
+          run,
+          reader: integration0043Reader([pre, pre, pre, post]),
+          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          outputDirectory: join(root, "work"),
+          review: "reviewer@example.test",
+          artifactBlobIoCompatibilityReader: async (phase, context) => {
+            compatibilityReads.push({ phase, bearerToken: context.bearerToken });
+            return {
+              status: "ready",
+              currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+              rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+              currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+              rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+              unsafePredecessorInvocations: "drained-or-cancelled",
+            };
+          },
+          cloudflareEnvironment: {},
+        },
+      );
+
+      expect(result).toMatchObject({
+        kind: "takoserver.d1-schema-apply@v3",
+        environment: "integration",
+        pendingMigrations: [
+          "0037_worker_runtime_input_preparation_v2.sql",
+          "0038_selfhost_edge_kv.sql",
+          "0039_takoform_live_native_claim_across_tenants.sql",
+          "0040_selfhost_queues_and_schedules.sql",
+          "0041_selfhost_object_buckets.sql",
+          "0042_worker_endpoint_origin_reservation_space_id.sql",
+          "0043_artifact_blob_io_fences.sql",
+        ],
+      });
+      expect(compatibilityReads).toHaveLength(4);
+      expect(compatibilityReads.every(({ bearerToken }) => bearerToken === oauthToken)).toBe(true);
+
+      const wranglerCalls = calls.filter((entry) => entry.command[0]?.endsWith("/wrangler"));
+      expect(wranglerCalls.length).toBeGreaterThan(0);
+      expect(wranglerCalls.every(({ env }) => env.CLOUDFLARE_API_TOKEN === undefined)).toBe(true);
+      expect(JSON.stringify(wranglerCalls)).not.toContain(oauthToken);
+      expect(JSON.stringify(result)).not.toContain(oauthToken);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -1,6 +1,8 @@
 import { bytesDigest, canonicalDigest } from "../json.ts";
 import type { Clock, ObjectStoreAccess, Sql, SqlStatement } from "../ports.ts";
+import { SqlError } from "../ports.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
+import { admitArtifactBlobWrite, commitArtifactBlobWrite } from "./artifact-blob-io.ts";
 import {
   MAXIMUM_REQUEST_BODY_BYTES,
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
@@ -93,7 +95,7 @@ export class ArtifactInputError extends Error {
 
 export interface CreateTakoformArtifactsOptions {
   readonly sql: Sql;
-  readonly objects: Pick<ObjectStoreAccess, "put" | "get" | "head">;
+  readonly objects: Pick<ObjectStoreAccess, "writeOperationIdentity" | "put" | "get" | "head">;
   readonly clock: Clock;
   readonly randomId: () => string;
   /** Candidate compositions can bind the same transport to another non-public lane. */
@@ -104,6 +106,9 @@ export function createTakoformArtifacts(
   options: CreateTakoformArtifactsOptions,
 ): TakoformArtifactTransport {
   const { sql, objects, clock, randomId } = options;
+  if (objects.writeOperationIdentity !== "exact") {
+    throw new TypeError("Takoform artifact composition requires exact write operation identity");
+  }
   const artifactPrefix = options.artifactPrefix ?? DEFAULT_ARTIFACT_PREFIX;
   const artifactPattern = artifactPrefix.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const now = (): number => clock().getTime();
@@ -117,13 +122,6 @@ export function createTakoformArtifacts(
     return rows.length === 1;
   };
 
-  const grant = async (tenantId: string, digest: string, kind: string): Promise<void> => {
-    await sql.run(
-      "INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind) VALUES (?, ?, ?)",
-      [tenantId, digest, kind],
-    );
-  };
-
   const ownedUpload = async (
     principal: TakoformArtifactPrincipal,
     id: string,
@@ -131,11 +129,19 @@ export function createTakoformArtifacts(
     manifest: TakoformArtifactManifest;
     manifestDigest: string;
     lifecycleState: "open" | "committed" | "abandoned";
+    lifecycleFence: number;
+    rootState: "active" | "released" | null;
+    rootFence: number | null;
   } | null> => {
     const rows = await sql.query(
-      `SELECT manifest_json, manifest_digest, lifecycle_state
-       FROM tf_artifact_uploads
-       WHERE id = ? AND tenant_id = ? AND principal_id = ?`,
+      `SELECT upload.manifest_json, upload.manifest_digest, upload.lifecycle_state,
+              upload.lifecycle_fence, root.state AS root_state, root.fence AS root_fence
+       FROM tf_artifact_uploads AS upload
+       LEFT JOIN tf_artifact_roots AS root
+         ON root.tenant_id = upload.tenant_id AND root.root_kind = 'upload'
+        AND root.root_id = upload.id AND root.target_kind = 'manifest'
+        AND root.digest = upload.manifest_digest
+       WHERE upload.id = ? AND upload.tenant_id = ? AND upload.principal_id = ?`,
       [id, principal.tenantId, principal.principalId],
     );
     const row = rows[0];
@@ -144,6 +150,10 @@ export function createTakoformArtifacts(
       manifest: JSON.parse(String(row.manifest_json)) as TakoformArtifactManifest,
       manifestDigest: String(row.manifest_digest),
       lifecycleState: String(row.lifecycle_state) as "open" | "committed" | "abandoned",
+      lifecycleFence: Number(row.lifecycle_fence),
+      rootState:
+        row.root_state === "active" || row.root_state === "released" ? row.root_state : null,
+      rootFence: Number.isSafeInteger(row.root_fence) ? Number(row.root_fence) : null,
     };
   };
 
@@ -329,9 +339,16 @@ export function createTakoformArtifacts(
         "u",
       ).exec(url.pathname);
       if (request.method === "PUT" && match) {
-        const upload = await ownedUpload(principal, requiredSegment(match[1]));
+        const uploadId = requiredSegment(match[1]);
+        const upload = await ownedUpload(principal, uploadId);
         if (!upload) return failure("artifact_missing", 404);
-        if (upload.lifecycleState !== "open") return failure("artifact_invalid", 409);
+        if (
+          upload.lifecycleState !== "open" ||
+          upload.rootState !== "active" ||
+          upload.rootFence === null
+        ) {
+          return failure("artifact_invalid", 409);
+        }
         const digest = requiredDigest(match[2]);
         const declaration = declarations(upload.manifest).find((entry) => entry.digest === digest);
         if (!declaration) return failure("artifact_invalid", 400);
@@ -339,8 +356,27 @@ export function createTakoformArtifacts(
         if (bytes.byteLength !== declaration.size || (await bytesDigest(bytes)) !== digest) {
           return failure("artifact_invalid", 400);
         }
-        await objects.put(blobKey(digest), bytes, { contentType: declaration.mediaType });
-        await grant(principal.tenantId, digest, "blob");
+        const lease = await admitArtifactBlobWrite(
+          { sql, clock, randomId },
+          {
+            tenantId: principal.tenantId,
+            principalId: principal.principalId,
+            uploadId,
+            manifestDigest: upload.manifestDigest,
+            digest,
+            uploadFence: upload.lifecycleFence,
+            rootFence: upload.rootFence,
+            expectedSize: declaration.size,
+          },
+        );
+        if (!lease) return failure("artifact_invalid", 409);
+        const written = await objects.put(blobKey(digest), bytes, {
+          contentType: declaration.mediaType,
+          writeOperationId: lease.operationId,
+        });
+        if (!(await commitArtifactBlobWrite({ sql, clock, randomId }, lease, written))) {
+          return failure("artifact_invalid", 409);
+        }
         return new Response(null, { status: 201 });
       }
 
@@ -461,6 +497,9 @@ export function createTakoformArtifacts(
         } catch (error) {
           const settled = await readReplay(replayKey).catch(() => null);
           if (settled) return replayArtifactResponse(settled);
+          if (error instanceof SqlError && error.code === "constraint") {
+            return failure("artifact_invalid", 409);
+          }
           throw error;
         }
         return replayArtifactResponse(result);
@@ -490,9 +529,22 @@ export function createTakoformArtifacts(
                             AND lifecycle_state = 'open'
                         ) AND NOT EXISTS (
                           SELECT 1 FROM tf_artifact_replays WHERE replay_key = ?
+                        ) AND NOT EXISTS (
+                          SELECT 1
+                          FROM tf_artifact_blob_io_leases AS lease
+                          JOIN tf_artifact_manifest_members AS member
+                            ON member.manifest_digest = ? AND member.blob_digest = lease.digest
+                          WHERE lease.state <> 'available'
                         )
                       THEN 1 ELSE 0 END`,
-                params: [token, id, principal.tenantId, principal.principalId, replayKey],
+                params: [
+                  token,
+                  id,
+                  principal.tenantId,
+                  principal.principalId,
+                  replayKey,
+                  upload.manifestDigest,
+                ],
               },
               {
                 sql: `UPDATE tf_artifact_uploads
@@ -516,6 +568,9 @@ export function createTakoformArtifacts(
           } catch (error) {
             const settled = await readReplay(replayKey).catch(() => null);
             if (settled) return replayArtifactResponse(settled);
+            if (error instanceof SqlError && error.code === "constraint") {
+              return failure("artifact_invalid", 409);
+            }
             throw error;
           }
         } else {

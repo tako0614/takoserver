@@ -44,6 +44,7 @@ const target = {
   },
   r2: { bucketName: "takoserver-objects-rehearsal" },
   publicOrigin: "https://api.rehearsal.example.test",
+  artifactBlobIoMode: "pre-0043-quiesced",
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
 
@@ -52,6 +53,17 @@ const EMPTY: D1SchemaState = {
   shape: "[]\n",
   shapeDigest: `sha256:${"0".repeat(64)}`,
 };
+
+async function readyArtifactBlobIoCompatibility() {
+  return {
+    status: "ready" as const,
+    currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+    rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+    currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+    rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+    unsafePredecessorInvocations: "drained-or-cancelled" as const,
+  };
+}
 
 function stateThrough(count: number, marker: string): D1SchemaState {
   return {
@@ -78,6 +90,7 @@ function dataReaderSequence(
     readonly unmatchedSaga?: readonly number[];
     readonly legacyPreparation?: readonly number[];
     readonly duplicateNativeClaim?: readonly number[];
+    readonly activeRootDeletingCandidateConflict?: readonly number[];
   } = {},
 ): SchemaReader {
   const stateReader = readerSequence(states);
@@ -106,6 +119,19 @@ function dataReaderSequence(
     },
     async duplicateLiveNativeClaimCount() {
       return next("nativeClaim", counts.duplicateNativeClaim);
+    },
+    async activeRootDeletingArtifactCandidateConflictCount() {
+      return next("artifactConflict", counts.activeRootDeletingCandidateConflict);
+    },
+    async artifactBlobIoDeploymentCompatibility() {
+      return {
+        status: "ready",
+        currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+        rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+        currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+        rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+        unsafePredecessorInvocations: "drained-or-cancelled",
+      };
     },
   };
 }
@@ -261,7 +287,7 @@ function databaseLaneProcess(
           (database.query("SELECT COUNT(*) AS count FROM d1_migrations").get() as { count: number })
             .count,
         );
-        for (const migration of MIGRATIONS.slice(applied, 42)) {
+        for (const migration of MIGRATIONS.slice(applied, 43)) {
           database.transaction(() => {
             database.exec(migration.sql);
             database
@@ -312,6 +338,7 @@ async function rehearsalReceiptChainThrough0036(
           ...(predecessorReceiptPath === undefined ? {} : { predecessorReceiptPath }),
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
       predecessorReceiptPath = receiptPath;
@@ -330,7 +357,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-"));
     try {
       const fixture = processFixture();
-      for (const throughMigration of ["0028", "0033", "0036", "0042"] as const) {
+      for (const throughMigration of ["0028", "0033", "0036", "0043"] as const) {
         const failure = await runD1Schema(
           {
             action: "status",
@@ -370,6 +397,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, "work"),
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
 
@@ -431,6 +459,7 @@ describe("production-shaped D1 migration lane", () => {
           outputDirectory: join(root, `work-${expected.replaceAll(" ", "-")}`),
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         }).catch((error) => error);
         expect(failure.message).toContain(expected);
       }
@@ -463,6 +492,7 @@ describe("production-shaped D1 migration lane", () => {
           receiptPath,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
 
@@ -551,14 +581,14 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0042 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0043 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0042_worker_endpoint_origin_reservation_space_id.sql"),
-        join(migrationDirectory, "0043_unreviewed_extension.sql"),
+        join(migrationDirectory, "0043_artifact_blob_io_fences.sql"),
+        join(migrationDirectory, "0044_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -581,7 +611,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the four no-overwrite wave receipts cover the exact 20-file production suffix once", async () => {
+  test("the four no-overwrite wave receipts cover the exact 21-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -589,7 +619,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0028", 22, 28],
         ["0033", 28, 33],
         ["0036", 33, 36],
-        ["0042", 36, 42],
+        ["0043", 36, 43],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -637,7 +667,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(20);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(21);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -757,18 +787,19 @@ describe("production-shaped D1 migration lane", () => {
           lateInsertRejected = String(error).includes("runtime_input_preparation_v2_quiesced");
         }
       });
-      const receiptPath = join(root, "0042.receipt.json");
+      const receiptPath = join(root, "0043.receipt.json");
       await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0042" },
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
         target,
         {
           run: process.run,
           migrationDirectory: resolve(import.meta.dir, "../migrations"),
-          outputDirectory: join(root, "0042-work"),
+          outputDirectory: join(root, "0043-work"),
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
       expect(lateInsertRejected).toBe(true);
@@ -801,15 +832,16 @@ describe("production-shaped D1 migration lane", () => {
         () => insertLegacyPreparation(database, "between-fence-and-guard"),
       );
       const failure = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0042" },
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
         target,
         {
           run: process.run,
-          outputDirectory: join(root, "0042-work"),
-          receiptPath: join(root, "0042.receipt.json"),
+          outputDirectory: join(root, "0043-work"),
+          receiptPath: join(root, "0043.receipt.json"),
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       ).catch((error) => error);
       expect(failure).toMatchObject({ phase: "mutation" });
@@ -843,9 +875,9 @@ describe("production-shaped D1 migration lane", () => {
         }
         return await interruptedProcess.run(command, options);
       };
-      const receiptPath = join(root, "0042.receipt.json");
+      const receiptPath = join(root, "0043.receipt.json");
       const interrupted = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0042" },
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
         target,
         {
           run: interruptedRun,
@@ -854,6 +886,7 @@ describe("production-shaped D1 migration lane", () => {
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       ).catch((error) => error);
       expect(interrupted).toBeInstanceOf(Error);
@@ -868,7 +901,7 @@ describe("production-shaped D1 migration lane", () => {
 
       const resumedProcess = databaseLaneProcess(database, () => {});
       const resumed = await runD1Schema(
-        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0042" },
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
         target,
         {
           run: resumedProcess.run,
@@ -877,12 +910,13 @@ describe("production-shaped D1 migration lane", () => {
           predecessorReceiptPath: predecessor.receiptPath,
           review: "reviewer@example.test",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
       expect(resumed).toMatchObject({
         runtimeInputQuiescence: "installed-and-zero",
         providerAcknowledgement: "acknowledged",
-        lastAppliedMigration: "0042_worker_endpoint_origin_reservation_space_id.sql",
+        lastAppliedMigration: "0043_artifact_blob_io_fences.sql",
       });
       expect(resumedProcess.migrationApplyCalls()).toBe(1);
       expect(existsSync(`${receiptPath}.attempt`)).toBe(false);
@@ -901,8 +935,9 @@ describe("production-shaped D1 migration lane", () => {
         ["0033", 28, { malformedFormRef: [0, 0, 1] }],
         ["0033", 28, { duplicateResourceUid: [0, 0, 1] }],
         ["0036", 33, { unmatchedSaga: [0, 0, 1] }],
-        ["0042", 36, { legacyPreparation: [0, 0, 1] }],
-        ["0042", 36, { duplicateNativeClaim: [0, 0, 1] }],
+        ["0043", 36, { legacyPreparation: [0, 0, 1] }],
+        ["0043", 36, { duplicateNativeClaim: [0, 0, 1] }],
+        ["0043", 36, { activeRootDeletingCandidateConflict: [0, 0, 1] }],
       ] as const;
       for (const [index, [throughMigration, from, counts]] of cases.entries()) {
         const fixture = processFixture();
@@ -933,7 +968,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("status names the 0029, 0036, 0037, and 0039 repair counts", async () => {
+  test("status names the 0029, 0036, 0037, 0039, and 0043 repair counts", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-named-preflights-"));
     try {
       const cases = [
@@ -961,9 +996,13 @@ describe("production-shaped D1 migration lane", () => {
           },
         },
         {
-          throughMigration: "0042" as const,
+          throughMigration: "0043" as const,
           from: 36,
-          counts: { legacyPreparation: [4], duplicateNativeClaim: [5] },
+          counts: {
+            legacyPreparation: [4],
+            duplicateNativeClaim: [5],
+            activeRootDeletingCandidateConflict: [6],
+          },
           expected: {
             runtimeInputPreparationV2: {
               status: "legacy_data_repair_required",
@@ -972,6 +1011,10 @@ describe("production-shaped D1 migration lane", () => {
             liveNativeClaim: {
               status: "legacy_data_repair_required",
               duplicateLiveNativeClaimCount: 5,
+            },
+            artifactBlobIoFence: {
+              status: "legacy_data_repair_required",
+              activeRootDeletingCandidateConflictCount: 6,
             },
           },
         },
@@ -996,6 +1039,209 @@ describe("production-shaped D1 migration lane", () => {
           dataPreflights: { status: "data_repair_required", ...item.expected },
         });
       }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0043 re-reads the active-root/deleting-candidate conflict immediately before apply", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-conflict-race-"));
+    try {
+      chmodSync(root, 0o700);
+      const fixture = processFixture();
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      const pre = predecessor.state;
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([pre, pre, pre], {
+            activeRootDeletingCandidateConflict: [0, 0, 0, 1],
+          }),
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "0043.receipt.json"),
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+
+      expect(failure).toMatchObject({ phase: "mutation" });
+      expect(failure.message).toContain("0043 artifact blob I/O conflict");
+      expect(fixture.calls.some((call) => call.includes("apply"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0043 apply rejects a conflict that appeared after a ready status", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-status-apply-race-"));
+    try {
+      const fixture = processFixture();
+      const pre = stateThrough(36, "status-apply-race");
+      const reader = dataReaderSequence([pre], {
+        activeRootDeletingCandidateConflict: [0, 1],
+      });
+      const status = await runD1Schema(
+        { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          reader,
+          outputDirectory: join(root, "status-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(status).toMatchObject({
+        readyForApply: true,
+        dataPreflights: {
+          artifactBlobIoFence: {
+            status: "ready",
+            activeRootDeletingCandidateConflictCount: 0,
+          },
+        },
+      });
+
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: fixture.run,
+          reader,
+          outputDirectory: join(root, "apply-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toMatchObject({ phase: "preflight" });
+      expect(failure.message).toContain("data preflights require operator repair");
+      expect(fixture.calls.some((call) => call.includes("apply"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0043 makes the conflict count the final provider read before its first migration", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-last-read-"));
+    try {
+      chmodSync(root, 0o700);
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      const fixture = processFixture();
+      const events: string[] = [];
+      const baseReader = dataReaderSequence([
+        predecessor.state,
+        predecessor.state,
+        predecessor.state,
+        stateThrough(43, "0043-post"),
+      ]);
+      const reader: SchemaReader = {
+        ...baseReader,
+        async activeRootDeletingArtifactCandidateConflictCount(phase) {
+          events.push(`conflict:${phase}`);
+          return (await baseReader.activeRootDeletingArtifactCandidateConflictCount?.(phase)) ?? 0;
+        },
+      };
+      const run: SchemaProcess = async (command, options) => {
+        if (command.includes("migrations") && command.includes("apply")) events.push("apply");
+        return await fixture.run(command, options);
+      };
+
+      const result = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run,
+          reader,
+          artifactBlobIoCompatibilityReader: async (phase) => {
+            events.push(`compatibility:${phase}`);
+            return await readyArtifactBlobIoCompatibility();
+          },
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "0043.receipt.json"),
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        lastAppliedMigration: "0043_artifact_blob_io_fences.sql",
+      });
+      expect(events.slice(-3)).toEqual(["compatibility:mutation", "conflict:mutation", "apply"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0043 status exposes a missing external invocation-drain receipt as not ready", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-drain-status-"));
+    try {
+      const result = await runD1Schema(
+        { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          reader: dataReaderSequence([stateThrough(36, "drain-status")]),
+          artifactBlobIoCompatibilityReader: async () => ({
+            status: "drain_receipt_required",
+            currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+            rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+            currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+            rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+            unsafePredecessorInvocations: "unproven",
+          }),
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        readyForApply: false,
+        artifactBlobIoCompatibility: {
+          status: "drain_receipt_required",
+          unsafePredecessorInvocations: "unproven",
+        },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0043 re-reads compatibility Worker and drain evidence at the immediate migration fence", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0043-worker-race-"));
+    try {
+      chmodSync(root, 0o700);
+      const predecessor = await rehearsalReceiptChainThrough0036(root);
+      const fixture = processFixture();
+      let reads = 0;
+      const failure = await runD1Schema(
+        { action: "apply", environment: "rehearsal", commit: COMMIT, throughMigration: "0043" },
+        target,
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([predecessor.state, predecessor.state, predecessor.state]),
+          artifactBlobIoCompatibilityReader: async () => {
+            reads += 1;
+            return reads < 4
+              ? await readyArtifactBlobIoCompatibility()
+              : {
+                  status: "drain_receipt_required" as const,
+                  currentCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000043",
+                  rollbackCompatibilityDeploymentId: "10000000-0000-4000-8000-000000000042",
+                  currentCompatibilityVersionId: "00000000-0000-4000-8000-000000000043",
+                  rollbackCompatibilityVersionId: "00000000-0000-4000-8000-000000000042",
+                  unsafePredecessorInvocations: "unproven" as const,
+                };
+          },
+          outputDirectory: join(root, "work"),
+          receiptPath: join(root, "0043.receipt.json"),
+          predecessorReceiptPath: predecessor.receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+
+      expect(reads).toBe(4);
+      expect(failure).toMatchObject({ phase: "mutation" });
+      expect(failure.message).toContain("compatibility changed at the immediate migration fence");
+      expect(fixture.calls.some((call) => call.includes("apply"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1111,18 +1357,44 @@ describe("production-shaped D1 migration lane", () => {
            )`,
         )
         .run(`sha256:${"b".repeat(64)}`, `sha256:${"c".repeat(64)}`);
+      const conflictedManifest = `sha256:${"d".repeat(64)}`;
+      const conflictedBlob = `sha256:${"e".repeat(64)}`;
+      preparationDatabase
+        .query(
+          "INSERT INTO tf_artifact_manifest_members (manifest_digest, blob_digest) VALUES (?, ?)",
+        )
+        .run(conflictedManifest, conflictedBlob);
+      preparationDatabase
+        .query(
+          `INSERT INTO tf_artifact_gc_candidates
+             (kind, digest, state, fence, not_before, expected_etag, attempts,
+              last_outcome, created_at, updated_at, deleted_at)
+           VALUES ('blob', ?, 'deleting', 1, 1, 'etag-conflict', 1,
+                   'claimed', 1, 1, NULL)`,
+        )
+        .run(conflictedBlob);
+      preparationDatabase
+        .query(
+          `INSERT INTO tf_artifact_roots
+             (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
+              expires_at, release_reason, created_at, released_at)
+           VALUES ('tenant-conflict', 'resource', 'resource-conflict', 'manifest', ?,
+                   'active', 1, NULL, NULL, 1, NULL)`,
+        )
+        .run(conflictedManifest);
       const preparationStatus = await runD1Schema(
         {
           action: "status",
           environment: "rehearsal",
           commit: COMMIT,
-          throughMigration: "0042",
+          throughMigration: "0043",
         },
         target,
         {
           run: d1ReadProcess(preparationDatabase),
           outputDirectory: join(root, "preparation-work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
       expect(preparationStatus).toMatchObject({
@@ -1130,6 +1402,10 @@ describe("production-shaped D1 migration lane", () => {
           runtimeInputPreparationV2: {
             status: "legacy_data_repair_required",
             predecessorRowCount: 1,
+          },
+          artifactBlobIoFence: {
+            status: "legacy_data_repair_required",
+            activeRootDeletingCandidateConflictCount: 1,
           },
         },
       });
@@ -1156,13 +1432,14 @@ describe("production-shaped D1 migration lane", () => {
           action: "status",
           environment: "rehearsal",
           commit: COMMIT,
-          throughMigration: "0042",
+          throughMigration: "0043",
         },
         target,
         {
           run: d1ReadProcess(nativeClaimDatabase),
           outputDirectory: join(root, "native-claim-work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
         },
       );
       expect(nativeClaimStatus).toMatchObject({

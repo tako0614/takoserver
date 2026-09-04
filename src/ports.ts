@@ -79,6 +79,16 @@ export interface StoredObject {
   readonly size: number;
   readonly etag: string;
   readonly contentType?: string;
+  /**
+   * Opaque identity the adapter can attribute to the currently observed bytes.
+   *
+   * Artifact writers use it to distinguish their own lost acknowledgement
+   * from an older write at the same content-addressed key. Absence is a
+   * fail-closed result and an adapter must never synthesize the requested id.
+   * This field does not promise that every implementation stores bytes and
+   * metadata in one physical atomic operation.
+   */
+  readonly writeOperationId?: string;
 }
 
 export interface StoredObjectBody extends StoredObject {
@@ -97,10 +107,22 @@ export interface ObjectListPage {
  * by the implementation. HTTP-backed hosts only need this capability.
  */
 export interface ObjectStoreAccess {
+  /**
+   * Whether a successful `put(..., { writeOperationId })` returns that exact
+   * identity and later observations of the resulting bytes preserve it.
+   * Interrupted publication must omit/refuse the identity rather than report
+   * the requested id without proof. Artifact writers refuse before acquiring
+   * a durable lease when the selected transport cannot provide this contract.
+   */
+  readonly writeOperationIdentity: "exact" | "unsupported";
   put(
     key: string,
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
-    options?: { readonly contentType?: string },
+    options?: {
+      readonly contentType?: string;
+      /** Identity to expose only with this successfully published write. */
+      readonly writeOperationId?: string;
+    },
   ): Promise<StoredObject>;
   get(key: string): Promise<StoredObjectBody | null>;
   head(key: string): Promise<StoredObject | null>;
@@ -126,7 +148,11 @@ export interface ObjectStore extends ObjectStoreAccess {
   create(
     key: string,
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
-    options?: { readonly contentType?: string },
+    options?: {
+      readonly contentType?: string;
+      /** Identity to expose only with this successfully published write. */
+      readonly writeOperationId?: string;
+    },
   ): Promise<StoredObject | null>;
 }
 

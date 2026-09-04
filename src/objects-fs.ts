@@ -30,6 +30,11 @@ import {
  * during a crash finds the old bytes or the new ones, never half of either.
  * Staging is outside the user object namespace, so a key that happens to look
  * like an old staging suffix remains an ordinary object throughout a write.
+ * The body rename and metadata rename are separate publications. A successful
+ * tagged write returns only after both, while an interruption can leave absent
+ * or previous metadata. That case deliberately does not report the new
+ * operation id, so lost-acknowledgement recovery remains fenced; this adapter
+ * does not claim cross-file atomicity.
  *
  * On one host, with one JS runtime per OS process, one live runtime owns
  * mutations for a root. The claim is published with an atomic hard link, all
@@ -127,6 +132,8 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
   };
 
   return {
+    writeOperationIdentity: "exact",
+
     async create(key, body, opts): Promise<StoredObject | null> {
       const { body: path, meta, legacyMeta } = pathFor(key);
       const bytes = await collect(body);
@@ -139,12 +146,22 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
           // an existing key. Both paths are on the same filesystem.
           if (!(await publishCreateOnly(root, staged, path))) return null;
           const contentType = opts?.contentType;
-          await writeMetadata(root, key, meta, legacyMeta, contentType, digest(bytes));
+          const writeOperationId = opts?.writeOperationId;
+          await writeMetadata(
+            root,
+            key,
+            meta,
+            legacyMeta,
+            contentType,
+            digest(bytes),
+            writeOperationId,
+          );
           return {
             key,
             size: bytes.byteLength,
             etag: digest(bytes),
             ...(contentType ? { contentType } : {}),
+            ...(writeOperationId ? { writeOperationId } : {}),
           };
         } catch (error) {
           if (isAlreadyExists(error)) return null;
@@ -172,13 +189,23 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
           throw new ObjectStoreError("unavailable", `the disk refused the write: ${String(error)}`);
         }
         const contentType = opts?.contentType;
-        await writeMetadata(root, key, meta, legacyMeta, contentType, digest(bytes));
+        const writeOperationId = opts?.writeOperationId;
+        await writeMetadata(
+          root,
+          key,
+          meta,
+          legacyMeta,
+          contentType,
+          digest(bytes),
+          writeOperationId,
+        );
 
         return {
           key,
           size: bytes.byteLength,
           etag: digest(bytes),
           ...(contentType ? { contentType } : {}),
+          ...(writeOperationId ? { writeOperationId } : {}),
         };
       });
     },
@@ -203,6 +230,7 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
           size: opened.stat.size,
           etag: metadata.etag ?? "",
           ...(metadata.contentType ? { contentType: metadata.contentType } : {}),
+          ...(metadata.writeOperationId ? { writeOperationId: metadata.writeOperationId } : {}),
           body: streamFromFile(opened),
         };
       } catch {
@@ -224,6 +252,7 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
             size: opened.stat.size,
             etag: metadata.etag ?? "",
             ...(metadata.contentType ? { contentType: metadata.contentType } : {}),
+            ...(metadata.writeOperationId ? { writeOperationId: metadata.writeOperationId } : {}),
           };
         } finally {
           await opened.handle.close().catch(() => undefined);
@@ -282,6 +311,7 @@ export function createFileObjectStore(options: FileObjectStoreOptions): ObjectSt
             size: found.stat.size,
             etag: metadata.etag ?? "",
             ...(metadata.contentType ? { contentType: metadata.contentType } : {}),
+            ...(metadata.writeOperationId ? { writeOperationId: metadata.writeOperationId } : {}),
           });
         } finally {
           await found.handle.close().catch(() => undefined);
@@ -1263,7 +1293,7 @@ async function writeMigratedMetadata(
   metadataPathname: string,
   metadata: FileMetadata,
 ): Promise<void> {
-  if (!metadata.contentType && !metadata.etag) return;
+  if (!metadata.contentType && !metadata.etag && !metadata.writeOperationId) return;
   if (await isRegularFile(root, metadataPathname)) return;
   const staging = stagingPath(root, `metadata:${metadataPathname}`);
   try {
@@ -1274,6 +1304,7 @@ async function writeMigratedMetadata(
         JSON.stringify({
           ...(metadata.contentType ? { contentType: metadata.contentType } : {}),
           ...(metadata.etag ? { etag: metadata.etag } : {}),
+          ...(metadata.writeOperationId ? { writeOperationId: metadata.writeOperationId } : {}),
         }),
       ),
     );
@@ -1421,6 +1452,7 @@ async function collect(
 interface FileMetadata {
   readonly contentType?: string;
   readonly etag?: string;
+  readonly writeOperationId?: string;
 }
 
 async function writeMetadata(
@@ -1430,8 +1462,9 @@ async function writeMetadata(
   legacyPath: string,
   contentType: string | undefined,
   etag: string,
+  writeOperationId: string | undefined,
 ): Promise<void> {
-  if (!contentType && !etag) {
+  if (!contentType && !etag && !writeOperationId) {
     await removeSafeRegularFile(root, path);
     await removeLegacyMetadata(root, key, legacyPath);
     return;
@@ -1441,7 +1474,13 @@ async function writeMetadata(
     const staged = await writeExclusiveFile(
       root,
       staging,
-      new TextEncoder().encode(JSON.stringify({ ...(contentType ? { contentType } : {}), etag })),
+      new TextEncoder().encode(
+        JSON.stringify({
+          ...(contentType ? { contentType } : {}),
+          etag,
+          ...(writeOperationId ? { writeOperationId } : {}),
+        }),
+      ),
     );
     await publishReplace(root, staged, path);
   } finally {
@@ -1494,12 +1533,19 @@ async function readMetadataFile(root: string, path: string): Promise<FileMetadat
   try {
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-      const value = parsed as { readonly contentType?: unknown; readonly etag?: unknown };
+      const value = parsed as {
+        readonly contentType?: unknown;
+        readonly etag?: unknown;
+        readonly writeOperationId?: unknown;
+      };
       return {
         ...(typeof value.contentType === "string" && value.contentType
           ? { contentType: value.contentType }
           : {}),
         ...(typeof value.etag === "string" && value.etag ? { etag: value.etag } : {}),
+        ...(typeof value.writeOperationId === "string" && value.writeOperationId
+          ? { writeOperationId: value.writeOperationId }
+          : {}),
       };
     }
   } catch {

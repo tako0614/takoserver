@@ -5,6 +5,7 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { bytesDigest } from "../src/json.ts";
 import type { FundingSettlementVerifier } from "../src/ledger.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { createR2HttpObjectStore } from "../src/objects-r2-http.ts";
 import type { ObjectStoreAccess, Sql } from "../src/ports.ts";
 import { createTakoformArtifactReconciler } from "../src/takoform/artifact-reconciler.ts";
 import {
@@ -173,7 +174,56 @@ async function startUpload(
   return { response, uploadId: body.uploadId };
 }
 
+async function prepareDueBlobCandidate(input: {
+  readonly target: ArtifactFixture;
+  readonly reconciler: ReturnType<typeof createTakoformArtifactReconciler>;
+  readonly advance: (milliseconds: number) => void;
+  readonly bytes: Uint8Array;
+  readonly manifest: TakoformArtifactManifest;
+  readonly digest: string;
+  readonly key: string;
+}): Promise<void> {
+  const started = await startUpload(input.target, input.manifest, `${input.key}-start`);
+  expect(
+    (
+      await input.target.call(`uploads/${started.uploadId}/blobs/${input.digest}`, {
+        method: "PUT",
+        body: input.bytes as unknown as BodyInit,
+      })
+    ).status,
+  ).toBe(201);
+  expect(
+    (
+      await input.target.call(`uploads/${started.uploadId}`, {
+        method: "DELETE",
+        headers: { "idempotency-key": `${input.key}-delete` },
+      })
+    ).status,
+  ).toBe(204);
+  input.advance(25 * 60 * 60_000);
+  await input.reconciler.reconcile({ limit: 16, deleteObjects: false });
+  input.advance(2 * 60 * 60_000);
+}
+
 describe("Takoform artifact lifecycle", () => {
+  test("an object transport without exact write identity is rejected at composition", async () => {
+    const sql = createEphemeralSql();
+    let objectRequests = 0;
+    const objects = createR2HttpObjectStore({
+      accountId: "account",
+      bucketName: "bucket",
+      authorize: () => "Bearer test",
+      apiOrigin: "https://r2.test",
+      fetch: async () => {
+        objectRequests += 1;
+        return new Response(null, { status: 500 });
+      },
+    });
+    expect(() => fixture({ sql, objects })).toThrow("exact write operation identity");
+    expect(objectRequests).toBe(0);
+    expect(await sql.query("SELECT * FROM tf_artifact_blob_io_leases")).toEqual([]);
+  });
+
   test("a committed upload cannot be abandoned through the public DELETE", async () => {
     const target = fixture();
     const bytes = new TextEncoder().encode(
@@ -208,6 +258,382 @@ describe("Takoform artifact lifecycle", () => {
 
     expect((await target.call(manifestDigest, { method: "GET" })).status).toBe(200);
     expect((await target.call(`blobs/${digest}`, { method: "HEAD" })).status).toBe(200);
+  });
+
+  test("an upload abandoned while its body is arriving cannot publish bytes or a hold", async () => {
+    const durable = createEphemeralSql();
+    let uploadRead!: () => void;
+    const uploadWasRead = new Promise<void>((resolve) => {
+      uploadRead = resolve;
+    });
+    let observeOwnedUpload = false;
+    const sql: Sql = {
+      async query(statement, params) {
+        const rows = await durable.query(statement, params);
+        if (observeOwnedUpload && statement.includes("FROM tf_artifact_uploads")) {
+          observeOwnedUpload = false;
+          uploadRead();
+        }
+        return rows;
+      },
+      run: (statement, params) => durable.run(statement, params),
+      batch: (statements) => durable.batch(statements),
+    };
+    const objects = createMemoryObjectStore();
+    let timestamp = Date.parse("2026-09-08T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => "body-arrival-race",
+    });
+    const bytes = new TextEncoder().encode("export default 'late body'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const started = await startUpload(target, manifest, "start-late-body");
+
+    let releaseBody!: () => void;
+    const bodyReleased = new Promise<void>((resolve) => {
+      releaseBody = resolve;
+    });
+    const body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        await bodyReleased;
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    observeOwnedUpload = true;
+    const put = target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+      method: "PUT",
+      body,
+    });
+    await uploadWasRead;
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}`, {
+          method: "DELETE",
+          headers: { "idempotency-key": "delete-before-body" },
+        })
+      ).status,
+    ).toBe(204);
+    timestamp += 25 * 60 * 60_000;
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+
+    releaseBody();
+    const response = await put;
+    expect(response.status).toBe(409);
+    expect(await objects.head(`art/${digest.slice("sha256:".length)}`)).toBeNull();
+    expect(
+      await durable.query(
+        `SELECT 1 AS held FROM tf_artifact_holds
+         WHERE tenant_id = ? AND digest = ? AND kind = 'blob'`,
+        [PRINCIPAL.tenantId, digest],
+      ),
+    ).toEqual([]);
+  });
+
+  test("a writer CAS atomically revives a pending digest before collection", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    let timestamp = Date.parse("2026-09-09T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => "writer-revives-candidate",
+    });
+    const bytes = new TextEncoder().encode("export default 'revive'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const original = await startUpload(target, manifest, "start-revive-original");
+    expect(
+      (
+        await target.call(`uploads/${original.uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await target.call(`uploads/${original.uploadId}`, {
+          method: "DELETE",
+          headers: { "idempotency-key": "delete-revive-original" },
+        })
+      ).status,
+    ).toBe(204);
+    timestamp += 25 * 60 * 60_000;
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+    expect(
+      await sql.query(
+        `SELECT state FROM tf_artifact_gc_candidates WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "pending" }]);
+
+    const replacement = await startUpload(
+      target,
+      manifest,
+      "start-revive-replacement",
+      SECOND_PRINCIPAL,
+    );
+    expect(
+      (
+        await target.call(
+          `uploads/${replacement.uploadId}/blobs/${digest}`,
+          { method: "PUT", body: bytes },
+          SECOND_PRINCIPAL,
+        )
+      ).status,
+    ).toBe(201);
+    expect(
+      await sql.query(
+        `SELECT state, last_outcome FROM tf_artifact_gc_candidates
+         WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "cancelled", last_outcome: "reference_present" }]);
+    expect(
+      await sql.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "available", last_outcome: "write_committed" }]);
+
+    timestamp += 2 * 60 * 60_000;
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(0);
+    expect(await objects.head(`art/${digest.slice("sha256:".length)}`)).not.toBeNull();
+  });
+
+  test("lost R2 PUT acknowledgement recovers only through exact operation metadata", async () => {
+    const sql = createEphemeralSql();
+    const baseObjects = createMemoryObjectStore();
+    let loseAcknowledgement = true;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async put(key, body, options) {
+        const written = await baseObjects.put(key, body, options);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error("simulated lost R2 PUT acknowledgement");
+        }
+        return written;
+      },
+    };
+    let timestamp = Date.parse("2026-09-10T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => "recover-r2-put-ack",
+    });
+    const bytes = new TextEncoder().encode("export default 'R2 ack'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const started = await startUpload(target, manifest, "start-r2-put-ack");
+
+    await expect(
+      target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+        method: "PUT",
+        body: bytes,
+      }),
+    ).rejects.toThrow("lost R2 PUT acknowledgement");
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}`, {
+          method: "DELETE",
+          headers: { "idempotency-key": "delete-r2-put-ack-blocked" },
+        })
+      ).status,
+    ).toBe(409);
+    timestamp += 5 * 60_000;
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+    expect(
+      await sql.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "available", last_outcome: "write_committed" }]);
+    expect((await target.call(`blobs/${digest}`, { method: "HEAD" })).status).toBe(200);
+  });
+
+  test("lost writer settlement acknowledgement survives immediate lease reuse", async () => {
+    const durable = createEphemeralSql();
+    let loseSettlement = true;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (
+          loseSettlement &&
+          statements.some(({ sql }) => sql.includes("INSERT INTO tf_artifact_blob_io_results"))
+        ) {
+          loseSettlement = false;
+          await durable.run(
+            `UPDATE tf_artifact_blob_io_leases
+             SET operation_id = 'abw_later_reuse', fence = fence + 1, updated_at = updated_at + 1
+             WHERE state = 'available'`,
+          );
+          throw new Error("simulated lost writer settlement acknowledgement");
+        }
+        return result;
+      },
+    };
+    const target = fixture({ sql });
+    const bytes = new TextEncoder().encode("export default 'writer result reuse'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const started = await startUpload(target, manifest, "start-writer-result-reuse");
+
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      await durable.query(
+        `SELECT operation_kind, digest, outcome FROM tf_artifact_blob_io_results
+         WHERE operation_kind = 'write'`,
+      ),
+    ).toEqual([{ operation_kind: "write", digest, outcome: "write_committed" }]);
+  });
+
+  test("an expired writer never adopts pre-existing identical bytes", async () => {
+    const sql = createEphemeralSql();
+    const baseObjects = createMemoryObjectStore();
+    let putEntered!: () => void;
+    const putWasEntered = new Promise<void>((resolve) => {
+      putEntered = resolve;
+    });
+    let releasePut!: () => void;
+    const putReleased = new Promise<void>((resolve) => {
+      releasePut = resolve;
+    });
+    let pausePut = false;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async put(key, body, options) {
+        if (pausePut) {
+          pausePut = false;
+          putEntered();
+          await putReleased;
+        }
+        return await baseObjects.put(key, body, options);
+      },
+    };
+    let timestamp = Date.parse("2026-09-10T12:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => "reject-preexisting-identical",
+    });
+    const bytes = new TextEncoder().encode("export default 'pre-existing exact bytes'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const objectKey = `art/${digest.slice("sha256:".length)}`;
+    await baseObjects.put(objectKey, bytes);
+    const started = await startUpload(target, manifest, "start-preexisting-identical");
+    pausePut = true;
+    const put = target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+      method: "PUT",
+      body: bytes,
+    });
+    await putWasEntered;
+
+    timestamp += 5 * 60_000;
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+    expect(
+      await sql.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "writing", last_outcome: "write_admitted" }]);
+    expect(
+      await sql.query(
+        `SELECT 1 AS held FROM tf_artifact_holds
+         WHERE tenant_id = ? AND kind = 'blob' AND digest = ?`,
+        [PRINCIPAL.tenantId, digest],
+      ),
+    ).toEqual([]);
+
+    releasePut();
+    expect((await put).status).toBe(201);
+    expect((await baseObjects.head(objectKey))?.writeOperationId).toMatch(/^abw_/u);
+  });
+
+  test("an expired writer never adopts corrupt bytes tagged with its operation", async () => {
+    const sql = createEphemeralSql();
+    const baseObjects = createMemoryObjectStore();
+    const corrupt = new TextEncoder().encode("export default 'bad bytes'");
+    let loseAcknowledgement = true;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async put(key, _body, options) {
+        const written = await baseObjects.put(key, corrupt, options);
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error("simulated corrupt R2 PUT acknowledgement loss");
+        }
+        return written;
+      },
+    };
+    let timestamp = Date.parse("2026-09-10T18:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => "reject-corrupt-operation-bytes",
+    });
+    const expected = new TextEncoder().encode("export default 'ok! bytes'");
+    expect(corrupt.byteLength).toBe(expected.byteLength);
+    const manifest = await workerManifest(expected);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const started = await startUpload(target, manifest, "start-corrupt-operation-bytes");
+
+    await expect(
+      target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+        method: "PUT",
+        body: expected,
+      }),
+    ).rejects.toThrow("corrupt R2 PUT acknowledgement loss");
+    timestamp += 5 * 60_000;
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+
+    expect(
+      await sql.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "writing", last_outcome: "write_admitted" }]);
+    expect(
+      await sql.query(
+        `SELECT 1 AS held FROM tf_artifact_holds
+         WHERE tenant_id = ? AND kind = 'blob' AND digest = ?`,
+        [PRINCIPAL.tenantId, digest],
+      ),
+    ).toEqual([]);
   });
 
   test("start, commit, and abandon read back their atomic result after acknowledgement loss", async () => {
@@ -363,7 +789,8 @@ describe("Takoform artifact lifecycle", () => {
     const durable = createEphemeralSql();
     const fault = failNextSqlBeforeWrite(durable);
     const objects = createMemoryObjectStore();
-    const clock = () => new Date("2026-08-31T01:00:00.000Z");
+    let timestamp = Date.parse("2026-08-31T01:00:00.000Z");
+    const clock = () => new Date(timestamp);
     const target = fixture({ sql: fault.sql, objects, clock });
     const bytes = new TextEncoder().encode(
       "export default { fetch() { return new Response('repair') } }",
@@ -387,11 +814,12 @@ describe("Takoform artifact lifecycle", () => {
       randomId: () => "repair-partial-put",
     });
     expect(await reconciler.dryRun({ limit: 16 })).toMatchObject({
-      repairableHolds: 1,
+      repairableHolds: 0,
       expiredReplays: 0,
     });
+    timestamp += 5 * 60_000;
     expect(await reconciler.reconcile({ limit: 16, deleteObjects: false })).toMatchObject({
-      repairedHolds: 1,
+      repairedHolds: 0,
       deletedObjects: 0,
     });
     expect((await target.call(`blobs/${digest}`, { method: "HEAD" })).status).toBe(200);
@@ -595,6 +1023,573 @@ describe("Takoform artifact lifecycle", () => {
     ).toEqual([{ state: "active" }]);
   });
 
+  test("two collectors cannot share one delete claim", async () => {
+    const durable = createEphemeralSql();
+    let claimed = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (statements.some(({ sql }) => sql.includes("'delete_claimed'"))) claimed = true;
+        return result;
+      },
+    };
+    const baseObjects = createMemoryObjectStore();
+    let postClaimHead!: () => void;
+    const postClaimHeadEntered = new Promise<void>((resolve) => {
+      postClaimHead = resolve;
+    });
+    let releaseHead!: () => void;
+    const headReleased = new Promise<void>((resolve) => {
+      releaseHead = resolve;
+    });
+    let paused = false;
+    let deleteCalls = 0;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async head(key) {
+        if (claimed && !paused) {
+          paused = true;
+          postClaimHead();
+          await headReleased;
+        }
+        return await baseObjects.head(key);
+      },
+      async delete(key) {
+        deleteCalls += 1;
+        return await baseObjects.delete(key);
+      },
+    };
+    let timestamp = Date.parse("2026-09-13T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `overlap-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'overlap'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "overlap",
+    });
+
+    const owner = reconciler.reconcile({ limit: 16, deleteObjects: true });
+    await postClaimHeadEntered;
+    const observer = await reconciler.reconcile({ limit: 16, deleteObjects: true });
+    expect(observer.deletedObjects).toBe(0);
+    expect(deleteCalls).toBe(0);
+    releaseHead();
+    expect((await owner).deletedObjects).toBe(1);
+    expect(deleteCalls).toBe(1);
+  });
+
+  test("an expired pre-delete claimant is fenced and reclaimed before external deletion", async () => {
+    const durable = createEphemeralSql();
+    let claimed = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (statements.some(({ sql }) => sql.includes("'delete_claimed'"))) claimed = true;
+        return result;
+      },
+    };
+    const baseObjects = createMemoryObjectStore();
+    let failPostClaimHead = true;
+    let deleteCalls = 0;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async head(key) {
+        if (claimed && failPostClaimHead) {
+          failPostClaimHead = false;
+          throw new Error("simulated collector crash before delete start");
+        }
+        return await baseObjects.head(key);
+      },
+      async delete(key) {
+        deleteCalls += 1;
+        return await baseObjects.delete(key);
+      },
+    };
+    let timestamp = Date.parse("2026-09-14T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `reclaim-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'reclaim'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "reclaim",
+    });
+
+    await expect(reconciler.reconcile({ limit: 16, deleteObjects: true })).rejects.toThrow(
+      "collector crash before delete start",
+    );
+    expect(deleteCalls).toBe(0);
+    timestamp += 5 * 60_000;
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+    expect(deleteCalls).toBe(1);
+    expect(
+      await durable.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "available", last_outcome: "deleted" }]);
+  });
+
+  test("an expired pre-delete owner resumes as an observer after its claim is reclaimed", async () => {
+    const durable = createEphemeralSql();
+    let firstClaimed = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (statements.some(({ sql }) => sql.includes("'delete_claimed'"))) firstClaimed = true;
+        return result;
+      },
+    };
+    const baseObjects = createMemoryObjectStore();
+    let firstHeadEntered!: () => void;
+    const firstHeadWasEntered = new Promise<void>((resolve) => {
+      firstHeadEntered = resolve;
+    });
+    let releaseFirstHead!: () => void;
+    const firstHeadReleased = new Promise<void>((resolve) => {
+      releaseFirstHead = resolve;
+    });
+    let paused = false;
+    let deleteCalls = 0;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async head(key) {
+        if (firstClaimed && !paused) {
+          paused = true;
+          firstHeadEntered();
+          await firstHeadReleased;
+        }
+        return await baseObjects.head(key);
+      },
+      async delete(key) {
+        deleteCalls += 1;
+        return await baseObjects.delete(key);
+      },
+    };
+    let timestamp = Date.parse("2026-09-14T12:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `resume-after-reclaim-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'resume after reclaim'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "resume-after-reclaim",
+    });
+
+    const staleOwner = reconciler.reconcile({ limit: 16, deleteObjects: true });
+    await firstHeadWasEntered;
+    timestamp += 5 * 60_000;
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+    expect(deleteCalls).toBe(1);
+
+    releaseFirstHead();
+    expect((await staleOwner).deletedObjects).toBe(0);
+    expect(deleteCalls).toBe(1);
+    expect(
+      await durable.query(
+        `SELECT state, last_outcome FROM tf_artifact_gc_candidates
+         WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "deleted", last_outcome: "deleted" }]);
+  });
+
+  test("a stale pre-delete owner cannot overwrite its successor's ETag retry", async () => {
+    const durable = createEphemeralSql();
+    let firstClaimed = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (statements.some(({ sql }) => sql.includes("'delete_claimed'"))) firstClaimed = true;
+        return result;
+      },
+    };
+    const baseObjects = createMemoryObjectStore();
+    let firstHeadEntered!: () => void;
+    const firstHeadWasEntered = new Promise<void>((resolve) => {
+      firstHeadEntered = resolve;
+    });
+    let releaseFirstHead!: () => void;
+    const firstHeadReleased = new Promise<void>((resolve) => {
+      releaseFirstHead = resolve;
+    });
+    let paused = false;
+    let deleteCalls = 0;
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async head(key) {
+        if (firstClaimed && !paused) {
+          paused = true;
+          firstHeadEntered();
+          await firstHeadReleased;
+        }
+        return await baseObjects.head(key);
+      },
+      async delete(key) {
+        deleteCalls += 1;
+        return await baseObjects.delete(key);
+      },
+    };
+    let timestamp = Date.parse("2026-09-14T18:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `stale-etag-retry-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'stale etag original'");
+    const replacement = new TextEncoder().encode("export default 'stale etag replaced'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    const key = `art/${digest.slice("sha256:".length)}`;
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "stale-etag-retry",
+    });
+
+    const staleOwner = reconciler.reconcile({ limit: 16, deleteObjects: true });
+    await firstHeadWasEntered;
+    await baseObjects.put(key, replacement);
+    timestamp += 5 * 60_000;
+    const successor = await reconciler.reconcile({ limit: 16, deleteObjects: true });
+    expect(successor.retryableObjects).toBe(1);
+    expect(deleteCalls).toBe(0);
+
+    releaseFirstHead();
+    const stale = await staleOwner;
+    expect(stale.retryableObjects).toBe(0);
+    expect(stale.deletedObjects).toBe(0);
+    expect(deleteCalls).toBe(0);
+    expect(
+      await durable.query(
+        `SELECT state, last_outcome FROM tf_artifact_gc_candidates
+         WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "retry", last_outcome: "etag_changed" }]);
+    expect(await baseObjects.head(key)).not.toBeNull();
+  });
+
+  test("a started delete never gains a second claimant and does not block another digest", async () => {
+    const sql = createEphemeralSql();
+    const baseObjects = createMemoryObjectStore();
+    let deleteEntered!: () => void;
+    const firstDeleteEntered = new Promise<void>((resolve) => {
+      deleteEntered = resolve;
+    });
+    let releaseDelete!: () => void;
+    const deleteReleased = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    let paused = false;
+    const deleteCalls: string[] = [];
+    const objects: ObjectStoreAccess = {
+      ...baseObjects,
+      async delete(key) {
+        deleteCalls.push(key);
+        if (!paused) {
+          paused = true;
+          deleteEntered();
+          await deleteReleased;
+        }
+        return await baseObjects.delete(key);
+      },
+    };
+    let timestamp = Date.parse("2026-09-15T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `started-${++sequence}`,
+    });
+    const firstBytes = new TextEncoder().encode("export default 'started first'");
+    const secondBytes = new TextEncoder().encode("export default 'started second'");
+    const firstManifest = await workerManifest(firstBytes);
+    const secondManifest = await workerManifest(secondBytes);
+    const firstDigest = firstManifest.modules?.[0]?.digest;
+    const secondDigest = secondManifest.modules?.[0]?.digest;
+    if (!firstDigest || !secondDigest) throw new Error("fixture digest is missing");
+    for (const [bytes, manifest, digest, key] of [
+      [firstBytes, firstManifest, firstDigest, "started-first"],
+      [secondBytes, secondManifest, secondDigest, "started-second"],
+    ] as const) {
+      await prepareDueBlobCandidate({
+        target,
+        reconciler,
+        advance(milliseconds) {
+          timestamp += milliseconds;
+        },
+        bytes,
+        manifest,
+        digest,
+        key,
+      });
+    }
+
+    const owner = reconciler.reconcile({ limit: 16, deleteObjects: true });
+    await firstDeleteEntered;
+    const pausedKey = deleteCalls[0];
+    timestamp += 10 * 60_000;
+    const observer = await reconciler.reconcile({ limit: 16, deleteObjects: true });
+    expect(observer.deletedObjects).toBe(1);
+    expect(deleteCalls).toHaveLength(2);
+    expect(new Set(deleteCalls).size).toBe(2);
+    expect(await baseObjects.head(pausedKey ?? "missing")).not.toBeNull();
+
+    releaseDelete();
+    expect((await owner).deletedObjects).toBe(1);
+    expect(deleteCalls).toHaveLength(2);
+    expect(await baseObjects.head(pausedKey ?? "missing")).toBeNull();
+  });
+
+  test("an out-of-protocol unleased PUT before collector DELETE is removed and its hold is fenced", async () => {
+    const durable = createEphemeralSql();
+    const baseObjects = createMemoryObjectStore();
+    let digest = "";
+    let legacyHoldFenced = false;
+    const replacement = new TextEncoder().encode("legacy late replacement");
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (
+          digest &&
+          statements.some(({ sql }) => sql.includes("SET fence = fence + 1, lease_expires_at = ?"))
+        ) {
+          await baseObjects.put(`art/${digest.slice("sha256:".length)}`, replacement);
+          try {
+            await durable.run(
+              `INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind)
+               VALUES (?, ?, 'blob')`,
+              [PRINCIPAL.tenantId, digest],
+            );
+          } catch {
+            legacyHoldFenced = true;
+          }
+        }
+        return result;
+      },
+    };
+    let timestamp = Date.parse("2026-09-16T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects: baseObjects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects: baseObjects,
+      clock,
+      randomId: () => `late-put-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'late put target'");
+    const manifest = await workerManifest(bytes);
+    digest = manifest.modules?.[0]?.digest ?? "";
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "late-put",
+    });
+
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+    expect(legacyHoldFenced).toBe(true);
+    expect(await baseObjects.head(`art/${digest.slice("sha256:".length)}`)).toBeNull();
+  });
+
+  test("a lost SQL acknowledgement after delete settlement reads back the exact owner", async () => {
+    const durable = createEphemeralSql();
+    let loseSettlement = false;
+    const sql: Sql = {
+      query: (statement, params) => durable.query(statement, params),
+      run: (statement, params) => durable.run(statement, params),
+      async batch(statements) {
+        const result = await durable.batch(statements);
+        if (loseSettlement && statements.some(({ sql }) => sql.includes("SET state = 'deleted'"))) {
+          loseSettlement = false;
+          await durable.run(
+            `UPDATE tf_artifact_blob_io_leases
+             SET operation_id = 'abd_later_reuse', fence = fence + 1, updated_at = updated_at + 1
+             WHERE state = 'available'`,
+          );
+          throw new Error("simulated lost delete settlement acknowledgement");
+        }
+        return result;
+      },
+    };
+    const objects = createMemoryObjectStore();
+    let timestamp = Date.parse("2026-09-17T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `settle-ack-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'settle ack'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "settle-ack",
+    });
+
+    loseSettlement = true;
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+    expect(
+      await durable.query(
+        `SELECT state, last_outcome FROM tf_artifact_gc_candidates
+         WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "deleted", last_outcome: "deleted" }]);
+  });
+
+  test("an out-of-protocol unleased write is persistently re-quarantined from its released root", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    let timestamp = Date.parse("2026-09-18T00:00:00.000Z");
+    const clock = () => new Date(timestamp);
+    const target = fixture({ sql, objects, clock });
+    let sequence = 0;
+    const reconciler = createTakoformArtifactReconciler({
+      sql,
+      objects,
+      clock,
+      randomId: () => `legacy-rearm-${++sequence}`,
+    });
+    const bytes = new TextEncoder().encode("export default 'legacy rearm'");
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+    await prepareDueBlobCandidate({
+      target,
+      reconciler,
+      advance(milliseconds) {
+        timestamp += milliseconds;
+      },
+      bytes,
+      manifest,
+      digest,
+      key: "legacy-rearm",
+    });
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+
+    const key = `art/${digest.slice("sha256:".length)}`;
+    await objects.put(key, bytes);
+    await sql.run(
+      `INSERT OR IGNORE INTO tf_artifact_holds (tenant_id, digest, kind)
+       VALUES (?, ?, 'blob')`,
+      [PRINCIPAL.tenantId, digest],
+    );
+    await reconciler.reconcile({ limit: 16, deleteObjects: false });
+    expect(
+      await sql.query(
+        `SELECT state, not_before FROM tf_artifact_gc_candidates
+         WHERE kind = 'blob' AND digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "pending", not_before: timestamp + 60 * 60_000 }]);
+    expect(
+      await sql.query(
+        `SELECT 1 AS held FROM tf_artifact_holds
+         WHERE tenant_id = ? AND kind = 'blob' AND digest = ?`,
+        [PRINCIPAL.tenantId, digest],
+      ),
+    ).toEqual([]);
+    expect(await objects.head(key)).not.toBeNull();
+
+    timestamp += 2 * 60 * 60_000;
+    expect((await reconciler.reconcile({ limit: 16, deleteObjects: true })).deletedObjects).toBe(1);
+    expect(await objects.head(key)).toBeNull();
+  });
+
   test("keeps an honest deleting tombstone when SQL settlement fails after object deletion", async () => {
     const durable = createEphemeralSql();
     const fault = failNextSqlBeforeWrite(durable);
@@ -640,8 +1635,9 @@ describe("Takoform artifact lifecycle", () => {
       ),
     ).toEqual([{ state: "deleting", last_outcome: "claimed" }]);
 
-    // Retrying reads the fenced candidate and the now-absent object. It only
-    // settles the durable tombstone; it cannot issue a second destructive act.
+    // A pre-write SQL outage after the external delete is not an
+    // acknowledgement: the original invocation may still resume. Absence and
+    // elapsed time cannot release that started owner or authorize reuse.
     const retried = await reconciler.reconcile({ limit: 16, deleteObjects: true });
     expect(retried.deletedObjects).toBe(0);
     expect(retried.retryableObjects).toBe(0);
@@ -651,7 +1647,13 @@ describe("Takoform artifact lifecycle", () => {
          WHERE kind = 'blob' AND digest = ?`,
         [digest],
       ),
-    ).toEqual([{ state: "deleted", last_outcome: "already_absent" }]);
+    ).toEqual([{ state: "deleting", last_outcome: "claimed" }]);
+    expect(
+      await durable.query(
+        `SELECT state, last_outcome FROM tf_artifact_blob_io_leases WHERE digest = ?`,
+        [digest],
+      ),
+    ).toEqual([{ state: "deleting", last_outcome: "delete_started" }]);
   });
 
   test("cleans an exact failed-run upload only with a durable closure receipt and no live Resource", async () => {
@@ -936,6 +1938,8 @@ describe("Takoform artifact lifecycle", () => {
     const candidateDigest = `sha256:${"7".repeat(64)}`;
     const untrackedDigest = `sha256:${"8".repeat(64)}`;
     const resurrectedDeletedDigest = `sha256:${"9".repeat(64)}`;
+    const permanentlyFencedDigest = `sha256:${"a".repeat(64)}`;
+    const completedResultDigest = `sha256:${"b".repeat(64)}`;
     const manifest = JSON.stringify({
       apiVersion: "artifacts.takoform.com/v1alpha1",
       kind: "WorkerBundle",
@@ -994,6 +1998,25 @@ describe("Takoform artifact lifecycle", () => {
        VALUES ('blob', ?, 'deleted', 2, 21, NULL, 1, 'deleted', 11, 12, 12)`,
       [resurrectedDeletedDigest],
     );
+    await sql.run(
+      `INSERT INTO tf_artifact_blob_io_leases
+         (digest, state, fence, operation_id, tenant_id, principal_id, upload_id,
+          upload_fence, root_fence, expected_size, candidate_fence,
+          lease_expires_at, last_outcome, created_at, updated_at)
+       VALUES (?, 'deleting', 1, 'legacy-delete-status',
+               NULL, NULL, NULL, NULL, NULL, NULL, 2, 12,
+               'delete_started', 11, 12)`,
+      [permanentlyFencedDigest],
+    );
+    await sql.run(
+      `INSERT INTO tf_artifact_blob_io_results
+         (operation_id, digest, operation_kind, lease_fence, candidate_fence,
+          tenant_id, principal_id, upload_id, upload_fence, root_fence,
+          expected_size, outcome, completed_at)
+       VALUES ('abd_completed_status', ?, 'delete', 1, 1,
+               NULL, NULL, NULL, NULL, NULL, NULL, 'deleted', 12)`,
+      [completedResultDigest],
+    );
     await objects.put(`art/${untrackedDigest.slice("sha256:".length)}`, new Uint8Array([8]));
     await objects.put(
       `art/${resurrectedDeletedDigest.slice("sha256:".length)}`,
@@ -1026,7 +2049,11 @@ describe("Takoform artifact lifecycle", () => {
       },
     } as const;
 
-    expect(await reconciler.status()).toMatchObject(evidence);
+    expect(await reconciler.status()).toMatchObject({
+      ...evidence,
+      permanentlyFencedBlobDeletes: 1,
+      completedBlobIoResults: 1,
+    });
     expect(await reconciler.dryRun({ limit: 16 })).toMatchObject(evidence);
   });
 
@@ -1091,6 +2118,8 @@ describe("Takoform artifact lifecycle", () => {
       retryableCandidates: 0,
       deletingCandidates: 0,
       deletedTombstones: 0,
+      permanentlyFencedBlobDeletes: 0,
+      completedBlobIoResults: 0,
       legacyHoldRoots: 0,
       legacyManifestRoots: 0,
       danglingCommittedUploads: 0,

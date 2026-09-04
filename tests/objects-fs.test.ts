@@ -103,6 +103,35 @@ describe("objects on a disk", () => {
     expect(await new Response(read?.body).text()).toBe("still here");
   });
 
+  test("persists exact write operation identity and drops it on an untagged rewrite", async () => {
+    await store.put("art/exact", new TextEncoder().encode("first"), {
+      writeOperationId: "abw_filesystem_exact",
+    });
+    const reopened = createFileObjectStore({ root });
+    expect((await reopened.get("art/exact"))?.writeOperationId).toBe("abw_filesystem_exact");
+    expect((await reopened.head("art/exact"))?.writeOperationId).toBe("abw_filesystem_exact");
+    expect((await reopened.list({ prefix: "art/", limit: 10 })).objects[0]?.writeOperationId).toBe(
+      "abw_filesystem_exact",
+    );
+
+    await reopened.put("art/exact", new TextEncoder().encode("second"));
+    expect((await reopened.head("art/exact"))?.writeOperationId).toBeUndefined();
+  });
+
+  test("fails closed when tagged bytes have no readable metadata publication", async () => {
+    await store.put("art/interrupted", new TextEncoder().encode("bytes"), {
+      writeOperationId: "abw_filesystem_interrupted",
+    });
+    rmSync(join(root, ".object-metadata", "6172742f696e746572727570746564.json"));
+
+    const reopened = createFileObjectStore({ root });
+    expect((await reopened.head("art/interrupted"))?.writeOperationId).toBeUndefined();
+    expect((await reopened.get("art/interrupted"))?.writeOperationId).toBeUndefined();
+    expect(
+      (await reopened.list({ prefix: "art/", limit: 10 })).objects[0]?.writeOperationId,
+    ).toBeUndefined();
+  });
+
   test("publishes a complete create-only object without replacing an existing key", async () => {
     expect(await store.create("immutable", new TextEncoder().encode("first"))).not.toBeNull();
     expect(await store.create("immutable", new TextEncoder().encode("second"))).toBeNull();

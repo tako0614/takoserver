@@ -19,6 +19,7 @@ export interface R2ObjectLike {
   readonly size: number;
   readonly etag: string;
   readonly httpMetadata?: { readonly contentType?: string } | undefined;
+  readonly customMetadata?: Readonly<Record<string, string>> | undefined;
 }
 
 export interface R2ObjectBodyLike extends R2ObjectLike {
@@ -37,6 +38,7 @@ export interface R2BucketLike {
     body: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array>,
     options?: {
       readonly httpMetadata?: { readonly contentType?: string };
+      readonly customMetadata?: Readonly<Record<string, string>>;
       readonly onlyIf?: { readonly etagDoesNotMatch: "*" };
     },
   ): Promise<R2ObjectLike | null>;
@@ -47,8 +49,11 @@ export interface R2BucketLike {
     readonly prefix?: string;
     readonly limit?: number;
     readonly cursor?: string;
+    readonly include?: ("httpMetadata" | "customMetadata")[];
   }): Promise<R2ListedLike>;
 }
+
+const WRITE_OPERATION_METADATA_KEY = "takoserver-write-operation-id";
 
 /** `ObjectStore` over an R2 Worker binding. Bodies stay streamed end to end. */
 export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
@@ -64,10 +69,16 @@ export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
   }
 
   return {
+    writeOperationIdentity: "exact",
+
     async create(key, body, options): Promise<StoredObject | null> {
       const contentType = options?.contentType;
+      const writeOperationId = options?.writeOperationId;
       const written = await bucket.put(key, body, {
         ...(contentType ? { httpMetadata: { contentType } } : {}),
+        ...(writeOperationId
+          ? { customMetadata: { [WRITE_OPERATION_METADATA_KEY]: writeOperationId } }
+          : {}),
         onlyIf: { etagDoesNotMatch: "*" },
       });
       return written ? described(written) : null;
@@ -75,10 +86,17 @@ export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
 
     async put(key, body, options): Promise<StoredObject> {
       const contentType = options?.contentType;
+      const writeOperationId = options?.writeOperationId;
+      const putOptions = {
+        ...(contentType ? { httpMetadata: { contentType } } : {}),
+        ...(writeOperationId
+          ? { customMetadata: { [WRITE_OPERATION_METADATA_KEY]: writeOperationId } }
+          : {}),
+      };
       const written = await bucket.put(
         key,
         body,
-        contentType ? { httpMetadata: { contentType } } : undefined,
+        Object.keys(putOptions).length > 0 ? putOptions : undefined,
       );
       if (!written) throw new ObjectStoreError("unavailable", "R2 did not acknowledge the write");
       return described(written);
@@ -110,6 +128,7 @@ export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
       const page = await bucket.list({
         prefix: input.prefix,
         limit: input.limit,
+        include: ["httpMetadata", "customMetadata"],
         ...(input.cursor ? { cursor: input.cursor } : {}),
       });
       return {
@@ -123,6 +142,7 @@ export function createR2ObjectStore(bucket: R2BucketLike): ObjectStore {
 
 function described(object: R2ObjectLike): StoredObject {
   const contentType = object.httpMetadata?.contentType;
+  const writeOperationId = object.customMetadata?.[WRITE_OPERATION_METADATA_KEY];
   if (!Number.isSafeInteger(object.size) || object.size < 0) {
     throw new ObjectStoreError("unavailable", "R2 reported an invalid object size");
   }
@@ -131,5 +151,6 @@ function described(object: R2ObjectLike): StoredObject {
     size: object.size,
     etag: object.etag,
     ...(contentType ? { contentType } : {}),
+    ...(writeOperationId ? { writeOperationId } : {}),
   };
 }

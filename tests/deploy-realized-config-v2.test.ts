@@ -24,6 +24,22 @@ const target = {
 } satisfies DeployTarget;
 
 describe("realized Worker configuration", () => {
+  test("realizes the pre-0043 artifact I/O compatibility mode as an exact version binding", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-"));
+    try {
+      const path = writeWorkerConfig(
+        { ...target, artifactBlobIoMode: "pre-0043-quiesced" },
+        { path: join(root, "wrangler.jsonc"), main: "worker.js", commit: "a".repeat(40) },
+      );
+      const config = JSON.parse(readFileSync(path, "utf8")) as {
+        vars: Record<string, string>;
+      };
+      expect(config.vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE).toBe("pre-0043-quiesced");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("realizes the independent public Worker with no service binding", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-v2-"));
     try {
@@ -34,6 +50,7 @@ describe("realized Worker configuration", () => {
       });
       const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
       expect(effectiveSigningKeyId(target)).toBe("key-current");
+      expect(config.preview_urls).toBe(false);
       expect(config.vars).toMatchObject({ TAKOSERVER_SIGNING_KEY_ID: "key-current" });
       expect(config).not.toHaveProperty("services");
       expect(config.secrets).toEqual({
@@ -182,6 +199,7 @@ describe("realized Worker configuration", () => {
         "domains",
         "workers_dev",
         "workers_dev_subdomain",
+        "preview_urls",
         "triggers",
       ]) {
         expect(config).not.toHaveProperty(key);

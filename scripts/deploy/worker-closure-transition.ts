@@ -1,6 +1,10 @@
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import {
+  artifactBlobIoCompatibilityAllowsPending,
+  probeArtifactBlobIoQuiescence,
+} from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
@@ -192,11 +196,11 @@ export async function runWorkerClosureTransition(
         appliedMigrations: migrationState.applied,
         pendingMigrations: pending,
         mutationApplied: false,
-        ready: pending.length === 0,
+        ready: pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending),
       };
     }
 
-    if (pending.length > 0) {
+    if (pending.length > 0 && !artifactBlobIoCompatibilityAllowsPending(target, pending)) {
       throw preflightError(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
@@ -331,13 +335,23 @@ export async function runWorkerClosureTransition(
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
     const afterMigrations = await migrations.read();
-    if (pendingMigrations(afterMigrations.local, afterMigrations.applied).length > 0) {
+    const afterPending = pendingMigrations(afterMigrations.local, afterMigrations.applied);
+    if (
+      afterPending.length > 0 &&
+      !artifactBlobIoCompatibilityAllowsPending(target, afterPending)
+    ) {
       throw verificationError("closure transition left pending D1 migrations");
     }
-    const probe = await probeProduct(
-      target.publicOrigin,
-      options.fetcher ?? ((input, init) => fetch(input, init)),
-    );
+    const probe =
+      target.artifactBlobIoMode === "pre-0043-quiesced"
+        ? await probeArtifactBlobIoQuiescence(
+            target.publicOrigin,
+            options.fetcher ?? ((input, init) => fetch(input, init)),
+          )
+        : await probeProduct(
+            target.publicOrigin,
+            options.fetcher ?? ((input, init) => fetch(input, init)),
+          );
     const rollbackVersionId = after.history.previousVersionId;
     if (rollbackVersionId === null) {
       throw verificationError(
@@ -365,6 +379,7 @@ export async function runWorkerClosureTransition(
       previousVersionId: rollbackVersionId,
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
+      pendingMigrations: afterPending,
       probe,
       mutationApplied: true,
       rollback:
@@ -418,7 +433,9 @@ async function appliedClosureTransitionStatus(
     appliedMigrations: migrationState.applied,
     pendingMigrations: pending,
     mutationApplied: false,
-    ready: pending.length === 0 && successor.commit === invocation.commit,
+    ready:
+      (pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending)) &&
+      successor.commit === invocation.commit,
   };
 }
 

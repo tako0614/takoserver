@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { bytesDigest, canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createR2HttpObjectStore } from "../src/objects-r2-http.ts";
+import type { ObjectStoreError } from "../src/ports.ts";
 import { FORM_PACKAGE_LIMITS } from "../src/takoform/form-package-limits.ts";
 import {
   createFormPackageReader,
@@ -10,6 +11,30 @@ import {
 import { packageManifest } from "../src/takoform/form-packages.ts";
 
 describe("R2 HTTP object adapter", () => {
+  test("refuses an exact write identity it cannot round-trip", async () => {
+    let called = false;
+    const store = createR2HttpObjectStore({
+      accountId: "account",
+      bucketName: "bucket",
+      authorize: () => "Bearer test",
+      apiOrigin: "https://r2.test",
+      fetch: async () => {
+        called = true;
+        return new Response(null, { status: 500 });
+      },
+    });
+
+    await expect(
+      store.put("art/exact", new Uint8Array([1]), {
+        writeOperationId: "abw_http_must_not_drop",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid",
+      message: "R2 HTTP cannot persist an exact write operation identity",
+    } satisfies Partial<ObjectStoreError>);
+    expect(called).toBe(false);
+  });
+
   test("fails closed and returns promptly when a probe has no exact size metadata", async () => {
     let cancelled = false;
     const store = createR2HttpObjectStore({

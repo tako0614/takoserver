@@ -29,6 +29,15 @@ const VERSION_AFTER = "00000000-0000-4000-8000-000000000002";
 const VERSION_UNRELATED = "00000000-0000-4000-8000-000000000003";
 const VERSION_UNRELATED_PREVIOUS = "00000000-0000-4000-8000-000000000004";
 const OTHER_COMMIT = "d".repeat(40);
+const ARTIFACT_BLOB_IO_COMPATIBILITY_PENDING = [
+  "0037_worker_runtime_input_preparation_v2.sql",
+  "0038_selfhost_edge_kv.sql",
+  "0039_takoform_live_native_claim_across_tenants.sql",
+  "0040_selfhost_queues_and_schedules.sql",
+  "0041_selfhost_object_buckets.sql",
+  "0042_worker_endpoint_origin_reservation_space_id.sql",
+  "0043_artifact_blob_io_fences.sql",
+] as const;
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -60,6 +69,8 @@ function fixture(
     readonly beforeVersionMetadataAfterBuild?: boolean;
     readonly afterWithoutVersionMetadata?: boolean;
     readonly replaceDeploymentDuringFinalInspection?: boolean;
+    readonly selectedTarget?: DeployTarget;
+    readonly local?: readonly string[];
   } = {},
 ): {
   readonly run: WorkerProcess;
@@ -68,6 +79,7 @@ function fixture(
   readonly migrations: WorkerMigrationReader;
 } {
   const calls: string[][] = [];
+  const selectedTarget = input.selectedTarget ?? target;
   let current = input.current ?? "before";
   let built = false;
   let replacementObserved = false;
@@ -104,7 +116,7 @@ function fixture(
   };
   const state: WorkerState = {
     async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: target.workerName }];
+      return [{ hostname: "api.integration.example.test", service: selectedTarget.workerName }];
     },
     async workerDeployments() {
       if (current === "before") {
@@ -129,8 +141,7 @@ function fixture(
       ];
     },
     async workerVersion(_worker, versionId) {
-      const result = version(
-        versionId,
+      const message =
         versionId === VERSION_BEFORE
           ? built && input.beforeMessageAfterBuild !== undefined
             ? input.beforeMessageAfterBuild
@@ -143,15 +154,21 @@ function fixture(
               : input.afterMessage
             : input.unrelatedMessage === undefined
               ? `takoserver-worker:${OTHER_COMMIT}:${"e".repeat(64)}`
-              : input.unrelatedMessage,
-        versionId === VERSION_BEFORE &&
-          input.legacyBeforeWithoutVersionMetadata === true &&
-          !(built && input.beforeVersionMetadataAfterBuild === true)
-          ? "legacy-pre-version-metadata"
-          : versionId === VERSION_AFTER && input.afterWithoutVersionMetadata === true
-            ? "legacy-pre-version-metadata"
-            : "current",
-      );
+              : input.unrelatedMessage;
+      const result =
+        input.selectedTarget !== undefined && message !== null
+          ? versionForTarget(versionId, message, selectedTarget)
+          : version(
+              versionId,
+              message,
+              versionId === VERSION_BEFORE &&
+                input.legacyBeforeWithoutVersionMetadata === true &&
+                !(built && input.beforeVersionMetadataAfterBuild === true)
+                ? "legacy-pre-version-metadata"
+                : versionId === VERSION_AFTER && input.afterWithoutVersionMetadata === true
+                  ? "legacy-pre-version-metadata"
+                  : "current",
+            );
       if (
         built &&
         versionId === VERSION_BEFORE &&
@@ -173,7 +190,7 @@ function fixture(
     migrations: {
       async read() {
         return {
-          local: ["0001_first.sql", "0002_second.sql"],
+          local: input.local ?? ["0001_first.sql", "0002_second.sql"],
           applied: input.applied ?? ["0001_first.sql", "0002_second.sql"],
         };
       },
@@ -478,6 +495,51 @@ describe("split Takoserver Worker surfaces", () => {
       expect(failure.message).toContain("pending D1 migrations");
       expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
       expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("publishes a second all-traffic compatibility Version while the exact 0043 wave is pending", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-0043-compatibility-"));
+    const compatibilityTarget = {
+      ...target,
+      artifactBlobIoMode: "pre-0043-quiesced",
+    } satisfies DeployTarget;
+    try {
+      const current = fixture({
+        selectedTarget: compatibilityTarget,
+        local: ARTIFACT_BLOB_IO_COMPATIBILITY_PENDING,
+        applied: [],
+        beforeMessage: `takoserver-worker:${COMMIT}:${"c".repeat(64)}`,
+        diff: "",
+      });
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        compatibilityTarget,
+        {
+          ...current,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: artifactBlobIoQuiescenceFetcher,
+        },
+      );
+      expect(result).toMatchObject({
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+        probe: {
+          url: `${target.publicOrigin}/healthz`,
+          status: 503,
+          traffic: "quiesced",
+        },
+      });
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1669,6 +1731,22 @@ function publishedProductFetcher(
     }
     return Response.json({ error: "not_found" }, { status: 404 });
   };
+}
+
+async function artifactBlobIoQuiescenceFetcher(): Promise<Response> {
+  return Response.json(
+    {
+      error: {
+        code: "backend_unavailable",
+        message: "artifact blob I/O is quiesced for the 0043 compatibility cutover",
+        details: { reason: "runtime-configuration" },
+      },
+    },
+    {
+      status: 503,
+      headers: { "cache-control": "no-store", "retry-after": "60" },
+    },
+  );
 }
 
 function deployment(id: string, versionId: string, created: string) {
