@@ -18,11 +18,11 @@ The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0042>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0042>
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043>
 ```
 
-The fixed order is 0023–0028, 0029–0033, 0034–0036, then 0037–0042. A
+The fixed order is 0023–0028, 0029–0033, 0034–0036, then 0037–0043. A
 selector is accepted only when its predecessor is the current lineage; an
 incomplete wave can resume under the same selector, but cannot skip forward.
 Integration retains only the no-selector fast path for disposable cadence and
@@ -424,7 +424,7 @@ remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0042`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0043`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -714,7 +714,13 @@ The separate authority and irreversible surfaces are:
   post-qualification, and the final mutation fence report and require zero for
   0029 malformed FormRefs and duplicate live Resource UIDs, 0036 unmatched
   dispatched repair sagas, the nonempty 0037 v1 replacement predecessor, and
-  0039 duplicate live native claims. The audited migration inventory has one
+  0039 duplicate live native claims. A pending 0043 also reports the number of
+  `deleting` blob candidates that overlap either an active direct root or a
+  member of an active manifest root as
+  `dataPreflights.artifactBlobIoFence.activeRootDeletingCandidateConflictCount`.
+  A nonzero count is `legacy_data_repair_required`, and the exact query is run
+  again after the 0037 transactional guard and immediately before the wave's
+  first migration. The audited migration inventory has one
   fixed SHA-256 per file, including every already-applied file; a changed old
   migration therefore cannot be re-attested from the current checkout. Each
   rehearsal wave writes one no-overwrite canonical `0600` receipt binding the
@@ -746,6 +752,100 @@ The separate authority and irreversible surfaces are:
   exact authoritative boundary, then finalizes evidence without applying the
   migrations a second time. The lease does not claim to fence another operator
   host or a direct Cloudflare/API mutation.
+
+### 0043 artifact blob-I/O compatibility protocol
+
+Migration 0043 changes the authority immediately around R2 `PUT` and `DELETE`.
+An older invocation cannot see its lease table, and a D1 trigger cannot
+intercept an object request that has already crossed into R2. Therefore 0043 is
+not migration-first compatible. It remains blocked until this exact staged
+protocol has removed every older object-I/O invocation:
+
+1. Add `"artifactBlobIoMode": "pre-0043-quiesced"` to the operator-private
+   deploy target. Publish the selected 0043 commit through
+   `takoserver-worker-authority-cutover`, using the current Version as
+   `--closure-predecessor-version` and
+   `--add-var=TAKOSERVER_ARTIFACT_BLOB_IO_MODE`. This exceptional target is
+   allowed only while the exact ordered 0037–0043 suffix is pending. It returns
+   the owned `503 backend_unavailable` envelope on every request before D1/R2
+   composition and makes scheduled execution a no-op. The realized Worker
+   configuration explicitly sets `preview_urls: false`.
+2. Publish the same selected commit and compatibility target a second time
+   through `takoserver-worker-authority-cutover`, without a closure selector.
+   The authoritative current Version and its immediate rollback Version must
+   now both contain the exact quiescence binding and selected commit. Public
+   Version and alias preview URLs must remain disabled: Cloudflare documents
+   that an enabled [preview URL can publicly invoke a specific historical
+   Version](https://developers.cloudflare.com/workers/versions-and-deployments/preview-urls/).
+   The `/healthz` smoke for these publications is the quiescence `503`, not the
+   normal product-success probe.
+3. Keep traffic blocked. Only the external traffic/Cloudflare operator can
+   establish that every request and event invocation of every older Version
+   completed or was cancelled. This repository has no exhaustive active-
+   invocation API and does not manufacture that fact. A fixed waiting interval
+   is not a substitute: Cloudflare documents no hard duration limit for an
+   [HTTP Worker invocation while its client remains connected](https://developers.cloudflare.com/workers/platform/limits/#duration).
+   Once completion or cancellation is established, the operator writes a
+   private receipt with exactly this shape:
+
+   ```json
+   {
+     "kind": "takoserver.artifact-blob-io-quiescence@v1",
+     "environment": "production",
+     "accountId": "<exact account id>",
+     "workerName": "<exact Worker name>",
+     "databaseId": "<exact D1 id>",
+     "bucketName": "<exact R2 bucket name>",
+     "currentCompatibilityDeploymentId": "<current compatibility deployment UUID>",
+     "rollbackCompatibilityDeploymentId": "<immediate compatibility deployment UUID>",
+     "currentCompatibilityVersionId": "<current compatibility Version UUID>",
+     "rollbackCompatibilityVersionId": "<immediate compatibility rollback UUID>",
+     "unsafePredecessorInvocations": "drained-or-cancelled",
+     "observedAt": "<ISO timestamp>",
+     "operator": "<operator identity>"
+   }
+   ```
+
+   The receipt is an owned, link-free, exact-`0600` regular file of at most
+   16 KiB under an owned exact-`0700` directory outside every Git worktree. Set
+   `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` to its absolute path.
+   If the operator cannot establish the assertion, do not create the receipt;
+   0043 intentionally remains unavailable.
+4. Run `takoserver-d1-schema --status --through-migration=0043`. Readiness now
+   requires the two immutable compatibility Versions, disabled public preview
+   URLs, unchanged deployment history, an exact receipt created after and bound
+   to both deployment and Version identities, and zero
+   active-root/deleting-candidate conflicts. Apply re-reads every item at
+   qualification, at the final fence, and in mutation phase immediately before
+   the first migration. A preview setting, history, receipt, target, or count
+   change prevents the Wrangler apply; redeploying even the same two Versions
+   invalidates the receipt and requires another drain proof.
+5. After the exact 0043 lineage reads back, remove `artifactBlobIoMode` from the
+   private target and publish through the authority cutover with the serving
+   compatibility Version as `--closure-predecessor-version` and
+   `--retire-var=TAKOSERVER_ARTIFACT_BLOB_IO_MODE`. The new code now admits a
+   per-digest `write_admitted` owner before each PUT and advances a blob delete
+   through `delete_claimed` then `delete_started` before its one external
+   DELETE. Its immediate rollback remains the compatibility Worker, so rollback
+   is service-denying but cannot run historical object I/O.
+
+Before step 4, aborting the cutover may deliberately restore an older Version,
+but doing so invalidates and requires deletion of any drain receipt. From the
+first 0043 mutation onward, never select an older pre-compatibility Version,
+including through the dashboard or a manually chosen Version rollback. The
+owning deploy output names only the safe immediate predecessor. Subsequent
+normal publications make lease-aware Versions each other's rollback; the
+compatibility Version can then age out of the immediate rollback position.
+
+Artifact maintenance status exposes `permanentlyFencedBlobDeletes`: external
+DELETE owners still at `delete_started` after their lease deadline. Neither
+object absence nor elapsed time proves that a thrown DELETE will not later
+complete, so automatic reconciliation never releases or retries these rows;
+they require explicit operator adjudication. `completedBlobIoResults` accounts
+for immutable exact-operation results. Those results currently have no caller
+acknowledgement/compaction protocol and are intentionally retained without a
+time-based deletion policy; do not prune them merely to reduce the count.
+
 - `takoserver-signing-key-register`: append-only public Ed25519 JWK registration
   with exact absence recheck and no overwrite.
 - `takoserver-signing-repair`: the current, already registered key only; an
@@ -956,6 +1056,7 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_INDEPENDENT_REVIEW`
 - `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH`
 - `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`
+- `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` (only while 0043 is pending)
 - `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH`
 - `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH`
 - `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH`

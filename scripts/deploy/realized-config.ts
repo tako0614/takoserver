@@ -163,6 +163,7 @@ const VERSION_ONLY_TOPOLOGY_KEYS = new Set([
   "triggers",
   "workers_dev",
   "workers_dev_subdomain",
+  "preview_urls",
   "custom_domains",
   "domains",
 ]);
@@ -191,6 +192,9 @@ export function deploymentVariables(
     PUBLIC_ORIGIN: target.publicOrigin,
     TAKOSERVER_SIGNING_KEY_ID: signingKeyId,
   };
+  if (target.artifactBlobIoMode !== undefined) {
+    vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE = target.artifactBlobIoMode;
+  }
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {
@@ -344,10 +348,11 @@ function serviceAddress(
     if (aliases.length > 0) {
       throw preflightError("a workers.dev origin cannot carry aliases; name a real origin first");
     }
-    return { workers_dev: true };
+    return { workers_dev: true, preview_urls: false };
   }
   return {
     workers_dev: false,
+    preview_urls: false,
     routes: [hostname, ...aliases].map((pattern) => ({ pattern, custom_domain: true })),
   };
 }

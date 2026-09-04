@@ -42,9 +42,9 @@ v1beta1 ObjectBucket identity is recovery-only and is never installed as a
 current sale, authoring, or `/provision/v1` authority.
 
 Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
-the runtime Cloudflare runs at the edge. A Bun process may share R2 with a
-Cloudflare deployment, but its control state stays in local SQLite and its
-current Worker execution remains on local workerd. Production execution on
+the runtime Cloudflare runs at the edge. A Bun process owns both local SQLite
+control state and a local exact-identity artifact store; it rejects
+`TAKOSERVER_R2_BUCKET` before opening local state. Production execution on
 Cloudflare Workers belongs to the Worker entry, not to an ambient account
 credential in the Bun entry.
 
@@ -56,11 +56,11 @@ bun src/entry-bun.ts
 That is the whole first run. It creates its schema, generates the keys it signs
 with, prints a sign-in you can paste into its console, and starts serving.
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
-`CLOUDFLARE_ACCOUNT_ID` may separately back shared R2 or an explicitly reviewed
-ObjectBucket supply, but it is neither provider-selection nor resale authority
-and does not switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` is rejected by
-the Bun entry before it opens local state; use the Worker entry for D1-bound
-execution.
+`CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
+supply, but it is neither provider-selection nor resale authority and does not
+switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` and
+`TAKOSERVER_R2_BUCKET` are rejected by the Bun entry before it opens local
+state; use the Worker entry for D1/R2-bound execution.
 
 The released Cloudflare ObjectBucket provider survives only as an explicit
 recovery lane for observing and deleting its already-recorded beta

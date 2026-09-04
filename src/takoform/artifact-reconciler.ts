@@ -1,4 +1,11 @@
+import { bytesDigest } from "../json.ts";
 import type { Clock, ObjectStoreAccess, Row, Sql, SqlStatement } from "../ports.ts";
+import { SqlError } from "../ports.ts";
+import {
+  ARTIFACT_BLOB_IO_LEASE_MILLISECONDS,
+  commitArtifactBlobWrite,
+  expiredArtifactBlobWrites,
+} from "./artifact-blob-io.ts";
 
 const MAXIMUM_SWEEP_LIMIT = 64;
 const CANDIDATE_QUARANTINE_MILLISECONDS = 60 * 60_000;
@@ -63,6 +70,10 @@ export interface ArtifactMaintenanceStatus extends ArtifactMaintenanceEvidence {
   readonly retryableCandidates: number;
   readonly deletingCandidates: number;
   readonly deletedTombstones: number;
+  /** Started external DELETE owners past their deadline; automatic retry stays disabled. */
+  readonly permanentlyFencedBlobDeletes: number;
+  /** Durable exact-operation results retained for lost-acknowledgement recovery. */
+  readonly completedBlobIoResults: number;
 }
 
 export interface ExactFailedRunRepairRequest {
@@ -107,7 +118,7 @@ export interface ArtifactReconciler {
 
 export interface CreateArtifactReconcilerOptions {
   readonly sql: Sql;
-  readonly objects: Pick<ObjectStoreAccess, "head" | "delete" | "list">;
+  readonly objects: Pick<ObjectStoreAccess, "get" | "head" | "delete" | "list">;
   readonly clock: Clock;
   readonly randomId: () => string;
 }
@@ -130,6 +141,19 @@ interface CandidateRow extends CandidateDigest {
   readonly state: "pending" | "deleting" | "retry";
   readonly fence: number;
   readonly expectedEtag: string | null;
+}
+
+interface ArtifactBlobDeleteLease {
+  readonly operationId: string;
+  readonly fence: number;
+  readonly candidateFence: number;
+  readonly leaseExpiresAt: number;
+  readonly phase: "claimed" | "started";
+}
+
+interface ClaimedBlobCandidate {
+  readonly candidate: CandidateRow;
+  readonly lease: ArtifactBlobDeleteLease;
 }
 
 /**
@@ -164,6 +188,10 @@ export function createTakoformArtifactReconciler(
              AND root.target_kind = 'manifest'
              AND root.root_kind IN ('upload', 'replay', 'resource', 'deployment')
              AND hold.digest IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+               WHERE lease.digest = member.blob_digest AND lease.state <> 'available'
+             )
          )
          SELECT tenant_id, blob_digest FROM missing
          WHERE tenant_id > ? OR (tenant_id = ? AND blob_digest > ?)
@@ -415,6 +443,28 @@ export function createTakoformArtifactReconciler(
     };
   };
 
+  const reconcileExpiredWrites = async (limit: number): Promise<void> => {
+    const expired = await expiredArtifactBlobWrites(sql, now(), limit);
+    for (const lease of expired) {
+      const stored = await objects.get(blobKey(lease.digest));
+      if (
+        !stored ||
+        stored.size !== lease.expectedSize ||
+        stored.writeOperationId !== lease.operationId
+      ) {
+        continue;
+      }
+      const bytes = new Uint8Array(await new Response(stored.body).arrayBuffer());
+      if (bytes.byteLength !== lease.expectedSize || (await bytesDigest(bytes)) !== lease.digest) {
+        continue;
+      }
+      await commitArtifactBlobWrite({ sql, clock, randomId: options.randomId }, lease, stored);
+      // Absence, expiry, size, and even equal content are not ordering proof.
+      // A non-matching operation remains fenced until its exact PUT is visible
+      // or a future authority explicitly resolves it.
+    }
+  };
+
   const candidateDigests = async (limit: number): Promise<readonly CandidateDigest[]> => {
     const rows = await sql.query(
       `WITH proposed(kind, digest) AS (
@@ -456,6 +506,12 @@ export function createTakoformArtifactReconciler(
            WHERE candidate.kind = proposed.kind AND candidate.digest = proposed.digest
              AND candidate.state IN ('pending', 'deleting', 'retry')
          )
+         AND (
+           proposed.kind = 'manifest' OR NOT EXISTS (
+             SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+             WHERE lease.digest = proposed.digest AND lease.state <> 'available'
+           )
+         )
        ORDER BY proposed.kind, proposed.digest
        LIMIT ?`,
       [limit],
@@ -469,13 +525,19 @@ export function createTakoformArtifactReconciler(
   const dueCandidates = async (limit: number): Promise<readonly CandidateRow[]> => {
     const rows = await sql.query(
       `SELECT kind, digest, state, fence, expected_etag
-       FROM tf_artifact_gc_candidates
-       WHERE state = 'deleting'
-          OR (state IN ('pending', 'retry') AND not_before <= ?)
-       ORDER BY CASE state WHEN 'deleting' THEN 0 ELSE 1 END,
+       FROM tf_artifact_gc_candidates AS candidate
+       WHERE (candidate.state IN ('pending', 'retry') AND candidate.not_before <= ?)
+          OR (candidate.state = 'deleting' AND EXISTS (
+            SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+            WHERE lease.digest = candidate.digest AND lease.state = 'deleting'
+              AND lease.candidate_fence = candidate.fence
+              AND lease.last_outcome IN ('delete_claimed', 'delete_reclaimed')
+              AND lease.lease_expires_at <= ?
+          ))
+       ORDER BY CASE candidate.state WHEN 'deleting' THEN 0 ELSE 1 END,
                 updated_at, kind, digest
        LIMIT ?`,
-      [now(), limit],
+      [now(), now(), limit],
     );
     return rows.map((row) => {
       const state = stringColumn(row, "state");
@@ -528,40 +590,20 @@ export function createTakoformArtifactReconciler(
     candidate: CandidateRow,
     expectedEtag: string | null,
   ): Promise<CandidateRow | null> => {
+    if (candidate.kind !== "manifest") {
+      throw new Error("blob candidates require the per-digest delete lease");
+    }
     if (candidate.state !== "deleting") {
-      const liveness =
-        candidate.kind === "manifest"
-          ? `NOT EXISTS (
-               SELECT 1 FROM tf_artifact_roots
-               WHERE state = 'active' AND target_kind = 'manifest' AND digest = ?
-             )`
-          : `NOT EXISTS (
-               SELECT 1 FROM tf_artifact_roots AS root
-               WHERE root.state = 'active' AND (
-                 (root.target_kind = 'blob' AND root.digest = ?) OR
-                 (root.target_kind = 'manifest' AND EXISTS (
-                   SELECT 1 FROM tf_artifact_manifest_members AS member
-                   WHERE member.manifest_digest = root.digest AND member.blob_digest = ?
-                 ))
-               )
-             )`;
-      const params =
-        candidate.kind === "manifest"
-          ? [expectedEtag, now(), candidate.kind, candidate.digest, candidate.digest]
-          : [
-              expectedEtag,
-              now(),
-              candidate.kind,
-              candidate.digest,
-              candidate.digest,
-              candidate.digest,
-            ];
       const claimed = await sql.run(
         `UPDATE tf_artifact_gc_candidates
          SET state = 'deleting', fence = fence + 1, expected_etag = ?,
              attempts = attempts + 1, last_outcome = 'claimed', updated_at = ?
-         WHERE kind = ? AND digest = ? AND state IN ('pending', 'retry') AND ${liveness}`,
-        params,
+         WHERE kind = 'manifest' AND digest = ? AND state IN ('pending', 'retry')
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_artifact_roots
+             WHERE state = 'active' AND target_kind = 'manifest' AND digest = ?
+           )`,
+        [expectedEtag, now(), candidate.digest, candidate.digest],
       );
       if (claimed.changes !== 1) {
         if (await hasLiveReference(candidate)) await cancelReferencedCandidate(candidate);
@@ -585,19 +627,241 @@ export function createTakoformArtifactReconciler(
     };
   };
 
-  const settleDeleted = async (
+  const claimBlobCandidate = async (
     candidate: CandidateRow,
-    outcome: "deleted" | "already_absent" | "metadata_deleted",
-  ): Promise<void> => {
-    const settled = await sql.run(
-      `UPDATE tf_artifact_gc_candidates
-       SET state = 'deleted', expected_etag = NULL, last_outcome = ?,
-           updated_at = ?, deleted_at = ?
-       WHERE kind = ? AND digest = ? AND state = 'deleting' AND fence = ?`,
-      [outcome, now(), now(), candidate.kind, candidate.digest, candidate.fence],
-    );
-    if (settled.changes !== 1) {
-      throw new Error("artifact candidate settlement lost its fence");
+    expectedEtag: string | null,
+  ): Promise<ClaimedBlobCandidate | null> => {
+    const timestamp = now();
+    if (candidate.state === "deleting") {
+      const previousLease = await readBlobDeleteLease(sql, candidate);
+      if (!previousLease) throw new Error("artifact blob candidate lost its delete lease");
+      // Once an external DELETE began, neither absence nor elapsed time proves
+      // that its original invocation cannot resume. Keep that digest fenced.
+      if (previousLease.phase === "started" || previousLease.leaseExpiresAt > timestamp) {
+        return null;
+      }
+      const operationId = blobOperationId("delete-reclaim", options.randomId(), candidate);
+      const leaseExpiresAt = timestamp + ARTIFACT_BLOB_IO_LEASE_MILLISECONDS;
+      const token = blobOperationId("guard", options.randomId(), candidate);
+      try {
+        const writes = await sql.batch([
+          blobDeleteGuard(token, candidate, previousLease, {
+            phase: "claimed",
+            expiredAt: timestamp,
+            liveReference: "absent",
+          }),
+          {
+            sql: `UPDATE tf_artifact_blob_io_leases
+                  SET fence = fence + 1, operation_id = ?, lease_expires_at = ?,
+                      last_outcome = 'delete_reclaimed', updated_at = ?
+                  WHERE digest = ? AND state = 'deleting' AND operation_id = ?
+                    AND fence = ? AND candidate_fence = ?
+                    AND last_outcome IN ('delete_claimed', 'delete_reclaimed')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM tf_artifact_blob_io_results AS result
+                      WHERE result.operation_id = ?
+                    )
+                    AND lease_expires_at <= ?
+                  RETURNING fence`,
+            params: [
+              operationId,
+              leaseExpiresAt,
+              timestamp,
+              candidate.digest,
+              previousLease.operationId,
+              previousLease.fence,
+              candidate.fence,
+              operationId,
+              timestamp,
+            ],
+          },
+          { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+        ]);
+        if (writes[1]?.changes !== 1) {
+          throw new Error("artifact blob delete reclaim lost its fence");
+        }
+        return {
+          candidate,
+          lease: {
+            operationId,
+            fence: positiveIntegerColumn(writes[1]?.rows[0], "fence"),
+            candidateFence: candidate.fence,
+            leaseExpiresAt,
+            phase: "claimed",
+          },
+        };
+      } catch (error) {
+        const recovered = await readOwnedBlobDeleteClaim(
+          sql,
+          candidate,
+          operationId,
+          "claimed",
+        ).catch(() => null);
+        if (recovered) return recovered;
+        if (error instanceof SqlError && error.code === "constraint") return null;
+        throw error;
+      }
+    }
+
+    const nextFence = candidate.fence + 1;
+    const operationId = blobOperationId("delete", options.randomId(), candidate);
+    const leaseExpiresAt = timestamp + ARTIFACT_BLOB_IO_LEASE_MILLISECONDS;
+    const token = blobOperationId("guard", options.randomId(), candidate);
+    try {
+      const writes = await sql.batch([
+        {
+          sql: `INSERT INTO tf_artifact_gc_guards (token, valid)
+                SELECT ?, CASE WHEN EXISTS (
+                  SELECT 1 FROM tf_artifact_gc_candidates
+                  WHERE kind = 'blob' AND digest = ? AND state = ? AND fence = ?
+                    AND not_before <= ?
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM tf_artifact_roots AS root
+                  WHERE root.state = 'active' AND (
+                    (root.target_kind = 'blob' AND root.digest = ?) OR
+                    (root.target_kind = 'manifest' AND EXISTS (
+                      SELECT 1 FROM tf_artifact_manifest_members AS member
+                      WHERE member.manifest_digest = root.digest AND member.blob_digest = ?
+                    ))
+                  )
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+                  WHERE lease.digest = ? AND lease.state <> 'available'
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM tf_artifact_blob_io_results AS result
+                  WHERE result.operation_id = ?
+                ) THEN 1 ELSE 0 END`,
+          params: [
+            token,
+            candidate.digest,
+            candidate.state,
+            candidate.fence,
+            timestamp,
+            candidate.digest,
+            candidate.digest,
+            candidate.digest,
+            operationId,
+          ],
+        },
+        {
+          sql: `INSERT INTO tf_artifact_blob_io_leases
+                  (digest, state, fence, operation_id, tenant_id, principal_id, upload_id,
+                   upload_fence, root_fence, expected_size, candidate_fence,
+                   lease_expires_at, last_outcome, created_at, updated_at)
+                VALUES (?, 'deleting', 1, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?,
+                        'delete_claimed', ?, ?)
+                ON CONFLICT (digest) DO UPDATE SET
+                  state = 'deleting', fence = tf_artifact_blob_io_leases.fence + 1,
+                  operation_id = excluded.operation_id, tenant_id = NULL,
+                  principal_id = NULL, upload_id = NULL, upload_fence = NULL,
+                  root_fence = NULL, expected_size = NULL,
+                  candidate_fence = excluded.candidate_fence,
+                  lease_expires_at = excluded.lease_expires_at,
+                  last_outcome = 'delete_claimed', updated_at = excluded.updated_at
+                WHERE tf_artifact_blob_io_leases.state = 'available'
+                RETURNING fence`,
+          params: [candidate.digest, operationId, nextFence, leaseExpiresAt, timestamp, timestamp],
+        },
+        {
+          sql: `UPDATE tf_artifact_gc_candidates
+                SET state = 'deleting', fence = fence + 1, expected_etag = ?,
+                    attempts = attempts + 1, last_outcome = 'claimed', updated_at = ?
+                WHERE kind = 'blob' AND digest = ? AND state = ? AND fence = ?
+                  AND not_before <= ?`,
+          params: [
+            expectedEtag,
+            timestamp,
+            candidate.digest,
+            candidate.state,
+            candidate.fence,
+            timestamp,
+          ],
+        },
+        { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+      ]);
+      if (writes[1]?.changes !== 1 || writes[2]?.changes !== 1) {
+        throw new Error("artifact blob candidate claim lost its fence");
+      }
+      return {
+        candidate: {
+          ...candidate,
+          state: "deleting",
+          fence: nextFence,
+          expectedEtag,
+        },
+        lease: {
+          operationId,
+          fence: positiveIntegerColumn(writes[1]?.rows[0], "fence"),
+          candidateFence: nextFence,
+          leaseExpiresAt,
+          phase: "claimed",
+        },
+      };
+    } catch (error) {
+      const recovered = await readOwnedBlobDeleteClaim(
+        sql,
+        { ...candidate, fence: nextFence, state: "deleting", expectedEtag },
+        operationId,
+        "claimed",
+      ).catch(() => null);
+      if (recovered) return recovered;
+      if (error instanceof SqlError && error.code === "constraint") {
+        if (await hasLiveReference(candidate)) await cancelReferencedCandidate(candidate);
+        return null;
+      }
+      throw error;
+    }
+  };
+
+  const settleOwnedBlobDelete = async (
+    claimed: ClaimedBlobCandidate,
+    outcome: "deleted" | "already_absent",
+    phase: "claimed" | "started" = "started",
+  ): Promise<boolean> => {
+    const timestamp = now();
+    const token = blobOperationId("guard", options.randomId(), claimed.candidate);
+    try {
+      const writes = await sql.batch([
+        blobDeleteGuard(token, claimed.candidate, claimed.lease, {
+          phase,
+          liveReference: "absent",
+        }),
+        completedBlobDeleteResult(claimed, timestamp, outcome),
+        availableBlobDeleteLease(claimed, timestamp, outcome),
+        {
+          sql: `UPDATE tf_artifact_gc_candidates
+                SET state = 'deleted', expected_etag = NULL, last_outcome = ?,
+                    updated_at = ?, deleted_at = ?
+                WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?`,
+          params: [
+            outcome,
+            timestamp,
+            timestamp,
+            claimed.candidate.digest,
+            claimed.candidate.fence,
+          ],
+        },
+        { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+      ]);
+      if (writes[1]?.changes !== 1 || writes[2]?.changes !== 1 || writes[3]?.changes !== 1) {
+        throw new Error("artifact blob delete settlement lost its fence");
+      }
+      return true;
+    } catch (error) {
+      if (await settledBlobDeleteVisible(sql, claimed, outcome).catch(() => false)) return true;
+      if (
+        error instanceof SqlError &&
+        error.code === "constraint" &&
+        !(await readOwnedBlobDeleteClaim(
+          sql,
+          claimed.candidate,
+          claimed.lease.operationId,
+          phase,
+        ).catch(() => null))
+      ) {
+        return false;
+      }
+      throw error;
     }
   };
 
@@ -651,46 +915,41 @@ export function createTakoformArtifactReconciler(
   ): Promise<"deleted" | "absent" | "retry" | "skipped"> => {
     const before =
       candidate.state === "deleting" ? null : await objects.head(blobKey(candidate.digest));
-    const observedEtag = before?.etag || candidate.expectedEtag;
-    const claimed = await claimCandidate(candidate, observedEtag);
+    const observedEtag = before?.etag ?? candidate.expectedEtag;
+    let claimed = await claimBlobCandidate(candidate, observedEtag);
     if (!claimed) return "skipped";
-    if (await hasLiveReference(claimed)) {
-      await cancelReferencedCandidate(claimed);
+    if (await hasLiveReference(claimed.candidate)) {
+      await cancelClaimedBlobCandidate(sql, now(), options.randomId, claimed);
       return "skipped";
     }
-    const current = await objects.head(blobKey(claimed.digest));
+    const current = await objects.head(blobKey(claimed.candidate.digest));
     if (!current) {
-      await settleDeleted(claimed, "already_absent");
-      return "absent";
+      return (await settleOwnedBlobDelete(claimed, "already_absent", "claimed"))
+        ? "absent"
+        : "skipped";
     }
-    if (claimed.expectedEtag !== null && current.etag !== claimed.expectedEtag) {
-      await sql.run(
-        `UPDATE tf_artifact_gc_candidates
-         SET state = 'retry', fence = fence + 1, expected_etag = NULL,
-             not_before = ?, last_outcome = 'etag_changed', updated_at = ?, deleted_at = NULL
-         WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?`,
-        [now() + CANDIDATE_QUARANTINE_MILLISECONDS, now(), claimed.digest, claimed.fence],
-      );
-      return "retry";
+    if (
+      claimed.candidate.expectedEtag === null ||
+      current.etag !== claimed.candidate.expectedEtag
+    ) {
+      return (await retryClaimedBlobCandidate(sql, now(), options.randomId, claimed))
+        ? "retry"
+        : "skipped";
     }
+    const started = await beginClaimedBlobDelete(sql, now(), options.randomId, claimed);
+    if (!started) return "skipped";
+    claimed = started;
     let deleted: boolean;
     try {
-      deleted = await objects.delete(blobKey(claimed.digest));
+      deleted = await objects.delete(blobKey(claimed.candidate.digest));
     } catch {
-      await sql.run(
-        `UPDATE tf_artifact_gc_candidates
-         SET state = 'retry', fence = fence + 1, expected_etag = NULL,
-             not_before = ?, last_outcome = 'delete_failed', updated_at = ?, deleted_at = NULL
-         WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?`,
-        [now() + CANDIDATE_QUARANTINE_MILLISECONDS, now(), claimed.digest, claimed.fence],
-      );
-      return "retry";
+      // A thrown external DELETE is ambiguous: it may still complete. Retain
+      // the started owner permanently rather than authorize a second DELETE.
+      return "skipped";
     }
-    // Settlement is deliberately outside the object-delete catch. If SQL is
-    // unavailable after a successful external delete, leaving `deleting` +
-    // the claimed fence is the honest state: the next pass re-reads R2 and
-    // settles `already_absent` without issuing a blind second delete.
-    await settleDeleted(claimed, deleted ? "deleted" : "already_absent");
+    if (!(await settleOwnedBlobDelete(claimed, deleted ? "deleted" : "already_absent"))) {
+      return "skipped";
+    }
     return deleted ? "deleted" : "absent";
   };
 
@@ -712,18 +971,27 @@ export function createTakoformArtifactReconciler(
     },
 
     async status() {
-      const [uploads, roots, candidates, evidence] = await Promise.all([
-        sql.query(
-          `SELECT lifecycle_state, COUNT(*) AS total
+      const [uploads, roots, candidates, permanentDeleteFences, completedResults, evidence] =
+        await Promise.all([
+          sql.query(
+            `SELECT lifecycle_state, COUNT(*) AS total
            FROM tf_artifact_uploads GROUP BY lifecycle_state`,
-        ),
-        sql.query("SELECT COUNT(*) AS total FROM tf_artifact_roots WHERE state = 'active'"),
-        sql.query(
-          `SELECT state, COUNT(*) AS total
+          ),
+          sql.query("SELECT COUNT(*) AS total FROM tf_artifact_roots WHERE state = 'active'"),
+          sql.query(
+            `SELECT state, COUNT(*) AS total
            FROM tf_artifact_gc_candidates GROUP BY state`,
-        ),
-        maintenanceEvidence(),
-      ]);
+          ),
+          sql.query(
+            `SELECT COUNT(*) AS total
+           FROM tf_artifact_blob_io_leases
+           WHERE state = 'deleting' AND last_outcome = 'delete_started'
+             AND lease_expires_at <= ?`,
+            [now()],
+          ),
+          sql.query("SELECT COUNT(*) AS total FROM tf_artifact_blob_io_results"),
+          maintenanceEvidence(),
+        ]);
       const uploadCount = counts(uploads);
       const candidateCount = counts(candidates);
       return {
@@ -738,6 +1006,8 @@ export function createTakoformArtifactReconciler(
         retryableCandidates: candidateCount.retry ?? 0,
         deletingCandidates: candidateCount.deleting ?? 0,
         deletedTombstones: candidateCount.deleted ?? 0,
+        permanentlyFencedBlobDeletes: numberColumn(permanentDeleteFences[0], "total"),
+        completedBlobIoResults: numberColumn(completedResults[0], "total"),
       };
     },
 
@@ -960,6 +1230,7 @@ export function createTakoformArtifactReconciler(
     async reconcile(input) {
       const limit = boundedLimit(input.limit);
       const timestamp = now();
+      await reconcileExpiredWrites(limit);
       const [holds, replayRows] = await Promise.all([
         missingHolds(limit),
         expiredReplayRows(limit),
@@ -976,8 +1247,11 @@ export function createTakoformArtifactReconciler(
                     ON member.manifest_digest = root.digest
                   WHERE root.tenant_id = ? AND root.state = 'active'
                     AND root.target_kind = 'manifest' AND member.blob_digest = ?
+                ) AND NOT EXISTS (
+                  SELECT 1 FROM tf_artifact_blob_io_leases AS lease
+                  WHERE lease.digest = ? AND lease.state <> 'available'
                 )`,
-          params: [hold.tenantId, hold.digest, hold.tenantId, hold.digest],
+          params: [hold.tenantId, hold.digest, hold.tenantId, hold.digest, hold.digest],
         });
       }
       for (const row of replayRows) {
@@ -1089,6 +1363,371 @@ export function createTakoformArtifactReconciler(
       };
     },
   };
+}
+
+function blobDeleteGuard(
+  token: string,
+  candidate: CandidateRow,
+  lease: ArtifactBlobDeleteLease,
+  options: {
+    readonly phase: "claimed" | "started";
+    readonly expiredAt?: number;
+    readonly liveReference: "absent" | "present";
+  },
+): SqlStatement {
+  const phasePredicate =
+    options.phase === "started"
+      ? "last_outcome = 'delete_started'"
+      : "last_outcome IN ('delete_claimed', 'delete_reclaimed')";
+  const referencePredicate =
+    options.liveReference === "present"
+      ? `EXISTS (
+           SELECT 1 FROM tf_artifact_roots AS root
+           WHERE root.state = 'active' AND (
+             (root.target_kind = 'blob' AND root.digest = ?) OR
+             (root.target_kind = 'manifest' AND EXISTS (
+               SELECT 1 FROM tf_artifact_manifest_members AS member
+               WHERE member.manifest_digest = root.digest AND member.blob_digest = ?
+             ))
+           )
+         )`
+      : `NOT EXISTS (
+           SELECT 1 FROM tf_artifact_roots AS root
+           WHERE root.state = 'active' AND (
+             (root.target_kind = 'blob' AND root.digest = ?) OR
+             (root.target_kind = 'manifest' AND EXISTS (
+               SELECT 1 FROM tf_artifact_manifest_members AS member
+               WHERE member.manifest_digest = root.digest AND member.blob_digest = ?
+             ))
+           )
+         )`;
+  return {
+    sql: `INSERT INTO tf_artifact_gc_guards (token, valid)
+          SELECT ?, CASE WHEN EXISTS (
+            SELECT 1 FROM tf_artifact_gc_candidates
+            WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?
+          ) AND EXISTS (
+            SELECT 1 FROM tf_artifact_blob_io_leases
+            WHERE digest = ? AND state = 'deleting' AND operation_id = ?
+              AND fence = ? AND candidate_fence = ? AND ${phasePredicate}
+              ${options.expiredAt === undefined ? "" : "AND lease_expires_at <= ?"}
+          ) AND ${referencePredicate} THEN 1 ELSE 0 END`,
+    params: [
+      token,
+      candidate.digest,
+      candidate.fence,
+      candidate.digest,
+      lease.operationId,
+      lease.fence,
+      lease.candidateFence,
+      ...(options.expiredAt === undefined ? [] : [options.expiredAt]),
+      candidate.digest,
+      candidate.digest,
+    ],
+  };
+}
+
+async function readBlobDeleteLease(
+  sql: Sql,
+  candidate: CandidateRow,
+): Promise<ArtifactBlobDeleteLease | null> {
+  const rows = await sql.query(
+    `SELECT operation_id, fence, candidate_fence, lease_expires_at, last_outcome
+     FROM tf_artifact_blob_io_leases
+     WHERE digest = ? AND state = 'deleting' AND candidate_fence = ?`,
+    [candidate.digest, candidate.fence],
+  );
+  if (rows.length !== 1) return null;
+  const outcome = stringColumn(rows[0], "last_outcome");
+  const phase =
+    outcome === "delete_started"
+      ? "started"
+      : outcome === "delete_claimed" || outcome === "delete_reclaimed"
+        ? "claimed"
+        : null;
+  if (!phase) throw new Error("artifact blob delete lease phase is invalid");
+  return {
+    operationId: stringColumn(rows[0], "operation_id"),
+    fence: positiveIntegerColumn(rows[0], "fence"),
+    candidateFence: positiveIntegerColumn(rows[0], "candidate_fence"),
+    leaseExpiresAt: numberColumn(rows[0], "lease_expires_at"),
+    phase,
+  };
+}
+
+async function readOwnedBlobDeleteClaim(
+  sql: Sql,
+  candidate: CandidateRow,
+  operationId: string,
+  phase: "claimed" | "started",
+): Promise<ClaimedBlobCandidate | null> {
+  const outcomes =
+    phase === "started"
+      ? "lease.last_outcome = 'delete_started'"
+      : "lease.last_outcome IN ('delete_claimed', 'delete_reclaimed')";
+  const rows = await sql.query(
+    `SELECT candidate.digest, candidate.fence, candidate.expected_etag,
+            lease.operation_id, lease.fence AS lease_fence,
+            lease.candidate_fence, lease.lease_expires_at
+     FROM tf_artifact_gc_candidates AS candidate
+     JOIN tf_artifact_blob_io_leases AS lease
+       ON lease.digest = candidate.digest AND lease.state = 'deleting'
+      AND lease.candidate_fence = candidate.fence
+     WHERE candidate.kind = 'blob' AND candidate.digest = ?
+       AND candidate.state = 'deleting' AND candidate.fence = ?
+       AND lease.operation_id = ? AND ${outcomes}`,
+    [candidate.digest, candidate.fence, operationId],
+  );
+  if (rows.length !== 1) return null;
+  const row = rows[0];
+  return {
+    candidate: {
+      kind: "blob",
+      digest: digestColumn(row, "digest"),
+      state: "deleting",
+      fence: positiveIntegerColumn(row, "fence"),
+      expectedEtag: row?.expected_etag === null ? null : stringColumn(row, "expected_etag"),
+    },
+    lease: {
+      operationId: stringColumn(row, "operation_id"),
+      fence: positiveIntegerColumn(row, "lease_fence"),
+      candidateFence: positiveIntegerColumn(row, "candidate_fence"),
+      leaseExpiresAt: numberColumn(row, "lease_expires_at"),
+      phase,
+    },
+  };
+}
+
+async function beginClaimedBlobDelete(
+  sql: Sql,
+  timestamp: number,
+  randomId: () => string,
+  claimed: ClaimedBlobCandidate,
+): Promise<ClaimedBlobCandidate | null> {
+  if (claimed.lease.phase !== "claimed") return null;
+  const token = blobOperationId("guard", randomId(), claimed.candidate);
+  const leaseExpiresAt = timestamp + ARTIFACT_BLOB_IO_LEASE_MILLISECONDS;
+  try {
+    const writes = await sql.batch([
+      blobDeleteGuard(token, claimed.candidate, claimed.lease, {
+        phase: "claimed",
+        liveReference: "absent",
+      }),
+      {
+        sql: `UPDATE tf_artifact_blob_io_leases
+              SET fence = fence + 1, lease_expires_at = ?,
+                  last_outcome = 'delete_started', updated_at = ?
+              WHERE digest = ? AND state = 'deleting' AND operation_id = ?
+                AND fence = ? AND candidate_fence = ?
+                AND last_outcome IN ('delete_claimed', 'delete_reclaimed')
+              RETURNING fence`,
+        params: [
+          leaseExpiresAt,
+          timestamp,
+          claimed.candidate.digest,
+          claimed.lease.operationId,
+          claimed.lease.fence,
+          claimed.candidate.fence,
+        ],
+      },
+      { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+    ]);
+    if (writes[1]?.changes !== 1) return null;
+    return {
+      candidate: claimed.candidate,
+      lease: {
+        ...claimed.lease,
+        fence: positiveIntegerColumn(writes[1]?.rows[0], "fence"),
+        leaseExpiresAt,
+        phase: "started",
+      },
+    };
+  } catch (error) {
+    const recovered = await readOwnedBlobDeleteClaim(
+      sql,
+      claimed.candidate,
+      claimed.lease.operationId,
+      "started",
+    ).catch(() => null);
+    if (recovered) return recovered;
+    if (error instanceof SqlError && error.code === "constraint") return null;
+    throw error;
+  }
+}
+
+async function retryClaimedBlobCandidate(
+  sql: Sql,
+  timestamp: number,
+  randomId: () => string,
+  claimed: ClaimedBlobCandidate,
+): Promise<boolean> {
+  const token = blobOperationId("guard", randomId(), claimed.candidate);
+  try {
+    const writes = await sql.batch([
+      blobDeleteGuard(token, claimed.candidate, claimed.lease, {
+        phase: "claimed",
+        liveReference: "absent",
+      }),
+      completedBlobDeleteResult(claimed, timestamp, "etag_changed"),
+      availableBlobDeleteLease(claimed, timestamp, "etag_changed"),
+      {
+        sql: `UPDATE tf_artifact_gc_candidates
+              SET state = 'retry', fence = fence + 1, expected_etag = NULL,
+                  not_before = ?, last_outcome = 'etag_changed',
+                  updated_at = ?, deleted_at = NULL
+              WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?`,
+        params: [
+          timestamp + CANDIDATE_QUARANTINE_MILLISECONDS,
+          timestamp,
+          claimed.candidate.digest,
+          claimed.candidate.fence,
+        ],
+      },
+      { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+    ]);
+    if (writes[1]?.changes !== 1 || writes[2]?.changes !== 1 || writes[3]?.changes !== 1) {
+      throw new Error("artifact blob retry lost its delete lease");
+    }
+    return true;
+  } catch (error) {
+    if (await completedBlobDeleteVisible(sql, claimed, "etag_changed").catch(() => false)) {
+      return true;
+    }
+    if (
+      error instanceof SqlError &&
+      error.code === "constraint" &&
+      !(await readOwnedBlobDeleteClaim(
+        sql,
+        claimed.candidate,
+        claimed.lease.operationId,
+        "claimed",
+      ).catch(() => null))
+    ) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function cancelClaimedBlobCandidate(
+  sql: Sql,
+  timestamp: number,
+  randomId: () => string,
+  claimed: ClaimedBlobCandidate,
+): Promise<void> {
+  const token = blobOperationId("guard", randomId(), claimed.candidate);
+  try {
+    const writes = await sql.batch([
+      blobDeleteGuard(token, claimed.candidate, claimed.lease, {
+        phase: claimed.lease.phase,
+        liveReference: "present",
+      }),
+      completedBlobDeleteResult(claimed, timestamp, "reference_present"),
+      availableBlobDeleteLease(claimed, timestamp, "reference_present"),
+      {
+        sql: `UPDATE tf_artifact_gc_candidates
+              SET state = 'cancelled', fence = fence + 1, expected_etag = NULL,
+                  last_outcome = 'reference_present', updated_at = ?, deleted_at = NULL
+              WHERE kind = 'blob' AND digest = ? AND state = 'deleting' AND fence = ?`,
+        params: [timestamp, claimed.candidate.digest, claimed.candidate.fence],
+      },
+      { sql: "DELETE FROM tf_artifact_gc_guards WHERE token = ?", params: [token] },
+    ]);
+    if (writes[1]?.changes !== 1 || writes[2]?.changes !== 1 || writes[3]?.changes !== 1) {
+      throw new Error("artifact blob reference cancellation lost its delete lease");
+    }
+  } catch (error) {
+    if (await completedBlobDeleteVisible(sql, claimed, "reference_present").catch(() => false)) {
+      return;
+    }
+    throw error;
+  }
+}
+
+function availableBlobDeleteLease(
+  claimed: ClaimedBlobCandidate,
+  timestamp: number,
+  outcome: "deleted" | "already_absent" | "etag_changed" | "reference_present",
+): SqlStatement {
+  return {
+    sql: `UPDATE tf_artifact_blob_io_leases
+          SET state = 'available', fence = fence + 1,
+              tenant_id = NULL, principal_id = NULL, upload_id = NULL,
+              upload_fence = NULL, root_fence = NULL, expected_size = NULL,
+              candidate_fence = NULL, lease_expires_at = NULL,
+              last_outcome = ?, updated_at = ?
+          WHERE digest = ? AND state = 'deleting' AND operation_id = ?
+            AND fence = ? AND candidate_fence = ?`,
+    params: [
+      outcome,
+      timestamp,
+      claimed.candidate.digest,
+      claimed.lease.operationId,
+      claimed.lease.fence,
+      claimed.candidate.fence,
+    ],
+  };
+}
+
+function completedBlobDeleteResult(
+  claimed: ClaimedBlobCandidate,
+  timestamp: number,
+  outcome: "deleted" | "already_absent" | "etag_changed" | "reference_present",
+): SqlStatement {
+  return {
+    sql: `INSERT INTO tf_artifact_blob_io_results
+            (operation_id, digest, operation_kind, lease_fence, candidate_fence,
+             tenant_id, principal_id, upload_id, upload_fence, root_fence,
+             expected_size, outcome, completed_at)
+          SELECT operation_id, digest, 'delete', fence, candidate_fence,
+                 NULL, NULL, NULL, NULL, NULL, NULL, ?, ?
+          FROM tf_artifact_blob_io_leases
+          WHERE digest = ? AND state = 'deleting' AND operation_id = ?
+            AND fence = ? AND candidate_fence = ?`,
+    params: [
+      outcome,
+      timestamp,
+      claimed.candidate.digest,
+      claimed.lease.operationId,
+      claimed.lease.fence,
+      claimed.candidate.fence,
+    ],
+  };
+}
+
+async function completedBlobDeleteVisible(
+  sql: Sql,
+  claimed: ClaimedBlobCandidate,
+  outcome: "deleted" | "already_absent" | "etag_changed" | "reference_present",
+): Promise<boolean> {
+  const rows = await sql.query(
+    `SELECT 1 AS settled
+     FROM tf_artifact_blob_io_results
+     WHERE operation_id = ? AND digest = ? AND operation_kind = 'delete'
+       AND lease_fence = ? AND candidate_fence = ? AND outcome = ?`,
+    [
+      claimed.lease.operationId,
+      claimed.candidate.digest,
+      claimed.lease.fence,
+      claimed.candidate.fence,
+      outcome,
+    ],
+  );
+  return rows.length === 1;
+}
+
+async function settledBlobDeleteVisible(
+  sql: Sql,
+  claimed: ClaimedBlobCandidate,
+  outcome: "deleted" | "already_absent",
+): Promise<boolean> {
+  return await completedBlobDeleteVisible(sql, claimed, outcome);
+}
+
+function blobOperationId(prefix: string, random: string, candidate: CandidateRow): string {
+  const suffix = random.replace(/[^A-Za-z0-9._-]/gu, "").slice(0, 80);
+  if (suffix.length === 0) throw new Error("artifact blob operation id is empty");
+  return `${prefix}_${suffix}_${candidate.fence}_${candidate.digest.slice(-12)}`.slice(0, 128);
 }
 
 function boundedLimit(value: number): number {

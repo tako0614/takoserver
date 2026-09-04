@@ -132,7 +132,10 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(routineWorker?.obligations["post-conditions"]).toContain("PID-start");
     expect(routineWorker?.obligations["post-conditions"]).toContain("stale");
+    expect(routineWorker?.obligations["post-conditions"]).toContain("all-traffic quiescence 503");
     expect(routineWorker?.obligations["failure-handling"]).toContain("traffic is indeterminate");
+    expect(routineWorker?.obligations["failure-handling"]).toContain("0037-0043");
+    expect(routineWorker?.obligations["failure-handling"]).toContain("all-traffic");
     expect(routineWorker?.obligations["failure-handling"]).toContain(
       "never claims that no target was touched",
     );
@@ -145,8 +148,18 @@ describe("Takoserver split deploy entrypoint", () => {
       "cannot emit production rehearsal evidence",
     );
     expect(schema?.obligations.provenance).toContain("fixed next boundaries 0028");
+    expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
+    expect(schema?.obligations["pre-mutation-proof"]).toContain(
+      "active-root/deleting-candidate conflict",
+    );
+    expect(schema?.obligations["pre-mutation-proof"]).toContain("current and immediate rollback");
+    expect(schema?.obligations["pre-mutation-proof"]).toContain("public preview URLs are disabled");
+    expect(schema?.obligations["pre-mutation-proof"]).toContain("immediately before");
     expect(schema?.obligations["failure-handling"]).toContain("immediate authoritative");
+    expect(schema?.obligations["failure-handling"]).toContain(
+      "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
+    );
     expect(integrationAuthority?.obligations["post-conditions"]).toContain(
       "exact operator tenant and Space plain-text bindings",
     );
@@ -291,7 +304,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(baseline.stderr).toContain("deploy target descriptor not found");
     expect(baseline.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0042"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043"] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
           "takoserver-d1-schema",
@@ -316,7 +329,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
     expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
 
-    for (const through of ["0028", "0033", "0036", "0042"] as const) {
+    for (const through of ["0028", "0033", "0036", "0043"] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",
         "--status",

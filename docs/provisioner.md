@@ -9,10 +9,10 @@ the local workerd-backed provider.
 The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
 and a classified ticket leaves. No current official Takoserver Worker composes
-that remote client. Generic Cloudflare credentials may let the process share an
-R2 artifact store; control state remains local SQLite, and they never switch
-current Worker execution from workerd to Cloudflare or authorize a public
-storage product.
+that remote client. Generic Cloudflare credentials do not select a shared
+artifact store. The Bun composition owns local SQLite and local exact-identity
+artifact bytes together; its R2 HTTP adapter is retained only for read-only
+provisioner/package use.
 
 Most providers will not need this. One that reaches its backend by calling an
 HTTP API with a credential fits a Worker exactly, and adding it means adding a
@@ -32,17 +32,17 @@ pack. Relevant variables are:
 | `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths for the Worker socket. Both or neither. |
 | `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text. |
 | `TAKOSERVER_WORKERD_PORT` / `TAKOSERVER_WORKER_ENDPOINT_PORT` | Where Workers are served, and the port a published `WorkerEndpoint` address carries. A `WorkerEndpoint` needs `https` on the default port, so this deployment mints one only with TLS on 443 in workerd or a 443 front end declared with `TAKOSERVER_WORKER_ENDPOINT_PORT=443`. Anything else runs Workers and storage and says at boot that it can publish no endpoint. |
-| `TAKOSERVER_R2_BUCKET` | Optional artifact store shared with the Worker. Requires a Cloudflare account and token source. |
 | `TAKOSERVER_OPERATOR_PUBLIC_JWK` | Public half of the operator key. |
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional login-only operator key; never authorizes funding. |
 | `PORT` | Where to listen. |
 | `TAKOSERVER_DATA_PLANE_PORT` | Optional fixed port for the loopback KV/SQL data planes. Without it the kernel picks one and the process prints it. |
 
-`CLOUDFLARE_ACCOUNT_ID` is storage/control-plane input only in this mode. It is
-not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` is not supported
-by the Bun entry: it is rejected before any local directory, database, or key is
-opened because the D1 HTTP API cannot provide the atomic batch capability the
-control plane requires. `TAKOSERVER_ZONES` is rejected because DNS and
+`CLOUDFLARE_ACCOUNT_ID` is provider control-plane input only in this mode. It is
+not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` and
+`TAKOSERVER_R2_BUCKET` are not supported by the Bun entry: they are rejected
+before any local directory, database, or key is opened because request-time
+control and artifact writes require capabilities their HTTP adapters do not
+provide. `TAKOSERVER_ZONES` is rejected because DNS and
 Worker-route authority belongs to the production Worker entry. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
@@ -51,8 +51,8 @@ implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 Use a token created for the exact optional adapter, not a `wrangler login`
 session. Grant only what the selected Bun inputs use:
 
-- Account · Workers R2 Storage · Edit, only when an R2 artifact store or the
-  retired ObjectBucket drain is selected. A current `ObjectBucket` on this
+- Account · Workers R2 Storage · Edit, only when the retired ObjectBucket drain
+  is selected. A current `ObjectBucket` on this
   machine needs no Cloudflare permission at all: its bytes are local.
 
 The ordinary Bun stable provider does not need Workers Scripts, Workers Routes,

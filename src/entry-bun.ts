@@ -8,7 +8,6 @@ import { resolveIdentity } from "./identity-setup.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
-import { createR2HttpObjectStore } from "./objects-r2-http.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import {
   ensureOperatorKey,
@@ -114,6 +113,11 @@ if (process.env.TAKOSERVER_D1_DATABASE_ID !== undefined) {
     "TAKOSERVER_D1_DATABASE_ID is not supported by the Bun entry; use local SQLite control state",
   );
 }
+if (process.env.TAKOSERVER_R2_BUCKET !== undefined) {
+  throw new Error(
+    "TAKOSERVER_R2_BUCKET is not supported by the Bun entry; use its local exact-identity artifact store",
+  );
+}
 
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787";
 const port = Number(process.env.PORT ?? 8787);
@@ -160,10 +164,6 @@ const sql = (() => {
   }
   return createSqliteSql(database);
 })();
-// Artifact bytes may come from the same R2 bucket the Worker writes to. Bun's
-// control rows remain in local SQLite while the Worker keeps its rows in D1;
-// sharing only bytes ensures a bundle committed through the public API is there
-// when the provisioner goes to publish it.
 const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
   ? Number(process.env.TAKOSERVER_WORKERD_PORT)
   : 8788;
@@ -284,17 +284,11 @@ const workerd = createWorkerdSupervisor({
   },
 });
 
-const sharedBucket = process.env.TAKOSERVER_R2_BUCKET;
-const objects = sharedBucket
-  ? createR2HttpObjectStore({
-      accountId: required("CLOUDFLARE_ACCOUNT_ID"),
-      bucketName: sharedBucket,
-      authorize: () => `Bearer ${cloudflareToken()}`,
-    })
-  : // No shared bucket means this is a machine standing on its own, and a
-    // self-hosted deployment that forgets every customer's files on restart is
-    // not storage. Memory is kept for tests, which say so by asking for it.
-    process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
+// This machine owns its control rows and artifact bytes together. The R2 HTTP
+// adapter remains a read-only/provisioner seam, but it cannot round-trip the
+// exact operation identity required by request-time artifact PUT recovery.
+const objects =
+  process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
     ? createMemoryObjectStore()
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();

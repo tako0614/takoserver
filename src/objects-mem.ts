@@ -10,6 +10,7 @@ interface HeldObject {
   readonly bytes: Uint8Array;
   readonly etag: string;
   readonly contentType?: string;
+  readonly writeOperationId?: string;
 }
 
 /**
@@ -21,6 +22,8 @@ export function createMemoryObjectStore(): ObjectStore {
   const objects = new Map<string, HeldObject>();
 
   return {
+    writeOperationIdentity: "exact",
+
     async create(key, body, options): Promise<StoredObject | null> {
       if (objects.has(key)) return null;
       const bytes = await collect(body);
@@ -29,16 +32,40 @@ export function createMemoryObjectStore(): ObjectStore {
       if (objects.has(key)) return null;
       const etag = await digest(bytes);
       const contentType = options?.contentType;
-      objects.set(key, { bytes, etag, ...(contentType ? { contentType } : {}) });
-      return { key, size: bytes.byteLength, etag, ...(contentType ? { contentType } : {}) };
+      const writeOperationId = options?.writeOperationId;
+      objects.set(key, {
+        bytes,
+        etag,
+        ...(contentType ? { contentType } : {}),
+        ...(writeOperationId ? { writeOperationId } : {}),
+      });
+      return {
+        key,
+        size: bytes.byteLength,
+        etag,
+        ...(contentType ? { contentType } : {}),
+        ...(writeOperationId ? { writeOperationId } : {}),
+      };
     },
 
     async put(key, body, options): Promise<StoredObject> {
       const bytes = await collect(body);
       const etag = await digest(bytes);
       const contentType = options?.contentType;
-      objects.set(key, { bytes, etag, ...(contentType ? { contentType } : {}) });
-      return { key, size: bytes.byteLength, etag, ...(contentType ? { contentType } : {}) };
+      const writeOperationId = options?.writeOperationId;
+      objects.set(key, {
+        bytes,
+        etag,
+        ...(contentType ? { contentType } : {}),
+        ...(writeOperationId ? { writeOperationId } : {}),
+      });
+      return {
+        key,
+        size: bytes.byteLength,
+        etag,
+        ...(contentType ? { contentType } : {}),
+        ...(writeOperationId ? { writeOperationId } : {}),
+      };
     },
 
     async get(key): Promise<StoredObjectBody | null> {
@@ -50,6 +77,7 @@ export function createMemoryObjectStore(): ObjectStore {
         size: held.bytes.byteLength,
         etag: held.etag,
         ...(held.contentType ? { contentType: held.contentType } : {}),
+        ...(held.writeOperationId ? { writeOperationId: held.writeOperationId } : {}),
         body: new ReadableStream<Uint8Array>({
           start(controller) {
             controller.enqueue(snapshot);
@@ -67,6 +95,7 @@ export function createMemoryObjectStore(): ObjectStore {
         size: held.bytes.byteLength,
         etag: held.etag,
         ...(held.contentType ? { contentType: held.contentType } : {}),
+        ...(held.writeOperationId ? { writeOperationId: held.writeOperationId } : {}),
       };
     },
 
@@ -94,6 +123,7 @@ export function createMemoryObjectStore(): ObjectStore {
             size: held.bytes.byteLength,
             etag: held.etag,
             ...(held.contentType ? { contentType: held.contentType } : {}),
+            ...(held.writeOperationId ? { writeOperationId: held.writeOperationId } : {}),
           };
         }),
         truncated,

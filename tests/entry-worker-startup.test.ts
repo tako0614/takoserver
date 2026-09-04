@@ -38,6 +38,47 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("the pre-0043 compatibility mode blocks all traffic before storage composition", async () => {
+    const env = {
+      PUBLIC_ORIGIN: ORIGIN,
+      TAKOSERVER_ARTIFACT_BLOB_IO_MODE: "pre-0043-quiesced",
+    } as Parameters<typeof worker.fetch>[1];
+    const digest = `sha256:${"a".repeat(64)}`;
+    for (const [method, path] of [
+      ["GET", "/healthz"],
+      ["POST", "/apis/forms.takoform.com/v1/artifacts/uploads"],
+      ["PUT", `/apis/forms.takoform.com/v1/artifacts/uploads/up_old/blobs/${digest}`],
+      ["POST", "/apis/forms.takoform.com/v1/artifacts/uploads/up_old/commit"],
+      ["DELETE", "/apis/forms.takoform.com/v1/artifacts/uploads/up_old"],
+    ] as const) {
+      const response = await worker.fetch(new Request(`${ORIGIN}${path}`, { method }), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("retry-after")).toBe("60");
+      const body = await envelope(response);
+      expect(body.error.code).toBe("backend_unavailable");
+      expect(body.error.details?.reason).toBe("runtime-configuration");
+      expect(body.error.message).toContain("artifact blob I/O is quiesced");
+    }
+  });
+
+  test("the pre-0043 compatibility mode suppresses scheduled artifact collection before composition", async () => {
+    await expect(
+      worker.scheduled({}, {
+        TAKOSERVER_ARTIFACT_BLOB_IO_MODE: "pre-0043-quiesced",
+      } as Parameters<typeof worker.scheduled>[1]),
+    ).resolves.toBeUndefined();
+  });
+
+  test("an unknown artifact blob I/O mode fails closed as runtime configuration", async () => {
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}/healthz`),
+      workerEnv({ TAKOSERVER_ARTIFACT_BLOB_IO_MODE: "typo" }),
+    );
+    expect(response.status).toBe(503);
+    expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+  });
+
   test("answers a composition refusal with its reason class, not a bare exception", async () => {
     // The live incident: one Cloudflare SupplyContract declared twice, the edge
     // half without `storage.object`. Composition is lazy and per request, so

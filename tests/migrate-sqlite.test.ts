@@ -19,6 +19,7 @@ const SELFHOST_QUEUES_AND_SCHEDULES = "0040_selfhost_queues_and_schedules.sql";
 const SELFHOST_OBJECT_BUCKETS = "0041_selfhost_object_buckets.sql";
 const WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID =
   "0042_worker_endpoint_origin_reservation_space_id.sql";
+const ARTIFACT_BLOB_IO_FENCES = "0043_artifact_blob_io_fences.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -30,6 +31,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   SELFHOST_QUEUES_AND_SCHEDULES,
   SELFHOST_OBJECT_BUCKETS,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
+  ARTIFACT_BLOB_IO_FENCES,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -408,6 +410,7 @@ describe("bringing a local database up to date", () => {
         SELFHOST_QUEUES_AND_SCHEDULES,
         SELFHOST_OBJECT_BUCKETS,
         WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
+        ARTIFACT_BLOB_IO_FENCES,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -854,6 +857,8 @@ describe("bringing a local database up to date", () => {
       "integration_e2e_credential_pair_operations",
       "tf_artifact_consumer_uncertainties",
       "tf_artifact_gc_candidates",
+      "tf_artifact_blob_io_leases",
+      "tf_artifact_blob_io_results",
       "tf_artifact_manifest_members",
       "tf_artifact_owner_closure_receipts",
       "tf_artifact_roots",
@@ -951,6 +956,7 @@ describe("bringing a local database up to date", () => {
       "0040_selfhost_queues_and_schedules.sql",
       "0041_selfhost_object_buckets.sql",
       "0042_worker_endpoint_origin_reservation_space_id.sql",
+      "0043_artifact_blob_io_fences.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1074,6 +1080,7 @@ describe("bringing a local database up to date", () => {
       "0040_selfhost_queues_and_schedules.sql",
       "0041_selfhost_object_buckets.sql",
       "0042_worker_endpoint_origin_reservation_space_id.sql",
+      "0043_artifact_blob_io_fences.sql",
     ]);
     expect(
       database
@@ -2004,6 +2011,7 @@ describe("bringing a local database up to date", () => {
       SELFHOST_QUEUES_AND_SCHEDULES,
       SELFHOST_OBJECT_BUCKETS,
       WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
+      ARTIFACT_BLOB_IO_FENCES,
     ]);
     expect(
       database

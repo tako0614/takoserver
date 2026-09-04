@@ -62,6 +62,36 @@ test("the Bun entry rejects shared D1 before opening local state", async () => {
   }
 });
 
+test("the Bun entry rejects the unsupported shared R2 composition before opening local state", async () => {
+  const dataRoot = join(tmpdir(), `takoserver-shared-r2-${crypto.randomUUID()}`);
+  const child = Bun.spawn([process.execPath, "src/entry-bun.ts"], {
+    cwd: join(import.meta.dir, ".."),
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      TAKOSERVER_R2_BUCKET: "shared-artifacts",
+      TAKOSERVER_DATA_ROOT: dataRoot,
+      TAKOSERVER_DB: join(dataRoot, "control.sqlite"),
+    },
+  });
+
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  try {
+    expect(exitCode).not.toBe(0);
+    expect(`${stdout}\n${stderr}`).toContain("TAKOSERVER_R2_BUCKET");
+    expect(`${stdout}\n${stderr}`).toContain("not supported by the Bun entry");
+    expect(existsSync(dataRoot)).toBe(false);
+  } finally {
+    rmSync(dataRoot, { recursive: true, force: true });
+  }
+});
+
 test("the Bun entry has no shared-D1 or dead signing-key branches", async () => {
   const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
 
@@ -69,8 +99,11 @@ test("the Bun entry has no shared-D1 or dead signing-key branches", async () => 
   expect(source).not.toContain("loadSigningKey");
   expect(source).not.toContain("sharedDatabaseId");
   expect(source).toContain("TAKOSERVER_D1_DATABASE_ID");
+  expect(source).toContain("TAKOSERVER_R2_BUCKET");
   expect(source).toContain("return createSqliteSql(database);");
   expect(source.indexOf("TAKOSERVER_D1_DATABASE_ID")).toBeLessThan(
     source.indexOf("const dataRoot"),
   );
+  expect(source.indexOf("TAKOSERVER_R2_BUCKET")).toBeLessThan(source.indexOf("const dataRoot"));
+  expect(source).not.toContain("createR2HttpObjectStore");
 });

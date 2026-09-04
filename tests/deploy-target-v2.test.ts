@@ -46,6 +46,15 @@ describe("environment-exact deploy target", () => {
     });
   });
 
+  test("accepts only the explicit pre-0043 artifact I/O compatibility mode", () => {
+    withTarget(descriptor({ artifactBlobIoMode: "pre-0043-quiesced" }), (path) => {
+      expect(loadTarget(path, "rehearsal").artifactBlobIoMode).toBe("pre-0043-quiesced");
+    });
+    withTarget(descriptor({ artifactBlobIoMode: "quiet-ish" }), (path) => {
+      expect(() => loadTarget(path, "rehearsal")).toThrow("artifactBlobIoMode");
+    });
+  });
+
   test("refuses the retired cross-product runtime topology", () => {
     withTarget(
       descriptor({

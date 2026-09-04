@@ -63,6 +63,8 @@ export interface WorkerEnv {
   /** Exact source and built artifact identities injected by the owning deploy surface. */
   readonly TAKOSERVER_SOURCE_COMMIT?: string;
   readonly TAKOSERVER_WORKER_ARTIFACT_DIGEST?: string;
+  /** Temporary fail-closed 0042/0043 deployment bridge; never a steady mode. */
+  readonly TAKOSERVER_ARTIFACT_BLOB_IO_MODE?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
@@ -267,6 +269,25 @@ export function workerStartupFailureResponse(error: unknown): Response {
     { reason },
     { headers: { "cache-control": "no-store" } },
     refusal,
+  );
+}
+
+function artifactBlobIoMode(
+  env: Pick<WorkerEnv, "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
+): "normal" | "pre-0043-quiesced" {
+  const value = env.TAKOSERVER_ARTIFACT_BLOB_IO_MODE;
+  if (value === undefined) return "normal";
+  if (value === "pre-0043-quiesced") return value;
+  throw new TypeError("TAKOSERVER_ARTIFACT_BLOB_IO_MODE is invalid");
+}
+
+function artifactBlobIoQuiescenceResponse(): Response {
+  return errorEnvelopeResponse(
+    "backend_unavailable",
+    503,
+    { reason: "runtime-configuration" },
+    { headers: { "cache-control": "no-store", "retry-after": "60" } },
+    "artifact blob I/O is quiesced for the 0043 compatibility cutover",
   );
 }
 
@@ -527,6 +548,10 @@ export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     let app: App;
     try {
+      const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
+      if (mode === "pre-0043-quiesced") {
+        return artifactBlobIoQuiescenceResponse();
+      }
       app = await appFor(
         env,
         startupStage("public-origin", () => requirePublicOrigin(env)),
@@ -539,6 +564,7 @@ export default {
 
   /** Background settlement: expiring reservations return their holds. */
   async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
+    if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
     const app = await appFor(env, requirePublicOrigin(env));
     await app.tick();
   },

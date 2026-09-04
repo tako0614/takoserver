@@ -1,6 +1,10 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  artifactBlobIoCompatibilityAllowsPending,
+  probeArtifactBlobIoQuiescence,
+} from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -241,7 +245,8 @@ export async function runWorker(
             }
           : {}),
         ready:
-          before.pending.length === 0 &&
+          (before.pending.length === 0 ||
+            artifactBlobIoCompatibilityAllowsPending(target, before.pending)) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
@@ -275,7 +280,10 @@ export async function runWorker(
       commit: invocation.commit,
       run,
     });
-    if (before.pending.length > 0) {
+    if (
+      before.pending.length > 0 &&
+      !artifactBlobIoCompatibilityAllowsPending(target, before.pending)
+    ) {
       throw preflightError(
         "routine Worker publication refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(before.pending),
@@ -484,13 +492,22 @@ export async function runWorker(
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
-    if (after.pending.length > 0) {
+    if (
+      after.pending.length > 0 &&
+      !artifactBlobIoCompatibilityAllowsPending(target, after.pending)
+    ) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
-    const probe = await probeProduct(
-      target.publicOrigin,
-      options.fetcher ?? ((input, init) => fetch(input, init)),
-    );
+    const probe =
+      target.artifactBlobIoMode === "pre-0043-quiesced"
+        ? await probeArtifactBlobIoQuiescence(
+            target.publicOrigin,
+            options.fetcher ?? ((input, init) => fetch(input, init)),
+          )
+        : await probeProduct(
+            target.publicOrigin,
+            options.fetcher ?? ((input, init) => fetch(input, init)),
+          );
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,

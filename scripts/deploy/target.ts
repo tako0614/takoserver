@@ -27,6 +27,8 @@ export interface DeployTarget {
   readonly d1: { readonly databaseName: string; readonly databaseId: string };
   readonly r2: { readonly bucketName: string };
   readonly publicOrigin: string;
+  /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
+  readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /**
    * Other hostnames this deployment also answers on.
    *
@@ -210,6 +212,7 @@ export function parseDeployTarget(
       "formAuthority",
       "operatorIdentity",
       "integrationE2eCredentialAuthority",
+      "artifactBlobIoMode",
     ],
   );
 
@@ -240,6 +243,7 @@ export function parseDeployTarget(
     },
     r2: { bucketName: pattern(r2.bucketName, BUCKET_NAME, "r2.bucketName") },
     publicOrigin: httpsOrigin(value.publicOrigin),
+    ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...(value.aliases === undefined ? {} : { aliases: hostnames(value.aliases) }),
     ...(value.consoleOrigin === undefined
       ? {}
@@ -653,6 +657,14 @@ function boolean(value: unknown, field: string): boolean {
     throw preflightError(`deploy target \`${field}\` is invalid`);
   }
   return value;
+}
+
+function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pre-0043-quiesced" } {
+  if (value === undefined) return {};
+  if (value !== "pre-0043-quiesced") {
+    throw preflightError("deploy target `artifactBlobIoMode` must be pre-0043-quiesced when set");
+  }
+  return { artifactBlobIoMode: value };
 }
 
 function httpsOrigin(value: unknown): string {

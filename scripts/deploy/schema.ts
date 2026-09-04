@@ -14,6 +14,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  type ArtifactBlobIoDeploymentCompatibility,
+  inspectArtifactBlobIoDeploymentCompatibility,
+} from "./artifact-blob-io-compatibility.ts";
+import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
   DeployError,
@@ -92,6 +97,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0040_selfhost_queues_and_schedules.sql",
   "0041_selfhost_object_buckets.sql",
   "0042_worker_endpoint_origin_reservation_space_id.sql",
+  "0043_artifact_blob_io_fences.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -179,8 +185,10 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:602dba6c847e1e292f77bbc8cc9031cdd8dbbf4fc820feab32cb557d92d79365",
   "0042_worker_endpoint_origin_reservation_space_id.sql":
     "sha256:e3f2c9ed578eb92100158059fc6c16d4719b67b1dafcc30645c10791196d0254",
+  "0043_artifact_blob_io_fences.sql":
+    "sha256:8a85fa1b6d8ba67fec9d4e37ac9975c9f575ade3c2e9d6d4c4c1ac1a977447fc",
 };
-export const SCHEMA_WAVE_BOUNDARIES = ["0028", "0033", "0036", "0042"] as const;
+export const SCHEMA_WAVE_BOUNDARIES = ["0028", "0033", "0036", "0043"] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
   Record<
@@ -211,11 +219,11 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 36,
     throughMigration: "0036_provider_repair_and_managed_schedule_reconciliation.sql",
   },
-  "0042": {
+  "0043": {
     fromCount: 36,
     fromMigration: "0036_provider_repair_and_managed_schedule_reconciliation.sql",
-    throughCount: 42,
-    throughMigration: "0042_worker_endpoint_origin_reservation_space_id.sql",
+    throughCount: 43,
+    throughMigration: "0043_artifact_blob_io_fences.sql",
   },
 };
 const RESOURCE_DELETION_ATTESTATION_MIGRATION = "0029_resource_deletion_attestations.sql";
@@ -224,6 +232,7 @@ const PROVIDER_EXECUTION_LEASE_MIGRATION = "0024_takoform_provider_execution_lea
 const RUNTIME_INPUT_PREPARATION_MIGRATION = "0032_worker_runtime_input_preparations.sql";
 const RUNTIME_INPUT_PREPARATION_V2_MIGRATION = "0037_worker_runtime_input_preparation_v2.sql";
 const LIVE_NATIVE_CLAIM_MIGRATION = "0039_takoform_live_native_claim_across_tenants.sql";
+const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -262,6 +271,12 @@ export interface SchemaReader {
   }>;
   /** Read-only 0039 preflight; the tightened live claim must already be unique. */
   duplicateLiveNativeClaimCount?(phase: DeployPhase): Promise<number>;
+  /** Read-only 0043 preflight; an active root may not already overlap deletion. */
+  activeRootDeletingArtifactCandidateConflictCount?(phase: DeployPhase): Promise<number>;
+  /** Test/read boundary for the staged 0043 Worker and external drain proof. */
+  artifactBlobIoDeploymentCompatibility?(
+    phase: DeployPhase,
+  ): Promise<ArtifactBlobIoDeploymentCompatibility>;
 }
 
 export interface SchemaInvocation {
@@ -281,6 +296,11 @@ export interface SchemaOptions {
   readonly predecessorReceiptPath?: string;
   readonly leaseRoot?: string;
   readonly review?: string;
+  readonly artifactBlobIoQuiescenceReceiptPath?: string;
+  readonly artifactBlobIoCompatibilityReader?: (
+    phase: DeployPhase,
+    context: { readonly bearerToken: string | undefined },
+  ) => Promise<ArtifactBlobIoDeploymentCompatibility>;
 }
 
 export type SchemaBaselineOptions = Omit<SchemaOptions, "receiptPath" | "predecessorReceiptPath">;
@@ -581,6 +601,16 @@ export async function runD1Schema(
       run,
       injected: options.reader,
     });
+    const artifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
+      phase: "preflight",
+      pending: wave.pending,
+      target,
+      selectedCommit: invocation.commit,
+      bearerToken: credential?.token,
+      injected: options.reader,
+      compatibilityReader: options.artifactBlobIoCompatibilityReader,
+      receiptPath: options.artifactBlobIoQuiescenceReceiptPath,
+    });
     if (invocation.action === "status") {
       return {
         kind: "takoserver.d1-schema-status@v3",
@@ -602,10 +632,16 @@ export async function runD1Schema(
         nextPendingMigration: wave.pending[0] ?? null,
         schemaShapeDigest: initial.shapeDigest,
         dataPreflights,
-        readyForApply: wave.pending.length > 0 && dataPreflights.status === "ready",
+        artifactBlobIoCompatibility,
+        readyForApply:
+          wave.pending.length > 0 &&
+          dataPreflights.status === "ready" &&
+          (artifactBlobIoCompatibility.status === "ready" ||
+            artifactBlobIoCompatibility.status === "not_pending"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
+    assertArtifactBlobIoCompatibilityReady(artifactBlobIoCompatibility, "before qualification");
     if (invocation.environment === "integration" && wave.pending.length === 0) {
       throw preflightError(
         "the selected D1 migration wave is already complete; --apply refuses to turn a no-op into green mutation evidence",
@@ -676,6 +712,25 @@ export async function runD1Schema(
     });
     assertSameDataPreflights(dataPreflights, requalifiedDataPreflights, "during qualification");
     assertDataPreflightsReady(requalifiedDataPreflights, "after qualification");
+    const requalifiedArtifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
+      phase: "preflight",
+      pending: requalifiedWave.pending,
+      target,
+      selectedCommit: invocation.commit,
+      bearerToken: credential?.token,
+      injected: options.reader,
+      compatibilityReader: options.artifactBlobIoCompatibilityReader,
+      receiptPath: options.artifactBlobIoQuiescenceReceiptPath,
+    });
+    assertSameArtifactBlobIoCompatibility(
+      artifactBlobIoCompatibility,
+      requalifiedArtifactBlobIoCompatibility,
+      "during qualification",
+    );
+    assertArtifactBlobIoCompatibilityReady(
+      requalifiedArtifactBlobIoCompatibility,
+      "after qualification",
+    );
 
     const receiptEvidence =
       invocation.environment === "production" || rehearsalReceiptAlreadyExists
@@ -709,6 +764,25 @@ export async function runD1Schema(
       "at the final mutation fence",
     );
     assertDataPreflightsReady(fencedDataPreflights, "at the final mutation fence");
+    const fencedArtifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
+      phase: "preflight",
+      pending: fencedWave.pending,
+      target,
+      selectedCommit: invocation.commit,
+      bearerToken: credential?.token,
+      injected: options.reader,
+      compatibilityReader: options.artifactBlobIoCompatibilityReader,
+      receiptPath: options.artifactBlobIoQuiescenceReceiptPath,
+    });
+    assertSameArtifactBlobIoCompatibility(
+      requalifiedArtifactBlobIoCompatibility,
+      fencedArtifactBlobIoCompatibility,
+      "at the final mutation fence",
+    );
+    assertArtifactBlobIoCompatibilityReady(
+      fencedArtifactBlobIoCompatibility,
+      "at the final mutation fence",
+    );
     artifact.assertUnchanged();
     const predecessorReceiptEvidence =
       invocation.environment === "rehearsal"
@@ -774,6 +848,41 @@ export async function runD1Schema(
       runtimeInputQuiescence = await enforceRuntimeInputPreparationV2Quiescence({
         pending: fencedWave.pending,
         applied: fenced.applied,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      const mutationArtifactBlobIoCompatibility = await inspectArtifactBlobIoCompatibility({
+        phase: "mutation",
+        pending: fencedWave.pending,
+        target,
+        selectedCommit: invocation.commit,
+        bearerToken: credential?.token,
+        injected: options.reader,
+        compatibilityReader: options.artifactBlobIoCompatibilityReader,
+        receiptPath: options.artifactBlobIoQuiescenceReceiptPath,
+      });
+      if (
+        JSON.stringify(mutationArtifactBlobIoCompatibility) !==
+        JSON.stringify(fencedArtifactBlobIoCompatibility)
+      ) {
+        throw mutationError(
+          "0043 artifact blob I/O deployment compatibility changed at the immediate migration fence",
+        );
+      }
+      if (
+        mutationArtifactBlobIoCompatibility.status !== "ready" &&
+        mutationArtifactBlobIoCompatibility.status !== "not_pending"
+      ) {
+        throw mutationError(
+          "0043 artifact blob I/O deployment compatibility is not ready at the immediate migration fence",
+        );
+      }
+      // Keep this D1 count after the slower Worker/history proof. It is the
+      // final provider read before Wrangler starts the wave's first migration.
+      await enforceArtifactBlobIoConflictMutationFence({
+        pending: fencedWave.pending,
         configPath,
         environment,
         run,
@@ -925,6 +1034,7 @@ export async function runD1Schema(
       throughPrefixDigest: wave.throughPrefixDigest,
       pendingMigrations: wave.pending,
       dataPreflights: fencedDataPreflights,
+      artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1000,7 +1110,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0042",
+      "selected D1 wave requires the exact audited source inventory 0001-0043",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1045,7 +1155,7 @@ function assertAuditedMigrationHashes(
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
-        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0042 file",
+        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0043 file",
         `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
       );
     }
@@ -1091,12 +1201,100 @@ interface LiveNativeClaimPreflight {
   readonly duplicateLiveNativeClaimCount: number;
 }
 
+interface ArtifactBlobIoFencePreflight {
+  readonly status: "not_pending" | "ready" | "legacy_data_repair_required";
+  readonly activeRootDeletingCandidateConflictCount: number;
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
   readonly providerRepair: ProviderRepairPreflight;
   readonly runtimeInputPreparationV2: RuntimeInputPreparationV2Preflight;
   readonly liveNativeClaim: LiveNativeClaimPreflight;
+  readonly artifactBlobIoFence: ArtifactBlobIoFencePreflight;
+}
+
+type ArtifactBlobIoCompatibilityPreflight =
+  | ArtifactBlobIoDeploymentCompatibility
+  | {
+      readonly status: "not_pending";
+      readonly currentCompatibilityDeploymentId: null;
+      readonly rollbackCompatibilityDeploymentId: null;
+      readonly currentCompatibilityVersionId: null;
+      readonly rollbackCompatibilityVersionId: null;
+      readonly unsafePredecessorInvocations: "unproven";
+    };
+
+async function inspectArtifactBlobIoCompatibility(input: {
+  readonly phase: DeployPhase;
+  readonly pending: readonly string[];
+  readonly target: DeployTarget;
+  readonly selectedCommit: string;
+  readonly bearerToken: string | undefined;
+  readonly injected: SchemaReader | undefined;
+  readonly compatibilityReader:
+    | ((
+        phase: DeployPhase,
+        context: { readonly bearerToken: string | undefined },
+      ) => Promise<ArtifactBlobIoDeploymentCompatibility>)
+    | undefined;
+  readonly receiptPath: string | undefined;
+}): Promise<ArtifactBlobIoCompatibilityPreflight> {
+  if (!input.pending.includes(ARTIFACT_BLOB_IO_FENCE_MIGRATION)) {
+    return {
+      status: "not_pending",
+      currentCompatibilityDeploymentId: null,
+      rollbackCompatibilityDeploymentId: null,
+      currentCompatibilityVersionId: null,
+      rollbackCompatibilityVersionId: null,
+      unsafePredecessorInvocations: "unproven",
+    };
+  }
+  if (input.compatibilityReader) {
+    return await input.compatibilityReader(input.phase, { bearerToken: input.bearerToken });
+  }
+  const injected = input.injected?.artifactBlobIoDeploymentCompatibility;
+  if (injected) return await injected(input.phase);
+  const token = input.bearerToken;
+  if (typeof token !== "string") {
+    throw preflightError("0043 compatibility preflight requires CLOUDFLARE_API_TOKEN");
+  }
+  return await inspectArtifactBlobIoDeploymentCompatibility({
+    phase: input.phase,
+    target: input.target,
+    selectedCommit: input.selectedCommit,
+    state: new CloudflareState({ accountId: input.target.accountId, token }),
+    ...((input.receiptPath ?? process.env.TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH)
+      ? {
+          receiptPath:
+            input.receiptPath ??
+            (process.env.TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH as string),
+        }
+      : {}),
+  });
+}
+
+function assertArtifactBlobIoCompatibilityReady(
+  preflight: ArtifactBlobIoCompatibilityPreflight,
+  when: string,
+): void {
+  if (preflight.status !== "ready" && preflight.status !== "not_pending") {
+    throw preflightError(
+      `0043 artifact blob I/O deployment compatibility requires operator action ${when}`,
+      JSON.stringify(preflight),
+    );
+  }
+}
+
+function assertSameArtifactBlobIoCompatibility(
+  left: ArtifactBlobIoCompatibilityPreflight,
+  right: ArtifactBlobIoCompatibilityPreflight,
+  when: string,
+): void {
+  if (JSON.stringify(left) !== JSON.stringify(right)) {
+    throw preflightError(`0043 artifact blob I/O deployment compatibility changed ${when}`);
+  }
 }
 
 async function inspectDataPreflights(input: {
@@ -1111,25 +1309,33 @@ async function inspectDataPreflights(input: {
   const database = input.injected
     ? null
     : new RemoteD1(input.configPath, { environment: input.environment, run: input.run });
-  const [resourceDeletionAttestation, providerRepair, runtimeInputPreparationV2, liveNativeClaim] =
-    await Promise.all([
-      inspectResourceDeletionAttestationPreflight({ ...input, database }),
-      inspectProviderRepairPreflight(input),
-      inspectRuntimeInputPreparationV2Preflight({ ...input, database }),
-      inspectLiveNativeClaimPreflight({ ...input, database }),
-    ]);
+  const [
+    resourceDeletionAttestation,
+    providerRepair,
+    runtimeInputPreparationV2,
+    liveNativeClaim,
+    artifactBlobIoFence,
+  ] = await Promise.all([
+    inspectResourceDeletionAttestationPreflight({ ...input, database }),
+    inspectProviderRepairPreflight(input),
+    inspectRuntimeInputPreparationV2Preflight({ ...input, database }),
+    inspectLiveNativeClaimPreflight({ ...input, database }),
+    inspectArtifactBlobIoFencePreflight({ ...input, database }),
+  ]);
   return {
     status:
       resourceDeletionAttestation.status === "legacy_data_repair_required" ||
       providerRepair.status === "operator_reconciliation_required" ||
       runtimeInputPreparationV2.status === "legacy_data_repair_required" ||
-      liveNativeClaim.status === "legacy_data_repair_required"
+      liveNativeClaim.status === "legacy_data_repair_required" ||
+      artifactBlobIoFence.status === "legacy_data_repair_required"
         ? "data_repair_required"
         : "ready",
     resourceDeletionAttestation,
     providerRepair,
     runtimeInputPreparationV2,
     liveNativeClaim,
+    artifactBlobIoFence,
   };
 }
 
@@ -1352,6 +1558,77 @@ async function inspectLiveNativeClaimPreflight(input: {
     status: duplicateLiveNativeClaimCount === 0 ? "ready" : "legacy_data_repair_required",
     duplicateLiveNativeClaimCount,
   };
+}
+
+async function inspectArtifactBlobIoFencePreflight(input: {
+  readonly phase: DeployPhase;
+  readonly pending: readonly string[];
+  readonly injected: SchemaReader | undefined;
+  readonly database: RemoteD1 | null;
+}): Promise<ArtifactBlobIoFencePreflight> {
+  if (!input.pending.includes(ARTIFACT_BLOB_IO_FENCE_MIGRATION)) {
+    return { status: "not_pending", activeRootDeletingCandidateConflictCount: 0 };
+  }
+  const count = await readArtifactBlobIoConflictCount(input);
+  return {
+    status: count === 0 ? "ready" : "legacy_data_repair_required",
+    activeRootDeletingCandidateConflictCount: count,
+  };
+}
+
+async function enforceArtifactBlobIoConflictMutationFence(input: {
+  readonly pending: readonly string[];
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<void> {
+  if (!input.pending.includes(ARTIFACT_BLOB_IO_FENCE_MIGRATION)) return;
+  const database = input.injected
+    ? null
+    : new RemoteD1(input.configPath, { environment: input.environment, run: input.run });
+  const count = await readArtifactBlobIoConflictCount({
+    phase: "mutation",
+    injected: input.injected,
+    database,
+  });
+  if (count !== 0) {
+    throw mutationError(
+      "0043 artifact blob I/O conflict appeared at the immediate migration mutation fence",
+      JSON.stringify({ activeRootDeletingCandidateConflictCount: count }),
+    );
+  }
+}
+
+async function readArtifactBlobIoConflictCount(input: {
+  readonly phase: DeployPhase;
+  readonly injected: SchemaReader | undefined;
+  readonly database: RemoteD1 | null;
+}): Promise<number> {
+  const count = input.injected
+    ? await input.injected.activeRootDeletingArtifactCandidateConflictCount?.(input.phase)
+    : await readSingleCount(
+        input.database as RemoteD1,
+        input.phase,
+        "0043 active-root/deleting-candidate conflict preflight",
+        `SELECT COUNT(*) AS conflict_count
+         FROM tf_artifact_gc_candidates AS candidate
+         WHERE candidate.state = 'deleting' AND EXISTS (
+           SELECT 1
+           FROM tf_artifact_roots AS root
+           WHERE root.state = 'active' AND (
+             (root.target_kind = candidate.kind AND root.digest = candidate.digest) OR
+             (candidate.kind = 'blob' AND root.target_kind = 'manifest' AND EXISTS (
+               SELECT 1
+               FROM tf_artifact_manifest_members AS member
+               WHERE member.manifest_digest = root.digest
+                 AND member.blob_digest = candidate.digest
+             ))
+           )
+         )`,
+        "conflict_count",
+      );
+  return exactNonnegativeCount(count, "0043 active-root/deleting-candidate conflict preflight");
 }
 
 async function readResourceDeletionAttestationBackfillCounts(

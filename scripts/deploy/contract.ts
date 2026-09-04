@@ -83,6 +83,7 @@ export const DEPLOY_CONTRACT = {
         "wrangler.jsonc",
         "scripts/build-worker.ts",
         "scripts/deploy.ts",
+        "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/worker.ts",
         "scripts/deploy/worker-authority-paths.ts",
         "scripts/deploy/worker-composition.ts",
@@ -110,13 +111,15 @@ export const DEPLOY_CONTRACT = {
           "kernel flock with exact boot, PID-start, " +
           "and lock-inode owner evidence serializes this owning publication path through authoritative " +
           "readback and public smoke. Status distinguishes active, stale-reclaimable crashed, and unsafe " +
-          "lease state. Cloudflare exposes no conditional " +
+          "lease state. While the exact 0037-0043 suffix is pending, public smoke instead requires the " +
+          "owned all-traffic quiescence 503 before any request-time composition. Cloudflare exposes no conditional " +
           "deployment/CAS input, so authoritative post-mutation " +
           "history re-establishes the actual immediate predecessor as the rollback target.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${routineFailure} The surface refuses pending migrations and any configuration, secret, ` +
+          `${routineFailure} The surface refuses pending migrations except the exact 0037-0043 ` +
+          "suffix while the selected target is the all-traffic pre-0043 quiescence Worker. It refuses any configuration, secret, " +
           "signing or Hosted topology drift before upload. It also composes the selected target with " +
           "the Worker's own startup path before any upload and refuses with that composition's exact " +
           "words, so a target that parses and yet cannot serve is a pre-mutation refusal rather than a " +
@@ -143,6 +146,7 @@ export const DEPLOY_CONTRACT = {
         "wrangler.jsonc",
         "scripts/build-worker.ts",
         "scripts/deploy.ts",
+        "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/worker.ts",
         "scripts/deploy/worker-authority-paths.ts",
         "scripts/deploy/worker-closure-transition.ts",
@@ -169,13 +173,17 @@ export const DEPLOY_CONTRACT = {
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
           "Integration JIT enablement adds exactly its environment, dedicated public JWK, fixed organization, " +
-          "source commit and artifact digest plain-text bindings as one all-or-none profile. Every Form-authority " +
-          "environment separately seals handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form package-operation set, embeds P/capability/I, then hashes outer artifact A.",
+          "source commit and artifact digest plain-text bindings as one all-or-none profile. While the exact " +
+          "0037-0043 suffix is pending, public smoke instead requires the owned all-traffic quiescence 503 " +
+          "before any request-time composition. Every Form-authority environment separately seals " +
+          "handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form " +
+          "package-operation set, embeds P/capability/I, then hashes outer artifact A.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${highRiskFailure} Pending schema and any configuration, secret, signing or Hosted topology ` +
-          "drift are still refused. Integration alone may bridge exact absence to the complete JIT " +
+          `${highRiskFailure} Pending schema is refused except for the exact 0037-0043 suffix while ` +
+          "the selected target blocks all request and scheduled traffic in pre-0043 quiescence mode. " +
+          "Any other configuration, secret, signing or Hosted topology drift is still refused. Integration alone may bridge exact absence to the complete JIT " +
           "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
           "mismatch are refused. " +
           "The named --legacy-host-runtime-predecessor-version transition profile is the only " +
@@ -617,6 +625,7 @@ export const DEPLOY_CONTRACT = {
       target: "cloudflare-d1:environment-selected-takoserver-state",
       covers: [
         "migrations",
+        "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
@@ -628,18 +637,21 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
+        "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
       ],
       triggers: ["irreversible"],
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0028, ` +
-          "0033, 0036 or 0042. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036 or 0043. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
           "is explicitly integration-only.",
         "post-conditions":
           "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
-          "always names lastAppliedMigration and nextPendingMigration within the selected wave.",
+          "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
+          "While 0043 is pending it also names current and rollback compatibility deployment and " +
+          "Version identities, drain state, and active-root/deleting-candidate repair count.",
         reversal:
           "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
         "failure-handling":
@@ -649,19 +661,27 @@ export const DEPLOY_CONTRACT = {
           "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH; its exact canonical bytes are " +
           "SHA-256-linked into the next receipt. One target-D1 kernel lease spans attempt creation, " +
           "mutation, authoritative readback, and receipt/marker finalization. " +
-          " A failed provider acknowledgement performs an immediate authoritative lineage/shape " +
+          "A failed provider acknowledgement performs an immediate authoritative lineage/shape " +
           "readback. A partial result can resume only under the same through selector and exact " +
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
-          "without a second provider apply, and a later boundary cannot be skipped to.",
+          "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
+          "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
+          "repository never manufactures the external drained-or-cancelled assertion.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
-          "native claim. Rehearsal writes one no-overwrite 0600 receipt per wave outside every " +
+          "native claim, plus the 0043 active-root/deleting-candidate conflict count. Rehearsal writes " +
+          "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
           "bytes, pre-shape and expected post-shape. Before 0037, one transactional D1 batch installs " +
           "an exact insert-blocking trigger and asserts the replaced predecessor is still empty; " +
-          "0037 removes the guarded table. Integration evidence is never accepted.",
+          "0037 removes the guarded table. For 0043, current and immediate rollback Worker deployments and Versions " +
+          "must both be exact all-traffic compatibility builds at the selected commit, public preview URLs are disabled, and a private " +
+          "receipt created after and bound to both deployments must attest that every older request/event " +
+          "invocation drained or was cancelled. " +
+          "Those Version/history, receipt, and conflict proofs are re-read in mutation phase after " +
+          "the 0037 guard and immediately before the wave's first migration. Integration evidence is never accepted.",
         "independent-review": review,
       },
     },

@@ -64,7 +64,19 @@ export function createR2HttpObjectStore(options: R2HttpOptions): ObjectStoreAcce
   };
 
   return {
+    writeOperationIdentity: "unsupported",
+
     async put(key, body, opts): Promise<StoredObject> {
+      // This REST transport has no proven round-trip for Worker-binding custom
+      // metadata. Silently dropping an operation identity would let recovery
+      // adopt older identical bytes, so callers needing that guarantee must
+      // use an adapter that actually implements it.
+      if (opts?.writeOperationId !== undefined) {
+        throw new ObjectStoreError(
+          "invalid",
+          "R2 HTTP cannot persist an exact write operation identity",
+        );
+      }
       const bytes = await collect(body);
       const response = await call(
         "PUT",
