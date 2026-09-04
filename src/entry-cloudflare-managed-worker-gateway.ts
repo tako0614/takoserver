@@ -1,21 +1,25 @@
+import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   createCloudflareManagedWorkerGateway,
   createD1ManagedWorkerGatewayState,
   type ManagedWorkerD1Database,
   type ManagedWorkerDispatchNamespace,
 } from "./providers/cloudflare-managed-worker-gateway.ts";
+import {
+  type ManagedWorkerSqliteAuthority,
+  managedWorkerSqliteAdminProof,
+  managedWorkerSqliteInstanceName,
+} from "./providers/cloudflare-managed-worker-sqlite.ts";
+import type { CloudflareManagedWorkerGatewayAuthority } from "./providers/cloudflare-worker-backend.ts";
 
 export { TakoserverManagedWorkerSqlite } from "./providers/cloudflare-managed-worker-sqlite-object.ts";
 
 /**
  * Bindings and non-secret identity selected by the owning deploy target.
  *
- * `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET` is declared here because it belongs
- * to this Worker: it is read by the SQLite Durable Object this script exports,
- * which is handed this same environment, and never by the gateway's own
- * request paths. An operator provisions it out of band, with the same value the
- * provider composition seals admin calls with; until they do, the object
- * refuses every admin operation. A tenant's dispatched Worker never holds it.
+ * This internet-routed dispatcher owns only its D1/dispatch/SQLite boundary.
+ * Managed ObjectBucket receipt and S3 credentials belong to the separate
+ * route-less receipt authority Worker and must never be bound here.
  */
 export interface ManagedWorkerGatewayWorkerEnv {
   readonly STATE_DB: ManagedWorkerD1Database;
@@ -24,6 +28,46 @@ export interface ManagedWorkerGatewayWorkerEnv {
   readonly TAKOSERVER_MANAGED_WORKER_GATEWAY_ID?: string;
   readonly TAKOSERVER_ENVIRONMENT?: string;
   readonly TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET?: string;
+}
+
+/** Provider-only SQLite HMAC operations; no default RPC method is exported. */
+export class TakoserverManagedWorkerAuthority
+  extends WorkerEntrypoint<ManagedWorkerGatewayWorkerEnv>
+  implements CloudflareManagedWorkerGatewayAuthority
+{
+  async deriveSqliteInstanceName(input: {
+    readonly providerId: string;
+    readonly resourceUid: string;
+    readonly generation: string;
+  }): Promise<string> {
+    this.assertProvider(input.providerId);
+    return await managedWorkerSqliteInstanceName({
+      ...input,
+      instanceSecret: this.secret(),
+    });
+  }
+
+  async sealSqliteAdminProof(input: {
+    readonly operation: Parameters<typeof managedWorkerSqliteAdminProof>[0]["operation"];
+    readonly authority: ManagedWorkerSqliteAuthority;
+  }): Promise<string> {
+    this.assertProvider(input.authority.providerId);
+    return await managedWorkerSqliteAdminProof({ secret: this.secret(), ...input });
+  }
+
+  private secret(): string {
+    const secret = this.env.TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET;
+    if (typeof secret !== "string" || secret.length === 0) {
+      throw new TypeError("managed SQLite authority is unavailable");
+    }
+    return secret;
+  }
+
+  private assertProvider(providerId: string): void {
+    if (providerId !== this.env.MANAGED_PROVIDER_ID) {
+      throw new TypeError("managed SQLite provider identity conflicts");
+    }
+  }
 }
 
 const worker = {

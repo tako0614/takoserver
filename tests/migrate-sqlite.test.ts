@@ -21,6 +21,7 @@ const WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID =
   "0042_worker_endpoint_origin_reservation_space_id.sql";
 const ARTIFACT_BLOB_IO_FENCES = "0043_artifact_blob_io_fences.sql";
 const ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS = "0044_artifact_consumer_resolution_receipts.sql";
+const CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS = "0045_cloudflare_provider_executor_operations.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -34,6 +35,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
   ARTIFACT_BLOB_IO_FENCES,
   ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+  CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -355,7 +357,9 @@ describe("bringing a local database up to date", () => {
     );
     expect(receiptMigrationIndex).toBeGreaterThan(0);
     expect(MIGRATIONS[receiptMigrationIndex - 1]?.name).toBe(ARTIFACT_BLOB_IO_FENCES);
-    expect(MIGRATIONS[receiptMigrationIndex + 1]).toBeUndefined();
+    expect(MIGRATIONS[receiptMigrationIndex + 1]?.name).toBe(
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
+    );
 
     const database = new Database(":memory:");
     database.exec(`
@@ -368,7 +372,10 @@ describe("bringing a local database up to date", () => {
       applyHistoricalMigration(database, migration.name, migration.sql);
     }
 
-    expect(migrateSqlite(database).applied).toEqual([ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS]);
+    expect(migrateSqlite(database).applied).toEqual([
+      ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
+    ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
     const insert = database.query(`
@@ -493,6 +500,7 @@ describe("bringing a local database up to date", () => {
         WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
         ARTIFACT_BLOB_IO_FENCES,
         ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+        CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -944,6 +952,7 @@ describe("bringing a local database up to date", () => {
       "tf_artifact_manifest_members",
       "tf_artifact_owner_closure_receipts",
       "tf_artifact_roots",
+      "tf_cloudflare_provider_executor_operations",
       "tf_resources",
       "tf_resource_attachments",
       "tf_resource_deployments",
@@ -1040,6 +1049,7 @@ describe("bringing a local database up to date", () => {
       "0042_worker_endpoint_origin_reservation_space_id.sql",
       "0043_artifact_blob_io_fences.sql",
       "0044_artifact_consumer_resolution_receipts.sql",
+      "0045_cloudflare_provider_executor_operations.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1165,6 +1175,7 @@ describe("bringing a local database up to date", () => {
       "0042_worker_endpoint_origin_reservation_space_id.sql",
       "0043_artifact_blob_io_fences.sql",
       "0044_artifact_consumer_resolution_receipts.sql",
+      "0045_cloudflare_provider_executor_operations.sql",
     ]);
     expect(
       database
@@ -2097,6 +2108,7 @@ describe("bringing a local database up to date", () => {
       WORKER_ENDPOINT_ORIGIN_RESERVATION_SPACE_ID,
       ARTIFACT_BLOB_IO_FENCES,
       ARTIFACT_CONSUMER_RESOLUTION_RECEIPTS,
+      CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS,
     ]);
     expect(
       database

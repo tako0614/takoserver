@@ -1,10 +1,12 @@
 # Running the Bun provisioner
 
-Production Cloudflare execution is provisioned from the Worker itself; see
+Production Cloudflare execution runs in the named, route-less
+`CloudflareProviderExecutor` Worker; see
 [ADR 0001](adr/0001-provision-from-the-worker.md). Set its zones on the reviewed
-deploy target and keep its scoped token in the Worker secret. The Bun entry is
-a different composition: it always executes current Provider3 Edge Forms on
-the local workerd-backed provider.
+deploy target and keep its scoped token only in that executor's secret binding.
+The public API Worker holds a typed service binding and credential-free proxy.
+The Bun entry is a different composition: it always executes current Provider3
+Edge Forms on the local workerd-backed provider.
 
 The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
@@ -43,7 +45,7 @@ not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` and
 before any local directory, database, or key is opened because request-time
 control and artifact writes require capabilities their HTTP adapters do not
 provide. `TAKOSERVER_ZONES` is rejected because DNS and
-Worker-route authority belongs to the production Worker entry. The retired
+Worker-route authority belongs to the private production provider executor. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
 ### The Cloudflare token
@@ -56,8 +58,9 @@ session. Grant only what the selected Bun inputs use:
   machine needs no Cloudflare permission at all: its bytes are local.
 
 The ordinary Bun stable provider does not need Workers Scripts, Workers Routes,
-or DNS permission. Production Cloudflare Worker execution and its zone
-authority belong to `src/entry-worker.ts`.
+or DNS permission. Production Cloudflare Worker execution and zone authority
+belong to the route-less `src/entry-cloudflare-provider-executor.ts`; the public
+`src/entry-worker.ts` reaches it only through the typed service binding.
 
 `TAKOSERVER_CF_TOKEN_FILE` may be used instead of `CLOUDFLARE_API_TOKEN`: the
 file is read at the moment of each call, so a rotation does not need a restart.
@@ -158,21 +161,55 @@ Nothing is buffered: a `put` is written to a file as it arrives, and a ranged
 A key never becomes a path. Bodies live at names this Host minted, under a
 directory named by the bucket INCARNATION — tenant, Space, name, and Resource
 UID — so a customer who destroys a bucket and declares one with the same name
-gets an empty one rather than the old bytes. Directories are `0700` and files
-`0600`, and both are tightened and re-read rather than created hopefully.
+gets an empty one rather than the old bytes. Directory permission bits are
+requested as `0700`, tightened, and re-read; the store fails closed if any
+group/other bit remains. New body files are opened `O_EXCL | O_NOFOLLOW` with
+`0600`. This is deliberately a permission/symlink boundary, not a claim that
+the process proves filesystem ownership or stable inode identity.
 
-Multipart receipts are rows rather than isolate memory, which is the difference
-[ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md) names
-between this runtime and the managed one: a restart between
-`createMultipartUpload` and `completeMultipartUpload` costs nothing here, so the
-part sizes and etags a complete is validated against survive it.
+Multipart receipts are rows rather than isolate memory. Here those rows live in
+the self-host control database; on the managed Workers-for-Platforms runtime
+they live in a provider-owned Durable Object exported only by the dedicated
+route-less receipt-authority Worker. The internet-routed dispatch gateway owns
+the SQLite/dispatch path and carries no receipt namespace or R2 S3/proof
+credential. In either wrapper a
+restart between `createMultipartUpload` and `completeMultipartUpload` preserves
+the part sizes and etags used to validate completion. ADR 0007 records the two
+authority placements.
 
-**Destroying a bucket that still holds an object is refused.** The Form's
+The managed path has a stronger native-create boundary. The receipt Durable
+Object orchestration, not the tenant wrapper, is the sole multipart-create
+authority. Its provider-private bounded SigV4 adapter lists the exact object key,
+persists that upload-id baseline, installs a recovery alarm, consumes one durable
+create grant, and lists again. Exactly one new native upload is adopted; zero
+new uploads retry reconciliation without another create; multiple candidates or
+a reused native upload id enter the permanent
+`operator_reconciliation_required` fence. Alarm recovery aborts a single late
+delta instead of exposing it. Active receipts expire after seven days, terminal
+receipts are retained for seven days, and each alarm/GC turn handles at most 64
+receipts. Permanent ambiguity has no automatic next action and is not collected.
+
+Operators read that condition only through the receipt authority's narrow
+provider-executor service-binding RPC and the provider-owned
+`managedObjectBucketReceiptStatus({ identity, bucketName })` capability. Its
+`operatorReconciliationRequired` count and `repairRequired` boolean are scoped
+to the exact Resource UID, Deployment incarnation, Resource generation, provider,
+and bucket. It is not a tenant route or an `edge.objects` method. Destroy uses a
+separate operation-scoped admin proof: prepare first fences new creates and drains
+native multipart pages; only after the R2 bucket deletion and authoritative
+absence readback may commit remove the Durable Object storage. A `destroying`
+lifecycle is also `repairRequired`: after an ambiguous R2 delete, only the original
+opaque provider handle may continue absence readback and commit; it does not replay
+`DELETE`, and there is no automatic clear/adopt operation. Missing proof or private
+S3 credentials keeps both status/mutation authority fail-closed and never falls
+back to a tenant-native create.
+
+**On self-host, destroying a bucket that still holds an object is refused.** The Form's
 desired state is empty, so nothing in it could ask this Host to empty one, and
 emptying a customer's storage is not a decision a lifecycle delete may take. The
 refusal is named, non-retryable, and proven by one readback.
 
-An unfinished multipart upload is not one of those objects and does not refuse
+On self-host, an unfinished multipart upload is not one of those objects and does not refuse
 the destroy. It is bytes a customer began writing and never finished, no
 operation on the Binding lists one, and the upload id that could abort it lived
 in the isolate that minted it — so a Worker evicted between

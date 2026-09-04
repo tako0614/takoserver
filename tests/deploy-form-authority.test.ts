@@ -12,7 +12,7 @@ import {
   takoformCoreVerifierArtifactDigest,
   writeFormAuthorityConfig,
 } from "../scripts/deploy/form-authority.ts";
-import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { canonicalJson } from "../src/json.ts";
@@ -22,6 +22,7 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 import {
+  cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
@@ -76,7 +77,7 @@ const target = {
   objectBucketSupplies: {
     supplies: [{ provider: { kind: "cloudflare" } }],
   } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-  workerEndpointSuffix: "integration.example.workers.dev",
+  cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
   formAuthority: {
     workerName: "takoserver-form-authority-integration",
     identityProbeWorkerName: "takoserver-form-identity-integration",
@@ -483,6 +484,12 @@ function evolvedIntegrationTarget(): DeployTarget {
       organizationId: "org_takosumi_hosted_staging",
       publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
     },
+    formAuthority: {
+      ...target.formAuthority,
+      historicalPreExecutorPublicWorker: {
+        workerEndpointSuffix: "integration.example.workers.dev",
+      },
+    },
     signing: { currentKeyId: "key-current" },
   };
 }
@@ -550,7 +557,37 @@ function historicalPublicVersion(
   message: string,
   historicalTarget: DeployTarget,
 ): HistoricalPublicVersion {
-  const expected = expectedExactBindingClosure(historicalTarget);
+  const current = expectedExactBindingClosure(historicalTarget);
+  const topology = historicalTarget.cloudflareProviderExecutor;
+  const historical = historicalTarget.formAuthority?.historicalPreExecutorPublicWorker;
+  if (topology === undefined) throw new Error("historical fixture requires executor successor");
+  if (historical === undefined) throw new Error("historical fixture requires endpoint snapshot");
+  const expected = {
+    ...current,
+    CLOUDFLARE_PROVIDER_EXECUTOR: null,
+    TAKOSERVER_MANAGED_BASE_DOMAIN: null,
+    CLOUDFLARE_ACCOUNT_ID: {
+      type: "plain_text",
+      fields: { text: historicalTarget.accountId },
+    },
+    ...(historicalTarget.zones === undefined
+      ? {}
+      : {
+          TAKOSERVER_ZONES: {
+            type: "plain_text",
+            fields: { text: JSON.stringify(historicalTarget.zones) },
+          },
+        }),
+    ...(historicalTarget.edgeSupplies === undefined
+      ? {}
+      : {
+          TAKOSERVER_WORKER_ENDPOINT_SUFFIX: {
+            type: "plain_text",
+            fields: { text: historical.workerEndpointSuffix },
+          },
+        }),
+    CLOUDFLARE_API_TOKEN: { type: "secret_text", fields: {} },
+  } as const;
   return {
     annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
     resources: {
@@ -1294,6 +1331,87 @@ describe("route-less Form authority deploy surfaces", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("keeps the pre-executor endpoint snapshot readback-only and distinct from current routing", () => {
+    const currentTarget = evolvedIntegrationTarget();
+    const historicalSuffix =
+      currentTarget.formAuthority?.historicalPreExecutorPublicWorker?.workerEndpointSuffix;
+    expect(historicalSuffix).toBe("integration.example.workers.dev");
+    expect(historicalSuffix).not.toBe(currentTarget.cloudflareProviderExecutor?.managedBaseDomain);
+
+    const root = mkdtempSync(join(tmpdir(), "takoserver-historical-public-config-"));
+    try {
+      const configPath = writeWorkerConfig(currentTarget, {
+        path: join(root, "wrangler.jsonc"),
+        main: "src/entry-cloudflare-worker.ts",
+        commit: COMMIT,
+        authorityProfile: { kind: "historical-pre-jit" },
+      });
+      const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+        readonly vars?: Readonly<Record<string, string>>;
+        readonly secrets?: { readonly required?: readonly string[] };
+      };
+      expect(config.vars).not.toHaveProperty("TAKOSERVER_WORKER_ENDPOINT_SUFFIX");
+      expect(config.vars).not.toHaveProperty("CLOUDFLARE_ACCOUNT_ID");
+      expect(config.vars).not.toHaveProperty("TAKOSERVER_ZONES");
+      expect(config.secrets?.required).not.toContain("CLOUDFLARE_API_TOKEN");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an actual pre-executor public closure without its explicit endpoint snapshot", async () => {
+    const declared = evolvedIntegrationTarget();
+    const { historicalPreExecutorPublicWorker: _historical, ...formAuthority } =
+      declared.formAuthority as NonNullable<DeployTarget["formAuthority"]>;
+    const withoutSnapshot = { ...declared, formAuthority } satisfies DeployTarget;
+    await expect(
+      runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        withoutSnapshot,
+        { state: historicalPinnedPublicState(declared) },
+      ),
+    ).rejects.toThrow(/legacy Form authority pin does not name an exact public Worker closure/u);
+  });
+
+  test("refuses a mixed pre-executor and executor public closure", async () => {
+    const currentTarget = evolvedIntegrationTarget();
+    await expect(
+      runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        currentTarget,
+        {
+          state: historicalPinnedPublicState(currentTarget, {
+            mutateHistoricalVersion(version) {
+              version.resources.bindings.push(
+                {
+                  name: "CLOUDFLARE_PROVIDER_EXECUTOR",
+                  type: "service",
+                  service: currentTarget.cloudflareProviderExecutor?.workerName,
+                  entrypoint: "CloudflareProviderExecutor",
+                },
+                {
+                  name: "TAKOSERVER_MANAGED_BASE_DOMAIN",
+                  type: "plain_text",
+                  text: currentTarget.cloudflareProviderExecutor?.managedBaseDomain,
+                },
+              );
+            },
+          }),
+        },
+      ),
+    ).rejects.toThrow(/legacy Form authority pin does not name an exact public Worker closure/u);
   });
 
   for (const [label, binding, field, value] of [
@@ -2436,6 +2554,7 @@ describe("Form authority forward transition and descriptor drift", () => {
         ...target,
         edgeSupplies: edgeSuppliesFixture(),
         objectBucketSupplies: objectBucketSuppliesFixture(),
+        cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
       } satisfies DeployTarget;
       const descriptorPath = join(root, "integration.json");
       const descriptorBytes = `${JSON.stringify(descriptor, null, 2)}\n`;

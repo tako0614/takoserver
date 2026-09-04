@@ -256,6 +256,8 @@ export interface TakoformResourceDriver {
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
     readonly providerHandle?: string;
+    /** Exact live Host saga lease; provider adapters may project it to a route-less executor. */
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
@@ -290,6 +292,8 @@ export interface TakoformResourceDriver {
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
     readonly providerHandle?: string;
+    /** Exact live Host saga lease; provider adapters may project it to a route-less executor. */
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly resource: TakoformStoredResource;
@@ -314,6 +318,8 @@ export interface TakoformResourceDriver {
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
     readonly providerHandle?: string;
+    /** Exact live Host saga lease; provider adapters may project it to a route-less executor. */
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
@@ -339,12 +345,35 @@ export interface TakoformResourceDriver {
       readonly database: TakoformStoredResource;
     }): Promise<readonly TakoformSqliteMigrationIdentity[]>;
     applySuffix(input: {
+      /** Stable application Resource saga identity, never a portable migration-ledger field. */
+      readonly operationId: string;
+      /** Initial dispatch or recovery under that same durable saga. */
+      readonly operationMode: "initial" | "recovery";
+      /** Exact live Host saga lease covering this provider mutation. */
+      readonly executionAuthority: TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      /** Stable full desired history; recovery derives a fresh suffix from this exact intent. */
+      readonly desired: readonly TakoformSqliteMigration[];
       readonly expectedPrefix: readonly TakoformSqliteMigrationIdentity[];
       readonly migrations: readonly TakoformSqliteMigration[];
     }): Promise<void>;
   };
+}
+
+/**
+ * Ephemeral proof that one executor owns the accepted Host mutation right now.
+ *
+ * This never enters the portable Resource or SQLite migration ledger. The
+ * fingerprint is the exact request identity already committed by the existing
+ * provider-mutation saga; the lease token fences stale workers attempting to
+ * dispatch or settle the same operation.
+ */
+export interface TakoformProviderExecutionAuthority {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly leaseToken: string;
+  readonly fingerprint: string;
 }
 
 /** Provider selection and runtime-input admission share one authority. */

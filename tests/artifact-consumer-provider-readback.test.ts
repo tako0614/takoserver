@@ -236,6 +236,7 @@ describe("Cloudflare artifact-consumer readback", () => {
         await provider.verifyArtifactConsumption?.({
           offering: MODULE_WORKER,
           nativeId: "worker:script-name",
+          target: artifactReadTarget("uid_worker", "dep_worker"),
           identity: {
             tenantRef: "org_repair",
             resourceUid: "uid_worker",
@@ -324,6 +325,7 @@ describe("Cloudflare artifact-consumer readback", () => {
       await provider.verifyArtifactConsumption?.({
         offering: MODULE_WORKER,
         nativeId: workerNativeId,
+        target: artifactReadTarget("uid_worker", "dep_worker"),
         identity: { tenantRef: "org_repair", resourceUid: "uid_worker" },
         candidateManifestDigests: [MANIFEST],
       }),
@@ -487,6 +489,7 @@ describe("Cloudflare artifact-consumer readback", () => {
       await provider.verifyArtifactConsumption?.({
         offering: MODULE_WORKER,
         nativeId,
+        target: artifactReadTarget("uid_worker", "dep_worker", "retained"),
         identity: { tenantRef: "org_repair", resourceUid: "uid_worker" },
         candidateManifestDigests: [MANIFEST],
       }),
@@ -515,7 +518,7 @@ describe("Cloudflare artifact-consumer readback", () => {
     expect(requests).toEqual([]);
   });
 
-  test("closed retained absence uses its attested address without a newer output marker", async () => {
+  test("closed retained absence binds its attested address to the snapshotted generation", async () => {
     const { provider, methods } = fixtureResponse(new Response(null, { status: 404 }));
     const sold = {
       id: VERSION.id,
@@ -547,7 +550,14 @@ describe("Cloudflare artifact-consumer readback", () => {
           createdAt: 100,
           updatedAt: 200,
           observed: {},
-          outputs: {},
+          outputs: {
+            __takoserver: {
+              resourceUid: "uid_version",
+              space: "default",
+              name: "version-name",
+              generation: "1",
+            },
+          },
         },
         address: {
           space: "default",
@@ -559,6 +569,91 @@ describe("Cloudflare artifact-consumer readback", () => {
       }),
     ).toMatchObject({ outcome: "absent" });
     expect(methods).toEqual(["GET"]);
+  });
+
+  test("the lifecycle driver forwards exact snapshotted Deployment artifact custody", async () => {
+    let captured: ProviderArtifactConsumptionInput | undefined;
+    const provider = {
+      id: "cloudflare",
+      offerings: [VERSION],
+      async apply() {
+        throw new Error("unused provider mutation");
+      },
+      async observe() {
+        throw new Error("unused provider read");
+      },
+      async delete() {
+        throw new Error("unused provider mutation");
+      },
+      async verifyArtifactConsumption(input: ProviderArtifactConsumptionInput) {
+        captured = input;
+        return {
+          outcome: "present",
+          manifestDigests: [MANIFEST],
+          evidence: { provider: "executor-proxy" },
+        } as const;
+      },
+    } satisfies Provider;
+    const sold = {
+      id: VERSION.id,
+      providerPackRef: provider.id,
+      providerInstallationRef: "cloudflare.staging",
+      form: VERSION.form,
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      catalog: {
+        list: () => [sold],
+        findOffering: () => sold,
+      } as never,
+      ledger: {} as never,
+      deployments: {} as never,
+    });
+
+    expect(
+      await driver.artifactConsumerRepair.verifyArtifactConsumption({
+        deployment: {
+          tenantId: "org_snapshot",
+          deploymentId: "dep_snapshot",
+          resourceUid: "uid_snapshot",
+          offeringId: VERSION.id,
+          providerPackRef: provider.id,
+          providerInstallationRef: "cloudflare.staging",
+          nativeId: "version:script-name:version-id",
+          state: "active",
+          createdAt: 100,
+          updatedAt: 222,
+          observed: {},
+          outputs: {
+            __takoserver: {
+              resourceUid: "uid_snapshot",
+              space: "default",
+              name: "version-name",
+              generation: "7",
+            },
+          },
+        },
+        resource: {
+          space: "default",
+          apiVersion: "edge.forms.takoform.com/v1beta1",
+          kind: "WorkerVersion",
+          name: "version-name",
+          uid: "uid_snapshot",
+          revision: "revision-7",
+          formRef: { ...VERSION.form },
+          relationsDigest: `sha256:${"c".repeat(64)}`,
+          providerOperationIds: ["operation-version"],
+        },
+        candidateManifestDigests: [MANIFEST],
+      }),
+    ).toMatchObject({ outcome: "present", manifestDigests: [MANIFEST] });
+    expect(captured?.target).toEqual({
+      tenantId: "org_snapshot",
+      resourceUid: "uid_snapshot",
+      incarnationId: "dep_snapshot",
+      state: "active",
+      updatedAt: 222,
+    });
   });
 
   test("the lifecycle driver never falls back from a malformed surviving FormRef", async () => {
@@ -715,9 +810,24 @@ function historicalInput(): ProviderArtifactConsumptionInput {
   return {
     offering: VERSION,
     nativeId: "version:script-name:version-id",
+    target: artifactReadTarget("uid_version", "dep_version"),
     identity: { tenantRef: "org_repair", resourceUid: "uid_version" },
     candidateManifestDigests: [MANIFEST],
   };
+}
+
+function artifactReadTarget(
+  resourceUid: string,
+  incarnationId: string,
+  state: "active" | "retained" = "active",
+) {
+  return {
+    tenantId: "org_repair",
+    resourceUid,
+    incarnationId,
+    state,
+    updatedAt: 200,
+  } as const;
 }
 
 function versionRelations(): readonly ProviderRelation[] {
@@ -816,6 +926,7 @@ function managedBackend(
 ): CloudflareWorkersForPlatformsBackendOptions {
   return {
     kind: "workers-for-platforms",
+    providerInstallationId: "cloudflare.staging",
     dispatchNamespace: "customer-workers",
     gatewayWorkerName: "gateway-worker",
     managedBaseDomain: "apps.takoserver.test",

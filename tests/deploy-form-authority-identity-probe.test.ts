@@ -14,6 +14,7 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
@@ -41,7 +42,7 @@ const target = {
   objectBucketSupplies: {
     supplies: [{ provider: { kind: "cloudflare" } }],
   } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-  workerEndpointSuffix: "production.example.workers.dev",
+  cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
   formAuthority: {
     workerName: "takoserver-form-authority-production",
     identityProbeWorkerName: "takoserver-form-identity-production",
@@ -467,7 +468,6 @@ describe("Form authority identity probe forward transition apply", () => {
     environment: "integration",
     workerName: "takoserver-api-integration",
     publicOrigin: "https://api.integration.example.test",
-    workerEndpointSuffix: "integration.example.workers.dev",
     formAuthority: {
       ...target.formAuthority,
       identityProbeOrigin:

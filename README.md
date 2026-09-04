@@ -19,17 +19,30 @@ supply. Provider bucket names, regions, endpoints, credentials, and supply
 documents remain inside the selected Provider Pack and Deployment; none is
 Resource desired, observed, output, discovery, or Worker binding state.
 
-One runtime carries that Binding: the ordinary-workers backend, the one an
-operator's own Cloudflare account runs. It uploads the tenant's exact bundle
-bytes with no wrapper, so the declared name carries Cloudflare's native R2
-binding, exactly as `sqliteBindings` carries a native D1 binding and
-`kvBindings` a native KV namespace; no bucket name, region, endpoint, or
-credential reaches the Worker. The managed Worker backend refuses
-`bucketBindings` by name, because the `edge.objects` facade it would project
-keeps its multipart receipts in isolate memory and cannot survive an eviction.
-ADR 0007 records both, and the divergence from
-[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md),
-rather than leaving them implied.
+Both Cloudflare Worker backends carry that Binding. The ordinary-workers
+backend uploads the tenant's exact bundle bytes with no wrapper, so the
+declared name carries Cloudflare's native R2 binding. The managed
+Workers-for-Platforms backend keeps the customer module as a user Worker and
+projects the same nine-method `edge.objects` facade from its provider-authored
+wrapper. Its raw R2 binding and provider-owned receipt Durable Object namespace
+are hidden capabilities, never projected into the tenant handler environment.
+The namespace points across scripts to a dedicated route-less receipt-authority
+Worker; the internet-routed dispatch gateway carries neither that namespace nor
+the R2 S3 access key, secret key, or receipt proof secret. The Durable Object owns
+multipart lifecycle state under an opaque identity derived from provider,
+Resource UID, Deployment incarnation, and Resource generation. Its orchestration
+is the only native multipart-create authority: a private bounded SigV4 adapter
+persists the exact-key upload-id baseline, issues one durable create grant, and
+adopts only one synchronous list delta. A private R2 marker separately reconciles
+a lost completion acknowledgement. Seven-day active expiry and seven-day
+terminal retention run in batches of 64; an ambiguous multi-delta create remains
+permanently visible as `operatorReconciliationRequired` instead of being guessed
+or garbage-collected. A destruction fence likewise reports `repairRequired`
+until the original opaque delete handle proves provider absence and commits;
+it never authorizes a second R2 `DELETE`. No bucket name, region, endpoint, credential, Durable
+Object name, or receipt authority enters the Takoform contract. ADR 0007 records
+the runtime-specific shapes and their divergence from
+[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md).
 
 Takoserver serves no public S3-credential or managed standard-service retail
 route. Separate S3 retail is not composed by default, and provider credentials
@@ -263,17 +276,34 @@ same way it does on Cloudflare.
 
 ## Running it on Cloudflare
 
-Set `CLOUDFLARE_ACCOUNT_ID` and a scoped API token only with a reviewed hosted
-Edge or ObjectBucket supply. A credential without that supply is rejected.
-Historical released provider adapters may remain installed to observe and
-delete recorded Deployments, but their beta Forms are not republished as a sale
-catalog. The control plane itself can also run as a Worker. `bun run deploy -- --contract`
-prints the side-effect-free split deploy contract. Every operation then names
-one surface, one `--status` or `--apply` action, an exact environment, and an
-exact 40-hex commit; there is no mixed controller, plan, ledger, journal, or
-target override. See [`docs/deploy.md`](docs/deploy.md) for the surface list,
-ordering, private inputs, and failure rules. The landing-page details are in
+The public control-plane Worker never receives a Cloudflare parent credential.
+Reviewed Cloudflare Edge or ObjectBucket supplies require one exact route-less
+provider-executor topology; the public Worker holds only its typed service
+binding and non-secret supply projection. The executor alone receives
+`CLOUDFLARE_API_TOKEN` and the runtime-input sealing keyring from its canonical
+operator-private secrets file. Apply, import/adoption, and their recovery paths
+are bound to the exact active Host saga lease and executor-owned pre-effect
+claim. Observation, artifact-consumption readback, and upstream usage meters
+are bound to the exact tenant, Offering, provider installation, and recorded
+Deployment before the executor uses its parent credential. Historical released
+provider adapters may remain installed to observe and delete recorded
+Deployments, but their beta Forms are not republished as a sale catalog.
+`bun run deploy -- --contract` prints the
+side-effect-free split deploy contract. Every operation then names one surface,
+one `--status` or `--apply` action, an exact environment, and an exact 40-hex
+commit; there is no mixed controller, plan, ledger, journal, or target override.
+See [`docs/deploy.md`](docs/deploy.md) for the surface list, dependency order,
+the clean-checkout integration target realization path, private inputs, and
+failure rules. In particular, do not copy the retired
+`.deploy/target.staging.json` shape into a current checkout: the current v2
+target joins the Cloudflare supplies, executor, gateway, and receipt-authority
+identities atomically. The landing-page details are in
 [`docs/deploy-site.md`](docs/deploy-site.md).
+
+Wasabi has no equivalent private executor. Every Wasabi supply or recovery
+offering therefore fails target parsing/public composition closed; its access
+key, secret key, provider, and parent-backed meter are never public Worker
+bindings. Self-host storage remains independent of that hosted restriction.
 
 The official operator-private deploy target may declare `aiModels`,
 `objectBucketSupplies`, and whether hosted sponsorship is enabled.
@@ -354,15 +384,17 @@ immutable version directory, and never written anywhere else.
 The declaration's names remain in the Worker Version spec; values do not enter
 portable state. Realization places the other non-secret values in Worker vars.
 AI uses the native Workers AI binding, so it does not copy an account API token
-into inference requests. `CLOUDFLARE_API_TOKEN` remains the provisioning
-secret. No R2 parent access key or public S3 credential issuer is part of the
-current deployment contract. Deploy
+into inference requests. `CLOUDFLARE_API_TOKEN` remains provider-executor
+authority, not tenant runtime input. Managed R2 S3 credentials and the receipt
+proof secret enter only the route-less receipt-authority Worker's atomic
+`--secrets-file` publication; there is no public S3 credential issuer. Deploy
 preflight refuses an enabled capability whose required secret is absent. With
 no such target fields, `/v1/ai` and ObjectBucket retail stay absent rather than
 using a demo backend.
 
 See [docs/adr/0001-provision-from-the-worker.md](docs/adr/0001-provision-from-the-worker.md)
-for why the deployed Worker holds the account credential, and what that costs.
+for the superseded public-credential decision and the current route-less
+provider-executor boundary.
 The reservation and RuntimeInputAuthority boundary is recorded in
 [docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md),
 and the runtime-input wire contract this Host now speaks in

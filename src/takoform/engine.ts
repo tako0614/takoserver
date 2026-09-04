@@ -22,7 +22,12 @@ import {
   validateDeclaredConstraints,
 } from "./relations.ts";
 import { materializeDefaults, validateDesired } from "./schema.ts";
-import { applySqliteMigrationApplication, sqliteMigrationCondition } from "./sqlite-migrations.ts";
+import {
+  applySqliteMigrationApplication,
+  type PreparedSqliteMigrationApplication,
+  prepareSqliteMigrationApplication,
+  sqliteMigrationCondition,
+} from "./sqlite-migrations.ts";
 import { resolveStandardServiceSlots } from "./standard-services.ts";
 import type {
   ProviderMutationExecution,
@@ -292,6 +297,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
+    readonly fingerprint: string;
     readonly authorityHeadDigest?: `sha256:${string}`;
     readonly claimOwnerId?: string;
     readonly onContention?: () => void;
@@ -312,6 +318,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly execute: (
       mode: "initial" | "recovery",
       execution: Extract<ProviderMutationExecution, { readonly kind: "acquired" }>,
+      leaseToken: string,
     ) => Promise<TakoformDriverReceipt>;
   }): Promise<TakoformDriverReceipt> => {
     providerMutationLeaseSequence += 1;
@@ -357,7 +364,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         await input.onDispatch?.();
       }
       executeEntered = true;
-      const receipt = await input.execute(execution.mode, execution);
+      const receipt = await input.execute(execution.mode, execution, leaseToken);
       input.onReceiptReady?.();
       await store.recordProviderMutationReceipt({
         tenantId: input.tenantId,
@@ -1278,28 +1285,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
       try {
-        await applySqliteMigrationApplication({
-          tenantId: context.tenantId,
-          space: body.metadata.space,
-          form,
-          relations,
-          store,
-          artifacts,
-          driver,
-          ...(authority.fence
-            ? {
-                beforeSideEffect: async () => {
-                  await refreshMutation(
-                    context,
-                    create ? "create" : "update",
-                    body.metadata.space,
-                    form.identity.formRef,
-                    authority,
-                  );
-                },
-              }
-            : {}),
-        });
         if (create) await context.beforeCreate?.();
         standardServices = await resolveStandardServiceSlots({
           tenantId: context.tenantId,
@@ -1355,10 +1340,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
+        let preparedMigration: PreparedSqliteMigrationApplication | null = null;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: opId,
           resourceUid: uid,
+          fingerprint,
           claimOwnerId,
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -1391,6 +1378,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               body.metadata.space,
               relations,
             );
+            preparedMigration = await prepareSqliteMigrationApplication({
+              tenantId: context.tenantId,
+              space: body.metadata.space,
+              form,
+              relations,
+              store,
+              artifacts,
+              driver,
+            });
             await refreshMutation(
               context,
               create ? "create" : "update",
@@ -1399,7 +1395,21 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               authority,
             );
           },
-          execute: async (operationMode, execution) => {
+          execute: async (operationMode, execution, leaseToken) => {
+            const executionAuthority = {
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              leaseToken,
+              fingerprint,
+            } as const;
+            await applySqliteMigrationApplication({
+              tenantId: context.tenantId,
+              operationId: opId,
+              operationMode,
+              executionAuthority,
+              prepared: preparedMigration,
+              driver,
+            });
             return await driver.apply({
               operationId: opId,
               operationKey: idempotencyKey(context.request),
@@ -1415,6 +1425,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 : {}),
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
+              executionAuthority,
               tenantId: context.tenantId,
               resourceUid: uid,
               form,
@@ -1798,28 +1809,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
       try {
-        await applySqliteMigrationApplication({
-          tenantId: context.tenantId,
-          space: body.metadata.space,
-          form,
-          relations,
-          store,
-          artifacts,
-          driver,
-          ...(authority.fence
-            ? {
-                beforeSideEffect: async () => {
-                  await refreshMutation(
-                    context,
-                    "import",
-                    body.metadata.space,
-                    form.identity.formRef,
-                    authority,
-                  );
-                },
-              }
-            : {}),
-        });
         standardServices = await resolveStandardServiceSlots({
           tenantId: context.tenantId,
           space: body.metadata.space,
@@ -1874,10 +1863,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
+        let preparedMigration: PreparedSqliteMigrationApplication | null = null;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: importId,
           resourceUid: uid,
+          fingerprint,
           claimOwnerId,
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -1910,6 +1901,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               body.metadata.space,
               relations,
             );
+            preparedMigration = await prepareSqliteMigrationApplication({
+              tenantId: context.tenantId,
+              space: body.metadata.space,
+              form,
+              relations,
+              store,
+              artifacts,
+              driver,
+            });
             await refreshMutation(
               context,
               "import",
@@ -1928,11 +1928,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               outcome: "import_conflict",
             });
           },
-          execute: async (operationMode, execution) => {
+          execute: async (operationMode, execution, leaseToken) => {
+            const executionAuthority = {
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              leaseToken,
+              fingerprint,
+            } as const;
+            await applySqliteMigrationApplication({
+              tenantId: context.tenantId,
+              operationId: importId,
+              operationMode,
+              executionAuthority,
+              prepared: preparedMigration,
+              driver,
+            });
             return await importProviderResource({
               operationId: importId,
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
+              executionAuthority,
               tenantId: context.tenantId,
               resourceUid: uid,
               form,
@@ -2143,6 +2158,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           tenantId: context.tenantId,
           operationId: deleteId,
           resourceUid: current.metadata.uid,
+          fingerprint,
           claimOwnerId: context.durableOperation?.claimOwnerId ?? deleteId,
           onContention: () => {
             providerContended = true;
@@ -2168,12 +2184,18 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             );
             await refreshRetained(context, "delete", current, authority);
           },
-          execute: async (operationMode, execution) => {
+          execute: async (operationMode, execution, leaseToken) => {
             return (
               (await driver.delete({
                 operationId: deleteId,
                 operationMode,
                 ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
+                executionAuthority: {
+                  tenantId: context.tenantId,
+                  resourceUid: current.metadata.uid,
+                  leaseToken,
+                  fingerprint,
+                },
                 tenantId: context.tenantId,
                 resourceUid: current.metadata.uid,
                 resource: structuredClone(current),

@@ -448,6 +448,7 @@ test("creates a WorkerEndpoint on a self-host that terminates TLS on the default
     operationKey: "key-endpoint-http",
     tenantId: "org_01",
     resourceUid: "uid-endpoint-01",
+    executionAuthority: testExecutionAuthority("org_01", "uid-endpoint-01", "op-endpoint-http"),
     form: endpointForm,
     name: TARGET.endpointName,
     space: TARGET.space,
@@ -2127,6 +2128,11 @@ for (const { label, space } of [
       operationKey: "key-endpoint-hostmint",
       tenantId: "org_01",
       resourceUid: "uid-endpoint-01",
+      executionAuthority: testExecutionAuthority(
+        "org_01",
+        "uid-endpoint-01",
+        "op-endpoint-hostmint",
+      ),
       form: endpointForm,
       name: TARGET.endpointName,
       space,
@@ -2216,6 +2222,7 @@ test("re-binds after a WorkerEndpoint create the provider refused", async () => 
       operationKey: `key-endpoint-${uid}`,
       tenantId: "org_01",
       resourceUid: uid,
+      executionAuthority: testExecutionAuthority("org_01", uid, `op-endpoint-${uid}`),
       form: endpointFormDefinition(),
       name: TARGET.endpointName,
       space: TARGET.space,
@@ -2808,4 +2815,13 @@ async function setWorkerCondition(
     JSON.stringify(resource),
     uid,
   ]);
+}
+
+function testExecutionAuthority(tenantId: string, resourceUid: string, operationId: string) {
+  return {
+    tenantId,
+    resourceUid,
+    leaseToken: `pmlease_${operationId}`,
+    fingerprint: `test:${operationId}`,
+  };
 }

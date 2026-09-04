@@ -39,8 +39,16 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
         this.#migrationLedgers.get(`${input.tenantId}\0${input.database.metadata.uid}`) ?? [],
       ),
     applySuffix: async (input: {
+      readonly operationId: string;
+      readonly operationMode: "initial" | "recovery";
+      readonly executionAuthority: import("./types.ts").TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      readonly desired: readonly {
+        readonly path: string;
+        readonly digest: `sha256:${string}`;
+        readonly sql: Uint8Array;
+      }[];
       readonly expectedPrefix: readonly { path: string; digest: `sha256:${string}` }[];
       readonly migrations: readonly {
         readonly path: string;

@@ -250,6 +250,11 @@ export interface WranglerExistingVersionDeployment {
   readonly deploymentId: string;
 }
 
+export interface WranglerLifecycleDeployment {
+  readonly versionId: string;
+  readonly targets: readonly string[];
+}
+
 export interface WranglerVersionPublicationLease {
   readonly accountId: string;
   readonly workerName: string;
@@ -705,6 +710,89 @@ export async function publishWranglerVersion(input: {
   return await publishWranglerVersionWhileLeased(input, run);
 }
 
+/**
+ * Atomically uploads and deploys one Worker bundle that carries a Durable
+ * Object lifecycle change. Cloudflare rejects lifecycle changes through
+ * `versions upload`, so this deliberately cannot share the staged Version
+ * path above. The caller owns provider-history readback because Wrangler's
+ * deploy event identifies the Version but not its Deployment.
+ */
+export async function deployWranglerLifecycleChange(input: {
+  readonly root: string;
+  readonly bundlePath: string;
+  readonly configPath: string;
+  readonly accountId: string;
+  readonly workerName: string;
+  readonly message: string;
+  readonly lease: WranglerVersionPublicationLease;
+  readonly assertCurrentStillExpected: () => Promise<void>;
+  /** Already-validated private JSON used by Wrangler's one-operation secret upload. */
+  readonly secretsFilePath?: string;
+  readonly environment?: Readonly<Record<string, string>>;
+  readonly run?: WranglerProcess;
+}): Promise<WranglerLifecycleDeployment> {
+  if (
+    !isAbsolute(input.root) ||
+    !isAbsolute(input.bundlePath) ||
+    !isAbsolute(input.configPath) ||
+    (input.secretsFilePath !== undefined && !isAbsolute(input.secretsFilePath))
+  ) {
+    throw preflightError("Wrangler lifecycle deployment requires absolute artifact paths");
+  }
+  if (!WORKER_NAME.test(input.workerName)) {
+    throw preflightError("Wrangler lifecycle deployment requires one exact Worker name");
+  }
+  if (input.lease.accountId !== input.accountId || input.lease.workerName !== input.workerName) {
+    throw preflightError("Wrangler lifecycle deployment lease does not match the exact target");
+  }
+  try {
+    await input.assertCurrentStillExpected();
+  } catch (error) {
+    throw mutationError(
+      "Worker lifecycle predecessor re-fence failed; this invocation did not start a deployment",
+      safeErrorDetail(error),
+    );
+  }
+  mkdirSync(input.root, { recursive: true, mode: 0o700 });
+  const outputPath = join(input.root, "wrangler-lifecycle-deploy.jsonl");
+  rmSync(outputPath, { force: true });
+  const deployed = await runPublicationCommand(
+    input.run ?? runCommand,
+    wranglerCommand([
+      "deploy",
+      input.bundlePath,
+      "--name",
+      input.workerName,
+      "--no-bundle",
+      "--config",
+      input.configPath,
+      "--strict",
+      "--message",
+      input.message,
+      ...(input.secretsFilePath === undefined ? [] : ["--secrets-file", input.secretsFilePath]),
+    ]),
+    { ...(input.environment ?? {}), WRANGLER_OUTPUT_FILE_PATH: outputPath },
+    "Worker lifecycle deployment could not be started; run --status before repair",
+  );
+  if (deployed.exitCode !== 0) {
+    throw mutationError(
+      "Worker lifecycle deployment acknowledgement is indeterminate; do not retry before --status",
+      `exit=${deployed.exitCode}`,
+    );
+  }
+  try {
+    return parseWranglerLifecycleDeployOutput(
+      readOutput(outputPath, deployed.stdout),
+      input.workerName,
+    );
+  } catch (error) {
+    throw mutationError(
+      "Worker lifecycle deployment returned no exact Version identity; run --status before repair",
+      safeErrorDetail(error),
+    );
+  }
+}
+
 async function publishWranglerVersionWhileLeased(
   input: {
     readonly root: string;
@@ -942,6 +1030,40 @@ export function parseWranglerVersionUploadOutput(
   assertOptionalString(event.wrangler_environment, "wrangler_environment");
   assertOptionalTimestamp(event.timestamp);
   return { versionId: event.version_id };
+}
+
+export function parseWranglerLifecycleDeployOutput(
+  raw: string,
+  workerName: string,
+): WranglerLifecycleDeployment {
+  const event = parsePublicationEvent(raw, "lifecycle deployment");
+  assertExactEventKeys(event, "lifecycle deployment", [
+    "type",
+    "version",
+    "worker_name",
+    "worker_tag",
+    "version_id",
+    "targets",
+    "worker_name_overridden",
+    "wrangler_environment",
+    "timestamp",
+  ]);
+  if (
+    event.type !== "deploy" ||
+    event.version !== 1 ||
+    event.worker_name !== workerName ||
+    event.worker_name_overridden !== false ||
+    typeof event.version_id !== "string" ||
+    !UUID.test(event.version_id) ||
+    !Array.isArray(event.targets) ||
+    event.targets.some((target) => typeof target !== "string")
+  ) {
+    throw preflightError("Wrangler lifecycle deployment event has an invalid publication shape");
+  }
+  assertOptionalNullableString(event.worker_tag, "worker_tag");
+  assertOptionalString(event.wrangler_environment, "wrangler_environment");
+  assertOptionalTimestamp(event.timestamp);
+  return { versionId: event.version_id, targets: event.targets };
 }
 
 export function parseWranglerVersionDeployOutput(

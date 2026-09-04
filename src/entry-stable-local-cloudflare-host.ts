@@ -8,6 +8,7 @@ import { createStaticTestTakoformHost as createTakoformHost } from "./app.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import type {
+  Provider,
   ProviderOffering,
   ProviderRelation,
   ProviderResult,
@@ -201,9 +202,11 @@ export async function startStableLocalCloudflareHost(input: {
 }
 
 function localProviderDriver(
-  provider: CloudflareProvider,
+  provider: Provider,
   offerings: readonly ProviderOffering[],
 ): TakoformResourceDriver {
+  const sqliteMigrations = provider.sqliteMigrations;
+  if (!sqliteMigrations) throw new TakoformHostError("unsupported_capability", 422);
   const byKind = new Map(offerings.map((offering) => [offering.form.kind, offering]));
   const deployments = new Map<string, ProviderRelation["deployment"]>();
 
@@ -233,11 +236,14 @@ function localProviderDriver(
         await provider.apply({
           operationId: value.operationId,
           ...(value.operationMode ? { operationMode: value.operationMode } : {}),
+          executionAuthority: value.executionAuthority,
           offering: selected,
           identity: {
             tenantRef: value.tenantId,
             space: value.space,
             name: value.name,
+            uid: value.resourceUid,
+            ...(current ? { incarnationId: current.id } : {}),
           },
           spec: value.spec,
           relations: relations(value.relations),
@@ -285,6 +291,14 @@ function localProviderDriver(
         await provider.observe({
           offering: selected,
           nativeId: current.nativeId,
+          identity: {
+            tenantRef: value.tenantId,
+            space: value.resource.metadata.space,
+            name: value.resource.metadata.name,
+            uid: value.resourceUid,
+            incarnationId: current.id,
+            generation: value.resource.metadata.generation,
+          },
           spec: value.resource.spec,
         }),
       );
@@ -299,12 +313,17 @@ function localProviderDriver(
       ticketResult(
         await provider.delete({
           operationId: value.operationId,
+          ...(value.operationMode ? { operationMode: value.operationMode } : {}),
+          executionAuthority: value.executionAuthority,
           offering: selected,
           nativeId: current.nativeId,
           identity: {
             tenantRef: value.tenantId,
             space: value.resource.metadata.space,
             name: value.resource.metadata.name,
+            uid: value.resourceUid,
+            incarnationId: current.id,
+            generation: value.resource.metadata.generation,
           },
           spec: value.resource.spec,
         }),
@@ -312,20 +331,43 @@ function localProviderDriver(
       deployments.delete(value.resourceUid);
     },
     sqliteMigrations: {
-      async readLedger({ database }) {
+      async readLedger({ tenantId, database }) {
         const current = deployments.get(database.metadata.uid);
         if (!current) throw new TakoformHostError("resource_not_found", 404);
-        const result = await provider.sqliteMigrations.readLedger({
+        const result = await sqliteMigrations.readLedger({
           nativeId: current.nativeId,
+          target: {
+            tenantId,
+            resourceUid: database.metadata.uid,
+            incarnationId: current.id,
+            generation: database.metadata.generation,
+          },
         });
         if (!result.ok) throw providerFailure(result.failure.code);
         return result.value;
       },
-      async applySuffix({ database, expectedPrefix, migrations }) {
+      async applySuffix({
+        operationId,
+        operationMode,
+        executionAuthority,
+        database,
+        desired,
+        expectedPrefix,
+        migrations,
+      }) {
         const current = deployments.get(database.metadata.uid);
         if (!current) throw new TakoformHostError("resource_not_found", 404);
-        const result = await provider.sqliteMigrations.applySuffix({
+        const result = await sqliteMigrations.applySuffix({
+          operationId,
+          operationMode,
+          executionAuthority,
           nativeId: current.nativeId,
+          target: {
+            resourceUid: database.metadata.uid,
+            incarnationId: current.id,
+            generation: database.metadata.generation,
+          },
+          desired,
           expectedPrefix,
           migrations,
         });

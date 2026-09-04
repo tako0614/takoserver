@@ -5,7 +5,7 @@ import {
   type WorkerProductionCompositionEnv,
 } from "../../src/worker-production-composition.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
-import { deploymentVariables, expectedWorkerSecrets } from "./realized-config.ts";
+import { deploymentVariables } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
 
 /**
@@ -25,30 +25,11 @@ import type { DeployTarget } from "./target.ts";
  * words, not a post-condition failure to roll back from.
  */
 
-/**
- * Stand-in for one secret this surface never reads.
- *
- * Composition asks only whether a credential is present and paired; it never
- * authenticates with one here. Using an obvious placeholder keeps the check
- * runnable from `--status` without an operator-private secret input, and keeps
- * real bytes out of a process that exists to be run before every upload.
- */
-const PLACEHOLDER_SECRET = "deploy-preflight-placeholder";
-
 /** Plain-text composition inputs, taken from the realized target vars. */
 const COMPOSITION_VARS = [
   "TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
   "TAKOSERVER_EDGE_SUPPLIES",
-  "CLOUDFLARE_ACCOUNT_ID",
-  "TAKOSERVER_ZONES",
-  "TAKOSERVER_WORKER_ENDPOINT_SUFFIX",
-] as const;
-
-/** Credentials composition only tests for presence and pairing. */
-const COMPOSITION_SECRETS = [
-  "CLOUDFLARE_API_TOKEN",
-  "TAKOSERVER_WASABI_ACCESS_KEY_ID",
-  "TAKOSERVER_WASABI_SECRET_ACCESS_KEY",
+  "TAKOSERVER_MANAGED_BASE_DOMAIN",
 ] as const;
 
 /** The composition inputs the Worker reads, derived exactly as the upload does. */
@@ -58,16 +39,20 @@ export function workerCompositionEnv(target: DeployTarget): WorkerProductionComp
   // JIT bindings is a composition input, so the choice cannot change the answer.
   const derived = deploymentVariables(target, undefined, { kind: "historical-pre-jit" });
   const vars = (derived.vars ?? {}) as Readonly<Record<string, string>>;
-  const secrets = new Set(expectedWorkerSecrets(target));
-  const env: Record<string, string> = {};
+  const env: Record<string, unknown> = {};
   for (const name of COMPOSITION_VARS) {
     const value = vars[name];
     if (value !== undefined) env[name] = value;
   }
-  for (const name of COMPOSITION_SECRETS) {
-    if (secrets.has(name)) env[name] = PLACEHOLDER_SECRET;
+  if (target.cloudflareProviderExecutor !== undefined) {
+    // Composition never invokes the binding. Its exact presence is the
+    // credential-free capability fact the runtime requires before it exposes
+    // any Cloudflare recovery/provider surface.
+    env.CLOUDFLARE_PROVIDER_EXECUTOR = {} as NonNullable<
+      WorkerProductionCompositionEnv["CLOUDFLARE_PROVIDER_EXECUTOR"]
+    >;
   }
-  return env;
+  return env as WorkerProductionCompositionEnv;
 }
 
 /**
@@ -89,7 +74,6 @@ export async function assertTargetComposes(
       env,
       forms: current.forms,
       retainedForms: retained.forms,
-      artifacts: { manifest: async () => null, blob: async () => null },
       now: new Date(),
     });
   } catch (error) {

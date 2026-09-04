@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Miniflare, type MiniflareOptions } from "miniflare";
+import { managedObjectReceiptRuntimeProof } from "../src/providers/cloudflare-managed-object-receipt.ts";
 import {
   MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
   MANAGED_WORKER_EDGE_SQL_BINDING_KIND,
@@ -25,6 +26,62 @@ const EVENT_PROTOCOL = "takoserver.managed-worker-event@v1";
 const EVENT_CONTENT_TYPE = "application/vnd.takoserver.managed-worker-event.v1+json";
 const GATEWAY_PROP = "takoserverManagedWorkerGateway";
 const GATEWAY_PROPS_SCHEMA = "takoserver.managed-worker-gateway-props@v1";
+const OBJECT_RECEIPT_AUTHORITY = {
+  schema: "takoserver.managed-object-receipt-authority@v1",
+  providerId: "cloudflare.wfp.integration",
+  resourceUid: "bucket-media-uid",
+  incarnationId: "deployment-bucket-media",
+  generation: "1",
+} as const;
+const OBJECT_RECEIPT_NATIVE_NAME = "__TAKOSERVER_OBJECT_RECEIPTS_0";
+const OBJECT_RECEIPT_INSTANCE_NAME = `tsobj-${"A".repeat(43)}`;
+const OBJECT_RECEIPT_PROOF_SECRET = "managed-object-receipt-test-secret";
+const OBJECT_RECEIPT_RUNTIME_PROOF = await managedObjectReceiptRuntimeProof({
+  secret: OBJECT_RECEIPT_PROOF_SECRET,
+  authority: OBJECT_RECEIPT_AUTHORITY,
+  bucketName: "managed-bucket",
+});
+
+function edgeObjectsDescriptor() {
+  return {
+    kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
+    publicName: "MEDIA",
+    nativeName: "__TAKOSERVER_OBJECTS_0",
+    receiptNativeName: OBJECT_RECEIPT_NATIVE_NAME,
+    receiptInstanceName: OBJECT_RECEIPT_INSTANCE_NAME,
+    bucketName: "managed-bucket",
+    runtimeProof: OBJECT_RECEIPT_RUNTIME_PROOF,
+    authority: OBJECT_RECEIPT_AUTHORITY,
+  } as const;
+}
+
+async function bundledObjectReceiptWorker(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-object-receipt-wrapper-test-"));
+  try {
+    const objectModule = resolve(
+      import.meta.dir,
+      "../src/providers/cloudflare-managed-object-receipt-object.ts",
+    );
+    const entry = join(root, "worker.ts");
+    await Bun.write(
+      entry,
+      `export { TakoserverManagedObjectReceipt } from ${JSON.stringify(objectModule)};
+export default { fetch() { return new Response(null, { status: 404 }); } };`,
+    );
+    const built = await Bun.build({
+      entrypoints: [entry],
+      target: "browser",
+      format: "esm",
+      external: ["cloudflare:workers"],
+    });
+    if (!built.success) throw new AggregateError(built.logs, "receipt worker bundle failed");
+    const output = built.outputs[0];
+    if (!output) throw new Error("receipt worker bundle produced no module");
+    return await output.text();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 async function loadGeneratedWorker(
   customerSource: string,
@@ -79,6 +136,15 @@ function gatewayContext(entrypoint: "queue" | "scheduled", waits: Promise<unknow
       throw new Error("must not be projected");
     },
   };
+}
+
+function xml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function eventRequest(event: object): Request {
@@ -143,8 +209,89 @@ test("managed Worker wrapper runs a real workerd multipart module graph", async 
 });
 
 test("managed edge.objects projection runs all nine operations against real workerd R2", async () => {
+  const receiptWorker = await bundledObjectReceiptWorker();
+  const openUploads = new Map<string, { readonly key: string; readonly uploadId: string }>();
+  const s3Transport = async (request: Request, miniflare: Miniflare): Promise<Response> => {
+    const url = new URL(request.url);
+    const key = decodeURIComponent(url.pathname.split("/").slice(2).join("/"));
+    const bucket = await miniflare.getR2Bucket(
+      "__TAKOSERVER_OBJECTS_0",
+      "wrapper-edge-objects-test",
+    );
+    if (request.method === "GET" && url.searchParams.has("uploads")) {
+      const prefix = url.searchParams.get("prefix");
+      const uploads = [...openUploads.values()].filter(
+        (candidate) => prefix === null || candidate.key === prefix,
+      );
+      return new Response(
+        `<?xml version="1.0"?><ListMultipartUploadsResult><IsTruncated>false</IsTruncated>${uploads
+          .map(
+            (upload) =>
+              `<Upload><Key>${xml(upload.key)}</Key><UploadId>${xml(upload.uploadId)}</UploadId></Upload>`,
+          )
+          .join("")}</ListMultipartUploadsResult>`,
+      );
+    }
+    if (request.method === "POST" && url.searchParams.has("uploads")) {
+      const contentType = request.headers.get("content-type");
+      const marker = request.headers.get("x-amz-meta-takoserver-multipart-receipt-v1");
+      const upload = await bucket.createMultipartUpload(key, {
+        ...(contentType ? { httpMetadata: { contentType } } : {}),
+        ...(marker ? { customMetadata: { "takoserver-multipart-receipt-v1": marker } } : {}),
+      });
+      openUploads.set(upload.uploadId, { key, uploadId: upload.uploadId });
+      return new Response(
+        `<?xml version="1.0"?><InitiateMultipartUploadResult><Bucket>managed-bucket</Bucket><Key>${xml(key)}</Key><UploadId>${xml(upload.uploadId)}</UploadId></InitiateMultipartUploadResult>`,
+      );
+    }
+    if (request.method === "DELETE") {
+      const uploadId = url.searchParams.get("uploadId");
+      const upload = uploadId ? openUploads.get(uploadId) : undefined;
+      if (!upload || upload.key !== key) return new Response(null, { status: 404 });
+      await bucket.resumeMultipartUpload(key, uploadId as string).abort();
+      openUploads.delete(uploadId as string);
+      return new Response(null, { status: 204 });
+    }
+    if (request.method === "HEAD") return new Response(null, { status: 200 });
+    return new Response(null, { status: 405 });
+  };
   const runtime = new Miniflare({
     workers: [
+      {
+        config: {
+          name: "managed-object-receipt-gateway-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: { "worker.js": { type: "esm", contents: receiptWorker } },
+          },
+          exports: {
+            TakoserverManagedObjectReceipt: { type: "durable-object", storage: "sqlite" },
+          },
+          env: {
+            MANAGED_PROVIDER_ID: { type: "text", value: OBJECT_RECEIPT_AUTHORITY.providerId },
+            TAKOSERVER_MANAGED_OBJECT_ACCOUNT_ID: { type: "text", value: "test-account" },
+            TAKOSERVER_MANAGED_OBJECT_ACCESS_KEY_ID: {
+              type: "text",
+              value: "test-access-key",
+            },
+            TAKOSERVER_MANAGED_OBJECT_SECRET_ACCESS_KEY: {
+              type: "text",
+              value: "test-secret-key",
+            },
+            TAKOSERVER_MANAGED_OBJECT_PROOF_SECRET: {
+              type: "text",
+              value: OBJECT_RECEIPT_PROOF_SECRET,
+            },
+            TAKOSERVER_MANAGED_OBJECT_S3_TRANSPORT: {
+              type: "fetcher",
+              handler: s3Transport,
+            },
+          },
+          triggers: [],
+        },
+      },
       {
         config: {
           name: "wrapper-edge-objects-test",
@@ -157,13 +304,7 @@ test("managed edge.objects projection runs all nine operations against real work
                 type: "esm",
                 contents: managedWorkerEntrypointSource({
                   ...EMPTY_WORKER,
-                  bindings: [
-                    {
-                      kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
-                      publicName: "MEDIA",
-                      nativeName: "__TAKOSERVER_OBJECTS_0",
-                    },
-                  ],
+                  bindings: [edgeObjectsDescriptor()],
                 }),
               },
               "index.js": {
@@ -261,14 +402,15 @@ test("managed edge.objects projection runs all nine operations against real work
   let undersizedNonFinalError;
   try { await env.MEDIA.completeMultipartUpload("multipart-fence.txt", invalidUpload.uploadId, [invalidFirst, invalidSecond]); }
   catch (error) { undersizedNonFinalError = error.name; }
-  const staleUpload = await env.MEDIA.createMultipartUpload("multipart-fence.txt");
-  const stalePart = await env.MEDIA.uploadPart("multipart-fence.txt", staleUpload.uploadId, 1, "short");
+  const staleUpload = await env.MEDIA.createMultipartUpload("multipart-stale.txt");
+  const stalePart = await env.MEDIA.uploadPart("multipart-stale.txt", staleUpload.uploadId, 1, "short");
   let stalePartError;
-  try { await env.MEDIA.completeMultipartUpload("multipart-fence.txt", staleUpload.uploadId, [{ ...stalePart, etag: stalePart.etag + "-stale" }]); }
+  try { await env.MEDIA.completeMultipartUpload("multipart-stale.txt", staleUpload.uploadId, [{ ...stalePart, etag: stalePart.etag + "-stale" }]); }
   catch (error) { stalePartError = error.name; }
   const multipartFenceBody = await new Response((await env.MEDIA.get("multipart-fence.txt")).body).text();
   step = "abort";
   const abandoned = await env.MEDIA.createMultipartUpload("abandoned.txt");
+  await env.MEDIA.abortMultipartUpload("abandoned.txt", abandoned.uploadId);
   await env.MEDIA.abortMultipartUpload("abandoned.txt", abandoned.uploadId);
   step = "delete";
   await env.MEDIA.delete("workerd.txt");
@@ -279,14 +421,23 @@ test("managed edge.objects projection runs all nine operations against real work
               },
             },
           },
-          env: { __TAKOSERVER_OBJECTS_0: { type: "r2", name: "managed-edge-objects-test" } },
+          env: {
+            __TAKOSERVER_OBJECTS_0: { type: "r2", name: "managed-edge-objects-test" },
+            [OBJECT_RECEIPT_NATIVE_NAME]: {
+              type: "durable-object",
+              workerName: "managed-object-receipt-gateway-test",
+              exportName: "TakoserverManagedObjectReceipt",
+            },
+          },
           triggers: [],
         },
       },
     ],
   });
   try {
-    const response = await runtime.dispatchFetch("https://worker.example/");
+    const response = await (await runtime.getWorker("wrapper-edge-objects-test")).fetch(
+      "https://worker.example/",
+    );
     const responseText = await response.text();
     expect({ status: response.status, responseText }).toMatchObject({ status: 200 });
     expect(JSON.parse(responseText)).toEqual({
@@ -377,6 +528,1212 @@ test("managed edge.objects projection runs all nine operations against real work
   }
 }, 60_000);
 
+test("managed edge.objects reconciles a lost R2 complete response without a second complete", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      const upload = await env.MEDIA.createMultipartUpload("lost-ack.bin");
+      const part = { partNumber: 1, etag: "part-etag" };
+      const first = await env.MEDIA.completeMultipartUpload("lost-ack.bin", upload.uploadId, [part]);
+      const second = await env.MEDIA.completeMultipartUpload("lost-ack.bin", upload.uploadId, [part]);
+      const head = await env.MEDIA.head("lost-ack.bin");
+      return Response.json({ first, second, headKeys: Reflect.ownKeys(head).sort() });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let state: "new" | "active" | "completing" | "completed" = "new";
+  let marker = "";
+  let nativeCompleteCalls = 0;
+  const receipt = {
+    async createMultipartUpload(input: { readonly marker: string }) {
+      marker = input.marker;
+      state = "active";
+      completed.customMetadata = { "takoserver-multipart-receipt-v1": marker };
+      return { ok: true, value: { state: "active" } };
+    },
+    async beginCreate(input: { readonly marker: string }) {
+      marker = input.marker;
+      state = "new";
+      return { ok: true, value: { state: "creating" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      state = "active";
+      return { ok: true, value: { state: "active" } };
+    },
+    async beginPart(input: { readonly attemptId: string }) {
+      return {
+        ok: true,
+        value: { nativeUploadId: "native-upload", attemptId: input.attemptId },
+      };
+    },
+    async commitPart(input: { readonly etag: string; readonly partNumber: number }) {
+      return { ok: true, value: { etag: input.etag, partNumber: input.partNumber } };
+    },
+    async releasePart() {
+      return { ok: true, value: { state: "active" } };
+    },
+    async beginComplete() {
+      if (state === "completed") {
+        return { ok: true, value: { action: "done", etag: '"object-etag"', size: 4 } };
+      }
+      if (state === "completing") {
+        return {
+          ok: true,
+          value: {
+            action: "reconcile",
+            nativeUploadId: "native-upload",
+            marker,
+            expectedSize: 4,
+          },
+        };
+      }
+      state = "completing";
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-upload",
+          marker,
+          expectedSize: 4,
+        },
+      };
+    },
+    async commitComplete(input: { readonly etag: string; readonly size: number }) {
+      state = "completed";
+      return { ok: true, value: { etag: input.etag, size: input.size } };
+    },
+    async failComplete() {
+      state = "active";
+      return { ok: true, value: { state: "active" } };
+    },
+    async markCompleteLost() {
+      state = "completing";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const completed = {
+    httpEtag: '"object-etag"',
+    size: 4,
+    customMetadata: {} as Record<string, string>,
+  };
+  const raw = {
+    async head() {
+      return nativeCompleteCalls > 0 ? completed : null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      throw new Error("wrapper must not own native multipart create");
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart(_partNumber: number, body: ReadableStream<Uint8Array>) {
+          await new Response(body).arrayBuffer();
+          return { etag: "part-etag" };
+        },
+        async complete() {
+          nativeCompleteCalls += 1;
+          throw new Error("R2 response lost after the object became visible");
+        },
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      first: { etag: '"object-etag"', size: 4 },
+      second: { etag: '"object-etag"', size: 4 },
+      headKeys: ["etag", "size"],
+    });
+    expect(nativeCompleteCalls).toBe(1);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects leaves native create failure cleanup to its receipt authority", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      try { await env.MEDIA.createMultipartUpload("create-failed.bin"); }
+      catch (error) { return Response.json({ error: error.name }); }
+      return new Response("unexpected", { status: 500 });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "new";
+  let nativeAbortCalls = 0;
+  const receipt = {
+    async createMultipartUpload() {
+      receiptState = "aborted";
+      return { ok: false, error: { code: "backend_unavailable" } };
+    },
+    async beginCreate() {
+      receiptState = "creating";
+      return { ok: true, value: { state: "creating" } };
+    },
+    async markCreateOutcomeUnknown() {
+      receiptState = "reconciliation_required";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginAbort(input: { readonly nativeUploadId?: string }) {
+      if (input.nativeUploadId !== undefined) throw new Error("unexpected native id");
+      receiptState = "aborted";
+      return { ok: true, value: { action: "done" } };
+    },
+    async commitAbort() {
+      receiptState = "aborted";
+      return { ok: true, value: { state: "aborted" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      const error = new Error("native create rejected the key");
+      error.name = "invalid_key";
+      throw error;
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {},
+        async abort() {
+          nativeAbortCalls += 1;
+        },
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({ error: "backend_unavailable" });
+    expect(receiptState).toBe("aborted");
+    expect(nativeAbortCalls).toBe(0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects surfaces receipt-owned ambiguous create outcomes without native fallback", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      let transport;
+      try { await env.MEDIA.createMultipartUpload("create-ambiguous.bin"); }
+      catch (error) { transport = error.name; }
+      let malformed;
+      try { await env.MEDIA.createMultipartUpload("create-malformed.bin"); }
+      catch (error) { malformed = error.name; }
+      return Response.json({ transport, malformed });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "new";
+  let marked = 0;
+  let nativeCreateCalls = 0;
+  const receipt = {
+    async createMultipartUpload() {
+      marked += 1;
+      receiptState = "operator_reconciliation_required";
+      return { ok: false, error: { code: "backend_unavailable" } };
+    },
+    async beginCreate() {
+      receiptState = "creating";
+      return { ok: true, value: { state: "creating" } };
+    },
+    async markCreateOutcomeUnknown() {
+      marked += 1;
+      receiptState = "reconciliation_required";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      nativeCreateCalls += 1;
+      if (nativeCreateCalls === 1) throw new Error("transport acknowledgement lost after create");
+      return {};
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {},
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({
+      transport: "backend_unavailable",
+      malformed: "backend_unavailable",
+    });
+    expect(receiptState).toBe("operator_reconciliation_required");
+    expect(marked).toBe(2);
+    expect(nativeCreateCalls).toBe(0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects never creates again for a stale creating receipt", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      try { await env.MEDIA.createMultipartUpload("stale-create.bin"); }
+      catch (error) { return Response.json({ error: error.name }); }
+      return new Response("unexpected", { status: 500 });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let nativeCreateCalls = 0;
+  const receipt = {
+    async createMultipartUpload() {
+      return { ok: false, error: { code: "backend_unavailable" } };
+    },
+    async beginCreate() {
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async markCreateOutcomeUnknown() {
+      throw new Error("must not mark a fenced receipt twice");
+    },
+    async activateCreate() {
+      throw new Error("must not activate stale create");
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      nativeCreateCalls += 1;
+      return { uploadId: "must-not-create" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {},
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({ error: "backend_unavailable" });
+    expect(nativeCreateCalls).toBe(0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects does not second-guess receipt-owned activation recovery", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      try { await env.MEDIA.createMultipartUpload("activation-lost.bin"); }
+      catch (error) { return Response.json({ error: error.name }); }
+      return new Response("unexpected", { status: 500 });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "new";
+  let activationCalls = 0;
+  let nativeAbortCalls = 0;
+  const receipt = {
+    async createMultipartUpload() {
+      receiptState = "aborted";
+      return { ok: false, error: { code: "backend_unavailable" } };
+    },
+    async beginCreate() {
+      receiptState = "creating";
+      return { ok: true, value: { state: "creating" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      activationCalls += 1;
+      throw new Error("activation acknowledgement lost");
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginAbort(input: { readonly nativeUploadId?: string }) {
+      expect(input.nativeUploadId).toBe("native-activation-lost");
+      receiptState = "aborting";
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-activation-lost",
+          marker: "A".repeat(43),
+        },
+      };
+    },
+    async commitAbort() {
+      receiptState = "aborted";
+      return { ok: true, value: { state: "aborted" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "native-activation-lost" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {},
+        async abort() {
+          nativeAbortCalls += 1;
+        },
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({ error: "backend_unavailable" });
+    expect(activationCalls).toBe(0);
+    expect(receiptState).toBe("aborted");
+    expect(nativeAbortCalls).toBe(0);
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects fences a definitive upload_not_found and keeps reconciliation pending", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      const part = { partNumber: 1, etag: "part-etag" };
+      let first;
+      try { await env.MEDIA.completeMultipartUpload("lost.bin", "receipt-lost", [part]); }
+      catch (error) { first = error.name; }
+      let second;
+      try { await env.MEDIA.completeMultipartUpload("lost.bin", "receipt-lost", [part]); }
+      catch (error) { second = error.name; }
+      return Response.json({ first, second });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "active";
+  let markedLost = 0;
+  const receipt = {
+    async beginCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      if (receiptState === "completion_reconciling") {
+        return {
+          ok: true,
+          value: {
+            action: "reconcile",
+            nativeUploadId: "native-lost",
+            marker: "A".repeat(43),
+            expectedSize: 4,
+          },
+        };
+      }
+      receiptState = "completing";
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-lost",
+          marker: "A".repeat(43),
+          expectedSize: 4,
+        },
+      };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      markedLost += 1;
+      receiptState = "completion_reconciling";
+      return { ok: true, value: { state: "completion_reconciling" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "unused" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {
+          throw new Error("R2 multipart upload was not found (10024)");
+        },
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({
+      first: "upload_not_found",
+      second: "backend_unavailable",
+    });
+    expect(markedLost).toBe(1);
+    expect(receiptState).toBe("completion_reconciling");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects fences upload_not_found when head is ambiguous without retrying complete", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      const parts = [{ partNumber: 1, etag: "part-etag" }];
+      let first;
+      try {
+        await env.MEDIA.completeMultipartUpload("ambiguous.bin", "receipt-ambiguous", parts);
+      } catch (error) {
+        first = error.name;
+      }
+      let second;
+      try {
+        await env.MEDIA.completeMultipartUpload("ambiguous.bin", "receipt-ambiguous", parts);
+      } catch (error) {
+        second = error.name;
+      }
+      return Response.json({ first, second });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "active";
+  let markedLost = 0;
+  let nativeCompleteCalls = 0;
+  const receipt = {
+    async beginCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      if (receiptState === "reconciliation_required") {
+        return {
+          ok: true,
+          value: {
+            action: "reconcile",
+            nativeUploadId: "native-ambiguous",
+            marker: "A".repeat(43),
+            expectedSize: 4,
+          },
+        };
+      }
+      receiptState = "completing";
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-ambiguous",
+          marker: "A".repeat(43),
+          expectedSize: 4,
+        },
+      };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCompleteLost() {
+      markedLost += 1;
+      receiptState = "reconciliation_required";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      throw new Error("head readback unavailable");
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "unused" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {
+          nativeCompleteCalls += 1;
+          throw new Error("R2 multipart upload was not found (10024)");
+        },
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({
+      first: "backend_unavailable",
+      second: "backend_unavailable",
+    });
+    expect(markedLost).toBe(2);
+    expect(nativeCompleteCalls).toBe(1);
+    expect(receiptState).toBe("reconciliation_required");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects does not report invalid_part unless the durable receipt reopens", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      try {
+        await env.MEDIA.completeMultipartUpload("failed.bin", "receipt-id", [
+          { partNumber: 1, etag: "part-etag" },
+        ]);
+      } catch (error) {
+        return Response.json({ error: error.name });
+      }
+      return new Response("unexpected", { status: 500 });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  const raw = {
+    async head() {
+      return null;
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "unused" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {
+          throw { name: "invalid_part" };
+        },
+        async abort() {},
+      };
+    },
+  };
+  const receipt = {
+    async beginCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-upload",
+          marker: "A".repeat(43),
+          expectedSize: 4,
+        },
+      };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      return { ok: true, value: { state: "completing" } };
+    },
+    async markCompleteLost() {
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({ error: "backend_unavailable" });
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects fences an invalid_part with a different object and never retries complete", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      const parts = [{ partNumber: 1, etag: "part-etag" }];
+      let first;
+      try { await env.MEDIA.completeMultipartUpload("mismatch.bin", "receipt-mismatch", parts); }
+      catch (error) { first = error.name; }
+      let second;
+      try { await env.MEDIA.completeMultipartUpload("mismatch.bin", "receipt-mismatch", parts); }
+      catch (error) { second = error.name; }
+      return Response.json({ first, second });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "active";
+  let nativeCompleteCalls = 0;
+  let markReconciliationCalls = 0;
+  let failCompleteCalls = 0;
+  const marker = "A".repeat(43);
+  const receipt = {
+    async beginCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      if (receiptState === "reconciliation_required") {
+        return {
+          ok: true,
+          value: {
+            action: "reconcile",
+            nativeUploadId: "native-mismatch",
+            marker,
+            expectedSize: 4,
+          },
+        };
+      }
+      receiptState = "completing";
+      return {
+        ok: true,
+        value: { action: "execute", nativeUploadId: "native-mismatch", marker, expectedSize: 4 },
+      };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      failCompleteCalls += 1;
+      receiptState = "active";
+      return { ok: true, value: { state: "active" } };
+    },
+    async markCompleteLost() {
+      markReconciliationCalls += 1;
+      receiptState = "reconciliation_required";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return {
+        httpEtag: '"different-object"',
+        size: 4,
+        customMetadata: { "takoserver-multipart-receipt-v1": "not-this-receipt" },
+      };
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "unused" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {
+          nativeCompleteCalls += 1;
+          throw { name: "invalid_part" };
+        },
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({
+      first: "backend_unavailable",
+      second: "backend_unavailable",
+    });
+    expect(nativeCompleteCalls).toBe(1);
+    expect(failCompleteCalls).toBe(0);
+    expect(markReconciliationCalls).toBe(2);
+    expect(receiptState).toBe("reconciliation_required");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
+test("managed edge.objects fences upload_not_found when the marker size disagrees and never retries complete", async () => {
+  const loaded = await loadGeneratedWorker(
+    `export default { async fetch(_request, env) {
+      const parts = [{ partNumber: 1, etag: "part-etag" }];
+      let first;
+      try { await env.MEDIA.completeMultipartUpload("size-mismatch.bin", "receipt-size-mismatch", parts); }
+      catch (error) { first = error.name; }
+      let second;
+      try { await env.MEDIA.completeMultipartUpload("size-mismatch.bin", "receipt-size-mismatch", parts); }
+      catch (error) { second = error.name; }
+      return Response.json({ first, second });
+    } };`,
+    { ...EMPTY_WORKER, bindings: [edgeObjectsDescriptor()] },
+  );
+  let receiptState = "active";
+  let nativeCompleteCalls = 0;
+  let markReconciliationCalls = 0;
+  let failCompleteCalls = 0;
+  const marker = "A".repeat(43);
+  const receipt = {
+    async beginCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async markCreateOutcomeUnknown() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async activateCreate() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitPart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async releasePart() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async beginComplete() {
+      if (receiptState === "reconciliation_required") {
+        return {
+          ok: true,
+          value: {
+            action: "reconcile",
+            nativeUploadId: "native-size-mismatch",
+            marker,
+            expectedSize: 4,
+          },
+        };
+      }
+      receiptState = "completing";
+      return {
+        ok: true,
+        value: {
+          action: "execute",
+          nativeUploadId: "native-size-mismatch",
+          marker,
+          expectedSize: 4,
+        },
+      };
+    },
+    async commitComplete() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async failComplete() {
+      failCompleteCalls += 1;
+      receiptState = "active";
+      return { ok: true, value: { state: "active" } };
+    },
+    async markCompleteLost() {
+      markReconciliationCalls += 1;
+      receiptState = "reconciliation_required";
+      return { ok: true, value: { state: "reconciliation_required" } };
+    },
+    async beginAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+    async commitAbort() {
+      return { ok: false, error: { code: "conflict" } };
+    },
+  };
+  const raw = {
+    async head() {
+      return {
+        httpEtag: '"different-size"',
+        size: 9,
+        customMetadata: { "takoserver-multipart-receipt-v1": marker },
+      };
+    },
+    async get() {
+      return null;
+    },
+    async put() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+    async createMultipartUpload() {
+      return { uploadId: "unused" };
+    },
+    resumeMultipartUpload() {
+      return {
+        async uploadPart() {
+          return { etag: "unused" };
+        },
+        async complete() {
+          nativeCompleteCalls += 1;
+          throw { name: "upload_not_found" };
+        },
+        async abort() {},
+      };
+    },
+  };
+  try {
+    const response = await loaded.worker.fetch(
+      publicRequest(),
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: { getByName: () => receipt },
+      },
+      { waitUntil() {} },
+    );
+    expect(await response.json()).toEqual({
+      first: "backend_unavailable",
+      second: "backend_unavailable",
+    });
+    expect(nativeCompleteCalls).toBe(1);
+    expect(failCompleteCalls).toBe(0);
+    expect(markReconciliationCalls).toBe(2);
+    expect(receiptState).toBe("reconciliation_required");
+  } finally {
+    await loaded.dispose();
+  }
+});
+
 test("managed edge.objects list projects the exact closed Binding result", async () => {
   const loaded = await loadGeneratedWorker(
     `export default { async fetch(_request, env) {
@@ -402,13 +1759,7 @@ test("managed edge.objects list projects the exact closed Binding result", async
     } };`,
     {
       ...EMPTY_WORKER,
-      bindings: [
-        {
-          kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
-          publicName: "MEDIA",
-          nativeName: "__TAKOSERVER_OBJECTS_0",
-        },
-      ],
+      bindings: [edgeObjectsDescriptor()],
     },
   );
   const raw = {
@@ -464,7 +1815,57 @@ test("managed edge.objects list projects the exact closed Binding result", async
   try {
     const response = await loaded.worker.fetch(
       publicRequest(),
-      { __TAKOSERVER_OBJECTS_0: raw },
+      {
+        __TAKOSERVER_OBJECTS_0: raw,
+        [OBJECT_RECEIPT_NATIVE_NAME]: {
+          getByName() {
+            return {
+              async createMultipartUpload() {
+                return { ok: true, value: { state: "active" } };
+              },
+              async beginCreate() {
+                return { ok: true, value: { state: "creating" } };
+              },
+              async markCreateOutcomeUnknown() {
+                return { ok: false, error: { code: "conflict" } };
+              },
+              async activateCreate() {
+                return { ok: true, value: { state: "active" } };
+              },
+              async beginPart(input: { readonly attemptId: string }) {
+                return {
+                  ok: true,
+                  value: { nativeUploadId: "unused", attemptId: input.attemptId },
+                };
+              },
+              async commitPart() {
+                return { ok: false, error: { code: "backend_unavailable" } };
+              },
+              async releasePart() {
+                return { ok: true, value: { state: "active" } };
+              },
+              async beginComplete() {
+                return { ok: false, error: { code: "invalid_part" } };
+              },
+              async commitComplete() {
+                return { ok: false, error: { code: "backend_unavailable" } };
+              },
+              async failComplete() {
+                return { ok: true, value: { state: "active" } };
+              },
+              async markCompleteLost() {
+                return { ok: true, value: { state: "reconciliation_required" } };
+              },
+              async beginAbort() {
+                return { ok: false, error: { code: "not_found" } };
+              },
+              async commitAbort() {
+                return { ok: false, error: { code: "not_found" } };
+              },
+            };
+          },
+        },
+      },
       { waitUntil() {} },
     );
     expect(await response.json()).toEqual({
@@ -516,10 +1917,8 @@ test("generator rejects unsafe module names, unsupported native shapes, and name
       ...EMPTY_WORKER,
       bindings: [
         {
-          kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
+          ...edgeObjectsDescriptor(),
           apiVersion: "interfaces.takoform.com/v1alpha1",
-          publicName: "MEDIA",
-          nativeName: "__TAKOSERVER_OBJECTS_0",
         } as never,
       ],
     }),
@@ -557,6 +1956,17 @@ test("generator rejects unsafe module names, unsupported native shapes, and name
           instanceName: "opaque-instance",
         },
         { name: "__TAKOSERVER_SQLITE_0", type: "plain_text" },
+      ],
+    }),
+  ).toThrow(TypeError);
+  expect(() =>
+    managedWorkerEntrypointSource({
+      ...EMPTY_WORKER,
+      bindings: [
+        {
+          ...edgeObjectsDescriptor(),
+          receiptInstanceName: "customer-selected-receipt-authority",
+        },
       ],
     }),
   ).toThrow(TypeError);
@@ -1307,11 +2717,7 @@ function importableEnvWorker(name: string, compatibilityFlags: string[]): Minifl
               bindings: [
                 { name: "GREETING", type: "plain_text" },
                 { name: "API_KEY", type: "secret_text" },
-                {
-                  kind: MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
-                  publicName: "MEDIA",
-                  nativeName: "__TAKOSERVER_OBJECTS_0",
-                },
+                edgeObjectsDescriptor(),
               ],
             }),
           },
@@ -1321,6 +2727,7 @@ function importableEnvWorker(name: string, compatibilityFlags: string[]): Minifl
 export default { async fetch(_request, env) {
   const importableKeys = Reflect.ownKeys(importable ?? {}).sort();
   const rawBucket = importable?.__TAKOSERVER_OBJECTS_0;
+  const rawReceiptNamespace = importable?.__TAKOSERVER_OBJECT_RECEIPTS_0;
   let rawPut = "absent";
   if (rawBucket) {
     try { await rawBucket.put("raw.txt", "raw"); rawPut = "stored"; }
@@ -1330,6 +2737,7 @@ export default { async fetch(_request, env) {
     importableKeys,
     rawSecret: importable?.API_KEY ?? null,
     rawPut,
+    rawReceiptNamespace: rawReceiptNamespace ? "present" : "absent",
     handlerKeys: Reflect.ownKeys(env).sort(),
     handlerGreeting: env.GREETING,
     handlerSecret: env.API_KEY,
@@ -1346,6 +2754,11 @@ export default { async fetch(_request, env) {
           type: "r2",
           name: `${name}-bucket`,
         },
+        [OBJECT_RECEIPT_NATIVE_NAME]: {
+          type: "durable-object",
+          workerName: "managed-object-receipt-import-fence-test",
+          exportName: "TakoserverManagedObjectReceipt",
+        },
       },
       triggers: [],
     },
@@ -1355,8 +2768,25 @@ export default { async fetch(_request, env) {
 async function importableEnvComparison() {
   const unflaggedWorkerName = "wrapper-import-fence-unflagged";
   const flaggedWorkerName = "wrapper-import-fence-flagged";
+  const receiptWorker = await bundledObjectReceiptWorker();
   const runtime = new Miniflare({
     workers: [
+      {
+        config: {
+          name: "managed-object-receipt-import-fence-test",
+          type: "worker",
+          compatibilityDate: "2026-08-18",
+          manifest: {
+            mainModule: "worker.js",
+            modules: { "worker.js": { type: "esm", contents: receiptWorker } },
+          },
+          exports: {
+            TakoserverManagedObjectReceipt: { type: "durable-object", storage: "sqlite" },
+          },
+          env: {},
+          triggers: [],
+        },
+      },
       importableEnvWorker(unflaggedWorkerName, []),
       importableEnvWorker(flaggedWorkerName, ["disallow_importable_env"]),
     ],
@@ -1402,9 +2832,15 @@ test("disallow_importable_env empties the tenant's importable env and changes no
   // one import away, and the handle is usable. This is the defect.
   expect(comparison.unflagged).toEqual({
     ...projected,
-    importableKeys: ["API_KEY", "GREETING", "__TAKOSERVER_OBJECTS_0"],
+    importableKeys: [
+      "API_KEY",
+      "GREETING",
+      "__TAKOSERVER_OBJECTS_0",
+      "__TAKOSERVER_OBJECT_RECEIPTS_0",
+    ],
     rawSecret: "s3cret",
     rawPut: "stored",
+    rawReceiptNamespace: "present",
   });
 
   // With it the importable environment is empty, and the handler env and the
@@ -1414,5 +2850,6 @@ test("disallow_importable_env empties the tenant's importable env and changes no
     importableKeys: [],
     rawSecret: null,
     rawPut: "absent",
+    rawReceiptNamespace: "absent",
   });
 }, 60_000);

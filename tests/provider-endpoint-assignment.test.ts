@@ -14,6 +14,7 @@ import {
   failed,
   type Provider,
   type ProviderOffering,
+  type ResourceIdentity,
   succeeded,
 } from "../src/provider-port.ts";
 import type { TakoformDriverRelation, TakoformStoredResource } from "../src/takoform/types.ts";
@@ -118,6 +119,7 @@ function soldEndpoint(offering: ProviderOffering): Offering {
 async function fixture(input: {
   readonly priced?: boolean;
   readonly apply?: (input: ApplyInput) => ReturnType<Provider["apply"]>;
+  readonly observe?: Provider["observe"];
   readonly recoverDelete?: Provider["recoverDelete"];
   readonly activationFails?: boolean;
   readonly assignmentAckLost?: boolean;
@@ -166,7 +168,8 @@ async function fixture(input: {
         outputs: { hostname: "reserved.endpoint.test", url: "https://reserved.endpoint.test/" },
       });
     },
-    async observe() {
+    async observe(observeInput) {
+      if (input.observe) return await input.observe(observeInput);
       return failed("not_found", "not used");
     },
     async delete(deleteInput) {
@@ -299,6 +302,12 @@ async function fixture(input: {
   const applyInput = {
     operationId: "operation-endpoint",
     operationKey: "key-endpoint",
+    executionAuthority: {
+      tenantId,
+      resourceUid: endpointUid,
+      leaseToken: "lease-endpoint",
+      fingerprint: "fingerprint-endpoint",
+    },
     tenantId,
     resourceUid: endpointUid,
     form: endpoint,
@@ -547,10 +556,50 @@ test("recovery convergence resumes the exact assignment after process death befo
   });
 });
 
-test("delete recovery settles the exact provider tombstone before reservation deactivation", async () => {
+test("observe forwards the exact deployment incarnation and Resource generation", async () => {
+  let observedIdentity: ResourceIdentity | undefined;
   const context = await fixture({
-    recoverDelete: async (input) =>
-      succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} }),
+    observe: async (input) => {
+      observedIdentity = input.identity;
+      return succeeded({ nativeId: input.nativeId, observed: {}, outputs: {} });
+    },
+  });
+  await context.deployments.create({
+    tenantId,
+    id: "deployment-endpoint-observe",
+    resourceUid: endpointUid,
+    offeringId: "fake.endpoint",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    nativeId: `endpoint:${endpointUid}`,
+    state: "active",
+    observed: {},
+    outputs: {},
+  });
+
+  await context.driver.observe({
+    tenantId,
+    resourceUid: endpointUid,
+    resource: endpointResource(context.endpoint),
+    relations: [],
+  });
+  expect(observedIdentity).toEqual({
+    tenantRef: tenantId,
+    space: "default",
+    name: "public",
+    uid: endpointUid,
+    incarnationId: "deployment-endpoint-observe",
+    generation: "1",
+  });
+});
+
+test("delete recovery settles the exact provider tombstone before reservation deactivation", async () => {
+  let recoveredIdentity: ResourceIdentity | undefined;
+  const context = await fixture({
+    recoverDelete: async (input) => {
+      recoveredIdentity = input.identity;
+      return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    },
   });
   await context.deployments.create({
     tenantId,
@@ -571,6 +620,12 @@ test("delete recovery settles the exact provider tombstone before reservation de
   await context.driver.delete({
     operationId: "operation-endpoint-delete",
     operationMode: "recovery",
+    executionAuthority: {
+      tenantId,
+      resourceUid: endpointUid,
+      leaseToken: "lease-endpoint-delete",
+      fingerprint: "fingerprint-endpoint-delete",
+    },
     tenantId,
     resourceUid: endpointUid,
     resource: endpointResource(context.endpoint),
@@ -582,4 +637,12 @@ test("delete recovery settles the exact provider tombstone before reservation de
     "reservation.deactivate",
   ]);
   expect(context.calls().deactivateCalls).toBe(1);
+  expect(recoveredIdentity).toEqual({
+    tenantRef: tenantId,
+    space: "default",
+    name: "public",
+    uid: endpointUid,
+    incarnationId: "deployment-endpoint",
+    generation: "1",
+  });
 });

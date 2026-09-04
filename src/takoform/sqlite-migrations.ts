@@ -1,3 +1,4 @@
+import { bytesDigest } from "../json.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { ArtifactResolver } from "./engine.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
@@ -5,6 +6,7 @@ import type { TakoformStore } from "./store.ts";
 import type {
   InstalledTakoformForm,
   TakoformCondition,
+  TakoformProviderExecutionAuthority,
   TakoformResourceDriver,
   TakoformSqliteMigration,
   TakoformSqliteMigrationIdentity,
@@ -24,13 +26,16 @@ interface MigrationContext {
   readonly store: Pick<TakoformStore, "readResource">;
   readonly artifacts: ArtifactResolver;
   readonly driver: TakoformResourceDriver;
-  /** Fresh Host admission check immediately before the target DB is changed. */
-  readonly beforeSideEffect?: () => Promise<void>;
 }
 
 interface MigrationPlan {
   readonly database: TakoformStoredResource;
   readonly desired: readonly TakoformSqliteMigrationIdentity[];
+}
+
+export interface PreparedSqliteMigrationApplication {
+  readonly database: TakoformStoredResource;
+  readonly desired: readonly TakoformSqliteMigration[];
 }
 
 export function isSqliteMigrationApplication(form: InstalledTakoformForm): boolean {
@@ -41,31 +46,68 @@ export function isSqliteMigrationApplication(form: InstalledTakoformForm): boole
   );
 }
 
-/** Validates and applies only the exact unapplied suffix to the target DB. */
-export async function applySqliteMigrationApplication(input: MigrationContext): Promise<void> {
-  if (!isSqliteMigrationApplication(input.form)) return;
+/**
+ * Resolves the immutable desired history before the saga crosses its provider
+ * dispatch marker. No target-database mutation occurs in this phase.
+ */
+export async function prepareSqliteMigrationApplication(
+  input: MigrationContext,
+): Promise<PreparedSqliteMigrationApplication | null> {
+  if (!isSqliteMigrationApplication(input.form)) return null;
   const executor = input.driver.sqliteMigrations;
   if (!executor) throw new TakoformHostError("unsupported_capability", 422);
   const plan = await migrationPlan(input);
-  const applied = await executor.readLedger({ tenantId: input.tenantId, database: plan.database });
-  requirePrefix(applied, plan.desired);
-  const migrations: TakoformSqliteMigration[] = [];
-  for (const migration of plan.desired.slice(applied.length)) {
+  const desired: TakoformSqliteMigration[] = [];
+  for (const migration of plan.desired) {
     const sql = await input.artifacts.resolveBlob(input.tenantId, migration.digest);
     if (!sql) throw new TakoformHostError("artifact_missing", 404);
-    migrations.push({ ...migration, sql });
+    if ((await bytesDigest(sql)) !== migration.digest) {
+      throw new TakoformHostError("artifact_invalid", 400);
+    }
+    desired.push({ ...migration, sql: sql.slice() });
   }
+  return { database: plan.database, desired };
+}
+
+/**
+ * Reconciles only the exact unapplied suffix while the application Resource's
+ * existing provider-mutation saga lease is held.
+ */
+export async function applySqliteMigrationApplication(input: {
+  readonly tenantId: string;
+  readonly operationId: string;
+  readonly operationMode: "initial" | "recovery";
+  readonly executionAuthority: TakoformProviderExecutionAuthority;
+  readonly prepared: PreparedSqliteMigrationApplication | null;
+  readonly driver: TakoformResourceDriver;
+}): Promise<void> {
+  if (!input.prepared) return;
+  const executor = input.driver.sqliteMigrations;
+  if (!executor) throw new TakoformHostError("unsupported_capability", 422);
+  const desired = input.prepared.desired.map(({ path, digest }) => ({ path, digest }));
+  const applied = await executor.readLedger({
+    tenantId: input.tenantId,
+    database: input.prepared.database,
+  });
+  requirePrefix(applied, desired);
+  const migrations = input.prepared.desired.slice(applied.length);
   if (migrations.length > 0) {
-    await input.beforeSideEffect?.();
     await executor.applySuffix({
+      operationId: input.operationId,
+      operationMode: input.operationMode,
+      executionAuthority: input.executionAuthority,
       tenantId: input.tenantId,
-      database: plan.database,
+      database: input.prepared.database,
+      desired: input.prepared.desired,
       expectedPrefix: applied,
       migrations,
     });
   }
-  const settled = await executor.readLedger({ tenantId: input.tenantId, database: plan.database });
-  if (!sameLedger(settled, plan.desired)) throw new TakoformHostError("backend_unavailable", 503);
+  const settled = await executor.readLedger({
+    tenantId: input.tenantId,
+    database: input.prepared.database,
+  });
+  if (!sameLedger(settled, desired)) throw new TakoformHostError("backend_unavailable", 503);
 }
 
 /** Derived readiness follows the target database's authoritative ledger. */

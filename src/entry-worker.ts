@@ -11,12 +11,13 @@ import {
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
+import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-rpc.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
 import { embeddedPublicFormImplementationIdentity } from "./public-form-implementation-build.ts";
 import type {
   PublicFormImplementationIdentity,
   PublicWorkerImplementationIdentity,
-} from "./public-worker-implementation.ts";
+} from "./public-host-identity.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
@@ -36,16 +37,11 @@ import { createWorkerProductionComposition } from "./worker-production-compositi
 /**
  * The Cloudflare Workers entry.
  *
- * This serves the whole product, provisioning included. ADR 0001 decided that
- * the Worker provisions Cloudflare resources itself with a scoped API token
- * held as a secret: customer Workers are separate scripts with separate
- * bundles, so there is nobody to leak that reach to. What stays forbidden in
- * this bundle are the D1/R2 HTTP transports — the Worker has bindings for
- * both, and long-lived storage keys have no business in an edge isolate.
- *
- * The private composition may enable several provider packs at once. Each pack
- * keeps its own credential and exact Offering identity; the catalog compiler
- * rejects a partial or ambiguous composition before the Worker serves.
+ * This serves the public product and keeps Host state, artifacts, and sealed
+ * runtime-input preparation. Parent-provider credentials are deliberately not
+ * part of this environment: reviewed Cloudflare operations cross one typed,
+ * route-less service binding, and providers without such an executor fail
+ * closed before the Worker serves.
  */
 
 export interface WorkerEnv {
@@ -83,12 +79,6 @@ export interface WorkerEnv {
   readonly TAKOS_ID_CLIENT_ID?: string;
   /** Private sponsorship owner API bearer. */
   readonly TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN?: string;
-  /** The Cloudflare account this deployment provisions in. */
-  readonly CLOUDFLARE_ACCOUNT_ID?: string;
-  /** Scoped Cloudflare API token. A secret, never a var. */
-  readonly CLOUDFLARE_API_TOKEN?: string;
-  /** DNS zones this deployment may attach Workers to, as JSON. */
-  readonly TAKOSERVER_ZONES?: string;
   /** Stripe secret key. The deploy target must separately authorize Checkout. */
   readonly STRIPE_SECRET_KEY?: string;
   /** Exact operator intent to expose Stripe Checkout on this deployment. */
@@ -103,13 +93,12 @@ export interface WorkerEnv {
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   /** Reviewed Cloudflare sales for released identity Forms other than storage. */
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  /** Typed private provider authority; never an HTTP bearer bridge. */
+  readonly CLOUDFLARE_PROVIDER_EXECUTOR?: CloudflareProviderExecutorRpc;
+  /** Non-secret endpoint suffix used for synchronous public address derivation. */
+  readonly TAKOSERVER_MANAGED_BASE_DOMAIN?: string;
   /** Operator-private AES key ring for one-shot Worker runtime inputs. */
   readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING?: string;
-  /** Exact workers.dev suffix assigned to the configured provider account. */
-  readonly TAKOSERVER_WORKER_ENDPOINT_SUFFIX?: string;
-  /** Wasabi sub-user credentials. Both are Worker secrets. */
-  readonly TAKOSERVER_WASABI_ACCESS_KEY_ID?: string;
-  readonly TAKOSERVER_WASABI_SECRET_ACCESS_KEY?: string;
 }
 
 /**
@@ -481,14 +470,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       env,
       forms: currentCandidates.forms,
       retainedForms: edge.forms,
-      artifacts: {
-        manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
-        async blob(digest) {
-          const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-          return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-        },
-      },
-      ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
       now: new Date(),
     }),
   );

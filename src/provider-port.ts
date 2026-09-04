@@ -98,6 +98,10 @@ export interface ResourceIdentity {
   readonly name: string;
   /** Stable Host Resource UID. Required by adapters that consume one-shot inputs. */
   readonly uid?: string;
+  /** Exact provider Deployment incarnation; replacements never share lifecycle authority. */
+  readonly incarnationId?: string;
+  /** Exact Host Resource generation represented by this provider call. */
+  readonly generation?: string;
 }
 
 /**
@@ -175,6 +179,18 @@ export interface ProviderMutationInput {
   readonly operationMode?: "initial" | "recovery";
   /** Opaque provider-owned handle retained by the Host for recovery polling. */
   readonly providerHandle?: string;
+  /**
+   * Exact live Host saga lease. Route-less executors require and verify it;
+   * in-process adapters may ignore it while retaining the same closed input.
+   */
+  readonly executionAuthority?: ProviderExecutionAuthority;
+}
+
+export interface ProviderExecutionAuthority {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly leaseToken: string;
+  readonly fingerprint: string;
 }
 
 export interface ApplyInput extends ProviderMutationInput {
@@ -260,6 +276,20 @@ export interface ProviderSqliteMigration extends ProviderSqliteMigrationIdentity
   readonly sql: Uint8Array;
 }
 
+/** Exact Host database realization targeted by an administrative SQL mutation. */
+export interface ProviderSqliteMigrationTarget {
+  readonly resourceUid: string;
+  readonly incarnationId: string;
+  readonly generation: string;
+}
+
+/** Exact tenant-scoped realization proof for a route-less provider readback. */
+export interface ProviderReadAuthorityTarget extends ProviderSqliteMigrationTarget {
+  readonly tenantId: string;
+}
+
+export type ProviderSqliteMigrationReadTarget = ProviderReadAuthorityTarget;
+
 export type ProviderValue<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly failure: ProviderFailure };
@@ -311,6 +341,15 @@ export type ProviderNativeAbsence =
       readonly retryable: boolean;
     };
 
+/** Exact recorded Deployment custody for credentialed artifact readback. */
+export interface ProviderArtifactReadAuthorityTarget {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly incarnationId: string;
+  readonly state: "active" | "retained";
+  readonly updatedAt: number;
+}
+
 /** Provider-owned answer about which held artifact an exact native identity consumes. */
 export type ProviderArtifactConsumption =
   | {
@@ -333,6 +372,7 @@ export type ProviderArtifactConsumption =
 export interface ProviderArtifactConsumptionInput {
   readonly offering: ProviderOffering;
   readonly nativeId: string;
+  readonly target: ProviderArtifactReadAuthorityTarget;
   readonly identity: {
     readonly tenantRef: string;
     readonly resourceUid: string;
@@ -387,6 +427,7 @@ export interface Provider {
   verifyNativeAbsence?(input: {
     readonly offering: ProviderOffering;
     readonly descriptor: ProviderNativeReadbackDescriptor;
+    readonly target: ProviderReadAuthorityTarget;
   }): Promise<ProviderNativeAbsence>;
   /**
    * Strictly read-only artifact attribution for one recorded Deployment.
@@ -417,7 +458,11 @@ export interface Provider {
    * strictly read-only inspection seam.
    */
   convergeApply?(input: ApplyInput): Promise<ProviderTicket>;
-  poll?(input: { readonly operationId: string; readonly handle: string }): Promise<ProviderTicket>;
+  poll?(input: {
+    readonly operationId: string;
+    readonly handle: string;
+    readonly executionAuthority?: ProviderExecutionAuthority;
+  }): Promise<ProviderTicket>;
   observe(input: {
     readonly offering: ProviderOffering;
     readonly nativeId: string;
@@ -432,6 +477,7 @@ export interface Provider {
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the Host for polling. */
     readonly providerHandle?: string;
+    readonly executionAuthority?: ProviderExecutionAuthority;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -447,6 +493,7 @@ export interface Provider {
     readonly operationId: string;
     readonly operationMode?: "initial" | "recovery";
     readonly providerHandle?: string;
+    readonly executionAuthority?: ProviderExecutionAuthority;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -461,6 +508,7 @@ export interface Provider {
     readonly operationMode?: "initial" | "recovery";
     /** Opaque provider-owned handle retained by the Host for polling. */
     readonly providerHandle?: string;
+    readonly executionAuthority?: ProviderExecutionAuthority;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -472,6 +520,7 @@ export interface Provider {
     readonly operationId: string;
     readonly operationMode?: "initial" | "recovery";
     readonly providerHandle?: string;
+    readonly executionAuthority?: ProviderExecutionAuthority;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -482,9 +531,16 @@ export interface Provider {
   readonly sqliteMigrations?: {
     readLedger(input: {
       readonly nativeId: string;
+      readonly target: ProviderSqliteMigrationReadTarget;
     }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>>;
     applySuffix(input: {
+      readonly operationId: string;
+      readonly operationMode: "initial" | "recovery";
+      readonly executionAuthority?: ProviderExecutionAuthority;
       readonly nativeId: string;
+      readonly target: ProviderSqliteMigrationTarget;
+      /** Stable full desired history used for provider-owned intent CAS. */
+      readonly desired: readonly ProviderSqliteMigration[];
       readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
       readonly migrations: readonly ProviderSqliteMigration[];
     }): Promise<ProviderValue<undefined>>;

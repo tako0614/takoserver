@@ -349,7 +349,7 @@ try {
     config,
     "--json",
     "--command",
-    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_roots', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
+    "SELECT name FROM sqlite_schema WHERE type = 'table' AND name IN ('integration_e2e_credential_pair_operations', 'provision_token_consumptions', 'runtime_grant_keys', 'runtime_grant_replays', 'runtime_resources', 'sponsorship_resources', 'sponsorship_tenants', 'tf_artifact_blob_io_leases', 'tf_artifact_blob_io_results', 'tf_artifact_consumer_resolution_receipts', 'tf_artifact_consumer_uncertainties', 'tf_artifact_gc_candidates', 'tf_artifact_gc_guards', 'tf_artifact_manifest_members', 'tf_artifact_owner_closure_receipts', 'tf_artifact_roots', 'tf_cloudflare_provider_executor_operations', 'tf_deferred_operations', 'tf_operation_commit_guards', 'tf_provider_mutation_sagas', 'tf_resource_attachments', 'tf_resource_claims', 'tf_resource_deletion_attestations', 'tf_resource_deployments', 'tf_resource_provider_effects', 'wallet_credit_allocations', 'wallet_credit_lots', 'worker_endpoint_origin_reservations', 'worker_runtime_input_preparations') ORDER BY name",
   ]);
   const value: unknown = JSON.parse(raw);
   if (!Array.isArray(value) || !isRecord(value[0]) || !Array.isArray(value[0].results)) {
@@ -378,6 +378,7 @@ try {
       "tf_artifact_manifest_members",
       "tf_artifact_owner_closure_receipts",
       "tf_artifact_roots",
+      "tf_cloudflare_provider_executor_operations",
       "tf_deferred_operations",
       "tf_operation_commit_guards",
       "tf_provider_mutation_sagas",

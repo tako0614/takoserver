@@ -99,6 +99,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0042_worker_endpoint_origin_reservation_space_id.sql",
   "0043_artifact_blob_io_fences.sql",
   "0044_artifact_consumer_resolution_receipts.sql",
+  "0045_cloudflare_provider_executor_operations.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -190,8 +191,10 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:8a85fa1b6d8ba67fec9d4e37ac9975c9f575ade3c2e9d6d4c4c1ac1a977447fc",
   "0044_artifact_consumer_resolution_receipts.sql":
     "sha256:ea0ebaab3e944b23ddea3c0ab8c847560fec2931471c8dd8e81b334e5548b5e2",
+  "0045_cloudflare_provider_executor_operations.sql":
+    "sha256:7d87cb2eec7a3434ece89f1e5d2ecac470d1e717c0611ee3f47b5390f991f9f2",
 };
-export const SCHEMA_WAVE_BOUNDARIES = ["0028", "0033", "0036", "0043", "0044"] as const;
+export const SCHEMA_WAVE_BOUNDARIES = ["0028", "0033", "0036", "0043", "0044", "0045"] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
   Record<
@@ -233,6 +236,12 @@ const SCHEMA_WAVES: Readonly<
     fromMigration: "0043_artifact_blob_io_fences.sql",
     throughCount: 44,
     throughMigration: "0044_artifact_consumer_resolution_receipts.sql",
+  },
+  "0045": {
+    fromCount: 44,
+    fromMigration: "0044_artifact_consumer_resolution_receipts.sql",
+    throughCount: 45,
+    throughMigration: "0045_cloudflare_provider_executor_operations.sql",
   },
 };
 const RESOURCE_DELETION_ATTESTATION_MIGRATION = "0029_resource_deletion_attestations.sql";
@@ -1119,7 +1128,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0044",
+      "selected D1 wave requires the exact audited source inventory 0001-0045",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1164,7 +1173,7 @@ function assertAuditedMigrationHashes(
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
-        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0044 file",
+        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0045 file",
         `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
       );
     }

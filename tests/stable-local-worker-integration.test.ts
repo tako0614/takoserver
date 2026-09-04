@@ -270,6 +270,18 @@ function applyInput(
     spec: value.spec,
     relations,
     ...extras,
+    executionAuthority:
+      extras.executionAuthority ??
+      testExecutionAuthority("org_stable_local", value.metadata.uid, `op-${value.metadata.name}`),
+  };
+}
+
+function testExecutionAuthority(tenantId: string, resourceUid: string, operationId: string) {
+  return {
+    tenantId,
+    resourceUid,
+    leaseToken: `pmlease_${operationId}`,
+    fingerprint: `test:${operationId}`,
   };
 }
 

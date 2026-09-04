@@ -182,6 +182,17 @@ export function expectedExactBindingClosure(
     AI: { type: "ai", fields: {} },
     WORKER_VERSION: { type: "version_metadata", fields: {} },
     ...expectedBindingClosureForTarget(target),
+    ...(target.cloudflareProviderExecutor === undefined
+      ? {}
+      : {
+          CLOUDFLARE_PROVIDER_EXECUTOR: {
+            type: "service",
+            fields: {
+              service: target.cloudflareProviderExecutor.workerName,
+              entrypoint: "CloudflareProviderExecutor",
+            },
+          },
+        }),
     ...Object.fromEntries(
       Object.entries(entries).map(([name, value]) => [
         name,

@@ -60,7 +60,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite)\.ts$/u,
+      /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -89,7 +89,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -158,10 +158,9 @@ const HOST_ONLY = [
   // Writing files and starting processes: a Worker can do neither.
   "src/workerd-runtime.ts",
   "src/workerd-supervisor.ts",
-  // The Worker has D1 and R2 bindings. A credential-bearing HTTP transport is
-  // not a capability it needs, and a capability nothing needs is one worth
-  // refusing — see docs/adr/0001-provision-from-the-worker.md, which permits
-  // the Cloudflare provider here and keeps these two out.
+  // The public Worker has D1 and R2 bindings. Credential-bearing HTTP
+  // transports and the real Cloudflare provider belong only to the route-less
+  // executor; see docs/adr/0001-provision-from-the-worker.md.
   "src/sql-d1-http.ts",
   "src/objects-r2-http.ts",
 ];
@@ -171,6 +170,62 @@ if (existsSync(WORKER_ENTRY)) {
   for (const banned of HOST_ONLY) {
     if (reachable.has(banned)) {
       violations.push(`${WORKER_ENTRY} transitively imports host-only module ${banned}`);
+    }
+  }
+  for (const banned of [
+    "src/providers/cloudflare.ts",
+    "src/providers/cloudflare-wfp-backend.ts",
+    "src/providers/cloudflare-worker-backend.ts",
+    "src/providers/cloudflare-edge-meter.ts",
+    "src/providers/cloudflare-r2-meter.ts",
+    "src/providers/wasabi.ts",
+    "src/providers/wasabi-meter.ts",
+  ]) {
+    if (reachable.has(banned)) {
+      violations.push(
+        `${WORKER_ENTRY} transitively imports private parent-provider module ${banned}`,
+      );
+    }
+  }
+  for (const path of reachable) {
+    const source = readFileSync(path, "utf8");
+    for (const forbidden of [
+      "CLOUDFLARE_API_TOKEN",
+      "CLOUDFLARE_ACCOUNT_ID",
+      "TAKOSERVER_WASABI_ACCESS_KEY_ID",
+      "TAKOSERVER_WASABI_SECRET_ACCESS_KEY",
+    ]) {
+      if (source.includes(forbidden)) {
+        violations.push(`${WORKER_ENTRY} reaches ${path}, which names private ${forbidden}`);
+      }
+    }
+  }
+}
+
+const CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY = "src/entry-cloudflare-provider-executor.ts";
+if (existsSync(CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY)) {
+  const reachable = reachableFrom([CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY]);
+  for (const required of [
+    "src/providers/cloudflare.ts",
+    "src/providers/cloudflare-wfp-backend.ts",
+    "src/providers/cloudflare-edge-meter.ts",
+    "src/providers/cloudflare-r2-meter.ts",
+  ]) {
+    if (!reachable.has(required)) {
+      violations.push(`${CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY} does not reach required ${required}`);
+    }
+  }
+  for (const banned of [
+    "src/app.ts",
+    "src/router.ts",
+    "src/openapi.ts",
+    "src/providers/wasabi.ts",
+    "src/providers/wasabi-meter.ts",
+  ]) {
+    if (reachable.has(banned)) {
+      violations.push(
+        `${CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY} transitively imports forbidden ${banned}`,
+      );
     }
   }
 }

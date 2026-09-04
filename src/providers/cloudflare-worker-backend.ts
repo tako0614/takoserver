@@ -14,6 +14,10 @@ import type {
   ResourceIdentity,
 } from "../provider-port.ts";
 import type {
+  ManagedObjectReceiptAuthority,
+  ManagedObjectReceiptResult,
+} from "./cloudflare-managed-object-receipt.ts";
+import type {
   ManagedWorkerSqliteAdminOperation,
   ManagedWorkerSqliteAdminResult,
   ManagedWorkerSqliteAuthority,
@@ -57,6 +61,8 @@ export interface CloudflareWorkersForPlatformsBackendOptions {
   readonly kind: "workers-for-platforms";
   readonly dispatchNamespace: string;
   readonly gatewayWorkerName: string;
+  /** Exact ProviderInstallation whose Resources this backend may bind. */
+  readonly providerInstallationId: string;
   /** Exact operator-owned suffix, without a leading dot. */
   readonly managedBaseDomain: string;
   /** Provider-private D1 authority shared with the gateway as STATE_DB. */
@@ -92,6 +98,60 @@ export interface CloudflareWorkersForPlatformsBackendOptions {
   }) => Promise<string>;
   /** Provider-only capability for the gateway's external SQLite DO class. */
   readonly sqliteNamespace: CloudflareManagedSqliteNamespace;
+  /**
+   * Route-less authority script that owns the receipt Durable Object and all
+   * R2 S3/proof credentials. This name is embedded only in provider-authored
+   * tenant Version metadata; it is never accepted from a tenant declaration.
+   */
+  readonly objectReceiptWorkerName?: string;
+  /**
+   * Narrow cross-script RPC capability. The caller never receives the proof
+   * secret or an administrative Durable Object namespace.
+   */
+  readonly objectReceiptAuthority?: CloudflareManagedObjectReceiptAuthority;
+}
+
+export interface CloudflareManagedObjectReceiptRuntimeBinding {
+  readonly instanceName: string;
+  readonly proof: string;
+}
+
+export interface CloudflareManagedObjectReceiptDestroyPreparation {
+  readonly state: "draining" | "prepared";
+  /** Opaque prepare proof retained only inside the provider recovery handle. */
+  readonly authorityProof: string;
+}
+
+/** RPC surface exported only by the route-less receipt-authority Worker. */
+export interface CloudflareManagedObjectReceiptAuthority {
+  takoserverObjectReceiptRuntimeBinding(input: {
+    readonly authority: ManagedObjectReceiptAuthority;
+    readonly bucketName: string;
+  }): Promise<ManagedObjectReceiptResult<CloudflareManagedObjectReceiptRuntimeBinding>>;
+  takoserverObjectReceiptInspect(input: {
+    readonly authority: ManagedObjectReceiptAuthority;
+    readonly bucketName: string;
+  }): Promise<
+    ManagedObjectReceiptResult<{
+      readonly schemaVersion: 2;
+      readonly lifecycle: "active" | "destroying";
+      readonly authority: ManagedObjectReceiptAuthority | null;
+      readonly bucketName: string | null;
+      readonly receiptCount: number;
+      readonly operatorReconciliationRequired: number;
+      readonly nextActionAt: number | null;
+    }>
+  >;
+  takoserverObjectReceiptPrepareDestroy(input: {
+    readonly authority: ManagedObjectReceiptAuthority;
+    readonly bucketName: string;
+    readonly authorityProof?: string;
+  }): Promise<ManagedObjectReceiptResult<CloudflareManagedObjectReceiptDestroyPreparation>>;
+  takoserverObjectReceiptCommitDestroy(input: {
+    readonly authority: ManagedObjectReceiptAuthority;
+    readonly bucketName: string;
+    readonly authorityProof: string;
+  }): Promise<ManagedObjectReceiptResult<{ readonly destroyed: true }>>;
 }
 
 /** Every admin call carries the authority tuple and the proof that seals it. */
@@ -123,6 +183,59 @@ export interface CloudflareManagedSqliteStub {
 
 export interface CloudflareManagedSqliteNamespace {
   getByName(instanceName: string): CloudflareManagedSqliteStub;
+}
+
+/** Narrow service-binding RPC exported by the public dispatcher for SQLite authority. */
+export interface CloudflareManagedWorkerGatewayAuthority {
+  deriveSqliteInstanceName(input: {
+    readonly providerId: string;
+    readonly resourceUid: string;
+    readonly generation: string;
+  }): Promise<string>;
+  sealSqliteAdminProof(input: {
+    readonly operation: ManagedWorkerSqliteAdminOperation;
+    readonly authority: ManagedWorkerSqliteAuthority;
+  }): Promise<string>;
+}
+
+export interface CloudflareManagedObjectReceiptAdminRequest {
+  readonly authority: ManagedObjectReceiptAuthority;
+  readonly bucketName: string;
+  readonly proof: string;
+}
+
+/** Provider/operator-only status for one exact ObjectBucket incarnation. */
+export interface CloudflareManagedObjectBucketReceiptStatus {
+  readonly lifecycle: "active" | "destroying";
+  readonly receiptCount: number;
+  readonly operatorReconciliationRequired: number;
+  /** True for a permanent ambiguous receipt or any uncommitted destruction fence. */
+  readonly repairRequired: boolean;
+  readonly nextActionAt: number | null;
+}
+
+export interface CloudflareManagedObjectReceiptStub {
+  takoserverObjectReceiptInspect(input: CloudflareManagedObjectReceiptAdminRequest): Promise<
+    ManagedObjectReceiptResult<{
+      readonly schemaVersion: 2;
+      readonly lifecycle: "active" | "destroying";
+      readonly authority: ManagedObjectReceiptAuthority | null;
+      readonly bucketName: string | null;
+      readonly receiptCount: number;
+      readonly operatorReconciliationRequired: number;
+      readonly nextActionAt: number | null;
+    }>
+  >;
+  takoserverObjectReceiptPrepareDestroy(
+    input: CloudflareManagedObjectReceiptAdminRequest,
+  ): Promise<ManagedObjectReceiptResult<{ readonly state: "draining" | "prepared" }>>;
+  takoserverObjectReceiptCommitDestroy(
+    input: CloudflareManagedObjectReceiptAdminRequest,
+  ): Promise<ManagedObjectReceiptResult<{ readonly destroyed: true }>>;
+}
+
+export interface CloudflareManagedObjectReceiptNamespace {
+  getByName(instanceName: string): CloudflareManagedObjectReceiptStub;
 }
 
 export interface CloudflareManagedScheduleReconciliationStatus {
@@ -229,4 +342,24 @@ export interface CloudflareWorkerBackend {
   reconcileManagedSchedules?(
     proof: CloudflareManagedScheduleOperatorProof,
   ): Promise<ProviderValue<CloudflareManagedScheduleReconciliationStatus>>;
+  managedObjectBucketReceiptStatus?(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+  }): Promise<ProviderValue<CloudflareManagedObjectBucketReceiptStatus>>;
+  prepareManagedObjectBucketDestroy?(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+    /** Opaque-handle binding on recovery; omitted only on the initial call. */
+    readonly authorityProof?: string;
+  }): Promise<
+    ProviderValue<{
+      readonly state: "draining" | "prepared";
+      readonly authorityProof: string;
+    }>
+  >;
+  commitManagedObjectBucketDestroy?(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+    readonly authorityProof: string;
+  }): Promise<ProviderValue<{ readonly destroyed: true }>>;
 }

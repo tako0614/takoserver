@@ -5,11 +5,17 @@ import { join } from "node:path";
 import {
   effectiveSigningKeyId,
   expectedWorkerSecrets,
+  writeCloudflareProviderExecutorConfig,
   writeWorkerConfig,
 } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
+import {
+  cloudflareProviderExecutorTarget,
+  edgeSuppliesFixture,
+  objectBucketSuppliesFixture,
+} from "./helpers/hosted-supply-fixtures.ts";
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -56,6 +62,85 @@ describe("realized Worker configuration", () => {
       expect(config.secrets).toEqual({
         required: ["TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN", "TAKOSERVER_SIGNING_KEY"],
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps parent credentials only in the route-less provider executor", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-provider-executor-config-"));
+    const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
+    const supplied = {
+      ...target,
+      edgeSupplies: edgeSuppliesFixture(),
+      objectBucketSupplies: objectBucketSuppliesFixture(),
+      cloudflareProviderExecutor,
+    } satisfies DeployTarget;
+    try {
+      const publicPath = writeWorkerConfig(supplied, {
+        path: join(root, "public.json"),
+        main: join(root, "public.js"),
+        commit: "a".repeat(40),
+      });
+      const executorPath = writeCloudflareProviderExecutorConfig(supplied, {
+        path: join(root, "executor.json"),
+        main: join(root, "executor.js"),
+      });
+      const publicConfig = JSON.parse(readFileSync(publicPath, "utf8")) as {
+        services: unknown;
+        vars: Record<string, string>;
+        secrets: { required: string[] };
+      };
+      const executorConfig = JSON.parse(readFileSync(executorPath, "utf8")) as {
+        workers_dev: boolean;
+        preview_urls: boolean;
+        services: unknown;
+        vars: Record<string, string>;
+        secrets: { required: string[] };
+        [key: string]: unknown;
+      };
+
+      expect(publicConfig.services).toEqual([
+        {
+          binding: "CLOUDFLARE_PROVIDER_EXECUTOR",
+          service: cloudflareProviderExecutor.workerName,
+          entrypoint: "CloudflareProviderExecutor",
+        },
+      ]);
+      expect(publicConfig.vars.TAKOSERVER_MANAGED_BASE_DOMAIN).toBe(
+        cloudflareProviderExecutor.managedBaseDomain,
+      );
+      expect(publicConfig.vars).not.toHaveProperty("CLOUDFLARE_ACCOUNT_ID");
+      expect(publicConfig.vars).not.toHaveProperty("TAKOSERVER_ZONES");
+      expect(publicConfig.secrets.required).not.toContain("CLOUDFLARE_API_TOKEN");
+      expect(JSON.stringify(publicConfig)).not.toContain("TAKOSERVER_WASABI_");
+
+      expect(executorConfig.workers_dev).toBe(false);
+      expect(executorConfig.preview_urls).toBe(false);
+      expect(executorConfig).not.toHaveProperty("routes");
+      expect(executorConfig).not.toHaveProperty("route");
+      expect(executorConfig.services).toEqual([
+        {
+          binding: "MANAGED_WORKER_AUTHORITY",
+          service: cloudflareProviderExecutor.gatewayWorkerName,
+          entrypoint: "TakoserverManagedWorkerAuthority",
+        },
+        {
+          binding: "MANAGED_OBJECT_RECEIPT_AUTHORITY",
+          service: cloudflareProviderExecutor.receiptAuthorityWorkerName,
+          entrypoint: "TakoserverManagedObjectReceiptAuthority",
+        },
+      ]);
+      expect(executorConfig.vars).toMatchObject({
+        CLOUDFLARE_ACCOUNT_ID: supplied.accountId,
+        TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID:
+          cloudflareProviderExecutor.providerInstallationId,
+        TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE: cloudflareProviderExecutor.dispatchNamespace,
+      });
+      expect(executorConfig.secrets.required).toEqual([
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
+      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -293,7 +378,7 @@ describe("realized Worker configuration", () => {
       objectBucketSupplies: {
         supplies: [{ provider: { kind: "cloudflare" } }],
       } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-      workerEndpointSuffix: "integration.example.workers.dev",
+      cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
       formAuthority: {
         workerName: "takoserver-form-authority-integration",
         identityProbeWorkerName: "takoserver-form-identity-integration",

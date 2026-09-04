@@ -30,7 +30,9 @@ import {
  * envelope or a provider-native client, and running on the operator's own
  * machine does not make that a different contract for the Bindings a wrapper
  * host projects. It is not a claim about every backend: an ordinary-workers
- * Worker carries native Cloudflare bindings, which is the divergence
+ * Worker carries a native Cloudflare R2 binding, while the managed
+ * Workers-for-Platforms Worker receives the provider wrapper and its private
+ * receipt Durable Object. That backend divergence is what
  * [ADR 0007](../../docs/adr/0007-objectbucket-joins-the-implementation-catalog.md)
  * records for `bucketBindings`.
  *
@@ -79,9 +81,12 @@ export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
  *
  * Byte for byte the surface the managed Cloudflare wrapper projects over a
  * native `r2_bucket`: same nine methods, same option names, same error names,
- * same ceilings. What differs is only what is behind it — this Host's own
- * object plane rather than R2 — which is precisely what ADR 0005 says a
- * Binding facade is allowed to differ in.
+ * same ceilings. What differs is what is behind it — this Host's own durable
+ * object plane rather than R2, with upload rows and bodies it can reconcile
+ * locally. The managed wrapper's receipt Durable Object protects its native
+ * R2 multipart lifecycle, but provider-side discovery remains a separate
+ * concern; this is precisely the backend difference ADR 0005 allows a
+ * Binding facade to hide.
  */
 export const SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND = "edge.objects@1.0.0" as const;
 
@@ -1174,11 +1179,13 @@ function validateQueueSendOptions(options) {
  * 5 MiB floor on every part but the last. What is different is only what is
  * behind it: a plane on this machine rather than a native R2 binding.
  *
- * The in-isolate part ledger is here for the same reason the managed one has
- * it, and it is deliberately NOT the authority: this Host's plane records every
- * part durably and validates a complete against those rows, so an eviction
- * between createMultipartUpload and completeMultipartUpload costs nothing. That
- * is the difference ADR 0007 names between the two runtimes.
+ * The in-isolate part ledger is here for the same reason the managed adapter
+ * has a receipt ledger, and it is deliberately NOT the authority: this Host's
+ * plane records every part durably and validates a complete against those
+ * rows, so an eviction between createMultipartUpload and
+ * completeMultipartUpload costs nothing. The managed adapter instead keeps
+ * its receipt ledger in a private Durable Object while R2 owns the native
+ * upload, which is the recovery difference ADR 0007 names between runtimes.
  */
 function createObjectsAdapter(call, binding) {
   const multipart = new SafeMap();

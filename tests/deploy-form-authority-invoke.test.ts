@@ -27,6 +27,7 @@ import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
 } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "d".repeat(40);
@@ -738,7 +739,7 @@ async function integrationTarget(): Promise<DeployTarget> {
     objectBucketSupplies: {
       supplies: [{ provider: { kind: "cloudflare" } }],
     } as unknown as NonNullable<DeployTarget["objectBucketSupplies"]>,
-    workerEndpointSuffix: "integration.example.workers.dev",
+    cloudflareProviderExecutor: cloudflareProviderExecutorTarget("cloudflare.primary"),
     formAuthority: {
       workerName: "takoserver-form-authority-integration",
       identityProbeWorkerName: "takoserver-form-identity-integration",

@@ -18,11 +18,11 @@ The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044>
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044|0045>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0028|0033|0036|0043|0044|0045>
 ```
 
-The fixed order is 0023–0028, 0029–0033, 0034–0036, 0037–0043, then 0044. A
+The fixed order is 0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, then 0045. A
 selector is accepted only when its predecessor is the current lineage; an
 incomplete wave can resume under the same selector, but cannot skip forward.
 Integration retains only the no-selector fast path for disposable cadence and
@@ -99,8 +99,24 @@ it:
 No other surface needs it: `takoserver-worker` shares the public Worker's
 closure and its declaration is `takoserver-worker-authority-cutover`;
 `takoserver-console` and `takoserver-site` fence no binding closure at all; and
-`takoserver-managed-worker-gateway` already reports an inexact predecessor as
-drift and publishes past it rather than refusing.
+the managed-worker gateway and managed-object receipt authority each own a
+closed lifecycle boundary rather than entering this generic mechanism.
+
+The internet-routed `takoserver-managed-worker-gateway` keeps its original
+`TakoserverManagedWorkerSqlite` `v1` lineage and carries no receipt Durable
+Object namespace or managed R2 S3/proof secret. The distinct
+`takoserver-managed-object-receipt-authority` Worker is route-less and starts
+its own `TakoserverManagedObjectReceipt` lineage at `v1`. Because that fresh
+lineage creates durable state, rehearsal writes one external no-overwrite
+`0600` receipt named by
+`TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH`; production
+consumes the same commit, module digest, null predecessor, class, lineage, and
+empty target shape and re-reads both receipt and provider history immediately
+before its one atomic code/lifecycle/secret deployment. Exact last-mutation
+readback follows. An acknowledgement or local lease-release ambiguity is
+forward-repair-only. Deploy and qualify this route-less authority before the
+provider executor that binds it; the gateway has no receipt-authority binding
+and can be qualified independently.
 
 Each accepts `--closure-predecessor-version=<uuid>` together with an explicit
 declaration built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
@@ -389,6 +405,101 @@ matching absolute `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` path). There is no
 target flag, mixed preflight/apply controller, deploy-plan flag, evidence
 ledger, journal, capability token, or implied deploy authority.
 
+### Realizing the integration target from a clean checkout
+
+A clean exact checkout intentionally contains no live target. Realize the
+current integration descriptor as a new operator-private file at
+`/root/dev/takos/.operator-private/takoserver/integration/target.v2.json`, mode
+`0600`, then select it with:
+
+```bash
+export TAKOSERVER_DEPLOY_TARGET_INTEGRATION=/root/dev/takos/.operator-private/takoserver/integration/target.v2.json
+```
+
+Do not copy `.deploy/target.staging.json`: that is the retired target shape and
+may carry `workerEndpointSuffix`, a direct parent-credential composition, or
+other pre-executor topology. Author the new file from the current
+`takoserver.deploy-target@v2` base values (account, public Worker, D1, R2,
+origin, signing identity, and any other currently reviewed options), join a
+fresh exact `takoserver.hosted-edge-supplies@v2` and/or
+`takoserver.hosted-object-bucket-supplies@v2` object from the private commercial
+owner, and add this topology in the same review:
+
+```json
+{
+  "cloudflareProviderExecutor": {
+    "workerName": "takoserver-cloudflare-provider-executor-integration",
+    "dispatchNamespace": "takoserver-customers-integration",
+    "gatewayWorkerName": "takoserver-managed-worker-gateway-integration",
+    "managedBaseDomain": "<current managed base domain>",
+    "providerInstallationId": "<current Cloudflare ProviderInstallation id>",
+    "receiptAuthorityWorkerName": "takoserver-managed-object-receipt-authority-integration",
+    "releaseReadbackQualification": {
+      "schema": "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+      "dispatchNamespace": "takoserver-customers-integration",
+      "rehearsalDigest": "sha256:<64 lowercase hex characters>"
+    }
+  }
+}
+```
+
+The snippet is the topology member, not a complete target. Replace every
+bracketed value with reviewed current evidence before placing it in the full
+JSON object. The parser requires every Cloudflare supply's
+`providerInstallation.id` to equal `providerInstallationId`, requires the
+qualification to name the same dispatch namespace, and requires the public,
+receipt-authority, gateway, and executor Worker names to be distinct. The
+receipt authority reads both its Worker name and `MANAGED_PROVIDER_ID` only
+from this tuple; no duplicate environment variable may redirect it. Keep the
+executor two-secret file and the receipt three-secret file separate from this
+non-secret target.
+
+While the integration Form-authority migration still has to recognize the
+immutable public Worker generation from before the executor, the operator must
+also copy that generation's exact endpoint suffix into this closed,
+readback-only snapshot inside `formAuthority`:
+
+```json
+{
+  "formAuthority": {
+    "historicalPreExecutorPublicWorker": {
+      "workerEndpointSuffix": "<exact suffix read from the pinned historical Version>"
+    }
+  }
+}
+```
+
+This member is integration-only, is accepted only with the complete historical
+Form-authority bridge, sponsorship, JIT authority, edge supplies, and executor
+topology, and is never emitted by `deploymentVariables` or `writeWorkerConfig`.
+It must not be inferred from `cloudflareProviderExecutor.managedBaseDomain`:
+the two values may differ. A missing or mismatched snapshot refuses the legacy
+Version rather than widening the readback profile. Delete the member after the
+joint route-less authority and gateway status described in
+[`docs/form-authority.md`](form-authority.md) proves the bridge complete.
+
+A private composer pinned to an older public contract that still requires or
+emits `workerEndpointSuffix` is not a realization source. Advance that pin and
+review its current v2 output, or author the current v2 object directly; never
+rename an older artifact and treat the filename as schema conversion.
+
+From the clean checkout, first run the read-only owner paths with that selector:
+
+```bash
+export TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH=/root/dev/takos/.operator-private/takoserver/integration/cloudflare-provider-executor.secrets.json
+bun run deploy -- takoserver-d1-schema --status --environment=integration --commit=<40-hex-commit>
+bun run deploy -- takoserver-managed-object-receipt-authority --status --environment=integration --commit=<40-hex-commit>
+bun run deploy -- cloudflare-provider-executor --status --environment=integration --commit=<40-hex-commit>
+```
+
+Each command must parse the same file. A missing, legacy, partial, or mismatched
+descriptor fails before Cloudflare or D1 is touched. Status readiness does not
+authorize apply; after migration 0045 is present, the reviewed release order is
+receipt authority, gateway, executor, then public API. The schema and receipt
+status calls also require the integration deploy credential described below;
+the executor status reads its parent token only from the separate canonical
+two-secret file named above.
+
 ## Environment inputs and action matrix
 
 `requiresEnv` in `takos.deploy-contract@v2` is the conservative union of the
@@ -397,8 +508,9 @@ not mean that every listed variable is read by every action. Each surface's
 obligation answer names the exact action condition; `--contract` itself reads
 no operator input.
 
-For every Cloudflare-owned row below, an explicit `CLOUDFLARE_API_TOKEN` always
-wins. In `integration`, an absent token may be resolved only from the exact
+For every Cloudflare-owned row below whose required condition says “resolved
+Cloudflare credential”, an explicit `CLOUDFLARE_API_TOKEN` always wins. In
+`integration`, an absent token may be resolved only from the exact
 `wrangler auth token --json` object `{ "type": "oauth", "token": "..." }`.
 That bearer is held in-process for direct REST readback only; it is never
 logged or serialized, and Wrangler children receive no token environment and
@@ -406,13 +518,18 @@ use their stored OAuth profile. The OAuth extractor explicitly sets
 `WRANGLER_WRITE_LOGS=false`, so Wrangler's mode-0644 debug log cannot persist
 the bearer; its credential child-environment overlay contains no competing API
 key, email, token variant, or unrelated secret. `rehearsal` and `production`
-still require the explicit API token. The conservative `requiresEnv` union
+still require the explicit API token. The route-less provider executor is the
+deliberate exception: it accepts only its canonical external two-secret file,
+never ambient token/OAuth resolution. The conservative `requiresEnv` union
 remains unchanged.
 
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
-| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. |
+| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. A target with Cloudflare supplies additionally requires the exact selected-commit provider executor qualification. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
+| `takoserver-managed-object-receipt-authority` | `--status`, `--apply` | integration, rehearsal, production | The Worker name and provider installation come solely from `target.cloudflareProviderExecutor`; a resolved Cloudflare deploy credential is required for both actions. `--apply` additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH`; only a fresh rehearsal/production `v1` apply reads `TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH`. Status never reads any of those three apply-only inputs. |
+| `takoserver-managed-worker-gateway` | `--status`, `--apply` | integration, rehearsal, production | Exact route, gateway and legacy script, zone, provider, dispatch namespace, and gateway identities plus a resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It reads no managed-object S3/proof secret or receipt-authority evidence. |
+| `cloudflare-provider-executor` | `--status`, `--apply`; `--apply --reverse` | integration, rehearsal, production | `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for every action and contains exactly the parent `CLOUDFLARE_API_TOKEN` and runtime-input seal keyring. Status uses the token only for authoritative readback; forward apply publishes both secret bindings atomically. Apply/reverse additionally require `TAKOSERVER_INDEPENDENT_REVIEW`. Receipt authority, gateway, migration 0045, and the selected target must already be exact. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -424,7 +541,7 @@ remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0043|0044`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0028|0033|0036|0043|0044|0045`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only; every rehearsal wave after the first also requires the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -510,6 +627,56 @@ no import graph to walk.
 
 The separate authority and irreversible surfaces are:
 
+- `takoserver-managed-object-receipt-authority`: the sole owner of the
+  route-less receipt Durable Object Worker. Status exhaustively reads current
+  deployment history, one exact module, the closed binding set, `v1` migration,
+  workers.dev/preview settings, all account routes, and the complete account
+  custom-domain inventory without reading a secret source or rehearsal receipt.
+  No route or custom-domain service mapping may name the authority Worker. Apply
+  builds one sealed artifact, copies the
+  exact three-secret operator input into it, and invokes one supported Wrangler
+  `deploy --secrets-file` operation. Code, the local Durable Object namespace,
+  its `v1` migration, identity vars, and all three secret bindings therefore
+  become one Worker publication; there is no post-deploy secret mutation. The
+  copied file is removed in `finally` after success or failure, including when
+  the caller retains the remaining release directory. A fresh `v1` lifecycle is
+  irreversible: rehearsal emits no-overwrite external evidence only after exact
+  readback, production consumes and re-reads it at the final mutation fence, and
+  integration evidence can never authorize production. Existing exact
+  route-less `v1` predecessors use the same atomic publication without changing
+  lifecycle lineage. Any route, extra binding, different lineage, changed
+  predecessor, or lost acknowledgement fails closed for status/forward repair.
+- `takoserver-managed-worker-gateway`: the internet-routed dispatch and SQLite
+  gateway. It retains its original `TakoserverManagedWorkerSqlite` `v1`
+  lifecycle and contains no receipt namespace, S3 credential, or receipt proof
+  secret. Its existing staged-Version, exact deployment/readback, route-last,
+  and provider-history rollback protocol is unchanged. It has no dependency on
+  the receipt authority; the later route-less provider executor must qualify
+  both Workers before it can publish tenant Versions.
+- `cloudflare-provider-executor`: the sole Cloudflare parent-provider runtime.
+  Its target-owned Worker name, provider installation, dispatch namespace,
+  gateway, managed base domain, receipt authority, D1, R2, account, supplies,
+  and release-readback qualification form one closed topology. Status validates
+  migration 0045, the exact selected-commit receipt authority and gateway, one
+  immutable executor module, the exhaustive D1/R2/dispatch/cross-script Durable
+  Object/service/plain-text/secret binding set, compatibility settings,
+  workers.dev/preview disablement, and exhaustive absence from routes and custom
+  domains. It reads the parent token only from
+  `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`; the public Worker
+  receives neither that file nor either value. Forward apply builds with an
+  empty secret environment, seals one module/config/canonical two-secret copy,
+  re-fences topology, schema, dependencies, provider history, and bytes, then
+  performs one Wrangler `deploy --secrets-file`. Reverse selects only the
+  immediate provider-history predecessor, proves its immutable module and
+  binding closure, re-fences the complete current route-less state before
+  moving traffic, and verifies the restored deployment at 100 percent. The
+  additive D1 migration remains. A lost acknowledgement is never replayed.
+- `takoserver-worker` qualifies that exact executor Version before a public
+  publication whenever the target contains a Cloudflare supply. It repeats the
+  qualification at the mutation fence and after publication. The required
+  release order is receipt authority, managed gateway, provider executor, then
+  public API. A missing or changed executor stops publication; the public Worker
+  cannot fall back to a credential-bearing ordinary Cloudflare provider.
 - `takoserver-worker-authority-cutover`: reviewed publication of
   authority-sensitive Worker code and exact owned configuration. Integration
   may add only the complete JIT credential-authority profile: environment,
@@ -522,7 +689,11 @@ The separate authority and irreversible surfaces are:
   secret into the candidate predecessor state.
   Its named closure-transition profile is the only way to bring a live Version
   forward after the operator-private target descriptor legitimately changes
-  shape. Apply performs exactly one upload of the complete current closure: the
+  shape. A Cloudflare target uses the same selected-commit provider-executor
+  qualification as the routine surface: status includes it in readiness, apply
+  refuses an unready executor before public Worker readback or build, and apply
+  re-fences the exact executor deployment both immediately before upload and
+  after public readback. Apply performs exactly one upload of the complete current closure: the
   target plain-text vars exactly as the routine surface produces them, every
   required secret, and the same authoritative readback, annotation, closure and
   public product probe the cutover already performs. Added and rotated secret
@@ -536,45 +707,17 @@ The separate authority and irreversible surfaces are:
   successor whose non-canonical annotation inventory the ordinary inspectors
   then refuse.
 
-  For the current integration Worker — retire
-  `TAKOSERVER_STANDARD_SERVICE_SUPPLIES`, add
-  `TAKOSERVER_OBJECT_BUCKET_SUPPLIES`, publish the corrected
-  `TAKOSERVER_EDGE_SUPPLIES` value, add the
-  `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` secret and replace the revoked
-  `CLOUDFLARE_API_TOKEN` provisioner credential — the exact commands are:
-
-  ```sh
-  bun run deploy -- takoserver-worker-authority-cutover --status \
-    --environment=integration --commit=<40-hex-sha> \
-    --closure-predecessor-version=2bb7b9d3-7ac7-4df3-ad50-15bcaa67a5b6 \
-    --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
-    --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
-    --refresh-var=TAKOSERVER_EDGE_SUPPLIES \
-    --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
-    --rotate-secret=CLOUDFLARE_API_TOKEN
-
-  bun run deploy -- takoserver-worker-authority-cutover --apply \
-    --environment=integration --commit=<40-hex-sha> \
-    --closure-predecessor-version=2bb7b9d3-7ac7-4df3-ad50-15bcaa67a5b6 \
-    --retire-var=TAKOSERVER_STANDARD_SERVICE_SUPPLIES \
-    --add-var=TAKOSERVER_OBJECT_BUCKET_SUPPLIES \
-    --refresh-var=TAKOSERVER_EDGE_SUPPLIES \
-    --add-secret=TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING \
-    --rotate-secret=CLOUDFLARE_API_TOKEN
-  ```
-
-  That predecessor is the Version a `wrangler rollback` restored after the
-  ambiguous-`SupplyContract` incident, so the run exercises all three rules at
-  once: the corrected `TAKOSERVER_EDGE_SUPPLIES` value travels as a refresh, the
-  seal keyring and the rotated provisioner token are already in the script-level
-  store and are admitted from there, and the corrected descriptor is composed
-  before anything is uploaded. Replace `<40-hex-sha>` with the exact reviewed
-  commit; the predecessor UUID must still be the authoritative current Version.
-
-  `--status` reports the delta it would apply and mutates nothing. `--apply`
-  additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and reads
-  `$TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY/TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`
-  and `$TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY/CLOUDFLARE_API_TOKEN`.
+  The former integration transition that placed `CLOUDFLARE_API_TOKEN` on the
+  public Worker is retired. A public Version or script-level secret inventory
+  that still contains that name is drift and cannot become ready. The parent
+  token is supplied only to `cloudflare-provider-executor` through its closed
+  secrets file. The public Worker may retain
+  `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` for request-side runtime-input
+  preparation, but executor-side leasing uses the executor's independently
+  published copy. A live public secret retirement is an explicit authority
+  mutation and must not be smuggled through a routine Worker deploy; no command
+  in this document treats a successful executor deployment as authority to
+  delete it.
 - `takoserver-form-authority-identity-probe`: one reviewed minimal read-only
   Worker upload in every Form-authority environment. Its permanent target-owned
   workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
@@ -727,7 +870,11 @@ The separate authority and irreversible surfaces are:
   exact commit, predecessor, through boundary, selected bytes, and before/after
   shape. Every later receipt embeds its predecessor and binds those exact bytes
   by SHA-256, producing one chain rooted at the 0023–0028 rehearsal. Production
-  consumes the matching wave receipt read-only. Immediately before 0037, one D1
+  consumes the matching wave receipt read-only. The fixed 0044 wave adds durable
+  artifact-consumer resolution receipts. Its distinct 0045 successor adds the
+  private Cloudflare executor's pre-effect operation CAS and can start only from
+  the exact 0044 boundary. Immediately
+  before 0037, one D1
   transaction installs an exact `BEFORE INSERT` guard on the v1 predecessor and
   asserts its row count is still zero. Because the published 0037 replacement
   drops that guarded table, no row inserted after the ordinary preflight can be
@@ -1052,7 +1199,8 @@ A target that declares `formAuthority` must declare distinct
 `identityProbeOrigin`. They select the owned read-only RPC bridge topology, not
 payload or implementation digests; `P` and `I` remain build-derived.
 
-- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_API_TOKEN` (direct deploy/readback surfaces only; the executor
+  reads its parent token from the closed secrets file below)
 - `TAKOSERVER_INDEPENDENT_REVIEW`
 - `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH`
 - `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`
@@ -1064,6 +1212,10 @@ payload or implementation digests; `P` and `I` remain build-derived.
 - `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH`
 - `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` (operator identity owner proof)
 - `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`
+- `TAKOSERVER_MANAGED_WORKER_PROVIDER_ID` (gateway/SQLite provider-pack identity)
+- `TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH`
+- `TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH` (fresh route-less authority `v1` in rehearsal or production only)
+- `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`
 - `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH`
 - `--form-authority-scope-transition=/absolute/operator-private/transition.json`
 - `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`
@@ -1101,6 +1253,73 @@ Secret inputs must be owned, link-free regular files with mode `0600`. They are
 sent only through stdin or an ephemeral sealed Wrangler secrets file, never as
 command arguments or output. A successful task, branch, check, or review does
 not authorize a deploy.
+
+The receipt authority writes
+`target.cloudflareProviderExecutor.providerInstallationId` into its
+`MANAGED_PROVIDER_ID` fence. Its Worker name comes from that same target object.
+There is no duplicate script-name or provider-installation environment input
+that can redirect it. The installation id is deliberately not the gateway's
+`TAKOSERVER_MANAGED_WORKER_PROVIDER_ID`, which remains the `cloudflare`
+provider-pack identity used by the SQLite/gateway state.
+
+`TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH` names one absolute, canonical,
+link-free, owner-held, single-link `0600` regular file outside this repository.
+It is between 3 and 16 KiB and uses the exact canonical UTF-8 JSON bytes below,
+including two-space indentation and one final newline:
+
+```json
+{
+  "TAKOSERVER_MANAGED_OBJECT_ACCESS_KEY_ID": "operator-supplied-access-key-id",
+  "TAKOSERVER_MANAGED_OBJECT_SECRET_ACCESS_KEY": "operator-supplied-secret-access-key",
+  "TAKOSERVER_MANAGED_OBJECT_PROOF_SECRET": "operator-supplied-proof-secret"
+}
+```
+
+Those are the complete names: a missing or extra property is refused. Each
+value is nonempty, at most 4 KiB as UTF-8, already trimmed, and contains no
+control character. The deploy surface holds the opened inode while reading and
+requires its device, inode, size, modification time, and change time to remain
+stable. It then creates an exclusive `0600` copy inside an owned `0700`,
+canonical, link-free release root outside the repository, seals that copy with
+the artifact, and passes only its path to Wrangler's single
+`deploy --secrets-file` command. The materialized copy is removed after every
+success and failure; the operator's source file is never changed or removed.
+Its path never enters a child command. Wrangler necessarily receives the sealed
+copy's path as the `--secrets-file` operand, but neither path contains secret
+bytes, and no secret value enters argv, result JSON, generated Worker config, or
+diagnostics.
+
+`TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH` names the
+external evidence file for only the fresh route-less authority `v1` lifecycle.
+Its immediate parent is an owned exact-`0700` directory outside every Git
+repository, and the receipt itself is a no-overwrite, owned, single-link
+exact-`0600` canonical JSON file. Rehearsal creates it only after the exact
+route-less Worker readback; production consumes the matching bytes read-only
+and checks them again immediately before publication. Integration apply and all
+status actions do not read it. Routine code/secret publication over an existing
+exact `v1` authority does not read or replace it.
+
+`TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` names one absolute,
+canonical, link-free, owner-held, single-link `0600` regular file outside this
+repository, no larger than 32 KiB. It has exact canonical UTF-8 JSON bytes with
+two-space indentation and one final newline:
+
+```json
+{
+  "CLOUDFLARE_API_TOKEN": "operator-supplied-parent-token",
+  "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING": "operator-supplied-keyring"
+}
+```
+
+No other key is accepted. Each value is nonempty, trimmed, free of control
+characters, and at most 16 KiB as UTF-8. Status and reverse validate the source
+and use only the token for direct Cloudflare readback/publication authority;
+they do not copy or publish the file. Forward apply creates an exclusive `0600`
+copy inside the owned `0700` release, seals it to `0400` with the module and
+configuration, passes it to Wrangler's single `deploy --secrets-file`, and
+removes it after both success and failure. The build child receives neither
+secret. The source path and bytes never enter result JSON or diagnostics, and
+the public Worker receives neither binding.
 
 `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is an owned, exact-`0700`,
 link-free absolute directory holding one such `0600` file per declared secret,
@@ -1174,10 +1393,17 @@ browser, so each one says where it comes from.
 - `TAKOSERVER_SIGNING_KEY` — registered by `takoserver-signing-key-register`,
   repaired by `takoserver-signing-repair`, rotated by
   `takoserver-signing-rotation`.
-- `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` (Worker
-  bindings) — operator-supplied, installed and rotated through
-  `takoserver-worker-authority-cutover`'s `--add-secret` / `--rotate-secret`
-  declaration out of `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`.
+- `CLOUDFLARE_API_TOKEN` (provider parent authority) — operator-supplied only to
+  `cloudflare-provider-executor` through
+  `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`. It is not a public API
+  Worker binding. A separate token with only deploy/readback permissions may be
+  used by public deployment tooling; that process credential is likewise never
+  published into the public Worker.
+- `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` — operator-supplied independently to
+  the public request-side runtime-input preparer and the private executor-side
+  lease resolver. The executor copy is published only through its closed secret
+  file. A public copy, when the target requires it, uses the reviewed Worker
+  closure secret input; the two placements do not transfer the parent token.
 
 `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH` is a third, dedicated
 operator-private Ed25519 key. The target stores only its public half and the

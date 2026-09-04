@@ -1,8 +1,8 @@
 # ADR 0007 — ObjectBucket joins the implementation catalog
 
-**Status:** accepted, 2026-09-02
+**Status:** accepted, 2026-09-02; amended 2026-09-03
 
-> **Amended twice on 2026-09-02, and the body below is the first statement of
+> **Amended twice on 2026-09-02 and again on 2026-09-03; the body below is the first statement of
 > each.** Where it says a self-host "realizes none" of the ObjectBucket supply
 > and records the Form with an EMPTY operation set, that is no longer true: a
 > self-host now holds object bodies under its data root and their metadata in
@@ -54,9 +54,9 @@ They stay installed, unsupported, and without an activation head.
 
 ## What each runtime hands the Worker
 
-Exactly one Cloudflare Worker backend accepts `bucketBindings`. The self-host
-runtime accepts one too, and hands over something different; it is described
-after the two Cloudflare backends.
+Both Cloudflare Worker backends accept `bucketBindings`. The self-host runtime
+accepts one too and hands over something different; it is described after the
+two Cloudflare backends.
 
 - The **ordinary-workers backend** — the production path in an operator's own
   Cloudflare account — uploads the tenant's exact bundle bytes with no wrapper.
@@ -64,15 +64,18 @@ after the two Cloudflare backends.
   Cloudflare's native R2 binding, exactly as `sqliteBindings` already carries a
   native D1 binding and `kvBindings` a native KV namespace on that same
   backend.
-- The **managed (Workers-for-Platforms) backend** refuses `bucketBindings`
-  outright, by name and non-retryably, before it reads a bundle. Its wrapper
-  can project the `edge.objects` facade over an internal `r2_bucket` binding,
-  and does so correctly against a real R2 in test — but the facade keeps its
-  multipart validation receipts in isolate memory, and an eviction between
-  `createMultipartUpload` and `completeMultipartUpload` is ordinary rather than
-  exceptional. Until the managed path owns a durable receipt backend it cannot
-  claim a restart-safe ObjectBucket runtime, and a Provider Pack capability
-  reaching it must be refused rather than left unreachable by configuration.
+- The **managed (Workers-for-Platforms) backend** keeps the customer module as
+  a user Worker and projects the exact `edge.objects` facade from the
+  provider-authored wrapper. The raw `r2_bucket` binding and a cross-script
+  receipt Durable Object namespace are hidden bindings protected from module
+  imports by `disallow_importable_env`; only the facade enters handler `env`.
+  The namespace points to a dedicated route-less authority Worker, not the
+  internet-routed dispatch gateway. Its SQLite Durable Object owns create,
+  part, complete, and abort receipts across isolate eviction; only that
+  authority Worker holds the R2 S3 keys and proof secret. Its opaque instance
+  identity derives from provider
+  authority, ObjectBucket Resource UID, Deployment incarnation, and Resource
+  generation, never from the bucket's display or native name.
 
 On the accepting backend the validation is: one runtime Binding per declaration
 in the same order, the exact `module-worker.object-bucket@1.1.0` identity with
@@ -94,12 +97,12 @@ Binding selects and materializes the bucket, and the runtime shape under the
 declared name is Cloudflare's own. Nothing about bucket name, region,
 endpoint, credential, or supply document reaches the Worker either way.
 
-The **self-host runtime** accepts one as well, and this is where the two
-Cloudflare answers separate for a reason rather than by accident. It publishes
-every Worker Version through a Takoserver-owned entrypoint, so it has the place
-to interpose a facade that the ordinary-workers backend does not — and the
-receipt problem that keeps the managed backend out does not arise, because its
-multipart receipts are rows in the control database rather than isolate memory.
+The **self-host runtime** accepts one as well, and this is where the runtime
+answers separate for a reason rather than by accident. It publishes every
+Worker Version through a Takoserver-owned entrypoint, so it has the place to
+interpose a facade that the ordinary-workers backend does not. Its multipart
+receipts are rows in the control database; the managed backend instead owns
+them in the route-less authority Worker's receipt Durable Object.
 So `env.MEDIA` there is the exact `edge.objects` facade of ADR 0005, over an
 object plane on the machine itself. The validation below is the same
 validation; only the material differs. See
@@ -107,11 +110,11 @@ validation; only the material differs. See
 
 The consumer importer added to the Cloudflare runtime-binding materializer
 reverses the note that "an ordinary Worker adapter must not consume this export
-at all". That note existed because of the wrapper's in-isolate receipt ledger.
-A native R2 binding has no such problem: its multipart state is the provider's,
-and survives isolate eviction. The materializer is a Provider Pack capability,
-so the route it publishes is the pack's; which runtime may consume it is the
-backend's own answer, and the managed backend's answer is no.
+at all". A native R2 binding keeps multipart state at the provider, and the
+managed facade now keeps the validation and retry ledger in a provider-owned
+Durable Object. The materializer is a Provider Pack capability, so the route it
+publishes is the pack's; each backend still validates its own runtime authority
+before any Cloudflare mutation.
 
 ## Naming and import
 
@@ -233,16 +236,16 @@ refused before anything is read.
 
 An unfinished multipart upload is not one of those objects, and the delete drops
 it rather than refusing on it. Durability is what lets this Host serve
-`bucketBindings` where the managed wrapper may not — and durability is also what
-would have turned a lost upload id into a permanent lifecycle deadlock, because
-the id lives only in the isolate that minted it and the Form's Binding declares
-no operation that enumerates open uploads. A refusal there would tell a customer
-to empty a bucket that every operation they hold reports as empty. So the
-destroy takes the receipts and their part files with everything else, and the
-maintenance tick expires uploads older than seven days on buckets nobody is
-destroying. The absence readback still counts an upload as presence: a completed
-destroy leaves neither, so both being zero is what proves the destroy ran, and
-that is a different question from what the delete must refuse.
+`bucketBindings` across restart — and durability is also what would have turned
+a lost upload id into a permanent lifecycle deadlock, because the id lives only
+in the isolate that minted it and the Form's Binding declares no operation that
+enumerates open uploads. A refusal there would tell a customer to empty a bucket
+that every operation they hold reports as empty. So the destroy takes the
+receipts and their part files with everything else, and the maintenance tick
+expires uploads older than seven days on buckets nobody is destroying. The
+absence readback still counts an upload as presence: a completed destroy leaves
+neither, so both being zero is what proves the destroy ran, and that is a
+different question from what the delete must refuse.
 
 ### Deploy-target obligation
 
@@ -314,10 +317,11 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
   retained v1beta1 ObjectBucket drain capability is untouched and remains
   observe/delete only, under the address-derived `local-bucket:` names its
   already-recorded Deployments carry.
-- The managed Worker backend refuses `bucketBindings` by name. The
-  ordinary-workers backend and the self-host wrapper backend are the two
-  runtimes that bind one, and they bind it differently: Cloudflare's own R2
-  binding there, the exact `edge.objects` facade here.
+- All three runtimes bind `bucketBindings`: the ordinary-workers backend hands
+  Cloudflare's native R2 binding to the declared name, while the managed and
+  self-host wrappers hand it the exact `edge.objects` facade. Managed receipts
+  live in the provider-owned route-less authority Worker; self-host receipts
+  live in its control database.
 
 ## Amendment — 2026-09-02: the managed lane's pre-shipment defects
 
@@ -332,9 +336,9 @@ true before anyone composes it.
 **The wrapper's projected `env` never hid anything.** A binding belongs to the
 script it is declared on, and the runtime hands every one of them to every
 module that script runs — `import { env } from "cloudflare:workers"` included.
-So the internal `__TAKOSERVER_SQLITE_<i>` Durable Object namespace and, if the
-bucket refusal above were ever lifted, the `__TAKOSERVER_OBJECTS_<i>` R2 handle
-were one import away from tenant code, along with every `secret_text` value.
+So the internal `__TAKOSERVER_SQLITE_<i>` Durable Object namespace, the
+`__TAKOSERVER_OBJECTS_<i>` R2 handle, and the managed receipt namespace would
+be one import away from tenant code, along with every `secret_text` value.
 `tests/cloudflare-managed-worker-wrapper.test.ts` runs the generated wrapper
 under the pinned workerd and shows the raw bucket being written through that
 route. Every managed tenant user Worker is therefore now uploaded with
@@ -410,3 +414,151 @@ recorded under the old digest would return `conflict`. There are no such
 records: no composition builds this backend, so no receipt exists in any
 environment. The managed lane starts fresh, and no re-key path is provided
 because there is nothing to re-key.
+
+## Amendment — 2026-09-03: durable managed multipart authority
+
+The managed Workers-for-Platforms backend now accepts the same exact
+`module-worker.object-bucket@1.1.0` materialization as the other Cloudflare
+backend. This does not add a Form, Binding, output, credential, service, or
+tenant-visible method. The customer module remains a Workers-for-Platforms user
+Worker and receives only the existing nine-method `edge.objects` facade.
+
+Before upload, the managed provider closes the declaration, BindingRef,
+relation pointer and pattern, target UID, exact ObjectBucket Form identity,
+Space, positive generation, active Deployment tenant and provider installation,
+Deployment native id and output, and the provider-private R2 material. It then
+adds two hidden capabilities to that immutable user Worker Version: the raw R2
+bucket and a cross-script namespace for `TakoserverManagedObjectReceipt` on the
+dedicated route-less receipt-authority Worker. `disallow_importable_env` keeps
+both unavailable to customer module imports; the wrapper's projected handler
+environment contains only the facade. The internet-routed dispatch gateway
+retains its original SQLite Durable Object and dispatch namespace only.
+
+One SQLite Durable Object is selected by a SHA-256 name over a length-prefixed
+tuple of provider id, ObjectBucket Resource UID, Deployment incarnation id, and
+Resource generation. The bucket's desired name and native R2 name are absent
+from that identity. Every runtime proof is an HMAC over that exact tuple and
+bucket; inspect, prepare-destroy, and commit-destroy use a separate label and
+operation-scoped proof. The Object validates its provider id, private S3
+credentials, proof secret, request shape, and proof before schema or provider
+mutation. These credentials exist only as bindings on that route-less authority
+Worker and are never gateway/public-API bindings, tenant environment, result,
+error, or stored receipt data. The first authorized call
+claims the tuple and bucket in durable storage, so a misaddressed or colliding
+capability cannot silently reuse another authority.
+
+The receipt orchestration is the sole native multipart-create authority. The
+tenant wrapper has no raw create call. A private bounded SigV4 R2 S3 adapter
+lists multipart uploads for the exact object key; the Object persists that
+upload-id baseline, installs a recovery alarm, and atomically consumes the one
+native-create grant before it sends one create. One synchronous post-create
+list delta is adopted. A zero delta moves to `create_reconciling` and retries
+the list without recreating. Multiple deltas, an acknowledged-id disagreement,
+or a native upload id already owned by another receipt move permanently to
+`operator_reconciliation_required`. Alarm recovery never silently adopts a
+late single delta: it aborts it and terminates the receipt. One unresolved
+receipt fences its exact object key throughout this process.
+
+Public upload ids are provider-minted receipt ids rather than R2 upload ids.
+The durable states are `preparing`, `creating`, `create_reconciling`, `active`,
+`completing`, `completion_reconciling`, `completed`, `aborting`, `aborted`,
+`operator_reconciliation_required`, and `destroying`. Part attempts and
+committed etags and sizes, completion selection, the exact baseline, attempts,
+and created/updated/terminal/next-action timestamps are rows; duplicate parts
+supersede older etags and stale, unordered, duplicate, undersized non-final, or
+oversized completions are refused from those rows after restart exactly as
+before eviction.
+
+R2 does not document `R2MultipartUpload.complete()` as idempotent, so recovery
+does not call it twice. The wrapper receives one durable `execute` grant and
+moves the receipt to `completing` before the native call. Multipart creation
+attaches a random provider-private marker as R2 custom metadata. Whether the
+native call returns or loses its response, `head` must show that exact marker
+and the durably computed size before the receipt commits; later retries only
+reconcile that readback. The facade never projects custom metadata. A definitive
+invalid part response may reopen the active receipt; an ambiguous response
+without the marker remains unavailable rather than being retried as a second
+completion.
+
+There is one deliberate completion liveness stop. A process loss after the
+durable execute grant but before the native call is indistinguishable, under the
+documented R2 binding contract, from an in-flight completion whose response is
+lost and whose marker is not yet observable. With an absent readback that
+receipt remains `completing`; a mismatch or indeterminate readback moves it to
+`completion_reconciling`. Both return `backend_unavailable`, and automatically
+issuing another native completion is blocked. This does not weaken the
+lost-response case into a guessed retry or an unsupported at-most-once claim.
+
+Active receipts expire seven days after creation, independently of later part
+activity. Completed and aborted receipts retain their result for seven days and
+then GC in batches of at most 64; authority and bucket control rows are not
+collected. The same bound applies to an alarm's due-receipt work. A permanent
+operator fence has no next-action timestamp and is never GC'd. Provider-only
+status returns its count as `operatorReconciliationRequired` and derives
+`repairRequired`; this is not a tenant route or a tenth facade method.
+
+Bucket destruction is a separate admin state machine. The exact-incarnation
+prepare proof changes bucket control to `destroying`, refuses later creates,
+and aborts bounded multipart pages with an alarm between pages. The provider
+may issue the R2 bucket delete only after that drain reports prepared. It then
+confirms authoritative bucket absence before an independently sealed
+commit-destroy deletes the Object storage. Delete and commit acknowledgement
+losses resume from readback and the opaque handle without replaying the R2
+bucket delete. Provider-only status treats the durable `destroying` lifecycle as
+`repairRequired` until that exact handle proves absence and commits; there is no
+automatic clear/adopt operation for an abandoned or ambiguous delete fence.
+
+The receipt class does not extend the gateway's established `v1` lineage. It is
+the sole class of a distinct route-less Worker and starts at that Worker's own
+outer migration `v1`. Its runtime configuration contains the account id and
+exactly three secret bindings: R2 S3 access-key id, secret access key, and the
+receipt proof secret. The gateway configuration contains none of them and keeps
+only `TakoserverManagedWorkerSqlite` under its original `v1` migration.
+
+Fresh authority publication must supply those three values with the code and DO
+lifecycle atomically. The owning deploy surface therefore accepts one canonical,
+link-free, single-link, owner-only `0600` JSON file outside the repository,
+copies it into the sealed release, and invokes Wrangler once with
+`deploy --secrets-file`. It never performs a code deploy followed by three
+surprise secret mutations. The generated config and result expose names only,
+and the copied secret file is removed on both success and failure even when the
+operator retained the rest of the release directory.
+
+The fresh `v1` DO lifecycle is a separate irreversible authority transition.
+Rehearsal writes external no-overwrite `0600` evidence for the exact commit,
+module digest, null predecessor, class, v1 lineage, and empty mutation targets;
+production consumes and immediately re-reads the same evidence. Provider
+history and the sealed artifact/secret copy are re-fenced immediately before
+the one deployment. Exact Version, module-byte, closed binding, migration,
+workers.dev/preview, deployment-history, and no-route readback follows. The
+complete account custom-domain inventory must also contain no service mapping
+to the authority Worker. An acknowledgement or cleanup ambiguity stops for
+status/forward repair rather than replaying the publication.
+
+The route-less provider executor holds only the authority Worker's narrow
+service-binding RPC. It asks that RPC to mint a runtime instance/proof pair and
+to inspect, prepare, or commit destruction; it never receives the proof secret
+or an administrative DO namespace. Every RPC rejects a ProviderInstallation id
+other than the authority Worker's exact configured id before addressing a DO.
+The receipt Worker's `MANAGED_PROVIDER_ID` value comes solely from
+`target.cloudflareProviderExecutor.providerInstallationId`, not a duplicate
+operator environment selector and not the gateway/SQLite
+`TAKOSERVER_MANAGED_WORKER_PROVIDER_ID` provider-pack identity.
+Tenant Versions receive only the cross-script namespace plus their exact
+runtime proof; tenant handlers still see only `edge.objects`.
+
+Finally, the parent Cloudflare credential and WfP backend also belong in that
+route-less provider executor, not in Takoserver's public API Worker. The public
+Worker uses a narrow Provider RPC proxy plus non-secret catalog projection.
+ObjectBucket import and readback-only import recovery cross that same typed RPC
+under the exact Host saga lease, Deployment incarnation, and Resource
+generation. Its retail meter and artifact-consumption reads are likewise bound
+to the exact tenant, Offering, ProviderInstallation, native id, and recorded
+Deployment; neither can fall back to a public parent-account adapter.
+The executor deploy surface qualifies the exact selected-commit receipt
+authority and managed gateway, migration 0045, immutable module and binding
+closure, workers.dev/preview settings, and exhaustive absence of routes and
+custom domains. The public deploy then pins that exact executor Version before
+publication and rechecks it at the mutation fence. Until this chain is exact,
+production composition refuses reviewed edge and legacy Cloudflare ObjectBucket
+supplies instead of silently advertising an ordinary-Workers backend.

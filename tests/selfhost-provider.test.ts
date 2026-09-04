@@ -126,6 +126,12 @@ function deployedRelation(
 }
 
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
+const readTarget = (name: string) => ({
+  tenantId: "org_demo",
+  resourceUid: `uid-${name}`,
+  incarnationId: `dep-${name}`,
+  generation: "1",
+});
 
 /** The one materialized version directory under a script, whichever id it got. */
 function versionDirectoryName(dataRoot: string, script: string): string {
@@ -952,7 +958,11 @@ describe("publishing a Worker through the Edge Family", () => {
       scriptName: script,
     });
     expect(
-      await local.verifyNativeAbsence({ offering: endpointOffering, descriptor }),
+      await local.verifyNativeAbsence({
+        offering: endpointOffering,
+        descriptor,
+        target: readTarget("hello-endpoint"),
+      }),
     ).toMatchObject({ outcome: "present" });
     const deleteInput = {
       operationId: "op_endpoint_delete",
@@ -965,7 +975,11 @@ describe("publishing a Worker through the Edge Family", () => {
     };
     expect(await local.delete(deleteInput)).toMatchObject({ phase: "succeeded" });
     expect(
-      await local.verifyNativeAbsence({ offering: endpointOffering, descriptor }),
+      await local.verifyNativeAbsence({
+        offering: endpointOffering,
+        descriptor,
+        target: readTarget("hello-endpoint"),
+      }),
     ).toMatchObject({ outcome: "absent" });
     if (!local.recoverDelete) throw new Error("the selfhost provider is missing delete recovery");
     expect(await local.recoverDelete({ ...deleteInput, operationMode: "recovery" })).toMatchObject({
@@ -2728,13 +2742,21 @@ describe("the current ObjectBucket Form on a self-host", () => {
       nativeId: created.result.nativeId,
       identity: { ...identity("media"), uid: "uid-media" },
     });
-    expect(await local.verifyNativeAbsence({ offering: currentBucket, descriptor })).toMatchObject({
-      outcome: "present",
-    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: currentBucket,
+        descriptor,
+        target: readTarget("media"),
+      }),
+    ).toMatchObject({ outcome: "present" });
     state.objects = 0;
-    expect(await local.verifyNativeAbsence({ offering: currentBucket, descriptor })).toMatchObject({
-      outcome: "absent",
-    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: currentBucket,
+        descriptor,
+        target: readTarget("media"),
+      }),
+    ).toMatchObject({ outcome: "absent" });
   });
 
   test("keeps the retained v1beta1 drain working", async () => {
@@ -2806,6 +2828,7 @@ describe("read-only native absence verification", () => {
     const present = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
       descriptor,
+      target: readTarget("hello-v1"),
     });
     expect(present).toEqual({
       outcome: "present",
@@ -2826,6 +2849,7 @@ describe("read-only native absence verification", () => {
     const absent = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
       descriptor,
+      target: readTarget("hello-v1"),
     });
     expect(absent).toEqual({
       outcome: "absent",
@@ -2838,6 +2862,7 @@ describe("read-only native absence verification", () => {
     const malformed = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
       descriptor: { ...descriptor, data: { scriptName: "not-the-parent", versionId: "bad" } },
+      target: readTarget("hello-v1"),
     });
     expect(malformed).toEqual({ outcome: "unknown", reason: "malformed", retryable: false });
   });
@@ -2856,53 +2881,99 @@ describe("the SQLite migration ledger", () => {
     const nativeId = database.phase === "succeeded" ? database.result.nativeId : "";
     const port = local.sqliteMigrations;
     if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const target = {
+      resourceUid: "uid_db",
+      incarnationId: "dep_op_db",
+      generation: "1",
+    };
+    const readTarget = { tenantId: "tenant", ...target };
 
-    expect(await port.readLedger({ nativeId })).toEqual({ ok: true, value: [] });
+    expect(await port.readLedger({ nativeId, target: readTarget })).toEqual({
+      ok: true,
+      value: [],
+    });
 
+    const firstSql = new TextEncoder().encode(
+      "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+    );
     const first = {
       path: "0001_init.sql",
-      digest: `sha256:${"1".repeat(64)}` as const,
-      sql: new TextEncoder().encode("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)"),
+      digest: `sha256:${createHash("sha256").update(firstSql).digest("hex")}` as const,
+      sql: firstSql,
     };
-    expect(await port.applySuffix({ nativeId, expectedPrefix: [], migrations: [first] })).toEqual({
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_first",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [first],
+        expectedPrefix: [],
+        migrations: [first],
+      }),
+    ).toEqual({
       ok: true,
       value: undefined,
     });
 
-    const ledger = await port.readLedger({ nativeId });
+    const ledger = await port.readLedger({ nativeId, target: readTarget });
     expect(ledger).toEqual({
       ok: true,
       value: [{ path: first.path, digest: first.digest }],
     });
 
     // A stale prefix means the database moved underneath the plan.
+    const moreSql = new TextEncoder().encode("CREATE TABLE more (id INTEGER PRIMARY KEY)");
+    const more = {
+      path: "0002_more.sql",
+      digest: `sha256:${createHash("sha256").update(moreSql).digest("hex")}` as const,
+      sql: moreSql,
+    };
+    const alteredMore = {
+      ...more,
+      sql: new TextEncoder().encode("CREATE TABLE other (id INTEGER PRIMARY KEY)"),
+    };
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_altered_bytes",
+        operationMode: "recovery",
+        nativeId,
+        target,
+        desired: [first, more],
+        expectedPrefix: [{ path: first.path, digest: first.digest }],
+        migrations: [alteredMore],
+      }),
+    ).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+
     const conflicting = await port.applySuffix({
+      operationId: "op_migration_conflicting",
+      operationMode: "initial",
       nativeId,
+      target,
+      desired: [more],
       expectedPrefix: [],
-      migrations: [
-        {
-          path: "0002_more.sql",
-          digest: `sha256:${"2".repeat(64)}`,
-          sql: new TextEncoder().encode("CREATE TABLE more (id INTEGER PRIMARY KEY)"),
-        },
-      ],
+      migrations: [more],
     });
     expect(conflicting).toMatchObject({ ok: false, failure: { code: "conflict" } });
 
     // Broken SQL commits nothing, ledger row included.
+    const brokenSql = new TextEncoder().encode("THIS IS NOT SQL");
+    const brokenMigration = {
+      path: "0002_broken.sql",
+      digest: `sha256:${createHash("sha256").update(brokenSql).digest("hex")}` as const,
+      sql: brokenSql,
+    };
     const broken = await port.applySuffix({
+      operationId: "op_migration_broken",
+      operationMode: "initial",
       nativeId,
+      target,
+      desired: [first, brokenMigration],
       expectedPrefix: [{ path: first.path, digest: first.digest }],
-      migrations: [
-        {
-          path: "0002_broken.sql",
-          digest: `sha256:${"3".repeat(64)}`,
-          sql: new TextEncoder().encode("THIS IS NOT SQL"),
-        },
-      ],
+      migrations: [brokenMigration],
     });
     expect(broken).toMatchObject({ ok: false, failure: { code: "provider_error" } });
-    expect(await port.readLedger({ nativeId })).toEqual({
+    expect(await port.readLedger({ nativeId, target: readTarget })).toEqual({
       ok: true,
       value: [{ path: first.path, digest: first.digest }],
     });
@@ -3252,9 +3323,13 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       relations: [relation("/worker", "ModuleWorker", "hello")],
     });
     const cronOffering = offering("WorkerCronTrigger");
-    expect(await local.verifyNativeAbsence({ offering: cronOffering, descriptor })).toMatchObject({
-      outcome: "present",
-    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: cronOffering,
+        descriptor,
+        target: readTarget("hello-cron"),
+      }),
+    ).toMatchObject({ outcome: "present" });
 
     expect(
       (
@@ -3272,9 +3347,13 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       ).phase,
     ).toBe("succeeded");
     expect(forgotten).toEqual(["0 * * * *"]);
-    expect(await local.verifyNativeAbsence({ offering: cronOffering, descriptor })).toMatchObject({
-      outcome: "absent",
-    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: cronOffering,
+        descriptor,
+        target: readTarget("hello-cron"),
+      }),
+    ).toMatchObject({ outcome: "absent" });
     // And the gate goes with it: nothing delivers to this Worker any more.
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
     expect(config).not.toContain("selfhost-events");
