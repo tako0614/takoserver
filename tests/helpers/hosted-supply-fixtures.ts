@@ -50,6 +50,7 @@ export function cloudflareProviderExecutorTarget(
   return {
     workerName: "takoserver-cloudflare-provider-executor",
     dispatchNamespace: "takoserver-customers",
+    dispatchNamespaceId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     gatewayWorkerName: "takoserver-managed-worker-gateway",
     managedBaseDomain: "workers.example.test",
     providerInstallationId,

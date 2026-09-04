@@ -25,6 +25,7 @@ const CLOUDFLARE_PROVIDER_EXECUTOR_OPERATIONS = "0045_cloudflare_provider_execut
 const EXACT_ARTIFACT_RECOVERY_RECEIPTS = "0046_exact_artifact_recovery_receipts.sql";
 const SPONSORSHIP_CUTOVER_CONSUMPTION = "0047_sponsorship_cutover_consumption.sql";
 const RESOURCE_EXECUTION_EVIDENCE = "0048_resource_execution_evidence.sql";
+const ARTIFACT_CONSUMER_ACTIVE_RESOLUTION = "0049_artifact_consumer_active_resolution.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -42,6 +43,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   EXACT_ARTIFACT_RECOVERY_RECEIPTS,
   SPONSORSHIP_CUTOVER_CONSUMPTION,
   RESOURCE_EXECUTION_EVIDENCE,
+  ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -369,6 +371,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 2]?.name).toBe(EXACT_ARTIFACT_RECOVERY_RECEIPTS);
     expect(MIGRATIONS[receiptMigrationIndex + 3]?.name).toBe(SPONSORSHIP_CUTOVER_CONSUMPTION);
     expect(MIGRATIONS[receiptMigrationIndex + 4]?.name).toBe(RESOURCE_EXECUTION_EVIDENCE);
+    expect(MIGRATIONS[receiptMigrationIndex + 5]?.name).toBe(ARTIFACT_CONSUMER_ACTIVE_RESOLUTION);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -387,6 +390,7 @@ describe("bringing a local database up to date", () => {
       EXACT_ARTIFACT_RECOVERY_RECEIPTS,
       SPONSORSHIP_CUTOVER_CONSUMPTION,
       RESOURCE_EXECUTION_EVIDENCE,
+      ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -442,6 +446,136 @@ describe("bringing a local database up to date", () => {
       database
         .query(
           "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_sqlite_fixture'",
+        )
+        .run(),
+    ).toThrow("artifact_consumer_resolution_receipt_durable");
+  });
+
+  test("0049 preserves every prior receipt shape and admits only active zero consumption", () => {
+    const migrationIndex = MIGRATIONS.findIndex(
+      ({ name }) => name === ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
+    );
+    expect(migrationIndex).toBe(MIGRATIONS.length - 1);
+    const database = new Database(":memory:");
+    for (const migration of MIGRATIONS.slice(0, migrationIndex)) database.exec(migration.sql);
+
+    const digest = (character: string) => `sha256:${character.repeat(64)}`;
+    const insert = database.query(`
+      INSERT INTO tf_artifact_consumer_resolution_receipts
+        (receipt_id, tenant_id, deployment_id, uncertainty_fence, idempotency_key,
+         plan_digest, snapshot_digest, resolution, manifest_digest,
+         provider_evidence_digest, deployment_state_before,
+         deployment_updated_at_before, created_at)
+      VALUES (?, 'tenant_fixture', ?, ?, ?, ?, ?, ?, ?, ?, ?, 100, ?)
+    `);
+    for (const [index, resolution, manifestDigest, deploymentState] of [
+      [1, "terminalized_absent", null, "active"],
+      [2, "terminalized_absent", null, "retained"],
+      [3, "attributed_manifest", digest("a"), "active"],
+      [4, "attributed_manifest", digest("b"), "retained"],
+    ] as const) {
+      insert.run(
+        `acr_before_${index}`,
+        `deployment_before_${index}`,
+        index,
+        `repair:before:${index}`,
+        digest(String(index)),
+        digest(String(index + 4)),
+        resolution,
+        manifestDigest,
+        digest((["9", "a", "b", "c"] as const)[index - 1] ?? "9"),
+        deploymentState,
+        100 + index,
+      );
+    }
+    const rowsBefore = database
+      .query("SELECT * FROM tf_artifact_consumer_resolution_receipts ORDER BY receipt_id")
+      .all();
+
+    database.exec(MIGRATIONS[migrationIndex]?.sql ?? "");
+
+    expect(
+      database
+        .query("SELECT * FROM tf_artifact_consumer_resolution_receipts ORDER BY receipt_id")
+        .all(),
+    ).toEqual(rowsBefore);
+    expect(
+      database
+        .query(
+          `SELECT name FROM sqlite_schema
+           WHERE type = 'index'
+             AND name = 'tf_artifact_consumer_resolution_receipts_deployment'`,
+        )
+        .get(),
+    ).toEqual({ name: "tf_artifact_consumer_resolution_receipts_deployment" });
+
+    const insertZero = (
+      receiptId: string,
+      deploymentId: string,
+      idempotencyKey: string,
+      manifestDigest: string | null,
+      deploymentState: "active" | "retained",
+    ) =>
+      database
+        .query(`
+          INSERT INTO tf_artifact_consumer_resolution_receipts
+            (receipt_id, tenant_id, deployment_id, uncertainty_fence, idempotency_key,
+             plan_digest, snapshot_digest, resolution, manifest_digest,
+             provider_evidence_digest, deployment_state_before,
+             deployment_updated_at_before, created_at)
+          VALUES (?, 'tenant_fixture', ?, 9, ?, ?, ?, 'verified_zero_consumption', ?, ?, ?, 200, 201)
+        `)
+        .run(
+          receiptId,
+          deploymentId,
+          idempotencyKey,
+          digest("c"),
+          digest("d"),
+          manifestDigest,
+          digest("e"),
+          deploymentState,
+        );
+
+    insertZero("acr_zero_active", "deployment_zero_active", "repair:zero:active", null, "active");
+    expect(() =>
+      insertZero(
+        "acr_zero_retained",
+        "deployment_zero_retained",
+        "repair:zero:retained",
+        null,
+        "retained",
+      ),
+    ).toThrow(/constraint/iu);
+    expect(() =>
+      insertZero(
+        "acr_zero_manifest",
+        "deployment_zero_manifest",
+        "repair:zero:manifest",
+        digest("f"),
+        "active",
+      ),
+    ).toThrow(/constraint/iu);
+    expect(() =>
+      insertZero(
+        "acr_zero_duplicate_fence",
+        "deployment_zero_active",
+        "repair:zero:duplicate",
+        null,
+        "active",
+      ),
+    ).toThrow(/UNIQUE|constraint/iu);
+    expect(() =>
+      database
+        .query(
+          `UPDATE tf_artifact_consumer_resolution_receipts
+           SET created_at = 202 WHERE receipt_id = 'acr_zero_active'`,
+        )
+        .run(),
+    ).toThrow("artifact_consumer_resolution_receipt_immutable");
+    expect(() =>
+      database
+        .query(
+          "DELETE FROM tf_artifact_consumer_resolution_receipts WHERE receipt_id = 'acr_zero_active'",
         )
         .run(),
     ).toThrow("artifact_consumer_resolution_receipt_durable");
@@ -516,6 +650,7 @@ describe("bringing a local database up to date", () => {
         EXACT_ARTIFACT_RECOVERY_RECEIPTS,
         SPONSORSHIP_CUTOVER_CONSUMPTION,
         RESOURCE_EXECUTION_EVIDENCE,
+        ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1068,6 +1203,7 @@ describe("bringing a local database up to date", () => {
       "0046_exact_artifact_recovery_receipts.sql",
       "0047_sponsorship_cutover_consumption.sql",
       "0048_resource_execution_evidence.sql",
+      "0049_artifact_consumer_active_resolution.sql",
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1197,6 +1333,7 @@ describe("bringing a local database up to date", () => {
       "0046_exact_artifact_recovery_receipts.sql",
       "0047_sponsorship_cutover_consumption.sql",
       "0048_resource_execution_evidence.sql",
+      "0049_artifact_consumer_active_resolution.sql",
     ]);
     expect(
       database
@@ -2133,6 +2270,7 @@ describe("bringing a local database up to date", () => {
       EXACT_ARTIFACT_RECOVERY_RECEIPTS,
       SPONSORSHIP_CUTOVER_CONSUMPTION,
       RESOURCE_EXECUTION_EVIDENCE,
+      ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
     ]);
     expect(
       database

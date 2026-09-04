@@ -119,7 +119,7 @@ describe("artifact-consumer repair operator client", () => {
           deploymentId: "dep_cli",
           uncertaintyFence: 1,
           planDigest: PLAN,
-          resolution: "terminalized_absent",
+          resolution: "verified_zero_consumption",
           createdAt: "2026-09-03T20:00:00.000Z",
         },
       }),
@@ -151,7 +151,75 @@ describe("artifact-consumer repair operator client", () => {
       kind: ARTIFACT_CONSUMER_REPAIR_APPLY_FORMAT,
       planDigest: PLAN,
     });
-    expect(stdout.join("")).toContain('"resolution": "terminalized_absent"');
+    expect(stdout.join("")).toContain('"resolution": "verified_zero_consumption"');
+  });
+
+  test("rejects every remote resolution and manifest-digest mismatch", async () => {
+    const malformedReceipts = [
+      {
+        resolution: "verified_zero_consumption",
+        manifestDigest: "bogus",
+      },
+      {
+        resolution: "verified_zero_consumption",
+        manifestDigest: `sha256:${"b".repeat(64)}`,
+      },
+      {
+        resolution: "terminalized_absent",
+        manifestDigest: `sha256:${"b".repeat(64)}`,
+      },
+      {
+        resolution: "attributed_manifest",
+      },
+      {
+        resolution: "attributed_manifest",
+        manifestDigest: "bogus",
+      },
+    ] as const;
+
+    for (const malformed of malformedReceipts) {
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      let requestCount = 0;
+      const code = await runArtifactConsumerRepairCli(
+        ["apply", "https://api.takoserver.test", "org_cli", "dep_cli", "repair:cli:invalid"],
+        {
+          async fetch() {
+            requestCount += 1;
+            if (requestCount === 1) {
+              return Response.json({
+                repair: {
+                  kind: ARTIFACT_CONSUMER_REPAIR_STATUS_FORMAT,
+                  deploymentId: "dep_cli",
+                  state: "actionable",
+                  planDigest: PLAN,
+                  uncertaintyFence: 1,
+                  candidateManifestCount: 1,
+                },
+              });
+            }
+            return Response.json({
+              receipt: {
+                kind: ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT,
+                receiptId: "acr_cli_invalid",
+                deploymentId: "dep_cli",
+                uncertaintyFence: 1,
+                planDigest: PLAN,
+                ...malformed,
+                createdAt: "2026-09-03T20:00:00.000Z",
+              },
+            });
+          },
+          stdout: (value) => stdout.push(value),
+          stderr: (value) => stderr.push(value),
+          token: () => "owner-session-token",
+        },
+      );
+
+      expect(code).toBe(1);
+      expect(stdout).toEqual([]);
+      expect(stderr.join("")).toContain("malformed artifact-consumer resolution receipt");
+    }
   });
 
   test("there is no command-line slot for caller claims or a caller plan digest", async () => {

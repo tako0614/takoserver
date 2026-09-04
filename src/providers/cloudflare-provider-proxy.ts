@@ -17,7 +17,10 @@ import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
 } from "./cloudflare-edge-meter-contract.ts";
-import type { CloudflareProviderExecutorRpc } from "./cloudflare-provider-executor-rpc.ts";
+import {
+  type CloudflareProviderExecutorRpc,
+  isCloudflareProviderArtifactConsumption,
+} from "./cloudflare-provider-executor-rpc.ts";
 import {
   cloudflareWfpOwnsOffering,
   createCloudflareNativeReadbackDescriptor,
@@ -143,10 +146,13 @@ export class CloudflareProviderProxy implements Provider {
     return this.#binding.verifyNativeAbsence(input);
   }
 
-  verifyArtifactConsumption(
+  async verifyArtifactConsumption(
     input: Parameters<NonNullable<Provider["verifyArtifactConsumption"]>>[0],
   ): Promise<ProviderArtifactConsumption> {
-    return this.#binding.verifyArtifactConsumption(input);
+    const result: unknown = await this.#binding.verifyArtifactConsumption(input);
+    return isCloudflareProviderArtifactConsumption(result)
+      ? result
+      : { outcome: "unknown", reason: "malformed", retryable: false };
   }
 
   readonly sqliteMigrations = {

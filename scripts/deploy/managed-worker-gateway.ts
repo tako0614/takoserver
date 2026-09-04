@@ -5,6 +5,11 @@ import { join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
 import {
+  type ManagedWorkerDispatchNamespaceMetadata,
+  type ManagedWorkerDispatchNamespaceState,
+  requirePinnedManagedWorkerDispatchNamespace,
+} from "./managed-worker-dispatch-namespace.ts";
+import {
   REPOSITORY,
   requireEnvironment,
   resolveCloudflareCredential,
@@ -36,7 +41,7 @@ export interface ManagedWorkerGatewayRoute {
   readonly script: string | null;
 }
 
-export interface ManagedWorkerGatewayRouteState {
+export interface ManagedWorkerGatewayRouteState extends ManagedWorkerDispatchNamespaceState {
   workerRoutes(): Promise<readonly ManagedWorkerGatewayRoute[]>;
   /** Immutable gateway Worker deployment history and Version readback. */
   workerDeployments?(workerName: string): Promise<readonly unknown[]>;
@@ -80,8 +85,6 @@ export interface ManagedWorkerGatewayOptions {
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   /** Provider identity carried as an explicit Worker variable. */
   readonly providerId?: string;
-  /** Dispatch namespace id carried as an explicit Wrangler binding. */
-  readonly dispatchNamespace?: string;
   /** Stable gateway identity carried as an explicit Worker variable. */
   readonly gatewayId?: string;
   readonly routePattern?: string;
@@ -270,8 +273,6 @@ export async function runManagedWorkerGateway(
   const zoneId = options.zoneId ?? process.env.TAKOSERVER_MANAGED_WORKER_ZONE_ID;
   const providerId =
     options.providerId ?? process.env.TAKOSERVER_MANAGED_WORKER_PROVIDER_ID ?? null;
-  const dispatchNamespace =
-    options.dispatchNamespace ?? process.env.TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE ?? null;
   const gatewayId = options.gatewayId ?? process.env.TAKOSERVER_MANAGED_WORKER_GATEWAY_ID ?? null;
   const run = options.run ?? runCommand;
   const credential =
@@ -290,6 +291,8 @@ export async function runManagedWorkerGateway(
       accountId: options.accountId ?? target.accountId,
       token: credential?.token ?? exactCloudflareToken(cloudflareEnvironment),
     });
+  let namespace = await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
+  const dispatchNamespace = namespace.namespaceName;
   const inspect = (routes: readonly ManagedWorkerGatewayRoute[]) =>
     inspectManagedWorkerGatewayRoute(routes, {
       pattern,
@@ -304,12 +307,12 @@ export async function runManagedWorkerGateway(
     commit: invocation.commit,
     gatewayScript,
     providerId: providerId ?? "",
-    dispatchNamespace: dispatchNamespace ?? "",
+    dispatchNamespace,
     gatewayId: gatewayId ?? "",
   });
   let plan = planManagedWorkerGatewayRoute(inspection, invocation);
   if (invocation.action === "status") {
-    return gatewayStatus(invocation, inspection, plan, worker);
+    return gatewayStatus(invocation, inspection, plan, worker, namespace);
   }
   if (plan.action === "refuse" || plan.targetScript === null) {
     throw preflightError(plan.reason);
@@ -329,7 +332,7 @@ export async function runManagedWorkerGateway(
       cloudflareEnvironment,
       gatewayScript,
       providerId: exactToken(providerId ?? "", "managed Worker provider id"),
-      dispatchNamespace: exactToken(dispatchNamespace ?? "", "managed Worker dispatch namespace"),
+      dispatchNamespace,
       gatewayId: exactToken(gatewayId ?? "", "managed Worker gateway id"),
     });
     const mutation =
@@ -341,6 +344,7 @@ export async function runManagedWorkerGateway(
           ? {}
           : { fetcher: options.routeMutationFetcher }),
       });
+    namespace = await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
     await mutation.update({
       zoneId: inspection.current.zoneId,
       id: inspection.current.id,
@@ -348,12 +352,13 @@ export async function runManagedWorkerGateway(
       script: plan.targetScript,
     });
     inspection = inspect(await state.workerRoutes());
+    namespace = await requirePinnedManagedWorkerDispatchNamespace("verification", state, target);
     if (inspection.current?.script !== inspection.legacyScript) {
       throw verificationError(
         "managed gateway route reversal readback did not restore legacy script",
       );
     }
-    return gatewayApply(invocation, inspection, plan, true, worker, reviewer);
+    return gatewayApply(invocation, inspection, plan, true, worker, reviewer, namespace);
   }
 
   if (!worker.ready) {
@@ -363,10 +368,7 @@ export async function runManagedWorkerGateway(
       run,
     });
     const configuredProviderId = exactToken(providerId ?? "", "managed Worker provider id");
-    const configuredDispatchNamespace = exactToken(
-      dispatchNamespace ?? "",
-      "managed Worker dispatch namespace",
-    );
+    const configuredDispatchNamespace = dispatchNamespace;
     const configuredGatewayId = exactToken(gatewayId ?? "", "managed Worker gateway id");
     await runOwnerGate(run);
     const temporary = options.outputDirectory === undefined;
@@ -423,6 +425,7 @@ export async function runManagedWorkerGateway(
           }));
         let publication: Awaited<ReturnType<typeof publishWranglerVersion>>;
         try {
+          namespace = await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
           publication = await publishWranglerVersion({
             root,
             bundlePath: prepared.bundlePath,
@@ -456,6 +459,7 @@ export async function runManagedWorkerGateway(
               }
             },
             assertPredecessorStillCurrent: async () => {
+              await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
               const current = await readGatewayHistory("preflight", state, gatewayScript);
               if (!sameGatewayHistory(current, predecessor)) {
                 throw preflightError("gateway Worker predecessor changed during Version staging");
@@ -466,6 +470,11 @@ export async function runManagedWorkerGateway(
           await publicationLease.release();
         }
         artifact.assertUnchanged();
+        namespace = await requirePinnedManagedWorkerDispatchNamespace(
+          "verification",
+          state,
+          target,
+        );
         const afterUpload = await inspectGatewayWorker("verification", state, {
           target,
           commit: source.commit,
@@ -514,7 +523,8 @@ export async function runManagedWorkerGateway(
   }
 
   if (plan.action === "none") {
-    return gatewayApply(invocation, inspection, plan, false, worker, reviewer);
+    namespace = await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
+    return gatewayApply(invocation, inspection, plan, false, worker, reviewer, namespace);
   }
   const mutation =
     options.mutate ??
@@ -526,6 +536,7 @@ export async function runManagedWorkerGateway(
         : { fetcher: options.routeMutationFetcher }),
     });
   const current = inspection.current;
+  namespace = await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
   if (plan.action === "create") {
     if (zoneId === undefined) {
       throw preflightError(
@@ -544,12 +555,13 @@ export async function runManagedWorkerGateway(
     throw preflightError("managed gateway route transition is not actionable");
   }
   inspection = inspect(await state.workerRoutes());
+  namespace = await requirePinnedManagedWorkerDispatchNamespace("verification", state, target);
   if (inspection.status !== "ready") {
     throw verificationError(
       "managed gateway route readback does not match the requested transition",
     );
   }
-  return gatewayApply(invocation, inspection, plan, true, worker, reviewer);
+  return gatewayApply(invocation, inspection, plan, true, worker, reviewer, namespace);
 }
 
 function sameGatewayHistory(
@@ -686,6 +698,7 @@ async function rollbackGatewayWorker(input: {
         environment: input.cloudflareEnvironment,
         run,
         assertCurrentStillExpected: async () => {
+          await requirePinnedManagedWorkerDispatchNamespace("preflight", state, target);
           const latest = await readGatewayHistory("preflight", state, gatewayScript);
           if (!sameGatewayHistory(latest, current)) {
             throw preflightError("gateway Worker changed before rollback traffic mutation");
@@ -732,6 +745,7 @@ async function rollbackGatewayWorker(input: {
         "gateway Worker rollback Version readback is not the exact predecessor",
       );
     }
+    await requirePinnedManagedWorkerDispatchNamespace("verification", state, target);
     return {
       ...restored,
       deploymentId: restoredHistory.deploymentId,
@@ -748,12 +762,15 @@ function gatewayStatus(
   inspection: ManagedWorkerGatewayRouteInspection,
   plan: ReturnType<typeof planManagedWorkerGatewayRoute>,
   worker: GatewayWorkerInspection,
+  namespace: ManagedWorkerDispatchNamespaceMetadata,
 ): Record<string, unknown> {
   return {
     kind: "takoserver.managed-worker-gateway-status@v1",
     surface: invocation.surface,
     environment: invocation.environment,
     selectedCommit: invocation.commit,
+    dispatchNamespace: namespace.namespaceName,
+    dispatchNamespaceId: namespace.namespaceId,
     routePattern: inspection.pattern,
     gatewayScript: inspection.gatewayScript,
     legacyScript: inspection.legacyScript,
@@ -784,6 +801,7 @@ function gatewayApply(
   mutated: boolean,
   worker: GatewayWorkerInspection,
   reviewer: string | null,
+  namespace: ManagedWorkerDispatchNamespaceMetadata,
 ): Record<string, unknown> {
   return {
     kind: "takoserver.managed-worker-gateway-apply@v1",
@@ -791,6 +809,8 @@ function gatewayApply(
     environment: invocation.environment,
     commit: invocation.commit,
     reviewer,
+    dispatchNamespace: namespace.namespaceName,
+    dispatchNamespaceId: namespace.namespaceId,
     routePattern: inspection.pattern,
     routeStatus: inspection.status,
     workerStatus: worker.status,

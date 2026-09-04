@@ -130,6 +130,7 @@ describe("Cloudflare artifact-consumer readback", () => {
 
     expect(await provider.verifyArtifactConsumption?.(historicalInput())).toEqual({
       outcome: "present",
+      consumption: "identified",
       manifestDigests: [MANIFEST],
       evidence: { provider: "cloudflare", kind: "WorkerVersion", binding: "artifact_manifest" },
     });
@@ -170,6 +171,7 @@ describe("Cloudflare artifact-consumer readback", () => {
       }),
     ).toEqual({
       outcome: "present",
+      consumption: "identified",
       manifestDigests: [MANIFEST],
       evidence: { provider: "cloudflare", kind: "WorkerVersion", binding: "host_operation" },
     });
@@ -216,7 +218,7 @@ describe("Cloudflare artifact-consumer readback", () => {
     for (const [response, expected] of [
       [
         Response.json({ success: true, errors: [], result: {} }),
-        { outcome: "present", manifestDigests: [] },
+        { outcome: "present", consumption: "none" },
       ],
       [new Response(null, { status: 404 }), { outcome: "absent" }],
     ] as const) {
@@ -292,6 +294,7 @@ describe("Cloudflare artifact-consumer readback", () => {
 
     expect(await provider.verifyArtifactConsumption?.({ ...historicalInput(), nativeId })).toEqual({
       outcome: "present",
+      consumption: "identified",
       manifestDigests: [MANIFEST],
       evidence: {
         provider: providerId,
@@ -331,7 +334,7 @@ describe("Cloudflare artifact-consumer readback", () => {
       }),
     ).toEqual({
       outcome: "present",
-      manifestDigests: [],
+      consumption: "none",
       evidence: {
         provider: providerId,
         kind: "ModuleWorker",
@@ -589,6 +592,7 @@ describe("Cloudflare artifact-consumer readback", () => {
         captured = input;
         return {
           outcome: "present",
+          consumption: "identified",
           manifestDigests: [MANIFEST],
           evidence: { provider: "executor-proxy" },
         } as const;
@@ -646,7 +650,11 @@ describe("Cloudflare artifact-consumer readback", () => {
         },
         candidateManifestDigests: [MANIFEST],
       }),
-    ).toMatchObject({ outcome: "present", manifestDigests: [MANIFEST] });
+    ).toMatchObject({
+      outcome: "present",
+      consumption: "identified",
+      manifestDigests: [MANIFEST],
+    });
     expect(captured?.target).toEqual({
       tenantId: "org_snapshot",
       resourceUid: "uid_snapshot",
@@ -674,6 +682,7 @@ describe("Cloudflare artifact-consumer readback", () => {
         providerCalls += 1;
         return {
           outcome: "present",
+          consumption: "identified",
           manifestDigests: [MANIFEST],
           evidence: { provider: "fixture" },
         } as const;
@@ -761,6 +770,7 @@ describe("Cloudflare artifact-consumer readback", () => {
         providerCalls += 1;
         return {
           outcome: "present",
+          consumption: "identified",
           manifestDigests: [MANIFEST],
           evidence: { provider: "fixture" },
         } as const;

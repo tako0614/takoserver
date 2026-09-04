@@ -109,6 +109,53 @@ export class CloudflareState {
     return envelope.result;
   }
 
+  async dispatchNamespace(name: string): Promise<unknown | null> {
+    if (!/^[a-z0-9][a-z0-9-]{1,62}$/u.test(name)) {
+      throw preflightError("Cloudflare dispatch namespace name is invalid");
+    }
+    const label = `${name} dispatch namespace`;
+    const url = this.#url(`/workers/dispatch/namespaces/${encodeURIComponent(name)}`);
+    let response: Response;
+    try {
+      response = await this.#fetcher(
+        new Request(url, {
+          method: "GET",
+          redirect: "error",
+          headers: { authorization: `Bearer ${this.#token}`, accept: "application/json" },
+          signal: AbortSignal.timeout(15_000),
+        }),
+      );
+    } catch (error) {
+      throw preflightError(
+        `${label} transport failed`,
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+    const text = await readBoundedResponseText(response, MAX_PROVIDER_RESPONSE_BYTES, label);
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw preflightError(`${label} returned malformed JSON (HTTP ${response.status})`);
+    }
+    if (
+      response.status === 404 &&
+      isRecord(body) &&
+      body.success === false &&
+      body.result === null &&
+      Array.isArray(body.errors) &&
+      body.errors.length === 1 &&
+      isRecord(body.errors[0]) &&
+      body.errors[0].code === 100119
+    ) {
+      return null;
+    }
+    if (!response.ok || !isRecord(body) || body.success !== true || !isRecord(body.result)) {
+      throw preflightError(`${label} failed (HTTP ${response.status})`);
+    }
+    return body.result;
+  }
+
   async workerDomainOwner(hostname: string): Promise<string | null> {
     const domains = await this.workerDomains();
     const matches = domains.filter((entry) => entry.hostname === hostname);

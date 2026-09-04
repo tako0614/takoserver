@@ -15,6 +15,10 @@ import {
   inspectManagedObjectReceiptAuthority,
   type ManagedObjectReceiptAuthorityState,
 } from "./managed-object-receipt-authority.ts";
+import {
+  type ManagedWorkerDispatchNamespaceState,
+  readPinnedManagedWorkerDispatchNamespace,
+} from "./managed-worker-dispatch-namespace.ts";
 import { type CommandResult, REPOSITORY, requireEnvironment, runCommand } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { writeCloudflareProviderExecutorConfig } from "./realized-config.ts";
@@ -47,6 +51,7 @@ export interface CloudflareProviderExecutorInvocation {
 }
 
 export interface CloudflareProviderExecutorState extends ManagedObjectReceiptAuthorityState {
+  dispatchNamespace?: ManagedWorkerDispatchNamespaceState["dispatchNamespace"];
   workerVersion(workerName: string, versionId: string): Promise<unknown>;
   workerSecrets(workerName: string): Promise<readonly unknown[]>;
   workerDomains(): Promise<readonly { readonly hostname: string; readonly service: string }[]>;
@@ -83,6 +88,7 @@ export interface CloudflareProviderExecutorOptions {
 export interface CloudflareProviderExecutorInspection {
   readonly status: "absent" | "ready" | "stale" | "drift";
   readonly ready: boolean;
+  readonly acknowledgementRecoveryQualified?: boolean;
   /** Exact owned executor closure, independent of the selected source commit. */
   readonly managedExact: boolean;
   readonly routeLess: boolean;
@@ -168,8 +174,9 @@ export async function runCloudflareProviderExecutor(
       options.schema ??
       remoteCloudflareProviderExecutorSchema(inspectionConfig, childEnvironment, run);
     const dependencies =
-      options.dependencies ??
-      cloudflareProviderExecutorDependencies(state, target, invocation.commit);
+      options.dependencies === undefined
+        ? cloudflareProviderExecutorDependencies(state, target, invocation.commit)
+        : namespaceQualifiedDependencies(options.dependencies, state, target);
     let before = await inspectCloudflareProviderExecutor(
       "preflight",
       state,
@@ -407,13 +414,20 @@ export async function inspectCloudflareProviderExecutor(
 ): Promise<CloudflareProviderExecutorInspection> {
   const topology = target.cloudflareProviderExecutor;
   if (!topology) throw phaseError(phase, "Cloudflare provider executor target topology is absent");
+  if (topology.dispatchNamespaceId === undefined) {
+    throw phaseError(phase, "Cloudflare provider executor requires a pinned dispatch namespace id");
+  }
   const [history, schemaReady, dependencyState] = await Promise.all([
     readHistory(phase, state, topology.workerName),
     schema.read(phase),
     dependencies.read(phase),
   ]);
   if (history === null) {
-    return absentInspection(schemaReady, dependencyState);
+    return absentInspection(
+      schemaReady,
+      dependencyState,
+      topology.releaseReadbackQualification !== undefined,
+    );
   }
   try {
     const [version, settings, subdomain, routes, domains, secretInventory] = await Promise.all([
@@ -456,6 +470,7 @@ export async function inspectCloudflareProviderExecutor(
     return {
       status: ready ? "ready" : managedExact ? "stale" : "drift",
       ready,
+      acknowledgementRecoveryQualified: topology.releaseReadbackQualification !== undefined,
       managedExact,
       routeLess,
       schemaReady,
@@ -477,7 +492,11 @@ export async function inspectCloudflareProviderExecutor(
       throw phaseError(phase, "Cloudflare provider executor readback is malformed", error);
     }
     return {
-      ...absentInspection(schemaReady, dependencyState),
+      ...absentInspection(
+        schemaReady,
+        dependencyState,
+        topology.releaseReadbackQualification !== undefined,
+      ),
       status: "drift",
       versionId: history.versionId,
       deploymentId: history.deploymentId,
@@ -533,9 +552,10 @@ export function cloudflareProviderExecutorDependencies(
 ): CloudflareProviderExecutorDependencyReader {
   const topology = target.cloudflareProviderExecutor;
   if (!topology) throw preflightError("Cloudflare provider executor dependency topology is absent");
+  const namespaceState = executorNamespaceState(state);
   return {
     async read(phase) {
-      const [receipt, gateway] = await Promise.all([
+      const [receipt, gateway, namespace] = await Promise.all([
         inspectManagedObjectReceiptAuthority(phase, state, {
           scriptName: topology.receiptAuthorityWorkerName,
           providerInstallationId: topology.providerInstallationId,
@@ -543,10 +563,11 @@ export function cloudflareProviderExecutorDependencies(
           commit,
         }),
         inspectManagedWorkerGatewayDependency(phase, state, target, commit),
+        readPinnedManagedWorkerDispatchNamespace(phase, namespaceState, target),
       ]);
       const receiptAuthorityReady = receipt.ready && receipt.routeLess;
       return {
-        ready: receiptAuthorityReady && gateway.ready,
+        ready: receiptAuthorityReady && gateway.ready && namespace.ready,
         receiptAuthorityReady,
         receiptAuthorityVersionId: receipt.versionId,
         managedWorkerGatewayReady: gateway.ready,
@@ -554,6 +575,32 @@ export function cloudflareProviderExecutorDependencies(
       };
     },
   };
+}
+
+function namespaceQualifiedDependencies(
+  dependencies: CloudflareProviderExecutorDependencyReader,
+  state: CloudflareProviderExecutorState,
+  target: DeployTarget,
+): CloudflareProviderExecutorDependencyReader {
+  const namespaceState = executorNamespaceState(state);
+  return {
+    async read(phase) {
+      const [inspection, namespace] = await Promise.all([
+        dependencies.read(phase),
+        readPinnedManagedWorkerDispatchNamespace(phase, namespaceState, target),
+      ]);
+      return { ...inspection, ready: inspection.ready && namespace.ready };
+    },
+  };
+}
+
+function executorNamespaceState(
+  state: CloudflareProviderExecutorState,
+): ManagedWorkerDispatchNamespaceState {
+  if (state.dispatchNamespace === undefined) {
+    throw preflightError("Cloudflare provider executor dispatch namespace reader is unavailable");
+  }
+  return { dispatchNamespace: state.dispatchNamespace.bind(state) };
 }
 
 async function inspectManagedWorkerGatewayDependency(
@@ -742,6 +789,7 @@ function statusResult(
     entrypoint: EXECUTOR_ENTRYPOINT,
     status: inspection.status,
     ready: inspection.ready,
+    acknowledgementRecoveryQualified: inspection.acknowledgementRecoveryQualified === true,
     routeLess: inspection.routeLess,
     schemaReady: inspection.schemaReady,
     dependencies: inspection.dependencies,
@@ -786,6 +834,7 @@ function applyResult(
     mutation,
     reviewer,
     ready: inspection.ready,
+    acknowledgementRecoveryQualified: inspection.acknowledgementRecoveryQualified === true,
   };
 }
 
@@ -879,6 +928,7 @@ function executorBindingClosure(
     },
     PUBLIC_ORIGIN: { type: "plain_text", fields: { text: target.publicOrigin } },
     CLOUDFLARE_ACCOUNT_ID: { type: "plain_text", fields: { text: target.accountId } },
+    TAKOSERVER_ENVIRONMENT: { type: "plain_text", fields: { text: target.environment } },
     TAKOSERVER_ZONES: {
       type: "plain_text",
       fields: { text: JSON.stringify(target.zones ?? []) },
@@ -899,10 +949,14 @@ function executorBindingClosure(
       type: "plain_text",
       fields: { text: topology.providerInstallationId },
     },
-    TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: {
-      type: "plain_text",
-      fields: { text: JSON.stringify(topology.releaseReadbackQualification) },
-    },
+    ...(topology.releaseReadbackQualification === undefined
+      ? {}
+      : {
+          TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: {
+            type: "plain_text",
+            fields: { text: JSON.stringify(topology.releaseReadbackQualification) },
+          },
+        }),
     TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: {
       type: "plain_text",
       fields: { text: topology.receiptAuthorityWorkerName },
@@ -1149,10 +1203,12 @@ function sameExecutorInspection(
 function absentInspection(
   schemaReady: boolean,
   dependencies: CloudflareProviderExecutorDependencyInspection,
+  acknowledgementRecoveryQualified: boolean,
 ): CloudflareProviderExecutorInspection {
   return {
     status: "absent",
     ready: false,
+    acknowledgementRecoveryQualified,
     managedExact: false,
     routeLess: true,
     schemaReady,

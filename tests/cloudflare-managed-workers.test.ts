@@ -1264,6 +1264,35 @@ test("pending upload adoption stays closed until the exact namespace readback is
   expect(api.calls.some((call) => call.endsWith("/content"))).toBe(true);
 });
 
+test("an unqualified integration release still commits after exact acknowledged readback", async () => {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const provider = releaseProvider(api, sql, false);
+  const input = managedVersionInput(
+    "version_unqualified",
+    "release-unqualified",
+    "tsw-unqualified",
+  );
+  const resourceUid = input.identity.uid;
+  if (!resourceUid) throw new Error("managed release resource uid is missing");
+  expect(await provider.apply(input)).toMatchObject({ phase: "succeeded" });
+  expect(api.calls.map((call) => call.split(" ", 2).join(" "))).toEqual([
+    expect.stringMatching(/^PUT /u),
+    expect.stringMatching(/^GET /u),
+    expect.stringMatching(/\/content$/u),
+    expect.stringMatching(/\/settings$/u),
+    expect.stringMatching(/\/secrets$/u),
+  ]);
+  expect(api.calls.every((call) => !call.includes("/workers/scripts/"))).toBe(true);
+  expect(
+    await sql.query(
+      `SELECT state FROM cloudflare_managed_worker_receipts
+       WHERE provider_id = ? AND resource_uid = ?`,
+      ["cloudflare.wfp.integration", resourceUid],
+    ),
+  ).toEqual([{ state: "committed" }]);
+});
+
 test("committed releases fence ETag/content drift and delete ack loss by GET absence", async () => {
   const api = new ManagedReleaseApi();
   const sql = createEphemeralSql();

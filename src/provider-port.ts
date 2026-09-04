@@ -359,8 +359,15 @@ export type ProviderArtifactConsumption =
     }
   | {
       readonly outcome: "present";
-      /** Exact provider-backed matches. Zero and multiple remain non-terminal upstream. */
-      readonly manifestDigests: readonly `sha256:${string}`[];
+      /** The native identity is present and consumes no artifact manifest. */
+      readonly consumption: "none";
+      readonly evidence: JsonObject;
+    }
+  | {
+      readonly outcome: "present";
+      readonly consumption: "identified";
+      /** Exact provider-backed matches, non-empty and sorted by digest. */
+      readonly manifestDigests: readonly [`sha256:${string}`, ...`sha256:${string}`[]];
       readonly evidence: JsonObject;
     }
   | {
@@ -432,9 +439,10 @@ export interface Provider {
   /**
    * Strictly read-only artifact attribution for one recorded Deployment.
    * Implementations may identify only digests from provider-owned state or a
-   * provider identity bound to the exact current Resource snapshot. Missing,
-   * zero, multiple, or unverifiable matches must stay unknown/present-empty;
-   * this method must never mutate the provider to manufacture evidence.
+   * provider identity bound to the exact current Resource snapshot. A present
+   * native identity that consumes no artifact is explicit; missing, multiple,
+   * or unverifiable identities stay unknown. This method must never mutate the
+   * provider to manufacture evidence.
    */
   verifyArtifactConsumption?(
     input: ProviderArtifactConsumptionInput,

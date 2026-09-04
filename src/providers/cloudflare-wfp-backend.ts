@@ -686,7 +686,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       }
       return {
         outcome: "present",
-        manifestDigests: [],
+        consumption: "none",
         evidence: {
           provider: this.#providerId,
           kind,
@@ -703,6 +703,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
     return {
       outcome: "present",
+      consumption: "identified",
       manifestDigests: [manifestDigest],
       evidence: {
         provider: this.#providerId,

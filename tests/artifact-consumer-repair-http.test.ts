@@ -7,12 +7,37 @@ import {
 } from "../src/artifact-consumer-repair.ts";
 import { type Accounts, AuthError } from "../src/auth.ts";
 import { createControlRoutes } from "../src/control.ts";
+import { openApiDocument } from "../src/openapi.ts";
 
 const ORGANIZATION = "org_repair_http";
 const DEPLOYMENT = "dep_repair_http";
 const PLAN = `sha256:${"a".repeat(64)}` as const;
 
 describe("artifact consumer repair HTTP boundary", () => {
+  test("OpenAPI publishes the additive active zero-consumption receipt", () => {
+    const schema = openApiDocument.components.schemas.ArtifactConsumerResolutionReceipt;
+    expect(schema.properties.resolution.enum).toEqual([
+      "terminalized_absent",
+      "attributed_manifest",
+      "verified_zero_consumption",
+    ]);
+    expect(schema.oneOf).toEqual([
+      {
+        required: ["manifestDigest"],
+        properties: { resolution: { const: "attributed_manifest" } },
+      },
+      {
+        properties: {
+          resolution: {
+            type: "string",
+            enum: ["terminalized_absent", "verified_zero_consumption"],
+          },
+        },
+        not: { required: ["manifestDigest"] },
+      },
+    ]);
+  });
+
   test("GET and POST require the exact organization owner session", async () => {
     const { request, calls } = fixture();
 
@@ -35,7 +60,7 @@ describe("artifact consumer repair HTTP boundary", () => {
     expect(await applied.json()).toMatchObject({
       receipt: {
         kind: ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT,
-        resolution: "terminalized_absent",
+        resolution: "verified_zero_consumption",
       },
     });
     expect(calls).toEqual([
@@ -101,7 +126,7 @@ function fixture(enabled = true) {
         deploymentId: input.deploymentId,
         uncertaintyFence: 1,
         planDigest: input.planDigest,
-        resolution: "terminalized_absent",
+        resolution: "verified_zero_consumption",
         createdAt: "2026-09-03T20:00:00.000Z",
       };
     },

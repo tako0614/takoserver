@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
@@ -19,6 +19,7 @@ import { CLOUDFLARE_PROVIDER_METER_SOURCES } from "../src/providers/cloudflare-e
 import {
   type CloudflareProviderExecutorRpc,
   createCloudflareProviderExecutor,
+  isCloudflareProviderArtifactConsumption,
 } from "../src/providers/cloudflare-provider-executor-rpc.ts";
 import {
   CloudflareProviderProxy,
@@ -30,8 +31,24 @@ import {
 } from "../src/providers/cloudflare-readback-descriptor.ts";
 import type { CloudflareManagedObjectReceiptAuthority } from "../src/providers/cloudflare-worker-backend.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  edgeSuppliesFixture,
+  objectBucketSuppliesFixture,
+} from "./helpers/hosted-supply-fixtures.ts";
+
+mock.module("cloudflare:workers", () => ({
+  WorkerEntrypoint: class WorkerEntrypoint {},
+}));
+
+const { createCloudflareProviderExecutorFromEnv } = (await import(
+  "../src/entry-cloudflare-provider-executor.ts"
+)) as typeof import("../src/entry-cloudflare-provider-executor.ts");
+type CloudflareProviderExecutorEnvironment = Parameters<
+  typeof createCloudflareProviderExecutorFromEnv
+>[0];
 
 const DIGEST = `sha256:${"a".repeat(64)}` as const;
+const DIGEST_B = `sha256:${"b".repeat(64)}` as const;
 
 function offering(kind: string, formKind = kind): ProviderOffering {
   return {
@@ -69,6 +86,77 @@ const SUCCEEDED: ProviderTicket = {
   phase: "succeeded",
   result: { nativeId: "worker:managed-worker", observed: {}, outputs: {} },
 };
+
+function compositionEnvironment(
+  environment: string | undefined,
+): CloudflareProviderExecutorEnvironment {
+  const statement = {
+    bind(..._values: readonly unknown[]) {
+      return statement;
+    },
+    async all() {
+      return { results: [], meta: { changes: 0 } };
+    },
+  };
+  const stateDb = {
+    prepare() {
+      return statement;
+    },
+    async batch() {
+      return [];
+    },
+  };
+  const objects = {
+    async put() {
+      return { key: "object", size: 0, etag: "etag" };
+    },
+    async get() {
+      return null;
+    },
+    async head() {
+      return null;
+    },
+    async delete() {},
+    async list() {
+      return { objects: [], truncated: false };
+    },
+  };
+  return {
+    STATE_DB: stateDb,
+    OBJECTS: objects,
+    DISPATCHER: {},
+    MANAGED_WORKER_AUTHORITY: {},
+    SQLITE_DATABASES: {},
+    MANAGED_OBJECT_RECEIPT_AUTHORITY: {},
+    CLOUDFLARE_ACCOUNT_ID: "a".repeat(32),
+    CLOUDFLARE_API_TOKEN: "token",
+    ...(environment === undefined ? {} : { TAKOSERVER_ENVIRONMENT: environment }),
+    TAKOSERVER_ZONES: "[]",
+    TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE: "takoserver-customers-staging",
+    TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME: "takoserver-gateway-staging",
+    TAKOSERVER_MANAGED_BASE_DOMAIN: "workers.example.test",
+    TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID: "cloudflare.staging",
+    TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: "takoserver-receipts-staging",
+    TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: "{}",
+    PUBLIC_ORIGIN: "https://api.example.test",
+    TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(edgeSuppliesFixture()),
+    TAKOSERVER_OBJECT_BUCKET_SUPPLIES: JSON.stringify(objectBucketSuppliesFixture()),
+  } as unknown as CloudflareProviderExecutorEnvironment;
+}
+
+test("Cloudflare provider executor composition gates qualification on the exact environment", async () => {
+  for (const environment of ["rehearsal", "production"]) {
+    await expect(
+      createCloudflareProviderExecutorFromEnv(compositionEnvironment(environment)),
+    ).rejects.toThrow("releaseReadbackQualification");
+  }
+  await expect(
+    createCloudflareProviderExecutorFromEnv(compositionEnvironment("staging")),
+  ).rejects.toThrow("environment is invalid");
+  await expect(
+    createCloudflareProviderExecutorFromEnv(compositionEnvironment(undefined)),
+  ).rejects.toThrow("environment is invalid");
+});
 
 const artifacts = {
   async manifest() {
@@ -168,6 +256,64 @@ function managedObjectProvider(fetch: (request: Request) => Promise<Response>): 
 }
 
 describe("credential-free Cloudflare provider proxy", () => {
+  test("requires explicit nonempty sorted artifact-consumption RPC output", async () => {
+    expect(
+      isCloudflareProviderArtifactConsumption({
+        outcome: "present",
+        consumption: "none",
+        evidence: {},
+      }),
+    ).toBe(true);
+    expect(
+      isCloudflareProviderArtifactConsumption({
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [DIGEST, DIGEST_B],
+        evidence: {},
+      }),
+    ).toBe(true);
+    for (const malformed of [
+      { outcome: "present", manifestDigests: [DIGEST], evidence: {} },
+      { outcome: "present", consumption: "identified", manifestDigests: [], evidence: {} },
+      {
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [DIGEST, DIGEST],
+        evidence: {},
+      },
+      {
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [DIGEST_B, DIGEST],
+        evidence: {},
+      },
+      {
+        outcome: "present",
+        consumption: "none",
+        manifestDigests: [DIGEST],
+        evidence: {},
+      },
+    ]) {
+      expect(isCloudflareProviderArtifactConsumption(malformed)).toBe(false);
+    }
+
+    const proxy = new CloudflareProviderProxy({
+      offerings: [MODULE_WORKER],
+      managedBaseDomain: "workers.example.test",
+      runtimeInputs: true,
+      binding: {
+        async verifyArtifactConsumption() {
+          return { outcome: "present", manifestDigests: [DIGEST], evidence: {} };
+        },
+      } as never,
+    });
+    expect(await proxy.verifyArtifactConsumption?.({} as never)).toEqual({
+      outcome: "unknown",
+      reason: "malformed",
+      retryable: false,
+    });
+  });
+
   test("keeps direct parent APIs on a closed non-Worker offering allowlist", () => {
     const kv = offering("takoform.EdgeKVNamespace", "EdgeKVNamespace");
     const queue = offering("takoform.AtLeastOnceQueue", "AtLeastOnceQueue");
@@ -251,7 +397,12 @@ describe("credential-free Cloudflare provider proxy", () => {
       },
       async verifyArtifactConsumption() {
         calls.push("verifyArtifactConsumption");
-        return { outcome: "present", manifestDigests: [DIGEST], evidence: {} } as const;
+        return {
+          outcome: "present",
+          consumption: "identified",
+          manifestDigests: [DIGEST],
+          evidence: {},
+        } as const;
       },
       async readSqliteMigrationLedger() {
         calls.push("readSqliteMigrationLedger");
@@ -720,7 +871,12 @@ describe("Cloudflare provider executor authority fence", () => {
       const provider = providerStub({
         async verifyArtifactConsumption() {
           reads += 1;
-          return { outcome: "present", manifestDigests: [DIGEST], evidence: {} };
+          return {
+            outcome: "present",
+            consumption: "identified",
+            manifestDigests: [DIGEST],
+            evidence: {},
+          };
         },
       });
       const options = {
@@ -777,6 +933,7 @@ describe("Cloudflare provider executor authority fence", () => {
       expect(reads).toBe(0);
       expect(await executor.verifyArtifactConsumption(input)).toEqual({
         outcome: "present",
+        consumption: "identified",
         manifestDigests: [DIGEST],
         evidence: {},
       });

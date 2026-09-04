@@ -414,7 +414,7 @@ describe("forward-only D1 schema surface", () => {
         return await fixture.run(command, options);
       };
       const pre = migrationStateThrough(36, "oauth-0043-pre");
-      const post = migrationStateThrough(48, "oauth-0048-post");
+      const post = migrationStateThrough(49, "oauth-0049-post");
       const result = await runD1Schema(
         { action: "apply", environment: "integration", commit: COMMIT },
         integration0043Target,
@@ -455,6 +455,7 @@ describe("forward-only D1 schema surface", () => {
           "0046_exact_artifact_recovery_receipts.sql",
           "0047_sponsorship_cutover_consumption.sql",
           "0048_resource_execution_evidence.sql",
+          "0049_artifact_consumer_active_resolution.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);

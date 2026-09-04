@@ -663,7 +663,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       // lifecycle stays retained instead of falsely recording native deletion.
       return {
         outcome: "present",
-        manifestDigests: [],
+        consumption: "none",
         evidence: {
           provider: this.id,
           kind: providerKind(input.offering),
@@ -718,6 +718,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
       }
       return {
         outcome: "present",
+        consumption: "identified",
         manifestDigests: [marker.text],
         evidence: { provider: this.id, kind: "WorkerVersion", binding: "artifact_manifest" },
       };
@@ -755,6 +756,7 @@ WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
     }
     return {
       outcome: "present",
+      consumption: "identified",
       manifestDigests: [input.candidateManifestDigests[0] as `sha256:${string}`],
       evidence: { provider: this.id, kind: "WorkerVersion", binding: "host_operation" },
     };

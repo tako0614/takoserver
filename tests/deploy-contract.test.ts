@@ -48,6 +48,7 @@ const SURFACES = [
   ["takoserver-operator-identity", ["authority"]],
   ["takoserver-integration-operator-identity", ["authority"]],
   ["takoserver-managed-object-receipt-authority", ["irreversible", "authority"]],
+  ["takoserver-managed-worker-dispatch-namespace", ["irreversible", "authority"]],
   ["takoserver-managed-worker-gateway", ["authority"]],
   ["cloudflare-provider-executor", ["authority"]],
   ["takoserver-exact-artifact-recovery", ["irreversible", "authority"]],
@@ -113,6 +114,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     const providerExecutor = contract.surfaces.find(
       ({ surface }) => surface === "cloudflare-provider-executor",
+    );
+    const dispatchNamespace = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-managed-worker-dispatch-namespace",
     );
     const exactArtifactRecovery = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-exact-artifact-recovery",
@@ -270,9 +274,14 @@ describe("Takoserver split deploy entrypoint", () => {
       "TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID",
     );
     expect(providerExecutor?.obligations["post-conditions"]).toContain(
-      "receipt authority -> gateway -> executor -> public API",
+      "Namespace readiness precedes gateway deployment; receipt authority and gateway readiness precede executor deployment",
     );
     expect(providerExecutor?.obligations["post-conditions"]).toContain("Migration 0045");
+    expect(dispatchNamespace?.obligations.provenance).toContain("bootstrap projection");
+    expect(dispatchNamespace?.obligations["post-conditions"]).toContain("created-needs-target-pin");
+    expect(dispatchNamespace?.obligations.reversal).toContain("No delete, rename, reverse");
+    expect(dispatchNamespace?.obligations["pre-mutation-proof"]).toContain("rehearsal receipt");
+    expect(gateway?.requiresEnv).not.toContain("TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE");
     expect(providerExecutor?.obligations.reversal).toContain("immediate predecessor");
     expect(providerExecutor?.obligations.provenance).toContain(
       "TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>",
@@ -472,6 +481,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0046",
       "0047",
       "0048",
+      "0049",
     ] as const) {
       for (const environment of ["rehearsal", "production"] as const) {
         const accepted = await deploy([
@@ -508,6 +518,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0046",
       "0047",
       "0048",
+      "0049",
     ] as const) {
       const refused = await deploy([
         "takoserver-d1-schema",

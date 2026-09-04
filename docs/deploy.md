@@ -1,6 +1,6 @@
 # Takoserver deploy surfaces
 
-This repository owns one deploy entrypoint and twenty-eight separate mutation surfaces.
+This repository owns one deploy entrypoint and thirty separate mutation surfaces.
 The contract is read-only:
 
 ```sh
@@ -18,16 +18,19 @@ The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048>
+bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
+bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
-0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, 0045, 0046, 0047, and 0048. A
+0023–0028, 0029–0033, 0034–0036, 0037–0043, 0044, 0045, 0046, 0047, 0048, and 0049. A
 selector is accepted only when its predecessor is the current lineage; an
 incomplete wave can resume under the same selector, but cannot skip forward.
 The 0048 wave appends the value-free Resource execution-evidence ledger after
 the complete 0047 sponsorship authority lineage; it never rewrites 0047.
+The 0049 wave preserves every prior artifact-consumer receipt while admitting
+only active zero-consumption receipts with no manifest digest. Apply 0049
+before publishing the Worker that can emit that new receipt.
 Integration retains only the no-selector fast path for disposable cadence and
 rejects every protected selector. Its output is explicitly integration-only
 and it cannot write evidence accepted by rehearsal or production. The separate
@@ -465,15 +468,11 @@ owner, and add this topology in the same review:
   "cloudflareProviderExecutor": {
     "workerName": "takoserver-cloudflare-provider-executor-integration",
     "dispatchNamespace": "takoserver-customers-integration",
+    "dispatchNamespaceId": "<uuid read from the created namespace and explicitly pinned>",
     "gatewayWorkerName": "takoserver-managed-worker-gateway-integration",
     "managedBaseDomain": "<current managed base domain>",
     "providerInstallationId": "<current Cloudflare ProviderInstallation id>",
-    "receiptAuthorityWorkerName": "takoserver-managed-object-receipt-authority-integration",
-    "releaseReadbackQualification": {
-      "schema": "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-      "dispatchNamespace": "takoserver-customers-integration",
-      "rehearsalDigest": "sha256:<64 lowercase hex characters>"
-    }
+    "receiptAuthorityWorkerName": "takoserver-managed-object-receipt-authority-integration"
   }
 }
 ```
@@ -482,12 +481,62 @@ The snippet is the topology member, not a complete target. Replace every
 bracketed value with reviewed current evidence before placing it in the full
 JSON object. The parser requires every Cloudflare supply's
 `providerInstallation.id` to equal `providerInstallationId`, requires the
-qualification to name the same dispatch namespace, and requires the public,
-receipt-authority, gateway, and executor Worker names to be distinct. The
-receipt authority reads both its Worker name and `MANAGED_PROVIDER_ID` only
-from this tuple; no duplicate environment variable may redirect it. Keep the
-executor two-secret file and the receipt three-secret file separate from this
-non-secret target.
+public, receipt-authority, gateway, and executor Worker names to be distinct.
+Integration may omit `releaseReadbackQualification` because acknowledgement-
+recovery qualification is not yet implemented or reviewed; when supplied, it
+must retain the exact schema, namespace, and digest validation. Rehearsal and
+production require the qualification object. The receipt authority reads both its Worker name and
+`MANAGED_PROVIDER_ID` only from this tuple; no duplicate environment variable
+may redirect it. Keep the executor two-secret file and the receipt three-secret
+file separate from this non-secret target.
+
+Create the dispatch namespace before assembling any optional runtime
+qualification. The same environment-selected target path can initially contain only this namespace
+surface's projection:
+
+```json
+{
+  "kind": "takoserver.deploy-target@v2",
+  "environment": "integration",
+  "accountId": "<32 hex characters>",
+  "cloudflareProviderExecutor": {
+    "dispatchNamespace": "takoserver-customers-integration"
+  }
+}
+```
+
+```bash
+bun run deploy -- takoserver-managed-worker-dispatch-namespace --status --environment=integration --commit=<40-hex-commit>
+bun run deploy -- takoserver-managed-worker-dispatch-namespace --apply --environment=integration --commit=<40-hex-commit>
+```
+
+This projection is accepted only by the namespace surface. It does not satisfy
+the complete Worker/executor deploy target, does not publish an Offering, and
+does not need invented supply or rehearsal evidence. Creation makes one POST
+after a fresh absence read, then independently reads the exact id/name, empty
+script inventory and `trusted_workers=false`. It reports
+`created-needs-target-pin`. Explicitly add the returned id as
+`cloudflareProviderExecutor.dispatchNamespaceId`, then complete the target with
+the private owner's actual supplies (and, for rehearsal or production, runtime
+qualification) before deploying the gateway/executor. No separate namespace
+environment override exists.
+
+Cloudflare's optional `trusted_workers` response field uses its documented
+untrusted default only when the JSON property is omitted. An explicit `true`
+remains drift; `null` and other non-boolean values are malformed. A verification
+failure after creation never warrants another POST: inspect status, resolve the
+readback discrepancy, then explicitly pin the independently observed id.
+
+Status reports `absent`, `pin-existing`, `ready`, or `drift`. An existing empty
+unpinned namespace requires explicit pinning; a nonempty unpinned namespace is
+not adopted. A missing pinned namespace is drift and is never recreated under
+the same name. There is no deletion, rename or reverse action. A lost create
+acknowledgement stops without retry; use fresh status to reconcile it.
+Rehearsal creation writes an owned no-overwrite `0600` receipt outside Git under
+an owned `0700` directory. Production creation consumes the successful
+same-source-commit rehearsal receipt and re-reads it before creation through
+`TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH`.
+Integration and every status action do not read that receipt.
 
 The one reviewed integration incident additionally requires this closed target
 member. It is rejected outside integration and unless the current provider
@@ -636,12 +685,13 @@ remains unchanged.
 
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
-| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. A target with Cloudflare supplies additionally requires the exact selected-commit provider executor qualification. |
+| `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. A target with Cloudflare supplies additionally requires the exact selected-commit provider executor qualification outside integration; integration may omit the not-yet-produced acknowledgement-recovery marker. |
 | `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
 | `takoserver-public-parent-token-retirement` | `--status`, `--apply` | integration, rehearsal, production | Exact environment-selected v2 target and resolved Cloudflare credential for both actions; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It accepts no additional selector and never reads `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`. |
 | `takoserver-managed-object-receipt-authority` | `--status`, `--apply` | integration, rehearsal, production | The Worker name and provider installation come solely from `target.cloudflareProviderExecutor`; a resolved Cloudflare deploy credential is required for both actions. `--apply` additionally requires `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH`; only a fresh rehearsal/production `v1` apply reads `TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH`. Status never reads any of those three apply-only inputs. |
-| `takoserver-managed-worker-gateway` | `--status`, `--apply` | integration, rehearsal, production | Exact route, gateway and legacy script, zone, provider, dispatch namespace, and gateway identities plus a resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. It reads no managed-object S3/proof secret or receipt-authority evidence. |
-| `cloudflare-provider-executor` | `--status`, `--apply`; `--apply --reverse` | integration, rehearsal, production | `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for every action and contains exactly the parent `CLOUDFLARE_API_TOKEN` and runtime-input seal keyring. Status uses the token only for authoritative readback; forward apply publishes both secret bindings atomically. Apply/reverse additionally require `TAKOSERVER_INDEPENDENT_REVIEW`. Receipt authority, gateway, migration 0045, and the selected target must already be exact. |
+| `takoserver-managed-worker-dispatch-namespace` | `--status`, `--apply` | integration, rehearsal, production | Environment-selected account/name/optional-id target projection and resolved Cloudflare credential. Apply requires `TAKOSERVER_INDEPENDENT_REVIEW`; rehearsal/production creation additionally requires `TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH`. Status reads neither. No supply or runtime qualification is required to create the namespace. |
+| `takoserver-managed-worker-gateway` | `--status`, `--apply` | integration, rehearsal, production | Exact route, gateway and legacy script, zone, provider, and gateway identities plus a resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). Namespace name/id derive only from the complete selected target and must read back as the pinned untrusted incarnation; `TAKOSERVER_INDEPENDENT_REVIEW` is required for apply only. It reads no managed-object S3/proof secret or receipt-authority evidence. |
+| `cloudflare-provider-executor` | `--status`, `--apply`; `--apply --reverse` | integration, rehearsal, production | `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for every action and contains exactly the parent `CLOUDFLARE_API_TOKEN` and runtime-input seal keyring. Status uses the token only for authoritative readback; forward apply publishes both secret bindings atomically. Apply/reverse additionally require `TAKOSERVER_INDEPENDENT_REVIEW`. Receipt authority, gateway, migration 0045, and the selected target must already be exact. Integration may omit `releaseReadbackQualification`; status then reports `acknowledgementRecoveryQualified:false` and does not claim pending-ack recovery readiness. Rehearsal and production retain the required qualification object. |
 | `takoserver-exact-artifact-recovery` | `--status`, `--apply` | integration only | `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH`, `TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`, and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both actions; `TAKOSERVER_INDEPENDENT_REVIEW` for apply. `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH` is read only after status has proved the predecessor quiesced and planned a successor. Every path names a canonical owner-only 0600 file outside the repository. |
 | `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -654,7 +704,7 @@ remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -763,14 +813,18 @@ The separate authority and irreversible surfaces are:
 - `takoserver-managed-worker-gateway`: the internet-routed dispatch and SQLite
   gateway. It retains its original `TakoserverManagedWorkerSqlite` `v1`
   lifecycle and contains no receipt namespace, S3 credential, or receipt proof
-  secret. Its existing staged-Version, exact deployment/readback, route-last,
+  secret. Its target-pinned dispatch namespace must already exist with the
+  exact id/name and `trusted_workers=false`; the namespace is rechecked before
+  mutation and during readback. Its existing staged-Version, exact deployment/readback, route-last,
   and provider-history rollback protocol is unchanged. It has no dependency on
   the receipt authority; the later route-less provider executor must qualify
   both Workers before it can publish tenant Versions.
 - `cloudflare-provider-executor`: the sole Cloudflare parent-provider runtime.
   Its target-owned Worker name, provider installation, dispatch namespace,
   gateway, managed base domain, receipt authority, D1, R2, account, supplies,
-  and release-readback qualification form one closed topology. Status validates
+  and, when present, release-readback qualification form one closed topology.
+  Status reports whether acknowledgement recovery is qualified and never treats
+  an integration omission as recovery readiness. Status validates
   migration 0045, the exact selected-commit receipt authority and gateway, one
   immutable executor module, the exhaustive D1/R2/dispatch/cross-script Durable
   Object/service/plain-text/secret binding set, compatibility settings,
@@ -1007,7 +1061,11 @@ The separate authority and irreversible surfaces are:
   the exact 0044 boundary. The separate 0046 successor widens exact owner-closure
   receipts only for deterministic integration recovery writers and adds one
   durable singleton authorization; it can start only from the exact 0045
-  boundary. The exceptional 0022 selector is a standalone catch-up receipt,
+  boundary. The 0049 successor rebuilds the receipt table forward-only,
+  preserves all 0044 receipt rows, constraints, indexes, and triggers, and adds
+  only the active zero-consumption receipt shape. Routine Worker publication
+  refuses the pending 0049 migration. The exceptional 0022 selector is a
+  standalone catch-up receipt,
   not the root of this ordinary chain and not permission to adopt an arbitrary
   migration-name prefix. It can start only from the exact audited 0001–0016
   names and the frozen canonical 0016 application-schema digest. Rehearsal and

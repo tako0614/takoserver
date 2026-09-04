@@ -83,6 +83,7 @@ describe("artifact consumer repair", () => {
           calls.push([...input.candidateManifestDigests]);
           return {
             outcome: "present",
+            consumption: "identified",
             manifestDigests: [MANIFEST_A],
             evidence: { provider: "fixture", state: "present" },
           };
@@ -172,11 +173,12 @@ describe("artifact consumer repair", () => {
     const readbacks = [
       {
         outcome: "present" as const,
-        manifestDigests: [],
+        consumption: "none" as const,
         evidence: { provider: "fixture", matches: 0 },
       },
       {
         outcome: "present" as const,
+        consumption: "identified" as const,
         manifestDigests: [MANIFEST_A, MANIFEST_B],
         evidence: { provider: "fixture", matches: 2 },
       },
@@ -185,7 +187,7 @@ describe("artifact consumer repair", () => {
         reason: "unsupported" as const,
         retryable: false,
       },
-    ];
+    ] as const;
     for (const [index, readback] of readbacks.entries()) {
       const database = databaseWithRepairMigration();
       const deploymentId = `dep_blocked_${index}`;
@@ -282,6 +284,7 @@ describe("artifact consumer repair", () => {
       sql: createSqliteSql(database),
       provider: consumptionProvider({
         outcome: "present",
+        consumption: "identified",
         manifestDigests: [MANIFEST_B],
         evidence: { provider: "fixture", authority: "wrong-candidate" },
       }),
@@ -418,6 +421,7 @@ describe("artifact consumer repair", () => {
           seenResource = input.resource;
           return {
             outcome: "present",
+            consumption: "identified",
             manifestDigests: [MANIFEST_A],
             evidence: { provider: "fixture", native: "exact" },
           };
@@ -453,6 +457,276 @@ describe("artifact consumer repair", () => {
     // The repair resolves uncertainty, but the attributed target remains a
     // live root and therefore continues to block exact artifact recovery.
     expect(activeUncertaintyCount(database)).toBe(0);
+  });
+
+  test("an active Resource with no manifest candidates verifies zero consumption without mutation", async () => {
+    const database = databaseWithRepairMigration();
+    seedActiveCurrent(database, "dep_active_zero");
+    const resourceBefore = database
+      .query(
+        `SELECT resource_json, generation, revision, updated_at
+         FROM tf_resources WHERE tenant_id = ? AND uid = ?`,
+      )
+      .get(TENANT, "uid_dep_active_zero");
+    const deploymentBefore = database
+      .query(
+        `SELECT state, observed_json, outputs_json, updated_at
+         FROM tf_resource_deployments WHERE tenant_id = ? AND id = ?`,
+      )
+      .get(TENANT, "dep_active_zero");
+    let providerCalls = 0;
+    const repair = createArtifactConsumerRepair({
+      sql: createSqliteSql(database),
+      provider: consumptionProvider(
+        {
+          outcome: "present",
+          consumption: "none",
+          evidence: { provider: "fixture", native: "exact", consumption: "none" },
+        },
+        () => providerCalls++,
+      ),
+      clock: () => new Date("2026-09-03T20:00:00.000Z"),
+      randomId: () => "guard_active_zero",
+    });
+
+    const plan = await repair.status(TENANT, "dep_active_zero");
+    expect(plan).toMatchObject({
+      state: "actionable",
+      path: "active-resource",
+      action: "verify-artifact-consumption",
+      candidateManifestCount: 0,
+    });
+    expect(providerCalls).toBe(0);
+
+    const receipt = await repair.apply({
+      tenantId: TENANT,
+      deploymentId: "dep_active_zero",
+      idempotencyKey: "repair:active:zero",
+      planDigest: plan.planDigest,
+    });
+
+    expect(receipt).toMatchObject({
+      resolution: "verified_zero_consumption",
+      deploymentId: "dep_active_zero",
+      uncertaintyFence: 1,
+    });
+    expect(receipt).not.toHaveProperty("manifestDigest");
+    expect(providerCalls).toBe(1);
+    expect(
+      database
+        .query(
+          `SELECT resource_json, generation, revision, updated_at
+           FROM tf_resources WHERE tenant_id = ? AND uid = ?`,
+        )
+        .get(TENANT, "uid_dep_active_zero"),
+    ).toEqual(resourceBefore);
+    expect(
+      database
+        .query(
+          `SELECT state, observed_json, outputs_json, updated_at
+           FROM tf_resource_deployments WHERE tenant_id = ? AND id = ?`,
+        )
+        .get(TENANT, "dep_active_zero"),
+    ).toEqual(deploymentBefore);
+    expect(activeDeploymentRoot(database, "dep_active_zero")).toBeUndefined();
+    expect(uncertainty(database, "dep_active_zero")).toEqual({ state: "resolved", fence: 2 });
+  });
+
+  test("an active Resource with no spec candidate attributes one held provider manifest", async () => {
+    const database = databaseWithRepairMigration();
+    seedActiveCurrent(database, "dep_active_identified");
+    seedManifest(database, MANIFEST_A);
+    const resourceBefore = resourceIdentity(database, "uid_dep_active_identified");
+    const deploymentBefore = deploymentIdentity(database, "dep_active_identified");
+    const repair = createArtifactConsumerRepair({
+      sql: createSqliteSql(database),
+      provider: consumptionProvider({
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [MANIFEST_A],
+        evidence: { provider: "fixture", binding: "artifact_manifest" },
+      }),
+      clock: () => new Date("2026-09-03T20:00:00.000Z"),
+      randomId: () => "guard_active_identified",
+    });
+    const plan = await repair.status(TENANT, "dep_active_identified");
+    expect(plan).toMatchObject({ state: "actionable", candidateManifestCount: 0 });
+
+    const receipt = await repair.apply({
+      tenantId: TENANT,
+      deploymentId: "dep_active_identified",
+      idempotencyKey: "repair:active:identified",
+      planDigest: plan.planDigest,
+    });
+
+    expect(receipt).toMatchObject({
+      resolution: "attributed_manifest",
+      manifestDigest: MANIFEST_A,
+    });
+    expect(activeDeploymentRoot(database, "dep_active_identified")).toBe(MANIFEST_A);
+    expect(resourceIdentity(database, "uid_dep_active_identified")).toEqual(resourceBefore);
+    expect(deploymentIdentity(database, "dep_active_identified")).toEqual(deploymentBefore);
+    expect(uncertainty(database, "dep_active_identified")).toEqual({
+      state: "resolved",
+      fence: 2,
+    });
+  });
+
+  test("the final CAS refuses an identified digest removed after provider readback", async () => {
+    const database = databaseWithRepairMigration();
+    seedActiveCurrent(database, "dep_active_identified_race");
+    seedManifest(database, MANIFEST_A);
+    const base = createSqliteSql(database);
+    let injected = false;
+    const sql: Sql = {
+      query: (statement, params) => base.query(statement, params),
+      run: (statement, params) => base.run(statement, params),
+      async batch(statements) {
+        if (!injected) {
+          injected = true;
+          await base.run(
+            "DELETE FROM tf_artifact_holds WHERE tenant_id = ? AND kind = 'manifest' AND digest = ?",
+            [TENANT, MANIFEST_A],
+          );
+        }
+        return await base.batch(statements);
+      },
+    };
+    const repair = createArtifactConsumerRepair({
+      sql,
+      provider: consumptionProvider({
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [MANIFEST_A],
+        evidence: { provider: "fixture", binding: "artifact_manifest" },
+      }),
+      clock: () => new Date("2026-09-03T20:00:00.000Z"),
+      randomId: () => "guard_active_identified_race",
+    });
+    const plan = await repair.status(TENANT, "dep_active_identified_race");
+
+    expect(
+      repair.apply({
+        tenantId: TENANT,
+        deploymentId: "dep_active_identified_race",
+        idempotencyKey: "repair:active:identified:race",
+        planDigest: plan.planDigest,
+      }),
+    ).rejects.toMatchObject({ code: "plan_changed", status: 409 });
+    expect(activeDeploymentRoot(database, "dep_active_identified_race")).toBeUndefined();
+    expect(uncertainty(database, "dep_active_identified_race")).toEqual({
+      state: "active",
+      fence: 1,
+    });
+    expect(resolutionReceiptCount(database, "dep_active_identified_race")).toBe(0);
+  });
+
+  test("active identified-empty, duplicate, multiple, and unheld readbacks refuse atomically", async () => {
+    const cases = [
+      {
+        name: "empty",
+        seed: (_database: Database) => {},
+        readback: {
+          outcome: "present",
+          consumption: "identified",
+          manifestDigests: [],
+          evidence: { provider: "fixture", matches: 0 },
+        },
+      },
+      {
+        name: "multiple",
+        seed: (database: Database) => {
+          seedManifest(database, MANIFEST_A);
+          seedManifest(database, MANIFEST_B);
+        },
+        readback: {
+          outcome: "present",
+          consumption: "identified",
+          manifestDigests: [MANIFEST_A, MANIFEST_B],
+          evidence: { provider: "fixture", matches: 2 },
+        },
+      },
+      {
+        name: "duplicate",
+        seed: (database: Database) => {
+          seedManifest(database, MANIFEST_A);
+        },
+        readback: {
+          outcome: "present",
+          consumption: "identified",
+          manifestDigests: [MANIFEST_A, MANIFEST_A],
+          evidence: { provider: "fixture", matches: 2 },
+        },
+      },
+      {
+        name: "unheld",
+        seed: (_database: Database) => {},
+        readback: {
+          outcome: "present",
+          consumption: "identified",
+          manifestDigests: [MANIFEST_B],
+          evidence: { provider: "fixture", matches: 1 },
+        },
+      },
+    ] as const;
+    for (const [index, scenario] of cases.entries()) {
+      const database = databaseWithRepairMigration();
+      const deploymentId = `dep_active_refuse_${scenario.name}`;
+      seedActiveCurrent(database, deploymentId);
+      scenario.seed(database);
+      const repair = createArtifactConsumerRepair({
+        sql: createSqliteSql(database),
+        provider: consumptionProvider(scenario.readback as never),
+        clock: () => new Date("2026-09-03T20:00:00.000Z"),
+        randomId: () => `guard_active_refuse_${index}`,
+      });
+      const plan = await repair.status(TENANT, deploymentId);
+      expect(plan).toMatchObject({ state: "actionable", candidateManifestCount: 0 });
+
+      expect(
+        repair.apply({
+          tenantId: TENANT,
+          deploymentId,
+          idempotencyKey: `repair:active:refuse:${index}`,
+          planDigest: plan.planDigest,
+        }),
+      ).rejects.toMatchObject({ code: "repair_blocked", status: 409 });
+      expect(uncertainty(database, deploymentId)).toEqual({ state: "active", fence: 1 });
+      expect(activeDeploymentRoot(database, deploymentId)).toBeUndefined();
+      expect(resolutionReceiptCount(database, deploymentId)).toBe(0);
+    }
+  });
+
+  test("active unknown provider evidence preserves retryable status codes", async () => {
+    for (const [index, readback] of [
+      { outcome: "indeterminate" as const, reason: "transport" as const, retryable: true },
+      { outcome: "indeterminate" as const, reason: "unsupported" as const, retryable: false },
+    ].entries()) {
+      const database = databaseWithRepairMigration();
+      const deploymentId = `dep_active_unknown_${index}`;
+      seedActiveCurrent(database, deploymentId);
+      const repair = createArtifactConsumerRepair({
+        sql: createSqliteSql(database),
+        provider: consumptionProvider(readback),
+        clock: () => new Date("2026-09-03T20:00:00.000Z"),
+        randomId: () => `guard_active_unknown_${index}`,
+      });
+      const plan = await repair.status(TENANT, deploymentId);
+
+      expect(
+        repair.apply({
+          tenantId: TENANT,
+          deploymentId,
+          idempotencyKey: `repair:active:unknown:${index}`,
+          planDigest: plan.planDigest,
+        }),
+      ).rejects.toMatchObject({
+        code: readback.retryable ? "backend_unavailable" : "repair_blocked",
+        status: readback.retryable ? 503 : 409,
+      });
+      expect(uncertainty(database, deploymentId)).toEqual({ state: "active", fence: 1 });
+      expect(resolutionReceiptCount(database, deploymentId)).toBe(0);
+    }
   });
 
   test("provider absence contradicts an active Resource and cannot terminalize it", async () => {
@@ -685,6 +959,7 @@ describe("artifact consumer repair", () => {
           consumptionProvider(
             {
               outcome: "present",
+              consumption: "identified",
               manifestDigests: [MANIFEST_A],
               evidence: { provider: "fixture" },
             },
@@ -708,6 +983,7 @@ describe("artifact consumer repair", () => {
           consumptionProvider(
             {
               outcome: "present",
+              consumption: "identified",
               manifestDigests: [MANIFEST_A],
               evidence: { provider: "fixture" },
             },
@@ -730,6 +1006,7 @@ describe("artifact consumer repair", () => {
           consumptionProvider(
             {
               outcome: "present",
+              consumption: "identified",
               manifestDigests: [MANIFEST_A],
               evidence: { provider: "fixture" },
             },
@@ -1017,6 +1294,60 @@ describe("artifact consumer repair", () => {
     ).toEqual({ count: 1 });
   });
 
+  test("a zero-consumption receipt recovers a lost acknowledgement without a second read", async () => {
+    const database = databaseWithRepairMigration();
+    seedActiveCurrent(database, "dep_zero_lost_ack");
+    const resourceBefore = resourceIdentity(database, "uid_dep_zero_lost_ack");
+    const deploymentBefore = deploymentIdentity(database, "dep_zero_lost_ack");
+    const base = createSqliteSql(database);
+    let lose = true;
+    let providerCalls = 0;
+    const sql: Sql = {
+      query: (statement, params) => base.query(statement, params),
+      run: (statement, params) => base.run(statement, params),
+      async batch(statements) {
+        const result = await base.batch(statements);
+        if (lose) {
+          lose = false;
+          throw new Error("simulated lost acknowledgement");
+        }
+        return result;
+      },
+    };
+    const repair = createArtifactConsumerRepair({
+      sql,
+      provider: consumptionProvider(
+        {
+          outcome: "present",
+          consumption: "none",
+          evidence: { provider: "fixture", consumption: "none" },
+        },
+        () => providerCalls++,
+      ),
+      clock: () => new Date("2026-09-03T20:00:00.000Z"),
+      randomId: () => "guard_zero_lost_ack",
+    });
+    const plan = await repair.status(TENANT, "dep_zero_lost_ack");
+    const input = {
+      tenantId: TENANT,
+      deploymentId: "dep_zero_lost_ack",
+      idempotencyKey: "repair:zero:lost:ack",
+      planDigest: plan.planDigest,
+    } as const;
+
+    const first = await repair.apply(input);
+    const replay = await repair.apply(input);
+
+    expect(first).toEqual(replay);
+    expect(first.resolution).toBe("verified_zero_consumption");
+    expect(providerCalls).toBe(1);
+    expect(resourceIdentity(database, "uid_dep_zero_lost_ack")).toEqual(resourceBefore);
+    expect(deploymentIdentity(database, "dep_zero_lost_ack")).toEqual(deploymentBefore);
+    expect(activeDeploymentRoot(database, "dep_zero_lost_ack")).toBeUndefined();
+    expect(uncertainty(database, "dep_zero_lost_ack")).toEqual({ state: "resolved", fence: 2 });
+    expect(resolutionReceiptCount(database, "dep_zero_lost_ack")).toBe(1);
+  });
+
   test("an idempotency key cannot be reused for a different deployment", async () => {
     const database = databaseWithRepairMigration();
     seedRetainedHistorical(database, "dep_idempotency_first", "uid_idempotency_first");
@@ -1078,9 +1409,8 @@ describe("artifact consumer repair", () => {
   test("migration 0044 preserves existing lifecycle data", () => {
     const database = new Database(":memory:");
     for (const migration of MIGRATIONS) {
-      if (migration.name !== "0044_artifact_consumer_resolution_receipts.sql") {
-        database.exec(migration.sql);
-      }
+      if (migration.name === "0044_artifact_consumer_resolution_receipts.sql") break;
+      database.exec(migration.sql);
     }
     seedRetainedHistorical(database, "dep_preserved");
     seedManifest(database, MANIFEST_A);
@@ -1159,6 +1489,7 @@ describe("artifact consumer repair", () => {
           }
           return {
             outcome: "present",
+            consumption: "identified",
             manifestDigests: [manifestDigest],
             evidence: { provider: "integration-fixture", authority: "exact-current" },
           };
@@ -1299,8 +1630,12 @@ function seedRetainedClosed(
     .run(TENANT, resourceUid, JSON.stringify(formRef("WorkerVersion")));
 }
 
-function seedActiveCurrent(database: Database, deploymentId: string, manifestDigest: string): void {
-  seedManifest(database, manifestDigest);
+function seedActiveCurrent(
+  database: Database,
+  deploymentId: string,
+  manifestDigest?: string,
+): void {
+  if (manifestDigest) seedManifest(database, manifestDigest);
   const bundleUid = `bundle_${deploymentId}`;
   const resourceUid = `uid_${deploymentId}`;
   database
@@ -1320,7 +1655,7 @@ function seedActiveCurrent(database: Database, deploymentId: string, manifestDig
         kind: "WorkerBundle",
         metadata: { space: "default", name: `bundle-${deploymentId}`, uid: bundleUid },
         form: { formRef: formRef("WorkerBundle") },
-        spec: { manifestDigest },
+        spec: manifestDigest ? { manifestDigest } : {},
       }),
     );
   database
@@ -1455,5 +1790,34 @@ function activeUncertaintyCount(database: Database): number | undefined {
         "SELECT COUNT(*) AS count FROM tf_artifact_consumer_uncertainties WHERE tenant_id = ? AND state = 'active'",
       )
       .get(TENANT) as { count?: number } | null
+  )?.count;
+}
+
+function resourceIdentity(database: Database, resourceUid: string): unknown {
+  return database
+    .query(
+      `SELECT resource_json, generation, revision, updated_at
+       FROM tf_resources WHERE tenant_id = ? AND uid = ?`,
+    )
+    .get(TENANT, resourceUid);
+}
+
+function deploymentIdentity(database: Database, deploymentId: string): unknown {
+  return database
+    .query(
+      `SELECT state, observed_json, outputs_json, updated_at
+       FROM tf_resource_deployments WHERE tenant_id = ? AND id = ?`,
+    )
+    .get(TENANT, deploymentId);
+}
+
+function resolutionReceiptCount(database: Database, deploymentId: string): number | undefined {
+  return (
+    database
+      .query(
+        `SELECT COUNT(*) AS count FROM tf_artifact_consumer_resolution_receipts
+         WHERE tenant_id = ? AND deployment_id = ?`,
+      )
+      .get(TENANT, deploymentId) as { count?: number } | null
   )?.count;
 }

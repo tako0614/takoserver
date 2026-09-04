@@ -12,6 +12,7 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runManagedObjectReceiptAuthority } from "./deploy/managed-object-receipt-authority.ts";
+import { runManagedWorkerDispatchNamespace } from "./deploy/managed-worker-dispatch-namespace.ts";
 import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import { runPublicParentTokenRetirement } from "./deploy/public-parent-token-retirement.ts";
@@ -26,7 +27,11 @@ import {
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
-import { loadTarget, targetPath } from "./deploy/target.ts";
+import {
+  loadManagedWorkerDispatchNamespaceTarget,
+  loadTarget,
+  targetPath,
+} from "./deploy/target.ts";
 import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
 import { runWorkerClosureTransition } from "./deploy/worker-closure-transition.ts";
 import type { WorkerClosureDelta } from "./deploy/worker-state.ts";
@@ -48,7 +53,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Rehearsal and production D1 schema status/apply require one fixed next-wave selector:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
@@ -705,6 +710,21 @@ function isSurface(value: string | undefined): value is Surface {
 }
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-managed-worker-dispatch-namespace") {
+    const namespaceTarget = loadManagedWorkerDispatchNamespaceTarget(
+      targetPath(invocation.environment),
+      invocation.environment,
+    );
+    return await runManagedWorkerDispatchNamespace(
+      {
+        surface: invocation.surface,
+        action: invocation.action,
+        environment: invocation.environment,
+        commit: invocation.commit,
+      },
+      namespaceTarget,
+    );
+  }
   const target = loadTarget(targetPath(invocation.environment), invocation.environment);
   const scopeTransition =
     invocation.formAuthorityScopeTransitionPath === undefined

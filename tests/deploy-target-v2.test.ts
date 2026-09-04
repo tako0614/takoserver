@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadTarget, parseDeployTarget, targetPath } from "../scripts/deploy/target.ts";
+import {
+  loadManagedWorkerDispatchNamespaceTarget,
+  loadTarget,
+  parseDeployTarget,
+  targetPath,
+} from "../scripts/deploy/target.ts";
 import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../src/artifact-recovery.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 import {
@@ -148,6 +153,33 @@ describe("environment-exact deploy target", () => {
       ).cloudflareProviderExecutor,
     ).toEqual(cloudflareProviderExecutor);
 
+    const { dispatchNamespaceId: _bootstrapId, ...bootstrapExecutor } = cloudflareProviderExecutor;
+    expect(
+      parseDeployTarget(
+        descriptor({
+          edgeSupplies,
+          objectBucketSupplies,
+          cloudflareProviderExecutor: bootstrapExecutor,
+        }),
+        "bootstrap Cloudflare target",
+        "rehearsal",
+      ).cloudflareProviderExecutor,
+    ).toEqual(bootstrapExecutor);
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          edgeSupplies,
+          objectBucketSupplies,
+          cloudflareProviderExecutor: {
+            ...cloudflareProviderExecutor,
+            dispatchNamespaceId: "not-a-uuid",
+          },
+        }),
+        "invalid namespace pin",
+        "rehearsal",
+      ),
+    ).toThrow("dispatchNamespaceId");
+
     for (const rejected of [
       descriptor({ edgeSupplies }),
       descriptor({ cloudflareProviderExecutor }),
@@ -183,6 +215,63 @@ describe("environment-exact deploy target", () => {
     ]) {
       expect(() => parseDeployTarget(rejected, "Cloudflare target", "rehearsal")).toThrow();
     }
+  });
+
+  test("allows integration to omit the unproduced acknowledgement-recovery qualification", () => {
+    const edgeSupplies = edgeSuppliesFixture();
+    const objectBucketSupplies = objectBucketSuppliesFixture();
+    const qualified = cloudflareProviderExecutorTarget();
+    const { releaseReadbackQualification: _qualification, ...unqualified } = qualified;
+    const integration = descriptor({
+      environment: "integration",
+      edgeSupplies,
+      objectBucketSupplies,
+      cloudflareProviderExecutor: unqualified,
+    });
+    expect(
+      parseDeployTarget(integration, "integration target without qualification", "integration")
+        .cloudflareProviderExecutor,
+    ).toEqual(unqualified);
+    expect(() =>
+      parseDeployTarget(
+        { ...integration, environment: "rehearsal" },
+        "rehearsal target without qualification",
+        "rehearsal",
+      ),
+    ).toThrow("releaseReadbackQualification");
+    expect(() =>
+      parseDeployTarget(
+        { ...integration, environment: "production" },
+        "production target without qualification",
+        "production",
+      ),
+    ).toThrow("releaseReadbackQualification");
+    expect(() =>
+      parseDeployTarget(
+        {
+          ...integration,
+          cloudflareProviderExecutor: {
+            ...unqualified,
+            releaseReadbackQualification: null,
+          },
+        },
+        "malformed integration qualification",
+        "integration",
+      ),
+    ).toThrow("releaseReadbackQualification");
+  });
+
+  test("loads the namespace bootstrap projection without fabricated supply qualification", () => {
+    const minimal = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "rehearsal",
+      accountId: "a".repeat(32),
+      cloudflareProviderExecutor: { dispatchNamespace: "takoserver-customers-rehearsal" },
+    } as const;
+    withTarget(minimal, (path) => {
+      expect(loadManagedWorkerDispatchNamespaceTarget(path, "rehearsal")).toEqual(minimal);
+      expect(() => loadTarget(path, "rehearsal")).toThrow("unexpected keys");
+    });
   });
 
   test("refuses a descriptor for another environment", () => {

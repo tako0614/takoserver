@@ -189,22 +189,30 @@ export function writeCloudflareProviderExecutorConfig(
   if (!topology) {
     throw preflightError("Cloudflare provider executor config requires exact target topology");
   }
+  if (topology.releaseReadbackQualification === undefined && target.environment !== "integration") {
+    throw preflightError(
+      "Cloudflare provider executor releaseReadbackQualification is required outside integration",
+    );
+  }
   const neutral = readExecutorNeutralConfig();
   assertExecutorNeutral(neutral);
   const { $schema: _schema, ...base } = neutral;
   const vars: Record<string, string> = {
     PUBLIC_ORIGIN: target.publicOrigin,
     CLOUDFLARE_ACCOUNT_ID: target.accountId,
+    TAKOSERVER_ENVIRONMENT: target.environment,
     TAKOSERVER_ZONES: JSON.stringify(target.zones ?? []),
     TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE: topology.dispatchNamespace,
     TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME: topology.gatewayWorkerName,
     TAKOSERVER_MANAGED_BASE_DOMAIN: topology.managedBaseDomain,
     TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID: topology.providerInstallationId,
-    TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: JSON.stringify(
-      topology.releaseReadbackQualification,
-    ),
     TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: topology.receiptAuthorityWorkerName,
   };
+  if (topology.releaseReadbackQualification !== undefined) {
+    vars.TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION = JSON.stringify(
+      topology.releaseReadbackQualification,
+    );
+  }
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
   }

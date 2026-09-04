@@ -850,9 +850,15 @@ describe("reviewed Worker closure transition", () => {
     });
   });
 
-  test("apply refuses pending migrations and settles a lost acknowledgement through status", async () => {
+  test("apply refuses pending 0049 and settles a lost acknowledgement through status", async () => {
     await withRoot("takoserver-closure-pending-", async (root) => {
-      const pending = fixture(root, { applied: ["0001_first.sql"] });
+      const pending = fixture(root, {
+        local: [
+          "0048_resource_execution_evidence.sql",
+          "0049_artifact_consumer_active_resolution.sql",
+        ],
+        applied: ["0048_resource_execution_evidence.sql"],
+      });
       const refusal = await runWorkerClosureTransition(
         {
           surface: "takoserver-worker-authority-cutover",

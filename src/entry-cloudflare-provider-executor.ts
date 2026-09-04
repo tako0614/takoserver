@@ -35,6 +35,8 @@ import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 
+export type CloudflareProviderExecutorEnvironment = "integration" | "rehearsal" | "production";
+
 /** Exact bindings of the route-less parent-provider authority Worker. */
 export interface CloudflareProviderExecutorEnv {
   readonly STATE_DB: Parameters<typeof createD1Sql>[0];
@@ -45,6 +47,7 @@ export interface CloudflareProviderExecutorEnv {
   readonly MANAGED_OBJECT_RECEIPT_AUTHORITY: CloudflareManagedObjectReceiptAuthority;
   readonly CLOUDFLARE_ACCOUNT_ID: string;
   readonly CLOUDFLARE_API_TOKEN: string;
+  readonly TAKOSERVER_ENVIRONMENT: CloudflareProviderExecutorEnvironment;
   readonly TAKOSERVER_ZONES: string;
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
@@ -52,7 +55,7 @@ export interface CloudflareProviderExecutorEnv {
   readonly TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME: string;
   readonly TAKOSERVER_MANAGED_BASE_DOMAIN: string;
   readonly TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID: string;
-  readonly TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: string;
+  readonly TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION?: string;
   readonly TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: string;
   readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: string;
   readonly PUBLIC_ORIGIN: string;
@@ -178,6 +181,11 @@ export async function createCloudflareProviderExecutorFromEnv(
   ) {
     throw new TypeError("Cloudflare provider executor ordinary backend offering is not allowed");
   }
+  const releaseReadbackQualification = parseReleaseQualification(
+    env.TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION,
+    env.TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE,
+    env.TAKOSERVER_ENVIRONMENT,
+  );
 
   const clock = () => new Date();
   const artifacts = createTakoformArtifacts({
@@ -214,10 +222,7 @@ export async function createCloudflareProviderExecutorFromEnv(
       providerInstallationId: env.TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID,
       sql,
       inspectRelease: (input) => inspectManagedRelease(env.DISPATCHER, input),
-      releaseReadbackQualification: parseReleaseQualification(
-        env.TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION,
-        env.TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE,
-      ),
+      ...(releaseReadbackQualification === undefined ? {} : { releaseReadbackQualification }),
       deriveSqliteInstanceName: (input) =>
         env.MANAGED_WORKER_AUTHORITY.deriveSqliteInstanceName(input),
       sealSqliteAdminProof: (input) => env.MANAGED_WORKER_AUTHORITY.sealSqliteAdminProof(input),
@@ -302,7 +307,19 @@ async function inspectManagedRelease(
   };
 }
 
-function parseReleaseQualification(raw: string, dispatchNamespace: string) {
+function parseReleaseQualification(
+  raw: string | undefined,
+  dispatchNamespace: string,
+  environment: CloudflareProviderExecutorEnvironment,
+) {
+  if (raw === undefined) {
+    if (environment !== "integration") {
+      throw new TypeError(
+        "Cloudflare provider executor releaseReadbackQualification is required outside integration",
+      );
+    }
+    return undefined;
+  }
   let value: unknown;
   try {
     if (new TextEncoder().encode(raw).byteLength > 16_384) throw new Error();
@@ -370,14 +387,21 @@ function cloudflareZone(value: unknown): value is CloudflareZone {
 }
 
 function assertExecutorEnv(env: CloudflareProviderExecutorEnv): void {
+  if (
+    env.TAKOSERVER_ENVIRONMENT !== "integration" &&
+    env.TAKOSERVER_ENVIRONMENT !== "rehearsal" &&
+    env.TAKOSERVER_ENVIRONMENT !== "production"
+  ) {
+    throw new TypeError("Cloudflare provider executor environment is invalid");
+  }
   for (const value of [
     env.CLOUDFLARE_ACCOUNT_ID,
     env.CLOUDFLARE_API_TOKEN,
+    env.TAKOSERVER_ENVIRONMENT,
     env.TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE,
     env.TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME,
     env.TAKOSERVER_MANAGED_BASE_DOMAIN,
     env.TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID,
-    env.TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION,
     env.TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME,
     env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING,
     env.PUBLIC_ORIGIN,

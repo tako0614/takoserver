@@ -748,6 +748,21 @@ export const openApiDocument = {
           "createdAt",
         ],
         additionalProperties: false,
+        oneOf: [
+          {
+            required: ["manifestDigest"],
+            properties: { resolution: { const: "attributed_manifest" } },
+          },
+          {
+            properties: {
+              resolution: {
+                type: "string",
+                enum: ["terminalized_absent", "verified_zero_consumption"],
+              },
+            },
+            not: { required: ["manifestDigest"] },
+          },
+        ],
         properties: {
           kind: { const: ARTIFACT_CONSUMER_RESOLUTION_RECEIPT_FORMAT },
           receiptId: IDENTIFIER_SCHEMA,
@@ -756,7 +771,7 @@ export const openApiDocument = {
           planDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
           resolution: {
             type: "string",
-            enum: ["terminalized_absent", "attributed_manifest"],
+            enum: ["terminalized_absent", "attributed_manifest", "verified_zero_consumption"],
           },
           manifestDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
           createdAt: { type: "string", format: "date-time" },

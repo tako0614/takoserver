@@ -234,12 +234,18 @@ function resolutionReceipt(value: unknown): ArtifactConsumerResolutionReceipt | 
     !Number.isSafeInteger(receipt.uncertaintyFence) ||
     !isSha256Digest(receipt.planDigest) ||
     (receipt.resolution !== "terminalized_absent" &&
-      receipt.resolution !== "attributed_manifest") ||
+      receipt.resolution !== "attributed_manifest" &&
+      receipt.resolution !== "verified_zero_consumption") ||
     typeof receipt.createdAt !== "string"
   ) {
     return null;
   }
-  if ((receipt.resolution === "attributed_manifest") !== isSha256Digest(receipt.manifestDigest)) {
+  const hasManifestDigest = Object.hasOwn(receipt, "manifestDigest");
+  if (
+    receipt.resolution === "attributed_manifest"
+      ? !hasManifestDigest || !isSha256Digest(receipt.manifestDigest)
+      : hasManifestDigest
+  ) {
     return null;
   }
   return receipt as unknown as ArtifactConsumerResolutionReceipt;

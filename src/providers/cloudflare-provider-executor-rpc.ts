@@ -329,7 +329,7 @@ export function createCloudflareProviderExecutor(
       }
       try {
         const result = await provider.verifyArtifactConsumption(input);
-        return validArtifactConsumption(result)
+        return isCloudflareProviderArtifactConsumption(result)
           ? result
           : { outcome: "unknown", reason: "malformed", retryable: false };
       } catch {
@@ -2034,9 +2034,14 @@ function stringArray(
   );
 }
 
-function digestArray(value: unknown, maximum: number): value is readonly `sha256:${string}`[] {
+function digestArray(
+  value: unknown,
+  maximum: number,
+  minimum = 0,
+): value is readonly `sha256:${string}`[] {
   return (
     Array.isArray(value) &&
+    value.length >= minimum &&
     value.length <= maximum &&
     value.every(digest) &&
     value.every((item, index) => {
@@ -2046,7 +2051,9 @@ function digestArray(value: unknown, maximum: number): value is readonly `sha256
   );
 }
 
-function validArtifactConsumption(value: unknown): value is ProviderArtifactConsumption {
+export function isCloudflareProviderArtifactConsumption(
+  value: unknown,
+): value is ProviderArtifactConsumption {
   const raw = plainRecord(value) ? value : null;
   if (!raw || typeof raw.outcome !== "string") return false;
   if (raw.outcome === "absent") {
@@ -2054,8 +2061,20 @@ function validArtifactConsumption(value: unknown): value is ProviderArtifactCons
     return !!exact && jsonObject(exact.evidence);
   }
   if (raw.outcome === "present") {
-    const exact = maybeExactRecord(raw, ["outcome", "manifestDigests", "evidence"]);
-    return !!exact && digestArray(exact.manifestDigests, 16_384) && jsonObject(exact.evidence);
+    if (raw.consumption === "none") {
+      const exact = maybeExactRecord(raw, ["outcome", "consumption", "evidence"]);
+      return !!exact && jsonObject(exact.evidence);
+    }
+    if (raw.consumption === "identified") {
+      const exact = maybeExactRecord(raw, [
+        "outcome",
+        "consumption",
+        "manifestDigests",
+        "evidence",
+      ]);
+      return !!exact && digestArray(exact.manifestDigests, 16_384, 1) && jsonObject(exact.evidence);
+    }
+    return false;
   }
   if (raw.outcome === "unknown") {
     const exact = maybeExactRecord(raw, ["outcome", "reason", "retryable"]);

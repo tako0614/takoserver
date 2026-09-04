@@ -15,8 +15,13 @@ const IDEMPOTENCY_KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 
 type Digest = `sha256:${string}`;
+type NonEmptyDigests = readonly [Digest, ...Digest[]];
 type RepairPath = "retained-closed" | "retained-historical" | "active-resource";
 type RepairAction = "verify-native-absence" | "verify-artifact-consumption";
+type ArtifactConsumerResolution =
+  | "terminalized_absent"
+  | "attributed_manifest"
+  | "verified_zero_consumption";
 
 export type ArtifactConsumptionReadback =
   | {
@@ -25,12 +30,14 @@ export type ArtifactConsumptionReadback =
     }
   | {
       readonly outcome: "present";
-      /**
-       * Digests identified by provider-owned state. The lifecycle accepts
-       * exactly one digest and only when it was in the snapshotted candidate
-       * set; zero and multiple matches are deliberately not rounded to one.
-       */
-      readonly manifestDigests: readonly Digest[];
+      readonly consumption: "none";
+      readonly evidence: JsonObject;
+    }
+  | {
+      readonly outcome: "present";
+      readonly consumption: "identified";
+      /** Non-empty, sorted digests identified by provider-owned state. */
+      readonly manifestDigests: NonEmptyDigests;
       readonly evidence: JsonObject;
     }
   | {
@@ -126,7 +133,7 @@ export interface ArtifactConsumerResolutionReceipt {
   readonly deploymentId: string;
   readonly uncertaintyFence: number;
   readonly planDigest: Digest;
-  readonly resolution: "terminalized_absent" | "attributed_manifest";
+  readonly resolution: ArtifactConsumerResolution;
   readonly manifestDigest?: Digest;
   readonly createdAt: string;
 }
@@ -425,7 +432,7 @@ export function createArtifactConsumerRepair(
       }
 
       const deployment = providerDeployment(before.snapshot.deployment);
-      let resolution: "terminalized_absent" | "attributed_manifest";
+      let resolution: ArtifactConsumerResolution;
       let manifestDigest: Digest | undefined;
       let providerEvidence: JsonObject;
 
@@ -499,17 +506,30 @@ export function createArtifactConsumerRepair(
           }
           resolution = "terminalized_absent";
           providerEvidence = readback.evidence;
-        } else {
-          const identified = [...new Set(readback.manifestDigests)].sort();
+        } else if (readback.consumption === "none") {
+          if (before.path !== "active-resource") {
+            throw new ArtifactConsumerRepairError("repair_blocked", 409);
+          }
+          resolution = "verified_zero_consumption";
+          providerEvidence = readback.evidence;
+        } else if (readback.consumption === "identified") {
+          const identified = validIdentifiedDigests(readback.manifestDigests);
+          const digest = identified[0];
           if (
             identified.length !== 1 ||
-            !before.candidateManifestDigests.includes(identified[0] as Digest)
+            !digest ||
+            !before.snapshot.holds.some(
+              (hold) => hold.kind === "manifest" && hold.digest === digest,
+            ) ||
+            !before.snapshot.manifestRows.has(digest)
           ) {
             throw new ArtifactConsumerRepairError("repair_blocked", 409);
           }
           resolution = "attributed_manifest";
-          manifestDigest = identified[0] as Digest;
+          manifestDigest = digest;
           providerEvidence = readback.evidence;
+        } else {
+          throw new ArtifactConsumerRepairError("repair_blocked", 409);
         }
       }
 
@@ -989,7 +1009,7 @@ function activeCandidates(snapshot: RepairSnapshot): {
     }
   }
   const candidates = [...digests].sort();
-  if (candidates.length === 0) return { candidates, blocker: "resource_manifest_missing" };
+  if (candidates.length === 0) return { candidates };
   const held = new Set(
     snapshot.holds.filter((hold) => hold.kind === "manifest").map((hold) => hold.digest),
   );
@@ -1034,7 +1054,7 @@ function commitStatements(input: {
   readonly idempotencyKey: string;
   readonly planDigest: Digest;
   readonly snapshotDigest: Digest;
-  readonly resolution: "terminalized_absent" | "attributed_manifest";
+  readonly resolution: ArtifactConsumerResolution;
   readonly manifestDigest?: Digest;
   readonly providerEvidenceDigest: Digest;
   readonly now: number;
@@ -1068,13 +1088,16 @@ function commitStatements(input: {
         input.deployment.updatedAt,
       ],
     });
-  } else {
+  } else if (input.resolution === "attributed_manifest") {
     mutations.push({
       sql: `INSERT INTO tf_artifact_roots
               (tenant_id, root_kind, root_id, target_kind, digest, state, fence,
                expires_at, release_reason, created_at, released_at)
-            VALUES (?, 'deployment', ?, 'manifest', ?, 'active', 1,
-                    NULL, NULL, ?, NULL)
+            SELECT ?, 'deployment', ?, 'manifest', hold.digest, 'active', 1,
+                   NULL, NULL, ?, NULL
+            FROM tf_artifact_holds AS hold
+            JOIN tf_artifact_manifests AS manifest ON manifest.digest = hold.digest
+            WHERE hold.tenant_id = ? AND hold.kind = 'manifest' AND hold.digest = ?
             ON CONFLICT (tenant_id, root_kind, root_id, target_kind, digest) DO UPDATE SET
               state = 'active', fence = tf_artifact_roots.fence + 1,
               expires_at = NULL, release_reason = NULL, created_at = excluded.created_at,
@@ -1083,8 +1106,9 @@ function commitStatements(input: {
       params: [
         input.tenantId,
         input.deploymentId,
-        input.manifestDigest as Digest,
         input.deployment.createdAt,
+        input.tenantId,
+        input.manifestDigest as Digest,
       ],
     });
     mutations.push({
@@ -1106,6 +1130,20 @@ function commitStatements(input: {
         input.tenantId,
         input.deploymentId,
         input.manifestDigest as Digest,
+      ],
+    });
+  } else {
+    mutations.push({
+      sql: `UPDATE tf_artifact_consumer_uncertainties
+            SET state = 'resolved', fence = fence + 1, resolved_at = ?
+            WHERE tenant_id = ? AND consumer_kind = 'deployment'
+              AND consumer_id = ? AND state = 'active' AND fence = ? AND reason = ?`,
+      params: [
+        input.now,
+        input.tenantId,
+        input.deploymentId,
+        input.uncertainty.fence,
+        input.uncertainty.reason,
       ],
     });
   }
@@ -1200,7 +1238,11 @@ function receipt(
   if (rows.length !== 1) throw new ArtifactConsumerRepairError("backend_unavailable", 503);
   const row = rows[0] as Record<string, unknown>;
   const resolution = requiredText(row.resolution as JsonValue);
-  if (resolution !== "terminalized_absent" && resolution !== "attributed_manifest") {
+  if (
+    resolution !== "terminalized_absent" &&
+    resolution !== "attributed_manifest" &&
+    resolution !== "verified_zero_consumption"
+  ) {
     invalidSnapshot();
   }
   const manifestDigest =
@@ -1216,6 +1258,19 @@ function receipt(
     ...(manifestDigest ? { manifestDigest } : {}),
     createdAt: new Date(requiredInteger(row.created_at as JsonValue)).toISOString(),
   };
+}
+
+function validIdentifiedDigests(value: unknown): readonly Digest[] {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(isSha256Digest)) return [];
+  if (
+    value.some((digest, index) => {
+      const previous = value[index - 1];
+      return index > 0 && (previous === undefined || previous >= digest);
+    })
+  ) {
+    return [];
+  }
+  return value;
 }
 
 function validIdentity(tenantId: string, deploymentId: string): void {

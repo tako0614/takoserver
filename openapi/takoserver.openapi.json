@@ -102,6 +102,34 @@
           "createdAt"
         ],
         "additionalProperties": false,
+        "oneOf": [
+          {
+            "required": [
+              "manifestDigest"
+            ],
+            "properties": {
+              "resolution": {
+                "const": "attributed_manifest"
+              }
+            }
+          },
+          {
+            "properties": {
+              "resolution": {
+                "type": "string",
+                "enum": [
+                  "terminalized_absent",
+                  "verified_zero_consumption"
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "manifestDigest"
+              ]
+            }
+          }
+        ],
         "properties": {
           "kind": {
             "const": "takoserver.artifact-consumer-resolution-receipt@v1"
@@ -128,7 +156,8 @@
             "type": "string",
             "enum": [
               "terminalized_absent",
-              "attributed_manifest"
+              "attributed_manifest",
+              "verified_zero_consumption"
             ]
           },
           "manifestDigest": {

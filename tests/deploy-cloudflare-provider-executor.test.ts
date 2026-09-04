@@ -25,6 +25,7 @@ import {
   materializeCloudflareProviderExecutorSecrets,
 } from "../scripts/deploy/cloudflare-provider-executor-secrets.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { writeCloudflareProviderExecutorConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 
@@ -34,6 +35,7 @@ const COMMIT = "c".repeat(40);
 const WORKER = "takoserver-cloudflare-provider-executor-integration";
 const GATEWAY = "takoserver-managed-worker-gateway-integration";
 const RECEIPTS = "takoserver-managed-object-receipt-authority-integration";
+const DISPATCH_NAMESPACE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const VERSION = "11111111-1111-4111-8111-111111111111";
 const DEPLOYMENT = "22222222-2222-4222-8222-222222222222";
 const PREVIOUS_VERSION = "55555555-5555-4555-8555-555555555555";
@@ -67,6 +69,7 @@ function target(): DeployTarget {
     cloudflareProviderExecutor: {
       workerName: WORKER,
       dispatchNamespace: "takoserver-customers-integration",
+      dispatchNamespaceId: DISPATCH_NAMESPACE_ID,
       gatewayWorkerName: GATEWAY,
       managedBaseDomain: "workers.integration.example.test",
       providerInstallationId: "cloudflare.wfp.integration",
@@ -90,6 +93,8 @@ class ExecutorState implements CloudflareProviderExecutorState {
   routeOwner: string | null = null;
   driftSettingsAfterRead: number | null = null;
   private settingsReads = 0;
+
+  constructor(private readonly selected: DeployTarget = target()) {}
 
   publish(commit: string, digest: string, source: string): void {
     const previous = this.history[0];
@@ -137,7 +142,7 @@ class ExecutorState implements CloudflareProviderExecutorState {
   async workerVersionWithModules(workerName: string, versionId: string): Promise<unknown> {
     const version = this.versions.get(versionId);
     if (workerName !== WORKER || version === undefined) return {};
-    return executorVersion(version, versionId);
+    return executorVersion(version, versionId, this.selected);
   }
 
   async workerSettings(): Promise<unknown> {
@@ -186,6 +191,27 @@ class ExecutorState implements CloudflareProviderExecutorState {
       type: "secret_text",
     }));
   }
+
+  async dispatchNamespace(): Promise<unknown> {
+    return dispatchNamespaceMetadata();
+  }
+}
+
+function dispatchNamespaceMetadata(): unknown {
+  return dispatchNamespaceMetadataWithId(DISPATCH_NAMESPACE_ID);
+}
+
+function dispatchNamespaceMetadataWithId(namespaceId: string): unknown {
+  return {
+    created_by: "a".repeat(32),
+    created_on: "2026-09-04T00:00:00Z",
+    modified_by: "a".repeat(32),
+    modified_on: "2026-09-04T00:00:00Z",
+    namespace_id: namespaceId,
+    namespace_name: "takoserver-customers-integration",
+    script_count: 1,
+    trusted_workers: false,
+  };
 }
 
 function executorVersion(
@@ -195,8 +221,8 @@ function executorVersion(
     readonly source: string;
   },
   versionId = VERSION,
+  selected = target(),
 ): unknown {
-  const selected = target();
   const topology = selected.cloudflareProviderExecutor;
   if (!topology) throw new Error("missing topology");
   return {
@@ -242,6 +268,7 @@ function executorVersion(
       },
       { name: "PUBLIC_ORIGIN", type: "plain_text", text: selected.publicOrigin },
       { name: "CLOUDFLARE_ACCOUNT_ID", type: "plain_text", text: selected.accountId },
+      { name: "TAKOSERVER_ENVIRONMENT", type: "plain_text", text: selected.environment },
       { name: "TAKOSERVER_ZONES", type: "plain_text", text: "[]" },
       {
         name: "TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE",
@@ -263,11 +290,15 @@ function executorVersion(
         type: "plain_text",
         text: topology.providerInstallationId,
       },
-      {
-        name: "TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION",
-        type: "plain_text",
-        text: JSON.stringify(topology.releaseReadbackQualification),
-      },
+      ...(topology.releaseReadbackQualification === undefined
+        ? []
+        : [
+            {
+              name: "TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION",
+              type: "plain_text",
+              text: JSON.stringify(topology.releaseReadbackQualification),
+            },
+          ]),
       {
         name: "TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME",
         type: "plain_text",
@@ -435,6 +466,37 @@ test("checked-in executor topology is route-less and credential ownership is clo
   expect(packageJson.scripts.check).toContain("build:cloudflare-provider-executor");
 });
 
+test("integration executor config omits an unqualified acknowledgement-recovery marker", () => {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-executor-unqualified-config-"));
+  try {
+    const topology = target().cloudflareProviderExecutor;
+    if (!topology) throw new Error("missing Cloudflare provider executor topology");
+    const { releaseReadbackQualification: _qualification, ...unqualifiedTopology } = topology;
+    const path = writeCloudflareProviderExecutorConfig(
+      { ...target(), cloudflareProviderExecutor: unqualifiedTopology },
+      { path: join(root, "executor.json"), main: "worker.js" },
+    );
+    const config = JSON.parse(readFileSync(path, "utf8")) as {
+      vars: Record<string, string>;
+    };
+    expect(config.vars).not.toHaveProperty("TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION");
+    expect(config.vars.TAKOSERVER_ENVIRONMENT).toBe("integration");
+
+    expect(() =>
+      writeCloudflareProviderExecutorConfig(
+        {
+          ...target(),
+          environment: "production",
+          cloudflareProviderExecutor: unqualifiedTopology,
+        },
+        { path: join(root, "production.json"), main: "worker.js" },
+      ),
+    ).toThrow("releaseReadbackQualification");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("executor secrets materialize only from an external canonical owner-only file", () => {
   const sourceRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-secret-source-"));
   const releaseRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-secret-release-"));
@@ -505,6 +567,89 @@ test("executor inspection requires exact code, bindings, settings, secrets and n
   expect(planCloudflareProviderExecutor(routed, false)).toBe("refuse");
 });
 
+test("status marks integration acknowledgement recovery unqualified when the marker is absent", async () => {
+  const qualifiedTarget = target();
+  const topology = qualifiedTarget.cloudflareProviderExecutor;
+  if (!topology) throw new Error("missing Cloudflare provider executor topology");
+  const { releaseReadbackQualification: _qualification, ...unqualifiedTopology } = topology;
+  const unqualifiedTarget: DeployTarget = {
+    ...qualifiedTarget,
+    cloudflareProviderExecutor: unqualifiedTopology,
+  };
+  const state = new ExecutorState(unqualifiedTarget);
+  const absentState = new ExecutorState(unqualifiedTarget);
+  state.publish(COMMIT, createHash("sha256").update(BUNDLE).digest("hex"), BUNDLE);
+  const sourceRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-unqualified-status-"));
+  const secretPath = join(sourceRoot, "secrets.json");
+  try {
+    writeSecrets(secretPath);
+    const absent = await runCloudflareProviderExecutor(
+      {
+        surface: "cloudflare-provider-executor",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      unqualifiedTarget,
+      {
+        state: absentState,
+        schema: schema(),
+        dependencies: dependencies(),
+        secretsPath: secretPath,
+      },
+    );
+    expect(absent).toMatchObject({
+      status: "absent",
+      ready: false,
+      acknowledgementRecoveryQualified: false,
+    });
+
+    const status = await runCloudflareProviderExecutor(
+      {
+        surface: "cloudflare-provider-executor",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      unqualifiedTarget,
+      {
+        state,
+        schema: schema(),
+        dependencies: dependencies(),
+        secretsPath: secretPath,
+      },
+    );
+    expect(status).toMatchObject({
+      status: "ready",
+      ready: true,
+      acknowledgementRecoveryQualified: false,
+    });
+    state.routeOwner = WORKER;
+    const drift = await runCloudflareProviderExecutor(
+      {
+        surface: "cloudflare-provider-executor",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      unqualifiedTarget,
+      {
+        state,
+        schema: schema(),
+        dependencies: dependencies(),
+        secretsPath: secretPath,
+      },
+    );
+    expect(drift).toMatchObject({
+      status: "drift",
+      ready: false,
+      acknowledgementRecoveryQualified: false,
+    });
+  } finally {
+    rmSync(sourceRoot, { recursive: true, force: true });
+  }
+});
+
 test("dependency proof enforces receipt authority then the exact managed gateway route", async () => {
   const selected = target();
   const topology = selected.cloudflareProviderExecutor;
@@ -513,7 +658,11 @@ test("dependency proof enforces receipt authority then the exact managed gateway
   let gatewayExtraRoute = false;
   let gatewayCustomDomain = false;
   let receiptCustomDomain = false;
+  let observedDispatchNamespaceId = DISPATCH_NAMESPACE_ID;
   const state: CloudflareProviderExecutorState = {
+    async dispatchNamespace() {
+      return dispatchNamespaceMetadataWithId(observedDispatchNamespaceId);
+    },
     async workerDeployments(workerName) {
       if (workerName === RECEIPTS) {
         return [
@@ -593,6 +742,11 @@ test("dependency proof enforces receipt authority then the exact managed gateway
     receiptAuthorityReady: true,
     managedWorkerGatewayReady: true,
   });
+  observedDispatchNamespaceId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  await expect(proof.read("preflight")).resolves.toMatchObject({
+    ready: false,
+  });
+  observedDispatchNamespaceId = DISPATCH_NAMESPACE_ID;
   gatewayRouteOwner = "wrong-gateway";
   await expect(proof.read("preflight")).resolves.toMatchObject({
     ready: false,
@@ -618,6 +772,15 @@ test("dependency proof enforces receipt authority then the exact managed gateway
     receiptAuthorityReady: false,
     managedWorkerGatewayReady: true,
   });
+
+  const { dispatchNamespaceId: _dispatchNamespaceId, ...bootstrapTopology } = topology;
+  const bootstrapTarget: DeployTarget = {
+    ...selected,
+    cloudflareProviderExecutor: bootstrapTopology,
+  };
+  await expect(
+    cloudflareProviderExecutorDependencies(state, bootstrapTarget, COMMIT).read("preflight"),
+  ).rejects.toThrow("explicit target id pin");
 });
 
 test("schema proof requires migration 0045 and the exact CAS table and index", async () => {

@@ -30,6 +30,58 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("reads one dispatch namespace by exact name and recognizes only error 100119 as absent", async () => {
+    const requests: Request[] = [];
+    const metadata = {
+      namespace_id: "f174e90a-fafe-4643-bbbc-4a0ed4fc8415",
+      namespace_name: "takoserver-customers",
+    };
+    let response = Response.json({ success: true, result: metadata });
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return response;
+      },
+    });
+
+    expect(await state.dispatchNamespace("takoserver-customers")).toEqual(metadata);
+    response = Response.json(
+      { success: false, result: null, errors: [{ code: 100119, message: "not found" }] },
+      { status: 404 },
+    );
+    expect(await state.dispatchNamespace("takoserver-customers")).toBeNull();
+    expect(new URL(requests[0]?.url ?? "").pathname).toBe(
+      `/client/v4/accounts/${ACCOUNT}/workers/dispatch/namespaces/takoserver-customers`,
+    );
+    expect(requests.every((request) => request.method === "GET")).toBe(true);
+  });
+
+  test("never converts auth, unknown, false-result or malformed namespace responses to absence", async () => {
+    for (const response of [
+      Response.json(
+        { success: false, result: null, errors: [{ code: 100119, message: "forged" }] },
+        { status: 403 },
+      ),
+      Response.json(
+        { success: false, result: null, errors: [{ code: 100120, message: "unknown" }] },
+        { status: 404 },
+      ),
+      Response.json({ success: true, result: false }),
+      new Response("not-json", { status: 404 }),
+    ]) {
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        fetcher: async () => response,
+      });
+      await expect(state.dispatchNamespace("takoserver-customers")).rejects.toBeInstanceOf(
+        DeployError,
+      );
+    }
+  });
+
   test("re-authenticates all-zone token authority for every topology scan", async () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-topology-audit-"));
     const auditCredentialPath = join(directory, "credential.json");

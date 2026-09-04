@@ -75,11 +75,12 @@ export interface DeployTarget {
   readonly cloudflareProviderExecutor?: {
     readonly workerName: string;
     readonly dispatchNamespace: string;
+    readonly dispatchNamespaceId?: string;
     readonly gatewayWorkerName: string;
     readonly managedBaseDomain: string;
     readonly providerInstallationId: string;
     readonly receiptAuthorityWorkerName: string;
-    readonly releaseReadbackQualification: {
+    readonly releaseReadbackQualification?: {
       readonly schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1";
       readonly dispatchNamespace: string;
       readonly rehearsalDigest: `sha256:${string}`;
@@ -177,6 +178,16 @@ export interface DeployTarget {
   };
 }
 
+export interface ManagedWorkerDispatchNamespaceTarget {
+  readonly kind: "takoserver.deploy-target@v2";
+  readonly environment: DeployEnvironment;
+  readonly accountId: string;
+  readonly cloudflareProviderExecutor: {
+    readonly dispatchNamespace: string;
+    readonly dispatchNamespaceId?: string;
+  };
+}
+
 export const DEPLOY_TARGET_KIND = "takoserver.deploy-target@v2";
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
@@ -221,6 +232,7 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
             cloudflareProviderExecutor: {
               workerName: `takoserver-cloudflare-provider-executor-${environment}`,
               dispatchNamespace: `takoserver-customers-${environment}`,
+              dispatchNamespaceId: "<uuid after explicit namespace pin>",
               gatewayWorkerName: `takoserver-managed-worker-gateway-${environment}`,
               managedBaseDomain: `<managed-base-domain>`,
               providerInstallationId: `cloudflare.${environment}`,
@@ -250,6 +262,110 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
     throw preflightError(`deploy target descriptor is not valid JSON: ${path}`);
   }
   return parseDeployTarget(parsed, path, environment);
+}
+
+export function loadManagedWorkerDispatchNamespaceTarget(
+  path: string,
+  environment: DeployEnvironment,
+): ManagedWorkerDispatchNamespaceTarget {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    const selector = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
+    throw preflightError(
+      `dispatch namespace target descriptor not found: ${path}; select its absolute path with ${selector}`,
+      JSON.stringify(
+        {
+          kind: DEPLOY_TARGET_KIND,
+          environment,
+          accountId: "<32 hex characters>",
+          cloudflareProviderExecutor: {
+            dispatchNamespace: `takoserver-customers-${environment}`,
+            dispatchNamespaceId: "<optional uuid after explicit namespace pin>",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw preflightError(`dispatch namespace target descriptor is not valid JSON: ${path}`);
+  }
+  if (!isRecord(value)) {
+    throw preflightError("dispatch namespace target descriptor must be an object");
+  }
+  assertExactKeys(
+    value,
+    ["kind", "environment", "accountId", "cloudflareProviderExecutor"],
+    [
+      "workerName",
+      "d1",
+      "r2",
+      "publicOrigin",
+      "signing",
+      "aliases",
+      "consoleOrigin",
+      "googleClientId",
+      "takosId",
+      "stripeCheckout",
+      "zones",
+      "aiModels",
+      "objectBucketSupplies",
+      "edgeSupplies",
+      "sponsorshipAuthority",
+      "formAuthority",
+      "exactArtifactRecovery",
+      "operatorIdentity",
+      "integrationE2eCredentialAuthority",
+      "artifactBlobIoMode",
+    ],
+  );
+  if (value.kind !== DEPLOY_TARGET_KIND || value.environment !== environment) {
+    throw preflightError("dispatch namespace target kind or environment is invalid");
+  }
+  const executor = value.cloudflareProviderExecutor;
+  if (!isRecord(executor)) {
+    throw preflightError("dispatch namespace target cloudflareProviderExecutor must be an object");
+  }
+  assertExactKeys(
+    executor,
+    ["dispatchNamespace"],
+    [
+      "dispatchNamespaceId",
+      "workerName",
+      "gatewayWorkerName",
+      "managedBaseDomain",
+      "providerInstallationId",
+      "receiptAuthorityWorkerName",
+      "releaseReadbackQualification",
+    ],
+  );
+  return {
+    kind: DEPLOY_TARGET_KIND,
+    environment,
+    accountId: pattern(value.accountId, ACCOUNT_ID, "accountId"),
+    cloudflareProviderExecutor: {
+      dispatchNamespace: pattern(
+        executor.dispatchNamespace,
+        WORKER_NAME,
+        "cloudflareProviderExecutor.dispatchNamespace",
+      ),
+      ...(executor.dispatchNamespaceId === undefined
+        ? {}
+        : {
+            dispatchNamespaceId: pattern(
+              executor.dispatchNamespaceId,
+              UUID,
+              "cloudflareProviderExecutor.dispatchNamespaceId",
+            ),
+          }),
+    },
+  };
 }
 
 /** Pure validation of one already-decoded operator-private target descriptor. */
@@ -334,7 +450,10 @@ export function parseDeployTarget(
     ...(value.cloudflareProviderExecutor === undefined
       ? {}
       : {
-          cloudflareProviderExecutor: cloudflareProviderExecutor(value.cloudflareProviderExecutor),
+          cloudflareProviderExecutor: cloudflareProviderExecutor(
+            value.cloudflareProviderExecutor,
+            environment,
+          ),
         }),
     ...(value.sponsorshipAuthority === undefined
       ? {}
@@ -760,34 +879,47 @@ function parseHistoricalPreExecutorPublicWorker(
 
 function cloudflareProviderExecutor(
   value: unknown,
+  environment: DeployEnvironment,
 ): NonNullable<DeployTarget["cloudflareProviderExecutor"]> {
   if (!isRecord(value)) {
     throw preflightError("deploy target `cloudflareProviderExecutor` must be an object");
   }
-  assertExactKeys(value, [
-    "workerName",
-    "dispatchNamespace",
-    "gatewayWorkerName",
-    "managedBaseDomain",
-    "providerInstallationId",
-    "receiptAuthorityWorkerName",
-    "releaseReadbackQualification",
-  ]);
+  assertExactKeys(
+    value,
+    [
+      "workerName",
+      "dispatchNamespace",
+      "gatewayWorkerName",
+      "managedBaseDomain",
+      "providerInstallationId",
+      "receiptAuthorityWorkerName",
+    ],
+    ["dispatchNamespaceId", "releaseReadbackQualification"],
+  );
   const qualification = value.releaseReadbackQualification;
-  if (!isRecord(qualification)) {
-    throw preflightError(
-      "deploy target Cloudflare provider executor release qualification must be an object",
-    );
+  if (qualification === undefined) {
+    if (environment !== "integration") {
+      throw preflightError(
+        "deploy target Cloudflare provider executor releaseReadbackQualification is required outside integration",
+      );
+    }
+  } else {
+    if (!isRecord(qualification)) {
+      throw preflightError(
+        "deploy target Cloudflare provider executor releaseReadbackQualification must be an object",
+      );
+    }
+    assertExactKeys(qualification, ["schema", "dispatchNamespace", "rehearsalDigest"]);
   }
-  assertExactKeys(qualification, ["schema", "dispatchNamespace", "rehearsalDigest"]);
   const dispatchNamespace = pattern(
     value.dispatchNamespace,
     WORKER_NAME,
     "cloudflareProviderExecutor.dispatchNamespace",
   );
   if (
-    qualification.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
-    qualification.dispatchNamespace !== dispatchNamespace
+    qualification !== undefined &&
+    (qualification.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
+      qualification.dispatchNamespace !== dispatchNamespace)
   ) {
     throw preflightError(
       "deploy target Cloudflare provider executor release qualification must name its exact dispatch namespace",
@@ -796,6 +928,15 @@ function cloudflareProviderExecutor(
   return {
     workerName: pattern(value.workerName, WORKER_NAME, "cloudflareProviderExecutor.workerName"),
     dispatchNamespace,
+    ...(value.dispatchNamespaceId === undefined
+      ? {}
+      : {
+          dispatchNamespaceId: pattern(
+            value.dispatchNamespaceId,
+            UUID,
+            "cloudflareProviderExecutor.dispatchNamespaceId",
+          ),
+        }),
     gatewayWorkerName: pattern(
       value.gatewayWorkerName,
       WORKER_NAME,
@@ -816,15 +957,19 @@ function cloudflareProviderExecutor(
       WORKER_NAME,
       "cloudflareProviderExecutor.receiptAuthorityWorkerName",
     ),
-    releaseReadbackQualification: {
-      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-      dispatchNamespace,
-      rehearsalDigest: pattern(
-        qualification.rehearsalDigest,
-        SHA256,
-        "cloudflareProviderExecutor.releaseReadbackQualification.rehearsalDigest",
-      ) as `sha256:${string}`,
-    },
+    ...(qualification === undefined
+      ? {}
+      : {
+          releaseReadbackQualification: {
+            schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+            dispatchNamespace,
+            rehearsalDigest: pattern(
+              qualification.rehearsalDigest,
+              SHA256,
+              "cloudflareProviderExecutor.releaseReadbackQualification.rehearsalDigest",
+            ) as `sha256:${string}`,
+          },
+        }),
   };
 }
 

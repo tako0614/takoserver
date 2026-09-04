@@ -840,7 +840,7 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
-          "0033, 0036, 0043, 0044, 0045, 0046, 0047 or 0048. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048 or 0049. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
           "is explicitly integration-only. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -854,7 +854,8 @@ export const DEPLOY_CONTRACT = {
           "0045 boundary is the separate additive Cloudflare executor pre-effect CAS; the 0046 " +
           "boundary adds one exact artifact-recovery singleton and its receipt constraints only after 0045; " +
           "the 0047 boundary adds the sponsorship issuance admission and cutover-consumption receipts only after 0046; " +
-          "the 0048 boundary adds value-free Resource execution evidence only after 0047. " +
+          "the 0048 boundary adds value-free Resource execution evidence only after 0047; " +
+          "the 0049 boundary preserves prior artifact-consumer receipts and admits active zero-consumption resolution only after 0048. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1217,6 +1218,55 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-managed-worker-dispatch-namespace",
+      target: "cloudflare-workers-dispatch-namespace:environment-selected-managed-worker-runtime",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/managed-worker-dispatch-namespace.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/process.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} The environment-selected operator target is the only account/name/id authority. ` +
+          "This surface reads only kind, environment, accountId and cloudflareProviderExecutor.dispatchNamespace/dispatchNamespaceId. " +
+          "It accepts that bootstrap projection without fabricated supplies or release-readback qualification; " +
+          "the complete Worker/executor target remains separately required for runtime deployment." +
+          inputContract(applyReviewInput),
+        "post-conditions":
+          "Status distinguishes absent, pin-existing, ready and drift through exact provider metadata. " +
+          "Apply rechecks absence, creates the selected name once and independently reads back its exact " +
+          "namespace id/name, zero scripts and trusted_workers=false. It returns created-needs-target-pin, " +
+          "not runtime readiness. Existing empty unpinned namespaces require explicit id pinning; " +
+          "gateway/executor readiness requires the pinned incarnation to exist with untrusted tenant isolation.",
+        reversal:
+          "No delete, rename, reverse or implicit recreation is exposed. A missing pinned id or an " +
+          "unexpected/nonempty unpinned namespace requires separate operator reconciliation; creation " +
+          "does not authorize adoption or retirement of another namespace.",
+        "failure-handling":
+          `${highRiskFailure} Creation never retries a failed or lost acknowledgement. Status reads no review or receipt. ` +
+          "Fresh rehearsal creation writes one no-overwrite external owned 0600 receipt under an owned 0700 directory. " +
+          "Fresh production creation requires and re-reads that exact successful same-commit rehearsal receipt " +
+          "at the final mutation fence. TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH " +
+          "is required only for rehearsal/production creation, never integration or status.",
+        "pre-mutation-proof":
+          "Integration may create the explicitly selected disposable namespace. Rehearsal must use clean " +
+          "remote source and prove a fresh empty untrusted namespace; production requires that exact " +
+          "source rehearsal receipt plus a fresh exact-name absence read before its sole create.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-managed-worker-gateway",
       target: "cloudflare-workers-for-platforms:environment-selected-dispatch-gateway-route",
       covers: [
@@ -1230,6 +1280,9 @@ export const DEPLOY_CONTRACT = {
         "tsconfig.managed-worker-gateway.json",
         "scripts/deploy.ts",
         "scripts/deploy/managed-worker-gateway.ts",
+        "scripts/deploy/managed-worker-dispatch-namespace.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/target.ts",
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
@@ -1240,7 +1293,6 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT",
         "TAKOSERVER_MANAGED_WORKER_ZONE_ID",
         "TAKOSERVER_MANAGED_WORKER_PROVIDER_ID",
-        "TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE",
         "TAKOSERVER_MANAGED_WORKER_GATEWAY_ID",
         "TAKOSERVER_INDEPENDENT_REVIEW",
       ],
@@ -1248,15 +1300,15 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The gateway Worker bundle, DISPATCHER namespace, STATE_DB binding, ` +
-          "provider identity and exact route pattern are operator-selected inputs. `TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN`, `TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_ZONE_ID`, `TAKOSERVER_MANAGED_WORKER_PROVIDER_ID`, `TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE`, and `TAKOSERVER_MANAGED_WORKER_GATEWAY_ID` are required alongside `CLOUDFLARE_API_TOKEN`. Integration may " +
+          "provider identity and exact route pattern are operator-selected inputs. The dispatch namespace name and id derive only from the environment-selected target; no namespace environment override is accepted. `TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN`, `TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_ZONE_ID`, `TAKOSERVER_MANAGED_WORKER_PROVIDER_ID`, and `TAKOSERVER_MANAGED_WORKER_GATEWAY_ID` are required alongside `CLOUDFLARE_API_TOKEN`. Integration may " +
           "create only the explicitly configured staging wildcard; production starts from an exact " +
           "readback of the legacy route and never guesses a zone, account, namespace or domain.",
         "post-conditions":
-          "Status reads the complete exact-pattern route inventory and authoritative gateway deployment " +
+          "Status first qualifies the target-pinned untrusted dispatch namespace incarnation, then reads the complete exact-pattern route inventory and authoritative gateway deployment " +
           "history. Apply stages one immutable Version, reads back its exact code ETag, STATE_DB, " +
           "DISPATCHER, SQLite Durable Object, provider/gateway identity and workers.dev-disabled settings, " +
           "then creates a separate 100 percent traffic deployment and proves the exact predecessor. Only " +
-          "after that proof may integration create the configured staging route or production replace the " +
+          "after that proof and a fresh namespace identity fence may integration create the configured staging route or production replace the " +
           "read-back legacy route; customer-specific routes remain untouched.",
         reversal:
           "Production reversal derives the immutable predecessor only from provider deployment history, " +
@@ -1288,6 +1340,8 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/cloudflare-provider-executor.ts",
         "scripts/deploy/cloudflare-provider-executor-secrets.ts",
+        "scripts/deploy/managed-worker-dispatch-namespace.ts",
+        "scripts/deploy/cloudflare-state.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/realized-config.ts",
         "scripts/deploy/worker.ts",
@@ -1310,7 +1364,7 @@ export const DEPLOY_CONTRACT = {
             cloudflareProviderExecutorSecretsInput,
           ),
         "post-conditions":
-          "Status and post-apply readback require one exact immutable Version/module digest, exact D1/R2/dispatch/cross-Worker Durable Object/service/plain-text/secret binding closure, no local Durable Object migration, exact compatibility settings, workers.dev and preview URLs disabled, and exhaustive absence from routes and custom domains. Migration 0045 and its exact table/index shape must already be applied. The exact selected-commit receipt authority and managed gateway must be ready first. Only then may the public Worker qualify and bind this exact executor Version, enforcing receipt authority -> gateway -> executor -> public API release order.",
+          "Status and post-apply readback require one exact immutable Version/module digest, exact D1/R2/dispatch/cross-Worker Durable Object/service/plain-text/secret binding closure, no local Durable Object migration, exact compatibility settings, workers.dev and preview URLs disabled, and exhaustive absence from routes and custom domains. Migration 0045 and its exact table/index shape must already be applied. The exact target-pinned untrusted dispatch namespace incarnation, selected-commit receipt authority and managed gateway must be ready first. Namespace identity is rechecked at mutation and readback boundaries. Namespace readiness precedes gateway deployment; receipt authority and gateway readiness precede executor deployment; only then may the public Worker qualify and bind this exact executor Version.",
         reversal:
           "`--apply --reverse` derives the immediate predecessor only from authoritative deployment history, verifies that predecessor's code and immutable binding/migration closure, deploys it at 100 percent under the same target lease, and proves the resulting history. It restores that predecessor Version, including its historical secret bindings; migration 0045 is additive and remains in place.",
         "failure-handling":

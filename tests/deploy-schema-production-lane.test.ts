@@ -830,14 +830,14 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0048 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0049 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0048_resource_execution_evidence.sql"),
-        join(migrationDirectory, "0049_unreviewed_extension.sql"),
+        join(migrationDirectory, "0049_artifact_consumer_active_resolution.sql"),
+        join(migrationDirectory, "0050_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -860,7 +860,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the nine no-overwrite wave receipts cover the exact 26-file production suffix once", async () => {
+  test("the ten no-overwrite wave receipts cover the exact 27-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -874,6 +874,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0046", 45, 46],
         ["0047", 46, 47],
         ["0048", 47, 48],
+        ["0049", 48, 49],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -921,7 +922,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(26);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(27);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

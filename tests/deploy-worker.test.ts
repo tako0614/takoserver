@@ -546,10 +546,16 @@ describe("split Takoserver Worker surfaces", () => {
     expect(current.calls).toHaveLength(0);
   });
 
-  test("routine refuses pending migrations before its gate or upload", async () => {
+  test("routine refuses pending 0049 before its gate or upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-pending-"));
     try {
-      const current = fixture({ applied: ["0001_first.sql"] });
+      const current = fixture({
+        local: [
+          "0048_resource_execution_evidence.sql",
+          "0049_artifact_consumer_active_resolution.sql",
+        ],
+        applied: ["0048_resource_execution_evidence.sql"],
+      });
       const failure = await runWorker(
         {
           surface: "takoserver-worker",

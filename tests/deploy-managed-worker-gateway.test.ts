@@ -23,6 +23,7 @@ const currentDeploymentId = "44444444-4444-4444-8444-444444444444";
 const predecessorVersionId = "55555555-5555-4555-8555-555555555555";
 const predecessorDeploymentId = "66666666-6666-4666-8666-666666666666";
 const rollbackDeploymentId = "77777777-7777-4777-8777-777777777777";
+const dispatchNamespaceId = "88888888-8888-4888-8888-888888888888";
 const gatewaySource = "export default { fetch() { return new Response('ok'); } };\n";
 
 function target(environment: "integration" | "production"): DeployTarget {
@@ -34,6 +35,20 @@ function target(environment: "integration" | "production"): DeployTarget {
     d1: { databaseName: "state", databaseId: "00000000-0000-0000-0000-000000000000" },
     r2: { bucketName: "takoserver-objects" },
     publicOrigin: "https://api.example.test",
+    cloudflareProviderExecutor: {
+      workerName: "takoserver-provider-executor",
+      dispatchNamespace: "dispatch",
+      dispatchNamespaceId,
+      gatewayWorkerName: gatewayScript,
+      managedBaseDomain: "app.example.test",
+      providerInstallationId: "cloudflare.test",
+      receiptAuthorityWorkerName: "takoserver-managed-object-receipts",
+      releaseReadbackQualification: {
+        schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
+        dispatchNamespace: "dispatch",
+        rehearsalDigest: `sha256:${"9".repeat(64)}`,
+      },
+    },
     signing: { currentKeyId: "current-key" },
   };
 }
@@ -44,6 +59,23 @@ class FakeRouteState implements ManagedWorkerGatewayRouteState {
   async workerRoutes(): Promise<readonly ManagedWorkerGatewayRoute[]> {
     return this.routes;
   }
+
+  async dispatchNamespace(_name: string): Promise<unknown> {
+    return dispatchNamespaceMetadata();
+  }
+}
+
+function dispatchNamespaceMetadata(): unknown {
+  return {
+    created_by: "a".repeat(32),
+    created_on: "2026-09-04T00:00:00Z",
+    modified_by: "a".repeat(32),
+    modified_on: "2026-09-04T00:00:00Z",
+    namespace_id: dispatchNamespaceId,
+    namespace_name: "dispatch",
+    script_count: 1,
+    trusted_workers: false,
+  };
 }
 
 class ReadyGatewayState extends FakeRouteState {
@@ -130,6 +162,17 @@ class PublishingGatewayState extends FakeRouteState {
 
   async workerSettings(): Promise<unknown> {
     return { workers_dev: false, preview_urls: false };
+  }
+}
+
+class NamespaceSwapDuringBuildGatewayState extends PublishingGatewayState {
+  override async dispatchNamespace(): Promise<unknown> {
+    return {
+      ...(dispatchNamespaceMetadata() as Record<string, unknown>),
+      namespace_id: this.events.includes("build")
+        ? "99999999-9999-4999-8999-999999999999"
+        : dispatchNamespaceId,
+    };
   }
 }
 
@@ -556,12 +599,69 @@ test("status is read-only while apply requires an independent reviewer", async (
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
     },
   ).catch((error) => error);
   expect(failure).toMatchObject({ phase: "preflight" });
   expect(failure.message).toContain("TAKOSERVER_INDEPENDENT_REVIEW");
+});
+
+test("gateway requires the target namespace id and ignores a caller namespace override", async () => {
+  const selected = target("integration");
+  const topology = selected.cloudflareProviderExecutor;
+  if (!topology) throw new Error("missing topology");
+  const { dispatchNamespaceId: _dispatchNamespaceId, ...bootstrapTopology } = topology;
+  const bootstrapTarget: DeployTarget = {
+    ...selected,
+    cloudflareProviderExecutor: bootstrapTopology,
+  };
+  await expect(
+    runManagedWorkerGateway(
+      {
+        surface: "takoserver-managed-worker-gateway",
+        action: "status",
+        environment: "integration",
+        commit: "a".repeat(40),
+      },
+      bootstrapTarget,
+      {
+        state: new FakeRouteState([]),
+        routePattern: pattern,
+        gatewayScript,
+        legacyScript,
+        zoneId: "zone",
+      },
+    ),
+  ).rejects.toThrow("explicit target id pin");
+
+  const seen: string[] = [];
+  const state = new FakeRouteState([]);
+  state.dispatchNamespace = async (name: string) => {
+    seen.push(name);
+    return dispatchNamespaceMetadata();
+  };
+  const status = await runManagedWorkerGateway(
+    {
+      surface: "takoserver-managed-worker-gateway",
+      action: "status",
+      environment: "integration",
+      commit: "a".repeat(40),
+    },
+    selected,
+    {
+      state,
+      routePattern: pattern,
+      gatewayScript,
+      legacyScript,
+      zoneId: "zone",
+      dispatchNamespace: "caller-must-not-control-this",
+    } as Parameters<typeof runManagedWorkerGateway>[2],
+  );
+  expect(seen).toEqual([topology.dispatchNamespace]);
+  expect(status).toMatchObject({
+    dispatchNamespace: topology.dispatchNamespace,
+    dispatchNamespaceId,
+  });
 });
 
 /**
@@ -603,7 +703,6 @@ test("the gateway closure recognises the provisioned SQLite admin secret and not
         legacyScript,
         zoneId: "zone",
         providerId: "provider",
-        dispatchNamespace: "dispatch",
         gatewayId: "gateway",
       },
     ),
@@ -641,7 +740,6 @@ test("the gateway closure recognises the provisioned SQLite admin secret and not
         legacyScript,
         zoneId: "zone",
         providerId: "provider",
-        dispatchNamespace: "dispatch",
         gatewayId: "gateway",
       },
     ),
@@ -666,7 +764,6 @@ test("run surface performs injected integration mutation then exact readback", a
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayReadyRunner("a".repeat(40)),
@@ -716,7 +813,6 @@ test("run surface qualifies, builds, uploads, reads back, then mutates the route
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run,
@@ -758,6 +854,44 @@ test("run surface qualifies, builds, uploads, reads back, then mutates the route
   });
 });
 
+test("namespace replacement during build refuses before Version upload or traffic mutation", async () => {
+  const events: string[] = [];
+  const routeState = new NamespaceSwapDuringBuildGatewayState([], events);
+  const commit = "a".repeat(40);
+  const failure = await runManagedWorkerGateway(
+    {
+      surface: "takoserver-managed-worker-gateway",
+      action: "apply",
+      environment: "integration",
+      commit,
+    },
+    target("integration"),
+    {
+      state: routeState,
+      routePattern: pattern,
+      gatewayScript,
+      legacyScript,
+      zoneId: "zone",
+      providerId: "provider",
+      gatewayId: "gateway",
+      review: "reviewer",
+      run: gatewayPublicationRunner(routeState, events, commit),
+      publicationLease: publicationLease(),
+      routeMutationFetcher: async () => {
+        events.push("route");
+        return Response.json({ success: true });
+      },
+      cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+    },
+  ).catch((error) => error);
+  expect(failure).toMatchObject({ phase: "preflight" });
+  expect(failure.message).toContain("dispatch namespace id does not match the target pin");
+  expect(events).toEqual(["check", "build"]);
+  expect(routeState.versions.size).toBe(0);
+  expect(routeState.history).toEqual([]);
+  expect(routeState.routes).toEqual([]);
+});
+
 test("staged Version readback failure never starts traffic deployment or route mutation", async () => {
   const events: string[] = [];
   const routeState = new MalformedStagedGatewayState([], events);
@@ -777,7 +911,6 @@ test("staged Version readback failure never starts traffic deployment or route m
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayPublicationRunner(routeState, events, commit),
@@ -814,7 +947,6 @@ test("self annotation cannot adopt provider-stored code with different bytes", a
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayPublicationRunner(routeState, events, commit),
@@ -847,7 +979,6 @@ test("an ETag equal to the local digest cannot replace official module-byte read
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayPublicationRunner(routeState, events, commit),
@@ -880,7 +1011,6 @@ test("traffic deployment acknowledgement loss converges without a second deploym
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayPublicationRunner(routeState, events, commit, { loseDeploymentAck: true }),
@@ -907,7 +1037,6 @@ test("traffic deployment acknowledgement loss converges without a second deploym
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
     },
   );
@@ -937,7 +1066,6 @@ test("traffic deployment acknowledgement loss converges without a second deploym
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayPublicationRunner(routeState, events, commit),
@@ -1030,7 +1158,6 @@ test("production reversal restores the exact provider-history predecessor before
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run,
@@ -1078,7 +1205,6 @@ test("run surface uses the concrete Cloudflare route adapter after Worker readba
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayReadyRunner("a".repeat(40)),
@@ -1122,7 +1248,6 @@ test("concrete route adapter treats transport loss as indeterminate and never re
       legacyScript,
       zoneId: "zone",
       providerId: "provider",
-      dispatchNamespace: "dispatch",
       gatewayId: "gateway",
       review: "reviewer",
       run: gatewayReadyRunner("a".repeat(40)),
