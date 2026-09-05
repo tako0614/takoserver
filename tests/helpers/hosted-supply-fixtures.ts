@@ -55,11 +55,6 @@ export function cloudflareProviderExecutorTarget(
     managedBaseDomain: "workers.example.test",
     providerInstallationId,
     receiptAuthorityWorkerName: "takoserver-managed-object-receipts",
-    releaseReadbackQualification: {
-      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-      dispatchNamespace: "takoserver-customers",
-      rehearsalDigest: `sha256:${"9".repeat(64)}` as const,
-    },
   };
 }
 

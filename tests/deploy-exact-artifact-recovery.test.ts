@@ -46,11 +46,6 @@ const target = {
     managedBaseDomain: "managed.integration.example.test",
     providerInstallationId: "cloudflare.integration",
     receiptAuthorityWorkerName: "takoserver-receipt-authority-integration",
-    releaseReadbackQualification: {
-      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-      dispatchNamespace: "takoserver-customers-integration",
-      rehearsalDigest: `sha256:${"a".repeat(64)}`,
-    },
   },
   formAuthority: {
     workerName: "takoserver-form-authority-integration",

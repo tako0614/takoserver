@@ -8,6 +8,10 @@ import { CloudflareProvider, type CloudflareZone } from "./providers/cloudflare.
 import { createCloudflareEdgeMeterSources } from "./providers/cloudflare-edge-meter.ts";
 import type { ManagedWorkerDispatchNamespace } from "./providers/cloudflare-managed-worker-gateway.ts";
 import {
+  MANAGED_WORKER_LEGACY_READINESS_PATH,
+  MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+  MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA,
+  MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
   MANAGED_WORKER_READINESS_PATH,
   MANAGED_WORKER_READINESS_PROPS_SCHEMA,
   MANAGED_WORKER_READINESS_RESULT_SCHEMA,
@@ -55,7 +59,6 @@ export interface CloudflareProviderExecutorEnv {
   readonly TAKOSERVER_MANAGED_WORKER_GATEWAY_NAME: string;
   readonly TAKOSERVER_MANAGED_BASE_DOMAIN: string;
   readonly TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID: string;
-  readonly TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION?: string;
   readonly TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: string;
   readonly TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING: string;
   readonly PUBLIC_ORIGIN: string;
@@ -181,12 +184,6 @@ export async function createCloudflareProviderExecutorFromEnv(
   ) {
     throw new TypeError("Cloudflare provider executor ordinary backend offering is not allowed");
   }
-  const releaseReadbackQualification = parseReleaseQualification(
-    env.TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION,
-    env.TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE,
-    env.TAKOSERVER_ENVIRONMENT,
-  );
-
   const clock = () => new Date();
   const artifacts = createTakoformArtifacts({
     sql,
@@ -222,7 +219,6 @@ export async function createCloudflareProviderExecutorFromEnv(
       providerInstallationId: env.TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID,
       sql,
       inspectRelease: (input) => inspectManagedRelease(env.DISPATCHER, input),
-      ...(releaseReadbackQualification === undefined ? {} : { releaseReadbackQualification }),
       deriveSqliteInstanceName: (input) =>
         env.MANAGED_WORKER_AUTHORITY.deriveSqliteInstanceName(input),
       sealSqliteAdminProof: (input) => env.MANAGED_WORKER_AUTHORITY.sealSqliteAdminProof(input),
@@ -254,16 +250,28 @@ async function inspectManagedRelease(
   dispatcher: ManagedWorkerDispatchNamespace,
   input: CloudflareManagedReleaseInspectionInput,
 ): Promise<CloudflareManagedReleaseInspection> {
-  const props = {
-    schema: MANAGED_WORKER_READINESS_PROPS_SCHEMA,
-    operationId: input.operationId,
-    descriptorDigest: input.descriptorDigest,
-  } as const;
+  const legacy = input.releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL;
+  const props = legacy
+    ? {
+        schema: MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+        operationId: input.operationId,
+        descriptorDigest: input.descriptorDigest,
+      }
+    : {
+        schema: MANAGED_WORKER_READINESS_PROPS_SCHEMA,
+        operationId: input.operationId,
+        descriptorDigest: input.descriptorDigest,
+        challengeNonce: input.challengeNonce,
+      };
   let response: Response;
   try {
     response = await dispatcher
       .get(input.scriptName, props)
-      .fetch(new Request(`https://managed-worker.invalid${MANAGED_WORKER_READINESS_PATH}`));
+      .fetch(
+        new Request(
+          `https://managed-worker.invalid${legacy ? MANAGED_WORKER_LEGACY_READINESS_PATH : MANAGED_WORKER_READINESS_PATH}`,
+        ),
+      );
   } catch {
     return { ok: false, retryable: true };
   }
@@ -284,15 +292,24 @@ async function inspectManagedRelease(
   }
   if (
     !isRecord(raw) ||
-    !exactKeys(raw, ["schema", "operationId", "descriptorDigest", "handlers"])
+    !exactKeys(
+      raw,
+      legacy
+        ? ["schema", "operationId", "descriptorDigest", "handlers"]
+        : ["schema", "operationId", "descriptorDigest", "challengeNonce", "handlers"],
+    )
   ) {
     return { ok: false, retryable: false };
   }
   const handlers = managedHandlers(raw.handlers);
   if (
-    raw.schema !== MANAGED_WORKER_READINESS_RESULT_SCHEMA ||
+    raw.schema !==
+      (legacy
+        ? MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA
+        : MANAGED_WORKER_READINESS_RESULT_SCHEMA) ||
     raw.operationId !== input.operationId ||
     raw.descriptorDigest !== input.descriptorDigest ||
+    (!legacy && raw.challengeNonce !== input.challengeNonce) ||
     !handlers ||
     !sameStrings(handlers, input.declaredHandlers)
   ) {
@@ -303,44 +320,9 @@ async function inspectManagedRelease(
     scriptName: input.scriptName,
     operationId: input.operationId,
     descriptorDigest: input.descriptorDigest,
+    ...(legacy ? {} : { challengeNonce: input.challengeNonce }),
     handlers,
   };
-}
-
-function parseReleaseQualification(
-  raw: string | undefined,
-  dispatchNamespace: string,
-  environment: CloudflareProviderExecutorEnvironment,
-) {
-  if (raw === undefined) {
-    if (environment !== "integration") {
-      throw new TypeError(
-        "Cloudflare provider executor releaseReadbackQualification is required outside integration",
-      );
-    }
-    return undefined;
-  }
-  let value: unknown;
-  try {
-    if (new TextEncoder().encode(raw).byteLength > 16_384) throw new Error();
-    value = JSON.parse(raw);
-  } catch {
-    throw new TypeError("invalid Cloudflare release readback qualification");
-  }
-  if (
-    !isRecord(value) ||
-    !exactKeys(value, ["schema", "dispatchNamespace", "rehearsalDigest"]) ||
-    value.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
-    value.dispatchNamespace !== dispatchNamespace ||
-    !sha256(value.rehearsalDigest)
-  ) {
-    throw new TypeError("invalid Cloudflare release readback qualification");
-  }
-  return {
-    schema: value.schema,
-    dispatchNamespace: value.dispatchNamespace,
-    rehearsalDigest: value.rehearsalDigest,
-  } as const;
 }
 
 function parseZones(raw: string): readonly CloudflareZone[] {
@@ -424,10 +406,6 @@ function managedHandlers(value: unknown): readonly ManagedWorkerHandlerName[] | 
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
-}
-
-function sha256(value: unknown): value is `sha256:${string}` {
-  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 function exactKeys(

@@ -88,7 +88,6 @@ export interface CloudflareProviderExecutorOptions {
 export interface CloudflareProviderExecutorInspection {
   readonly status: "absent" | "ready" | "stale" | "drift";
   readonly ready: boolean;
-  readonly acknowledgementRecoveryQualified?: boolean;
   /** Exact owned executor closure, independent of the selected source commit. */
   readonly managedExact: boolean;
   readonly routeLess: boolean;
@@ -423,11 +422,7 @@ export async function inspectCloudflareProviderExecutor(
     dependencies.read(phase),
   ]);
   if (history === null) {
-    return absentInspection(
-      schemaReady,
-      dependencyState,
-      topology.releaseReadbackQualification !== undefined,
-    );
+    return absentInspection(schemaReady, dependencyState);
   }
   try {
     const [version, settings, subdomain, routes, domains, secretInventory] = await Promise.all([
@@ -470,7 +465,6 @@ export async function inspectCloudflareProviderExecutor(
     return {
       status: ready ? "ready" : managedExact ? "stale" : "drift",
       ready,
-      acknowledgementRecoveryQualified: topology.releaseReadbackQualification !== undefined,
       managedExact,
       routeLess,
       schemaReady,
@@ -492,11 +486,7 @@ export async function inspectCloudflareProviderExecutor(
       throw phaseError(phase, "Cloudflare provider executor readback is malformed", error);
     }
     return {
-      ...absentInspection(
-        schemaReady,
-        dependencyState,
-        topology.releaseReadbackQualification !== undefined,
-      ),
+      ...absentInspection(schemaReady, dependencyState),
       status: "drift",
       versionId: history.versionId,
       deploymentId: history.deploymentId,
@@ -789,7 +779,6 @@ function statusResult(
     entrypoint: EXECUTOR_ENTRYPOINT,
     status: inspection.status,
     ready: inspection.ready,
-    acknowledgementRecoveryQualified: inspection.acknowledgementRecoveryQualified === true,
     routeLess: inspection.routeLess,
     schemaReady: inspection.schemaReady,
     dependencies: inspection.dependencies,
@@ -834,7 +823,6 @@ function applyResult(
     mutation,
     reviewer,
     ready: inspection.ready,
-    acknowledgementRecoveryQualified: inspection.acknowledgementRecoveryQualified === true,
   };
 }
 
@@ -949,14 +937,6 @@ function executorBindingClosure(
       type: "plain_text",
       fields: { text: topology.providerInstallationId },
     },
-    ...(topology.releaseReadbackQualification === undefined
-      ? {}
-      : {
-          TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION: {
-            type: "plain_text",
-            fields: { text: JSON.stringify(topology.releaseReadbackQualification) },
-          },
-        }),
     TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME: {
       type: "plain_text",
       fields: { text: topology.receiptAuthorityWorkerName },
@@ -1203,12 +1183,10 @@ function sameExecutorInspection(
 function absentInspection(
   schemaReady: boolean,
   dependencies: CloudflareProviderExecutorDependencyInspection,
-  acknowledgementRecoveryQualified: boolean,
 ): CloudflareProviderExecutorInspection {
   return {
     status: "absent",
     ready: false,
-    acknowledgementRecoveryQualified,
     managedExact: false,
     routeLess: true,
     schemaReady,

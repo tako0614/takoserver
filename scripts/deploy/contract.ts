@@ -1240,7 +1240,7 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} The environment-selected operator target is the only account/name/id authority. ` +
           "This surface reads only kind, environment, accountId and cloudflareProviderExecutor.dispatchNamespace/dispatchNamespaceId. " +
-          "It accepts that bootstrap projection without fabricated supplies or release-readback qualification; " +
+          "It accepts that bootstrap projection without fabricated supplies; " +
           "the complete Worker/executor target remains separately required for runtime deployment." +
           inputContract(applyReviewInput),
         "post-conditions":
@@ -1357,7 +1357,7 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The target descriptor is the sole source of the executor Worker name, ` +
-          "provider installation, dispatch namespace, gateway, managed base domain, receipt authority, D1, R2, account and release-readback qualification. The external credential file is a separate authority boundary." +
+          "provider installation, dispatch namespace, gateway, managed base domain, receipt authority, D1, R2 and account. The external credential file is a separate authority boundary." +
           inputContract(
             providerExecutorTargetInput,
             applyReviewInput,

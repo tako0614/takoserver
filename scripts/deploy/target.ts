@@ -80,11 +80,6 @@ export interface DeployTarget {
     readonly managedBaseDomain: string;
     readonly providerInstallationId: string;
     readonly receiptAuthorityWorkerName: string;
-    readonly releaseReadbackQualification?: {
-      readonly schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1";
-      readonly dispatchNamespace: string;
-      readonly rehearsalDigest: `sha256:${string}`;
-    };
   };
   /** Route-less Hosted sponsorship authority; its organization is deploy-pinned. */
   readonly sponsorshipAuthority?: {
@@ -237,11 +232,6 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
               managedBaseDomain: `<managed-base-domain>`,
               providerInstallationId: `cloudflare.${environment}`,
               receiptAuthorityWorkerName: `takoserver-managed-object-receipt-authority-${environment}`,
-              releaseReadbackQualification: {
-                schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-                dispatchNamespace: `takoserver-customers-${environment}`,
-                rehearsalDigest: "sha256:<64 lowercase hex characters>",
-              },
             },
             signing: { currentKeyId: `takoserver-${environment}-<yyyy-mm>` },
           },
@@ -342,7 +332,6 @@ export function loadManagedWorkerDispatchNamespaceTarget(
       "managedBaseDomain",
       "providerInstallationId",
       "receiptAuthorityWorkerName",
-      "releaseReadbackQualification",
     ],
   );
   return {
@@ -450,10 +439,7 @@ export function parseDeployTarget(
     ...(value.cloudflareProviderExecutor === undefined
       ? {}
       : {
-          cloudflareProviderExecutor: cloudflareProviderExecutor(
-            value.cloudflareProviderExecutor,
-            environment,
-          ),
+          cloudflareProviderExecutor: cloudflareProviderExecutor(value.cloudflareProviderExecutor),
         }),
     ...(value.sponsorshipAuthority === undefined
       ? {}
@@ -879,7 +865,6 @@ function parseHistoricalPreExecutorPublicWorker(
 
 function cloudflareProviderExecutor(
   value: unknown,
-  environment: DeployEnvironment,
 ): NonNullable<DeployTarget["cloudflareProviderExecutor"]> {
   if (!isRecord(value)) {
     throw preflightError("deploy target `cloudflareProviderExecutor` must be an object");
@@ -894,37 +879,13 @@ function cloudflareProviderExecutor(
       "providerInstallationId",
       "receiptAuthorityWorkerName",
     ],
-    ["dispatchNamespaceId", "releaseReadbackQualification"],
+    ["dispatchNamespaceId"],
   );
-  const qualification = value.releaseReadbackQualification;
-  if (qualification === undefined) {
-    if (environment !== "integration") {
-      throw preflightError(
-        "deploy target Cloudflare provider executor releaseReadbackQualification is required outside integration",
-      );
-    }
-  } else {
-    if (!isRecord(qualification)) {
-      throw preflightError(
-        "deploy target Cloudflare provider executor releaseReadbackQualification must be an object",
-      );
-    }
-    assertExactKeys(qualification, ["schema", "dispatchNamespace", "rehearsalDigest"]);
-  }
   const dispatchNamespace = pattern(
     value.dispatchNamespace,
     WORKER_NAME,
     "cloudflareProviderExecutor.dispatchNamespace",
   );
-  if (
-    qualification !== undefined &&
-    (qualification.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
-      qualification.dispatchNamespace !== dispatchNamespace)
-  ) {
-    throw preflightError(
-      "deploy target Cloudflare provider executor release qualification must name its exact dispatch namespace",
-    );
-  }
   return {
     workerName: pattern(value.workerName, WORKER_NAME, "cloudflareProviderExecutor.workerName"),
     dispatchNamespace,
@@ -957,19 +918,6 @@ function cloudflareProviderExecutor(
       WORKER_NAME,
       "cloudflareProviderExecutor.receiptAuthorityWorkerName",
     ),
-    ...(qualification === undefined
-      ? {}
-      : {
-          releaseReadbackQualification: {
-            schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-            dispatchNamespace,
-            rehearsalDigest: pattern(
-              qualification.rehearsalDigest,
-              SHA256,
-              "cloudflareProviderExecutor.releaseReadbackQualification.rehearsalDigest",
-            ) as `sha256:${string}`,
-          },
-        }),
   };
 }
 

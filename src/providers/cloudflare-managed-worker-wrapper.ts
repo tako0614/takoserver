@@ -31,23 +31,56 @@ export const MANAGED_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
 export const MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND = "edge.objects@1.0.0" as const;
 export const MANAGED_WORKER_INTERNAL_BINDING_PREFIX = "__TAKOSERVER_" as const;
 export const MANAGED_WORKER_READINESS_PATH =
-  "/.well-known/takoserver/managed-worker-readiness/v1" as const;
+  "/.well-known/takoserver/managed-worker-readiness/v2" as const;
 export const MANAGED_WORKER_READINESS_PROPS_SCHEMA =
-  "takoserver.managed-worker-readiness@v1" as const;
+  "takoserver.managed-worker-readiness@v2" as const;
 export const MANAGED_WORKER_READINESS_RESULT_SCHEMA =
+  "takoserver.managed-worker-readiness-result@v2" as const;
+export const MANAGED_WORKER_LEGACY_READINESS_PATH =
+  "/.well-known/takoserver/managed-worker-readiness/v1" as const;
+export const MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA =
+  "takoserver.managed-worker-readiness@v1" as const;
+export const MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA =
   "takoserver.managed-worker-readiness-result@v1" as const;
+export const MANAGED_WORKER_RELEASE_PROTOCOL = "takoserver.managed-worker-release@v2" as const;
+export const MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL =
+  "takoserver.managed-worker-release@legacy-v1" as const;
+export type ManagedWorkerReleaseProtocol =
+  | typeof MANAGED_WORKER_RELEASE_PROTOCOL
+  | typeof MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL;
+export const MANAGED_WORKER_RELEASE_PROOF_SCHEMA =
+  "takoserver.managed-worker-release-proof@v1" as const;
+export const MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING = "__TAKOSERVER_RELEASE_PROOF_KEY" as const;
 
 export interface ManagedWorkerReadinessProps {
   readonly schema: typeof MANAGED_WORKER_READINESS_PROPS_SCHEMA;
   readonly operationId: string;
   readonly descriptorDigest: string;
+  readonly challengeNonce: string;
 }
 
 export interface ManagedWorkerReadinessResult {
   readonly schema: typeof MANAGED_WORKER_READINESS_RESULT_SCHEMA;
   readonly operationId: string;
   readonly descriptorDigest: string;
+  readonly challengeNonce: string;
   readonly handlers: readonly ManagedWorkerHandlerName[];
+}
+
+export interface ManagedWorkerReleaseProof {
+  readonly schema: typeof MANAGED_WORKER_RELEASE_PROOF_SCHEMA;
+  readonly providerInstallationId: string;
+  readonly accountId: string;
+  readonly tenantRef: string;
+  readonly dispatchNamespace: string;
+  readonly operationId: string;
+  readonly resourceUid: string;
+  readonly preparationId: string;
+  readonly preparationCommitment: `sha256:${string}`;
+  readonly logicalWorkerId: string;
+  readonly workerResourceUid: string;
+  readonly secretNames: readonly string[];
+  readonly expectedMac: string;
 }
 
 export interface ManagedWorkerNativeBindingDescriptor {
@@ -87,6 +120,8 @@ export interface ManagedWorkerEntrypointSourceInput {
   readonly originalMainModule: string;
   readonly declaredHandlers: readonly ManagedWorkerHandlerName[];
   readonly bindings: readonly ManagedWorkerBindingDescriptor[];
+  readonly releaseProtocol?: ManagedWorkerReleaseProtocol;
+  readonly releaseProof?: ManagedWorkerReleaseProof;
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
@@ -94,6 +129,7 @@ const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const AUTHORITY_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/u;
 const RECEIPT_INSTANCE_NAME = /^tsobj-[A-Za-z0-9_-]{43}$/u;
 const RECEIPT_PROOF = /^[A-Za-z0-9_-]{43}$/u;
+const RELEASE_PROOF_VALUE = /^[A-Za-z0-9_-]{43}$/u;
 const OBJECT_BUCKET_NAME = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
 const VARIABLE_NAME = /^[A-Za-z][A-Za-z0-9._-]*$/u;
 const RESERVED_PUBLIC_BINDINGS = new Set([
@@ -111,10 +147,30 @@ const HANDLER_NAMES = new Set<string>(MANAGED_WORKER_HANDLER_NAMES);
 export function managedWorkerEntrypointSource(input: ManagedWorkerEntrypointSourceInput): string {
   const normalizedInput = normalizeSourceInput(input);
   const moduleSpecifier = `./${normalizedInput.originalMainModule}`;
-  const configuration = {
-    declaredHandlers: [...normalizedInput.declaredHandlers].sort(),
-    bindings: normalizedInput.bindings,
-  };
+  const legacy = normalizedInput.releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL;
+  const configuration = legacy
+    ? {
+        declaredHandlers: [...normalizedInput.declaredHandlers].sort(),
+        bindings: normalizedInput.bindings,
+      }
+    : {
+        declaredHandlers: [...normalizedInput.declaredHandlers].sort(),
+        bindings: normalizedInput.bindings,
+        rawBindingNames: managedRawBindingNames(
+          normalizedInput.bindings,
+          !!normalizedInput.releaseProof,
+        ),
+        ...(normalizedInput.releaseProof ? { releaseProof: normalizedInput.releaseProof } : {}),
+      };
+  const readinessPath = legacy
+    ? MANAGED_WORKER_LEGACY_READINESS_PATH
+    : MANAGED_WORKER_READINESS_PATH;
+  const readinessPropsSchema = legacy
+    ? MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA
+    : MANAGED_WORKER_READINESS_PROPS_SCHEMA;
+  const readinessResultSchema = legacy
+    ? MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA
+    : MANAGED_WORKER_READINESS_RESULT_SCHEMA;
 
   return `const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
 const EVENT_PATH = ${JSON.stringify(TAKOSERVER_MANAGED_WORKER_EVENT_PATH)};
@@ -122,10 +178,10 @@ const EVENT_PROTOCOL = ${JSON.stringify(TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL
 const EVENT_CONTENT_TYPE = ${JSON.stringify(TAKOSERVER_MANAGED_WORKER_EVENT_CONTENT_TYPE)};
 const PROPS_NAME = ${JSON.stringify(TAKOSERVER_MANAGED_WORKER_GATEWAY_PROP)};
 const PROPS_SCHEMA = ${JSON.stringify(TAKOSERVER_MANAGED_WORKER_GATEWAY_PROPS_SCHEMA)};
-const READINESS_PATH = ${JSON.stringify(MANAGED_WORKER_READINESS_PATH)};
-const READINESS_PROPS_SCHEMA = ${JSON.stringify(MANAGED_WORKER_READINESS_PROPS_SCHEMA)};
-const READINESS_RESULT_SCHEMA = ${JSON.stringify(MANAGED_WORKER_READINESS_RESULT_SCHEMA)};
-
+const READINESS_PATH = ${JSON.stringify(readinessPath)};
+const READINESS_PROPS_SCHEMA = ${JSON.stringify(readinessPropsSchema)};
+const READINESS_RESULT_SCHEMA = ${JSON.stringify(readinessResultSchema)};
+${legacy ? "" : `const RELEASE_PROOF_SCHEMA = ${JSON.stringify(MANAGED_WORKER_RELEASE_PROOF_SCHEMA)};\nconst RELEASE_PROOF_KEY_BINDING = ${JSON.stringify(MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING)};\n`}
 // Capture every mutable intrinsic used below before evaluating customer code.
 const SafeApply = Reflect.apply;
 const SafeOwnKeys = Reflect.ownKeys;
@@ -136,7 +192,7 @@ const SafeAtob = atob;
 const SafeBtoa = btoa;
 const SafeCrypto = crypto;
 const SafeCryptoRandomUUID = crypto.randomUUID;
-const SafeDateGetTime = Date.prototype.getTime;
+${legacy ? "" : `const SafeSubtle = crypto.subtle;\nconst SafeSubtleImportKey = SafeSubtle.importKey;\nconst SafeSubtleVerify = SafeSubtle.verify;\n`}const SafeDateGetTime = Date.prototype.getTime;
 const SafeError = Error;
 const SafeTypeError = TypeError;
 const SafeHeadersGet = Headers.prototype.get;
@@ -189,7 +245,7 @@ const SafeResponseHeadersGet = captureGetter(Response.prototype, "headers");
 const SafeResponseStatusGet = captureGetter(Response.prototype, "status");
 const SafeStringCharCodeAt = String.prototype.charCodeAt;
 const SafeStringSlice = String.prototype.slice;
-const SafeTextDecoder = TextDecoder;
+${legacy ? "" : "const SafeString = String;\n"}const SafeTextDecoder = TextDecoder;
 const SafeTextDecoderDecode = TextDecoder.prototype.decode;
 const SafeTextEncoder = TextEncoder;
 const SafeTextEncoderEncode = TextEncoder.prototype.encode;
@@ -203,7 +259,7 @@ const SafeURLHashGet = captureGetter(URL.prototype, "hash");
 const SafeURLOriginGet = captureGetter(URL.prototype, "origin");
 const SafeURLPathnameGet = captureGetter(URL.prototype, "pathname");
 const SafeURLSearchGet = captureGetter(URL.prototype, "search");
-const SafeReader = new SafeReadableStream().getReader();
+${legacy ? "" : `const SafeHmacImportAlgorithm = SafeApply(SafeObjectFreeze, SafeObject, [{ name: "HMAC", hash: "SHA-256" }]);\nconst SafeHmacVerifyUsages = SafeApply(SafeObjectFreeze, SafeObject, [["verify"]]);\n`}const SafeReader = new SafeReadableStream().getReader();
 const SafeReaderRead = SafeReader.read;
 const SafeReaderCancel = SafeReader.cancel;
 const SafeReaderReleaseLock = SafeReader.releaseLock;
@@ -239,7 +295,7 @@ const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const R2_INVALID_PART_PATTERN = /[(](?:10011|10025|10048)[)]$/u;
 const R2_UPLOAD_NOT_FOUND_PATTERN = /[(]10024[)]$/u;
-const SQL_ERROR_CODES = ["sql_error", "numeric_out_of_range", "busy", "backend_unavailable"];
+${legacy ? "" : "const RELEASE_PROOF_VALUE_PATTERN = /^[A-Za-z0-9_-]{43}$/u;\n"}const SQL_ERROR_CODES = ["sql_error", "numeric_out_of_range", "busy", "backend_unavailable"];
 const OBJECT_RECEIPT_ERROR_CODES = ["invalid_argument", "conflict", "not_found", "invalid_part", "value_too_large", "backend_unavailable"];
 const encoder = new SafeTextEncoder();
 let originalPromise;
@@ -260,13 +316,22 @@ export default SafeApply(SafeObjectFreeze, SafeObject, [{
     const pathname = SafeApply(SafeURLPathnameGet, url, []);
     const readiness = trustedReadinessProps(rawContext, pathname);
     if (readiness) {
-      try {
+${
+  legacy
+    ? ""
+    : `      try {
+        await verifyReleaseProof(rawEnv);
+      } catch {
+        return statusResponse(409);
+      }
+`
+}      try {
         await loadOriginal();
         const result = SafeObjectCreate(null);
         result.schema = READINESS_RESULT_SCHEMA;
         result.operationId = readiness.operationId;
         result.descriptorDigest = readiness.descriptorDigest;
-        result.handlers = CONFIGURATION.declaredHandlers;
+${legacy ? "" : "        result.challengeNonce = readiness.challengeNonce;\n"}        result.handlers = CONFIGURATION.declaredHandlers;
         return SafeApply(SafeResponseJson, SafeResponse, [result]);
       } catch {
         return statusResponse(500);
@@ -275,13 +340,13 @@ export default SafeApply(SafeObjectFreeze, SafeObject, [{
     const entrypoint = trustedEntrypoint(rawContext);
     if (pathname !== EVENT_PATH || SafeApply(SafeRequestMethodGet, request, []) !== "POST" || entrypoint === "fetch") {
       if (!declares("fetch")) return statusResponse(404);
-      const env = projectEnv(rawEnv);
+${legacy ? "" : "      await verifyReleaseProof(rawEnv);\n"}      const env = projectEnv(rawEnv);
       const context = createPortableContext(rawContext);
       const original = await loadOriginal();
       return await SafeApply(original.handlers.fetch, original.target, [request, env, context]);
     }
     try {
-      if (!eventHeadersAreValid(request)) throw new SafeTypeError("managed Worker event headers are invalid");
+${legacy ? "" : "      await verifyReleaseProof(rawEnv);\n"}      if (!eventHeadersAreValid(request)) throw new SafeTypeError("managed Worker event headers are invalid");
       const event = await boundedEvent(request);
       const props = trustedProps(rawContext, event);
       if (event.kind === "queue") {
@@ -331,10 +396,46 @@ function sealGeneratedConfiguration(raw) {
     bindings[index] = SafeApply(SafeObjectFreeze, SafeObject, [descriptor]);
   }
   SafeApply(SafeObjectFreeze, SafeObject, [bindings]);
-  const configuration = SafeObjectCreate(null);
+${
+  legacy
+    ? ""
+    : `  const rawBindingNames = internalArray();
+  for (let index = 0; index < raw.rawBindingNames.length; index += 1) {
+    rawBindingNames[index] = raw.rawBindingNames[index];
+  }
+  SafeApply(SafeObjectFreeze, SafeObject, [rawBindingNames]);
+`
+}  const configuration = SafeObjectCreate(null);
   configuration.declaredHandlers = declaredHandlers;
   configuration.bindings = bindings;
-  return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
+${
+  legacy
+    ? ""
+    : `  configuration.rawBindingNames = rawBindingNames;
+  if (raw.releaseProof) {
+    const releaseProof = SafeObjectCreate(null);
+    releaseProof.schema = raw.releaseProof.schema;
+    releaseProof.providerInstallationId = raw.releaseProof.providerInstallationId;
+    releaseProof.accountId = raw.releaseProof.accountId;
+    releaseProof.tenantRef = raw.releaseProof.tenantRef;
+    releaseProof.dispatchNamespace = raw.releaseProof.dispatchNamespace;
+    releaseProof.operationId = raw.releaseProof.operationId;
+    releaseProof.resourceUid = raw.releaseProof.resourceUid;
+    releaseProof.preparationId = raw.releaseProof.preparationId;
+    releaseProof.preparationCommitment = raw.releaseProof.preparationCommitment;
+    releaseProof.logicalWorkerId = raw.releaseProof.logicalWorkerId;
+    releaseProof.workerResourceUid = raw.releaseProof.workerResourceUid;
+    const secretNames = internalArray();
+    for (let index = 0; index < raw.releaseProof.secretNames.length; index += 1) {
+      secretNames[index] = raw.releaseProof.secretNames[index];
+    }
+    SafeApply(SafeObjectFreeze, SafeObject, [secretNames]);
+    releaseProof.secretNames = secretNames;
+    releaseProof.expectedMac = raw.releaseProof.expectedMac;
+    configuration.releaseProof = SafeApply(SafeObjectFreeze, SafeObject, [releaseProof]);
+  }
+`
+}  return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
 }
 
 function internalArray() {
@@ -353,7 +454,110 @@ function declares(name) {
   }
   return false;
 }
+${
+  legacy
+    ? ""
+    : `
+async function verifyReleaseProof(rawEnv) {
+  if (!rawEnv || (typeof rawEnv !== "object" && typeof rawEnv !== "function")) {
+    throw new SafeTypeError("managed Worker release bindings are unavailable");
+  }
+  const actualNames = SafeOwnKeys(rawEnv);
+  if (actualNames.length !== CONFIGURATION.rawBindingNames.length) {
+    throw new SafeTypeError("managed Worker release binding closure drifted");
+  }
+  for (let expectedIndex = 0; expectedIndex < CONFIGURATION.rawBindingNames.length; expectedIndex += 1) {
+    const expected = CONFIGURATION.rawBindingNames[expectedIndex];
+    let found = false;
+    for (let actualIndex = 0; actualIndex < actualNames.length; actualIndex += 1) {
+      if (actualNames[actualIndex] === expected) found = true;
+    }
+    if (!found) throw new SafeTypeError("managed Worker release binding closure drifted");
+  }
+  const proof = CONFIGURATION.releaseProof;
+  if (!proof) return;
+  const encodedKey = rawEnv[RELEASE_PROOF_KEY_BINDING];
+  if (typeof encodedKey !== "string") {
+    throw new SafeTypeError("managed Worker release proof is unavailable");
+  }
+  const fields = internalArray();
+  fields[0] = RELEASE_PROOF_SCHEMA;
+  fields[1] = proof.providerInstallationId;
+  fields[2] = proof.accountId;
+  fields[3] = proof.tenantRef;
+  fields[4] = proof.dispatchNamespace;
+  fields[5] = proof.operationId;
+  fields[6] = proof.resourceUid;
+  fields[7] = proof.preparationId;
+  fields[8] = proof.preparationCommitment;
+  fields[9] = proof.logicalWorkerId;
+  fields[10] = proof.workerResourceUid;
+  fields[11] = SafeString(proof.secretNames.length);
+  for (let index = 0; index < proof.secretNames.length; index += 1) {
+    const name = proof.secretNames[index];
+    const value = rawEnv[name];
+    if (typeof value !== "string" || !boundedUtf8(value, 32768)) {
+      throw new SafeTypeError("managed Worker release secret is unavailable");
+    }
+    fields[fields.length] = name;
+    fields[fields.length] = value;
+  }
+  const keyBytes = decodeReleaseProofValue(encodedKey);
+  const signature = decodeReleaseProofValue(proof.expectedMac);
+  const key = await SafeApply(SafeSubtleImportKey, SafeSubtle, ["raw", keyBytes, SafeHmacImportAlgorithm, false, SafeHmacVerifyUsages]);
+  const verified = await SafeApply(SafeSubtleVerify, SafeSubtle, ["HMAC", key, signature, releaseProofMessage(fields)]);
+  if (!verified) throw new SafeTypeError("managed Worker release proof does not match");
+}
 
+function releaseProofMessage(fields) {
+  const encoded = internalArray();
+  let total = 0;
+  for (let index = 0; index < fields.length; index += 1) {
+    const bytes = SafeApply(SafeTextEncoderEncode, encoder, [fields[index]]);
+    const length = viewByteLength(bytes);
+    total += 4 + length;
+    if (!SafeNumberIsSafeInteger(total) || total > 3 * 1024 * 1024) {
+      throw new SafeTypeError("managed Worker release proof is too large");
+    }
+    encoded[index] = bytes;
+  }
+  const output = new SafeUint8Array(total);
+  let offset = 0;
+  for (let index = 0; index < encoded.length; index += 1) {
+    const bytes = encoded[index];
+    const length = viewByteLength(bytes);
+    output[offset] = (length >>> 24) & 255;
+    output[offset + 1] = (length >>> 16) & 255;
+    output[offset + 2] = (length >>> 8) & 255;
+    output[offset + 3] = length & 255;
+    offset += 4;
+    SafeApply(SafeUint8ArraySet, output, [bytes, offset]);
+    offset += length;
+  }
+  return output;
+}
+
+function decodeReleaseProofValue(value) {
+  if (typeof value !== "string" || !SafeApply(SafeRegExpTest, RELEASE_PROOF_VALUE_PATTERN, [value])) {
+    throw new SafeTypeError("managed Worker release proof encoding is invalid");
+  }
+  let base64 = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const code = SafeApply(SafeStringCharCodeAt, value, [index]);
+    base64 += code === 45 ? "+" : code === 95 ? "/" : value[index];
+  }
+  const decoded = SafeAtob(base64 + "=");
+  if (decoded.length !== 32) {
+    throw new SafeTypeError("managed Worker release proof encoding is invalid");
+  }
+  const bytes = new SafeUint8Array(32);
+  for (let index = 0; index < decoded.length; index += 1) {
+    bytes[index] = SafeApply(SafeStringCharCodeAt, decoded, [index]);
+  }
+  return bytes;
+}
+`
+}
 function loadOriginal() {
   if (!originalPromise) {
     const loading = import(${JSON.stringify(moduleSpecifier)});
@@ -458,9 +662,15 @@ function trustedReadinessProps(rawContext, pathname) {
   if (pathname !== READINESS_PATH) return undefined;
   try {
     const props = rawContext && rawContext.props;
-    if (!isRecord(props) || !exactKeys(props, ["schema", "operationId", "descriptorDigest"])) return undefined;
+${
+  legacy
+    ? `    if (!isRecord(props) || !exactKeys(props, ["schema", "operationId", "descriptorDigest"])) return undefined;
     if (props.schema !== READINESS_PROPS_SCHEMA || !token(props.operationId) || !digest(props.descriptorDigest)) return undefined;
-    return props;
+`
+    : `    if (!isRecord(props) || !exactKeys(props, ["schema", "operationId", "descriptorDigest", "challengeNonce"])) return undefined;
+    if (props.schema !== READINESS_PROPS_SCHEMA || !token(props.operationId) || !digest(props.descriptorDigest) || !SafeApply(SafeRegExpTest, RELEASE_PROOF_VALUE_PATTERN, [props.challengeNonce])) return undefined;
+`
+}    return props;
   } catch {
     return undefined;
   }
@@ -2022,9 +2232,19 @@ function normalizeSourceInput(input: ManagedWorkerEntrypointSourceInput): {
   readonly originalMainModule: string;
   readonly declaredHandlers: ManagedWorkerHandlerName[];
   readonly bindings: ManagedWorkerBindingDescriptor[];
+  readonly releaseProtocol: ManagedWorkerReleaseProtocol;
+  readonly releaseProof?: ManagedWorkerReleaseProof;
 } {
   const fields = dataProperties(input, "input");
-  exactNormalizedKeys(fields, ["originalMainModule", "declaredHandlers", "bindings"], "input");
+  const optional = [
+    ...(Object.hasOwn(fields, "releaseProtocol") ? ["releaseProtocol"] : []),
+    ...(Object.hasOwn(fields, "releaseProof") ? ["releaseProof"] : []),
+  ];
+  exactNormalizedKeys(
+    fields,
+    ["originalMainModule", "declaredHandlers", "bindings", ...optional],
+    "input",
+  );
   validateArtifactPartName(fields.originalMainModule);
   const declaredHandlersInput = dataArray(fields.declaredHandlers, "declaredHandlers");
   if (declaredHandlersInput.length < 1) {
@@ -2145,11 +2365,139 @@ function normalizeSourceInput(input: ManagedWorkerEntrypointSourceInput): {
   for (const nativeName of nativeNames) {
     if (publicNames.has(nativeName)) invalid("bindings");
   }
+  const releaseProof = Object.hasOwn(fields, "releaseProof")
+    ? normalizeReleaseProof(fields.releaseProof, bindings)
+    : undefined;
+  const releaseProtocol = Object.hasOwn(fields, "releaseProtocol")
+    ? fields.releaseProtocol
+    : MANAGED_WORKER_RELEASE_PROTOCOL;
+  if (
+    (releaseProtocol !== MANAGED_WORKER_RELEASE_PROTOCOL &&
+      releaseProtocol !== MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL) ||
+    (releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL && releaseProof)
+  ) {
+    invalid("releaseProtocol");
+  }
   return {
     originalMainModule: fields.originalMainModule,
     declaredHandlers,
     bindings,
+    releaseProtocol,
+    ...(releaseProof ? { releaseProof } : {}),
   };
+}
+
+function normalizeReleaseProof(
+  value: unknown,
+  bindings: readonly ManagedWorkerBindingDescriptor[],
+): ManagedWorkerReleaseProof {
+  const proof = dataProperties(value, "releaseProof");
+  exactNormalizedKeys(
+    proof,
+    [
+      "schema",
+      "providerInstallationId",
+      "accountId",
+      "tenantRef",
+      "dispatchNamespace",
+      "operationId",
+      "resourceUid",
+      "preparationId",
+      "preparationCommitment",
+      "logicalWorkerId",
+      "workerResourceUid",
+      "secretNames",
+      "expectedMac",
+    ],
+    "releaseProof",
+  );
+  const names = dataArray(proof.secretNames, "releaseProof");
+  const providerInstallationId = proof.providerInstallationId;
+  const accountId = proof.accountId;
+  const tenantRef = proof.tenantRef;
+  const dispatchNamespace = proof.dispatchNamespace;
+  const operationId = proof.operationId;
+  const resourceUid = proof.resourceUid;
+  const preparationId = proof.preparationId;
+  const preparationCommitment = proof.preparationCommitment;
+  const logicalWorkerId = proof.logicalWorkerId;
+  const workerResourceUid = proof.workerResourceUid;
+  const expectedMac = proof.expectedMac;
+  const secretNames = names.filter((name): name is string => typeof name === "string");
+  const available = bindings
+    .filter(
+      (binding): binding is ManagedWorkerNativeBindingDescriptor =>
+        Object.hasOwn(binding, "type") &&
+        (binding as ManagedWorkerNativeBindingDescriptor).type === "secret_text",
+    )
+    .map((binding) => binding.name)
+    .sort();
+  if (
+    proof.schema !== MANAGED_WORKER_RELEASE_PROOF_SCHEMA ||
+    typeof providerInstallationId !== "string" ||
+    !AUTHORITY_TOKEN.test(providerInstallationId) ||
+    typeof accountId !== "string" ||
+    !AUTHORITY_TOKEN.test(accountId) ||
+    typeof tenantRef !== "string" ||
+    !AUTHORITY_TOKEN.test(tenantRef) ||
+    typeof dispatchNamespace !== "string" ||
+    !AUTHORITY_TOKEN.test(dispatchNamespace) ||
+    typeof operationId !== "string" ||
+    !AUTHORITY_TOKEN.test(operationId) ||
+    typeof resourceUid !== "string" ||
+    !AUTHORITY_TOKEN.test(resourceUid) ||
+    typeof preparationId !== "string" ||
+    !AUTHORITY_TOKEN.test(preparationId) ||
+    !releaseProofCommitment(preparationCommitment) ||
+    typeof logicalWorkerId !== "string" ||
+    !AUTHORITY_TOKEN.test(logicalWorkerId) ||
+    typeof workerResourceUid !== "string" ||
+    !AUTHORITY_TOKEN.test(workerResourceUid) ||
+    names.length < 1 ||
+    names.length > 64 ||
+    secretNames.length !== names.length ||
+    secretNames.some((name) => !/^[A-Z_][A-Z0-9_]{0,127}$/u.test(name)) ||
+    JSON.stringify(secretNames) !== JSON.stringify([...secretNames].sort()) ||
+    JSON.stringify(secretNames) !== JSON.stringify(available) ||
+    typeof expectedMac !== "string" ||
+    !RELEASE_PROOF_VALUE.test(expectedMac)
+  ) {
+    invalid("releaseProof");
+  }
+  return {
+    schema: MANAGED_WORKER_RELEASE_PROOF_SCHEMA,
+    providerInstallationId,
+    accountId,
+    tenantRef,
+    dispatchNamespace,
+    operationId,
+    resourceUid,
+    preparationId,
+    preparationCommitment,
+    logicalWorkerId,
+    workerResourceUid,
+    secretNames,
+    expectedMac,
+  };
+}
+
+function releaseProofCommitment(value: unknown): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
+function managedRawBindingNames(
+  bindings: readonly ManagedWorkerBindingDescriptor[],
+  releaseProof: boolean,
+): readonly string[] {
+  const names = bindings.flatMap((binding) =>
+    "type" in binding
+      ? [binding.name]
+      : binding.kind === MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND
+        ? [binding.nativeName, binding.receiptNativeName]
+        : [binding.nativeName],
+  );
+  if (releaseProof) names.push(MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING);
+  return names.sort();
 }
 
 function normalizeObjectReceiptAuthority(value: unknown): ManagedObjectReceiptAuthority {

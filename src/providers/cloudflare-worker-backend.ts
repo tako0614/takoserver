@@ -25,6 +25,7 @@ import type {
   ManagedWorkerSqliteMigration,
   ManagedWorkerSqliteMigrationIdentity,
 } from "./cloudflare-managed-worker-sqlite.ts";
+import type { ManagedWorkerReleaseProtocol } from "./cloudflare-managed-worker-wrapper.ts";
 
 export interface CloudflareOrdinaryWorkerBackendOptions {
   readonly kind: "ordinary-workers";
@@ -33,9 +34,11 @@ export interface CloudflareOrdinaryWorkerBackendOptions {
 }
 
 export interface CloudflareManagedReleaseInspectionInput {
+  readonly releaseProtocol: ManagedWorkerReleaseProtocol;
   readonly scriptName: string;
   readonly descriptorDigest: `sha256:${string}`;
   readonly operationId: string;
+  readonly challengeNonce: string;
   readonly declaredHandlers: readonly ("fetch" | "queue" | "scheduled")[];
 }
 
@@ -45,17 +48,10 @@ export type CloudflareManagedReleaseInspection =
       readonly scriptName: string;
       readonly descriptorDigest: `sha256:${string}`;
       readonly operationId: string;
+      readonly challengeNonce?: string;
       readonly handlers: readonly ("fetch" | "queue" | "scheduled")[];
     }
   | { readonly ok: false; readonly retryable: boolean };
-
-export interface CloudflareManagedReleaseReadbackQualification {
-  readonly schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1";
-  /** Must be the exact namespace rehearsed by the owning deploy surface. */
-  readonly dispatchNamespace: string;
-  /** Digest of the recorded multi-module upload/content/settings/ETag rehearsal artifact. */
-  readonly rehearsalDigest: `sha256:${string}`;
-}
 
 export interface CloudflareWorkersForPlatformsBackendOptions {
   readonly kind: "workers-for-platforms";
@@ -71,12 +67,6 @@ export interface CloudflareWorkersForPlatformsBackendOptions {
   readonly inspectRelease: (
     input: CloudflareManagedReleaseInspectionInput,
   ) => Promise<CloudflareManagedReleaseInspection>;
-  /**
-   * Enables adoption of a present script after upload acknowledgement loss.
-   * Omission is fail-closed: acknowledged uploads still commit normally, but
-   * a pending receipt cannot infer undocumented GET content round-tripping.
-   */
-  readonly releaseReadbackQualification?: CloudflareManagedReleaseReadbackQualification;
   /** HMACs provider-private SQLite DO instance names; raw resource UIDs never enter bindings. */
   readonly deriveSqliteInstanceName: (input: {
     readonly providerId: string;

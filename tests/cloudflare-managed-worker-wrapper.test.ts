@@ -8,6 +8,10 @@ import { managedObjectReceiptRuntimeProof } from "../src/providers/cloudflare-ma
 import {
   MANAGED_WORKER_EDGE_OBJECTS_BINDING_KIND,
   MANAGED_WORKER_EDGE_SQL_BINDING_KIND,
+  MANAGED_WORKER_LEGACY_READINESS_PATH,
+  MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+  MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA,
+  MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
   MANAGED_WORKER_READINESS_PATH,
   MANAGED_WORKER_READINESS_PROPS_SCHEMA,
   MANAGED_WORKER_READINESS_RESULT_SCHEMA,
@@ -20,6 +24,42 @@ const EMPTY_WORKER: ManagedWorkerEntrypointSourceInput = {
   declaredHandlers: ["fetch"],
   bindings: [],
 };
+
+test("legacy managed Worker source and readiness remain byte-exact", async () => {
+  const input = {
+    ...EMPTY_WORKER,
+    releaseProtocol: MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
+  } as const;
+  const source = managedWorkerEntrypointSource(input);
+  expect(source.length).toBe(83_398);
+  expect(new Bun.CryptoHasher("sha256").update(source).digest("hex")).toBe(
+    "f4c8b5aee443846e95f0f696b03ca88777699e06404c75f7e41b9475b9f4cc8b",
+  );
+  const loaded = await loadGeneratedWorker(
+    'export default { fetch() { return new Response("legacy"); } };',
+    input,
+  );
+  try {
+    const props = {
+      schema: MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+      operationId: "operation-legacy",
+      descriptorDigest: `sha256:${"a".repeat(64)}`,
+    };
+    const response = await loaded.worker.fetch(
+      publicRequest(MANAGED_WORKER_LEGACY_READINESS_PATH),
+      {},
+      { props },
+    );
+    expect(await response.json()).toEqual({
+      schema: MANAGED_WORKER_LEGACY_READINESS_RESULT_SCHEMA,
+      operationId: props.operationId,
+      descriptorDigest: props.descriptorDigest,
+      handlers: ["fetch"],
+    });
+  } finally {
+    await loaded.dispose();
+  }
+});
 
 const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
 const EVENT_PROTOCOL = "takoserver.managed-worker-event@v1";
@@ -2003,6 +2043,7 @@ export default {
     schema: MANAGED_WORKER_READINESS_PROPS_SCHEMA,
     operationId: "operation-1",
     descriptorDigest: `sha256:${"a".repeat(64)}`,
+    challengeNonce: "b".repeat(43),
   };
   try {
     const response = await valid.worker.fetch(
@@ -2015,6 +2056,7 @@ export default {
       schema: MANAGED_WORKER_READINESS_RESULT_SCHEMA,
       operationId: "operation-1",
       descriptorDigest: `sha256:${"a".repeat(64)}`,
+      challengeNonce: "b".repeat(43),
       handlers: ["fetch", "scheduled"],
     });
     const publicResponse = await valid.worker.fetch(
@@ -2044,6 +2086,111 @@ export default {
     }
   }
 });
+
+test("release readiness proves exact raw secrets and keeps the proof key outside tenant env", async () => {
+  const customerSource =
+    "export default { fetch(_request, env) { return Response.json({ keys: Reflect.ownKeys(env), secret: env.API_KEY, proof: env.__TAKOSERVER_RELEASE_PROOF_KEY ?? null }); } };";
+  const releaseProof = {
+    schema: "takoserver.managed-worker-release-proof@v1" as const,
+    providerInstallationId: "cloudflare.wfp.integration",
+    accountId: "acct_1",
+    tenantRef: "organization_yurucommu",
+    dispatchNamespace: "takoserver-customers",
+    operationId: "operation-proof",
+    resourceUid: "resource-proof",
+    preparationId: "preparation-proof",
+    preparationCommitment: `sha256:${"a".repeat(64)}` as const,
+    logicalWorkerId: "tsw-proof",
+    workerResourceUid: "worker-proof",
+    secretNames: ["API_KEY"],
+    expectedMac: "4skXEfmOLjtQ2wPWoCUNb6JtAwq4cHLyfbJq9RgPR4w",
+  };
+  const loaded = await loadGeneratedWorker(customerSource, {
+    ...EMPTY_WORKER,
+    bindings: [{ name: "API_KEY", type: "secret_text" }],
+    releaseProof,
+  });
+  const props = {
+    schema: MANAGED_WORKER_READINESS_PROPS_SCHEMA,
+    operationId: releaseProof.operationId,
+    descriptorDigest: `sha256:${"b".repeat(64)}`,
+    challengeNonce: "c".repeat(43),
+  };
+  const exactEnv = {
+    API_KEY: "expected-secret",
+    __TAKOSERVER_RELEASE_PROOF_KEY: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  };
+  try {
+    const readiness = await loaded.worker.fetch(
+      publicRequest(MANAGED_WORKER_READINESS_PATH),
+      exactEnv,
+      { props },
+    );
+    expect(readiness.status).toBe(200);
+    expect(await readiness.json()).toEqual({
+      schema: MANAGED_WORKER_READINESS_RESULT_SCHEMA,
+      operationId: releaseProof.operationId,
+      descriptorDigest: `sha256:${"b".repeat(64)}`,
+      challengeNonce: "c".repeat(43),
+      handlers: ["fetch"],
+    });
+
+    for (const env of [
+      { ...exactEnv, API_KEY: "wrong-secret" },
+      { API_KEY: exactEnv.API_KEY },
+      { ...exactEnv, __TAKOSERVER_RELEASE_PROOF_KEY: "d".repeat(43) },
+      { ...exactEnv, EXTRA: "unexpected" },
+    ]) {
+      expect(
+        (
+          await loaded.worker.fetch(publicRequest(MANAGED_WORKER_READINESS_PATH), env, {
+            props,
+          })
+        ).status,
+      ).toBe(409);
+    }
+
+    const publicResponse = await loaded.worker.fetch(publicRequest(), exactEnv, {});
+    expect(await publicResponse.json()).toEqual({
+      keys: ["API_KEY"],
+      secret: "expected-secret",
+      proof: null,
+    });
+  } finally {
+    await loaded.dispose();
+  }
+
+  for (const replay of [
+    { providerInstallationId: "cloudflare.other" },
+    { accountId: "acct_other" },
+    { tenantRef: "organization_other" },
+    { dispatchNamespace: "takoserver-other" },
+    { operationId: "operation-other" },
+    { resourceUid: "resource-other" },
+    { preparationId: "preparation-other" },
+    { preparationCommitment: `sha256:${"b".repeat(64)}` as const },
+    { logicalWorkerId: "tsw-other" },
+    { workerResourceUid: "worker-other" },
+    { expectedMac: "d".repeat(43) },
+  ]) {
+    const replayed = await loadGeneratedWorker(customerSource, {
+      ...EMPTY_WORKER,
+      bindings: [{ name: "API_KEY", type: "secret_text" }],
+      releaseProof: { ...releaseProof, ...replay },
+    });
+    try {
+      expect(
+        (
+          await replayed.worker.fetch(publicRequest(MANAGED_WORKER_READINESS_PATH), exactEnv, {
+            props,
+          })
+        ).status,
+      ).toBe(409);
+    } finally {
+      await replayed.dispose();
+    }
+  }
+}, 10_000);
 
 test("customer env, context, and binding adapters have exact null-prototype projections", async () => {
   const bindingInput: ManagedWorkerEntrypointSourceInput = {
@@ -2103,8 +2250,6 @@ test("customer env, context, and binding adapters have exact null-prototype proj
         SECRET: "sealed",
         ...methods,
         __TAKOSERVER_SQLITE_0: { getByName: () => sqlStub },
-        RAW_EXTRA: "must-not-leak",
-        TAKOSERVER_INTERNAL_OPERATION_MARKER: "must-not-leak",
       },
       {
         waitUntil() {},
@@ -2466,7 +2611,6 @@ test("Queue delivery preserves encoded bytes, exact portable shapes, and throw s
         REPORT: (value: unknown) => {
           report = value;
         },
-        RAW_INTERNAL: "hidden",
       },
       gatewayContext("queue", waits),
     );

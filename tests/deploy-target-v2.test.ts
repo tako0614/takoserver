@@ -194,16 +194,6 @@ describe("environment-exact deploy target", () => {
         edgeSupplies,
         cloudflareProviderExecutor: {
           ...cloudflareProviderExecutor,
-          releaseReadbackQualification: {
-            ...cloudflareProviderExecutor.releaseReadbackQualification,
-            dispatchNamespace: "another-dispatch",
-          },
-        },
-      }),
-      descriptor({
-        edgeSupplies,
-        cloudflareProviderExecutor: {
-          ...cloudflareProviderExecutor,
           workerName: "takoserver-api-rehearsal",
         },
       }),
@@ -217,51 +207,25 @@ describe("environment-exact deploy target", () => {
     }
   });
 
-  test("allows integration to omit the unproduced acknowledgement-recovery qualification", () => {
+  test("accepts the exact provider executor topology in every environment", () => {
     const edgeSupplies = edgeSuppliesFixture();
     const objectBucketSupplies = objectBucketSuppliesFixture();
-    const qualified = cloudflareProviderExecutorTarget();
-    const { releaseReadbackQualification: _qualification, ...unqualified } = qualified;
-    const integration = descriptor({
-      environment: "integration",
-      edgeSupplies,
-      objectBucketSupplies,
-      cloudflareProviderExecutor: unqualified,
-    });
-    expect(
-      parseDeployTarget(integration, "integration target without qualification", "integration")
-        .cloudflareProviderExecutor,
-    ).toEqual(unqualified);
-    expect(() =>
-      parseDeployTarget(
-        { ...integration, environment: "rehearsal" },
-        "rehearsal target without qualification",
-        "rehearsal",
-      ),
-    ).toThrow("releaseReadbackQualification");
-    expect(() =>
-      parseDeployTarget(
-        { ...integration, environment: "production" },
-        "production target without qualification",
-        "production",
-      ),
-    ).toThrow("releaseReadbackQualification");
-    expect(() =>
-      parseDeployTarget(
-        {
-          ...integration,
-          cloudflareProviderExecutor: {
-            ...unqualified,
-            releaseReadbackQualification: null,
-          },
-        },
-        "malformed integration qualification",
-        "integration",
-      ),
-    ).toThrow("releaseReadbackQualification");
+    const executor = cloudflareProviderExecutorTarget();
+    for (const environment of ["integration", "rehearsal", "production"] as const) {
+      const selected = descriptor({
+        environment,
+        edgeSupplies,
+        objectBucketSupplies,
+        cloudflareProviderExecutor: executor,
+      });
+      expect(
+        parseDeployTarget(selected, `${environment} target`, environment)
+          .cloudflareProviderExecutor,
+      ).toEqual(executor);
+    }
   });
 
-  test("loads the namespace bootstrap projection without fabricated supply qualification", () => {
+  test("loads the namespace bootstrap projection without fabricated complete supplies", () => {
     const minimal = {
       kind: "takoserver.deploy-target@v2",
       environment: "rehearsal",

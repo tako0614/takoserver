@@ -144,12 +144,7 @@ function compositionEnvironment(
   } as unknown as CloudflareProviderExecutorEnvironment;
 }
 
-test("Cloudflare provider executor composition gates qualification on the exact environment", async () => {
-  for (const environment of ["rehearsal", "production"]) {
-    await expect(
-      createCloudflareProviderExecutorFromEnv(compositionEnvironment(environment)),
-    ).rejects.toThrow("releaseReadbackQualification");
-  }
+test("Cloudflare provider executor composition rejects an invalid environment", async () => {
   await expect(
     createCloudflareProviderExecutorFromEnv(compositionEnvironment("staging")),
   ).rejects.toThrow("environment is invalid");

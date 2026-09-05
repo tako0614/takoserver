@@ -56,11 +56,6 @@ function target(environment: "integration" | "rehearsal" | "production"): Deploy
       managedBaseDomain: `${environment}.workers.example.test`,
       providerInstallationId: PROVIDER_INSTALLATION,
       receiptAuthorityWorkerName: `takoserver-managed-object-receipt-authority-${environment}`,
-      releaseReadbackQualification: {
-        schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-        dispatchNamespace,
-        rehearsalDigest: `sha256:${"9".repeat(64)}`,
-      },
     },
     signing: { currentKeyId: "current-key" },
   };

@@ -1,4 +1,5 @@
 import { isEdgeFormsApiVersion } from "../form-ref.ts";
+import { base64UrlEncode } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
   type ApplyInput,
@@ -53,8 +54,14 @@ import {
   MANAGED_WORKER_EDGE_SQL_BINDING_KIND,
   MANAGED_WORKER_HANDLER_NAMES,
   MANAGED_WORKER_INTERNAL_BINDING_PREFIX,
+  MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
+  MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING,
+  MANAGED_WORKER_RELEASE_PROOF_SCHEMA,
+  MANAGED_WORKER_RELEASE_PROTOCOL,
   type ManagedWorkerBindingDescriptor,
   type ManagedWorkerHandlerName,
+  type ManagedWorkerReleaseProof,
+  type ManagedWorkerReleaseProtocol,
   managedWorkerEntrypointSource,
 } from "./cloudflare-managed-worker-wrapper.ts";
 import {
@@ -105,8 +112,26 @@ const MANAGED_WORKER_COMPATIBILITY_FLAGS = ["disallow_importable_env"] as const;
 const MANAGED_SQLITE_CLASS = "TakoserverManagedWorkerSqlite";
 const MANAGED_OBJECT_RECEIPT_CLASS = "TakoserverManagedObjectReceipt";
 const MANAGED_OBJECT_RECEIPT_PROOF = /^[A-Za-z0-9_-]{43}$/u;
+const MANAGED_RELEASE_PROOF_VALUE = /^[A-Za-z0-9_-]{43}$/u;
+const MANAGED_RELEASE_PROOF_FIELDS = [
+  "schema",
+  "providerInstallationId",
+  "accountId",
+  "tenantRef",
+  "dispatchNamespace",
+  "operationId",
+  "resourceUid",
+  "preparationId",
+  "preparationCommitment",
+  "logicalWorkerId",
+  "workerResourceUid",
+  "secretNames",
+  "expectedMac",
+] as const;
 const MAX_MODULES = 512;
 const MAX_MODULE_BYTES = 32 * 1024 * 1024;
+const MAX_RELEASE_PROOF_MESSAGE_BYTES = 3 * 1024 * 1024;
+const MAX_WORKER_VARIABLE_BINDINGS = 128;
 
 const MANAGED_FORM_KINDS = new Set([
   "ModuleWorker",
@@ -137,6 +162,7 @@ interface ManagedBindingClosure {
 }
 
 interface ManagedReleaseClosure {
+  readonly releaseProtocol: ManagedWorkerReleaseProtocol;
   readonly logicalWorkerId: string;
   readonly resourceUid: string;
   readonly operationId: string;
@@ -156,8 +182,28 @@ interface ManagedReleaseClosure {
   }[];
   readonly manifestDigest: string;
   readonly runtimeInputCommitment?: `sha256:${string}`;
+  readonly releaseProof?: ManagedWorkerReleaseProof;
   readonly workerResource: ProviderRelation["resource"];
   readonly bundleResource: ProviderRelation["resource"];
+}
+
+interface ManagedReleaseProofMaterial {
+  readonly proof: ManagedWorkerReleaseProof;
+  readonly key: string;
+}
+
+interface ManagedReleaseProofContext {
+  readonly providerInstallationId: string;
+  readonly accountId: string;
+  readonly tenantRef: string;
+  readonly dispatchNamespace: string;
+  readonly operationId: string;
+  readonly resourceUid: string;
+  readonly preparationId: string | undefined;
+  readonly preparationCommitment: `sha256:${string}` | undefined;
+  readonly logicalWorkerId: string;
+  readonly workerResourceUid: string;
+  readonly secretNames: readonly string[];
 }
 
 interface ManagedScheduleFence {
@@ -183,7 +229,6 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
   readonly #state: ManagedWorkerState;
   readonly #client: CloudflareWfpClient;
   readonly #inspectRelease: CloudflareWorkersForPlatformsBackendOptions["inspectRelease"];
-  readonly #pendingReleaseReadbackQualified: boolean;
   readonly #deriveSqliteInstanceName: CloudflareWorkersForPlatformsBackendOptions["deriveSqliteInstanceName"];
   readonly #sealSqliteAdminProof: CloudflareWorkersForPlatformsBackendOptions["sealSqliteAdminProof"];
   readonly #sqliteNamespace: CloudflareManagedSqliteNamespace;
@@ -245,16 +290,6 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       fetch: options.fetch,
     });
     this.#inspectRelease = options.inspectRelease;
-    const qualification = options.releaseReadbackQualification;
-    if (
-      qualification !== undefined &&
-      (qualification.schema !== "takoserver.cloudflare-wfp-release-readback-qualification@v1" ||
-        qualification.dispatchNamespace !== this.dispatchNamespace ||
-        !sha256(qualification.rehearsalDigest))
-    ) {
-      throw new TypeError("invalid managed Worker release readback qualification");
-    }
-    this.#pendingReleaseReadbackQualified = qualification !== undefined;
     this.#deriveSqliteInstanceName = options.deriveSqliteInstanceName;
     this.#sealSqliteAdminProof = options.sealSqliteAdminProof;
     this.#sqliteNamespace = options.sqliteNamespace;
@@ -991,6 +1026,20 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         true,
       );
     }
+    const vars = input.spec.vars === undefined ? {} : record(input.spec.vars);
+    if (
+      !vars ||
+      (!recovery &&
+        Object.keys(vars).length +
+          requiredSensitive.length +
+          (requiredSensitive.length > 0 ? 1 : 0) >
+          MAX_WORKER_VARIABLE_BINDINGS)
+    ) {
+      return failed(
+        "invalid_spec",
+        "the managed Worker variable binding closure exceeds the Workers for Platforms limit",
+      );
+    }
 
     // ObjectBucket material is provider authority, not a late upload detail.
     // Close every binding relation before acquiring a one-shot runtime-input
@@ -1031,12 +1080,40 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
 
     let closure: ManagedReleaseClosure | ProviderTicket;
+    let releaseProofMaterial: ManagedReleaseProofMaterial | undefined;
+    if (lease) {
+      try {
+        const worker = relationDeployment(input.relations, "/worker", "worker");
+        if (!worker) throw new TypeError("managed Worker release identity is unavailable");
+        releaseProofMaterial = await createManagedReleaseProof({
+          providerInstallationId: this.#providerInstallationId,
+          accountId: this.#accountId,
+          tenantRef: input.identity.tenantRef,
+          dispatchNamespace: this.dispatchNamespace,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid,
+          preparationId: lease.preparation.preparationId,
+          preparationCommitment: lease.preparation.commitment,
+          logicalWorkerId: worker.name,
+          workerResourceUid: target.workerResourceUid,
+          secretNames: requiredSensitive,
+          secretValues: lease.bindings,
+        });
+      } catch {
+        const aborted = await abortRuntimeLease(lease);
+        return (
+          aborted ?? failed("denied", "required sensitive Worker runtime inputs are unavailable")
+        );
+      }
+    }
     try {
       closure = await this.#prepareRelease(
         input,
         requiredSensitive,
         lease?.preparation.commitment,
         lease?.bindings,
+        releaseProofMaterial?.proof,
+        releaseProofMaterial?.key,
       );
     } catch {
       closure = failed("provider_error", "the managed Worker release could not be constructed");
@@ -1053,6 +1130,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       logicalWorkerId: closure.logicalWorkerId,
       operationId: input.operationId,
       descriptorDigest: closure.descriptorDigest,
+      observed: releasePendingReceiptObserved(closure),
     });
     if (claim.outcome === "conflict") {
       const aborted = lease ? await abortRuntimeLease(lease) : null;
@@ -1096,10 +1174,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     if (uploaded.ok === false) {
       return await this.#handleReleaseUploadFailure(input, closure, requiredSensitive, uploaded);
     }
-    const realized = await this.#readAndInspectRelease(closure, uploaded.value.etag, {
-      input,
-      requiredSensitive,
-    });
+    const realized = await this.#readAndInspectRelease(closure, uploaded.value.etag, true);
     if (realized.phase !== "succeeded")
       return realized.phase === "failed"
         ? realized
@@ -1158,24 +1233,77 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         return failed("denied", "required sensitive Worker runtime inputs are unavailable");
       }
     }
+    const logicalWorker = relationDeployment(input.relations, "/worker", "worker");
+    if (!logicalWorker) {
+      return failed("invalid_spec", "the managed Worker Version is incomplete");
+    }
+    const receipt = await this.#state.receiptByResourceUid(input.identity.uid as string);
+    const releaseProtocol = receipt
+      ? managedReleaseProtocolFromReceipt(receipt.observed)
+      : undefined;
+    const releaseProof =
+      receipt && releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL
+        ? managedReleaseProofFromReceipt(receipt.observed, {
+            providerInstallationId: this.#providerInstallationId,
+            accountId: this.#accountId,
+            tenantRef: input.identity.tenantRef,
+            dispatchNamespace: this.dispatchNamespace,
+            operationId: input.operationId,
+            resourceUid: input.identity.uid as string,
+            preparationId: recoveryLease?.preparation.preparationId,
+            preparationCommitment: recoveryLease?.preparation.commitment,
+            logicalWorkerId: logicalWorker.name,
+            workerResourceUid: target.workerResourceUid,
+            secretNames: requiredSensitive,
+          })
+        : undefined;
+    if (
+      !receipt ||
+      !releaseProtocol ||
+      (releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        requiredSensitive.length > 0 &&
+        !releaseProof) ||
+      (releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        requiredSensitive.length === 0 &&
+        Object.hasOwn(receipt.observed, "releaseProof")) ||
+      (releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+        Object.hasOwn(receipt.observed, "releaseProof"))
+    ) {
+      return failed(
+        "unavailable",
+        "the managed Worker release receipt requires operator reconciliation",
+        true,
+      );
+    }
     const closure = await this.#prepareRelease(
       input,
       requiredSensitive,
       recoveryLease?.preparation.commitment,
+      undefined,
+      releaseProof,
+      undefined,
+      false,
+      releaseProtocol,
     );
     if ("phase" in closure) return closure;
-    const receipt = await this.#state.receiptByResourceUid(closure.resourceUid);
     if (
       receipt?.kind !== "version" ||
       receipt.nativeId !== closure.nativeId ||
       receipt.operationId !== input.operationId ||
       receipt.descriptorDigest !== closure.descriptorDigest
     ) {
-      return failed("conflict", "the immutable managed Worker release receipt is unavailable");
+      return failed(
+        receipt?.state === "pending" ? "unavailable" : "conflict",
+        "the immutable managed Worker release receipt is unavailable",
+        receipt?.state === "pending",
+      );
     }
     const absent = await this.#client.scriptAbsent(closure.releaseScript);
-    if (absent.ok === false)
-      return wfpFailure(absent, "the managed Worker release readback failed");
+    if (absent.ok === false) {
+      return receipt.state === "pending"
+        ? failed("unavailable", "the managed Worker release readback is indeterminate", true)
+        : wfpFailure(absent, "the managed Worker release readback failed");
+    }
     if (absent.value) {
       if (receipt.state === "committed") {
         return failed("not_found", "the committed managed Worker release is absent");
@@ -1205,17 +1333,21 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       }
       return failed("not_found", "the managed Worker release upload did not occur");
     }
-    if (receipt.state === "pending" && !this.#pendingReleaseReadbackQualified) {
+    if (
+      receipt.state === "pending" &&
+      releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+      requiredSensitive.length > 0
+    ) {
       return failed(
         "unavailable",
-        "the managed Worker release readback has not been qualified for acknowledgement recovery",
+        "the legacy managed Worker release requires operator reconciliation",
         true,
       );
     }
     const realized = await this.#readAndInspectRelease(
       closure,
       receipt.state === "committed" ? receipt.providerEtag : undefined,
-      receipt.state === "pending" ? { input, requiredSensitive } : undefined,
+      receipt.state === "pending",
     );
     if (realized.phase !== "succeeded")
       return realized.phase === "failed"
@@ -1223,7 +1355,11 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         : failed("unavailable", "the managed Worker release did not settle", true);
     const realizedEtag = text(realized.result.observed.providerRevision);
     if (!realizedEtag) {
-      return failed("provider_error", "the managed Worker release revision is malformed");
+      return failed(
+        receipt.state === "pending" ? "unavailable" : "provider_error",
+        "the managed Worker release revision is malformed",
+        receipt.state === "pending",
+      );
     }
     if (receipt.state === "pending") {
       if (
@@ -1262,7 +1398,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     requiredSensitive: readonly string[],
     runtimeInputCommitment?: `sha256:${string}`,
     secretValues?: Readonly<Record<string, string>>,
+    releaseProof?: ManagedWorkerReleaseProof,
+    releaseProofKey?: string,
     deriveProviderObjectBindings = false,
+    releaseProtocol: ManagedWorkerReleaseProtocol = MANAGED_WORKER_RELEASE_PROTOCOL,
   ): Promise<ManagedReleaseClosure | ProviderTicket> {
     const worker = relationDeployment(input.relations, "/worker", "worker");
     const workerResource = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -1322,17 +1461,56 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     if (!bindings) {
       return failed("invalid_spec", "a managed Worker binding is unavailable or unsupported");
     }
+    if (
+      (releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        requiredSensitive.length > 0 !== (releaseProof !== undefined)) ||
+      (releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+        (releaseProof !== undefined ||
+          releaseProofKey !== undefined ||
+          secretValues !== undefined)) ||
+      (releaseProof !== undefined &&
+        !managedReleaseProofMatches(releaseProof, {
+          providerInstallationId: this.#providerInstallationId,
+          accountId: this.#accountId,
+          tenantRef: input.identity.tenantRef,
+          dispatchNamespace: this.dispatchNamespace,
+          operationId: input.operationId,
+          resourceUid,
+          preparationId: undefined,
+          preparationCommitment: runtimeInputCommitment,
+          logicalWorkerId: worker.name,
+          workerResourceUid: workerResource.metadata.uid,
+          secretNames: requiredSensitive,
+        })) ||
+      (releaseProofKey !== undefined &&
+        (!releaseProof || !secretValues || !MANAGED_RELEASE_PROOF_VALUE.test(releaseProofKey))) ||
+      (secretValues !== undefined && releaseProof !== undefined && releaseProofKey === undefined)
+    ) {
+      return failed("invalid_spec", "the managed Worker release proof is invalid");
+    }
+    const releaseBindings = releaseProof
+      ? [
+          ...bindings.metadata,
+          {
+            type: "secret_text",
+            name: MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING,
+            ...(releaseProofKey ? { text: releaseProofKey } : {}),
+          },
+        ]
+      : bindings.metadata;
     const wrapperModule = managedWrapperModuleName([...names]);
     const wrapperSource = managedWorkerEntrypointSource({
       originalMainModule: manifest.mainModule,
       declaredHandlers,
       bindings: bindings.wrapper,
+      releaseProtocol,
+      ...(releaseProof ? { releaseProof } : {}),
     });
     const settingsIdentity = {
       main_module: wrapperModule,
       compatibility_date: this.#compatibilityDate,
       compatibility_flags: [...MANAGED_WORKER_COMPATIBILITY_FLAGS],
-      bindings: canonicalBindingSettings(bindings.metadata),
+      bindings: canonicalBindingSettings(releaseBindings),
     };
     const moduleIdentity = await Promise.all(
       modules.map(async (module) => ({
@@ -1351,6 +1529,9 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       desired: input.spec,
       declaredHandlers,
       runtimeInputCommitment: runtimeInputCommitment ?? null,
+      ...(releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL
+        ? { releaseProtocol, releaseProof: releaseProof ?? null }
+        : {}),
       settings: settingsIdentity,
       modules: moduleIdentity,
       wrapper: {
@@ -1362,9 +1543,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const releaseScript = `tsr-${descriptorDigest.slice("sha256:".length)}`;
     const uploadMetadata = {
       ...settingsIdentity,
-      bindings: bindings.metadata,
+      bindings: releaseBindings,
     };
     return {
+      releaseProtocol,
       logicalWorkerId: worker.name,
       resourceUid,
       operationId: input.operationId,
@@ -1380,6 +1562,7 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       modules,
       manifestDigest,
       ...(runtimeInputCommitment ? { runtimeInputCommitment } : {}),
+      ...(releaseProof ? { releaseProof } : {}),
       workerResource,
       bundleResource,
     };
@@ -1641,31 +1824,51 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
   async #readAndInspectRelease(
     closure: ManagedReleaseClosure,
     expectedEtag?: string,
-    rejectionCleanup?: {
-      readonly input: ApplyInput;
-      readonly requiredSensitive: readonly string[];
-    },
+    pendingReceipt = false,
   ): Promise<ProviderTicket> {
     const read = await this.#client.readScript(closure.releaseScript);
-    if (read.ok === false) return wfpFailure(read, "the managed Worker release readback failed");
+    if (read.ok === false) {
+      return pendingReceipt
+        ? failed("unavailable", "the managed Worker release readback is indeterminate", true)
+        : wfpFailure(read, "the managed Worker release readback failed");
+    }
     if (
       (expectedEtag !== undefined && read.value.etag !== expectedEtag) ||
       !releaseSettingsMatch(read.value.settings, closure.settingsIdentity) ||
-      !releaseSecretNamesMatch(read.value.secrets, closure.requiredSensitive) ||
+      !releaseSecretNamesMatch(
+        read.value.secrets,
+        closure.releaseProof
+          ? [...closure.requiredSensitive, MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING]
+          : closure.requiredSensitive,
+      ) ||
       !(await releaseContentMatches(read.value, closure))
     ) {
-      return failed("provider_error", "the managed Worker release readback closure drifted");
+      return failed(
+        pendingReceipt ? "unavailable" : "provider_error",
+        "the managed Worker release readback closure drifted",
+        pendingReceipt,
+      );
     }
     let inspection: Awaited<
       ReturnType<CloudflareWorkersForPlatformsBackendOptions["inspectRelease"]>
     >;
     try {
+      const challengeNonce = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
       inspection = await this.#inspectRelease({
+        releaseProtocol: closure.releaseProtocol,
         scriptName: closure.releaseScript,
         descriptorDigest: closure.descriptorDigest,
         operationId: closure.operationId,
+        challengeNonce,
         declaredHandlers: closure.declaredHandlers,
       });
+      if (
+        inspection.ok &&
+        closure.releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        inspection.challengeNonce !== challengeNonce
+      ) {
+        inspection = { ok: false, retryable: false };
+      }
     } catch {
       return failed(
         "unavailable",
@@ -1674,19 +1877,11 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       );
     }
     if (!inspection.ok) {
-      const rejected = failed(
-        inspection.retryable ? "unavailable" : "provider_error",
+      return failed(
+        pendingReceipt || inspection.retryable ? "unavailable" : "provider_error",
         "the managed Worker release failed readiness inspection",
-        inspection.retryable,
+        pendingReceipt || inspection.retryable,
       );
-      return !inspection.retryable && rejectionCleanup
-        ? await this.#cleanupRejectedRelease(
-            rejectionCleanup.input,
-            closure,
-            rejectionCleanup.requiredSensitive,
-            rejected,
-          )
-        : rejected;
     }
     if (
       inspection.scriptName !== closure.releaseScript ||
@@ -1694,18 +1889,11 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       inspection.operationId !== closure.operationId ||
       !sameStrings(inspection.handlers, closure.declaredHandlers)
     ) {
-      const rejected = failed(
-        "provider_error",
+      return failed(
+        pendingReceipt ? "unavailable" : "provider_error",
         "the managed Worker release failed readiness inspection",
+        pendingReceipt,
       );
-      return rejectionCleanup
-        ? await this.#cleanupRejectedRelease(
-            rejectionCleanup.input,
-            closure,
-            rejectionCleanup.requiredSensitive,
-            rejected,
-          )
-        : rejected;
     }
     const observed = {
       scriptName: closure.logicalWorkerId,
@@ -1730,58 +1918,6 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       return failed("provider_error", "the managed Worker release receipt is malformed");
     }
     return await this.#readAndInspectRelease(closure, receipt.providerEtag);
-  }
-
-  async #cleanupRejectedRelease(
-    input: ApplyInput,
-    closure: ManagedReleaseClosure,
-    requiredSensitive: readonly string[],
-    rejection: ProviderTicket,
-  ): Promise<ProviderTicket> {
-    const removed = await this.#client.deleteScript(closure.releaseScript);
-    if (removed.ok === false) {
-      return failed(
-        "unavailable",
-        "the rejected managed Worker release cleanup is indeterminate",
-        true,
-      );
-    }
-    const absent = await this.#client.scriptAbsent(closure.releaseScript);
-    if (absent.ok === false || !absent.value) {
-      return failed(
-        "unavailable",
-        "the rejected managed Worker release cleanup is indeterminate",
-        true,
-      );
-    }
-    if (requiredSensitive.length > 0) {
-      try {
-        await (this.#runtimeInputs as ProviderRuntimeInputLeasePort).abandon?.({
-          organizationId: input.identity.tenantRef,
-          operationId: input.operationId,
-          resourceUid: input.identity.uid as string,
-          reference: input.operationKey as string,
-          target: runtimeInputTarget(input) as NonNullable<ReturnType<typeof runtimeInputTarget>>,
-          bindingNames: requiredSensitive,
-        });
-      } catch (error) {
-        return runtimeInputFailure(error, "abort");
-      }
-    }
-    if (
-      !(await this.#state.abortPendingReceipt({
-        resourceUid: closure.resourceUid,
-        operationId: input.operationId,
-        descriptorDigest: closure.descriptorDigest,
-      }))
-    ) {
-      return failed(
-        "unavailable",
-        "the rejected managed Worker release receipt is unavailable",
-        true,
-      );
-    }
-    return rejection;
   }
 
   async #handleReleaseUploadFailure(
@@ -2952,10 +3088,40 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
     const commitment = sha256Value(receipt.observed.runtimeInputCommitment);
     const releaseOperationId = text(receipt.observed.releaseOperationId);
+    const releaseProtocol = managedReleaseProtocolFromReceipt(receipt.observed);
+    const logicalWorker = relationDeployment(input.relations, "/worker", "worker");
+    const workerResource = relationResource(input.relations, "/worker", "ModuleWorker");
+    const releaseProof =
+      releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+      requiredSensitive &&
+      releaseOperationId &&
+      logicalWorker &&
+      workerResource
+        ? managedReleaseProofFromReceipt(receipt.observed, {
+            providerInstallationId: this.#providerInstallationId,
+            accountId: this.#accountId,
+            tenantRef: input.identity.tenantRef,
+            dispatchNamespace: this.dispatchNamespace,
+            operationId: releaseOperationId,
+            resourceUid,
+            preparationId: undefined,
+            preparationCommitment: commitment,
+            logicalWorkerId: logicalWorker.name,
+            workerResourceUid: workerResource.metadata.uid,
+            secretNames: requiredSensitive,
+          })
+        : undefined;
     if (
       !requiredSensitive ||
       !releaseOperationId ||
-      (requiredSensitive.length > 0 && !commitment)
+      !releaseProtocol ||
+      (requiredSensitive.length > 0 && !commitment) ||
+      (releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        requiredSensitive.length > 0 &&
+        !releaseProof) ||
+      (requiredSensitive.length === 0 && Object.hasOwn(receipt.observed, "releaseProof")) ||
+      (releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+        Object.hasOwn(receipt.observed, "releaseProof"))
     ) {
       return failed("provider_error", "the managed Worker release receipt is malformed");
     }
@@ -2971,7 +3137,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       requiredSensitive,
       commitment,
       undefined,
+      releaseProof,
+      undefined,
       true,
+      releaseProtocol,
     );
     if ("phase" in closure) return closure;
     if (closure.nativeId !== nativeId || closure.descriptorDigest !== receipt.descriptorDigest) {
@@ -3169,11 +3338,41 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const requiredSensitive = sensitiveBindingNames(input.spec?.requiredSensitiveVars);
     const commitment = sha256Value(receipt.observed.runtimeInputCommitment);
     const releaseOperationId = text(receipt.observed.releaseOperationId);
+    const releaseProtocol = managedReleaseProtocolFromReceipt(receipt.observed);
+    const logicalWorker = relationDeployment(input.relations, "/worker", "worker");
+    const workerResource = relationResource(input.relations, "/worker", "ModuleWorker");
+    const releaseProof =
+      releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+      requiredSensitive &&
+      releaseOperationId &&
+      logicalWorker &&
+      workerResource
+        ? managedReleaseProofFromReceipt(receipt.observed, {
+            providerInstallationId: this.#providerInstallationId,
+            accountId: this.#accountId,
+            tenantRef: input.identity.tenantRef,
+            dispatchNamespace: this.dispatchNamespace,
+            operationId: releaseOperationId,
+            resourceUid,
+            preparationId: undefined,
+            preparationCommitment: commitment,
+            logicalWorkerId: logicalWorker.name,
+            workerResourceUid: workerResource.metadata.uid,
+            secretNames: requiredSensitive,
+          })
+        : undefined;
     if (
       !input.spec ||
       !requiredSensitive ||
       !releaseOperationId ||
-      (requiredSensitive.length > 0 && !commitment)
+      !releaseProtocol ||
+      (requiredSensitive.length > 0 && !commitment) ||
+      (releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL &&
+        requiredSensitive.length > 0 &&
+        !releaseProof) ||
+      (requiredSensitive.length === 0 && Object.hasOwn(receipt.observed, "releaseProof")) ||
+      (releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+        Object.hasOwn(receipt.observed, "releaseProof"))
     ) {
       return failed("provider_error", "the managed Worker release receipt is malformed");
     }
@@ -3189,7 +3388,10 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       requiredSensitive,
       commitment,
       undefined,
+      releaseProof,
+      undefined,
       true,
+      releaseProtocol,
     );
     if ("phase" in closure) return closure;
     if (
@@ -3895,7 +4097,218 @@ function releaseReceiptObserved(
     releaseOperationId: closure.operationId,
     runtimeInputCommitment: closure.runtimeInputCommitment ?? null,
     manifestDigest: closure.manifestDigest,
+    ...(closure.releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL
+      ? { releaseProtocol: closure.releaseProtocol }
+      : {}),
+    ...(closure.releaseProof ? { releaseProof: closure.releaseProof } : {}),
   };
+}
+
+function releasePendingReceiptObserved(
+  closure: ManagedReleaseClosure,
+): Readonly<Record<string, unknown>> {
+  return {
+    ...(closure.releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL
+      ? { releaseProtocol: closure.releaseProtocol }
+      : {}),
+    ...(closure.releaseProof ? { releaseProof: closure.releaseProof } : {}),
+  };
+}
+
+async function createManagedReleaseProof(
+  input: ManagedReleaseProofContext & {
+    readonly preparationId: string;
+    readonly preparationCommitment: `sha256:${string}`;
+    readonly secretNames: readonly string[];
+    readonly secretValues: Readonly<Record<string, string>>;
+  },
+): Promise<ManagedReleaseProofMaterial> {
+  if (
+    input.secretNames.length < 1 ||
+    input.secretNames.length > 64 ||
+    !sameStrings(Object.keys(input.secretValues), input.secretNames)
+  ) {
+    throw new TypeError("invalid managed Worker release proof input");
+  }
+  const fields = [
+    MANAGED_WORKER_RELEASE_PROOF_SCHEMA,
+    input.providerInstallationId,
+    input.accountId,
+    input.tenantRef,
+    input.dispatchNamespace,
+    input.operationId,
+    input.resourceUid,
+    input.preparationId,
+    input.preparationCommitment,
+    input.logicalWorkerId,
+    input.workerResourceUid,
+    String(input.secretNames.length),
+  ];
+  for (const name of input.secretNames) {
+    const value = input.secretValues[name];
+    if (typeof value !== "string" || new TextEncoder().encode(value).byteLength > 32_768) {
+      throw new TypeError("invalid managed Worker release proof input");
+    }
+    fields.push(name, value);
+  }
+  const keyBytes = crypto.getRandomValues(new Uint8Array(32));
+  const keyValue = base64UrlEncode(keyBytes);
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const signature = await crypto.subtle.sign("HMAC", key, managedReleaseProofMessage(fields));
+    return {
+      proof: {
+        schema: MANAGED_WORKER_RELEASE_PROOF_SCHEMA,
+        providerInstallationId: input.providerInstallationId,
+        accountId: input.accountId,
+        tenantRef: input.tenantRef,
+        dispatchNamespace: input.dispatchNamespace,
+        operationId: input.operationId,
+        resourceUid: input.resourceUid,
+        preparationId: input.preparationId,
+        preparationCommitment: input.preparationCommitment,
+        logicalWorkerId: input.logicalWorkerId,
+        workerResourceUid: input.workerResourceUid,
+        secretNames: [...input.secretNames],
+        expectedMac: base64UrlEncode(signature),
+      },
+      key: keyValue,
+    };
+  } finally {
+    keyBytes.fill(0);
+  }
+}
+
+function managedReleaseProofMessage(fields: readonly string[]): ArrayBuffer {
+  const encoder = new TextEncoder();
+  const encoded = fields.map((field) => encoder.encode(field));
+  const total = encoded.reduce((size, field) => size + 4 + field.byteLength, 0);
+  if (!Number.isSafeInteger(total) || total > MAX_RELEASE_PROOF_MESSAGE_BYTES) {
+    throw new TypeError("managed Worker release proof input is too large");
+  }
+  const buffer = new ArrayBuffer(total);
+  const message = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  let offset = 0;
+  for (const field of encoded) {
+    view.setUint32(offset, field.byteLength, false);
+    offset += 4;
+    message.set(field, offset);
+    offset += field.byteLength;
+  }
+  return buffer;
+}
+
+function managedReleaseProtocolFromReceipt(
+  observed: Readonly<Record<string, unknown>>,
+): ManagedWorkerReleaseProtocol | undefined {
+  if (!Object.hasOwn(observed, "releaseProtocol")) {
+    return MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL;
+  }
+  return observed.releaseProtocol === MANAGED_WORKER_RELEASE_PROTOCOL
+    ? MANAGED_WORKER_RELEASE_PROTOCOL
+    : undefined;
+}
+
+function managedReleaseProofFromReceipt(
+  observed: Readonly<Record<string, unknown>>,
+  expected: ManagedReleaseProofContext,
+): ManagedWorkerReleaseProof | undefined {
+  const raw = record(observed.releaseProof);
+  if (!raw) return undefined;
+  const rawSecretNames = Array.isArray(raw.secretNames) ? raw.secretNames : [];
+  const normalizedSecretNames = rawSecretNames.filter(
+    (name): name is string => typeof name === "string",
+  );
+  const proof = {
+    schema: raw.schema,
+    providerInstallationId: raw.providerInstallationId,
+    accountId: raw.accountId,
+    tenantRef: raw.tenantRef,
+    dispatchNamespace: raw.dispatchNamespace,
+    operationId: raw.operationId,
+    resourceUid: raw.resourceUid,
+    preparationId: raw.preparationId,
+    preparationCommitment: raw.preparationCommitment,
+    logicalWorkerId: raw.logicalWorkerId,
+    workerResourceUid: raw.workerResourceUid,
+    secretNames: normalizedSecretNames,
+    expectedMac: raw.expectedMac,
+  };
+  if (
+    !managedReleaseProofHasExactFields(raw) ||
+    rawSecretNames.length !== normalizedSecretNames.length ||
+    !managedReleaseProofMatches(proof, expected)
+  ) {
+    return undefined;
+  }
+  return proof;
+}
+
+function managedReleaseProofMatches(
+  proof: unknown,
+  expected: ManagedReleaseProofContext,
+): proof is ManagedWorkerReleaseProof {
+  const value = record(proof);
+  if (!value) return false;
+  const names = Array.isArray(value.secretNames) ? value.secretNames : [];
+  return (
+    managedReleaseProofHasExactFields(value) &&
+    value.schema === MANAGED_WORKER_RELEASE_PROOF_SCHEMA &&
+    value.providerInstallationId === expected.providerInstallationId &&
+    value.accountId === expected.accountId &&
+    value.tenantRef === expected.tenantRef &&
+    value.dispatchNamespace === expected.dispatchNamespace &&
+    value.operationId === expected.operationId &&
+    value.resourceUid === expected.resourceUid &&
+    typeof value.preparationId === "string" &&
+    managedReleaseProofToken(value.preparationId) &&
+    (expected.preparationId === undefined || value.preparationId === expected.preparationId) &&
+    expected.preparationCommitment !== undefined &&
+    sha256(value.preparationCommitment) &&
+    value.preparationCommitment === expected.preparationCommitment &&
+    value.logicalWorkerId === expected.logicalWorkerId &&
+    value.workerResourceUid === expected.workerResourceUid &&
+    [
+      value.providerInstallationId,
+      value.accountId,
+      value.tenantRef,
+      value.dispatchNamespace,
+      value.operationId,
+      value.resourceUid,
+      value.logicalWorkerId,
+      value.workerResourceUid,
+    ].every(managedReleaseProofToken) &&
+    names.length > 0 &&
+    names.length <= 64 &&
+    names.length === expected.secretNames.length &&
+    names.every((name, index) => name === expected.secretNames[index]) &&
+    typeof value.expectedMac === "string" &&
+    MANAGED_RELEASE_PROOF_VALUE.test(value.expectedMac)
+  );
+}
+
+function managedReleaseProofHasExactFields(value: Readonly<Record<string, unknown>>): boolean {
+  const keys = Object.keys(value);
+  return (
+    keys.length === MANAGED_RELEASE_PROOF_FIELDS.length &&
+    MANAGED_RELEASE_PROOF_FIELDS.every((field) => Object.hasOwn(value, field))
+  );
+}
+
+function managedReleaseProofToken(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    /^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/u.test(value)
+  );
 }
 
 async function releaseRuntimeInputReceiptDigest(

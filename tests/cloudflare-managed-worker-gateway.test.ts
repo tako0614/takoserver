@@ -611,9 +611,9 @@ export default {
         },
         body: JSON.stringify(event),
       });
-    const first = await wrapper.default.fetch(request(), { declared: true }, { props });
-    const second = await wrapper.default.fetch(request(), { declared: true }, { props });
-    const third = await wrapper.default.fetch(request(), { declared: true }, { props });
+    const first = await wrapper.default.fetch(request(), {}, { props });
+    const second = await wrapper.default.fetch(request(), {}, { props });
+    const third = await wrapper.default.fetch(request(), {}, { props });
     const customer = (await import(customerPath)) as { restore(): void };
     customer.restore();
     expect(first.status).toBe(200);

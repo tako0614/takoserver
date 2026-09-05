@@ -1,18 +1,29 @@
 import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createCatalog } from "../src/catalog.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import {
   buildEdgeForms,
   edgeProviderOffering,
   objectBucketProviderOffering,
 } from "../src/edge-forms.ts";
+import { bytesDigest, canonicalDigest } from "../src/json.ts";
+import { createLedger } from "../src/ledger.ts";
 import type { JsonObject, Row, Sql } from "../src/ports.ts";
+import { createProviderDriver, ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import type {
   ApplyInput,
   ProviderOffering,
   ProviderRelation,
   ProviderTicket,
 } from "../src/provider-port.ts";
-import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
+import type {
+  ProviderRuntimeInputLeasePort,
+  ProviderRuntimeInputPreparationIdentity,
+} from "../src/provider-runtime-input-port.ts";
 import { type ArtifactBytes, CloudflareProvider } from "../src/providers/cloudflare.ts";
 import {
   type ManagedObjectReceiptAdminOperation,
@@ -31,6 +42,15 @@ import {
   type ManagedWorkerSqliteMigrationIdentity,
   managedWorkerSqliteAdminProof,
 } from "../src/providers/cloudflare-managed-worker-sqlite.ts";
+import {
+  MANAGED_WORKER_LEGACY_READINESS_PATH,
+  MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+  MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
+  MANAGED_WORKER_READINESS_PATH,
+  MANAGED_WORKER_READINESS_PROPS_SCHEMA,
+  MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING,
+  managedWorkerEntrypointSource,
+} from "../src/providers/cloudflare-managed-worker-wrapper.ts";
 import type {
   CloudflareManagedObjectReceiptAdminRequest,
   CloudflareManagedObjectReceiptAuthority,
@@ -40,6 +60,7 @@ import type {
   CloudflareManagedSqliteStub,
   CloudflareWorkersForPlatformsBackendOptions,
 } from "../src/providers/cloudflare-worker-backend.ts";
+import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 /** Stands in for the gateway's `TAKOSERVER_MANAGED_SQLITE_ADMIN_SECRET`. */
@@ -77,10 +98,10 @@ const objectBucketOffering = objectBucketProviderOffering(objectBucketForm, {
 });
 
 const moduleBytes = new TextEncoder().encode(
-  "export default { fetch() { return new Response('ok') } }",
+  "export default { fetch() { return new Response('ok') }, queue() {}, scheduled() {} }",
 );
-const bundleDigest = `sha256:${"d".repeat(64)}`;
-const moduleDigest = `sha256:${"e".repeat(64)}`;
+const bundleDigest: `sha256:${string}` = `sha256:${"d".repeat(64)}`;
+const moduleDigest: `sha256:${string}` = `sha256:${"e".repeat(64)}`;
 
 const artifacts: ArtifactBytes = {
   async manifest(_tenantRef, digest) {
@@ -929,7 +950,7 @@ test("managed Worker Versions bind ObjectBucket through hidden R2 and receipt ca
   const api = new ManagedReleaseApi();
   // The Provider Pack id (`cloudflare`) and installed authority id are distinct.
   // ObjectBucket relations are fenced by the latter, not by the adapter id.
-  const provider = releaseProvider(api, createEphemeralSql(), true, "cloudflare");
+  const provider = releaseProvider(api, createEphemeralSql(), "cloudflare");
   const input = managedVersionInput(
     "version_objects_binding",
     "release-objects-binding",
@@ -1171,7 +1192,7 @@ test("managed Worker Versions bind ObjectBucket through hidden R2 and receipt ca
   ).toMatchObject({ phase: "succeeded", result: { disposition: "deleted" } });
 });
 
-test("release readiness failure cleans the exact artifact and permits a fresh operation", async () => {
+test("release readiness failure leaves the present artifact pending without deletion", async () => {
   const api = new ManagedReleaseApi();
   api.inspectionFailure = true;
   const sql = createEphemeralSql();
@@ -1179,21 +1200,156 @@ test("release readiness failure cleans the exact artifact and permits a fresh op
   const input = managedVersionInput("version_readiness", "release-readiness", "tsw-readiness");
   expect(await provider.apply(input)).toMatchObject({
     phase: "failed",
-    failure: { code: "provider_error" },
+    failure: { code: "unavailable", retryable: true },
   });
-  expect(api.scripts.size).toBe(0);
-  expect(api.calls.some((call) => call.startsWith("DELETE "))).toBe(true);
+  expect(api.scripts.size).toBe(1);
+  expect(api.calls.some((call) => call.startsWith("DELETE "))).toBe(false);
   expect(
-    await sql.query(
-      "SELECT resource_uid FROM cloudflare_managed_worker_receipts WHERE provider_id = ?",
-      ["cloudflare.wfp.integration"],
-    ),
-  ).toEqual([]);
+    await sql.query("SELECT state FROM cloudflare_managed_worker_receipts WHERE provider_id = ?", [
+      "cloudflare.wfp.integration",
+    ]),
+  ).toEqual([{ state: "pending" }]);
 
   api.inspectionFailure = false;
   expect(
     await provider.apply({ ...input, operationId: "release-readiness-restart" }),
+  ).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+  expect(await provider.convergeApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
+    phase: "succeeded",
+  });
+  expect(api.calls.some((call) => call.startsWith("DELETE "))).toBe(false);
+});
+
+test("sensitive releases reserve the proof binding within the WfP variable limit", async () => {
+  const api = new ManagedReleaseApi();
+  const input = sensitiveManagedVersionInput(
+    "version_variable_capacity",
+    "release-variable-capacity",
+    "tsw-variable-capacity",
+  );
+  const requiredSensitiveVars = Array.from({ length: 64 }, (_, index) => `SECRET_${index}`);
+  const vars = Object.fromEntries(
+    Array.from({ length: 64 }, (_, index) => [`VARIABLE_${index}`, `value-${index}`]),
+  );
+  let acquireCalls = 0;
+  const runtimeInputs: ProviderRuntimeInputLeasePort = {
+    async acquire() {
+      acquireCalls += 1;
+      throw new Error("over-capacity release must not acquire runtime inputs");
+    },
+    async recover() {
+      throw new Error("initial release must not recover runtime inputs");
+    },
+    async abandon() {},
+  };
+  expect(
+    await releaseProvider(
+      api,
+      createEphemeralSql(),
+      "cloudflare.wfp.integration",
+      runtimeInputs,
+    ).apply({
+      ...input,
+      spec: { ...input.spec, vars, requiredSensitiveVars },
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+  expect(acquireCalls).toBe(0);
+  expect(api.scripts.size).toBe(0);
+  expect(api.calls).toEqual([]);
+});
+
+test("sensitive releases accept exactly 128 variables including the proof binding", async () => {
+  const api = new ManagedReleaseApi();
+  const requiredSensitiveVars = Array.from({ length: 64 }, (_, index) => `SECRET_${index}`);
+  const input = sensitiveManagedVersionInput(
+    "version_variable_boundary",
+    "release-variable-boundary",
+    "tsw-variable-boundary",
+  );
+  const trace = runtimeInputTrace();
+  const initialPort = initialSensitiveRuntimeInputs(input, "unused", trace);
+  const runtimeInputs: ProviderRuntimeInputLeasePort = {
+    ...initialPort,
+    async acquire(request) {
+      const lease = await initialPort.acquire(request);
+      return {
+        ...lease,
+        bindings: Object.fromEntries(requiredSensitiveVars.map((name) => [name, `test-${name}`])),
+      };
+    },
+  };
+  const result = await releaseProvider(
+    api,
+    createEphemeralSql(),
+    "cloudflare.wfp.integration",
+    runtimeInputs,
+  ).apply({
+    ...input,
+    spec: {
+      ...input.spec,
+      vars: Object.fromEntries(
+        Array.from({ length: 63 }, (_, index) => [`VARIABLE_${index}`, `value-${index}`]),
+      ),
+      requiredSensitiveVars,
+    },
+  });
+
+  expect(result).toMatchObject({ phase: "succeeded" });
+  expect(trace).toMatchObject({ acquires: 1, dispatches: 1, abandons: 0 });
+  expect(trace.settles).toHaveLength(1);
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  const [held] = api.scripts.values();
+  expect(held).toBeDefined();
+  if (!held) throw new Error("exact-capacity release is missing");
+  expect(Object.keys(held.rawEnv)).toHaveLength(128);
+  expect(held.secretNames).toHaveLength(65);
+  expect(held.secretNames).toContain(MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING);
+});
+
+test("sensitive readiness refusal retains the dispatched lease for proof recovery", async () => {
+  const api = new ManagedReleaseApi();
+  api.inspectionFailure = true;
+  const sql = createEphemeralSql();
+  const input = sensitiveManagedVersionInput(
+    "version_sensitive_readiness",
+    "release-sensitive-readiness",
+    "tsw-sensitive-readiness",
+  );
+  const initialTrace = runtimeInputTrace();
+  const provider = releaseProvider(
+    api,
+    sql,
+    "cloudflare.wfp.integration",
+    initialSensitiveRuntimeInputs(input, "secret-value-a", initialTrace),
+  );
+  expect(await provider.apply(input)).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+  });
+  expect(initialTrace).toMatchObject({
+    acquires: 1,
+    dispatches: 1,
+    abandons: 0,
+    settles: [],
+  });
+  expect(api.scripts.size).toBe(1);
+  expect(api.calls.filter((call) => call.startsWith("DELETE "))).toHaveLength(0);
+
+  api.inspectionFailure = false;
+  const recoveryTrace = runtimeInputTrace();
+  const recoveryProvider = releaseProvider(
+    api,
+    sql,
+    "cloudflare.wfp.integration",
+    recoverySensitiveRuntimeInputs(input, recoveryTrace),
+  );
+  expect(
+    await recoveryProvider.convergeApply?.({ ...input, operationMode: "recovery" }),
   ).toMatchObject({ phase: "succeeded" });
+  expect(recoveryTrace).toMatchObject({ acquires: 0, recovers: 1, abandons: 0 });
+  expect(recoveryTrace.settles).toHaveLength(1);
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  expect(api.calls.filter((call) => call.startsWith("DELETE "))).toHaveLength(0);
 });
 
 test("release pending receipts recover from no upload and definitive 4xx without poisoning identity", async () => {
@@ -1235,43 +1391,524 @@ test("release pending receipts recover from no upload and definitive 4xx without
   });
 });
 
-test("pending upload adoption stays closed until the exact namespace readback is rehearsed", async () => {
+test("a pending secret-free upload recovers by exact readback without a second PUT", async () => {
   const api = new ManagedReleaseApi();
   const sql = createEphemeralSql();
   const input = managedVersionInput("version_ack_lost", "release-ack-lost", "tsw-ack-lost");
-  const unqualified = releaseProvider(api, sql, false);
+  const provider = releaseProvider(api, sql);
   api.uploadFailure = "lost-ack";
-  expect(await unqualified.apply(input)).toMatchObject({
+  expect(await provider.apply(input)).toMatchObject({
     phase: "failed",
     failure: { code: "unavailable", retryable: true },
   });
   expect(api.scripts.size).toBe(1);
-  expect(await unqualified.recoverApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
+  expect(await provider.recoverApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
     phase: "failed",
     failure: { code: "unavailable", retryable: true },
   });
   expect(api.calls.some((call) => call.endsWith("/content"))).toBe(false);
-
-  const qualified = releaseProvider(api, sql, true);
-  expect(await qualified.recoverApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
-    phase: "failed",
-    failure: { code: "unavailable", retryable: true },
-  });
-  expect(api.calls.some((call) => call.endsWith("/content"))).toBe(false);
-  expect(await qualified.convergeApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
+  expect(await provider.convergeApply?.({ ...input, operationMode: "recovery" })).toMatchObject({
     phase: "succeeded",
   });
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
   expect(api.calls.some((call) => call.endsWith("/content"))).toBe(true);
 });
 
-test("an unqualified integration release still commits after exact acknowledged readback", async () => {
+test("an absent-marker legacy secret-free pending release recovers without a second PUT", async () => {
   const api = new ManagedReleaseApi();
   const sql = createEphemeralSql();
-  const provider = releaseProvider(api, sql, false);
   const input = managedVersionInput(
-    "version_unqualified",
-    "release-unqualified",
-    "tsw-unqualified",
+    "version_legacy_pending",
+    "release-legacy-pending",
+    "tsw-legacy-pending",
+  );
+  const seeded = await seedLegacyRelease(api, sql, input, "pending");
+  expect(seeded.observed).not.toHaveProperty("releaseProtocol");
+  expect(
+    await releaseProvider(api, sql).convergeApply?.({ ...input, operationMode: "recovery" }),
+  ).toMatchObject({ phase: "succeeded", result: { nativeId: seeded.nativeId } });
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  const receipt = await new ManagedWorkerState(
+    "cloudflare.wfp.integration",
+    sql,
+  ).receiptByResourceUid(input.identity.uid as string);
+  expect(receipt).toMatchObject({ state: "committed", nativeId: seeded.nativeId });
+  expect(receipt?.observed).not.toHaveProperty("releaseProtocol");
+});
+
+test("absent-marker legacy committed releases remain observable and deletable", async () => {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const input = sensitiveManagedVersionInput(
+    "version_legacy_committed",
+    "release-legacy-committed",
+    "tsw-legacy-committed",
+  );
+  const seeded = await seedLegacyRelease(api, sql, input, "committed");
+  const provider = releaseProvider(api, sql);
+  expect(
+    await provider.observe({
+      offering: versionOffering,
+      nativeId: seeded.nativeId,
+      identity: input.identity,
+      spec: input.spec,
+      ...(input.relations ? { relations: input.relations } : {}),
+    }),
+  ).toMatchObject({ phase: "succeeded", result: { nativeId: seeded.nativeId } });
+  expect(
+    await provider.delete({
+      operationId: "delete-legacy-committed",
+      operationMode: "initial",
+      offering: versionOffering,
+      nativeId: seeded.nativeId,
+      identity: input.identity,
+      spec: input.spec,
+      ...(input.relations ? { relations: input.relations } : {}),
+    }),
+  ).toMatchObject({ phase: "succeeded", result: { disposition: "deleted" } });
+  expect(api.scripts.size).toBe(0);
+});
+
+test("an absent-marker legacy sensitive pending release stays reachable without adoption", async () => {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const input = sensitiveManagedVersionInput(
+    "version_legacy_sensitive_pending",
+    "release-legacy-sensitive-pending",
+    "tsw-legacy-sensitive-pending",
+  );
+  const seeded = await seedLegacyRelease(api, sql, input, "pending");
+  const trace = runtimeInputTrace();
+  expect(
+    await releaseProvider(
+      api,
+      sql,
+      "cloudflare.wfp.integration",
+      recoverySensitiveRuntimeInputs(input, trace),
+    ).convergeApply?.({ ...input, operationMode: "recovery" }),
+  ).toMatchObject({ phase: "failed", failure: { code: "unavailable", retryable: true } });
+  expect(trace).toMatchObject({ recovers: 1, settles: [], abandons: 0 });
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  expect(api.calls.filter((call) => call.startsWith("DELETE "))).toHaveLength(0);
+  expect(
+    await new ManagedWorkerState("cloudflare.wfp.integration", sql).receiptByResourceUid(
+      input.identity.uid as string,
+    ),
+  ).toMatchObject({ state: "pending", nativeId: seeded.nativeId });
+});
+
+test("the Provider driver preserves a mismatched pending release for same-operation recovery", async () => {
+  const fixture = await pendingSensitiveRelease("driver-recovery");
+  fixture.held.rawEnv.API_KEY = "wrong-secret";
+  const trace = runtimeInputTrace();
+  const provider = releaseProvider(
+    fixture.api,
+    fixture.sql,
+    "cloudflare.wfp.integration",
+    recoverySensitiveRuntimeInputs(fixture.input, trace),
+  );
+  const clock = () => new Date("2026-09-05T00:00:00.000Z");
+  const deployments = createResourceDeploymentStore(fixture.sql, clock);
+  const workerRelation = fixture.input.relations?.find(
+    (relation) => relation.pointer === "/worker",
+  );
+  if (!workerRelation?.deployment) throw new Error("driver recovery Worker relation is incomplete");
+  await deployments.create({ ...workerRelation.deployment, providerPackRef: provider.id });
+  const form = released.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "WorkerVersion",
+  );
+  if (!form) throw new Error("released WorkerVersion Form is missing");
+  const relations = (fixture.input.relations ?? []).map(
+    ({ deployment: _deployment, ...relation }) => ({
+      ...relation,
+      resource: {
+        ...relation.resource,
+        status: {
+          observedGeneration: relation.resource.metadata.generation,
+          conditions: [],
+        },
+      },
+    }),
+  );
+  const driver = createProviderDriver({
+    providers: [provider],
+    catalog: createCatalog([]),
+    ledger: createLedger(fixture.sql, clock),
+    deployments,
+  });
+  const operation = {
+    operationId: fixture.input.operationId,
+    operationKey: fixture.input.operationKey as string,
+    operationMode: "recovery" as const,
+    ...(fixture.input.publicApply ? { publicApply: fixture.input.publicApply } : {}),
+    tenantId: fixture.input.identity.tenantRef,
+    resourceUid: fixture.input.identity.uid as string,
+    executionAuthority: {
+      tenantId: fixture.input.identity.tenantRef,
+      resourceUid: fixture.input.identity.uid as string,
+      leaseToken: `pmlease_${fixture.input.operationId}`,
+      fingerprint: `test:${fixture.input.operationId}`,
+      isolation: "shared-resource" as const,
+      available: true,
+    },
+    form,
+    name: fixture.input.identity.name,
+    space: fixture.input.identity.space,
+    spec: fixture.input.spec,
+    relations,
+  };
+  let firstError: unknown;
+  try {
+    await driver.apply(operation);
+  } catch (error) {
+    firstError = error;
+  }
+  expect(firstError).toBeInstanceOf(ProviderMutationRecoveryError);
+  expect(firstError).toMatchObject({ providerOutcome: "indeterminate" });
+  expect(
+    await new ManagedWorkerState("cloudflare.wfp.integration", fixture.sql).receiptByResourceUid(
+      operation.resourceUid,
+    ),
+  ).toMatchObject({ state: "pending" });
+  expect(await deployments.active(operation.tenantId, operation.resourceUid)).toBeNull();
+
+  fixture.held.rawEnv.API_KEY = "secret-value-a";
+  expect(await driver.apply(operation)).toMatchObject({
+    observed: { versionId: fixture.scriptName },
+  });
+  expect(trace.recovers).toBe(2);
+  expect(trace.settles).toHaveLength(1);
+  expect(fixture.api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+});
+
+test("a pending secret-bearing upload proves retained values after restart without replay", async () => {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const input = sensitiveManagedVersionInput(
+    "version_secret_ack_lost",
+    "release-secret-ack-lost",
+    "tsw-secret-ack-lost",
+  );
+  const initialTrace = runtimeInputTrace();
+  const initialProvider = releaseProvider(
+    api,
+    sql,
+    "cloudflare.wfp.integration",
+    initialSensitiveRuntimeInputs(input, "secret-value-a", initialTrace),
+  );
+  api.uploadFailure = "lost-ack";
+  const initial = await initialProvider.apply(input);
+  expect(initial).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+  });
+  expect(initialTrace).toMatchObject({ acquires: 1, dispatches: 1, settles: [] });
+  const resourceUid = input.identity.uid;
+  if (!resourceUid) throw new Error("sensitive release resource uid is missing");
+
+  const [scriptName, held] = [...api.scripts.entries()][0] ?? [];
+  if (!scriptName || !held) throw new Error("sensitive release was not retained");
+  const proofKey = held.rawEnv[MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING];
+  if (typeof proofKey !== "string") throw new Error("release proof key is missing");
+  expect(Reflect.ownKeys(held.rawEnv).sort()).toEqual([
+    "API_KEY",
+    MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING,
+  ]);
+
+  const rows = await sql.query(
+    `SELECT native_id, state, observed_json
+     FROM cloudflare_managed_worker_receipts
+     WHERE provider_id = ? AND resource_uid = ?`,
+    ["cloudflare.wfp.integration", resourceUid],
+  );
+  expect(rows).toHaveLength(1);
+  const pending = recordValue(rows[0]);
+  const nativeId = pending?.native_id;
+  const observedJson = pending?.observed_json;
+  if (typeof nativeId !== "string" || typeof observedJson !== "string") {
+    throw new Error("pending release receipt is malformed");
+  }
+  expect(pending?.state).toBe("pending");
+  expect(observedJson).toContain("takoserver.managed-worker-release@v2");
+  expect(observedJson).toContain("takoserver.managed-worker-release-proof@v1");
+  expect(observedJson).not.toContain("secret-value-a");
+  expect(observedJson).not.toContain(proofKey);
+  expect(JSON.stringify(initial)).not.toContain("secret-value-a");
+  expect(JSON.stringify(initial)).not.toContain(proofKey);
+
+  const recoveryTrace = runtimeInputTrace();
+  const recoveryProvider = releaseProvider(
+    api,
+    sql,
+    "cloudflare.wfp.integration",
+    recoverySensitiveRuntimeInputs(input, recoveryTrace),
+  );
+  const artifactInput = {
+    offering: versionOffering,
+    nativeId,
+    target: {
+      tenantId: input.identity.tenantRef,
+      resourceUid,
+      incarnationId: "deployment-version-secret-ack-lost",
+      state: "active" as const,
+      updatedAt: 1,
+    },
+    identity: {
+      tenantRef: input.identity.tenantRef,
+      resourceUid,
+    },
+    candidateManifestDigests: [bundleDigest] as const,
+  };
+  expect(await recoveryProvider.verifyArtifactConsumption?.(artifactInput)).toEqual({
+    outcome: "unknown",
+    reason: "authority_unavailable",
+    retryable: true,
+  });
+  expect(
+    await recoveryProvider.convergeApply?.({ ...input, operationMode: "recovery" }),
+  ).toMatchObject({ phase: "succeeded" });
+  expect(api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  expect(recoveryTrace).toMatchObject({ acquires: 0, recovers: 1, abandons: 0 });
+  expect(recoveryTrace.settles).toHaveLength(1);
+  expect(await recoveryProvider.verifyArtifactConsumption?.(artifactInput)).toMatchObject({
+    outcome: "present",
+    consumption: "identified",
+    manifestDigests: [bundleDigest],
+  });
+  expect(
+    await sql.query(
+      `SELECT state FROM cloudflare_managed_worker_receipts
+       WHERE provider_id = ? AND resource_uid = ?`,
+      ["cloudflare.wfp.integration", resourceUid],
+    ),
+  ).toEqual([{ state: "committed" }]);
+});
+
+for (const [caseName, mutate] of [
+  [
+    "wrong secret value",
+    async ({ held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      held.rawEnv.API_KEY = "secret-value-b";
+    },
+  ],
+  [
+    "missing proof key",
+    async ({ held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      delete held.rawEnv[MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING];
+    },
+  ],
+  [
+    "changed proof key",
+    async ({ held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      held.rawEnv[MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING] = "q".repeat(43);
+    },
+  ],
+  [
+    "extra raw binding",
+    async ({ held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      held.rawEnv.EXTRA = "unexpected";
+    },
+  ],
+  [
+    "secret inventory drift",
+    async ({ api, scriptName, held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      api.scripts.set(scriptName, {
+        ...held,
+        secretNames: held.secretNames.filter(
+          (name) => name !== MANAGED_WORKER_RELEASE_PROOF_KEY_BINDING,
+        ),
+      });
+    },
+  ],
+  [
+    "stale readiness challenge",
+    async ({ api }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      api.staleInspectionChallenge = true;
+    },
+  ],
+  [
+    "content drift",
+    async ({ api, scriptName, held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      api.scripts.set(scriptName, {
+        ...held,
+        content: new TextEncoder().encode("not multipart").buffer,
+        contentType: "multipart/form-data; boundary=broken",
+      });
+    },
+  ],
+  [
+    "settings drift",
+    async ({ api, scriptName, held }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      api.scripts.set(scriptName, {
+        ...held,
+        settings: { ...held.settings, compatibility_date: "2026-01-01" },
+      });
+    },
+  ],
+  [
+    "dispatcher identity drift",
+    async ({ api }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      api.inspectionOperationId = "release-secret-other";
+    },
+  ],
+  [
+    "cross-operation proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "operationId",
+        "release-secret-other",
+      );
+    },
+  ],
+  [
+    "cross-resource proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "resourceUid",
+        "version-secret-other",
+      );
+    },
+  ],
+  [
+    "cross-namespace proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "dispatchNamespace",
+        "takoserver-other",
+      );
+    },
+  ],
+  [
+    "cross-provider proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "providerInstallationId",
+        "cloudflare.other",
+      );
+    },
+  ],
+  [
+    "cross-account proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(sql, input.identity.uid as string, "accountId", "acct_other");
+    },
+  ],
+  [
+    "cross-tenant proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "tenantRef",
+        "organization_other",
+      );
+    },
+  ],
+  [
+    "cross-preparation proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "preparationId",
+        "preparation-other",
+      );
+    },
+  ],
+  [
+    "cross-logical-worker proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "logicalWorkerId",
+        "tsw-other",
+      );
+    },
+  ],
+  [
+    "cross-worker-resource proof replay",
+    async ({ sql, input }: Awaited<ReturnType<typeof pendingSensitiveRelease>>) => {
+      await mutatePendingReleaseProof(
+        sql,
+        input.identity.uid as string,
+        "workerResourceUid",
+        "worker-other",
+      );
+    },
+  ],
+] as const) {
+  test(`pending sensitive recovery refuses ${caseName} and keeps the writer fence`, async () => {
+    const fixture = await pendingSensitiveRelease(caseName.replaceAll(" ", "-"));
+    const resourceUid = fixture.input.identity.uid;
+    if (!resourceUid) throw new Error("pending sensitive resource uid is missing");
+    await mutate(fixture);
+    const trace = runtimeInputTrace();
+    const provider = releaseProvider(
+      fixture.api,
+      fixture.sql,
+      "cloudflare.wfp.integration",
+      recoverySensitiveRuntimeInputs(fixture.input, trace),
+    );
+    expect(
+      await provider.convergeApply?.({ ...fixture.input, operationMode: "recovery" }),
+    ).toMatchObject({ phase: "failed", failure: { code: "unavailable", retryable: true } });
+    expect(fixture.api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+    expect(fixture.api.calls.filter((call) => call.startsWith("DELETE "))).toHaveLength(0);
+    expect(fixture.api.scripts.size).toBe(1);
+    expect(trace.settles).toEqual([]);
+    expect(
+      await fixture.sql.query(
+        `SELECT state FROM cloudflare_managed_worker_receipts
+         WHERE provider_id = ? AND resource_uid = ?`,
+        ["cloudflare.wfp.integration", resourceUid],
+      ),
+    ).toEqual([{ state: "pending" }]);
+  });
+}
+
+test("an absent sensitive release aborts the pending receipt without replay", async () => {
+  const fixture = await pendingSensitiveRelease("absent");
+  const resourceUid = fixture.input.identity.uid;
+  if (!resourceUid) throw new Error("pending sensitive resource uid is missing");
+  fixture.api.scripts.clear();
+  const trace = runtimeInputTrace();
+  const provider = releaseProvider(
+    fixture.api,
+    fixture.sql,
+    "cloudflare.wfp.integration",
+    recoverySensitiveRuntimeInputs(fixture.input, trace),
+  );
+  expect(
+    await provider.convergeApply?.({ ...fixture.input, operationMode: "recovery" }),
+  ).toMatchObject({ phase: "failed", failure: { code: "not_found" } });
+  expect(trace).toMatchObject({ recovers: 1, abandons: 1, settles: [] });
+  expect(fixture.api.calls.filter((call) => call.startsWith("PUT "))).toHaveLength(1);
+  expect(
+    await fixture.sql.query(
+      `SELECT state FROM cloudflare_managed_worker_receipts
+       WHERE provider_id = ? AND resource_uid = ?`,
+      ["cloudflare.wfp.integration", resourceUid],
+    ),
+  ).toEqual([]);
+});
+
+test("an acknowledged release commits after exact readback", async () => {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const provider = releaseProvider(api, sql);
+  const input = managedVersionInput(
+    "version_acknowledged",
+    "release-acknowledged",
+    "tsw-acknowledged",
   );
   const resourceUid = input.identity.uid;
   if (!resourceUid) throw new Error("managed release resource uid is missing");
@@ -2457,28 +3094,114 @@ interface HeldRelease {
   readonly content: ArrayBuffer;
   readonly contentType: string;
   readonly settings: Readonly<Record<string, unknown>>;
+  readonly modules: ReadonlyMap<string, Uint8Array>;
+  readonly rawEnv: Record<string, unknown>;
+  readonly secretNames: readonly string[];
 }
 
 class ManagedReleaseApi {
   readonly calls: string[] = [];
   readonly scripts = new Map<string, HeldRelease>();
   inspectionFailure = false;
+  staleInspectionChallenge = false;
+  inspectionOperationId: string | undefined;
   uploadFailure: "none" | "transport" | "lost-ack" | "rejected" = "none";
   deleteLosesAck = false;
   nextEtag = 1;
 
   readonly inspectRelease: CloudflareWorkersForPlatformsBackendOptions["inspectRelease"] = async (
     input,
-  ) =>
-    this.inspectionFailure
-      ? { ok: false, retryable: false }
-      : {
+  ) => {
+    if (this.inspectionFailure) return { ok: false, retryable: false };
+    const held = this.scripts.get(input.scriptName);
+    if (!held) return { ok: false, retryable: false };
+    const root = await mkdtemp(join(tmpdir(), "takoserver-release-proof-backend-"));
+    try {
+      for (const [name, bytes] of held.modules) {
+        const path = join(root, name);
+        await mkdir(dirname(path), { recursive: true });
+        await Bun.write(path, bytes);
+      }
+      const mainModule = held.settings.main_module;
+      if (typeof mainModule !== "string") return { ok: false, retryable: false };
+      const loaded = (await import(
+        `${pathToFileURL(join(root, mainModule)).href}?test=${crypto.randomUUID()}`
+      )) as {
+        readonly default?: {
+          fetch(request: Request, env: Record<string, unknown>, context: object): Promise<Response>;
+        };
+      };
+      if (!loaded.default || typeof loaded.default.fetch !== "function") {
+        return { ok: false, retryable: false };
+      }
+      const response = await loaded.default.fetch(
+        new Request(
+          `https://managed-worker.invalid${
+            input.releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL
+              ? MANAGED_WORKER_LEGACY_READINESS_PATH
+              : MANAGED_WORKER_READINESS_PATH
+          }`,
+        ),
+        held.rawEnv,
+        {
+          props:
+            input.releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL
+              ? {
+                  schema: MANAGED_WORKER_LEGACY_READINESS_PROPS_SCHEMA,
+                  operationId: input.operationId,
+                  descriptorDigest: input.descriptorDigest,
+                }
+              : {
+                  schema: MANAGED_WORKER_READINESS_PROPS_SCHEMA,
+                  operationId: input.operationId,
+                  descriptorDigest: input.descriptorDigest,
+                  challengeNonce: input.challengeNonce,
+                },
+        },
+      );
+      if (!response.ok) {
+        return { ok: false, retryable: response.status === 429 || response.status >= 500 };
+      }
+      const raw = recordValue(await response.json());
+      const handlers = Array.isArray(raw?.handlers)
+        ? raw.handlers.filter(
+            (handler): handler is "fetch" | "queue" | "scheduled" =>
+              handler === "fetch" || handler === "queue" || handler === "scheduled",
+          )
+        : [];
+      const descriptorDigest = raw?.descriptorDigest;
+      const operationId = raw?.operationId;
+      const challengeNonce = raw?.challengeNonce;
+      if (
+        !testSha256(descriptorDigest) ||
+        typeof operationId !== "string" ||
+        (input.releaseProtocol !== MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL &&
+          typeof challengeNonce !== "string") ||
+        handlers.length !== (raw?.handlers as unknown[] | undefined)?.length
+      ) {
+        return { ok: false, retryable: false };
+      }
+      if (input.releaseProtocol === MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL) {
+        return {
           ok: true,
           scriptName: input.scriptName,
-          descriptorDigest: input.descriptorDigest,
-          operationId: input.operationId,
-          handlers: input.declaredHandlers,
+          descriptorDigest,
+          operationId: this.inspectionOperationId ?? operationId,
+          handlers,
         };
+      }
+      return {
+        ok: true,
+        scriptName: input.scriptName,
+        descriptorDigest,
+        operationId: this.inspectionOperationId ?? operationId,
+        challengeNonce: this.staleInspectionChallenge ? "z".repeat(43) : (challengeNonce as string),
+        handlers,
+      };
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  };
 
   readonly fetch = async (request: Request): Promise<Response> => {
     const path = new URL(request.url).pathname;
@@ -2506,8 +3229,27 @@ class ManagedReleaseApi {
       if (!metadata || !Array.isArray(metadata.bindings)) {
         return new Response(null, { status: 400 });
       }
+      const modules = new Map<string, Uint8Array>();
+      for (const [name, value] of form.entries()) {
+        if (name === "metadata" || typeof value === "string") continue;
+        modules.set(name, new Uint8Array(await (value as Blob).arrayBuffer()));
+      }
+      const rawEnv: Record<string, unknown> = {};
+      const secretNames: string[] = [];
       const bindings = metadata.bindings.map((value) => {
         const binding = { ...(recordValue(value) ?? {}) };
+        if (typeof binding.name === "string") {
+          if (binding.type === "secret_text") {
+            rawEnv[binding.name] = binding.text;
+            secretNames.push(binding.name);
+          } else if (binding.type === "plain_text") {
+            rawEnv[binding.name] = binding.text;
+          } else if (binding.type === "json") {
+            rawEnv[binding.name] = binding.json;
+          } else {
+            rawEnv[binding.name] = {};
+          }
+        }
         if (binding.type === "secret_text") delete binding.text;
         return binding;
       });
@@ -2522,6 +3264,9 @@ class ManagedReleaseApi {
           compatibility_flags: metadata.compatibility_flags,
           bindings,
         },
+        modules,
+        rawEnv,
+        secretNames: secretNames.sort(),
       });
       if (this.uploadFailure === "lost-ack") {
         this.uploadFailure = "none";
@@ -2551,7 +3296,10 @@ class ManagedReleaseApi {
       return Response.json({ success: true, result: held.settings });
     }
     if (request.method === "GET" && suffix === "/secrets") {
-      return Response.json({ success: true, result: [] });
+      return Response.json({
+        success: true,
+        result: held.secretNames.map((name) => ({ name })),
+      });
     }
     if (request.method === "GET" && !suffix) {
       return Response.json({
@@ -2566,8 +3314,8 @@ class ManagedReleaseApi {
 function releaseProvider(
   api: ManagedReleaseApi,
   sql: Sql,
-  readbackQualified = true,
   providerId = "cloudflare.wfp.integration",
+  runtimeInputs?: ProviderRuntimeInputLeasePort,
 ): CloudflareProvider {
   return new CloudflareProvider({
     id: providerId,
@@ -2576,7 +3324,8 @@ function releaseProvider(
     artifacts,
     authorize: () => "Bearer test-token",
     apiOrigin: "https://api.cloudflare.test/client/v4",
-    workerBackend: managedBackend(sql, api.inspectRelease, readbackQualified),
+    workerBackend: managedBackend(sql, api.inspectRelease),
+    ...(runtimeInputs ? { runtimeInputs } : {}),
     fetch: api.fetch,
   });
 }
@@ -2608,6 +3357,303 @@ function managedVersionInput(
   };
 }
 
+function sensitiveManagedVersionInput(
+  uid: string,
+  operationId: string,
+  logicalWorkerId: string,
+): ApplyInput {
+  const input = managedVersionInput(uid, operationId, logicalWorkerId);
+  return {
+    ...input,
+    operationKey: `takoform-worker-runtime-v1-${"f".repeat(64)}`,
+    publicApply: {
+      method: "PUT",
+      path: `/apis/forms.takoform.com/v1/resources/edge.forms.takoform.com/WorkerVersion/${uid}`,
+      ifNoneMatch: "*",
+      body: "{}",
+    },
+    spec: { ...input.spec, requiredSensitiveVars: ["API_KEY"] },
+  };
+}
+
+interface RuntimeInputTrace {
+  acquires: number;
+  dispatches: number;
+  recovers: number;
+  settles: string[];
+  abandons: number;
+}
+
+function runtimeInputTrace(): RuntimeInputTrace {
+  return { acquires: 0, dispatches: 0, recovers: 0, settles: [], abandons: 0 };
+}
+
+function sensitivePreparation(input: ApplyInput): ProviderRuntimeInputPreparationIdentity {
+  return {
+    preparationId: `preparation-${input.identity.uid}`,
+    operationKey: input.operationKey as string,
+    workerResourceUid: `worker_${input.identity.uid}`,
+    canonicalPublicOrigin: "https://api.example.test",
+    commitment: `sha256:${"a".repeat(64)}`,
+  };
+}
+
+function initialSensitiveRuntimeInputs(
+  input: ApplyInput,
+  secretValue: string,
+  trace: RuntimeInputTrace,
+): ProviderRuntimeInputLeasePort {
+  const preparation = sensitivePreparation(input);
+  return {
+    async acquire() {
+      trace.acquires += 1;
+      return {
+        bindings: { API_KEY: secretValue },
+        preparation,
+        async abort() {
+          trace.abandons += 1;
+        },
+        async dispatch() {
+          trace.dispatches += 1;
+          return {
+            async settle(receiptDigest) {
+              trace.settles.push(receiptDigest);
+            },
+          };
+        },
+      };
+    },
+    async recover() {
+      throw new Error("initial provider must not recover runtime inputs");
+    },
+    async abandon() {
+      trace.abandons += 1;
+    },
+  };
+}
+
+function recoverySensitiveRuntimeInputs(
+  input: ApplyInput,
+  trace: RuntimeInputTrace,
+): ProviderRuntimeInputLeasePort {
+  const preparation = sensitivePreparation(input);
+  return {
+    async acquire() {
+      throw new Error("recovery provider must not reacquire runtime input values");
+    },
+    async recover() {
+      trace.recovers += 1;
+      return {
+        preparation,
+        bindingNames: ["API_KEY"],
+        async settle(receiptDigest) {
+          trace.settles.push(receiptDigest);
+        },
+      };
+    },
+    async abandon() {
+      trace.abandons += 1;
+    },
+  };
+}
+
+async function pendingSensitiveRelease(suffix: string): Promise<{
+  readonly api: ManagedReleaseApi;
+  readonly sql: Sql;
+  readonly input: ApplyInput;
+  readonly scriptName: string;
+  readonly held: HeldRelease;
+}> {
+  const api = new ManagedReleaseApi();
+  const sql = createEphemeralSql();
+  const input = sensitiveManagedVersionInput(
+    `version_secret_${suffix}`,
+    `release-secret-${suffix}`,
+    `tsw-secret-${suffix}`,
+  );
+  api.uploadFailure = "lost-ack";
+  const initial = await releaseProvider(
+    api,
+    sql,
+    "cloudflare.wfp.integration",
+    initialSensitiveRuntimeInputs(input, "secret-value-a", runtimeInputTrace()),
+  ).apply(input);
+  if (initial.phase !== "failed" || initial.failure.code !== "unavailable") {
+    throw new Error("sensitive release did not enter pending recovery");
+  }
+  const [scriptName, held] = [...api.scripts.entries()][0] ?? [];
+  if (!scriptName || !held) throw new Error("pending sensitive release is missing");
+  return { api, sql, input, scriptName, held };
+}
+
+async function seedLegacyRelease(
+  api: ManagedReleaseApi,
+  sql: Sql,
+  input: ApplyInput,
+  state: "pending" | "committed",
+): Promise<{
+  readonly nativeId: string;
+  readonly observed: Readonly<Record<string, unknown>>;
+}> {
+  const resourceUid = input.identity.uid;
+  const logicalWorkerId = input.relations?.find((relation) => relation.pointer === "/worker")
+    ?.deployment?.outputs.scriptName;
+  const requiredSensitive = Array.isArray(input.spec.requiredSensitiveVars)
+    ? input.spec.requiredSensitiveVars.filter((name): name is string => typeof name === "string")
+    : [];
+  if (!resourceUid || typeof logicalWorkerId !== "string") {
+    throw new Error("legacy release identity is incomplete");
+  }
+  const declaredHandlers = ["fetch", "queue", "scheduled"] as const;
+  const wrapperModule = "__takoserver_managed_worker_entrypoint.mjs";
+  const wrapperSource = managedWorkerEntrypointSource({
+    originalMainModule: "index.js",
+    declaredHandlers,
+    bindings: requiredSensitive.map((name) => ({ name, type: "secret_text" as const })),
+    releaseProtocol: MANAGED_WORKER_LEGACY_RELEASE_PROTOCOL,
+  });
+  const settings = {
+    main_module: wrapperModule,
+    compatibility_date: "2026-08-19",
+    compatibility_flags: ["disallow_importable_env"],
+    bindings: requiredSensitive.map((name) => ({ name, type: "secret_text" })),
+  };
+  const runtimeInputCommitment =
+    requiredSensitive.length > 0 ? sensitivePreparation(input).commitment : null;
+  const descriptorDigest = await canonicalDigest({
+    schema: "takoserver.cloudflare-wfp-release-descriptor@v1",
+    providerId: "cloudflare.wfp.integration",
+    dispatchNamespace: "takoserver-customers",
+    logicalWorkerId,
+    resourceUid,
+    manifestDigest: bundleDigest,
+    desired: input.spec,
+    declaredHandlers,
+    runtimeInputCommitment,
+    settings,
+    modules: [
+      {
+        name: "index.js",
+        mediaType: "application/javascript+module",
+        digest: await bytesDigest(moduleBytes),
+      },
+    ],
+    wrapper: {
+      name: wrapperModule,
+      digest: await bytesDigest(new TextEncoder().encode(wrapperSource)),
+    },
+    assetsManifestDigest: null,
+  });
+  const scriptName = `tsr-${descriptorDigest.slice("sha256:".length)}`;
+  const nativeId = `version:${logicalWorkerId}:${scriptName}`;
+  const uploadBindings = requiredSensitive.map((name) => ({
+    name,
+    type: "secret_text",
+    text: `legacy-${name.toLowerCase()}`,
+  }));
+  const form = new FormData();
+  form.set(
+    "metadata",
+    new Blob(
+      [
+        JSON.stringify({
+          ...settings,
+          bindings: uploadBindings,
+        }),
+      ],
+      { type: "application/json" },
+    ),
+    "metadata.json",
+  );
+  form.set(
+    "index.js",
+    new Blob([moduleBytes], { type: "application/javascript+module" }),
+    "index.js",
+  );
+  form.set(
+    wrapperModule,
+    new Blob([wrapperSource], { type: "application/javascript+module" }),
+    wrapperModule,
+  );
+  const uploaded = await api.fetch(
+    new Request(
+      `https://api.cloudflare.test/client/v4/accounts/acct_1/workers/dispatch/namespaces/takoserver-customers/scripts/${scriptName}`,
+      { method: "PUT", body: form },
+    ),
+  );
+  if (!uploaded.ok) throw new Error("legacy release seed upload failed");
+  const held = api.scripts.get(scriptName);
+  if (!held) throw new Error("legacy release seed was not retained");
+  const stateStore = new ManagedWorkerState("cloudflare.wfp.integration", sql);
+  const claimed = await stateStore.claimReceipt({
+    resourceUid,
+    nativeId,
+    kind: "version",
+    logicalWorkerId,
+    operationId: input.operationId,
+    descriptorDigest,
+  });
+  if (claimed.outcome !== "claimed") throw new Error("legacy release receipt was not claimed");
+  const observed = {
+    scriptName: logicalWorkerId,
+    versionId: scriptName,
+    dispatchScriptName: scriptName,
+    providerRevision: held.etag,
+    descriptorDigest,
+    handlers: [...declaredHandlers],
+    releaseOperationId: input.operationId,
+    runtimeInputCommitment,
+    manifestDigest: bundleDigest,
+  };
+  if (
+    state === "committed" &&
+    !(await stateStore.commitReceipt({
+      resourceUid,
+      operationId: input.operationId,
+      descriptorDigest,
+      providerEtag: held.etag,
+      observed,
+    }))
+  ) {
+    throw new Error("legacy release receipt was not committed");
+  }
+  return { nativeId, observed: state === "committed" ? observed : {} };
+}
+
+async function mutatePendingReleaseProof(
+  sql: Sql,
+  resourceUid: string,
+  field:
+    | "providerInstallationId"
+    | "accountId"
+    | "tenantRef"
+    | "dispatchNamespace"
+    | "operationId"
+    | "resourceUid"
+    | "preparationId"
+    | "logicalWorkerId"
+    | "workerResourceUid"
+    | "expectedMac",
+  value: string,
+): Promise<void> {
+  const [row] = await sql.query(
+    `SELECT observed_json FROM cloudflare_managed_worker_receipts
+     WHERE provider_id = ? AND resource_uid = ?`,
+    ["cloudflare.wfp.integration", resourceUid],
+  );
+  const observedJson = recordValue(row)?.observed_json;
+  if (typeof observedJson !== "string") throw new Error("pending proof receipt is missing");
+  const observed = recordValue(JSON.parse(observedJson));
+  const releaseProof = recordValue(observed?.releaseProof);
+  if (!observed || !releaseProof) throw new Error("pending release proof is missing");
+  releaseProof[field] = value;
+  await sql.run(
+    `UPDATE cloudflare_managed_worker_receipts SET observed_json = ?
+     WHERE provider_id = ? AND resource_uid = ?`,
+    [JSON.stringify(observed), "cloudflare.wfp.integration", resourceUid],
+  );
+}
+
 function succeededNativeId(ticket: ProviderTicket): string {
   if (ticket.phase !== "succeeded")
     throw new Error(`expected provider success: ${JSON.stringify(ticket)}`);
@@ -2618,6 +3664,10 @@ function recordValue(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function testSha256(value: unknown): value is `sha256:${string}` {
+  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 class ManagedObjectReceiptFake implements CloudflareManagedObjectReceiptStub {
@@ -2936,9 +3986,9 @@ function managedBackend(
     scriptName: input.scriptName,
     descriptorDigest: input.descriptorDigest,
     operationId: input.operationId,
+    challengeNonce: input.challengeNonce,
     handlers: input.declaredHandlers,
   }),
-  readbackQualified = true,
 ): CloudflareWorkersForPlatformsBackendOptions {
   return {
     kind: "workers-for-platforms",
@@ -2948,15 +3998,6 @@ function managedBackend(
     managedBaseDomain: "app-staging.takos.jp",
     sql,
     inspectRelease,
-    ...(readbackQualified
-      ? {
-          releaseReadbackQualification: {
-            schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1" as const,
-            dispatchNamespace: "takoserver-customers",
-            rehearsalDigest: `sha256:${"9".repeat(64)}` as const,
-          },
-        }
-      : {}),
     async deriveSqliteInstanceName({ resourceUid }) {
       return `sqlite-${resourceUid}`;
     },

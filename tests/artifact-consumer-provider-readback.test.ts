@@ -947,6 +947,7 @@ function managedBackend(
         scriptName: input.scriptName,
         descriptorDigest: input.descriptorDigest,
         operationId: input.operationId,
+        challengeNonce: input.challengeNonce,
         handlers: input.declaredHandlers,
       };
     },

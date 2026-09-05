@@ -526,7 +526,7 @@ test("status is read-only and apply has no namespace override", async () => {
   expect(seen).toEqual([topology.dispatchNamespace]);
 });
 
-test("CLI dispatch accepts the namespace-only bootstrap target without runtime qualification", () => {
+test("CLI dispatch accepts the namespace-only bootstrap target", () => {
   const directory = mkdtempSync(join(tmpdir(), "takoserver-dispatch-cli-"));
   const targetPath = join(directory, "rehearsal.json");
   writeFileSync(
@@ -556,7 +556,6 @@ test("CLI dispatch accepts the namespace-only bootstrap target without runtime q
     const acceptedError = new TextDecoder().decode(accepted.stderr);
     expect(acceptedError).toContain("CLOUDFLARE_API_TOKEN is required for rehearsal");
     expect(acceptedError).not.toContain("deploy refused");
-    expect(acceptedError).not.toContain("releaseReadbackQualification");
     expect(acceptedError).not.toContain("supplies");
   } finally {
     rmSync(directory, { recursive: true, force: true });

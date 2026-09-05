@@ -65,11 +65,6 @@ const executorTarget = {
     managedBaseDomain: "workers.integration.example.test",
     providerInstallationId: "cloudflare.staging",
     receiptAuthorityWorkerName: "takoserver-object-receipts-integration",
-    releaseReadbackQualification: {
-      schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-      dispatchNamespace: "takoserver-managed-workers-integration",
-      rehearsalDigest: `sha256:${"9".repeat(64)}`,
-    },
   },
 } satisfies DeployTarget;
 
@@ -219,7 +214,7 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
-  test("public Worker status and apply fail closed on an unqualified provider executor", async () => {
+  test("public Worker status and apply fail closed on an unready provider executor", async () => {
     const current = fixture({ selectedTarget: executorTarget });
     const qualification = {
       async read(): Promise<CloudflareProviderExecutorInspection> {

@@ -25,7 +25,6 @@ import {
   materializeCloudflareProviderExecutorSecrets,
 } from "../scripts/deploy/cloudflare-provider-executor-secrets.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
-import { writeCloudflareProviderExecutorConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 
@@ -74,11 +73,6 @@ function target(): DeployTarget {
       managedBaseDomain: "workers.integration.example.test",
       providerInstallationId: "cloudflare.wfp.integration",
       receiptAuthorityWorkerName: RECEIPTS,
-      releaseReadbackQualification: {
-        schema: "takoserver.cloudflare-wfp-release-readback-qualification@v1",
-        dispatchNamespace: "takoserver-customers-integration",
-        rehearsalDigest: `sha256:${"9".repeat(64)}`,
-      },
     },
     signing: { currentKeyId: "current-key" },
   };
@@ -290,15 +284,6 @@ function executorVersion(
         type: "plain_text",
         text: topology.providerInstallationId,
       },
-      ...(topology.releaseReadbackQualification === undefined
-        ? []
-        : [
-            {
-              name: "TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION",
-              type: "plain_text",
-              text: JSON.stringify(topology.releaseReadbackQualification),
-            },
-          ]),
       {
         name: "TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_NAME",
         type: "plain_text",
@@ -466,37 +451,6 @@ test("checked-in executor topology is route-less and credential ownership is clo
   expect(packageJson.scripts.check).toContain("build:cloudflare-provider-executor");
 });
 
-test("integration executor config omits an unqualified acknowledgement-recovery marker", () => {
-  const root = mkdtempSync(join(tmpdir(), "takoserver-executor-unqualified-config-"));
-  try {
-    const topology = target().cloudflareProviderExecutor;
-    if (!topology) throw new Error("missing Cloudflare provider executor topology");
-    const { releaseReadbackQualification: _qualification, ...unqualifiedTopology } = topology;
-    const path = writeCloudflareProviderExecutorConfig(
-      { ...target(), cloudflareProviderExecutor: unqualifiedTopology },
-      { path: join(root, "executor.json"), main: "worker.js" },
-    );
-    const config = JSON.parse(readFileSync(path, "utf8")) as {
-      vars: Record<string, string>;
-    };
-    expect(config.vars).not.toHaveProperty("TAKOSERVER_CLOUDFLARE_RELEASE_READBACK_QUALIFICATION");
-    expect(config.vars.TAKOSERVER_ENVIRONMENT).toBe("integration");
-
-    expect(() =>
-      writeCloudflareProviderExecutorConfig(
-        {
-          ...target(),
-          environment: "production",
-          cloudflareProviderExecutor: unqualifiedTopology,
-        },
-        { path: join(root, "production.json"), main: "worker.js" },
-      ),
-    ).toThrow("releaseReadbackQualification");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test("executor secrets materialize only from an external canonical owner-only file", () => {
   const sourceRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-secret-source-"));
   const releaseRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-secret-release-"));
@@ -565,89 +519,6 @@ test("executor inspection requires exact code, bindings, settings, secrets and n
   );
   expect(routed).toMatchObject({ status: "drift", ready: false, routeLess: false });
   expect(planCloudflareProviderExecutor(routed, false)).toBe("refuse");
-});
-
-test("status marks integration acknowledgement recovery unqualified when the marker is absent", async () => {
-  const qualifiedTarget = target();
-  const topology = qualifiedTarget.cloudflareProviderExecutor;
-  if (!topology) throw new Error("missing Cloudflare provider executor topology");
-  const { releaseReadbackQualification: _qualification, ...unqualifiedTopology } = topology;
-  const unqualifiedTarget: DeployTarget = {
-    ...qualifiedTarget,
-    cloudflareProviderExecutor: unqualifiedTopology,
-  };
-  const state = new ExecutorState(unqualifiedTarget);
-  const absentState = new ExecutorState(unqualifiedTarget);
-  state.publish(COMMIT, createHash("sha256").update(BUNDLE).digest("hex"), BUNDLE);
-  const sourceRoot = mkdtempSync(join(tmpdir(), "takoserver-executor-unqualified-status-"));
-  const secretPath = join(sourceRoot, "secrets.json");
-  try {
-    writeSecrets(secretPath);
-    const absent = await runCloudflareProviderExecutor(
-      {
-        surface: "cloudflare-provider-executor",
-        action: "status",
-        environment: "integration",
-        commit: COMMIT,
-      },
-      unqualifiedTarget,
-      {
-        state: absentState,
-        schema: schema(),
-        dependencies: dependencies(),
-        secretsPath: secretPath,
-      },
-    );
-    expect(absent).toMatchObject({
-      status: "absent",
-      ready: false,
-      acknowledgementRecoveryQualified: false,
-    });
-
-    const status = await runCloudflareProviderExecutor(
-      {
-        surface: "cloudflare-provider-executor",
-        action: "status",
-        environment: "integration",
-        commit: COMMIT,
-      },
-      unqualifiedTarget,
-      {
-        state,
-        schema: schema(),
-        dependencies: dependencies(),
-        secretsPath: secretPath,
-      },
-    );
-    expect(status).toMatchObject({
-      status: "ready",
-      ready: true,
-      acknowledgementRecoveryQualified: false,
-    });
-    state.routeOwner = WORKER;
-    const drift = await runCloudflareProviderExecutor(
-      {
-        surface: "cloudflare-provider-executor",
-        action: "status",
-        environment: "integration",
-        commit: COMMIT,
-      },
-      unqualifiedTarget,
-      {
-        state,
-        schema: schema(),
-        dependencies: dependencies(),
-        secretsPath: secretPath,
-      },
-    );
-    expect(drift).toMatchObject({
-      status: "drift",
-      ready: false,
-      acknowledgementRecoveryQualified: false,
-    });
-  } finally {
-    rmSync(sourceRoot, { recursive: true, force: true });
-  }
 });
 
 test("dependency proof enforces receipt authority then the exact managed gateway route", async () => {
