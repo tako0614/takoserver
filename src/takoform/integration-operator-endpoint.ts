@@ -37,10 +37,6 @@ export async function createIntegrationFormAuthorityComposition(input: {
     ...input,
     verifier,
     packages: createExactFormPackageSource(packages),
-    // The integration fixture installs the complete publisher closure.  The
-    // runtime catalog separately decides which entries are executable; do not
-    // let the coordinator's default package set silently drop installed but
-    // unsupported Forms.
     packageSet: packages.map(({ formRef, packageDigest }) => ({
       formRef: structuredClone(formRef),
       packageDigest,

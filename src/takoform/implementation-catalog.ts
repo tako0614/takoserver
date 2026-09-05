@@ -70,15 +70,6 @@ export interface TakoformImplementationCatalog {
   readonly entries: readonly TakoformImplementationCatalogEntry[];
 }
 
-/**
- * Returns every exact candidate from one verified publisher projection.
- *
- * Selection is deliberately family- and product-neutral: the publisher set is
- * the source of installed identities, while executable support is decided
- * later by {@link deriveImplementationCatalog}.  A malformed or duplicate
- * identity is rejected here so a caller cannot silently substitute a package
- * under a different digest or make one exact Form ambiguous.
- */
 export function exactPublisherFormCandidates(
   candidates: readonly InstalledTakoformForm[],
 ): readonly InstalledTakoformForm[] {
@@ -284,13 +275,6 @@ export async function deriveImplementationCatalog(input: {
     const operations = requested
       ? available.filter((operation) => requested.includes(operation))
       : available;
-    // A candidate with a concrete handler participates in implementation
-    // support even when target capability is absent, in which case its
-    // operation set is intentionally empty.  A candidate with no handler is
-    // installed/discoverable only and must stay out of `entries`: the admission
-    // coordinator treats entry presence as support.  Every candidate identity
-    // remains bound below so unsupported packages cannot disappear from the
-    // Host's semantic implementation identity.
     if (handled.size > 0) {
       entries.push({
         formRef: structuredClone(form.identity.formRef),

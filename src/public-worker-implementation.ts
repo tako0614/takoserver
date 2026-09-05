@@ -76,9 +76,6 @@ export async function deriveRuntimeImplementationCatalog(
   if (!isSha256Digest(implementationPayloadDigest)) {
     throw new TypeError("public Form implementation payload digest is invalid");
   }
-  // The publisher projection is the complete installed identity set.  Product
-  // support is still narrowed by the capability/handler intersection below;
-  // no Form-kind allowlist belongs in this admission path.
   const forms = exactPublisherFormCandidates(currentTakoformCandidates().forms);
   const providerOperations = providerResourceOperationHandlers(
     CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,

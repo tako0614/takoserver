@@ -44,10 +44,6 @@ const ASSERTION_LIFETIME_SECONDS = 60;
 const READ_REQUEST_TIMEOUT_MS = 30_000;
 const APPLY_REQUEST_TIMEOUT_MS = 55_000;
 const FORM_OPERATION_ORDER = ["create", "read", "update", "delete", "import", "observe"] as const;
-// Support membership is derived from the same generic runtime catalog as the
-// public Worker.  The payload digest affects semantic identity but not which
-// exact Form kinds have concrete handlers, so a stable probe digest is enough
-// to classify readback forms without carrying a product-specific allowlist.
 const IMPLEMENTATION_ENTRIES = new Map<string, TakoformImplementationCatalogEntry>(
   (
     await deriveRuntimeImplementationCatalog({
