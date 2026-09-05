@@ -47,18 +47,17 @@ const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAP
 const EXPECTED_REPOSITORY = "https://github.com/tako0614/takoform-forms.git";
 const EXPECTED_REPOSITORY_COMMIT = "3231633605b737ce5279d7fc020b4780568e7091";
 const EXPECTED_SET_ID = "e7f8a39311dd011b8467e97e7f300cabb9a6b06c";
-const IMPLEMENTED_KINDS = Object.keys(YURUCOMMU_FORM_VERSIONS).sort();
+const IMPLEMENTED_KINDS = [
+  ...Object.keys(YURUCOMMU_FORM_VERSIONS),
+  "StaticAssetBundle",
+  "WorkerCustomDomain",
+].sort();
 /** Core attests the exact raw policy bytes; the Host pins the canonical digest. */
 const RAW_POLICY_DIGEST = await bytesDigest(
   new TextEncoder().encode(TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE.core.publisherPolicy),
 );
-/** ObjectBucket left this list when it joined the catalog; see ADR 0007. */
-const UNIMPLEMENTED_KINDS = [
-  "ActorNamespace",
-  "DurableWorkflow",
-  "StaticAssetBundle",
-  "WorkerCustomDomain",
-];
+/** These publisher Forms have no concrete Takoserver handler yet. */
+const UNIMPLEMENTED_KINDS = ["ActorNamespace", "DurableWorkflow"];
 
 describe("exact publisher-set import", () => {
   test("binds one exact import identity and a closed 17-package evidence set", async () => {
@@ -138,7 +137,7 @@ describe("exact publisher-set import", () => {
     ).rejects.toMatchObject({ code: "package_unavailable" });
   });
 
-  test("plans the complete import but supports and activates only the implemented subset", async () => {
+  test("plans the complete import but supports and activates only forms with handlers", async () => {
     const fixture = await productionFixture(fakeContainer());
     const plan = await fixture.composition.endpoint.plan(fixture.request);
 
@@ -153,6 +152,10 @@ describe("exact publisher-set import", () => {
     expect(kindsOf(plan, "SetSupport")).toEqual(IMPLEMENTED_KINDS);
     expect(kindsOf(plan, "SetActivation")).toEqual(IMPLEMENTED_KINDS);
     for (const kind of UNIMPLEMENTED_KINDS) {
+      const pkg = plan.packages.find((entry) => entry.formRef.kind === kind);
+      expect(pkg?.operations).toEqual([]);
+    }
+    for (const kind of ["StaticAssetBundle", "WorkerCustomDomain"]) {
       const pkg = plan.packages.find((entry) => entry.formRef.kind === kind);
       expect(pkg?.operations).toEqual([]);
     }
@@ -219,6 +222,15 @@ describe("exact publisher-set import", () => {
           eventDigest: null,
         });
       }
+    }
+    for (const kind of ["StaticAssetBundle", "WorkerCustomDomain"]) {
+      const form = readback.forms.find((candidate) => candidate.formRef.kind === kind);
+      expect(form).toMatchObject({
+        installed: true,
+        supported: true,
+        operations: [],
+        activationHead: { present: true, active: true },
+      });
     }
     // ADR 0007 moved ObjectBucket into the code-owned implementation catalog,
     // so the exact current package is now installed, supported, and active

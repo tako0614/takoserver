@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { resolvePublicWorkerImplementationIdentity } from "../src/entry-worker.ts";
 import {
   derivePublicFormImplementationIdentity,
+  deriveRuntimeImplementationCatalog,
   parseFormAuthorityCapabilityManifest,
   publicFormCapabilityManifest,
 } from "../src/public-worker-implementation.ts";
@@ -13,6 +14,22 @@ import {
 const artifact = (hex: string) => `sha256:${hex.repeat(64)}` as const;
 
 describe("public Worker semantic implementation identity", () => {
+  test("derives support from all publisher identities and concrete handlers", async () => {
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities: publicFormCapabilityManifest(),
+    });
+    const kinds = catalog.entries.map((entry) => entry.formRef.kind);
+    expect(kinds).toHaveLength(15);
+    expect(kinds).toEqual(expect.arrayContaining(["StaticAssetBundle", "WorkerCustomDomain"]));
+    expect(kinds).not.toEqual(expect.arrayContaining(["ActorNamespace", "DurableWorkflow"]));
+    expect(
+      catalog.entries
+        .filter((entry) => ["StaticAssetBundle", "WorkerCustomDomain"].includes(entry.formRef.kind))
+        .every((entry) => entry.operations.length === 0),
+    ).toBe(true);
+  });
+
   test("ignores unrelated outer Worker bytes but changes for payload or capability bytes", async () => {
     const capabilities = publicFormCapabilityManifest();
     const base = await derivePublicFormImplementationIdentity({
@@ -50,6 +67,14 @@ describe("public Worker semantic implementation identity", () => {
     );
     expect(() =>
       parseFormAuthorityCapabilityManifest(JSON.stringify({ ...capabilities, extra: true })),
+    ).toThrow("capability manifest is invalid");
+    expect(() =>
+      parseFormAuthorityCapabilityManifest(
+        JSON.stringify({
+          ...capabilities,
+          forms: { ...capabilities.forms, MadeUpForm: ["read"] },
+        }),
+      ),
     ).toThrow("capability manifest is invalid");
   });
 

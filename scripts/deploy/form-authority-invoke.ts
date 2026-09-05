@@ -1,6 +1,7 @@
 import { INTEGRATION_FORM_PACKAGES } from "../../src/generated/takoform-integration-form-packages.ts";
 import { canonicalDigest, canonicalJson, isSha256Digest } from "../../src/json.ts";
 import { signOperatorAssertion } from "../../src/operator-key.ts";
+import { deriveRuntimeImplementationCatalog } from "../../src/public-worker-implementation.ts";
 import { parseStrictJson } from "../../src/strict-json.ts";
 import {
   TAKOFORM_REVOCATION_V1,
@@ -22,6 +23,7 @@ import {
   type FormAuthorityReadback,
 } from "../../src/takoform/host-admission-coordinator.ts";
 import { deriveFormAuthorityIdentity } from "../../src/takoform/host-admission-endpoint.ts";
+import type { TakoformImplementationCatalogEntry } from "../../src/takoform/implementation-catalog.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
   type FormAuthorityDeployOptions,
@@ -42,6 +44,21 @@ const ASSERTION_LIFETIME_SECONDS = 60;
 const READ_REQUEST_TIMEOUT_MS = 30_000;
 const APPLY_REQUEST_TIMEOUT_MS = 55_000;
 const FORM_OPERATION_ORDER = ["create", "read", "update", "delete", "import", "observe"] as const;
+// Support membership is derived from the same generic runtime catalog as the
+// public Worker.  The payload digest affects semantic identity but not which
+// exact Form kinds have concrete handlers, so a stable probe digest is enough
+// to classify readback forms without carrying a product-specific allowlist.
+const IMPLEMENTATION_ENTRIES = new Map<string, TakoformImplementationCatalogEntry>(
+  (
+    await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
+      capabilities: publicFormCapabilityManifest(),
+    })
+  ).entries.map((entry) => [
+    canonicalJson({ formRef: entry.formRef, packageDigest: entry.packageDigest }),
+    entry,
+  ]),
+);
 const ADMISSION_STATES = new Set([
   "allow",
   "rotate",
@@ -504,8 +521,8 @@ async function integrationPlanRequest(input: {
       ? "takoserver-integration-form-authority-operator"
       : "takoserver-integration-form-authority-deactivation-operator",
     reason: input.desiredActive
-      ? "install, support and Space-activate the exact Yurucommu integration fixture"
-      : "deactivate the exact Yurucommu integration fixture at its current durable head",
+      ? "install, support and Space-activate the exact publisher integration fixture"
+      : "deactivate the exact publisher integration fixture at its current durable head",
   };
 }
 
@@ -731,18 +748,46 @@ function exactPackageClosure(values: readonly unknown[]): boolean {
 function readbackConverged(readback: FormAuthorityReadback): boolean {
   if (readback.forms.length !== INTEGRATION_FORM_PACKAGES.length) return false;
   if (!readback.activation.desiredActive) {
-    return readback.forms.every(
-      ({ activationHead }) => !activationHead.present || !activationHead.active,
-    );
+    return readback.forms.every(({ formRef, packageDigest, operations, activationHead }) => {
+      const entry = implementationEntry({ formRef, packageDigest });
+      return (
+        operationsEqual(operations, entry?.operations ?? []) &&
+        (!activationHead.present || !activationHead.active)
+      );
+    });
   }
   return readback.forms.every(
-    ({ installed, supported, activationHead }) =>
-      installed &&
-      supported &&
-      activationHead.present &&
-      activationHead.active &&
-      activationHead.implementationDigest === readback.identity.implementationDigest,
+    ({ formRef, packageDigest, operations, installed, supported, activationHead }) => {
+      if (!installed) return false;
+      const entry = implementationEntry({ formRef, packageDigest });
+      if (!entry) {
+        return (
+          operations.length === 0 && !supported && !activationHead.present && !activationHead.active
+        );
+      }
+      return (
+        operationsEqual(operations, entry.operations) &&
+        supported &&
+        activationHead.present &&
+        activationHead.active &&
+        activationHead.implementationDigest === readback.identity.implementationDigest
+      );
+    },
   );
+}
+
+function implementationEntry(input: {
+  readonly formRef: unknown;
+  readonly packageDigest: unknown;
+}): TakoformImplementationCatalogEntry | undefined {
+  if (!isRecord(input.formRef) || !isSha256Digest(input.packageDigest)) return undefined;
+  return IMPLEMENTATION_ENTRIES.get(
+    canonicalJson({ formRef: input.formRef, packageDigest: input.packageDigest }),
+  );
+}
+
+function operationsEqual(actual: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(actual) && canonicalJson(actual) === canonicalJson(expected);
 }
 
 function validActivationHead(value: unknown): value is FormAuthorityActivationHead {
@@ -773,8 +818,18 @@ function formReady(
 ): boolean {
   const activationHead = form.activationHead;
   if (!validActivationHead(activationHead)) return false;
+  const entry = implementationEntry({ formRef: form.formRef, packageDigest: form.packageDigest });
+  if (!operationsEqual(form.operations, entry?.operations ?? [])) return false;
   if (!request.activation.desiredActive) {
     return !activationHead.present || !activationHead.active;
+  }
+  if (!entry) {
+    return (
+      form.installed === true &&
+      form.supported === false &&
+      activationHead.present === false &&
+      activationHead.active === false
+    );
   }
   return (
     form.installed === true &&

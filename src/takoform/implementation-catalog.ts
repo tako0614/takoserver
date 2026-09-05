@@ -1,4 +1,5 @@
 import { canonicalDigest, canonicalJson, isSha256Digest } from "../json.ts";
+import { validateFormRef } from "./forms.ts";
 import type { InstalledTakoformForm, TakoformOperation } from "./types.ts";
 
 export const YURUCOMMU_FORM_VERSIONS = {
@@ -67,6 +68,62 @@ export interface TakoformImplementationCatalog {
   readonly capabilityDigest: `sha256:${string}`;
   readonly implementationDigest: `sha256:${string}`;
   readonly entries: readonly TakoformImplementationCatalogEntry[];
+}
+
+/**
+ * Returns every exact candidate from one verified publisher projection.
+ *
+ * Selection is deliberately family- and product-neutral: the publisher set is
+ * the source of installed identities, while executable support is decided
+ * later by {@link deriveImplementationCatalog}.  A malformed or duplicate
+ * identity is rejected here so a caller cannot silently substitute a package
+ * under a different digest or make one exact Form ambiguous.
+ */
+export function exactPublisherFormCandidates(
+  candidates: readonly InstalledTakoformForm[],
+): readonly InstalledTakoformForm[] {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new TypeError("verified publisher Form candidate set is empty");
+  }
+  const selected: InstalledTakoformForm[] = [];
+  const seen = new Set<string>();
+  const seenPackages = new Set<string>();
+  for (const candidate of candidates) {
+    const formRef = candidate?.identity?.formRef;
+    const packageDigest = candidate?.identity?.packageDigest;
+    if (
+      !formRef ||
+      typeof formRef.apiVersion !== "string" ||
+      formRef.apiVersion.length === 0 ||
+      typeof formRef.kind !== "string" ||
+      formRef.kind.length === 0 ||
+      typeof formRef.definitionVersion !== "string" ||
+      formRef.definitionVersion.length === 0 ||
+      !isSha256Digest(formRef.schemaDigest) ||
+      !isSha256Digest(packageDigest)
+    ) {
+      throw new TypeError("verified publisher Form candidate identity is invalid");
+    }
+    try {
+      validateFormRef(formRef);
+    } catch {
+      throw new TypeError("verified publisher Form candidate identity is invalid");
+    }
+    const key = canonicalJson(formRef);
+    if (seen.has(key)) {
+      throw new TypeError("verified publisher Form candidates contain a duplicate FormRef");
+    }
+    if (seenPackages.has(packageDigest)) {
+      throw new TypeError("verified publisher Form candidates contain a duplicate package digest");
+    }
+    seen.add(key);
+    seenPackages.add(packageDigest);
+    selected.push(structuredClone(candidate));
+  }
+  selected.sort((left, right) =>
+    canonicalJson(left.identity.formRef).localeCompare(canonicalJson(right.identity.formRef)),
+  );
+  return selected;
 }
 
 /**
@@ -193,6 +250,10 @@ export async function deriveImplementationCatalog(input: {
   );
   const seen = new Set<string>();
   const entries: TakoformImplementationCatalogEntry[] = [];
+  const candidateIdentities: {
+    readonly formRef: InstalledTakoformForm["identity"]["formRef"];
+    readonly packageDigest: `sha256:${string}`;
+  }[] = [];
   for (const form of forms) {
     const key = canonicalJson(form.identity.formRef);
     if (seen.has(key)) throw new TypeError("implementation catalog contains a duplicate FormRef");
@@ -201,6 +262,10 @@ export async function deriveImplementationCatalog(input: {
     if (!packageDigest || !isSha256Digest(packageDigest)) {
       throw new TypeError("implementation catalog needs an exact package digest");
     }
+    candidateIdentities.push({
+      formRef: structuredClone(form.identity.formRef),
+      packageDigest,
+    });
     const kind = form.identity.formRef.kind;
     const declared = operationSet(form.operations, `Form ${kind}`);
     const capable = operationSet(input.capabilities.forms[kind] ?? [], `capability ${kind}`);
@@ -219,11 +284,20 @@ export async function deriveImplementationCatalog(input: {
     const operations = requested
       ? available.filter((operation) => requested.includes(operation))
       : available;
-    entries.push({
-      formRef: structuredClone(form.identity.formRef),
-      packageDigest,
-      operations,
-    });
+    // A candidate with a concrete handler participates in implementation
+    // support even when target capability is absent, in which case its
+    // operation set is intentionally empty.  A candidate with no handler is
+    // installed/discoverable only and must stay out of `entries`: the admission
+    // coordinator treats entry presence as support.  Every candidate identity
+    // remains bound below so unsupported packages cannot disappear from the
+    // Host's semantic implementation identity.
+    if (handled.size > 0) {
+      entries.push({
+        formRef: structuredClone(form.identity.formRef),
+        packageDigest,
+        operations,
+      });
+    }
   }
   const normalizedCapabilities = normalizedManifest(input.capabilities);
   const normalizedHandlers = normalizedManifest(input.handlers);
@@ -231,6 +305,7 @@ export async function deriveImplementationCatalog(input: {
   const implementationDigest = await canonicalDigest({
     handlers: normalizedHandlers,
     capabilityDigest,
+    candidates: candidateIdentities,
     entries,
   });
   return {

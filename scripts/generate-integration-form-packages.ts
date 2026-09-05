@@ -3,10 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { bytesDigest, canonicalDigest, canonicalJson, isJsonObject } from "../src/json.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
-import {
-  YURUCOMMU_FORM_VERSIONS,
-  yurucommuFormCandidates,
-} from "../src/takoform/implementation-catalog.ts";
+import { exactPublisherFormCandidates } from "../src/takoform/implementation-catalog.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const OUTPUT = resolve(ROOT, "src/generated/takoform-integration-form-packages.ts");
@@ -41,7 +38,7 @@ interface EmbeddedPackage {
   readonly files: readonly EmbeddedPackageFile[];
 }
 
-const verifiedCandidates = yurucommuFormCandidates(currentTakoformCandidates().forms);
+const verifiedCandidates = exactPublisherFormCandidates(currentTakoformCandidates().forms);
 const generated = source
   ? await generateFromSource(resolve(source))
   : await readAndVerifyEmbeddedPackages();
@@ -66,11 +63,8 @@ async function generateFromSource(sourceRoot: string): Promise<readonly Embedded
   const packages: EmbeddedPackage[] = [];
   for (const form of verifiedCandidates) {
     const kind = form.identity.formRef.kind;
-    const definitionVersion = YURUCOMMU_FORM_VERSIONS[kind as keyof typeof YURUCOMMU_FORM_VERSIONS];
     const matches = candidateSet.forms.filter(
       (candidate) =>
-        candidate.kind === kind &&
-        candidate.formRef.definitionVersion === definitionVersion &&
         canonicalJson(candidate.formRef) === canonicalJson(form.identity.formRef) &&
         candidate.packageDigest === form.identity.packageDigest,
     );

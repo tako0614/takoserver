@@ -14,12 +14,11 @@ import {
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import {
   deriveImplementationCatalog,
+  exactPublisherFormCandidates,
   type TakoformHandlerManifest,
   type TakoformImplementationCatalog,
   type TakoformLifecycleCapabilityManifest,
-  YURUCOMMU_FORM_VERSIONS,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
-  yurucommuFormCandidates,
   yurucommuLifecycleCapabilityManifest,
 } from "./takoform/implementation-catalog.ts";
 import type { TakoformOperation } from "./takoform/types.ts";
@@ -32,6 +31,12 @@ const RESOURCE_OPERATION_ORDER = [
   "import",
   "observe",
 ] as const satisfies readonly TakoformOperation[];
+const FORM_KIND = /^[A-Z][A-Za-z0-9]{0,63}$/u;
+const CURRENT_PUBLISHER_FORM_KINDS = new Set(
+  exactPublisherFormCandidates(currentTakoformCandidates().forms).map(
+    ({ identity }) => identity.formRef.kind,
+  ),
+);
 
 export interface PublicFormImplementationConfiguration {
   readonly implementationPayloadDigest: `sha256:${string}`;
@@ -71,7 +76,10 @@ export async function deriveRuntimeImplementationCatalog(
   if (!isSha256Digest(implementationPayloadDigest)) {
     throw new TypeError("public Form implementation payload digest is invalid");
   }
-  const forms = yurucommuFormCandidates(currentTakoformCandidates().forms);
+  // The publisher projection is the complete installed identity set.  Product
+  // support is still narrowed by the capability/handler intersection below;
+  // no Form-kind allowlist belongs in this admission path.
+  const forms = exactPublisherFormCandidates(currentTakoformCandidates().forms);
   const providerOperations = providerResourceOperationHandlers(
     CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,
   );
@@ -129,7 +137,8 @@ function validateCapabilityManifest(value: unknown): void {
   }
   for (const [kind, operations] of Object.entries(value.forms)) {
     if (
-      !(kind in YURUCOMMU_FORM_VERSIONS) ||
+      !FORM_KIND.test(kind) ||
+      !CURRENT_PUBLISHER_FORM_KINDS.has(kind) ||
       !Array.isArray(operations) ||
       operations.some((operation) => !RESOURCE_OPERATION_ORDER.includes(operation)) ||
       new Set(operations).size !== operations.length

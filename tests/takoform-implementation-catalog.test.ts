@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { canonicalDigest } from "../src/json.ts";
+import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import {
   derivePublicFormImplementationIdentity,
   publicFormCapabilityManifest,
@@ -8,6 +8,7 @@ import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import {
   deriveImplementationCatalog,
+  exactPublisherFormCandidates,
   YURUCOMMU_FORM_VERSIONS,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   yurucommuFormCandidates,
@@ -15,6 +16,89 @@ import {
 } from "../src/takoform/implementation-catalog.ts";
 
 describe("Form authority implementation catalog", () => {
+  test("feeds every exact publisher identity into generic admission", () => {
+    const source = currentTakoformCandidates().forms;
+    const forms = exactPublisherFormCandidates(source);
+    expect(forms).toHaveLength(17);
+    expect(
+      forms.map((form) => [
+        form.identity.formRef.kind,
+        form.identity.formRef.definitionVersion,
+        form.identity.formRef.schemaDigest,
+        form.identity.packageDigest,
+      ]),
+    ).toEqual(
+      [...source]
+        .sort((left, right) =>
+          canonicalJson(left.identity.formRef).localeCompare(canonicalJson(right.identity.formRef)),
+        )
+        .map((form) => [
+          form.identity.formRef.kind,
+          form.identity.formRef.definitionVersion,
+          form.identity.formRef.schemaDigest,
+          form.identity.packageDigest,
+        ]),
+    );
+    expect(forms.map((form) => form.identity.formRef.kind)).toEqual(
+      expect.arrayContaining([
+        "ActorNamespace",
+        "DurableWorkflow",
+        "StaticAssetBundle",
+        "WorkerCustomDomain",
+      ]),
+    );
+
+    const wrongDigest = source.map((form, index) =>
+      index === 0
+        ? {
+            ...form,
+            identity: {
+              ...form.identity,
+              packageDigest: "sha256:not-a-valid-package-digest" as `sha256:${string}`,
+            },
+          }
+        : structuredClone(form),
+    );
+    expect(() => exactPublisherFormCandidates(wrongDigest)).toThrow(
+      "verified publisher Form candidate identity is invalid",
+    );
+  });
+
+  test("keeps all installed identities in the semantic digest while omitting forms without handlers", async () => {
+    const forms = exactPublisherFormCandidates(currentTakoformCandidates().forms);
+    const capabilities = {
+      apiVersion: "takoserver.form-lifecycle-capabilities@v1" as const,
+      implementation: "test-target-v1",
+      forms: {},
+    };
+    const handlers = {
+      apiVersion: "takoserver.form-handlers@v1" as const,
+      artifact: "test-artifact-v1",
+      forms: {
+        StaticAssetBundle: ["create", "read", "delete", "import", "observe"] as const,
+        WorkerCustomDomain: ["create", "read", "delete", "import", "observe"] as const,
+      },
+    };
+    const catalog = await deriveImplementationCatalog({ forms, capabilities, handlers });
+    expect(catalog.entries.map((entry) => entry.formRef.kind)).toEqual([
+      "StaticAssetBundle",
+      "WorkerCustomDomain",
+    ]);
+    expect(catalog.entries.every((entry) => entry.operations.length === 0)).toBe(true);
+
+    const withoutUnsupported = await deriveImplementationCatalog({
+      forms: forms.filter(
+        (form) =>
+          form.identity.formRef.kind !== "ActorNamespace" &&
+          form.identity.formRef.kind !== "DurableWorkflow",
+      ),
+      capabilities,
+      handlers,
+    });
+    expect(withoutUnsupported.implementationDigest).not.toBe(catalog.implementationDigest);
+    expect(withoutUnsupported.entries).toEqual(catalog.entries);
+  });
+
   test("selects exactly the 13 Yurucommu package identities from the verified corpus", () => {
     const forms = yurucommuFormCandidates(currentTakoformCandidates().forms);
     expect(
@@ -94,7 +178,7 @@ describe("Form authority implementation catalog", () => {
       "sha256:b7ea4f2da3f5dca05827442cb9a9f2419bf2063e3a9457cf6f97b7409da9f2c4",
     );
     expect(semantic.implementationDigest).toBe(
-      "sha256:8c9c862558356c41c487e8a18a020fedb0a5eb970046bfbac3664376420f1962",
+      "sha256:d5721ffce4cd3167d2f2a00aff8a0fd63e656a1d06b23b804b5c756b608ae15e",
     );
     // The two predecessor identities a converged self-host moves away from: the
     // one it served before ADR 0007, and the supply-less one ADR 0007 first

@@ -277,19 +277,21 @@ the deploy command exits nonzero as a verification failure. A lost apply
 acknowledgement is indeterminate and is never retried or hidden behind an
 automatic readback; the operator runs status before making an explicit fresh
 apply decision. Plan and readback requests are bounded at 30 seconds. Apply is
-bounded at 55 seconds, inside the assertion lifetime, so the exact 13-Form
+bounded at 55 seconds, inside the assertion lifetime, so the exact 17-package
 fixture can finish without turning an ordinary full convergence into a false
 lost acknowledgement.
 
 Deactivation is an explicit status/apply/status sequence: inspect status,
 apply once, then run status again. Its ready proof requires the exact generated
-13 Forms to each have a durable activation head that is either absent or
+17 Forms to each have a durable activation head that is either absent or
 inactive, plus a zero-command next plan. The v2 readback exposes each head as
 `activationHead` with `present`, `active`, `implementationDigest`, and
 `eventDigest`; it never hides a stale active head behind installed or effective
-booleans. Normal activation readiness still requires installed, supported, and
-a present active head whose implementation digest equals the current code
-identity.
+booleans. Normal activation readiness still requires every package to be
+installed; Forms with a concrete handler additionally require support and a
+present active head whose implementation digest equals the current code
+identity. A package with no handler remains installed but unsupported with no
+activation head.
 
 ## Exact publisher-set import
 
@@ -320,12 +322,15 @@ refused as `invalid_request` before D1, R2, or the Container is touched. Plan,
 apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
-intersection of the package set with the code-owned implementation catalog:
-`ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
-`WorkerCustomDomain` are installed durable packages with empty executable
-operations, never supported, never activated, and not offered by any
-Takoserver supply. Readback exposes them as `installed: true`,
-`supported: false`, and an absent activation head.
+intersection of the package set with the code-owned implementation catalog.
+That catalog has concrete handlers for 15 of the 17 identities: its
+`StaticAssetBundle` and `WorkerCustomDomain` entries currently have an empty
+operation intersection because this target advertises no corresponding supply,
+but they remain supported and activatable as implemented Forms. `ActorNamespace`
+and `DurableWorkflow` have no handlers, so they remain installed and
+discoverable only (`supported: false`) with an absent activation head. No
+operation is advertised unless it is declared by the package, present in the
+Host capability manifest, and handled by the runtime.
 
 `ObjectBucket` left that list in
 [ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md). The exact
@@ -509,7 +514,7 @@ Worker-version rollback alone never reverses an append-only activation event.
 
 ## Integration fixture corpus
 
-The integration fixture contains exactly these identities projected from the
+The integration fixture contains all 17 identities projected from the
 released-Core-verified public publisher set:
 
 - `AtLeastOnceQueue`, `EdgeKVNamespace`, `ModuleWorker`, `ObjectBucket`,
@@ -517,15 +522,20 @@ released-Core-verified public publisher set:
   `SQLiteMigrationSet`, `WorkerBundle`, `WorkerCronTrigger`, and
   `WorkerEndpoint` at definition version `0.1.0`;
 - `WorkerDeployment` at definition version `0.2.0` and `WorkerVersion` at
-  definition version `0.3.0`.
+  definition version `0.3.0`;
+- `ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
+  `WorkerCustomDomain` at definition version `0.1.0`.
 
-`ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
-`WorkerCustomDomain` are excluded. The owning current-catalog importer derives
-package, schema, and payload digests directly from the verified source checkout;
-literals in the operator do not confer trust. The portable gate then rechecks
-the embedded manifest and every payload against those exact current identities.
-The integration verifier accepts only those exact package closures, stable-v1
-empty revocation genesis, and matching namespace evidence.
+The executable implementation catalog is a separate, derived support subset:
+it currently has 15 entries (the two actor/workflow identities have no concrete
+handlers), while the static-asset and custom-domain entries are supported with
+empty operations until a target supplies their backends. The owning
+current-catalog importer derives package, schema, and payload digests directly
+from the verified source checkout; literals in the operator do not confer
+trust. The portable gate then rechecks the embedded manifest and every payload
+against those exact current identities. The integration verifier accepts only
+those exact package closures, stable-v1 empty revocation genesis, and matching
+namespace evidence.
 The Host then makes its own policy decision and issues the private handle shared
 only with its admission store.
 Activation is always scoped to one exact tenant/Space audience. There is no

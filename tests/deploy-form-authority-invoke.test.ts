@@ -14,6 +14,7 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
+import { INTEGRATION_FORM_PACKAGES } from "../src/generated/takoform-integration-form-packages.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
@@ -22,17 +23,15 @@ import {
   CURRENT_PUBLISHER_REPOSITORY,
 } from "../src/takoform/current-publisher-catalog.ts";
 import { deriveFormAuthorityIdentity } from "../src/takoform/host-admission-endpoint.ts";
-import {
-  YURUCOMMU_FORM_VERSIONS,
-  YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
-} from "../src/takoform/implementation-catalog.ts";
+import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "d".repeat(40);
 /** Derived so a Form joining the catalog cannot silently leave a count behind. */
-const FORM_COUNT = Object.keys(YURUCOMMU_FORM_VERSIONS).length;
+const PACKAGE_COUNT = INTEGRATION_FORM_PACKAGES.length;
+const IMPLEMENTED_COUNT = 15;
 const NOW = new Date("2026-08-29T02:00:00Z");
 const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
@@ -88,8 +87,10 @@ describe("signed Form authority operator invocation", () => {
 
     expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
     expect(canonicalJson(fixture.calls[1]?.body)).toBe(canonicalJson(fixture.calls[0]?.result));
-    expect((result.readback as { forms: unknown[] }).forms).toHaveLength(FORM_COUNT);
-    expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(2 + FORM_COUNT * 3);
+    expect((result.readback as { forms: unknown[] }).forms).toHaveLength(PACKAGE_COUNT);
+    expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(
+      2 + PACKAGE_COUNT + IMPLEMENTED_COUNT * 2,
+    );
     expect(result).toMatchObject({
       kind: "takoserver.integration-form-authority-invocation@v2",
       action: "apply",
@@ -104,7 +105,10 @@ describe("signed Form authority operator invocation", () => {
       productionEligible: false,
       credentialsRedacted: true,
       ready: true,
-      plan: { planDigest: expect.stringMatching(/^sha256:/), commandCount: 2 + FORM_COUNT * 3 },
+      plan: {
+        planDigest: expect.stringMatching(/^sha256:/),
+        commandCount: 2 + PACKAGE_COUNT + IMPLEMENTED_COUNT * 2,
+      },
       apply: {
         status: "converged",
         planDigest: expect.stringMatching(/^sha256:/),
@@ -168,7 +172,7 @@ describe("signed Form authority operator invocation", () => {
     expect(secondRequest.evidence?.publisher?.sourceCommit).not.toBe(NEXT_COMMIT);
   });
 
-  test("status is one signed readback and reports the exact 13-form convergence", async () => {
+  test("status is one signed readback and reports the exact publisher convergence", async () => {
     const fixture = await invocationFixture();
     await runFormAuthorityInvoke(
       {
@@ -197,7 +201,7 @@ describe("signed Form authority operator invocation", () => {
     expect(status).toMatchObject({ action: "status", ready: true, credentialsRedacted: true });
   });
 
-  test("deactivation uses a distinct surface and reports all 13 durable heads inactive", async () => {
+  test("deactivation uses a distinct surface and reports all executable heads inactive", async () => {
     const fixture = await invocationFixture();
     await runFormAuthorityInvoke(
       {
@@ -232,12 +236,12 @@ describe("signed Form authority operator invocation", () => {
       surface: "takoserver-integration-form-authority-deactivation",
       activation: { desiredActive: false },
       ready: true,
-      plan: { commandCount: FORM_COUNT },
+      plan: { commandCount: IMPLEMENTED_COUNT },
       apply: { status: "converged", nextCommandCount: 0 },
     });
     expect(
       (deactivated.readback as { forms: readonly { activationHead: { active: boolean } }[] }).forms,
-    ).toHaveLength(FORM_COUNT);
+    ).toHaveLength(PACKAGE_COUNT);
     expect(
       (
         deactivated.readback as {
@@ -424,7 +428,7 @@ describe("signed Form authority operator invocation", () => {
 
     expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
     expect(status).toMatchObject({ action: "status", ready: false, credentialsRedacted: true });
-    expect((status.readback as { forms: unknown[] }).forms).toHaveLength(FORM_COUNT);
+    expect((status.readback as { forms: unknown[] }).forms).toHaveLength(PACKAGE_COUNT);
   });
 
   test("classifies a malformed status readback as a preflight error", async () => {
@@ -525,6 +529,27 @@ describe("signed Form authority operator invocation", () => {
     }
   });
 
+  test("readback rejects operations that differ from the derived Form catalog", async () => {
+    for (const tamperReadback of ["operations", "implemented-operations"] as const) {
+      const fixture = await invocationFixture({ tamperReadback });
+      const failure = await runFormAuthorityInvoke(
+        {
+          surface: "takoserver-integration-form-authority",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        fixture.target,
+        fixture.options,
+      ).catch((error) => error);
+      expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
+      expect(failure).toMatchObject({
+        phase: "verification",
+        message: expect.stringContaining("readback is invalid"),
+      });
+    }
+  });
+
   test("hard-refuses non-integration before gateway inspection or private-key reads", async () => {
     let inspected = false;
     const target = await integrationTarget();
@@ -555,7 +580,12 @@ async function invocationFixture(
     readonly tamperPlanDigest?: boolean;
     readonly failApplyTransport?: boolean;
     readonly partialApply?: boolean;
-    readonly tamperReadback?: "truthy" | "extra" | "missing";
+    readonly tamperReadback?:
+      | "truthy"
+      | "extra"
+      | "missing"
+      | "operations"
+      | "implemented-operations";
   } = {},
 ) {
   let selectedCommit = COMMIT;
@@ -649,15 +679,27 @@ async function invocationFixture(
     if (action === "readback" && input.tamperReadback) {
       const readback = result as { forms: readonly Record<string, unknown>[] };
       const first = readback.forms[0] ?? {};
+      const implementedIndex = readback.forms.findIndex(
+        (form) =>
+          (form.formRef as { readonly kind?: unknown } | undefined)?.kind === "StaticAssetBundle",
+      );
+      const tamperIndex =
+        input.tamperReadback === "implemented-operations" && implementedIndex >= 0
+          ? implementedIndex
+          : 0;
+      const target = readback.forms[tamperIndex] ?? first;
       const malformed =
         input.tamperReadback === "truthy"
           ? { ...first, installed: "true" }
           : input.tamperReadback === "extra"
             ? { ...first, unexpected: true }
-            : (({ activationHead: _activationHead, ...missing }) => missing)(first);
+            : input.tamperReadback === "operations" ||
+                input.tamperReadback === "implemented-operations"
+              ? { ...target, operations: ["read"] }
+              : (({ activationHead: _activationHead, ...missing }) => missing)(first);
       returned = {
         ...(result as unknown as Record<string, unknown>),
-        forms: [malformed, ...readback.forms.slice(1)],
+        forms: readback.forms.map((form, index) => (index === tamperIndex ? malformed : form)),
       };
     }
     const last = calls.at(-1);

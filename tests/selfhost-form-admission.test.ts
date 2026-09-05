@@ -8,21 +8,35 @@ import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts"
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE } from "../src/generated/takoform-publisher-set-authority-closure.ts";
 import { TAKOFORM_PUBLISHER_SET_RECEIPT } from "../src/generated/takoform-publisher-set-receipt.ts";
-import { bytesDigest } from "../src/json.ts";
+import { bytesDigest, canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
+import { deriveRuntimeImplementationCatalog } from "../src/public-worker-implementation.ts";
+import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   TAKOFORM_CORE_COMMIT,
   TAKOFORM_CORE_VERIFIER_PROTOCOL,
   TAKOFORM_CORE_VERSION,
 } from "../src/takoform/form-authority-verification.ts";
-import { YURUCOMMU_FORM_VERSIONS } from "../src/takoform/implementation-catalog.ts";
+import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
 
 const ARTIFACT_DIGEST = takoformCoreVerifierArtifactDigest();
 const RAW_POLICY_DIGEST = await bytesDigest(
   new TextEncoder().encode(TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE.core.publisherPolicy),
 );
-const IMPLEMENTED = Object.keys(YURUCOMMU_FORM_VERSIONS).length;
+const SELFHOST_CAPABILITIES = yurucommuLifecycleCapabilityManifest(
+  SELFHOST_IDENTITY_CAPABILITY_KINDS,
+);
+const SELFHOST_IMPLEMENTATION_PAYLOAD_DIGEST = await canonicalDigest({
+  kind: "takoserver.selfhost-form-implementation@v1",
+  capabilities: SELFHOST_CAPABILITIES,
+});
+const SELFHOST_CATALOG = await deriveRuntimeImplementationCatalog({
+  implementationPayloadDigest: SELFHOST_IMPLEMENTATION_PAYLOAD_DIGEST,
+  capabilities: SELFHOST_CAPABILITIES,
+});
+const PACKAGE_COUNT = 17;
+const IMPLEMENTED = SELFHOST_CATALOG.entries.length;
 
 describe("self-host Form admission", () => {
   test("plans the exact publisher set as a dry run and records nothing", async () => {
@@ -40,8 +54,8 @@ describe("self-host Form admission", () => {
         fetch: verifier.fetch,
       });
       expect(result.applied).toBeNull();
-      expect(result.plan.packages).toHaveLength(17);
-      expect(result.plan.commands).toHaveLength(2 + 17 + IMPLEMENTED * 2);
+      expect(result.plan.packages).toHaveLength(PACKAGE_COUNT);
+      expect(result.plan.commands).toHaveLength(2 + PACKAGE_COUNT + IMPLEMENTED * 2);
       expect(verifier.calls).toEqual(["/v1/identity"]);
       expect(await fixture.sql.query("SELECT * FROM tf_form_publisher_events")).toEqual([]);
     } finally {
@@ -72,7 +86,7 @@ describe("self-host Form admission", () => {
       expect(applied.verificationMode).toBe("released-core");
       expect(verifier.calls).toEqual(["/v1/identity", "/v1/verify-set"]);
       const forms = applied.readback.forms;
-      expect(forms.filter((form) => form.installed)).toHaveLength(17);
+      expect(forms.filter((form) => form.installed)).toHaveLength(PACKAGE_COUNT);
       expect(forms.filter((form) => form.supported)).toHaveLength(IMPLEMENTED);
       expect(forms.filter((form) => form.activationHead.active)).toHaveLength(IMPLEMENTED);
       // ADR 0007: an identity Form is admitted with the operations its Form
@@ -96,6 +110,13 @@ describe("self-host Form admission", () => {
         "import",
         "observe",
       ]);
+      for (const kind of ["ActorNamespace", "DurableWorkflow"]) {
+        expect(forms.find((form) => form.formRef.kind === kind)).toMatchObject({
+          installed: true,
+          supported: false,
+          activationHead: { present: false, active: false },
+        });
+      }
       expect(await fixture.sql.query("SELECT count(*) AS c FROM tf_form_install_events")).toEqual([
         { c: 17 },
       ]);
