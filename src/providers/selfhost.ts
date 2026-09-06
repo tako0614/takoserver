@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { mkdir, readdir, readFile, rm } from "node:fs/promises";
+import { existsSync, constants as fsConstants } from "node:fs";
+import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
@@ -3269,8 +3269,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           }
           decoded.push({ path: migration.path, digest: migration.digest, sql });
         }
-        await mkdir(dirname(path), { recursive: true });
-        const database = new Database(path, { create: true });
+        await prepareSqliteMigrationPath(path);
+        const database = new Database(path);
         try {
           // Same reason as the reader, and more pressing: this one takes a
           // write lock the tenant's own connection may be holding.
@@ -4014,6 +4014,40 @@ function sqlitePathOf(nativeId: string, databasePath: (name: string) => string):
     return null;
   }
   return databasePath(parts[1]);
+}
+
+/** Makes the migration-owned database private before any tenant SQL can run. */
+async function prepareSqliteMigrationPath(path: string): Promise<void> {
+  const parent = dirname(path);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const parentHandle = await open(
+    parent,
+    fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+  );
+  try {
+    await parentHandle.chmod(0o700).catch(() => undefined);
+    const parentStat = await parentHandle.stat();
+    if (!parentStat.isDirectory() || (parentStat.mode & 0o777) !== 0o700) {
+      throw new Error("refusing to migrate under a non-private database directory");
+    }
+
+    const databaseHandle = await open(
+      path,
+      fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await databaseHandle.chmod(0o600).catch(() => undefined);
+      const databaseStat = await databaseHandle.stat();
+      if (!databaseStat.isFile() || (databaseStat.mode & 0o777) !== 0o600) {
+        throw new Error("refusing to migrate a non-private database file");
+      }
+    } finally {
+      await databaseHandle.close();
+    }
+  } finally {
+    await parentHandle.close();
+  }
 }
 
 function migrationPath(value: unknown): value is string {

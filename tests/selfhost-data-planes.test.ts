@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -55,11 +56,13 @@ let root: string;
 let sql: Sql;
 let now: Date;
 let planes: ReturnType<typeof createSelfhostDataPlanes>;
+let fixture: Database | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-data-planes-"));
   sql = createEphemeralSql();
   now = new Date("2026-09-02T00:00:00.000Z");
+  fixture = undefined;
   planes = createSelfhostDataPlanes({
     sql,
     grant: async (script, versionId) => GRANTS[`${script}\u0000${versionId}`] ?? null,
@@ -70,8 +73,31 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fixture?.close();
+  fixture = undefined;
   rmSync(root, { recursive: true, force: true });
 });
+
+function fixtureDatabase(): Database {
+  if (!fixture) {
+    fixture = new Database(join(root, "tsdb-alpha.sqlite"));
+    fixture.exec("PRAGMA foreign_keys = ON");
+  }
+  return fixture;
+}
+
+function provisionFixture(sqlText: string): void {
+  fixtureDatabase().exec(sqlText);
+}
+
+function fixtureSchema(): unknown[] {
+  return fixtureDatabase()
+    .query(
+      "SELECT type, name, tbl_name, sql FROM sqlite_schema " +
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )
+    .all();
+}
 
 async function post(
   path: string,
@@ -298,16 +324,7 @@ test("two Worker Versions cannot see each other's entries", async () => {
 // ---------------------------------------------------------------------------
 
 test("a statement executes against the version's own database", async () => {
-  expect(
-    value(
-      (
-        await db({
-          op: "execute",
-          statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)" },
-        })
-      ).envelope,
-    ),
-  ).toEqual({ rows: [], rowsWritten: 0 });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
   const inserted = value(
     (
       await db({
@@ -324,7 +341,7 @@ test("a statement executes against the version's own database", async () => {
 });
 
 test("a read after a write reports no rows written", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER)");
   await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1), (2), (3)" } });
   // `changes()` would still be 3 here; the facade refuses its own answer when
   // a read claims to have written, so this has to be the total delta.
@@ -336,10 +353,7 @@ test("a read after a write reports no rows written", async () => {
 });
 
 test("bound parameters carry text, numbers, null, and bytes", async () => {
-  await db({
-    op: "execute",
-    statement: { sql: "CREATE TABLE t (s TEXT, n INTEGER, z TEXT, b BLOB)" },
-  });
+  provisionFixture("CREATE TABLE t (s TEXT, n INTEGER, z TEXT, b BLOB)");
   await db({
     op: "execute",
     statement: {
@@ -356,7 +370,7 @@ test("bound parameters carry text, numbers, null, and bytes", async () => {
 });
 
 test("a transaction commits every statement or none of them", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY)");
   const committed = value(
     (
       await db({
@@ -392,15 +406,10 @@ test("a transaction commits every statement or none of them", async () => {
 });
 
 test("foreign keys are enforced, as they are on the managed backend", async () => {
-  await db({
-    op: "transaction",
-    statements: [
-      { sql: "CREATE TABLE parent (id INTEGER PRIMARY KEY)" },
-      {
-        sql: "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
-      },
-    ],
-  });
+  provisionFixture(
+    "CREATE TABLE parent (id INTEGER PRIMARY KEY); " +
+      "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+  );
   const orphan = await db({
     op: "execute",
     statement: { sql: "INSERT INTO child VALUES (1, 99)" },
@@ -415,7 +424,7 @@ test("broken SQL is a closed code rather than a SQLite message", async () => {
 });
 
 test("two Worker Versions get two databases", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER)");
   await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
   const other = await db(
     { op: "query", statement: { sql: "SELECT * FROM t" } },
@@ -438,6 +447,75 @@ test("an operation outside the vocabulary is refused", async () => {
 // ---------------------------------------------------------------------------
 // What a statement is allowed to be
 // ---------------------------------------------------------------------------
+
+test("runtime schema changes are refused before any operation executes", async () => {
+  provisionFixture(
+    "CREATE TABLE runtime_fixture (id INTEGER PRIMARY KEY, body TEXT NOT NULL); " +
+      "CREATE INDEX runtime_fixture_body ON runtime_fixture (body)",
+  );
+  const before = fixtureSchema();
+
+  expect(
+    (
+      await db({
+        op: "execute",
+        statement: { sql: "CREATE TABLE forbidden_runtime_schema (id INTEGER PRIMARY KEY)" },
+      })
+    ).envelope,
+  ).toEqual({ ok: false, error: { code: "sql_error" } });
+  expect(fixtureSchema()).toEqual(before);
+
+  expect(
+    (
+      await db({
+        op: "query",
+        statement: { sql: "ALTER TABLE runtime_fixture ADD COLUMN forbidden TEXT" },
+      })
+    ).envelope,
+  ).toEqual({ ok: false, error: { code: "sql_error" } });
+  expect(fixtureSchema()).toEqual(before);
+
+  expect(
+    (
+      await db({
+        op: "transaction",
+        statements: [
+          { sql: "INSERT INTO runtime_fixture (id, body) VALUES (1, 'must not survive')" },
+          { sql: "DROP TABLE runtime_fixture" },
+        ],
+      })
+    ).envelope,
+  ).toEqual({ ok: false, error: { code: "sql_error" } });
+  expect(fixtureSchema()).toEqual(before);
+  expect(fixtureDatabase().query("SELECT COUNT(*) AS count FROM runtime_fixture").get()).toEqual({
+    count: 0,
+  });
+});
+
+test("ordinary DML survives schema words in values and comments", async () => {
+  provisionFixture("CREATE TABLE dml_fixture (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+
+  for (const statement of [
+    {
+      sql: "INSERT INTO dml_fixture (id, body) VALUES (?, ?) /* CREATE TABLE hidden */",
+      params: [1, "inserted"],
+    },
+    {
+      sql: "UPDATE dml_fixture SET body = ? WHERE id = ? -- ALTER TABLE hidden\n",
+      params: ["updated", 1],
+    },
+    {
+      sql: "REPLACE INTO dml_fixture (id, body) VALUES (?, ?)",
+      params: [1, "replaced; DROP TABLE hidden"],
+    },
+    { sql: "DELETE FROM dml_fixture WHERE id = ? /* REINDEX hidden */", params: [1] },
+  ]) {
+    expect(value((await db({ op: "execute", statement })).envelope)).toMatchObject({
+      rows: [],
+      rowsWritten: 1,
+    });
+  }
+});
 
 test("a statement that would leave this database is refused before it is prepared", async () => {
   const victim = join(root, "victim.sqlite");
@@ -499,7 +577,7 @@ test("transaction control belongs to the plane, not to the statement", async () 
     });
   }
   // The words are still legal where SQLite means something else by them.
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY)");
   expect(
     value(
       (
@@ -519,7 +597,7 @@ test("transaction control belongs to the plane, not to the statement", async () 
 });
 
 test("a second statement in one text is refused", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER)");
   expect(
     (await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1); DROP TABLE t" } }))
       .envelope,
@@ -534,7 +612,7 @@ test("a second statement in one text is refused", async () => {
 });
 
 test("a semicolon inside a value is not a statement boundary", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (body TEXT)" } });
+  provisionFixture("CREATE TABLE t (body TEXT)");
   expect(
     value(
       (await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES ('a; DROP TABLE t')" } }))
@@ -551,7 +629,7 @@ test("a semicolon inside a value is not a statement boundary", async () => {
 // ---------------------------------------------------------------------------
 
 test("a write through query is rolled back rather than committed", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY)");
   await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
   // The managed backend runs `query` inside a transaction it always rolls
   // back, so the two backends must not differ on whether the row survives.
@@ -565,7 +643,7 @@ test("a write through query is rolled back rather than committed", async () => {
 });
 
 test("a transaction whose last statement fails leaves none of the earlier ones", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY)");
   const mixed = await db({
     op: "transaction",
     statements: [
@@ -581,7 +659,7 @@ test("a transaction whose last statement fails leaves none of the earlier ones",
 });
 
 test("a refused statement anywhere in a batch stops the batch before it starts", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER PRIMARY KEY)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER PRIMARY KEY)");
   const mixed = await db({
     op: "transaction",
     statements: [
@@ -618,7 +696,7 @@ test("a result larger than the ceiling is refused rather than materialised", asy
 });
 
 test("more rows than the ceiling is refused", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (i INTEGER)" } });
+  provisionFixture("CREATE TABLE t (i INTEGER)");
   const answer = await db({
     op: "query",
     statement: {
@@ -683,7 +761,7 @@ test("an unauthenticated caller is refused before the body is even measured", as
 });
 
 test("a database file and its directory are private to this process", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  await db({ op: "execute", statement: { sql: "SELECT 1" } });
   expect(statSync(join(root, "tsdb-alpha.sqlite")).mode & 0o777).toBe(0o600);
   expect(statSync(root).mode & 0o077).toBe(0);
 });
@@ -727,7 +805,7 @@ test("the sweep reclaims expired rows and nothing else, in bounded batches", asy
 });
 
 test("forgetting a database drops the handle rather than the file", async () => {
-  await db({ op: "execute", statement: { sql: "CREATE TABLE t (id INTEGER)" } });
+  provisionFixture("CREATE TABLE t (id INTEGER)");
   await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
   planes.maintenance.forgetDatabase("tsdb-alpha");
   // Reopened on the next request, so a database deleted and declared again

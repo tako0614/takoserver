@@ -1854,7 +1854,7 @@ function createSqlAdapter(rawEnv, descriptor) {
     const results = mapArray(value.results, projectSqlResult);
     const envelope = SafeObjectCreate(null); envelope.results = results;
     if (utf8Length(SafeJSONStringify(envelope)) > MAX_SQL_RESULT_BYTES) throw portableError("backend_unavailable");
-    return results;
+    return ${legacy ? "results" : "envelope"};
   };
   return portable;
 }

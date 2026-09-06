@@ -263,6 +263,43 @@ test("a SQL statement travels to the SQL plane and its rows come back projected"
   }
 });
 
+test("a SQL transaction returns the closed results envelope through the generated facade", async () => {
+  const { service, calls } = plane([
+    { ok: true, value: { results: [{ rows: [{ value: 1 }], rowsWritten: 0 }] } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       return Response.json(await env.DB.transaction([{ sql: "SELECT 1" }]));
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw1.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      results: [{ rows: [{ value: 1 }], rowsWritten: 0 }],
+    });
+    expect(calls[0]?.url).toEndWith(SELFHOST_DATA_PLANE_SQL_PATH);
+    expect(calls[0]?.body).toEqual({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "transaction",
+      statements: [{ sql: "SELECT 1" }],
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
 test("a plane refusal reaches the tenant under the closed error vocabulary", async () => {
   const { service } = plane([{ ok: false, error: { code: "sql_error" } }]);
   const generated = await loadGenerated(

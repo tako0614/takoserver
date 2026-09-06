@@ -1,7 +1,16 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -17,6 +26,7 @@ import {
   createSelfhostDataPlaneAccess,
   createSelfhostProvider,
   type SelfhostDataPlaneMaintenance,
+  selfhostDatabasePath,
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import {
@@ -2915,6 +2925,11 @@ describe("the SQLite migration ledger", () => {
       ok: true,
       value: undefined,
     });
+    const databaseName = nativeId.split(":")[1];
+    if (!databaseName) throw new Error("the selfhost SQLite native id must contain a name");
+    const databasePath = selfhostDatabasePath(root, databaseName);
+    expect(statSync(join(root, "databases")).mode & 0o777).toBe(0o700);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
 
     const ledger = await port.readLedger({ nativeId, target: readTarget });
     expect(ledger).toEqual({
@@ -2957,7 +2972,14 @@ describe("the SQLite migration ledger", () => {
     expect(conflicting).toMatchObject({ ok: false, failure: { code: "conflict" } });
 
     // Broken SQL commits nothing, ledger row included.
-    const brokenSql = new TextEncoder().encode("THIS IS NOT SQL");
+    const tenantDatabase = new Database(databasePath);
+    tenantDatabase
+      .query("INSERT INTO notes (id, body) VALUES (?, ?)")
+      .run(1, "existing tenant data");
+    tenantDatabase.close();
+    const brokenSql = new TextEncoder().encode(
+      "INSERT INTO notes (id, body) VALUES (2, 'must roll back'); THIS IS NOT SQL",
+    );
     const brokenMigration = {
       path: "0002_broken.sql",
       digest: `sha256:${createHash("sha256").update(brokenSql).digest("hex")}` as const,
@@ -2977,6 +2999,168 @@ describe("the SQLite migration ledger", () => {
       ok: true,
       value: [{ path: first.path, digest: first.digest }],
     });
+    expect(statSync(join(root, "databases")).mode & 0o777).toBe(0o700);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+    const preserved = new Database(databasePath);
+    try {
+      expect(preserved.query("SELECT id, body FROM notes ORDER BY id").all()).toEqual([
+        { id: 1, body: "existing tenant data" },
+      ]);
+    } finally {
+      preserved.close();
+    }
+  });
+
+  test("tightens an existing database and directory without changing tenant data", async () => {
+    const databaseName = "existing-database";
+    const databasePath = selfhostDatabasePath(root, databaseName);
+    await mkdir(join(root, "databases"), { recursive: true });
+    chmodSync(join(root, "databases"), 0o755);
+    const existing = new Database(databasePath, { create: true });
+    existing.exec("CREATE TABLE preserved (value TEXT NOT NULL)");
+    existing.query("INSERT INTO preserved (value) VALUES (?)").run("tenant-data");
+    existing.close();
+    chmodSync(databasePath, 0o644);
+
+    const migrationSql = new TextEncoder().encode(
+      "CREATE TABLE added_by_migration (id INTEGER PRIMARY KEY)",
+    );
+    const migration = {
+      path: "0001_existing.sql",
+      digest: `sha256:${createHash("sha256").update(migrationSql).digest("hex")}` as const,
+      sql: migrationSql,
+    };
+    const port = provider().sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_existing",
+        operationMode: "initial",
+        nativeId: `selfhost-sqlite:${databaseName}:op_db`,
+        target: {
+          resourceUid: "uid_existing_db",
+          incarnationId: "dep_existing_db",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+
+    expect(statSync(join(root, "databases")).mode & 0o777).toBe(0o700);
+    expect(statSync(databasePath).mode & 0o777).toBe(0o600);
+    const reopened = new Database(databasePath);
+    try {
+      expect(reopened.query("SELECT value FROM preserved").get()).toEqual({
+        value: "tenant-data",
+      });
+    } finally {
+      reopened.close();
+    }
+  });
+
+  test("refuses a symlinked database directory without touching its target", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "takoserver-sqlite-outside-"));
+    const sentinelPath = join(outside, "sentinel.txt");
+    try {
+      chmodSync(outside, 0o755);
+      await writeFile(sentinelPath, "outside-directory-data");
+      await symlink(outside, join(root, "databases"));
+      const migrationSql = new TextEncoder().encode(
+        "CREATE TABLE custody_probe (id INTEGER PRIMARY KEY)",
+      );
+      const migration = {
+        path: "0001_custody.sql",
+        digest: `sha256:${createHash("sha256").update(migrationSql).digest("hex")}` as const,
+        sql: migrationSql,
+      };
+      const port = provider().sqliteMigrations;
+      if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+      const outcome = await port
+        .applySuffix({
+          operationId: "op_migration_symlinked_parent",
+          operationMode: "initial",
+          nativeId: "selfhost-sqlite:parent-link:op_db",
+          target: {
+            resourceUid: "uid_symlinked_parent",
+            incarnationId: "dep_symlinked_parent",
+            generation: "1",
+          },
+          desired: [migration],
+          expectedPrefix: [],
+          migrations: [migration],
+        })
+        .then(
+          () => "applied",
+          () => "refused",
+        );
+
+      expect({
+        outcome,
+        outsideMode: statSync(outside).mode & 0o777,
+        sentinel: readFileSync(sentinelPath, "utf8"),
+        databaseCreated: existsSync(join(outside, "parent-link.sqlite")),
+      }).toEqual({
+        outcome: "refused",
+        outsideMode: 0o755,
+        sentinel: "outside-directory-data",
+        databaseCreated: false,
+      });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses a symlinked database file without touching its target", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "takoserver-sqlite-file-outside-"));
+    const outsidePath = join(outside, "outside.sqlite");
+    try {
+      await writeFile(outsidePath, "outside-file-bytes");
+      chmodSync(outsidePath, 0o640);
+      await mkdir(join(root, "databases"), { recursive: true });
+      await symlink(outsidePath, selfhostDatabasePath(root, "file-link"));
+      const migrationSql = new TextEncoder().encode(
+        "CREATE TABLE file_custody_probe (id INTEGER PRIMARY KEY)",
+      );
+      const migration = {
+        path: "0001_file_custody.sql",
+        digest: `sha256:${createHash("sha256").update(migrationSql).digest("hex")}` as const,
+        sql: migrationSql,
+      };
+      const port = provider().sqliteMigrations;
+      if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+      const outcome = await port
+        .applySuffix({
+          operationId: "op_migration_symlinked_file",
+          operationMode: "initial",
+          nativeId: "selfhost-sqlite:file-link:op_db",
+          target: {
+            resourceUid: "uid_symlinked_file",
+            incarnationId: "dep_symlinked_file",
+            generation: "1",
+          },
+          desired: [migration],
+          expectedPrefix: [],
+          migrations: [migration],
+        })
+        .then(
+          () => "applied",
+          () => "refused",
+        );
+
+      expect({
+        outcome,
+        outsideMode: statSync(outsidePath).mode & 0o777,
+        outsideBytes: readFileSync(outsidePath, "utf8"),
+      }).toEqual({
+        outcome: "refused",
+        outsideMode: 0o640,
+        outsideBytes: "outside-file-bytes",
+      });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

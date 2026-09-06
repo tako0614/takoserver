@@ -2192,7 +2192,7 @@ function createSqlAdapter(call, binding) {
     if (utf8Length(SafeJSONStringify(envelope)) > MAX_SQL_RESULT_BYTES) {
       throw portableError("backend_unavailable");
     }
-    return results;
+    return envelope;
   };
   return portable;
 }

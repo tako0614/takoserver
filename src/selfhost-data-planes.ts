@@ -964,13 +964,20 @@ const REFUSED_ANYWHERE = new Set(["attach", "detach", "vacuum", "pragma", "analy
  * Transaction control belongs to the plane, not to the caller. A tenant
  * `COMMIT` inside a batch ends the transaction the batch's own guarantee is
  * made of, and a tenant `BEGIN` leaves one open on a connection every later
- * request shares. These words are legal elsewhere — `END` closes a `CASE`,
- * `ROLLBACK` names a conflict resolution — so only the leading one is refused.
+ * request shares. Durable schema changes belong to the administrative
+ * migration path, not this runtime facade. These words are legal elsewhere —
+ * `END` closes a `CASE`, `ROLLBACK` names a conflict resolution, and `CREATE`,
+ * `ALTER`, `DROP`, and `REINDEX` may occur in a quoted value or comment — so
+ * only the leading one is refused.
  */
 const REFUSED_LEADING = new Set([
   "begin",
   "commit",
+  "create",
+  "alter",
+  "drop",
   "end",
+  "reindex",
   "rollback",
   "savepoint",
   "release",

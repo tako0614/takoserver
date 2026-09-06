@@ -15,6 +15,7 @@ import {
   MANAGED_WORKER_READINESS_PATH,
   MANAGED_WORKER_READINESS_PROPS_SCHEMA,
   MANAGED_WORKER_READINESS_RESULT_SCHEMA,
+  MANAGED_WORKER_RELEASE_PROTOCOL,
   type ManagedWorkerEntrypointSourceInput,
   managedWorkerEntrypointSource,
 } from "../src/providers/cloudflare-managed-worker-wrapper.ts";
@@ -2284,6 +2285,7 @@ test("KV, Queue producer, Service, and SQLite-DO adapters preserve portable byte
   const calls: Array<{ readonly operation: string; readonly value: unknown }> = [];
   const bindingInput: ManagedWorkerEntrypointSourceInput = {
     ...EMPTY_WORKER,
+    releaseProtocol: MANAGED_WORKER_RELEASE_PROTOCOL,
     bindings: [
       { name: "KV", type: "kv_namespace" },
       { name: "QUEUE", type: "queue" },
@@ -2500,7 +2502,7 @@ export default { async fetch(_request, env) {
         name: "numeric_out_of_range",
         message: "numeric_out_of_range",
       },
-      transaction: [{ rows: [{ value: "ok" }], rowsWritten: 0 }],
+      transaction: { results: [{ rows: [{ value: "ok" }], rowsWritten: 0 }] },
     });
     expect(typeof body.accepted).toBe("string");
     expect(body.accepted).not.toBe("cloudflare-does-not-return-this");

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -37,6 +38,16 @@ import { findWorkerd } from "../src/workerd-supervisor.ts";
 const EDGE_API = "edge.forms.takoform.com/v1beta1";
 const KV_NAMESPACE = "tskv-e2e-cache";
 const SQLITE_DATABASE = "tsdb-e2e-app";
+const SQLITE_NATIVE_ID = `selfhost-sqlite:${SQLITE_DATABASE}:op_db`;
+const SQLITE_PATH_SEGMENT = `databases/${SQLITE_DATABASE}.sqlite`;
+const NOTES_MIGRATION_SQL = new TextEncoder().encode(
+  "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+);
+const NOTES_MIGRATION = {
+  path: "0001-notes.sql",
+  digest: `sha256:${createHash("sha256").update(NOTES_MIGRATION_SQL).digest("hex")}` as const,
+  sql: NOTES_MIGRATION_SQL,
+};
 const HOSTNAME = "e2e.localhost";
 const WORKERD = findWorkerd(resolve(import.meta.dir, ".."));
 
@@ -62,7 +73,6 @@ const TENANT_MODULE = `export default {
       });
     }
     if (url.pathname === "/sql") {
-      await env.DB.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)");
       const written = await env.DB.execute(
         "INSERT INTO notes (id, body) VALUES (?, ?)",
         [1, "written through the facade"],
@@ -136,7 +146,6 @@ const TENANT_MODULE = `export default {
       return Response.json(attempts);
     }
     if (url.pathname === "/query-writes") {
-      await env.DB.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT)");
       await env.DB.execute("INSERT OR REPLACE INTO notes (id, body) VALUES (7, 'seven')");
       const through = await env.DB.query("DELETE FROM notes WHERE id = 7");
       const after = await env.DB.query("SELECT count(*) AS n FROM notes WHERE id = 7");
@@ -355,6 +364,7 @@ async function boot(
       },
     },
   });
+  const sqlitePath = join(root, SQLITE_PATH_SEGMENT);
 
   const worker = await local.apply({
     operationId: "op_worker",
@@ -363,6 +373,26 @@ async function boot(
     spec: {},
   });
   expect(worker.phase).toBe("succeeded");
+
+  const sqliteMigrations = local.sqliteMigrations;
+  if (!sqliteMigrations) throw new Error("the selfhost provider must execute SQLite migrations");
+  expect(
+    await sqliteMigrations.applySuffix({
+      operationId: "op_db_migration",
+      operationMode: "initial",
+      nativeId: SQLITE_NATIVE_ID,
+      target: {
+        resourceUid: "uid-SQLiteDatabase-app",
+        incarnationId: "dep-app",
+        generation: "1",
+      },
+      desired: [NOTES_MIGRATION],
+      expectedPrefix: [],
+      migrations: [NOTES_MIGRATION],
+    }),
+  ).toEqual({ ok: true, value: undefined });
+  expect(statSync(join(root, "databases")).mode & 0o777).toBe(0o700);
+  expect(statSync(sqlitePath).mode & 0o777).toBe(0o600);
 
   const version = await local.apply({
     operationId: "op_version",
@@ -390,13 +420,10 @@ async function boot(
         `selfhost-kv:${KV_NAMESPACE}:op_kv`,
         { namespaceId: KV_NAMESPACE },
       ),
-      deployed(
-        "/sqliteBindings/0/resource",
-        "SQLiteDatabase",
-        "app",
-        `selfhost-sqlite:${SQLITE_DATABASE}:op_db`,
-        { engine: "sqlite", path: join(root, "databases", `${SQLITE_DATABASE}.sqlite`) },
-      ),
+      deployed("/sqliteBindings/0/resource", "SQLiteDatabase", "app", SQLITE_NATIVE_ID, {
+        engine: "sqlite",
+        path: sqlitePath,
+      }),
     ],
   });
   expect(version.phase).toBe("succeeded");
@@ -528,10 +555,12 @@ test.skipIf(WORKERD === null)(
     expect(await response.json()).toEqual({
       written: { rows: [], rowsWritten: 1 },
       read: { rows: [{ id: 1, body: "written through the facade" }], rowsWritten: 0 },
-      batched: [
-        { rows: [], rowsWritten: 1 },
-        { rows: [], rowsWritten: 1 },
-      ],
+      batched: {
+        results: [
+          { rows: [], rowsWritten: 1 },
+          { rows: [], rowsWritten: 1 },
+        ],
+      },
       all: { rows: [{ id: 1 }, { id: 2 }, { id: 3 }], rowsWritten: 0 },
     });
   },
