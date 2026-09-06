@@ -158,7 +158,7 @@ export interface ExternalIdentityVerifier {
     readonly method?: IdentityProviderDescriptor["method"] | undefined;
     /** The value the caller asked the provider to embed in the token. */
     readonly nonce?: string | undefined;
-    /** Canonical request origin, for credentials that are audience-bound to one Host. */
+    /** Configured public Host origin, for credentials bound to one canonical audience. */
     readonly audience?: string | undefined;
   }): Promise<{
     readonly providerSubject: string;

@@ -135,9 +135,10 @@ export function createProviderDriver(
     validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
   }
   // A Provider instance is selected by pack id and has no installation
-  // selector. Build the closed catalog authority up front: if one pack is
-  // advertised for multiple installations, readback cannot safely choose one
-  // and every historical deployment under that pack must fail closed.
+  // selector. Build the closed commercial authority up front: if one pack is
+  // advertised for multiple installations, catalog-backed readback cannot
+  // safely choose one. Inherited relation readback instead requires its own
+  // exact, non-authoring ProviderNativeReadbackAuthority tuple below.
   const installationsByPack = new Map<string, Set<string>>();
   for (const offering of catalog.list()) {
     const refs = installationsByPack.get(offering.providerPackRef) ?? new Set<string>();
@@ -1566,26 +1567,20 @@ export function createProviderDriver(
       )) {
         // A retained Deployment is an historical provider identity, not a
         // license to ask whichever installation currently happens to expose
-        // the same offering id. Resolve the exact current catalog tuple first;
-        // a Form-family advance may cross that tuple only through an exact
-        // recovery-only capability. A missing/retired/drifted installation
-        // fails closed without a native provider readback call.
+        // the same offering id. Resolve either its exact commercial catalog
+        // tuple or an exact non-authoring technical relation tuple. A Form-
+        // family advance may cross either only through an exact recovery
+        // capability. Missing, retired, drifted, or ambiguous authority fails
+        // closed without a native provider readback call.
+        const provider = byId.get(deployment.providerPackRef);
         const catalogOffering = catalog.findOffering(deployment.offeringId);
         if (
-          !catalogOffering ||
-          catalogOffering.providerPackRef !== deployment.providerPackRef ||
-          catalogOffering.providerInstallationRef !== deployment.providerInstallationRef
+          catalogOffering &&
+          (catalogOffering.providerPackRef !== deployment.providerPackRef ||
+            catalogOffering.providerInstallationRef !== deployment.providerInstallationRef)
         ) {
           return await attest("indeterminate", "provider_unavailable");
         }
-        const installationRefs = installationsByPack.get(deployment.providerPackRef);
-        if (
-          installationRefs?.size !== 1 ||
-          !installationRefs?.has(deployment.providerInstallationRef)
-        ) {
-          return await attest("indeterminate", "provider_unavailable");
-        }
-        const provider = byId.get(deployment.providerPackRef);
         const currentOffering = provider?.offerings.find(
           (candidate) =>
             candidate.id === deployment.offeringId && sameForm(candidate.form, tombstone.formRef),
@@ -1594,9 +1589,35 @@ export function createProviderDriver(
           (candidate) =>
             candidate.id === deployment.offeringId && sameForm(candidate.form, tombstone.formRef),
         );
-        const offering = sameForm(catalogOffering.form, tombstone.formRef)
-          ? (currentOffering ?? recoveryOffering)
-          : recoveryOffering;
+        let offering: ProviderOffering | undefined;
+        if (catalogOffering) {
+          const installationRefs = installationsByPack.get(deployment.providerPackRef);
+          if (
+            installationRefs?.size !== 1 ||
+            !installationRefs.has(deployment.providerInstallationRef)
+          ) {
+            return await attest("indeterminate", "provider_unavailable");
+          }
+          offering = sameForm(catalogOffering.form, tombstone.formRef)
+            ? (currentOffering ?? recoveryOffering)
+            : recoveryOffering;
+        } else {
+          const authorities =
+            provider?.nativeReadbackAuthorities?.filter(
+              (authority) =>
+                authority.offeringId === deployment.offeringId &&
+                authority.providerInstallationRef === deployment.providerInstallationRef &&
+                sameForm(authority.form, tombstone.formRef),
+            ) ?? [];
+          const capabilities = [
+            ...(currentOffering ? [currentOffering] : []),
+            ...(recoveryOffering ? [recoveryOffering] : []),
+          ];
+          if (authorities.length !== 1 || capabilities.length !== 1) {
+            return await attest("indeterminate", "provider_unavailable");
+          }
+          offering = capabilities[0];
+        }
         if (
           !provider ||
           !offering ||

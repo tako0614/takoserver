@@ -4362,9 +4362,11 @@ function resourceListing(row: Row): ResourceListing {
 }
 
 function resourceDeletionTombstone(row: Row): ResourceDeletionTombstone {
-  const formRef = JSON.parse(text(row.form_ref_json)) as unknown;
+  const formRef = resourceExecutionFormRef(row.form_ref_json);
   const effectsValue = JSON.parse(text(row.effects_json)) as unknown;
-  if (!recordValue(formRef) || !Array.isArray(effectsValue)) {
+  const apiVersion = text(row.api_version);
+  const kind = text(row.kind);
+  if (!Array.isArray(effectsValue) || formRef.apiVersion !== apiVersion || formRef.kind !== kind) {
     throw new TakoformHostError("backend_unavailable", 503);
   }
   const effects = effectsValue.map(resourceDeletionEffect);
@@ -4411,11 +4413,11 @@ function resourceDeletionTombstone(row: Row): ResourceDeletionTombstone {
     address: {
       tenantId: text(row.tenant_id),
       space: text(row.space),
-      apiVersion: text(row.api_version),
-      kind: text(row.kind),
+      apiVersion,
+      kind,
       name: text(row.name),
     },
-    formRef: formRef as unknown as TakoformV1Alpha3FormRef,
+    formRef,
     state,
     closureFence,
     effects,

@@ -45,6 +45,7 @@ function fixture() {
     tokens: {} as never,
     settlement: {} as never,
     clock: () => new Date("2026-09-03T00:00:00Z"),
+    publicOrigin: "https://api.takoserver.test",
   });
   const list = async (space: string): Promise<Response> => {
     const url = new URL(

@@ -267,6 +267,7 @@ test("the provider's exact private-PUT/public-apply/private-GET sequence complet
     tokens: {} as never,
     settlement: {} as never,
     clock: () => now,
+    publicOrigin: HOST_ORIGIN,
     runtimeInputs: runtimeInputs.preparations,
   });
 

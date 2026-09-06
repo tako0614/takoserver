@@ -91,6 +91,17 @@ export interface ProviderOffering {
   readonly capabilities: readonly ProviderCapability[];
 }
 
+/**
+ * Host-composed authority to read one exact technical realization after its
+ * logical Resource has been deleted. This is deliberately not an Offering:
+ * it grants no catalog discovery, quote, create, import, or placement right.
+ */
+export interface ProviderNativeReadbackAuthority {
+  readonly offeringId: string;
+  readonly providerInstallationRef: string;
+  readonly form: TakoformV1Alpha3FormRef;
+}
+
 /** Who the resource belongs to and what it is called, in product terms. */
 export interface ResourceIdentity {
   readonly tenantRef: string;
@@ -413,6 +424,8 @@ export interface Provider {
   readonly offerings: readonly ProviderOffering[];
   /** Exact historical capabilities usable only for recorded Deployment recovery. */
   readonly recoveryOfferings?: readonly ProviderOffering[];
+  /** Exact non-authoring placement authority for retained native readback only. */
+  readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
   /** Exact future WorkerEndpoint derivation; never creates a Resource or provider object. */
   readonly workerEndpointOriginReservations?: ProviderWorkerEndpointOriginReservationCapability;
   /** Present only when this configured adapter can durably receive one-shot runtime inputs. */

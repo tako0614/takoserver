@@ -1049,6 +1049,7 @@ describe("Takoserver Resource execution evidence", () => {
       tokens: {} as never,
       settlement: {} as never,
       clock: () => new Date("2026-09-04T00:00:00.000Z"),
+      publicOrigin: "https://api.takoserver.test",
     });
     const url = new URL(
       `https://api.takoserver.test/v1/organizations/${TENANT_ID}/resources/${RESOURCE_UID}/execution-evidence`,

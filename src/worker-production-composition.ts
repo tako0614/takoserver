@@ -109,6 +109,7 @@ export function createWorkerProductionComposition(input: {
   const provider = new CloudflareProviderProxy({
     offerings: surface.offerings,
     recoveryOfferings: surface.recoveryOfferings,
+    nativeReadbackAuthorities: surface.nativeReadbackAuthorities,
     managedBaseDomain,
     runtimeInputs: surface.runtimeInputs,
     binding,

@@ -97,15 +97,17 @@ bun run debug:stable-local-cloudflare-host
 ```
 
 The catalog loader verifies the frozen 31-Form input before listening. The
-launcher installs the exact 13-Form union needed by the maintained Road to Me
-(9 Forms) and Yurucommu (12 Forms) local graphs. Its `StaticAssetBundle` path
+launcher installs the historical 13-Form union used by the Road to Me and
+Yurucommu local graph fixtures. Its `StaticAssetBundle` path
 uses the production Cloudflare Provider upload protocol and serves the realized
 asset manifest through the disposable workerd runtime, including Worker-first
 and single-page fallback behavior.
 
-The disposable Host accepts only Worker Versions whose
-`requiredSensitiveVars` declaration is omitted or empty, matching the public
-Host support profile. This command is not a deploy path. It binds `127.0.0.1`
+This diagnostic profile does not support `ObjectBucket` and accepts only Worker
+Versions whose `requiredSensitiveVars` declaration is omitted or empty. It is
+therefore insufficient for the current Yurucommu Provider 4 graph, which needs
+both capabilities; a passing older fixture is not a full current-app E2E.
+This command is not a deploy path. It binds `127.0.0.1`
 on an ephemeral port by default and prints one sanitized ready JSON line
 without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
 `TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
@@ -161,6 +163,7 @@ Everything lives under one directory, `.takoserver` by default.
 
 | Variable | What it does |
 |---|---|
+| `TAKOSERVER_PUBLIC_ORIGIN` | Canonical public API origin used for Host identity, operator audience, and the session cookie's Secure policy. Set the external HTTPS origin when the API is behind TLS termination. |
 | `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. |
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
 | `PORT` | Where the API and console API listen. |
@@ -204,6 +207,32 @@ which means terminating TLS on the default port in one of two ways:
   `TAKOSERVER_WORKER_ENDPOINT_PORT=443`. The port then normalizes away and the
   published address is the portless one the front end really answers on.
 
+For **Caddy in front of the HTTPS workerd listener**, disable upstream
+connection reuse. A Worker can reject a POST before reading its body; with
+the current workerd runtime and Caddy's pooled HTTP/1.1 upstream, the following
+request can fail with EOF / 502 before reaching the Worker. The compatible
+transport keeps each request independent, without replaying mutations:
+
+```caddyfile
+reverse_proxy https://127.0.0.1:8788 {
+  header_up Host {http.request.host}
+  transport http {
+    keepalive off
+    tls_server_name runtime.apps.example.com
+  }
+}
+```
+
+The port and TLS server name are examples: use this deployment's actual
+workerd listener and a name covered by its certificate. Keep certificate
+verification enabled; configure the proxy's trust pool when using a private
+CA. Preserve the original request Host so workerd can route the assigned
+WorkerEndpoint, including on proxy versions that rewrite HTTPS upstream Host
+headers by default. This changes only proxy-to-workerd pooling, not browser
+keep-alive or the Bun API listener. Do not compensate with automatic POST
+retries or by draining attacker-controlled bodies in application authorization.
+See Caddy's [HTTP transport reference](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport).
+
 Any other configuration — plain HTTP, or a port that is not the scheme's
 default — still runs Workers, KV, SQL, queues, cron and buckets, and still
 serves them on its own socket. It simply cannot mint a `WorkerEndpoint`, and it
@@ -219,6 +248,13 @@ API begins answering; a machine that has published nothing starts no runtime.
 Nothing in that table is required to start. What is absent is absent rather than
 faked: a deployment with no Stripe key does not serve the route that would begin
 a payment, and its console offers the way it does take money instead.
+
+The Bun API listener speaks HTTP, including when a front end terminates TLS.
+The configured public origin still owns operator sign-in and existing-owner
+proof audiences, and HTTPS deployments still issue and clear `Secure` session
+cookies. Backend URLs and `Forwarded` / `X-Forwarded-*` headers do not select
+that authority. Cookie authentication continues to require the exact configured
+console `Origin`; TLS termination does not relax that browser boundary.
 
 A hosted Cloudflare deployment enables customer card funding only when its
 private deploy target explicitly sets `"stripeCheckout": true` **and** the

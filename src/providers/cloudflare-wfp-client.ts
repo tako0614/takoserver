@@ -114,6 +114,33 @@ export class CloudflareWfpClient {
     if (read.ok === false) {
       return read.status === 404 ? { ok: true, status: 404, value: true } : copyFailure(read);
     }
+    const detail = object(read.value);
+    if (
+      !detail ||
+      (detail.dispatch_namespace !== undefined &&
+        detail.dispatch_namespace !== this.dispatchNamespace)
+    ) {
+      return malformed(read.status);
+    }
+    if (detail.script === null) {
+      if (detail.dispatch_namespace !== this.dispatchNamespace) return malformed(read.status);
+      // The metadata endpoint can return namespace metadata with script:null
+      // and HTTP 200. Null alone is not an absence contract: require a fresh
+      // 404 from the same exact script's settings, without reading its content.
+      const settings = await this.json("GET", `${this.scriptPath(scriptName)}/settings`);
+      if (settings.ok === false) {
+        return settings.status === 404
+          ? { ok: true, status: 404, value: true }
+          : copyFailure(settings);
+      }
+      return malformed(settings.status);
+    }
+    // Namespace metadata is optional for a present script. Its exact native
+    // identity still has to match the script addressed by this request.
+    const script = object(detail.script);
+    if (!script || text(script.id) !== scriptName || !text(script.etag)) {
+      return malformed(read.status);
+    }
     return { ok: true, status: read.status, value: false };
   }
 

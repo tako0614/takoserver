@@ -5,6 +5,7 @@ import type {
   Provider,
   ProviderArtifactConsumption,
   ProviderNativeAbsence,
+  ProviderNativeReadbackAuthority,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
   ProviderOffering,
@@ -31,6 +32,7 @@ export interface CloudflareProviderProxyOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
+  readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
   readonly managedBaseDomain: string;
   /** Static capability projection; no secret or lease value enters this object. */
   readonly runtimeInputs?: boolean;
@@ -48,6 +50,7 @@ export class CloudflareProviderProxy implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
+  readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
   readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
   readonly workerEndpointOriginReservations: NonNullable<
     Provider["workerEndpointOriginReservations"]
@@ -59,6 +62,9 @@ export class CloudflareProviderProxy implements Provider {
     this.offerings = structuredClone(options.offerings);
     if (options.recoveryOfferings) {
       this.recoveryOfferings = structuredClone(options.recoveryOfferings);
+    }
+    if (options.nativeReadbackAuthorities) {
+      this.nativeReadbackAuthorities = structuredClone(options.nativeReadbackAuthorities);
     }
     if (options.runtimeInputs) {
       this.runtimeInputCapabilities = {

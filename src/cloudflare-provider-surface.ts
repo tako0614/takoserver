@@ -1,13 +1,14 @@
 import { edgeProviderOffering, objectBucketProviderOffering } from "./edge-forms.ts";
 import type { HostedEdgeSupplies } from "./hosted-edge-supplies.ts";
 import type { HostedObjectBucketSupplies } from "./hosted-object-bucket-supplies.ts";
-import type { ProviderOffering } from "./provider-port.ts";
+import type { ProviderNativeReadbackAuthority, ProviderOffering } from "./provider-port.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 
 export interface CloudflareProviderSurface {
   readonly providerInstallationId: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings: readonly ProviderOffering[];
+  readonly nativeReadbackAuthorities: readonly ProviderNativeReadbackAuthority[];
   readonly runtimeInputs: boolean;
 }
 
@@ -26,6 +27,16 @@ const CLOUDFLARE_RELATION_FORM_KINDS = new Set([
   "WorkerCronTrigger",
   "QueueConsumer",
 ]);
+
+/** Current sellable identity supply that keeps each relation's placement reachable. */
+const CLOUDFLARE_RELATION_READBACK_ANCHORS: Readonly<Record<string, readonly string[]>> = {
+  WorkerVersion: ["ModuleWorker"],
+  WorkerDeployment: ["ModuleWorker"],
+  WorkerCustomDomain: ["ModuleWorker"],
+  WorkerEndpoint: ["ModuleWorker"],
+  WorkerCronTrigger: ["ModuleWorker"],
+  QueueConsumer: ["ModuleWorker", "AtLeastOnceQueue"],
+};
 
 /**
  * Credential-free technical capability projection shared by both isolates.
@@ -75,8 +86,12 @@ export function createCloudflareProviderSurface(input: {
 
   const forms = edgeFormMap(input.forms);
   const retained = edgeFormMap(input.retainedForms ?? []);
+  const suppliedIdentityKinds = new Set(
+    input.edgeSupplies?.offerings.map((offering) => offering.formKind) ?? [],
+  );
   const offerings: ProviderOffering[] = [];
   const recoveryOfferings: ProviderOffering[] = [];
+  const nativeReadbackAuthorities: ProviderNativeReadbackAuthority[] = [];
   const retainedObjectBucket = retained.get("ObjectBucket");
   for (const supply of cloudflareObjects) {
     if (input.edgeSupplies) {
@@ -133,11 +148,17 @@ export function createCloudflareProviderSurface(input: {
       ) {
         continue;
       }
-      offerings.push(
-        edgeProviderOffering(form, {
-          id: `cloudflare.edge.stable-v1.${form.identity.formRef.kind.toLowerCase()}`,
-        }),
-      );
+      const offering = edgeProviderOffering(form, {
+        id: `cloudflare.edge.stable-v1.${form.identity.formRef.kind.toLowerCase()}`,
+      });
+      offerings.push(offering);
+      if (relationReadbackAnchorsPresent(offering.form.kind, suppliedIdentityKinds)) {
+        nativeReadbackAuthorities.push({
+          offeringId: offering.id,
+          providerInstallationRef: installation.id,
+          form: structuredClone(offering.form),
+        });
+      }
     }
     for (const form of retained.values()) {
       const kind = form.identity.formRef.kind;
@@ -147,20 +168,28 @@ export function createCloudflareProviderSurface(input: {
       // adding identities again would create two recovery capabilities with
       // the same authority id.
       if (!CLOUDFLARE_RELATION_FORM_KINDS.has(kind)) continue;
-      recoveryOfferings.push(
-        edgeProviderOffering(form, {
-          id: `cloudflare.edge.${kind.toLowerCase()}`,
-        }),
-      );
+      const offering = edgeProviderOffering(form, {
+        id: `cloudflare.edge.${kind.toLowerCase()}`,
+      });
+      recoveryOfferings.push(offering);
+      if (relationReadbackAnchorsPresent(offering.form.kind, suppliedIdentityKinds)) {
+        nativeReadbackAuthorities.push({
+          offeringId: offering.id,
+          providerInstallationRef: installation.id,
+          form: structuredClone(offering.form),
+        });
+      }
     }
   }
 
   uniqueIds(offerings, "Cloudflare technical offering");
   uniqueIds(recoveryOfferings, "Cloudflare recovery offering");
+  uniqueReadbackAuthorities(nativeReadbackAuthorities);
   return {
     providerInstallationId: installation.id,
     offerings,
     recoveryOfferings,
+    nativeReadbackAuthorities,
     runtimeInputs: input.edgeSupplies !== null,
   };
 }
@@ -210,4 +239,25 @@ function uniqueExact<T>(values: readonly T[], label: string): T {
 function uniqueIds(offerings: readonly ProviderOffering[], label: string): void {
   const ids = offerings.map((offering) => offering.id);
   if (new Set(ids).size !== ids.length) throw new TypeError(`${label} ids must be unique`);
+}
+
+function uniqueReadbackAuthorities(authorities: readonly ProviderNativeReadbackAuthority[]): void {
+  const identities = authorities.map((authority) =>
+    [
+      authority.offeringId,
+      authority.providerInstallationRef,
+      authority.form.apiVersion,
+      authority.form.kind,
+      authority.form.definitionVersion,
+      authority.form.schemaDigest,
+    ].join("\u0000"),
+  );
+  if (new Set(identities).size !== identities.length) {
+    throw new TypeError("Cloudflare native readback authorities must be unique");
+  }
+}
+
+function relationReadbackAnchorsPresent(kind: string, supplied: ReadonlySet<string>): boolean {
+  const anchors = CLOUDFLARE_RELATION_READBACK_ANCHORS[kind];
+  return anchors?.every((anchor) => supplied.has(anchor)) === true;
 }

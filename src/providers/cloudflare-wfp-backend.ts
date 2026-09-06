@@ -640,6 +640,12 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       return { outcome: "unknown", reason: "malformed", retryable: false };
     }
     if (native.kind === "version") {
+      const authority = await this.#versionReadbackReceipt(
+        data.resourceUid,
+        input.descriptor.nativeId,
+        native,
+      );
+      if (!authority.ok) return authority.result;
       return await this.#verifyWorkerVersionNativeAbsence(native.name, kind);
     }
     let receipt: ManagedWorkerReceipt | null;
@@ -674,6 +680,55 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     return absence(absent.value ? "absent" : "present", this.#providerId, kind);
   }
 
+  /**
+   * Proves that a version-shaped native id belongs to this managed placement
+   * before the current dispatch namespace is consulted. Ordinary Workers used
+   * the same `version:<parent>:<name>` shape, so a Host deployment tuple alone
+   * cannot select WfP without this provider-owned receipt.
+   */
+  async #versionReadbackReceipt(
+    resourceUid: string,
+    nativeId: string,
+    native: { readonly parent: string; readonly name: string },
+  ): Promise<ManagedVersionReadbackReceipt> {
+    let receipt: ManagedWorkerReceipt | null;
+    try {
+      receipt = await this.#state.receiptByResourceUid(resourceUid);
+    } catch (error) {
+      return {
+        ok: false,
+        result:
+          error instanceof ManagedWorkerStateCorruptionError
+            ? { outcome: "unknown", reason: "malformed", retryable: false }
+            : { outcome: "unknown", reason: "transport", retryable: true },
+      };
+    }
+    if (!receipt || receipt.nativeId !== nativeId) {
+      return {
+        ok: false,
+        result: { outcome: "unknown", reason: "authority_unavailable", retryable: false },
+      };
+    }
+    if (
+      receipt.resourceUid !== resourceUid ||
+      receipt.kind !== "version" ||
+      receipt.logicalWorkerId !== native.parent ||
+      native.name !== `tsr-${receipt.descriptorDigest.slice("sha256:".length)}`
+    ) {
+      return {
+        ok: false,
+        result: { outcome: "unknown", reason: "malformed", retryable: false },
+      };
+    }
+    if (receipt.state === "pending" || receipt.state === "deleting") {
+      return {
+        ok: false,
+        result: { outcome: "unknown", reason: "authority_unavailable", retryable: true },
+      };
+    }
+    return { ok: true, receipt };
+  }
+
   async verifyArtifactConsumption(
     input: ProviderArtifactConsumptionInput,
   ): Promise<ProviderArtifactConsumption> {
@@ -687,15 +742,38 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       return { outcome: "unknown", reason: "malformed", retryable: false };
     }
 
-    // The receipt is Takoserver's attribution authority, but it is not native
-    // absence authority. A WorkerVersion can be terminalized as absent only
-    // after a fresh GET of its exact immutable release script returns 404.
     if (native.kind === "version") {
+      // The receipt first proves that this native id belongs to the current
+      // managed placement. It is attribution authority, not absence authority:
+      // absence still requires a fresh GET of the exact release script.
+      const authority = await this.#versionReadbackReceipt(
+        input.identity.resourceUid,
+        input.nativeId,
+        native,
+      );
+      if (!authority.ok) return authority.result;
       const nativeAbsence = await this.#verifyWorkerVersionNativeAbsence(native.name, kind);
       if (nativeAbsence.outcome === "unknown") return nativeAbsence;
       if (nativeAbsence.outcome === "absent") {
         return { outcome: "absent", evidence: nativeAbsence.evidence };
       }
+      if (authority.receipt.state === "deleted") {
+        return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
+      }
+      const manifestDigest = authority.receipt.observed.manifestDigest;
+      if (typeof manifestDigest !== "string" || !sha256(manifestDigest)) {
+        return { outcome: "unknown", reason: "malformed", retryable: false };
+      }
+      return {
+        outcome: "present",
+        consumption: "identified",
+        manifestDigests: [manifestDigest],
+        evidence: {
+          provider: this.#providerId,
+          kind,
+          authority: "managed_release_receipt",
+        },
+      };
     }
 
     let receipt: ManagedWorkerReceipt | null;
@@ -715,35 +793,16 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     if (receipt.state === "deleted") {
       return { outcome: "unknown", reason: "authority_unavailable", retryable: false };
     }
-    if (native.kind !== "version") {
-      if (receipt.kind === "version") {
-        return { outcome: "unknown", reason: "malformed", retryable: false };
-      }
-      return {
-        outcome: "present",
-        consumption: "none",
-        evidence: {
-          provider: this.#providerId,
-          kind,
-          state: "non_artifact_consumer",
-        },
-      };
-    }
-    if (receipt.kind !== "version") {
-      return { outcome: "unknown", reason: "malformed", retryable: false };
-    }
-    const manifestDigest = receipt.observed.manifestDigest;
-    if (typeof manifestDigest !== "string" || !sha256(manifestDigest)) {
+    if (receipt.kind === "version") {
       return { outcome: "unknown", reason: "malformed", retryable: false };
     }
     return {
       outcome: "present",
-      consumption: "identified",
-      manifestDigests: [manifestDigest],
+      consumption: "none",
       evidence: {
         provider: this.#providerId,
         kind,
-        authority: "managed_release_receipt",
+        state: "non_artifact_consumer",
       },
     };
   }
@@ -3756,6 +3815,13 @@ type ManagedNative =
       readonly kind: "version" | "deployment" | "cron" | "consumer";
       readonly parent: string;
       readonly name: string;
+    };
+
+type ManagedVersionReadbackReceipt =
+  | { readonly ok: true; readonly receipt: ManagedWorkerReceipt }
+  | {
+      readonly ok: false;
+      readonly result: Extract<ProviderNativeAbsence, { readonly outcome: "unknown" }>;
     };
 
 function parseManagedNativeId(value: string): ManagedNative | null {

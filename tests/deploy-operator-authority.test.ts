@@ -22,6 +22,7 @@ import { createOperatorSettlement } from "../src/operator-credentials.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 
 const ORIGIN = "https://api.production.example.test";
+const OTHER_ORIGIN = "https://api.other-host.test";
 const ORGANIZATION = "org_production_owner";
 const IDENTITY = {
   kind: "takoserver.operator-sign-in-identity@v1",
@@ -482,19 +483,95 @@ describe("operator authority", () => {
             ?.count,
         ),
       };
-      const crossHostReplay = await app.fetch(
-        new Request("https://api.other-host.test/v1/operator-owner-proof", {
+      // The same operator key is valid in a separate deployment only with its
+      // own configured audience and isolated organization ledger.
+      const otherSetup = resolveIdentity({
+        operatorPublicKeyJwk: fixture.publicJwk,
+        operatorAudience: OTHER_ORIGIN,
+        clock: () => now,
+      });
+      const otherSql = createEphemeralSql();
+      const otherApp = buildApp({
+        sql: otherSql,
+        objects: createMemoryObjectStore(),
+        identity: otherSetup.verifier,
+        identityProviders: otherSetup.providers,
+        settlement: createOperatorSettlement({
+          publicKeyJwk: fixture.publicJwk,
+          clock: () => now,
+        }),
+        publicOrigin: OTHER_ORIGIN,
+        forms: [],
+        hostForms: [],
+        driver: new InMemoryTakoformResourceDriver(),
+        offerings: [],
+      });
+      const otherAssertion = await signOperatorAssertion({
+        privateJwk: JSON.stringify(privateInput.jwk),
+        claims: {
+          purpose: "sign-in",
+          aud: OTHER_ORIGIN,
+          provider: IDENTITY.provider,
+          subject: IDENTITY.subject,
+          email: IDENTITY.email,
+          displayName: IDENTITY.displayName,
+        },
+        nowSeconds: Math.floor(now.getTime() / 1_000),
+        lifetimeSeconds: 60,
+      });
+      const otherSignedIn = await otherApp.fetch(
+        new Request(`${OTHER_ORIGIN}/v1/sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            provider: IDENTITY.provider,
+            method: "operator-assertion",
+            assertion: otherAssertion,
+          }),
+        }),
+      );
+      expect(otherSignedIn.status).toBe(200);
+      const otherSignedInBody = (await otherSignedIn.json()) as { sessionToken: string };
+      const otherOrganizationResponse = await otherApp.fetch(
+        new Request(`${OTHER_ORIGIN}/v1/organizations`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${otherSignedInBody.sessionToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ name: "Other Host" }),
+        }),
+      );
+      expect(otherOrganizationResponse.status).toBe(201);
+      const otherOrganizationBody = (await otherOrganizationResponse.json()) as {
+        organization: { id: string; ownerPrincipalId: string };
+      };
+      const crossHostReplay = await otherApp.fetch(
+        new Request(`${OTHER_ORIGIN}/v1/operator-owner-proof`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             provider: IDENTITY.provider,
             method: "operator-assertion",
             assertion,
-            organizationId: organizationBody.organization.id,
+            organizationId: otherOrganizationBody.organization.id,
           }),
         }),
       );
       expect(crossHostReplay.status).toBe(401);
+      const otherHostProof = await otherApp.fetch(
+        new Request(`${OTHER_ORIGIN}/v1/operator-owner-proof`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            provider: IDENTITY.provider,
+            method: "operator-assertion",
+            assertion: otherAssertion,
+            organizationId: otherOrganizationBody.organization.id,
+          }),
+        }),
+      );
+      expect(otherHostProof.status).toBe(200);
       const readOnlyProof = await app.fetch(
         new Request(`${ORIGIN}/v1/operator-owner-proof`, {
           method: "POST",

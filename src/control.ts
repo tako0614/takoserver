@@ -118,6 +118,8 @@ export interface Checkout {
 }
 
 export interface CreateControlRoutesOptions {
+  /** Canonical public audience and cookie transport, including behind TLS termination. */
+  readonly publicOrigin: string;
   readonly accounts: Accounts;
   readonly inventory: ResourceInventory;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
@@ -156,6 +158,7 @@ export type ControlRoutes = (request: Request, url: URL) => Promise<Response | n
 
 export function createControlRoutes(options: CreateControlRoutesOptions): ControlRoutes {
   const {
+    publicOrigin,
     accounts,
     inventory,
     deployments,
@@ -176,6 +179,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     originReservations,
     runtimeInputPolicy,
   } = options;
+  const secureCookies = new URL(publicOrigin).protocol === "https:";
 
   const authorization = (request: Request): string | null => {
     const header = request.headers.get("authorization");
@@ -361,7 +365,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         method: enumValue(body.method, ["operator-assertion"]) as "operator-assertion",
         assertion: bounded(body.assertion, 8 * 1_024),
         organizationId: text(body.organizationId),
-        audience: url.origin,
+        audience: publicOrigin,
       });
       return Response.json(proved, {
         headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
@@ -386,7 +390,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           | "google"
           | "github",
         assertion: bounded(body.assertion, 8 * 1_024),
-        audience: url.origin,
+        audience: publicOrigin,
         ...(body.method === undefined
           ? {}
           : {
@@ -404,7 +408,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           { principal },
           {
             headers: {
-              "set-cookie": sessionCookie(sessionToken, new URL(request.url).protocol === "https:"),
+              "set-cookie": sessionCookie(sessionToken, secureCookies),
             },
           },
         );
@@ -420,7 +424,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return new Response(null, {
         status: 204,
         headers: {
-          "set-cookie": clearSessionCookie(new URL(request.url).protocol === "https:"),
+          "set-cookie": clearSessionCookie(secureCookies),
         },
       });
     }

@@ -13,6 +13,8 @@ import { ManagedWorkerState } from "../src/providers/managed-worker-state.ts";
 
 const MANIFEST = `sha256:${"a".repeat(64)}` as const;
 const BLOB = `sha256:${"d".repeat(64)}` as const;
+const MANAGED_DESCRIPTOR = `sha256:${"e".repeat(64)}` as const;
+const MANAGED_VERSION_NATIVE_ID = `version:logical-worker:tsr-${"e".repeat(64)}`;
 const MODULE_BYTES = new TextEncoder().encode("export default { fetch() {} }");
 const VERSION: ProviderOffering = {
   id: "cloudflare.edge.workerversion",
@@ -254,9 +256,9 @@ describe("Cloudflare artifact-consumer readback", () => {
   test("managed Workers-for-Platforms attributes only its exact committed receipt", async () => {
     const sql = createEphemeralSql();
     const providerId = "cloudflare.wfp.integration";
-    const nativeId = "version:logical-worker:release-worker";
+    const nativeId = MANAGED_VERSION_NATIVE_ID;
     const operationId = "managed-release-operation";
-    const descriptorDigest = `sha256:${"e".repeat(64)}` as const;
+    const descriptorDigest = MANAGED_DESCRIPTOR;
     const state = new ManagedWorkerState(providerId, sql);
     expect(
       await state.claimReceipt({
@@ -288,7 +290,13 @@ describe("Cloudflare artifact-consumer readback", () => {
       workerBackend: managedBackend(sql),
       async fetch(request) {
         methods.push(request.method);
-        return Response.json({ success: true, errors: [], result: {} });
+        return Response.json({
+          success: true,
+          result: {
+            dispatch_namespace: "customer-workers",
+            script: { id: MANAGED_VERSION_NATIVE_ID.split(":")[2], etag: "provider-etag" },
+          },
+        });
       },
     });
 
@@ -344,20 +352,17 @@ describe("Cloudflare artifact-consumer readback", () => {
     expect(methods).toEqual(["GET"]);
   });
 
-  test("managed WorkerVersion native presence is never erased by receipt drift", async () => {
-    for (const receiptState of ["missing", "mismatched", "deleted"] as const) {
+  test("managed WorkerVersion receipt drift blocks namespace reads", async () => {
+    for (const receiptState of ["missing", "mismatched"] as const) {
       const sql = createEphemeralSql();
-      const inputNativeId = "version:logical-worker:release-worker";
+      const inputNativeId = MANAGED_VERSION_NATIVE_ID;
       if (receiptState !== "missing") {
         await seedManagedReceipt(new ManagedWorkerState("cloudflare.wfp.integration", sql), {
           resourceUid: "uid_version",
-          nativeId:
-            receiptState === "mismatched"
-              ? "version:logical-worker:different-release-worker"
-              : inputNativeId,
+          nativeId: "version:logical-worker:different-release-worker",
           kind: "version",
           logicalWorkerId: "logical-worker",
-          state: receiptState === "deleted" ? "deleted" : "committed",
+          state: "committed",
         });
       }
       const requests: Request[] = [];
@@ -377,16 +382,51 @@ describe("Cloudflare artifact-consumer readback", () => {
         retryable: false,
       });
       const descriptor = managedVersionReadbackDescriptor(provider, inputNativeId);
-      expect(await provider.verifyNativeAbsence?.({ offering: VERSION, descriptor })).toMatchObject(
-        {
-          outcome: "present",
-        },
-      );
-      expect(requests).toHaveLength(2);
+      expect(await provider.verifyNativeAbsence?.({ offering: VERSION, descriptor })).toEqual({
+        outcome: "unknown",
+        reason: "authority_unavailable",
+        retryable: false,
+      });
+      expect(requests).toHaveLength(0);
     }
+
+    const sql = createEphemeralSql();
+    await seedManagedReceipt(new ManagedWorkerState("cloudflare.wfp.integration", sql), {
+      resourceUid: "uid_version",
+      nativeId: MANAGED_VERSION_NATIVE_ID,
+      kind: "version",
+      logicalWorkerId: "logical-worker",
+      state: "deleted",
+    });
+    const requests: Request[] = [];
+    const provider = managedReadbackProvider(sql, [VERSION], async (request) => {
+      requests.push(request);
+      return Response.json({
+        success: true,
+        result: {
+          dispatch_namespace: "customer-workers",
+          script: { id: MANAGED_VERSION_NATIVE_ID.split(":")[2], etag: "provider-etag" },
+        },
+      });
+    });
+    expect(
+      await provider.verifyArtifactConsumption?.({
+        ...historicalInput(),
+        nativeId: MANAGED_VERSION_NATIVE_ID,
+      }),
+    ).toEqual({
+      outcome: "unknown",
+      reason: "authority_unavailable",
+      retryable: false,
+    });
+    const descriptor = managedVersionReadbackDescriptor(provider, MANAGED_VERSION_NATIVE_ID);
+    expect(await provider.verifyNativeAbsence?.({ offering: VERSION, descriptor })).toMatchObject({
+      outcome: "present",
+    });
+    expect(requests).toHaveLength(2);
   });
 
-  test("managed WorkerVersion fresh 404 targets the requested release across receipt drift", async () => {
+  test("managed WorkerVersion fresh 404 is absence only behind a stable exact receipt", async () => {
     for (const receiptState of [
       "missing",
       "committed",
@@ -397,7 +437,7 @@ describe("Cloudflare artifact-consumer readback", () => {
     ] as const) {
       const sql = createEphemeralSql();
       const providerId = "cloudflare.wfp.integration";
-      const inputNativeId = "version:logical-worker:release-worker";
+      const inputNativeId = MANAGED_VERSION_NATIVE_ID;
       const receiptNativeId =
         receiptState === "mismatched"
           ? "version:logical-worker:different-release-worker"
@@ -418,22 +458,33 @@ describe("Cloudflare artifact-consumer readback", () => {
         return new Response(null, { status: 404 });
       });
 
+      const stable = receiptState === "committed" || receiptState === "deleted";
+      const retryable = receiptState === "pending" || receiptState === "deleting";
+      const expected = stable
+        ? { outcome: "absent" as const }
+        : {
+            outcome: "unknown" as const,
+            reason: "authority_unavailable" as const,
+            retryable,
+          };
       expect(
         await provider.verifyArtifactConsumption?.({
           ...historicalInput(),
           nativeId: inputNativeId,
         }),
-      ).toMatchObject({ outcome: "absent" });
+      ).toMatchObject(expected);
       const descriptor = managedVersionReadbackDescriptor(provider, inputNativeId);
       expect(await provider.verifyNativeAbsence?.({ offering: VERSION, descriptor })).toMatchObject(
-        {
-          outcome: "absent",
-        },
+        expected,
       );
-      expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
-        "/client/v4/accounts/account-id/workers/dispatch/namespaces/customer-workers/scripts/release-worker",
-        "/client/v4/accounts/account-id/workers/dispatch/namespaces/customer-workers/scripts/release-worker",
-      ]);
+      expect(requests.map((request) => new URL(request.url).pathname)).toEqual(
+        stable
+          ? [
+              `/client/v4/accounts/account-id/workers/dispatch/namespaces/customer-workers/scripts/tsr-${"e".repeat(64)}`,
+              `/client/v4/accounts/account-id/workers/dispatch/namespaces/customer-workers/scripts/tsr-${"e".repeat(64)}`,
+            ]
+          : [],
+      );
     }
   });
 
@@ -449,6 +500,13 @@ describe("Cloudflare artifact-consumer readback", () => {
       ],
     ] as const) {
       const sql = createEphemeralSql();
+      await seedManagedReceipt(new ManagedWorkerState("cloudflare.wfp.integration", sql), {
+        resourceUid: "uid_version",
+        nativeId: MANAGED_VERSION_NATIVE_ID,
+        kind: "version",
+        logicalWorkerId: "logical-worker",
+        state: "committed",
+      });
       const requests: Request[] = [];
       const provider = managedReadbackProvider(sql, [VERSION], async (request) => {
         requests.push(request);
@@ -458,13 +516,10 @@ describe("Cloudflare artifact-consumer readback", () => {
       expect(
         await provider.verifyArtifactConsumption?.({
           ...historicalInput(),
-          nativeId: "version:logical-worker:release-worker",
+          nativeId: MANAGED_VERSION_NATIVE_ID,
         }),
       ).toEqual(expected);
-      const descriptor = managedVersionReadbackDescriptor(
-        provider,
-        "version:logical-worker:release-worker",
-      );
+      const descriptor = managedVersionReadbackDescriptor(provider, MANAGED_VERSION_NATIVE_ID);
       expect(await provider.verifyNativeAbsence?.({ offering: VERSION, descriptor })).toEqual(
         expected,
       );
@@ -1008,7 +1063,7 @@ async function seedManagedReceipt(
     readonly state: "pending" | "committed" | "deleting" | "deleted";
   },
 ): Promise<void> {
-  const descriptorDigest = `sha256:${"e".repeat(64)}` as const;
+  const descriptorDigest = MANAGED_DESCRIPTOR;
   const operationId = `managed-${input.kind}-operation`;
   expect(
     await state.claimReceipt({

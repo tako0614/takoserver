@@ -509,6 +509,7 @@ export function buildApp(ports: AppPorts): App {
 
   const verifyNativeAbsence = driver.verifyNativeAbsence;
   const control = createControlRoutes({
+    publicOrigin: ports.publicOrigin,
     accounts,
     inventory,
     deployments,

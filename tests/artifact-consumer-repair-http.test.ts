@@ -176,6 +176,7 @@ function fixture(enabled = true) {
     tokens: {} as never,
     settlement: {} as never,
     clock: () => new Date("2026-09-03T20:00:00.000Z"),
+    publicOrigin: "https://api.takoserver.test",
     ...(enabled ? { artifactConsumerRepair: repair } : {}),
   });
   return {

@@ -94,6 +94,7 @@ function fixture(prepareRefusal?: WorkerEndpointOriginReservationError) {
     tokens: {} as never,
     settlement: {} as never,
     clock: () => new Date("2026-08-31T12:00:00.000Z"),
+    publicOrigin: "https://api.example.test",
     originReservations,
   });
   return {

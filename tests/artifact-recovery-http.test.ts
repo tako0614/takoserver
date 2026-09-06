@@ -27,6 +27,7 @@ test("the normal customer Worker has no artifact recovery route", async () => {
     tokens: {} as never,
     settlement: {} as never,
     clock: () => new Date("2026-09-04T00:00:00.000Z"),
+    publicOrigin: "https://api.takoserver.test",
   });
   for (const action of ["status", "apply", "purge"]) {
     const url = new URL(
