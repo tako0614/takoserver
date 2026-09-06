@@ -22,6 +22,11 @@ import {
   type ResourceIdentity,
 } from "../provider-port.ts";
 import {
+  MAXIMUM_REQUEST_BODY_BYTES,
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../takoform/limits.ts";
+import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
 } from "./cloudflare-edge-meter-contract.ts";
@@ -31,6 +36,7 @@ import {
 } from "./cloudflare-readback-descriptor.ts";
 import { cloudflareR2EdgeObjectsMaterial } from "./cloudflare-runtime-bindings.ts";
 import { ProviderMeterError } from "./provider-meter.ts";
+import { assertSafeMigrationSql } from "./sqlite-migration-policy.ts";
 
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
 export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
@@ -1091,9 +1097,18 @@ async function resolveSqliteMigrationInput(
     if (!authority || !options.migrationSql) return null;
     if (!sqliteProjectionIsExact(input)) return null;
     const desired: ProviderSqliteMigration[] = [];
+    let totalBytes = 0;
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     for (const identity of input.desired) {
-      const sql = await options.migrationSql(authority.tenantId, identity.digest);
-      if (!sql || (await bytesDigest(sql)) !== identity.digest) return null;
+      const resolved = await options.migrationSql(authority.tenantId, identity.digest);
+      if (!resolved) return null;
+      totalBytes += resolved.byteLength;
+      // MigrationBundle uses the Host's artifact byte bound, not the runtime
+      // edge.sql statement bound. Validate every file before claiming intent.
+      if (totalBytes > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) return null;
+      const sql = resolved.slice();
+      assertSafeMigrationSql(decoder.decode(sql));
+      if ((await bytesDigest(sql)) !== identity.digest) return null;
       desired.push({ ...identity, sql });
     }
     return {
@@ -1880,7 +1895,7 @@ function migrationIdentities(value: unknown, emptyAllowed: boolean): boolean {
   return (
     Array.isArray(value) &&
     (emptyAllowed || value.length > 0) &&
-    value.length <= 16_384 &&
+    value.length <= TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES &&
     new Set(
       value.map((item) =>
         plainRecord(item) && typeof item.path === "string" ? item.path : Symbol("invalid"),
@@ -1889,7 +1904,10 @@ function migrationIdentities(value: unknown, emptyAllowed: boolean): boolean {
     value.every((item) => {
       const raw = maybeExactRecord(item, ["path", "digest"]);
       return !!raw && migrationPath(raw.path) && digest(raw.digest);
-    })
+    }) &&
+    // This is a strict projection of the admitted manifest. It cannot exceed
+    // that manifest's request envelope even when the count bound is satisfied.
+    new TextEncoder().encode(JSON.stringify(value)).byteLength <= MAXIMUM_REQUEST_BODY_BYTES
   );
 }
 

@@ -2040,15 +2040,30 @@ test("managed SQLite lifecycle uses one closed direct authority and byte migrati
   const migrationDigest = `sha256:${hex(
     new Uint8Array(await crypto.subtle.digest("SHA-256", migrationSql)),
   )}` as const;
+  const migrationTarget = {
+    resourceUid: identity.uid,
+    incarnationId: "deployment-sqlite-main",
+    generation: "1",
+  };
+  const migrations = [{ path: "0001_notes.sql", digest: migrationDigest, sql: migrationSql }];
   expect(
     await provider.sqliteMigrations?.applySuffix({
+      operationId: "sqlite-migrate",
+      operationMode: "initial",
       nativeId,
+      target: migrationTarget,
+      desired: migrations,
       expectedPrefix: [],
-      migrations: [{ path: "0001_notes.sql", digest: migrationDigest, sql: migrationSql }],
+      migrations,
     }),
   ).toEqual({ ok: true, value: undefined });
   expect(sqlite.lastMigrationBytes).toBeInstanceOf(Uint8Array);
-  expect(await provider.sqliteMigrations?.readLedger({ nativeId })).toEqual({
+  expect(
+    await provider.sqliteMigrations?.readLedger({
+      nativeId,
+      target: { ...migrationTarget, tenantId: "organization_yurucommu" },
+    }),
+  ).toEqual({
     ok: true,
     value: [{ path: "0001_notes.sql", digest: migrationDigest }],
   });

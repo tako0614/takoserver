@@ -4,11 +4,13 @@ import {
   edgeProviderOffering,
   objectBucketProviderOffering,
 } from "../src/edge-forms.ts";
+import { bytesDigest } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 import type {
   ProviderOffering,
   ProviderRelation,
   ProviderRuntimeBinding,
+  ProviderSqliteMigrationIdentity,
 } from "../src/provider-port.ts";
 import type {
   ProviderRuntimeInputLeasePort,
@@ -3358,6 +3360,10 @@ describe("released edge Form placement", () => {
   });
 
   test("reads and atomically appends the exact SQLite migration prefix", async () => {
+    const firstSql = new TextEncoder().encode("CREATE TABLE first (id INTEGER PRIMARY KEY);");
+    const secondSql = new TextEncoder().encode("CREATE TABLE example (id INTEGER PRIMARY KEY);");
+    const firstDigest = await bytesDigest(firstSql);
+    const secondDigest = await bytesDigest(secondSql);
     const calls: Call[] = [];
     const provider = new CloudflareProvider({
       accountId: "acct_1",
@@ -3389,51 +3395,722 @@ describe("released edge Form placement", () => {
                       {
                         sequence: 1,
                         path: "0001.sql",
-                        digest: `sha256:${"a".repeat(64)}`,
+                        digest: firstDigest,
                       },
                     ],
                   },
                 ]
-              : Array.from({ length: 4 }, () => ({
-                  success: true,
-                  results: [],
-                }));
+              : index === 3
+                ? Array.from({ length: 4 }, () => ({
+                    success: true,
+                    results: [],
+                  }))
+                : index === 4
+                  ? [
+                      {
+                        success: true,
+                        results: [{ name: "_takoform_sqlite_migrations" }],
+                      },
+                    ]
+                  : [
+                      {
+                        success: true,
+                        results: [
+                          { sequence: 1, path: "0001.sql", digest: firstDigest },
+                          { sequence: 2, path: "0002.sql", digest: secondDigest },
+                        ],
+                      },
+                    ];
         return Response.json({ success: true, errors: [], result });
       },
     });
     const ledger = await provider.sqliteMigrations.readLedger({
       nativeId: "d1:database-id",
+      target: {
+        tenantId: "tenant-secret",
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
     });
     expect(ledger).toEqual({
       ok: true,
-      value: [{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }],
+      value: [{ path: "0001.sql", digest: firstDigest }],
     });
+    const expectedPrefix = [
+      { path: "0001.sql", digest: firstDigest, leaked: "tenant-secret" },
+    ] as unknown as readonly ProviderSqliteMigrationIdentity[];
     const applied = await provider.sqliteMigrations.applySuffix({
+      operationId: "operation-sqlite",
+      operationMode: "initial",
       nativeId: "d1:database-id",
-      expectedPrefix: [{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }],
+      target: {
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+      desired: [
+        {
+          path: "0001.sql",
+          digest: firstDigest,
+          sql: firstSql,
+        },
+        {
+          path: "0002.sql",
+          digest: secondDigest,
+          sql: secondSql,
+        },
+      ],
+      expectedPrefix,
       migrations: [
         {
           path: "0002.sql",
-          digest: `sha256:${"b".repeat(64)}`,
-          sql: new TextEncoder().encode("CREATE TABLE example (id INTEGER PRIMARY KEY);"),
+          digest: secondDigest,
+          sql: secondSql,
         },
       ],
     });
     expect(applied).toEqual({ ok: true, value: undefined });
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(5);
     expect(calls.every((call) => call.url.endsWith("/d1/database/database-id/query"))).toBe(true);
     const batch = JSON.parse(calls[2]?.body ?? "{}") as {
       batch?: { sql?: string; params?: unknown[] }[];
     };
-    expect(batch.batch).toHaveLength(4);
-    expect(batch.batch?.[1]?.sql).toContain("json_each(?)");
-    expect(batch.batch?.[1]?.params).toEqual([
+    expect(batch.batch).toHaveLength(3);
+    expect(batch.batch?.[0]?.sql).toContain("json_each(?)");
+    expect(batch.batch?.[0]?.params).toEqual([
       1,
-      JSON.stringify([{ path: "0001.sql", digest: `sha256:${"a".repeat(64)}` }]),
+      JSON.stringify([{ path: "0001.sql", digest: firstDigest }]),
     ]);
-    expect(batch.batch?.[2]?.sql).toBe("CREATE TABLE example (id INTEGER PRIMARY KEY);");
-    expect(batch.batch?.[3]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
-    expect(batch.batch?.[3]?.params?.[0]).toBe(2);
+    expect(batch.batch?.[1]?.sql).toBe("CREATE TABLE example (id INTEGER PRIMARY KEY);");
+    expect(batch.batch?.[2]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
+    expect(batch.batch?.[2]?.params?.[0]).toBe(2);
+  });
+
+  test("applies an admitted 105-file suffix as one D1 transaction per file", async () => {
+    const files = await Promise.all(
+      Array.from({ length: 105 }, async (_, index) => {
+        const sql =
+          index === 0
+            ? new TextEncoder().encode("SELECT 1;\n".repeat(12_000))
+            : new TextEncoder().encode(
+                index === 104 ? "" : `CREATE TABLE migration_${index} (id INTEGER);`,
+              );
+        return {
+          path: `${String(index + 1).padStart(4, "0")}.sql`,
+          digest: await bytesDigest(sql),
+          sql,
+        } as const;
+      }),
+    );
+    const ledger: { path: string; digest: `sha256:${string}` }[] = [];
+    const calls: Call[] = [];
+    const batchCalls: { sql: string; params?: unknown[] }[][] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const body = await request.clone().text();
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body,
+        });
+        const parsed = JSON.parse(body) as {
+          sql?: string;
+          batch?: { sql: string; params?: unknown[] }[];
+        };
+        if (parsed.batch) {
+          batchCalls.push(parsed.batch);
+          const insert = parsed.batch.at(-1);
+          const params = insert?.params ?? [];
+          ledger.push({
+            path: String(params[1]),
+            digest: String(params[2]) as `sha256:${string}`,
+          });
+          // D1's result array is not required to mirror every SQL statement.
+          return Response.json({
+            success: true,
+            errors: [],
+            result:
+              batchCalls.length % 2 === 0
+                ? [{ success: true }, { success: true, results: [] }]
+                : [{ success: true }],
+          });
+        }
+        if (parsed.sql?.includes("sqlite_master")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }],
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: [
+            {
+              success: true,
+              results: ledger.map((row, index) => ({ sequence: index + 1, ...row })),
+            },
+          ],
+        });
+      },
+    });
+    const applied = await provider.sqliteMigrations.applySuffix({
+      operationId: "operation-105",
+      operationMode: "initial",
+      executionAuthority: {
+        tenantId: "tenant-secret",
+        resourceUid: "application-resource",
+        leaseToken: "lease-secret",
+        fingerprint: "fingerprint-secret",
+      },
+      nativeId: "d1:database-id",
+      target: {
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+      desired: files,
+      expectedPrefix: [],
+      migrations: files,
+    });
+    expect(applied).toEqual({ ok: true, value: undefined });
+    expect(batchCalls).toHaveLength(105);
+    const firstBatch = batchCalls[0] ?? [];
+    expect(firstBatch.filter((entry) => entry.sql.trim() === "SELECT 1;")).toHaveLength(12_000);
+    expect(
+      firstBatch.every((entry) => new TextEncoder().encode(entry.sql).byteLength <= 100_000),
+    ).toBe(true);
+    expect(calls).toHaveLength(107);
+    // The empty final file has no SQL effect, but still commits its exact
+    // identity atomically with the prefix guard rather than being skipped.
+    expect(batchCalls[104]).toHaveLength(2);
+    expect(ledger[104]?.digest).toBe(
+      "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    );
+    expect(ledger).toEqual(files.map(({ path, digest }) => ({ path, digest })));
+    expect(calls.every((call) => !call.body.includes("tenant-secret"))).toBe(true);
+    expect(calls.every((call) => !call.body.includes("database-resource"))).toBe(true);
+  });
+
+  test("does not continue after a malformed successful D1 batch response", async () => {
+    const sql = new TextEncoder().encode("CREATE TABLE malformed_result (id INTEGER);");
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    const ledger: { path: string; digest: `sha256:${string}` }[] = [];
+    let batchCalls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const parsed = JSON.parse(await request.clone().text()) as {
+          sql?: string;
+          batch?: { params?: unknown[] }[];
+        };
+        if (parsed.batch) {
+          batchCalls += 1;
+          const params = parsed.batch.at(-1)?.params ?? [];
+          ledger.push({
+            path: String(params[1]),
+            digest: String(params[2]) as `sha256:${string}`,
+          });
+          // A successful HTTP envelope with no typed native result is not
+          // evidence that this atomic batch committed.
+          return Response.json({ success: true, errors: [], result: [] });
+        }
+        if (parsed.sql?.includes("sqlite_master")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }],
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: [
+            {
+              success: true,
+              results: ledger.map((row, index) => ({ sequence: index + 1, ...row })),
+            },
+          ],
+        });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-malformed-result",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      failure: {
+        code: "provider_error",
+        message: "the migration batch response is invalid",
+        retryable: false,
+      },
+    });
+    expect(batchCalls).toBe(1);
+    expect(ledger).toEqual([{ path: migration.path, digest: migration.digest }]);
+  });
+
+  test("classifies an individual native SQL capacity refusal before mutation", async () => {
+    const sql = new TextEncoder().encode(`SELECT '${"x".repeat(100_001)}';`);
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    let calls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        calls += 1;
+        return Response.json({ success: true, errors: [], result: [] });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-native-capacity",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      failure: {
+        code: "provider_error",
+        message: "a migration SQL statement exceeds the Cloudflare D1 native limit",
+        retryable: false,
+      },
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("rejects a malformed final migration before the first D1 mutation", async () => {
+    const firstSql = new TextEncoder().encode("CREATE TABLE first (id INTEGER);");
+    const secondSql = new TextEncoder().encode("CREATE TABLE second (id INTEGER);");
+    const desired = [
+      { path: "0001.sql", digest: await bytesDigest(firstSql), sql: firstSql },
+      {
+        path: "0002.sql",
+        digest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+        sql: secondSql,
+      },
+    ] as const;
+    let calls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        calls += 1;
+        return Response.json({ success: true, errors: [], result: [] });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-malformed-last",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired,
+        expectedPrefix: [],
+        migrations: desired,
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      failure: {
+        code: "invalid_spec",
+        message: "a migration digest does not match its SQL",
+        retryable: false,
+      },
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("rejects a migration suffix whose order differs from desired history", async () => {
+    const firstSql = new TextEncoder().encode("CREATE TABLE ordered_first (id INTEGER);");
+    const secondSql = new TextEncoder().encode("CREATE TABLE ordered_second (id INTEGER);");
+    const first = { path: "0001.sql", digest: await bytesDigest(firstSql), sql: firstSql } as const;
+    const second = {
+      path: "0002.sql",
+      digest: await bytesDigest(secondSql),
+      sql: secondSql,
+    } as const;
+    let calls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        calls += 1;
+        return Response.json({ success: true, errors: [], result: [] });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-order-mismatch",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [first, second],
+        expectedPrefix: [],
+        migrations: [second, first],
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      failure: {
+        code: "invalid_spec",
+        message: "the migration suffix is invalid",
+        retryable: false,
+      },
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("rejects migration transaction control before any D1 mutation", async () => {
+    const sql = new TextEncoder().encode("BEGIN; SELECT 1;");
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    let calls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        calls += 1;
+        return Response.json({ success: true, errors: [], result: [] });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-transaction-control",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("rejects transaction control hidden behind a UTF-8 BOM before mutation", async () => {
+    const sql = new TextEncoder().encode("\uFEFFBEGIN; SELECT 1;");
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    let calls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        calls += 1;
+        return Response.json({ success: true, errors: [], result: [] });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-bom-transaction-control",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(calls).toBe(0);
+  });
+
+  test("keeps BOM-separated trigger statements as exact native batch entries", async () => {
+    const source =
+      "CREATE TABLE trigger_target (id INTEGER);\uFEFFCREATE TRIGGER trigger_after " +
+      "AFTER INSERT ON trigger_target BEGIN INSERT INTO trigger_target (id) VALUES (NEW.id + 100); END;";
+    const sql = new TextEncoder().encode(source);
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    const batches: { sql: string; params?: unknown[] }[][] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const parsed = JSON.parse(await request.clone().text()) as {
+          sql?: string;
+          batch?: { sql: string; params?: unknown[] }[];
+        };
+        if (parsed.batch) {
+          batches.push(parsed.batch);
+          return Response.json({ success: true, errors: [], result: [{ success: true }] });
+        }
+        if (parsed.sql?.includes("sqlite_master")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }],
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: [
+            {
+              success: true,
+              results: [{ sequence: 1, path: migration.path, digest: migration.digest }],
+            },
+          ],
+        });
+      },
+    });
+    await expect(
+      provider.sqliteMigrations.applySuffix({
+        operationId: "operation-bom-trigger",
+        operationMode: "initial",
+        nativeId: "d1:database-id",
+        target: {
+          resourceUid: "database-resource",
+          incarnationId: "database-incarnation",
+          generation: "1",
+        },
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).resolves.toEqual({ ok: true, value: undefined });
+    expect(batches).toHaveLength(1);
+    expect(batches[0]?.[2]?.sql).toBe("CREATE TABLE trigger_target (id INTEGER);");
+    expect(batches[0]?.[3]?.sql).toBe(
+      "\uFEFFCREATE TRIGGER trigger_after AFTER INSERT ON trigger_target BEGIN INSERT INTO trigger_target (id) VALUES (NEW.id + 100); END;",
+    );
+  });
+
+  test("returns an indeterminate failure after a lost D1 mutation response", async () => {
+    const sql = new TextEncoder().encode("CREATE TABLE lost_response (id INTEGER);");
+    const migration = { path: "0001.sql", digest: await bytesDigest(sql), sql } as const;
+    const ledger: { path: string; digest: `sha256:${string}` }[] = [];
+    let batchCalls = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const parsed = JSON.parse(await request.clone().text()) as {
+          sql?: string;
+          batch?: { params?: unknown[] }[];
+        };
+        if (parsed.batch) {
+          batchCalls += 1;
+          const params = parsed.batch.at(-1)?.params ?? [];
+          ledger.push({
+            path: String(params[1]),
+            digest: String(params[2]) as `sha256:${string}`,
+          });
+          throw new Error("connection reset after commit");
+        }
+        if (parsed.sql?.includes("sqlite_master")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }],
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: [
+            {
+              success: true,
+              results: ledger.map((row, index) => ({ sequence: index + 1, ...row })),
+            },
+          ],
+        });
+      },
+    });
+    const applied = await provider.sqliteMigrations.applySuffix({
+      operationId: "operation-lost-response",
+      operationMode: "initial",
+      nativeId: "d1:database-id",
+      target: {
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+      desired: [migration],
+      expectedPrefix: [],
+      migrations: [migration],
+    });
+    expect(applied).toEqual({
+      ok: false,
+      failure: {
+        code: "unavailable",
+        message: "the migration outcome is indeterminate; inspect the ledger before retrying",
+        retryable: false,
+      },
+    });
+    expect(batchCalls).toBe(1);
+    expect(ledger).toEqual([{ path: migration.path, digest: migration.digest }]);
+  });
+
+  test("leaves earlier files committed when a later file fails, then resumes the exact suffix", async () => {
+    const files = await Promise.all(
+      Array.from({ length: 3 }, async (_, index) => {
+        const sql = new TextEncoder().encode(`CREATE TABLE retry_${index} (id INTEGER);`);
+        return {
+          path: `${String(index + 1).padStart(4, "0")}.sql`,
+          digest: await bytesDigest(sql),
+          sql,
+        } as const;
+      }),
+    );
+    const ledger: { path: string; digest: `sha256:${string}` }[] = [];
+    let failThird = true;
+    const batchPaths: string[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        const parsed = JSON.parse(await request.clone().text()) as {
+          sql?: string;
+          batch?: { sql: string; params?: unknown[] }[];
+        };
+        if (parsed.batch) {
+          const insert = parsed.batch.at(-1);
+          const params = insert?.params ?? [];
+          const path = String(params[1]);
+          batchPaths.push(path);
+          if (failThird && path === files[2]?.path) {
+            return Response.json(
+              { success: false, errors: [{ code: 1000, message: "migration failed" }] },
+              { status: 400 },
+            );
+          }
+          ledger.push({ path, digest: String(params[2]) as `sha256:${string}` });
+          return Response.json({ success: true, errors: [], result: [{ success: true }] });
+        }
+        if (parsed.sql?.includes("sqlite_master")) {
+          return Response.json({
+            success: true,
+            errors: [],
+            result: [{ success: true, results: [{ name: "_takoform_sqlite_migrations" }] }],
+          });
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: [
+            {
+              success: true,
+              results: ledger.map((row, index) => ({ sequence: index + 1, ...row })),
+            },
+          ],
+        });
+      },
+    });
+    const first = await provider.sqliteMigrations.applySuffix({
+      operationId: "operation-retry",
+      operationMode: "initial",
+      nativeId: "d1:database-id",
+      target: {
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+      desired: files,
+      expectedPrefix: [],
+      migrations: files,
+    });
+    expect(first).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(ledger).toEqual(files.slice(0, 2).map(({ path, digest }) => ({ path, digest })));
+    const read = await provider.sqliteMigrations.readLedger({
+      nativeId: "d1:database-id",
+      target: {
+        tenantId: "tenant-secret",
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+    });
+    expect(read).toEqual({ ok: true, value: ledger });
+    failThird = false;
+    const last = files[2];
+    if (!last) throw new Error("missing final migration");
+    const retry = await provider.sqliteMigrations.applySuffix({
+      operationId: "operation-retry",
+      operationMode: "recovery",
+      nativeId: "d1:database-id",
+      target: {
+        resourceUid: "database-resource",
+        incarnationId: "database-incarnation",
+        generation: "1",
+      },
+      desired: files,
+      expectedPrefix: ledger,
+      migrations: [last],
+    });
+    expect(retry).toEqual({ ok: true, value: undefined });
+    expect(ledger).toEqual(files.map(({ path, digest }) => ({ path, digest })));
+    expect(batchPaths).toEqual(["0001.sql", "0002.sql", "0003.sql", "0003.sql"]);
   });
 
   /**

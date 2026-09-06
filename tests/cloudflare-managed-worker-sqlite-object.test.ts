@@ -47,8 +47,14 @@ const OTHER_AUTHORITY = { ...AUTHORITY, operationId: "operation-2" };
 export default {
   async fetch(_request, env) {
     const stub = env.SQLITE_DATABASES.getByName("tsdb-managed-sqlite-object-test");
+    const payload = "x".repeat(36_000);
     const migrationSql = new TextEncoder().encode(
-      "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+      [
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+        "CREATE VIEW migration_payload_1 AS SELECT '" + payload + "' AS value",
+        "CREATE VIEW migration_payload_2 AS SELECT '" + payload + "' AS value",
+        "CREATE VIEW migration_payload_3 AS SELECT '" + payload + "' AS value",
+      ].join(";\\n"),
     );
     const digestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", migrationSql));
     const digest =
@@ -85,6 +91,45 @@ export default {
       await seal("read-migration-ledger", AUTHORITY),
     );
     const inspected = await stub.takoserverSqliteInspect(await seal("inspect", AUTHORITY));
+    const noOpSql = new TextEncoder().encode("SELECT 1");
+    const noOpDigestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", noOpSql));
+    const noOpDigest =
+      "sha256:" +
+      [...noOpDigestBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const emptySql = new Uint8Array();
+    const emptyDigestBytes = new Uint8Array(await crypto.subtle.digest("SHA-256", emptySql));
+    const emptyDigest =
+      "sha256:" +
+      [...emptyDigestBytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const largeMigrations = Array.from({ length: 1_200 }, (_, index) => ({
+      path:
+        "migrations/" +
+        String(index + 2).padStart(4, "0") +
+        "-" +
+        "x".repeat(64) +
+        ".sql",
+      digest: index === 0 ? emptyDigest : noOpDigest,
+      sql: index === 0 ? emptySql : noOpSql,
+    }));
+    const largeMigrated = await stub.takoserverSqliteApplyMigrationSuffix({
+      ...(await seal("apply-migration-suffix", AUTHORITY)),
+      expectedPrefix: [{ path: "001-notes.sql", digest }],
+      migrations: largeMigrations,
+    });
+    const largeLedger = await stub.takoserverSqliteReadMigrationLedger(
+      await seal("read-migration-ledger", AUTHORITY),
+    );
+    const largeControlBytes =
+      largeLedger.ok
+        ? new TextEncoder().encode(
+            JSON.stringify({
+              schema: "takoserver.managed-sqlite-control@v2",
+              lifecycle: "active",
+              authority: AUTHORITY,
+              migrations: largeLedger.value,
+            }),
+          ).byteLength
+        : 0;
     const httpStatus = (await stub.fetch(new Request("https://do.invalid/admin"))).status;
     const destroyed = await stub.takoserverSqliteDestroy(await seal("destroy", AUTHORITY));
     const afterDestroy = await stub.edgeSqlExecute({ sql: "SELECT 1" });
@@ -95,6 +140,7 @@ export default {
       missing,
       initialized,
       squatted,
+      migrationBytes: migrationSql.byteLength,
       migrated,
       inserted,
       queried,
@@ -102,6 +148,14 @@ export default {
       pragmaRefused,
       ledger,
       inspected,
+      largeHistory: {
+        migrated: largeMigrated,
+        ledgerOk: largeLedger.ok,
+        ledgerEntries: largeLedger.ok ? largeLedger.value.length : 0,
+        zeroByteLedgered: largeLedger.ok && largeLedger.value[1]?.digest === emptyDigest,
+        lastPath: largeLedger.ok ? largeLedger.value.at(-1)?.path : undefined,
+        controlBytes: largeControlBytes,
+      },
       httpStatus,
       destroyed,
       afterDestroy,
@@ -164,7 +218,8 @@ test("the managed SQLite Durable Object answers every RPC method on real workerd
     const response = await runtime.dispatchFetch("https://worker.example/");
     const text = await response.text();
     expect({ status: response.status, text }).toMatchObject({ status: 200 });
-    expect(JSON.parse(text)).toEqual({
+    const body = JSON.parse(text);
+    expect(body).toEqual({
       // Runtime SQL before an authority exists is refused, not answered.
       uninitialized: { ok: false, error: { code: "backend_unavailable" } },
       // The authority tuple alone claims nothing: the admin plane wants the
@@ -175,6 +230,10 @@ test("the managed SQLite Durable Object answers every RPC method on real workerd
       // A second authority on a claimed instance is a conflict, never a
       // silent re-claim.
       squatted: { ok: false, error: { code: "conflict" } },
+      // One artifact file is larger than workerd's 100 KB per-statement
+      // ceiling, but each of its four native statements is comfortably below
+      // it. The stable sql.exec path receives the exact precomputed slices.
+      migrationBytes: expect.any(Number),
       migrated: { ok: true },
       inserted: { ok: true, value: { rows: [], rowsWritten: 1 } },
       queried: { ok: true, value: { rows: [{ body: "from rpc" }], rowsWritten: 0 } },
@@ -209,11 +268,24 @@ test("the managed SQLite Durable Object answers every RPC method on real workerd
           ],
         },
       },
+      // This is one actual workerd RPC and one SQLite-backed DO KV record, not
+      // the Bun fake. Its history is above the former 100-entry cap and its
+      // serialized v2 control record is above the legacy 128 KiB KV ceiling.
+      largeHistory: {
+        migrated: { ok: true },
+        ledgerOk: true,
+        ledgerEntries: 1_201,
+        zeroByteLedgered: true,
+        lastPath: `migrations/1201-${"x".repeat(64)}.sql`,
+        controlBytes: expect.any(Number),
+      },
       // `fetch` stays inert: no HTTP path reaches customer tables.
       httpStatus: 404,
       destroyed: { ok: true, value: { destroyed: true } },
       afterDestroy: { ok: false, error: { code: "backend_unavailable" } },
     });
+    expect(body.migrationBytes).toBeGreaterThan(100_000);
+    expect(body.largeHistory.controlBytes).toBeGreaterThan(128 * 1_024);
   } finally {
     await runtime.dispose();
   }

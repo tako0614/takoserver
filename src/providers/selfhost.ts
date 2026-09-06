@@ -41,7 +41,10 @@ import {
   derivedProviderResourceIncarnationName,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
-import { TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES } from "../takoform/limits.ts";
+import {
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../takoform/limits.ts";
 import {
   internalHostname,
   WORKERD_ASSETS_BINDING,
@@ -103,6 +106,7 @@ import {
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
 } from "./selfhost-worker-wrapper.ts";
+import { assertSafeMigrationSql } from "./sqlite-migration-policy.ts";
 
 /**
  * Provisioning the released Takoform Edge Family on the machine this runs on.
@@ -3220,7 +3224,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         }
         if (
           input.migrations.length < 1 ||
-          input.migrations.length > 100 ||
           !validMigrationProjection(input.desired, input.expectedPrefix, input.migrations)
         ) {
           return {
@@ -3232,21 +3235,37 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             },
           };
         }
-        const decoded: { path: string; digest: string; sql: string }[] = [];
-        for (const migration of input.migrations) {
-          if (!migrationPath(migration.path) || !sha256(migration.digest)) {
+        const decoded: { path: string; digest: `sha256:${string}`; sql: string }[] = [];
+        let totalBytes = 0;
+        const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+        for (const [index, migration] of input.desired.entries()) {
+          if (!(migration.sql instanceof Uint8Array)) {
             return {
               ok: false,
               failure: {
                 code: "invalid_spec",
-                message: "a migration identity is invalid",
+                message: "a migration SQL payload is invalid",
+                retryable: false,
+              },
+            };
+          }
+          totalBytes += migration.sql.byteLength;
+          if (
+            !Number.isSafeInteger(totalBytes) ||
+            totalBytes > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES
+          ) {
+            return {
+              ok: false,
+              failure: {
+                code: "invalid_spec",
+                message: "the migration bundle is too large",
                 retryable: false,
               },
             };
           }
           let sql: string;
           try {
-            sql = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(migration.sql);
+            sql = decoder.decode(migration.sql);
           } catch {
             return {
               ok: false,
@@ -3257,17 +3276,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               },
             };
           }
-          if (sql.length === 0 || sql.length > 100_000) {
-            return {
-              ok: false,
-              failure: {
-                code: "invalid_spec",
-                message: "a migration SQL statement is invalid",
-                retryable: false,
-              },
-            };
+          if (sql.length > 0) {
+            try {
+              assertSafeMigrationSql(sql);
+            } catch {
+              return {
+                ok: false,
+                failure: {
+                  code: "invalid_spec",
+                  message: "a migration SQL statement crosses its database authority",
+                  retryable: false,
+                },
+              };
+            }
           }
-          decoded.push({ path: migration.path, digest: migration.digest, sql });
+          if (index >= input.expectedPrefix.length) {
+            decoded.push({ path: migration.path, digest: migration.digest, sql });
+          }
         }
         await prepareSqliteMigrationPath(path);
         const database = new Database(path);
@@ -3275,59 +3300,63 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           // Same reason as the reader, and more pressing: this one takes a
           // write lock the tenant's own connection may be holding.
           database.exec(`PRAGMA busy_timeout = ${SQLITE_LOCK_WAIT_MS}`);
-          database.exec("BEGIN IMMEDIATE");
-          try {
-            database.exec(SQLITE_MIGRATION_LEDGER_DDL);
-            const rows = database
-              .query(
-                `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
-              )
-              .all() as { sequence: number; path: string; digest: string }[];
-            const matches =
-              rows.length === input.expectedPrefix.length &&
-              rows.every(
-                (row, index) =>
-                  row.sequence === index + 1 &&
-                  row.path === input.expectedPrefix[index]?.path &&
-                  row.digest === input.expectedPrefix[index]?.digest,
+          const applied = input.expectedPrefix.map(({ path, digest }) => ({ path, digest }));
+          for (const migration of decoded) {
+            let transactionOpen = false;
+            try {
+              database.exec("BEGIN IMMEDIATE");
+              transactionOpen = true;
+              database.exec(SQLITE_MIGRATION_LEDGER_DDL);
+              const rows = database
+                .query(
+                  `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
+                )
+                .all() as { sequence: number; path: string; digest: string }[];
+              const matches =
+                rows.length === applied.length &&
+                rows.every(
+                  (row, index) =>
+                    row.sequence === index + 1 &&
+                    row.path === applied[index]?.path &&
+                    row.digest === applied[index]?.digest,
+                );
+              if (!matches) {
+                database.exec("ROLLBACK");
+                transactionOpen = false;
+                return {
+                  ok: false,
+                  failure: {
+                    code: "conflict",
+                    message: "the database migration history moved",
+                    retryable: false,
+                  },
+                };
+              }
+              const insert = database.prepare(
+                `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
               );
-            if (!matches) {
-              database.exec("ROLLBACK");
+              if (migration.sql.length > 0) database.exec(migration.sql);
+              insert.run(applied.length + 1, migration.path, migration.digest);
+              database.exec("COMMIT");
+              transactionOpen = false;
+              applied.push({ path: migration.path, digest: migration.digest });
+            } catch (error) {
+              if (transactionOpen) {
+                try {
+                  database.exec("ROLLBACK");
+                } catch {
+                  // The transaction may have already been rolled back by SQLite.
+                }
+              }
               return {
                 ok: false,
                 failure: {
-                  code: "conflict",
-                  message: "the database migration history moved",
+                  code: "provider_error",
+                  message: `a migration failed to apply: ${error instanceof Error ? error.message : "unknown"}`,
                   retryable: false,
                 },
               };
             }
-            const insert = database.prepare(
-              `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
-            );
-            for (const [offset, migration] of decoded.entries()) {
-              database.exec(migration.sql);
-              insert.run(
-                input.expectedPrefix.length + offset + 1,
-                migration.path,
-                migration.digest,
-              );
-            }
-            database.exec("COMMIT");
-          } catch (error) {
-            try {
-              database.exec("ROLLBACK");
-            } catch {
-              // The transaction may have already been rolled back by SQLite.
-            }
-            return {
-              ok: false,
-              failure: {
-                code: "provider_error",
-                message: `a migration failed to apply: ${error instanceof Error ? error.message : "unknown"}`,
-                retryable: false,
-              },
-            };
           }
           return { ok: true, value: undefined };
         } finally {
@@ -4071,14 +4100,18 @@ function validMigrationProjection(
   ) {
     return false;
   }
+  const paths = new Set<string>();
   for (const [index, migration] of desired.entries()) {
     if (
       !migrationPath(migration.path) ||
       !sha256(migration.digest) ||
+      !(migration.sql instanceof Uint8Array) ||
+      paths.has(migration.path) ||
       `sha256:${createHash("sha256").update(migration.sql).digest("hex")}` !== migration.digest
     ) {
       return false;
     }
+    paths.add(migration.path);
     if (index < expectedPrefix.length) {
       const applied = expectedPrefix[index];
       if (applied?.path !== migration.path || applied.digest !== migration.digest) return false;
@@ -4087,7 +4120,8 @@ function validMigrationProjection(
     const suffix = migrations[index - expectedPrefix.length];
     if (
       suffix?.path !== migration.path ||
-      suffix.digest !== migration.digest ||
+      suffix?.digest !== migration.digest ||
+      !(suffix?.sql instanceof Uint8Array) ||
       `sha256:${createHash("sha256").update(suffix.sql).digest("hex")}` !== migration.digest
     ) {
       return false;

@@ -417,6 +417,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/providers/cloudflare-wfp-client.ts",
       "src/providers/cloudflare.ts",
       "src/providers/managed-worker-state.ts",
+      "src/providers/sqlite-migration-policy.ts",
       "src/public-form-implementation-build.ts",
       "src/public-form-runtime.ts",
       "src/public-worker-implementation.ts",

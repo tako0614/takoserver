@@ -1,3 +1,10 @@
+import {
+  MAXIMUM_REQUEST_BODY_BYTES,
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../takoform/limits.ts";
+import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migration-policy.ts";
+
 /** The only values that cross the customer-facing edge.sql RPC. */
 export type ManagedWorkerSqlValue =
   | null
@@ -97,11 +104,14 @@ const LEGACY_CONTROL_TABLE_NAMES = [
   LEGACY_DESTROYED_TABLE,
   LEGACY_LEDGER_TABLE,
 ] as const;
+/** Customer edge.sql limits. Administrative migration files do not use these. */
 const MAX_SQL_BYTES = 100_000;
 const MAX_SQL_PARAMETERS = 100;
 const MAX_SQL_STATEMENTS = 100;
-const MAX_MIGRATION_HISTORY = 100;
-const MAX_CONTROL_RECORD_BYTES = 128 * 1024;
+/** MigrationBundle limits admitted and advertised by the Takoform Host. */
+const MAX_MIGRATION_FILES = TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES;
+const MAX_MIGRATION_BUNDLE_BYTES = TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES;
+const MAX_CONTROL_MIGRATION_PROJECTION_BYTES = MAXIMUM_REQUEST_BODY_BYTES;
 const MAX_SQL_ROWS = 10_000;
 const MAX_SQL_COLUMNS = 100;
 const MAX_SQL_VALUE_BYTES = 1_000_000;
@@ -119,11 +129,56 @@ const BUSY_ERROR = "busy" as const;
 const BACKEND_ERROR = "backend_unavailable" as const;
 const QUERY_ROLLBACK = Symbol("takoserver-query-rollback");
 
+/**
+ * A committed MigrationBundle manifest is at most 1 MiB. The control record
+ * keeps only its ordered path+digest projection, so that projection may use at
+ * most the same 1 MiB. Its remaining maximum is exactly 1,815 serialized
+ * UTF-8 bytes: the fixed v2 envelope, longest lifecycle, and longest authority
+ * admitted by TOKEN/GENERATION/DIGEST. Thus the largest valid record is
+ * 1,050,391 bytes, safely below SQLite-backed Durable Object KV's 2 MiB limit.
+ */
+const MAX_CONTROL_RECORD_AUTHORITY_OVERHEAD_BYTES =
+  utf8(
+    JSON.stringify({
+      schema: MANAGED_SQLITE_CONTROL_SCHEMA,
+      lifecycle: "destroyed",
+      authority: {
+        providerId: "a".repeat(MAX_TOKEN_BYTES),
+        resourceUid: "a".repeat(MAX_TOKEN_BYTES),
+        generation: "9".repeat(19),
+        operationId: "a".repeat(MAX_TOKEN_BYTES),
+        descriptorDigest: `sha256:${"a".repeat(64)}`,
+      },
+      migrations: [],
+    }),
+  ) - utf8("[]");
+const MAX_CONTROL_RECORD_BYTES =
+  MAX_CONTROL_MIGRATION_PROJECTION_BYTES + MAX_CONTROL_RECORD_AUTHORITY_OVERHEAD_BYTES;
+const SQLITE_BACKED_DO_KV_MAX_BYTES = 2 * 1024 * 1024;
+if (MAX_CONTROL_RECORD_BYTES >= SQLITE_BACKED_DO_KV_MAX_BYTES) {
+  throw new Error("managed SQLite control record exceeds the SQLite-backed DO KV limit");
+}
+
 interface ManagedWorkerSqliteControlRecord {
   readonly schema: typeof MANAGED_SQLITE_CONTROL_SCHEMA;
   readonly lifecycle: "active" | "destroyed";
   readonly authority: ManagedWorkerSqliteAuthority;
   readonly migrations: readonly ManagedWorkerSqliteMigrationIdentity[];
+}
+
+interface ParsedMigrationInput {
+  readonly authority: ManagedWorkerSqliteAuthority;
+  readonly proof: string;
+  readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
+  readonly migrations: readonly ManagedWorkerSqliteMigration[];
+}
+
+interface PreparedMigrationInput {
+  readonly requested: readonly ManagedWorkerSqliteMigrationIdentity[];
+  readonly migrations: readonly {
+    readonly identity: ManagedWorkerSqliteMigrationIdentity;
+    readonly statements: readonly string[];
+  }[];
 }
 
 /**
@@ -411,64 +466,45 @@ export class ManagedWorkerSqliteCore {
   ): Promise<ManagedWorkerSqliteAdminResult<undefined>> {
     const parsed = parseMigrationInput(input);
     if (!parsed) return adminFailure("invalid_argument");
-    let digests: readonly `sha256:${string}`[];
-    try {
-      digests = await Promise.all(
-        parsed.migrations.map(async (migration) => {
-          const digest = `sha256:${hex(
-            new Uint8Array(
-              await crypto.subtle.digest("SHA-256", migration.sql as unknown as BufferSource),
-            ),
-          )}` as const;
-          if (digest !== migration.digest) throw new AdminSentinel("invalid_argument");
-          return digest;
-        }),
-      );
-    } catch (error) {
-      return adminFailure(error instanceof AdminSentinel ? error.code : "invalid_argument");
-    }
     try {
       await this.#assertAdminProof("apply-migration-suffix", parsed.authority, parsed.proof);
-      this.#transactionSync(() => {
-        const control = this.#assertActiveAuthority(parsed.authority);
-        const current = control.migrations;
-        if (!sameMigrationsPrefix(current, parsed.expectedPrefix)) {
-          throw new AdminSentinel("conflict");
-        }
-        const identities = parsed.migrations.map((migration, index) => {
-          const digest = digests[index];
-          if (!digest) throw new AdminSentinel("invalid_argument");
-          return { path: migration.path, digest };
+      const prepared = await prepareMigrationInput(parsed);
+      const control = this.#assertActiveAuthority(parsed.authority);
+      let applied = control.migrations;
+      if (
+        !sameMigrationsPrefix(applied, parsed.expectedPrefix) ||
+        !sameMigrationsPrefix(prepared.requested, applied)
+      ) {
+        throw new AdminSentinel("conflict");
+      }
+
+      // An acknowledgement may be lost after all files commit, or the same RPC
+      // may be retried after a later file failed. The current ledger is durable
+      // progress within this exact requested history, so only its unrecorded
+      // tail runs. Every file stays whole: its exact native SQLite statement
+      // slices and ledger append share this one transaction.
+      for (
+        let migrationIndex = applied.length - parsed.expectedPrefix.length;
+        migrationIndex < prepared.migrations.length;
+        migrationIndex += 1
+      ) {
+        const migration = prepared.migrations[migrationIndex];
+        if (!migration) throw new AdminSentinel("invalid_argument");
+        applied = this.#transactionSync(() => {
+          const latest = this.#assertActiveAuthority(parsed.authority);
+          if (!sameMigrations(latest.migrations, applied)) {
+            throw new AdminSentinel("conflict");
+          }
+          for (const statement of migration.statements) this.#sql.exec(statement);
+          const next = [...applied, migration.identity];
+          this.#writeControl({
+            lifecycle: "active",
+            authority: latest.authority,
+            migrations: next,
+          });
+          return next;
         });
-        const requested = [...parsed.expectedPrefix, ...identities];
-        // A caller may have lost the acknowledgement after the transaction
-        // committed. An exact already-applied suffix is a successful retry and
-        // must not execute customer SQL a second time.
-        if (sameMigrations(current, requested)) return;
-        if (current.length !== parsed.expectedPrefix.length) {
-          throw new AdminSentinel("conflict");
-        }
-        if (requested.length > MAX_MIGRATION_HISTORY || hasDuplicateMigrationPath(requested)) {
-          throw new AdminSentinel("invalid_argument");
-        }
-        const paths = new Set(current.map((entry) => entry.path));
-        for (let index = 0; index < parsed.migrations.length; index += 1) {
-          const migration = parsed.migrations[index];
-          if (!migration) throw new AdminSentinel("invalid_argument");
-          if (paths.has(migration.path)) throw new AdminSentinel("conflict");
-          const digest = digests[index];
-          if (!digest) throw new AdminSentinel("invalid_argument");
-          const sql = decodeMigrationSql(migration.sql);
-          validateMigrationSql(sql);
-          this.#sql.exec(sql);
-          paths.add(migration.path);
-        }
-        this.#writeControl({
-          lifecycle: "active",
-          authority: control.authority,
-          migrations: requested,
-        });
-      });
+      }
       return adminSuccess(undefined);
     } catch (error) {
       return adminFailure(error instanceof AdminSentinel ? error.code : "backend_unavailable");
@@ -740,14 +776,24 @@ function validateSql(sql: string): void {
  * token in a literal/comment also fails closed rather than risking a provider
  * table leak.
  */
-function validateMigrationSql(sql: string): void {
-  if (utf8(sql) === 0 || utf8(sql) > MAX_SQL_BYTES || sql.includes("\u0000")) {
+function prepareManagedMigrationSql(sql: string): readonly string[] {
+  if (sql.includes("\u0000")) {
+    throw new AdminSentinel("invalid_argument");
+  }
+  let statements: readonly string[];
+  try {
+    statements = prepareMigrationSql(sql, MAX_SQL_BYTES);
+  } catch (error) {
+    if (error instanceof MigrationSqlCapacityError) {
+      throw new AdminSentinel("backend_unavailable");
+    }
     throw new AdminSentinel("invalid_argument");
   }
   const stripped = stripSqlComments(sql);
   if (containsProtectedIdentifier(sql) || containsProtectedIdentifier(stripped)) {
     throw new AdminSentinel("invalid_argument");
   }
+  return statements;
 }
 
 /**
@@ -781,7 +827,10 @@ function containsProtectedIdentifier(sql: string): boolean {
 
 function decodeMigrationSql(bytes: Uint8Array): string {
   try {
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+    // Keep a leading BOM as U+FEFF. SQLite treats it as whitespace, and the
+    // shared lexical pass must see it so the exact source slice remains tied
+    // to the artifact bytes and cannot hide a forbidden first command.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new AdminSentinel("invalid_argument");
   }
@@ -831,7 +880,7 @@ function parseControlRecord(value: unknown): ManagedWorkerSqliteControlRecord | 
     value.schema !== MANAGED_SQLITE_CONTROL_SCHEMA ||
     (value.lifecycle !== "active" && value.lifecycle !== "destroyed") ||
     !Array.isArray(value.migrations) ||
-    value.migrations.length > MAX_MIGRATION_HISTORY
+    value.migrations.length > MAX_MIGRATION_FILES
   ) {
     return null;
   }
@@ -858,9 +907,10 @@ function validControlRecord(value: ManagedWorkerSqliteControlRecord): boolean {
     value.schema !== MANAGED_SQLITE_CONTROL_SCHEMA ||
     (value.lifecycle !== "active" && value.lifecycle !== "destroyed") ||
     !parseAuthority(value.authority) ||
-    value.migrations.length > MAX_MIGRATION_HISTORY ||
+    value.migrations.length > MAX_MIGRATION_FILES ||
     value.migrations.some((migration) => !parseMigrationIdentity(migration)) ||
-    hasDuplicateMigrationPath(value.migrations)
+    hasDuplicateMigrationPath(value.migrations) ||
+    !validControlMigrationProjection(value.migrations)
   ) {
     return false;
   }
@@ -871,12 +921,62 @@ function validControlRecord(value: ManagedWorkerSqliteControlRecord): boolean {
   }
 }
 
-function parseMigrationInput(value: unknown): {
-  readonly authority: ManagedWorkerSqliteAuthority;
-  readonly proof: string;
-  readonly expectedPrefix: readonly ManagedWorkerSqliteMigrationIdentity[];
-  readonly migrations: readonly ManagedWorkerSqliteMigration[];
-} | null {
+async function prepareMigrationInput(input: ParsedMigrationInput): Promise<PreparedMigrationInput> {
+  const identities = input.migrations.map(({ path, digest }) => ({ path, digest }));
+  const requested = [...input.expectedPrefix, ...identities];
+  if (
+    requested.length > MAX_MIGRATION_FILES ||
+    hasDuplicateMigrationPath(requested) ||
+    !validControlMigrationProjection(requested)
+  ) {
+    throw new AdminSentinel("invalid_argument");
+  }
+
+  let totalSqlBytes = 0;
+  const preparedSql: (readonly string[])[] = [];
+  for (const migration of input.migrations) {
+    totalSqlBytes += migration.sql.byteLength;
+    if (!Number.isSafeInteger(totalSqlBytes) || totalSqlBytes > MAX_MIGRATION_BUNDLE_BYTES) {
+      throw new AdminSentinel("invalid_argument");
+    }
+    const sql = decodeMigrationSql(migration.sql);
+    preparedSql.push(prepareManagedMigrationSql(sql));
+  }
+
+  const digests = await Promise.all(
+    input.migrations.map(async (migration) => {
+      return `sha256:${hex(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", migration.sql as unknown as BufferSource),
+        ),
+      )}` as const;
+    }),
+  );
+  if (digests.some((digest, index) => digest !== input.migrations[index]?.digest)) {
+    throw new AdminSentinel("invalid_argument");
+  }
+
+  return {
+    requested,
+    migrations: identities.map((identity, index) => {
+      const statements = preparedSql[index];
+      if (statements === undefined) throw new AdminSentinel("invalid_argument");
+      return { identity, statements };
+    }),
+  };
+}
+
+function validControlMigrationProjection(
+  migrations: readonly ManagedWorkerSqliteMigrationIdentity[],
+): boolean {
+  try {
+    return utf8(JSON.stringify(migrations)) <= MAX_CONTROL_MIGRATION_PROJECTION_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+function parseMigrationInput(value: unknown): ParsedMigrationInput | null {
   if (!isRecord(value) || !onlyKeys(value, ["authority", "proof", "expectedPrefix", "migrations"]))
     return null;
   const authority = parseAuthority(value.authority);
@@ -885,10 +985,11 @@ function parseMigrationInput(value: unknown): {
     typeof value.proof !== "string" ||
     !PROOF.test(value.proof) ||
     !Array.isArray(value.expectedPrefix) ||
-    value.expectedPrefix.length > MAX_SQL_STATEMENTS ||
+    value.expectedPrefix.length > MAX_MIGRATION_FILES ||
     !Array.isArray(value.migrations) ||
     value.migrations.length < 1 ||
-    value.migrations.length > MAX_SQL_STATEMENTS
+    value.migrations.length > MAX_MIGRATION_FILES ||
+    value.expectedPrefix.length + value.migrations.length > MAX_MIGRATION_FILES
   )
     return null;
   const expectedPrefix = value.expectedPrefix.map(parseMigrationIdentity);
@@ -931,7 +1032,7 @@ function parseMigration(value: unknown): ManagedWorkerSqliteMigration | null {
     !isRecord(value) ||
     !onlyKeys(value, ["path", "digest", "sql"]) ||
     !(value.sql instanceof Uint8Array) ||
-    value.sql.byteLength > MAX_SQL_BYTES
+    value.sql.byteLength > MAX_MIGRATION_BUNDLE_BYTES
   )
     return null;
   if (
@@ -1091,9 +1192,9 @@ function validPath(value: string): boolean {
     value.length > 0 &&
     utf8(value) <= MAX_PATH_BYTES &&
     !value.includes("\u0000") &&
+    !value.startsWith("/") &&
     !value.includes("\\") &&
-    value !== "." &&
-    value !== ".."
+    !value.split("/").some((part) => part === "." || part === "..")
   );
 }
 

@@ -25,6 +25,8 @@ class BunSqliteState implements ManagedWorkerSqliteState {
   readonly database = new Database(":memory:");
   readonly kvValues = new Map<string, unknown>();
   failNextKvPut = false;
+  failKvPutAt: number | undefined;
+  kvPutCount = 0;
   readonly storage = {
     sql: {
       exec: <T extends Record<string, ArrayBuffer | string | number | null>>(
@@ -63,8 +65,10 @@ class BunSqliteState implements ManagedWorkerSqliteState {
     kv: {
       get: <T>(key: string): T | undefined => this.kvValues.get(key) as T | undefined,
       put: <T>(key: string, value: T): void => {
-        if (this.failNextKvPut) {
+        this.kvPutCount += 1;
+        if (this.failNextKvPut || this.kvPutCount === this.failKvPutAt) {
           this.failNextKvPut = false;
+          this.failKvPutAt = undefined;
           throw new Error("kv write failed");
         }
         this.kvValues.set(key, structuredClone(value));
@@ -104,11 +108,82 @@ async function sealed(
 }
 
 async function migration(path: string, sql: string) {
-  const bytes = new TextEncoder().encode(sql);
-  const digest = `sha256:${[...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+  return await migrationBytes(path, new TextEncoder().encode(sql));
+}
+
+async function migrationBytes(path: string, bytes: Uint8Array) {
+  const digest = `sha256:${[
+    ...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource)),
+  ]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("")}` as const;
   return { path, digest, sql: bytes };
+}
+
+function utf8Bytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+function migrationIdentitiesWithSerializedBytes(targetBytes: number) {
+  const entries: { path: string; digest: `sha256:${string}` }[] = [];
+  const digest = `sha256:${"f".repeat(64)}` as const;
+  let serializedBytes = 2; // []
+  for (let index = 0; serializedBytes < targetBytes; index += 1) {
+    const prefix = `m${index.toString().padStart(5, "0")}-`;
+    const maximumPath = `${prefix}${"x".repeat(255 - prefix.length)}`;
+    const maximumEntry = { path: maximumPath, digest };
+    const separatorBytes = entries.length === 0 ? 0 : 1;
+    const maximumAdded = separatorBytes + utf8Bytes(maximumEntry);
+    if (serializedBytes + maximumAdded <= targetBytes) {
+      entries.push(maximumEntry);
+      serializedBytes += maximumAdded;
+      continue;
+    }
+
+    const minimumEntry = { path: prefix, digest };
+    const minimumAdded = separatorBytes + utf8Bytes(minimumEntry);
+    const remaining = targetBytes - serializedBytes;
+    if (remaining < minimumAdded) {
+      const previous = entries.at(-1);
+      if (!previous) throw new Error("cannot derive exact migration projection size");
+      const reduction = minimumAdded - remaining;
+      if (previous.path.length - reduction < 1) {
+        throw new Error("cannot derive exact migration projection size");
+      }
+      previous.path = previous.path.slice(0, -reduction);
+      serializedBytes -= reduction;
+    }
+    const finalPathBytes = targetBytes - serializedBytes - minimumAdded;
+    if (finalPathBytes < 0 || prefix.length + finalPathBytes > 255) {
+      throw new Error("cannot derive exact migration projection size");
+    }
+    entries.push({ path: `${prefix}${"x".repeat(finalPathBytes)}`, digest });
+    serializedBytes = targetBytes;
+  }
+  if (utf8Bytes(entries) !== targetBytes) {
+    throw new Error("migration projection did not reach the requested serialized size");
+  }
+  return entries;
+}
+
+function neutralMigrationSql(targetBytes: number): string {
+  const prefix = `${[
+    "CREATE TABLE migration_effects (sequence INTEGER PRIMARY KEY)",
+    "CREATE TABLE first_file_statements (sequence INTEGER PRIMARY KEY)",
+    ...Array.from(
+      { length: 500 },
+      (_, index) => `INSERT INTO first_file_statements VALUES (${index + 1})`,
+    ),
+  ].join(";\n")};\n`;
+  const finalStatement = "INSERT INTO migration_effects VALUES (1)";
+  const fixedBytes = new TextEncoder().encode(`${prefix}/**/\n${finalStatement}`).byteLength;
+  const paddingBytes = targetBytes - fixedBytes;
+  if (paddingBytes < 0) throw new Error("neutral migration target is too small");
+  const sql = `${prefix}/*${"x".repeat(paddingBytes)}*/\n${finalStatement}`;
+  if (new TextEncoder().encode(sql).byteLength !== targetBytes) {
+    throw new Error("neutral migration did not reach the requested byte size");
+  }
+  return sql;
 }
 
 test("SQLite DO names are deterministic and never include the raw resource UID", async () => {
@@ -252,6 +327,318 @@ test("customer SQL and the control KV record commit or roll back together", asyn
   });
 });
 
+test("a zero-byte migration atomically records its artifact identity", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
+  const empty = await migrationBytes("migrations/0001-empty.sql", new Uint8Array());
+  const request = {
+    ...(await sealed("apply-migration-suffix")),
+    expectedPrefix: [],
+    migrations: [empty],
+  };
+
+  state.failNextKvPut = true;
+  expect(await database.takoserverSqliteApplyMigrationSuffix(request)).toEqual({
+    ok: false,
+    error: { code: "backend_unavailable" },
+  });
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({ ok: true, value: [] });
+
+  expect(await database.takoserverSqliteApplyMigrationSuffix(request)).toEqual({
+    ok: true,
+    value: undefined,
+  });
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({
+    ok: true,
+    value: [{ path: empty.path, digest: empty.digest }],
+  });
+});
+
+test("a 105-file suffix commits per file and an exact partial retry resumes without replay", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
+
+  // This is a neutral generated analogue of the real 107,748-byte baseline,
+  // with hundreds of statements but no application SQL copied into this repo.
+  const firstFileSql = neutralMigrationSql(107_748);
+  expect(new TextEncoder().encode(firstFileSql).byteLength).toBe(107_748);
+  const migrations = await Promise.all([
+    migration("migrations/0001-long-file.sql", firstFileSql),
+    ...Array.from({ length: 104 }, (_, index) =>
+      migration(
+        `migrations/${(index + 2).toString().padStart(4, "0")}.sql`,
+        `INSERT INTO migration_effects VALUES (${index + 2})`,
+      ),
+    ),
+  ]);
+
+  // Initialization was KV put 1. Fail the ledger append for file 103 after
+  // files 1..102 have each committed their SQL and identity independently.
+  state.failKvPutAt = state.kvPutCount + 103;
+  const exactSuffix = {
+    ...(await sealed("apply-migration-suffix")),
+    expectedPrefix: [],
+    migrations,
+  };
+  expect(await database.takoserverSqliteApplyMigrationSuffix(exactSuffix)).toEqual({
+    ok: false,
+    error: { code: "backend_unavailable" },
+  });
+  const partial = await database.takoserverSqliteReadMigrationLedger(
+    await sealed("read-migration-ledger"),
+  );
+  expect(partial).toMatchObject({ ok: true });
+  if (!partial.ok) throw new Error("expected a readable partial migration ledger");
+  expect(partial.value).toEqual(
+    migrations.slice(0, 102).map(({ path, digest }) => ({ path, digest })),
+  );
+  expect(
+    state.database.query("SELECT sequence FROM migration_effects ORDER BY sequence").all(),
+  ).toEqual(Array.from({ length: 102 }, (_, index) => ({ sequence: index + 1 })));
+
+  // This is the identical original request, including expectedPrefix: []. The
+  // recorded 102-entry prefix is recognized as progress within that request,
+  // so replaying any INSERT would violate the primary key instead of succeeding.
+  expect(await database.takoserverSqliteApplyMigrationSuffix(exactSuffix)).toEqual({
+    ok: true,
+    value: undefined,
+  });
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({
+    ok: true,
+    value: migrations.map(({ path, digest }) => ({ path, digest })),
+  });
+  expect(
+    state.database.query("SELECT sequence FROM migration_effects ORDER BY sequence").all(),
+  ).toEqual(Array.from({ length: 105 }, (_, index) => ({ sequence: index + 1 })));
+});
+
+test("the complete migration input is validated before its first tenant statement", async () => {
+  const aggregateLimit = 10_485_760;
+  const invalidUtf8 = await migrationBytes("migrations/0002-invalid-utf8.sql", Uint8Array.of(0xff));
+  const aggregateBytes = new TextEncoder().encode(`--${"x".repeat(aggregateLimit - 2)}`);
+  expect(aggregateBytes.byteLength).toBe(aggregateLimit);
+  const scenarios = [
+    {
+      name: "path",
+      second: await migration("migrations/../escape.sql", "SELECT 1"),
+    },
+    {
+      name: "digest",
+      second: {
+        ...(await migration("migrations/0002-digest.sql", "SELECT 1")),
+        digest: `sha256:${"0".repeat(64)}` as const,
+      },
+    },
+    { name: "UTF-8", second: invalidUtf8 },
+    {
+      name: "unique path",
+      second: await migration("migrations/0001-first.sql", "SELECT 1"),
+    },
+    {
+      name: "aggregate bytes",
+      second: await migrationBytes("migrations/0002-aggregate.sql", aggregateBytes),
+    },
+    {
+      name: "protected storage",
+      second: await migration(
+        "migrations/0002-protected.sql",
+        "CREATE TABLE leaked_control AS SELECT * FROM _cf_KV",
+      ),
+    },
+    {
+      name: "transaction escape",
+      second: await migration(
+        "migrations/0002-transaction.sql",
+        "BEGIN; CREATE TABLE escaped_transaction (value TEXT); COMMIT",
+      ),
+    },
+    {
+      name: "BOM transaction escape",
+      second: await migration(
+        "migrations/0002-bom-transaction.sql",
+        "SELECT 1;\ufeffBEGIN; CREATE TABLE escaped_bom (value TEXT); COMMIT",
+      ),
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const state = new BunSqliteState();
+    const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+    await database.takoserverSqliteInitialize(await sealed("initialize"));
+    const first = await migration(
+      "migrations/0001-first.sql",
+      "CREATE TABLE must_not_exist (value TEXT)",
+    );
+    const result = await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [first, scenario.second],
+    });
+    expect({ name: scenario.name, result }).toEqual({
+      name: scenario.name,
+      result: { ok: false, error: { code: "invalid_argument" } },
+    });
+    expect({
+      name: scenario.name,
+      table: state.database
+        .query("SELECT name FROM sqlite_schema WHERE name = 'must_not_exist'")
+        .all(),
+    }).toEqual({ name: scenario.name, table: [] });
+    expect({
+      name: scenario.name,
+      ledger: await database.takoserverSqliteReadMigrationLedger(
+        await sealed("read-migration-ledger"),
+      ),
+    }).toEqual({ name: scenario.name, ledger: { ok: true, value: [] } });
+  }
+});
+
+test("a later statement failure rolls back its whole file and corrected SQL can retry", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
+
+  const failing = await migration(
+    "migrations/0001-atomic.sql",
+    [
+      "CREATE TABLE file_atomic (value INTEGER PRIMARY KEY)",
+      "CREATE TABLE file_atomic_audit (value INTEGER NOT NULL)",
+      "CREATE \ufeffTRIGGER file_atomic_insert AFTER INSERT ON file_atomic BEGIN " +
+        "INSERT INTO file_atomic_audit VALUES (CASE WHEN NEW.value > 0 THEN NEW.value ELSE 0 END); END",
+      "INSERT INTO file_atomic VALUES (1)",
+      "INSERT INTO file_atomic VALUES (1)",
+    ].join(";\n"),
+  );
+  expect(
+    await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [failing],
+    }),
+  ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(
+    state.database.query("SELECT name FROM sqlite_schema WHERE name = 'file_atomic'").all(),
+  ).toEqual([]);
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({ ok: true, value: [] });
+
+  const corrected = await migration(
+    "migrations/0001-atomic.sql",
+    [
+      "CREATE TABLE file_atomic (value INTEGER PRIMARY KEY)",
+      "CREATE TABLE file_atomic_audit (value INTEGER NOT NULL)",
+      "CREATE \ufeffTRIGGER file_atomic_insert AFTER INSERT ON file_atomic BEGIN " +
+        "INSERT INTO file_atomic_audit VALUES (CASE WHEN NEW.value > 0 THEN NEW.value ELSE 0 END); END",
+      "INSERT INTO file_atomic VALUES (1)",
+      "INSERT INTO file_atomic VALUES (2)",
+    ].join(";\n"),
+  );
+  expect(
+    await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [corrected],
+    }),
+  ).toEqual({ ok: true, value: undefined });
+  expect(state.database.query("SELECT value FROM file_atomic ORDER BY value").all()).toEqual([
+    { value: 1 },
+    { value: 2 },
+  ]);
+  expect(state.database.query("SELECT value FROM file_atomic_audit ORDER BY value").all()).toEqual([
+    { value: 1 },
+    { value: 2 },
+  ]);
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({
+    ok: true,
+    value: [{ path: corrected.path, digest: corrected.digest }],
+  });
+});
+
+test("an over-capacity native statement is refused before an earlier file executes", async () => {
+  const state = new BunSqliteState();
+  const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
+  await database.takoserverSqliteInitialize(await sealed("initialize"));
+  const first = await migration(
+    "migrations/0001-must-not-run.sql",
+    "CREATE TABLE must_not_run (value TEXT)",
+  );
+  const overCapacity = await migration(
+    "migrations/0002-over-capacity.sql",
+    `SELECT '${"x".repeat(100_000)}'`,
+  );
+
+  expect(
+    await database.takoserverSqliteApplyMigrationSuffix({
+      ...(await sealed("apply-migration-suffix")),
+      expectedPrefix: [],
+      migrations: [first, overCapacity],
+    }),
+  ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+  expect(
+    state.database.query("SELECT name FROM sqlite_schema WHERE name = 'must_not_run'").all(),
+  ).toEqual([]);
+  expect(
+    await database.takoserverSqliteReadMigrationLedger(await sealed("read-migration-ledger")),
+  ).toEqual({ ok: true, value: [] });
+});
+
+test("the v2 control record bound is the admitted manifest projection plus exact authority overhead", async () => {
+  const manifestProjectionBytes = 1_048_576;
+  const migrations = migrationIdentitiesWithSerializedBytes(manifestProjectionBytes);
+  expect(migrations.length).toBeLessThanOrEqual(16_384);
+  const maximumAuthority = {
+    providerId: "a".repeat(512),
+    resourceUid: "b".repeat(512),
+    generation: "9".repeat(19),
+    operationId: "c".repeat(512),
+    descriptorDigest: `sha256:${"d".repeat(64)}` as const,
+  };
+  const record = {
+    schema: MANAGED_SQLITE_CONTROL_SCHEMA,
+    lifecycle: "destroyed" as const,
+    authority: maximumAuthority,
+    migrations,
+  };
+  expect(utf8Bytes(record.migrations)).toBe(manifestProjectionBytes);
+  // The exact maximum envelope overhead is 1,815 bytes: fixed v2 fields plus
+  // the longest valid authority and lifecycle, excluding the migrations [].
+  expect(utf8Bytes(record)).toBe(1_050_391);
+  expect(utf8Bytes(record)).toBeLessThan(2 * 1_024 * 1_024);
+
+  const atLimit = new BunSqliteState();
+  atLimit.kvValues.set(MANAGED_SQLITE_CONTROL_KEY, record);
+  const database = new ManagedWorkerSqliteCore(atLimit, ADMIN_ENV);
+  expect(
+    await database.takoserverSqliteInspect(await sealed("inspect", maximumAuthority)),
+  ).toMatchObject({
+    ok: true,
+    value: { state: "destroyed", authority: maximumAuthority },
+  });
+
+  const overLimit = structuredClone(record);
+  const extendable = overLimit.migrations.find((entry) => entry.path.length < 255);
+  if (!extendable) throw new Error("expected one extendable migration path");
+  extendable.path += "x";
+  expect(utf8Bytes(overLimit.migrations)).toBe(manifestProjectionBytes + 1);
+  const malformed = new BunSqliteState();
+  malformed.kvValues.set(MANAGED_SQLITE_CONTROL_KEY, overLimit);
+  const malformedDatabase = new ManagedWorkerSqliteCore(malformed, ADMIN_ENV);
+  expect(
+    await malformedDatabase.takoserverSqliteInspect(await sealed("inspect", maximumAuthority)),
+  ).toEqual({ ok: false, error: { code: "backend_unavailable" } });
+});
+
 test("destroy is idempotent, leaves a KV tombstone, and closes runtime RPC", async () => {
   const state = new BunSqliteState();
   const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
@@ -289,11 +676,15 @@ test("destroy is idempotent, leaves a KV tombstone, and closes runtime RPC", asy
   // `tests/cloudflare-managed-worker-sqlite-object.test.ts`.
 });
 
-test("runtime rejects schema and hidden KV access while former control names remain customer SQL", async () => {
+test("runtime rejects schema and hidden KV access and migrations cannot mint a ledger-like table", async () => {
   const state = new BunSqliteState();
   const database = new ManagedWorkerSqliteCore(state, ADMIN_ENV);
   await database.takoserverSqliteInitialize(await sealed("initialize"));
   expect(await database.edgeSqlExecute({ sql: "CREATE TABLE nope (id INTEGER)" })).toEqual({
+    ok: false,
+    error: { code: "sql_error" },
+  });
+  expect(await database.edgeSqlQuery({ sql: `SELECT '${"x".repeat(100_000)}'` })).toEqual({
     ok: false,
     error: { code: "sql_error" },
   });
@@ -324,29 +715,22 @@ test("runtime rejects schema and hidden KV access while former control names rem
       migrations: [forbidden],
     }),
   ).toEqual({ ok: false, error: { code: "invalid_argument" } });
-  const customerTable = await migration(
-    "005-former-control-name.sql",
+  const ledgerLikeTable = await migration(
+    "005-ledger-like-name.sql",
     'CREATE TABLE "_takoform_sqlite_migrations" (value TEXT)',
   );
   expect(
     await database.takoserverSqliteApplyMigrationSuffix({
       ...(await sealed("apply-migration-suffix")),
       expectedPrefix: [],
-      migrations: [customerTable],
+      migrations: [ledgerLikeTable],
     }),
-  ).toEqual({ ok: true, value: undefined });
+  ).toEqual({ ok: false, error: { code: "invalid_argument" } });
   expect(
-    await database.edgeSqlExecute({
-      sql: 'INSERT INTO "_takoform_sqlite_migrations" VALUES (?)',
-      params: ["customer"],
-    }),
-  ).toMatchObject({ ok: true, value: { rowsWritten: 1 } });
-  expect(
-    await database.edgeSqlQuery({ sql: 'SELECT value FROM "_takoform_sqlite_migrations"' }),
-  ).toEqual({
-    ok: true,
-    value: { rows: [{ value: "customer" }], rowsWritten: 0 },
-  });
+    state.database
+      .query("SELECT name FROM sqlite_schema WHERE name = '_takoform_sqlite_migrations'")
+      .all(),
+  ).toEqual([]);
   expect(await database.takoserverSqliteInspect(await sealed("inspect"))).toMatchObject({
     ok: true,
     value: { state: "active", authority: AUTHORITY },

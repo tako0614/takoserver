@@ -1,4 +1,5 @@
 import { isEdgeFormsApiVersion } from "../form-ref.ts";
+import { bytesDigest } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import type {
   ProviderRelation,
@@ -36,6 +37,10 @@ import {
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import {
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../takoform/limits.ts";
+import {
   createCloudflareNativeReadbackDescriptor,
   validateCloudflareNativeReadbackDescriptor,
 } from "./cloudflare-readback-descriptor.ts";
@@ -52,6 +57,7 @@ import type {
   CloudflareWorkerBackend,
   CloudflareWorkerBackendOptions,
 } from "./cloudflare-worker-backend.ts";
+import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migration-policy.ts";
 
 export type {
   ArtifactBytes,
@@ -134,6 +140,13 @@ const SQLITE_MIGRATION_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS ${SQLITE_MIGRATI
     substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
   )
 )`;
+
+type CloudflareSqliteMigrationReadInput = Parameters<
+  NonNullable<Provider["sqliteMigrations"]>["readLedger"]
+>[0];
+type CloudflareSqliteMigrationApplyInput = Parameters<
+  NonNullable<Provider["sqliteMigrations"]>["applySuffix"]
+>[0];
 
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
@@ -335,118 +348,158 @@ export class CloudflareProvider implements Provider {
     return await this.#workerBackend.managedObjectBucketReceiptStatus(input);
   }
 
-  readonly sqliteMigrations = {
-    readLedger: async (input: {
-      readonly nativeId: string;
-    }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
+  async #readD1MigrationLedger(
+    databaseId: string,
+  ): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> {
+    const exists = await this.#d1Query(databaseId, {
+      sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 2",
+      params: [SQLITE_MIGRATION_LEDGER],
+    });
+    if (!exists.ok) return callFailure(exists);
+    const existsRows = d1Rows(exists.result);
+    if (!existsRows || existsRows.length > 1) {
+      return providerValueFailure("provider_error", "the migration ledger response is invalid");
+    }
+    if (existsRows.length === 0) return { ok: true, value: [] };
+
+    const read = await this.#d1Query(databaseId, {
+      sql: `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
+    });
+    if (!read.ok) return callFailure(read);
+    const rows = d1Rows(read.result);
+    if (!rows) {
+      return providerValueFailure("provider_error", "the migration ledger response is invalid");
+    }
+    const ledger: ProviderSqliteMigrationIdentity[] = [];
+    const paths = new Set<string>();
+    for (const [index, rowValue] of rows.entries()) {
+      const row = record(rowValue);
+      const sequence = integer(row?.sequence);
+      const path = optionalString(row?.path);
+      const digest = optionalString(row?.digest);
+      if (
+        sequence !== index + 1 ||
+        !migrationPath(path) ||
+        !sha256Digest(digest) ||
+        paths.has(path)
+      ) {
+        return providerValueFailure("provider_error", "the migration ledger is malformed");
+      }
+      paths.add(path);
+      ledger.push({ path, digest });
+    }
+    return { ok: true, value: ledger };
+  }
+
+  readonly sqliteMigrations: NonNullable<Provider["sqliteMigrations"]> = {
+    readLedger: async (
+      input: CloudflareSqliteMigrationReadInput,
+    ): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
       if (this.#workerBackend?.readSqliteMigrationLedger) {
         return await this.#workerBackend.readSqliteMigrationLedger(input);
       }
       const databaseId = d1DatabaseId(input.nativeId);
       if (!databaseId)
         return providerValueFailure("invalid_spec", "the database identity is invalid");
-      const exists = await this.#d1Query(databaseId, {
-        sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 2",
-        params: [SQLITE_MIGRATION_LEDGER],
-      });
-      if (!exists.ok) return callFailure(exists);
-      const existsRows = d1Rows(exists.result);
-      if (!existsRows || existsRows.length > 1) {
-        return providerValueFailure("provider_error", "the migration ledger response is invalid");
-      }
-      if (existsRows.length === 0) return { ok: true, value: [] };
-
-      const read = await this.#d1Query(databaseId, {
-        sql: `SELECT sequence, path, digest FROM ${SQLITE_MIGRATION_LEDGER} ORDER BY sequence`,
-      });
-      if (!read.ok) return callFailure(read);
-      const rows = d1Rows(read.result);
-      if (!rows) {
-        return providerValueFailure("provider_error", "the migration ledger response is invalid");
-      }
-      const ledger: ProviderSqliteMigrationIdentity[] = [];
-      for (const [index, rowValue] of rows.entries()) {
-        const row = record(rowValue);
-        const sequence = integer(row?.sequence);
-        const path = optionalString(row?.path);
-        const digest = optionalString(row?.digest);
-        if (sequence !== index + 1 || !migrationPath(path) || !sha256Digest(digest)) {
-          return providerValueFailure("provider_error", "the migration ledger is malformed");
-        }
-        ledger.push({ path, digest });
-      }
-      return { ok: true, value: ledger };
+      return await this.#readD1MigrationLedger(databaseId);
     },
-    applySuffix: async (input: {
-      readonly nativeId: string;
-      readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
-      readonly migrations: readonly ProviderSqliteMigration[];
-    }): Promise<ProviderValue<undefined>> => {
+    applySuffix: async (
+      input: CloudflareSqliteMigrationApplyInput,
+    ): Promise<ProviderValue<undefined>> => {
       if (this.#workerBackend?.applySqliteMigrationSuffix) {
         return await this.#workerBackend.applySqliteMigrationSuffix(input);
       }
       const databaseId = d1DatabaseId(input.nativeId);
       if (!databaseId)
         return providerValueFailure("invalid_spec", "the database identity is invalid");
-      if (input.migrations.length < 1 || input.migrations.length > 100) {
-        return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+      const validated = await validateCloudflareSqliteMigrationInput(input);
+      if (!validated.ok) return validated;
+
+      let prefix = input.expectedPrefix.slice();
+      let suffixOffset = 0;
+      while (suffixOffset < input.migrations.length) {
+        const migration = input.migrations[suffixOffset];
+        if (!migration) {
+          return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+        }
+        const batch = sqliteMigrationBatch({
+          prefix,
+          migration,
+          statements: validated.value.sqlByIdentity.get(migrationIdentityKey(migration)) ?? [],
+          createLedger: suffixOffset === 0 && prefix.length === 0,
+        });
+        const applied = await this.#d1Query(databaseId, { batch });
+        if (!applied.ok) {
+          if (!applied.indeterminate) return callFailure(applied);
+          // A request whose response was lost may have committed. Read the
+          // ledger once to give the operator durable evidence, but never
+          // continue or report success from that readback: the caller must
+          // perform its normal recovery read before retrying this suffix.
+          const readback = await this.#readD1MigrationLedger(databaseId);
+          if (!readback.ok) {
+            return providerValueFailure(
+              "unavailable",
+              "the migration outcome could not be confirmed",
+              false,
+            );
+          }
+          const actual = readback.value;
+          if (actual.length > input.desired.length || !ledgerPrefix(actual, input.desired)) {
+            return providerValueFailure("conflict", "the database migration history moved");
+          }
+          return providerValueFailure(
+            "unavailable",
+            "the migration outcome is indeterminate; inspect the ledger before retrying",
+            false,
+          );
+        }
+        // A successful native batch is atomic. D1 may return fewer result
+        // entries than statements in a multi-statement batch, so only require
+        // that every returned entry is explicitly successful; never infer
+        // commit from an array length (including an empty array).
+        if (!d1BatchSucceeded(applied.result)) {
+          // The HTTP envelope succeeded but did not provide typed native
+          // success evidence. Readback prevents a caller from blindly
+          // replaying a batch whose acknowledgement shape was malformed.
+          const readback = await this.#readD1MigrationLedger(databaseId);
+          if (!readback.ok) {
+            return providerValueFailure(
+              "unavailable",
+              "the migration outcome could not be confirmed",
+              false,
+            );
+          }
+          const actual = readback.value;
+          if (actual.length > input.desired.length || !ledgerPrefix(actual, input.desired)) {
+            return providerValueFailure("conflict", "the database migration history moved");
+          }
+          return providerValueFailure("provider_error", "the migration batch response is invalid");
+        }
+        prefix = [...prefix, { path: migration.path, digest: migration.digest }];
+        suffixOffset += 1;
       }
-      const expected = JSON.stringify(input.expectedPrefix);
-      if (expected.length > 64 * 1_024) {
-        return providerValueFailure("invalid_spec", "the migration prefix is too large");
-      }
-      const batch: { sql: string; params?: readonly (string | number)[] }[] = [
-        { sql: SQLITE_MIGRATION_LEDGER_DDL },
-        {
-          sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest)
-SELECT 0, '__takoform_guard__', 'sha256:${"0".repeat(64)}'
-WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
-   OR EXISTS (
-     SELECT 1 FROM json_each(?) AS expected
-     LEFT JOIN ${SQLITE_MIGRATION_LEDGER} AS actual
-       ON actual.sequence = CAST(expected.key AS INTEGER) + 1
-     WHERE actual.path IS NULL
-        OR actual.path != json_extract(expected.value, '$.path')
-        OR actual.digest != json_extract(expected.value, '$.digest')
-   )`,
-          params: [input.expectedPrefix.length, expected],
-        },
-      ];
-      for (const [offset, migration] of input.migrations.entries()) {
-        if (!migrationPath(migration.path) || !sha256Digest(migration.digest)) {
-          return providerValueFailure("invalid_spec", "a migration identity is invalid");
-        }
-        let sql: string;
-        try {
-          sql = new TextDecoder("utf-8", {
-            fatal: true,
-            ignoreBOM: false,
-          }).decode(migration.sql);
-        } catch {
-          return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
-        }
-        if (sql.length === 0 || sql.length > 100_000) {
-          return providerValueFailure("invalid_spec", "a migration SQL statement is invalid");
-        }
-        batch.push(
-          { sql },
-          {
-            sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
-            params: [input.expectedPrefix.length + offset + 1, migration.path, migration.digest],
-          },
+
+      // The native batch acknowledgement proves each per-file transaction
+      // committed; one final ledger read establishes the durable prefix at
+      // the provider boundary and detects any external history movement.
+      const readback = await this.#readD1MigrationLedger(databaseId);
+      if (!readback.ok) {
+        return providerValueFailure(
+          "unavailable",
+          "the migration outcome could not be confirmed",
+          false,
         );
       }
-      const applied = await this.#d1Query(databaseId, { batch });
-      if (!applied.ok) return callFailure(applied);
-      const results = d1Results(applied.result);
-      if (
-        !results ||
-        results.length !== batch.length ||
-        results.some((result) => result.success !== true)
-      ) {
-        return providerValueFailure("provider_error", "the migration batch result is invalid");
+      const actual = readback.value;
+      if (actual.length > input.desired.length || !ledgerPrefix(actual, input.desired)) {
+        return providerValueFailure("conflict", "the database migration history moved");
       }
-      return { ok: true, value: undefined };
+      if (actual.length !== input.desired.length) {
+        return providerValueFailure("provider_error", "the migration ledger response is invalid");
+      }
+      return actual.length === input.desired.length
+        ? { ok: true, value: undefined }
+        : providerValueFailure("provider_error", "the migration ledger response is invalid");
     },
   };
 
@@ -2871,6 +2924,181 @@ function d1Rows(value: unknown): readonly unknown[] | null {
   return Array.isArray(results[0].results) ? results[0].results : null;
 }
 
+/**
+ * REST D1 batch responses may contain fewer entries than statements in the
+ * submitted batch. Every returned entry must nevertheless explicitly report
+ * success before the atomic native commit is trusted; an empty or malformed
+ * result is not evidence of a commit.
+ */
+function d1BatchSucceeded(value: unknown): boolean {
+  const results = d1Results(value);
+  return (
+    results !== null && results.length > 0 && results.every((result) => result.success === true)
+  );
+}
+
+interface ValidatedCloudflareSqliteMigrations {
+  readonly sqlByIdentity: ReadonlyMap<string, readonly string[]>;
+}
+
+async function validateCloudflareSqliteMigrationInput(
+  input: CloudflareSqliteMigrationApplyInput,
+): Promise<ProviderValue<ValidatedCloudflareSqliteMigrations>> {
+  if (
+    !Array.isArray(input.desired) ||
+    !Array.isArray(input.expectedPrefix) ||
+    !Array.isArray(input.migrations) ||
+    input.desired.length < 1 ||
+    input.desired.length > TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES ||
+    input.expectedPrefix.length > input.desired.length ||
+    input.migrations.length < 1 ||
+    input.migrations.length > TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES ||
+    input.migrations.length !== input.desired.length - input.expectedPrefix.length
+  ) {
+    return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+  }
+
+  const sqlByIdentity = new Map<string, readonly string[]>();
+  const textByIdentity = new Map<string, string>();
+  const paths = new Set<string>();
+  let totalBytes = 0;
+  for (const migration of input.desired) {
+    const decoded = await decodeCloudflareMigration(migration);
+    if (!decoded.ok) return decoded;
+    if (paths.has(migration.path)) {
+      return providerValueFailure("invalid_spec", "migration paths must be unique");
+    }
+    paths.add(migration.path);
+    totalBytes += migration.sql.byteLength;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) {
+      return providerValueFailure("invalid_spec", "the migration bundle is too large");
+    }
+    sqlByIdentity.set(migrationIdentityKey(migration), decoded.value.statements);
+    textByIdentity.set(migrationIdentityKey(migration), decoded.value.sql);
+  }
+
+  for (const [index, expected] of input.expectedPrefix.entries()) {
+    if (!migrationIdentity(expected)) {
+      return providerValueFailure("invalid_spec", "the migration prefix is invalid");
+    }
+    const desired = input.desired[index];
+    if (!desired || !sameMigrationIdentity(expected, desired)) {
+      return providerValueFailure("invalid_spec", "the migration prefix is not an exact prefix");
+    }
+  }
+
+  for (const [index, migration] of input.migrations.entries()) {
+    const decoded = await decodeCloudflareMigration(migration);
+    if (!decoded.ok) return decoded;
+    const desired = input.desired[input.expectedPrefix.length + index];
+    if (!desired || !sameMigrationIdentity(migration, desired)) {
+      return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+    }
+    if (decoded.value.sql !== textByIdentity.get(migrationIdentityKey(desired))) {
+      return providerValueFailure("invalid_spec", "the migration suffix is invalid");
+    }
+  }
+  return { ok: true, value: { sqlByIdentity } };
+}
+
+async function decodeCloudflareMigration(
+  migration: ProviderSqliteMigration | ProviderSqliteMigrationIdentity,
+): Promise<ProviderValue<{ readonly sql: string; readonly statements: readonly string[] }>> {
+  if (!migrationIdentity(migration)) {
+    return providerValueFailure("invalid_spec", "a migration identity is invalid");
+  }
+  if (!("sql" in migration) || !(migration.sql instanceof Uint8Array)) {
+    return providerValueFailure("invalid_spec", "a migration SQL statement is invalid");
+  }
+  if ((await bytesDigest(migration.sql)) !== migration.digest) {
+    return providerValueFailure("invalid_spec", "a migration digest does not match its SQL");
+  }
+  let sql: string;
+  try {
+    // Preserve a source BOM as part of the exact migration bytes. The shared
+    // SQLite completeness/policy scanner classifies U+FEFF as whitespace, so
+    // a BOM cannot hide a forbidden command or alter statement framing.
+    sql = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(migration.sql);
+  } catch {
+    return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
+  }
+  let statements: readonly string[];
+  try {
+    statements = prepareMigrationSql(sql, CLOUDFLARE_D1_MAX_SQL_STATEMENT_BYTES);
+  } catch (error) {
+    if (error instanceof MigrationSqlCapacityError) {
+      return providerValueFailure(
+        "provider_error",
+        "a migration SQL statement exceeds the Cloudflare D1 native limit",
+      );
+    }
+    return providerValueFailure("invalid_spec", "a migration SQL statement is not permitted");
+  }
+  return { ok: true, value: { sql, statements } };
+}
+
+const CLOUDFLARE_D1_MAX_SQL_STATEMENT_BYTES = 100_000;
+
+function sqliteMigrationBatch(input: {
+  readonly prefix: readonly ProviderSqliteMigrationIdentity[];
+  readonly migration: ProviderSqliteMigration;
+  readonly statements: readonly string[];
+  readonly createLedger: boolean;
+}): { sql: string; params?: readonly (string | number)[] }[] {
+  const expected = JSON.stringify(input.prefix.map(({ path, digest }) => ({ path, digest })));
+  const batch: { sql: string; params?: readonly (string | number)[] }[] = [];
+  if (input.createLedger) batch.push({ sql: SQLITE_MIGRATION_LEDGER_DDL });
+  batch.push(
+    {
+      sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest)
+SELECT 0, '__takoform_guard__', 'sha256:${"0".repeat(64)}'
+WHERE (SELECT COUNT(*) FROM ${SQLITE_MIGRATION_LEDGER}) != ?
+   OR EXISTS (
+     SELECT 1 FROM json_each(?) AS expected
+     LEFT JOIN ${SQLITE_MIGRATION_LEDGER} AS actual
+       ON actual.sequence = CAST(expected.key AS INTEGER) + 1
+     WHERE actual.path IS NULL
+        OR actual.path != json_extract(expected.value, '$.path')
+        OR actual.digest != json_extract(expected.value, '$.digest')
+   )`,
+      params: [input.prefix.length, expected],
+    },
+    ...input.statements.map((sql) => ({ sql })),
+    {
+      sql: `INSERT INTO ${SQLITE_MIGRATION_LEDGER} (sequence, path, digest) VALUES (?, ?, ?)`,
+      params: [input.prefix.length + 1, input.migration.path, input.migration.digest],
+    },
+  );
+  return batch;
+}
+
+function migrationIdentity(
+  value: ProviderSqliteMigrationIdentity | undefined,
+): value is ProviderSqliteMigrationIdentity {
+  return !!value && migrationPath(value.path) && sha256Digest(value.digest);
+}
+
+function migrationIdentityKey(value: ProviderSqliteMigrationIdentity): string {
+  return `${value.path}\u0000${value.digest}`;
+}
+
+function sameMigrationIdentity(
+  left: ProviderSqliteMigrationIdentity,
+  right: ProviderSqliteMigrationIdentity,
+): boolean {
+  return left.path === right.path && left.digest === right.digest;
+}
+
+function ledgerPrefix(
+  actual: readonly ProviderSqliteMigrationIdentity[],
+  desired: readonly ProviderSqliteMigrationIdentity[],
+): boolean {
+  return actual.every((entry, index) => {
+    const expected = desired[index];
+    return expected !== undefined && sameMigrationIdentity(entry, expected);
+  });
+}
+
 function d1DatabaseId(nativeId: string): string | null {
   const native = parseNativeId(nativeId);
   return native?.kind === "d1" ? native.name : null;
@@ -2881,9 +3109,10 @@ function migrationPath(value: string | undefined): value is string {
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= 255 &&
+    new TextEncoder().encode(value).byteLength <= 255 &&
     !value.startsWith("/") &&
     !value.includes("\\") &&
-    !value.split("/").includes("..")
+    !value.split("/").some((part) => part === "." || part === "..")
   );
 }
 

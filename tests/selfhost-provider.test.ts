@@ -35,6 +35,10 @@ import {
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
 import {
+  TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../src/takoform/limits.ts";
+import {
   createWorkerdRuntime,
   type WorkerdRuntime,
   type WorkerdSite,
@@ -2879,6 +2883,603 @@ describe("read-only native absence verification", () => {
 });
 
 describe("the SQLite migration ledger", () => {
+  test("applies an admitted 105-file history with a large first file of short statements", async () => {
+    const local = provider();
+    const database = await local.apply({
+      operationId: "op_db_large_history",
+      offering: offering("SQLiteDatabase"),
+      identity: identity("large-history"),
+      spec: {},
+    });
+    expect(database.phase).toBe("succeeded");
+    const nativeId = database.phase === "succeeded" ? database.result.nativeId : "";
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+
+    const firstStatements = [
+      "CREATE TABLE migration_values (value INTEGER PRIMARY KEY)",
+      ...Array.from(
+        { length: 3_500 },
+        (_, index) => `INSERT INTO migration_values (value) VALUES (${index})`,
+      ),
+    ];
+    const firstSql = new TextEncoder().encode(`${firstStatements.join(";\n")};`);
+    expect(firstSql.byteLength).toBeGreaterThan(100_000);
+    const migrations = [
+      {
+        path: "0001_large.sql",
+        digest: `sha256:${createHash("sha256").update(firstSql).digest("hex")}` as const,
+        sql: firstSql,
+      },
+      ...Array.from({ length: 104 }, (_, index) => {
+        const sql = new TextEncoder().encode(
+          `INSERT INTO migration_values (value) VALUES (${3_500 + index})`,
+        );
+        return {
+          path: `${String(index + 2).padStart(4, "0")}_append.sql`,
+          digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+          sql,
+        };
+      }),
+    ];
+    expect(migrations).toHaveLength(105);
+    expect(migrations.length).toBeLessThanOrEqual(TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES);
+    expect(
+      migrations.reduce((total, migration) => total + migration.sql.byteLength, 0),
+    ).toBeLessThanOrEqual(TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES);
+
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_large_history",
+        operationMode: "initial",
+        nativeId,
+        target: {
+          resourceUid: "uid_large_history",
+          incarnationId: "dep_large_history",
+          generation: "1",
+        },
+        desired: migrations,
+        expectedPrefix: [],
+        migrations,
+      }),
+    ).toEqual({ ok: true, value: undefined });
+
+    const ledger = await port.readLedger({
+      nativeId,
+      target: {
+        tenantId: "tenant",
+        resourceUid: "uid_large_history",
+        incarnationId: "dep_large_history",
+        generation: "1",
+      },
+    });
+    expect(ledger).toEqual({
+      ok: true,
+      value: migrations.map(({ path, digest }) => ({ path, digest })),
+    });
+    const databaseName = nativeId.split(":")[1];
+    if (!databaseName) throw new Error("the selfhost SQLite native id must contain a name");
+    const persisted = new Database(selfhostDatabasePath(root, databaseName));
+    try {
+      expect(persisted.query("SELECT COUNT(*) AS count FROM migration_values").get()).toEqual({
+        count: 3_604,
+      });
+    } finally {
+      persisted.close();
+    }
+  });
+
+  test("records a zero-byte migration as an atomic no-op", async () => {
+    const local = provider();
+    const database = await local.apply({
+      operationId: "op_db_empty_migration",
+      offering: offering("SQLiteDatabase"),
+      identity: identity("empty-migration"),
+      spec: {},
+    });
+    expect(database.phase).toBe("succeeded");
+    const nativeId = database.phase === "succeeded" ? database.result.nativeId : "";
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const target = {
+      resourceUid: "uid_empty_migration",
+      incarnationId: "dep_empty_migration",
+      generation: "1",
+    };
+    const ledgerTarget = { tenantId: "tenant", ...target };
+    const migration = (path: string, sql: Uint8Array) => ({
+      path,
+      digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+      sql,
+    });
+    const empty = migration("0001_empty.sql", new Uint8Array());
+    const following = migration(
+      "0002_following.sql",
+      new TextEncoder().encode(
+        "CREATE TABLE empty_migration (value INTEGER PRIMARY KEY); INSERT INTO empty_migration (value) VALUES (1);",
+      ),
+    );
+    const failing = migration(
+      "0003_failing.sql",
+      new TextEncoder().encode("CREATE TABLE empty_migration (other INTEGER);"),
+    );
+
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_empty_noop",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [empty, following],
+        expectedPrefix: [],
+        migrations: [empty, following],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+    expect(await port.readLedger({ nativeId, target: ledgerTarget })).toEqual({
+      ok: true,
+      value: [empty, following].map(({ path, digest }) => ({ path, digest })),
+    });
+
+    const firstFailure = await port.applySuffix({
+      operationId: "op_migration_empty_later_failure",
+      operationMode: "recovery",
+      nativeId,
+      target,
+      desired: [empty, following, failing],
+      expectedPrefix: [empty, following].map(({ path, digest }) => ({ path, digest })),
+      migrations: [failing],
+    });
+    expect(firstFailure).toMatchObject({ ok: false, failure: { code: "provider_error" } });
+    expect(await port.readLedger({ nativeId, target: ledgerTarget })).toEqual({
+      ok: true,
+      value: [empty, following].map(({ path, digest }) => ({ path, digest })),
+    });
+
+    const identicalRetry = await port.applySuffix({
+      operationId: "op_migration_empty_later_failure_retry",
+      operationMode: "recovery",
+      nativeId,
+      target,
+      desired: [empty, following, failing],
+      expectedPrefix: [empty, following].map(({ path, digest }) => ({ path, digest })),
+      migrations: [failing],
+    });
+    expect(identicalRetry).toMatchObject({ ok: false, failure: { code: "provider_error" } });
+    expect(await port.readLedger({ nativeId, target: ledgerTarget })).toEqual({
+      ok: true,
+      value: [empty, following].map(({ path, digest }) => ({ path, digest })),
+    });
+
+    const databaseName = nativeId.split(":")[1];
+    if (!databaseName) throw new Error("the selfhost SQLite native id must contain a name");
+    const persisted = new Database(selfhostDatabasePath(root, databaseName));
+    try {
+      expect(persisted.query("SELECT COUNT(*) AS count FROM empty_migration").get()).toEqual({
+        count: 1,
+      });
+    } finally {
+      persisted.close();
+    }
+  });
+
+  test("keeps completed files when a later file fails and retries from the actual prefix", async () => {
+    const local = provider();
+    const database = await local.apply({
+      operationId: "op_db_retry_history",
+      offering: offering("SQLiteDatabase"),
+      identity: identity("retry-history"),
+      spec: {},
+    });
+    expect(database.phase).toBe("succeeded");
+    const nativeId = database.phase === "succeeded" ? database.result.nativeId : "";
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const target = {
+      resourceUid: "uid_retry_history",
+      incarnationId: "dep_retry_history",
+      generation: "1",
+    };
+    const readTarget = { tenantId: "tenant", ...target };
+
+    const migrations = [
+      {
+        path: "0001_init.sql",
+        sql: new TextEncoder().encode(
+          "CREATE TABLE migration_retry (value INTEGER PRIMARY KEY); INSERT INTO migration_retry (value) VALUES (0);",
+        ),
+      },
+      ...Array.from({ length: 101 }, (_, index) => ({
+        path: `${String(index + 2).padStart(4, "0")}_append.sql`,
+        sql: new TextEncoder().encode(`INSERT INTO migration_retry (value) VALUES (${index + 1});`),
+      })),
+      {
+        path: "0103_fail.sql",
+        sql: new TextEncoder().encode(
+          "INSERT INTO migration_retry (value) VALUES (102); INSERT INTO migration_retry (value) VALUES (103);",
+        ),
+      },
+      {
+        path: "0104_after-failure.sql",
+        sql: new TextEncoder().encode("INSERT INTO migration_retry (value) VALUES (104);"),
+      },
+    ].map((migration) => ({
+      ...migration,
+      digest: `sha256:${createHash("sha256").update(migration.sql).digest("hex")}` as const,
+    }));
+    expect(migrations).toHaveLength(104);
+    const seed = migrations[0];
+    if (!seed) throw new Error("the migration retry fixture must have a seed");
+
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_retry_seed",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [seed],
+        expectedPrefix: [],
+        migrations: [seed],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+
+    const databaseName = nativeId.split(":")[1];
+    if (!databaseName) throw new Error("the selfhost SQLite native id must contain a name");
+    const databasePath = selfhostDatabasePath(root, databaseName);
+    const conflict = new Database(databasePath);
+    conflict.query("INSERT INTO migration_retry (value) VALUES (?)").run(103);
+    conflict.close();
+
+    const firstAttempt = await port.applySuffix({
+      operationId: "op_migration_retry_failure",
+      operationMode: "recovery",
+      nativeId,
+      target,
+      desired: migrations,
+      expectedPrefix: [{ path: seed.path, digest: seed.digest }],
+      migrations: migrations.slice(1),
+    });
+    expect(firstAttempt).toMatchObject({ ok: false, failure: { code: "provider_error" } });
+    const afterFailure = await port.readLedger({ nativeId, target: readTarget });
+    expect(afterFailure).toEqual({
+      ok: true,
+      value: migrations.slice(0, 102).map(({ path, digest }) => ({ path, digest })),
+    });
+
+    const afterFailedFile = new Database(databasePath);
+    try {
+      expect(
+        afterFailedFile.query("SELECT value FROM migration_retry WHERE value = 102").all(),
+      ).toEqual([]);
+      expect(afterFailedFile.query("SELECT COUNT(*) AS count FROM migration_retry").get()).toEqual({
+        count: 103,
+      });
+      afterFailedFile.query("DELETE FROM migration_retry WHERE value = ?").run(103);
+    } finally {
+      afterFailedFile.close();
+    }
+
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_retry_recovery",
+        operationMode: "recovery",
+        nativeId,
+        target,
+        desired: migrations,
+        expectedPrefix: migrations.slice(0, 102).map(({ path, digest }) => ({ path, digest })),
+        migrations: migrations.slice(102),
+      }),
+    ).toEqual({ ok: true, value: undefined });
+    expect(await port.readLedger({ nativeId, target: readTarget })).toEqual({
+      ok: true,
+      value: migrations.map(({ path, digest }) => ({ path, digest })),
+    });
+    const complete = new Database(databasePath);
+    try {
+      expect(complete.query("SELECT COUNT(*) AS count FROM migration_retry").get()).toEqual({
+        count: 105,
+      });
+    } finally {
+      complete.close();
+    }
+  });
+
+  test("prevalidates malformed UTF-8, NUL SQL, digest mismatch, duplicate paths, and aggregate bounds before mutation", async () => {
+    const local = provider();
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const migration = (path: string, sql: Uint8Array) => ({
+      path,
+      digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+      sql,
+    });
+
+    const valid = migration(
+      "0001_valid.sql",
+      new TextEncoder().encode("CREATE TABLE prevalidation (value INTEGER PRIMARY KEY);"),
+    );
+    const malformedBytes = new Uint8Array([0xc3, 0x28]);
+    const malformed = migration("0002_malformed.sql", malformedBytes);
+    const malformedResult = await port.applySuffix({
+      operationId: "op_migration_prevalidate_utf8",
+      operationMode: "initial",
+      nativeId: "selfhost-sqlite:prevalidate-utf8:op_db",
+      target: {
+        resourceUid: "uid_prevalidate_utf8",
+        incarnationId: "dep_prevalidate_utf8",
+        generation: "1",
+      },
+      desired: [valid, malformed],
+      expectedPrefix: [],
+      migrations: [valid, malformed],
+    });
+    expect(malformedResult).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(existsSync(selfhostDatabasePath(root, "prevalidate-utf8"))).toBe(false);
+
+    const nulBytes = new TextEncoder().encode("CREATE TABLE nul_sql (value INTEGER);\u0000");
+    const nulSql = migration("0002_nul.sql", nulBytes);
+    const nulResult = await port.applySuffix({
+      operationId: "op_migration_prevalidate_nul",
+      operationMode: "initial",
+      nativeId: "selfhost-sqlite:prevalidate-nul:op_db",
+      target: {
+        resourceUid: "uid_prevalidate_nul",
+        incarnationId: "dep_prevalidate_nul",
+        generation: "1",
+      },
+      desired: [valid, nulSql],
+      expectedPrefix: [],
+      migrations: [valid, nulSql],
+    });
+    expect(nulResult).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(existsSync(selfhostDatabasePath(root, "prevalidate-nul"))).toBe(false);
+
+    const digestMismatch = {
+      ...migration(
+        "0002_digest.sql",
+        new TextEncoder().encode("CREATE TABLE digest_mismatch (value INTEGER);"),
+      ),
+      digest: `sha256:${"0".repeat(64)}` as const,
+    };
+    const digestResult = await port.applySuffix({
+      operationId: "op_migration_prevalidate_digest",
+      operationMode: "initial",
+      nativeId: "selfhost-sqlite:prevalidate-digest:op_db",
+      target: {
+        resourceUid: "uid_prevalidate_digest",
+        incarnationId: "dep_prevalidate_digest",
+        generation: "1",
+      },
+      desired: [valid, digestMismatch],
+      expectedPrefix: [],
+      migrations: [valid, digestMismatch],
+    });
+    expect(digestResult).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(existsSync(selfhostDatabasePath(root, "prevalidate-digest"))).toBe(false);
+
+    const duplicate = migration(
+      "0001_duplicate.sql",
+      new TextEncoder().encode("CREATE TABLE duplicate_paths (value INTEGER PRIMARY KEY);"),
+    );
+    const duplicatePath = migration(
+      duplicate.path,
+      new TextEncoder().encode("CREATE TABLE another_duplicate (value INTEGER PRIMARY KEY);"),
+    );
+    const duplicateResult = await port.applySuffix({
+      operationId: "op_migration_prevalidate_duplicate",
+      operationMode: "initial",
+      nativeId: "selfhost-sqlite:prevalidate-duplicate:op_db",
+      target: {
+        resourceUid: "uid_prevalidate_duplicate",
+        incarnationId: "dep_prevalidate_duplicate",
+        generation: "1",
+      },
+      desired: [duplicate, duplicatePath],
+      expectedPrefix: [],
+      migrations: [duplicate, duplicatePath],
+    });
+    expect(duplicateResult).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(existsSync(selfhostDatabasePath(root, "prevalidate-duplicate"))).toBe(false);
+
+    const oversized = migration(
+      "0001_oversized.sql",
+      new TextEncoder().encode("x".repeat(TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES + 1)),
+    );
+    const oversizedResult = await port.applySuffix({
+      operationId: "op_migration_prevalidate_aggregate",
+      operationMode: "initial",
+      nativeId: "selfhost-sqlite:prevalidate-aggregate:op_db",
+      target: {
+        resourceUid: "uid_prevalidate_aggregate",
+        incarnationId: "dep_prevalidate_aggregate",
+        generation: "1",
+      },
+      desired: [oversized],
+      expectedPrefix: [],
+      migrations: [oversized],
+    });
+    expect(oversizedResult).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(existsSync(selfhostDatabasePath(root, "prevalidate-aggregate"))).toBe(false);
+  });
+
+  test("rejects migration SQL that escapes the file transaction before any prefix is applied", async () => {
+    const local = provider();
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const firstSql = new TextEncoder().encode(
+      "CREATE TABLE policy_guard (value INTEGER PRIMARY KEY);",
+    );
+    const first = {
+      path: "0001_policy.sql",
+      digest: `sha256:${createHash("sha256").update(firstSql).digest("hex")}` as const,
+      sql: firstSql,
+    };
+    const unsafeSql = [
+      "COMMIT;",
+      "END;",
+      "ATTACH DATABASE 'outside.sqlite' AS external;",
+      "VACUUM;",
+      "CREATE TABLE bom_before_commit (value INTEGER);\ufeffCOMMIT;",
+      "CREATE TABLE '_takoform_sqlite_migrations' (value INTEGER);",
+      "PRAGMA writable_schema = ON;",
+    ];
+    for (const [index, sqlText] of unsafeSql.entries()) {
+      const sql = new TextEncoder().encode(sqlText);
+      const last = {
+        path: `0002_unsafe_${index}.sql`,
+        digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+        sql,
+      };
+      const databaseName = `policy-guard-${index}`;
+      const result = await port.applySuffix({
+        operationId: `op_migration_policy_${index}`,
+        operationMode: "initial",
+        nativeId: `selfhost-sqlite:${databaseName}:op_db`,
+        target: {
+          resourceUid: `uid_policy_guard_${index}`,
+          incarnationId: `dep_policy_guard_${index}`,
+          generation: "1",
+        },
+        desired: [first, last],
+        expectedPrefix: [],
+        migrations: [first, last],
+      });
+      expect(result).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+      expect(existsSync(selfhostDatabasePath(root, databaseName))).toBe(false);
+    }
+  });
+
+  test("admits trigger, CASE, quoted-semicolon, comment, and safe PRAGMA SQL", async () => {
+    const local = provider();
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const sql = new TextEncoder().encode(
+      "\ufeffCREATE TABLE policy_positive (\n" +
+        "  value INTEGER PRIMARY KEY,\n" +
+        "  note TEXT,\n" +
+        "  CHECK (CASE WHEN value >= 0 THEN 1 ELSE 0 END = 1)\n" +
+        ");\n" +
+        "\ufeffCREATE \ufeffTRIGGER policy_positive_trigger\n" +
+        "AFTER INSERT ON policy_positive\n" +
+        "BEGIN\n" +
+        "  UPDATE policy_positive\n" +
+        "  SET note = 'quoted;semicolon'\n" +
+        "  WHERE value = NEW.value;\n" +
+        "END;\n" +
+        "-- A semicolon in this comment must not end the trigger body.\n" +
+        "PRAGMA user_version = 42;\n" +
+        "INSERT INTO policy_positive (value, note) VALUES (1, 'initial');\n",
+    );
+    const migration = {
+      path: "0001_policy_positive.sql",
+      digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+      sql,
+    };
+    const nativeId = "selfhost-sqlite:policy-positive:op_db";
+    const target = {
+      resourceUid: "uid_policy_positive",
+      incarnationId: "dep_policy_positive",
+      generation: "1",
+    };
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_policy_positive",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [migration],
+        expectedPrefix: [],
+        migrations: [migration],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+    const persisted = new Database(selfhostDatabasePath(root, "policy-positive"));
+    try {
+      expect(persisted.query("SELECT value, note FROM policy_positive").all()).toEqual([
+        { value: 1, note: "quoted;semicolon" },
+      ]);
+      expect(persisted.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+    } finally {
+      persisted.close();
+    }
+  });
+
+  test("refuses a reordered prefix without executing any suffix SQL", async () => {
+    const local = provider();
+    const database = await local.apply({
+      operationId: "op_db_prefix_guard",
+      offering: offering("SQLiteDatabase"),
+      identity: identity("prefix-guard"),
+      spec: {},
+    });
+    expect(database.phase).toBe("succeeded");
+    const nativeId = database.phase === "succeeded" ? database.result.nativeId : "";
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const firstSql = new TextEncoder().encode(
+      "CREATE TABLE prefix_guard (value INTEGER PRIMARY KEY);",
+    );
+    const first = {
+      path: "0001_first.sql",
+      digest: `sha256:${createHash("sha256").update(firstSql).digest("hex")}` as const,
+      sql: firstSql,
+    };
+    const secondSql = new TextEncoder().encode("INSERT INTO prefix_guard (value) VALUES (2);");
+    const second = {
+      path: "0002_second.sql",
+      digest: `sha256:${createHash("sha256").update(secondSql).digest("hex")}` as const,
+      sql: secondSql,
+    };
+    const thirdSql = new TextEncoder().encode("INSERT INTO prefix_guard (value) VALUES (3);");
+    const third = {
+      path: "0003_third.sql",
+      digest: `sha256:${createHash("sha256").update(thirdSql).digest("hex")}` as const,
+      sql: thirdSql,
+    };
+    const target = {
+      resourceUid: "uid_prefix_guard",
+      incarnationId: "dep_prefix_guard",
+      generation: "1",
+    };
+    expect(
+      await port.applySuffix({
+        operationId: "op_migration_prefix_seed",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [first],
+        expectedPrefix: [],
+        migrations: [first],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+
+    const reordered = await port.applySuffix({
+      operationId: "op_migration_prefix_reordered",
+      operationMode: "recovery",
+      nativeId,
+      target,
+      desired: [second, first, third],
+      expectedPrefix: [],
+      migrations: [second, first, third],
+    });
+    expect(reordered).toMatchObject({ ok: false, failure: { code: "conflict" } });
+    expect(
+      await port.readLedger({
+        nativeId,
+        target: { tenantId: "tenant", ...target },
+      }),
+    ).toEqual({
+      ok: true,
+      value: [{ path: first.path, digest: first.digest }],
+    });
+    const databaseName = nativeId.split(":")[1];
+    if (!databaseName) throw new Error("the selfhost SQLite native id must contain a name");
+    const persisted = new Database(selfhostDatabasePath(root, databaseName));
+    try {
+      expect(persisted.query("SELECT value FROM prefix_guard").all()).toEqual([]);
+    } finally {
+      persisted.close();
+    }
+  });
+
   test("applies real SQL and refuses a moved history", async () => {
     const local = provider();
     const database = await local.apply({

@@ -1625,6 +1625,191 @@ describe("Cloudflare provider executor authority fence", () => {
     }
   });
 
+  test("validates the whole migration artifact before claiming or dispatching its mutation", async () => {
+    for (const invalid of [
+      "nul",
+      "utf8",
+      "aggregate-size",
+      "commit",
+      "bom-commit",
+      "attach",
+    ] as const) {
+      const database = migratedDatabase();
+      try {
+        seedResource(database, {
+          uid: "resource-database",
+          kind: "SQLiteDatabase",
+          name: "database",
+          generation: "7",
+        });
+        seedDeployment(database, {
+          id: "deployment-database",
+          resourceUid: "resource-database",
+          offeringId: "cloudflare.edge.stable-v1.sqlitedatabase",
+          nativeId: "sqlite:database-native",
+        });
+        seedSaga(database, {
+          operationId: "operation-app",
+          resourceUid: "resource-application",
+          kind: "SQLiteMigrationApplication",
+          name: "application",
+          leaseToken: "lease-app",
+        });
+        const firstSql = new TextEncoder().encode("CREATE TABLE first(id INTEGER);");
+        const invalidSql =
+          invalid === "nul"
+            ? new Uint8Array([0])
+            : invalid === "utf8"
+              ? new Uint8Array([0xc3, 0x28])
+              : invalid === "aggregate-size"
+                ? new Uint8Array(10 * 1024 * 1024).fill(0x20)
+                : new TextEncoder().encode(
+                    invalid === "commit"
+                      ? "CREATE TABLE escaped(id INTEGER); COMMIT;"
+                      : invalid === "bom-commit"
+                        ? "CREATE TABLE escaped(id INTEGER);\uFEFFCOMMIT;"
+                        : "ATTACH DATABASE '/tmp/foreign.sqlite' AS foreign_db;",
+                  );
+        const first = { path: "0001.sql", digest: await bytesDigest(firstSql) };
+        const last = { path: "0002.sql", digest: await bytesDigest(invalidSql) };
+        const blobs = new Map([
+          [first.digest, firstSql],
+          [last.digest, invalidSql],
+        ]);
+        let dispatches = 0;
+        const executor = createCloudflareProviderExecutor({
+          provider: async () =>
+            providerStub({
+              sqliteMigrations: {
+                async readLedger() {
+                  return { ok: true, value: [] };
+                },
+                async applySuffix() {
+                  dispatches += 1;
+                  return { ok: true, value: undefined };
+                },
+              },
+            }),
+          sql: createSqliteSql(database),
+          providerInstallationId: "cloudflare.primary",
+          migrationSql: async (_tenantId, digest) => blobs.get(digest) ?? null,
+          clock: () => new Date(1_000),
+        });
+        const request = {
+          operationId: "operation-app",
+          operationMode: "initial" as const,
+          executionAuthority: authority("resource-application", "lease-app"),
+          nativeId: "sqlite:database-native",
+          target: {
+            resourceUid: "resource-database",
+            incarnationId: "deployment-database",
+            generation: "7",
+          },
+          desired: [first, last],
+          expectedPrefix: [],
+          migrations: [first, last],
+        };
+        expect(await executor.applySqliteMigrationSuffix(request)).toEqual({
+          ok: false,
+          failure: deniedFailure(),
+        });
+        expect(dispatches).toBe(0);
+        // Refusal happened before claiming the operation: its valid artifact
+        // may now be submitted without inheriting an invalid pinned intent.
+        expect(
+          await executor.applySqliteMigrationSuffix({
+            ...request,
+            desired: [first],
+            migrations: [first],
+          }),
+        ).toEqual({ ok: true, value: undefined });
+        expect(dispatches).toBe(1);
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("forwards a 105-file migration history with large and zero-byte files unchanged", async () => {
+    const database = migratedDatabase();
+    try {
+      seedResource(database, {
+        uid: "resource-database",
+        kind: "SQLiteDatabase",
+        name: "database",
+        generation: "7",
+      });
+      seedDeployment(database, {
+        id: "deployment-database",
+        resourceUid: "resource-database",
+        offeringId: "cloudflare.edge.stable-v1.sqlitedatabase",
+        nativeId: "sqlite:database-native",
+      });
+      seedSaga(database, {
+        operationId: "operation-large",
+        resourceUid: "resource-application",
+        kind: "SQLiteMigrationApplication",
+        name: "application",
+        leaseToken: "lease-large",
+      });
+      const desired: ProviderSqliteMigration[] = [];
+      const blobs = new Map<string, Uint8Array>();
+      for (let index = 0; index < 105; index += 1) {
+        const sql = new TextEncoder().encode(
+          index === 0 ? "SELECT 1;\n".repeat(11_000) : index === 104 ? "" : `SELECT ${index};`,
+        );
+        const digest = await bytesDigest(sql);
+        desired.push({ path: `${String(index + 1).padStart(4, "0")}.sql`, digest, sql });
+        blobs.set(digest, sql);
+      }
+      let received: readonly ProviderSqliteMigration[] = [];
+      const executor = createCloudflareProviderExecutor({
+        provider: async () =>
+          providerStub({
+            sqliteMigrations: {
+              async readLedger() {
+                return { ok: true, value: [] };
+              },
+              async applySuffix(input) {
+                received = input.desired;
+                return { ok: true, value: undefined };
+              },
+            },
+          }),
+        sql: createSqliteSql(database),
+        providerInstallationId: "cloudflare.primary",
+        migrationSql: async (_tenantId, digest) => blobs.get(digest) ?? null,
+        clock: () => new Date(1_000),
+      });
+      const identities = desired.map(({ path, digest }) => ({ path, digest }));
+      expect(
+        await executor.applySqliteMigrationSuffix({
+          operationId: "operation-large",
+          operationMode: "initial",
+          executionAuthority: authority("resource-application", "lease-large"),
+          nativeId: "sqlite:database-native",
+          target: {
+            resourceUid: "resource-database",
+            incarnationId: "deployment-database",
+            generation: "7",
+          },
+          desired: identities,
+          expectedPrefix: [],
+          migrations: identities,
+        }),
+      ).toEqual({ ok: true, value: undefined });
+      expect(received).toHaveLength(105);
+      expect(received[0]?.sql.byteLength).toBe(110_000);
+      expect(received[104]?.path).toBe("0105.sql");
+      expect(received[104]?.sql.byteLength).toBe(0);
+      expect(received[104]?.digest).toBe(
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      );
+    } finally {
+      database.close();
+    }
+  });
+
   test("rejects extra RPC input members instead of relying on structural typing", async () => {
     const executor = createCloudflareProviderExecutor({
       provider: async () => managedProvider([MODULE_WORKER]),

@@ -142,6 +142,45 @@ managed backend does it, so a write smuggled through it never commits. bun's
 SQLite bindings expose no `SQLITE_LIMIT_ATTACHED`, so the statement gate is the
 control rather than a second one behind it.
 
+### Administrative SQLite migrations
+
+Schema changes belong to `SQLiteMigrationApplication`, not the Worker's
+`edge.sql` binding. The Host resolves the immutable MigrationBundle, verifies
+each file's bytes and digest, and binds the requested ordered history to the
+exact database realization. Runtime SQL statement-count limits are not limits
+on the number of migration files. Artifact admission limits remain owned by
+`src/takoform/limits.ts`.
+
+Before changing any database contents, the executor checks the complete input's
+identity projection, unique paths, UTF-8, artifact bounds, and SQL authority.
+Migration SQL may change the declared database, but may not attach another
+database, load an extension, modify Host bookkeeping, or end the Host's
+transaction. Allowed schema-inspection and constraint pragmas do not grant
+access to storage paths or Host journal settings. Native statement capacity is
+checked before execution on backends that impose that additional limit.
+Allowing a pragma does not override native SQLite semantics. In particular,
+`PRAGMA foreign_keys` cannot change enforcement inside a transaction. The Host
+does not move an application's statements outside its file transaction or
+rewrite them to `defer_foreign_keys`; application migrations must work under
+the selected backend's transactional behavior.
+
+One file and its ledger entry commit atomically. SQLite syntax and constraints
+are checked by the native engine inside that transaction: if a later statement
+fails, none of that file's writes or ledger entry commits. Earlier files stay
+committed. Recovery reads the exact durable prefix and never replays a recorded
+file; a lost acknowledgement is not permission to blindly retry the mutation.
+An empty SQL file is a valid no-op with its own ledger entry; an empty migration
+inventory is not a valid Migration Set.
+
+Cloudflare executes exact, unnormalized statement slices within the same
+file transaction because a file can exceed the native SQL-call limit while its
+individual statements fit. The shared preparation module uses SQLite's pinned
+completeness state machine, including quoted semicolons and trigger bodies; it
+does not rewrite SQL or create new statement identities. The original file's
+digest remains authoritative. Self-host execution may submit the whole file to
+its native engine. A backend capacity refusal does not change the published
+Form's meaning. No experimental runtime API is required.
+
 ### What a Worker's bucket binding may say
 
 `env.MEDIA` is the exact `edge.objects@1.0.0` facade the managed Cloudflare
