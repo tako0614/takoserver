@@ -1,3 +1,4 @@
+import { validateOfferingId } from "./catalog.ts";
 import type { PricePlan, ProviderInstallation, SupplyContract } from "./catalog-compiler.ts";
 import {
   parseHostedPlacement,
@@ -94,11 +95,21 @@ function parseOffering(value: unknown): HostedEdgeOffering {
   }
   return {
     formKind,
-    offeringId: id(item.offeringId),
+    offeringId: offeringId(item.offeringId),
     displayName: bounded(item.displayName, 1, 128),
     pricePlan,
     placement,
   };
+}
+
+function offeringId(value: unknown): string {
+  const result = id(value);
+  try {
+    validateOfferingId(result);
+  } catch {
+    invalid();
+  }
+  return result;
 }
 
 function resourceClass(offering: HostedEdgeOffering): string {

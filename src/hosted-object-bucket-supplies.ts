@@ -1,3 +1,4 @@
+import { validateOfferingId } from "./catalog.ts";
 import type { PricePlan, ProviderInstallation, SupplyContract } from "./catalog-compiler.ts";
 import type { ObjectBucketPlacement } from "./object-bucket-deployment.ts";
 import { parseStrictJson } from "./strict-json.ts";
@@ -82,7 +83,7 @@ function parseSupply(value: unknown): HostedObjectBucketSupply {
     invalid();
   }
   return {
-    offeringId: id(item.offeringId),
+    offeringId: offeringId(item.offeringId),
     displayName: bounded(item.displayName, 1, 128),
     provider,
     providerInstallation,
@@ -90,6 +91,16 @@ function parseSupply(value: unknown): HostedObjectBucketSupply {
     pricePlan,
     placement,
   };
+}
+
+function offeringId(value: unknown): string {
+  const result = id(value);
+  try {
+    validateOfferingId(result);
+  } catch {
+    invalid();
+  }
+  return result;
 }
 
 function parseProvider(value: unknown): HostedObjectBucketProvider {

@@ -56,6 +56,49 @@ const SUPPLY = {
 } as const;
 
 describe("hosted ObjectBucket supply contract", () => {
+  test("requires Offering IDs to fit the durable catalog identity bounds", () => {
+    for (const offeringId of ["a", "ab", "a".repeat(256)]) {
+      expect(() =>
+        parseHostedObjectBucketSupplies(
+          JSON.stringify({
+            kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+            supplies: [{ ...SUPPLY, offeringId }],
+          }),
+        ),
+      ).toThrow("invalid hosted ObjectBucket supplies");
+    }
+
+    for (const offeringId of ["abc", `a${"b".repeat(254)}`]) {
+      expect(
+        parseHostedObjectBucketSupplies(
+          JSON.stringify({
+            kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+            supplies: [{ ...SUPPLY, offeringId }],
+          }),
+        ).supplies[0]?.offeringId,
+      ).toBe(offeringId);
+    }
+  });
+
+  test("keeps hosted lowercase Offering grammar and one-character price-plan IDs", () => {
+    expect(() =>
+      parseHostedObjectBucketSupplies(
+        JSON.stringify({
+          kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+          supplies: [{ ...SUPPLY, offeringId: "Storage/Object" }],
+        }),
+      ),
+    ).toThrow("invalid hosted ObjectBucket supplies");
+
+    const parsed = parseHostedObjectBucketSupplies(
+      JSON.stringify({
+        kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND,
+        supplies: [{ ...SUPPLY, pricePlan: { ...SUPPLY.pricePlan, id: "x" } }],
+      }),
+    );
+    expect(parsed.supplies[0]?.pricePlan.id).toBe("x");
+  });
+
   test("accepts private S3 supply only behind the portable object-bucket Binding", () => {
     const parsed = parseHostedObjectBucketSupplies(
       JSON.stringify({ kind: HOSTED_OBJECT_BUCKET_SUPPLIES_KIND, supplies: [SUPPLY] }),

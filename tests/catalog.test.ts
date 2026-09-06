@@ -59,6 +59,27 @@ function offering(id: string, providerPackRef: string): Offering {
 }
 
 describe("Offering catalog", () => {
+  test("rejects inoperable Offering IDs before availability filtering", () => {
+    for (const id of ["a", "ab", "a".repeat(256)]) {
+      expect(() => createCatalog([offering(id, "alpha")])).toThrow("invalid offering id");
+      expect(() => createCatalog([{ ...offering(id, "alpha"), available: false }])).toThrow(
+        "invalid offering id",
+      );
+      expect(() => createCatalog([{ ...offering(id, "alpha"), retired: true }])).toThrow(
+        "invalid offering id",
+      );
+    }
+  });
+
+  test("accepts the database-safe bounds and token reference alphabet", () => {
+    const shortest = offering("abc", "alpha");
+    const longest = offering(`A${"b".repeat(253)}/`, "beta");
+    const mixed = offering("Edge/Worker.v1", "gamma");
+    const catalog = createCatalog([shortest, longest, mixed]);
+
+    expect(catalog.list().map((entry) => entry.id)).toEqual([shortest.id, longest.id, mixed.id]);
+  });
+
   test("keeps several operator placements for one exact Form", () => {
     const alpha = offering("compute.edge.alpha.global", "alpha");
     const beta = offering("compute.edge.beta.global", "beta");

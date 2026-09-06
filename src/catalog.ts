@@ -2,6 +2,19 @@ import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { canonicalDigest } from "./json.ts";
 
+const OFFERING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,254}$/u;
+
+/**
+ * Offering IDs cross the catalog, provision-token, and Deployment stores.
+ * Keep their domain boundary at the intersection of those durable contracts:
+ * 3..255 characters, with the token reference alphabet.
+ */
+export function validateOfferingId(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !OFFERING_ID.test(value)) {
+    throw new TypeError("invalid offering id");
+  }
+}
+
 /**
  * What Takoserver sells.
  *
@@ -134,6 +147,7 @@ export interface Catalog {
 export function createCatalog(offerings: readonly Offering[]): Catalog {
   const byId = new Map<string, Offering>();
   for (const offering of offerings) {
+    validateOfferingId(offering.id);
     if (byId.has(offering.id)) throw new TypeError(`duplicate offering id: ${offering.id}`);
     byId.set(offering.id, structuredClone(offering));
   }

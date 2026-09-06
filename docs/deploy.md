@@ -14,6 +14,12 @@ bun run deploy -- <surface> --status --environment=<integration|rehearsal|produc
 bun run deploy -- <surface> --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 ```
 
+Catalog Offering IDs are durable references shared by the catalog, provision
+tokens, and Deployments: they must be 3–255 characters and use the token
+reference alphabet (`A–Z`, `a–z`, `0–9`, `.`, `_`, `:`, `/`, `-`). Hosted
+supply parsers retain their existing lower-case grammar for Offerings; this
+bound does not tighten price-plan or other hosted reference fields.
+
 The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector:
 
