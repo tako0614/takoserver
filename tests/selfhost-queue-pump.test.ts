@@ -25,13 +25,16 @@ import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
  */
 
 const QUEUE = "tsq-delivery";
+const QUEUE_NAME = "delivery";
 const DLQ = "tsq-delivery-dlq";
+const DLQ_NAME = "delivery-dlq";
 const SCRIPT = "sw-fixture";
 const VERSION = "v-fixture";
 const TOKEN = "event-token-fixture";
 
 const CONSUMER = {
   queue: QUEUE,
+  queueName: QUEUE_NAME,
   maxBatchSize: 10,
   maxBatchTimeoutSeconds: 0,
   maxConcurrency: 1,
@@ -42,6 +45,7 @@ const CONSUMER = {
 const RETENTION = { messageRetentionSeconds: 345_600, deliveryDelaySeconds: 0 } as const;
 
 interface Delivery {
+  readonly worker: string;
   readonly path: string;
   readonly route: string | undefined;
   readonly token: string | undefined;
@@ -84,8 +88,9 @@ function recordingRuntime(): {
       async has() {
         return true;
       },
-      async probe(_name, path, init) {
+      async probe(name, path, init) {
         const delivery: Delivery = {
+          worker: name,
           path,
           route: init.route,
           token: init.headers[SELFHOST_WORKER_EVENT_TOKEN_HEADER],
@@ -210,10 +215,140 @@ test("delivers a batch on the event route with the version's own token", async (
   // event must not be able to.
   expect(delivery?.route).toBe("events");
   expect(delivery?.token).toBe(TOKEN);
-  expect(delivery?.event.queue).toBe(QUEUE);
+  expect(delivery?.event.queue).toBe(QUEUE_NAME);
   expect(delivery?.event.logicalWorkerId).toBe(SCRIPT);
   expect(delivery?.event.deploymentId).toBe(VERSION);
   expect(delivery?.event.messages?.map((message) => message.attempts)).toEqual([1, 1]);
+  expect(await rows()).toEqual([]);
+});
+
+test("does not reserve messages for a legacy attachment with no portable queue name", async () => {
+  const runtime = recordingRuntime();
+  let idsMinted = 0;
+  const { queueName: _queueName, ...legacyConsumer } = CONSUMER;
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({ consumers: [legacyConsumer] }),
+    clock: () => new Date(millis),
+    randomId: () => `id-${++idsMinted}`,
+  });
+  await enqueue(1);
+
+  expect(await pump.tick()).toBe(0);
+  expect(idsMinted).toBe(0);
+  expect(runtime.deliveries).toEqual([]);
+  expect(await rows()).toMatchObject([{ deliveries: 0, lease_token: null }]);
+});
+
+test("does not reserve messages for an invalid portable queue name", async () => {
+  const runtime = recordingRuntime();
+  let idsMinted = 0;
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({ consumers: [{ ...CONSUMER, queueName: "Delivery_Internal" }] }),
+    clock: () => new Date(millis),
+    randomId: () => `id-${++idsMinted}`,
+  });
+  await enqueue(1);
+
+  expect(await pump.tick()).toBe(0);
+  expect(idsMinted).toBe(0);
+  expect(runtime.deliveries).toEqual([]);
+  expect(await rows()).toMatchObject([{ deliveries: 0, lease_token: null }]);
+});
+
+test("does not spend messages when a legacy dead-letter target has no portable name", async () => {
+  const runtime = recordingRuntime();
+  let idsMinted = 0;
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({
+      consumers: [
+        {
+          ...CONSUMER,
+          maxRetries: 0,
+          deadLetterQueue: { queue: DLQ, ...RETENTION },
+        },
+      ],
+    }),
+    clock: () => new Date(millis),
+    randomId: () => `id-${++idsMinted}`,
+  });
+  await enqueue(1);
+
+  expect(await pump.tick()).toBe(0);
+  expect(idsMinted).toBe(0);
+  expect(runtime.deliveries).toEqual([]);
+  expect(await rows()).toMatchObject([{ queue_id: QUEUE, deliveries: 0, lease_token: null }]);
+});
+
+test("isolates native queues while exposing the same logical name in two tenants", async () => {
+  const runtime = recordingRuntime();
+  const otherQueue = "tsq-other-delivery";
+  const otherScript = "sw-other-fixture";
+  const target = (
+    script: string,
+    versionId: string,
+    eventToken: string,
+    queue: string,
+  ): SelfhostEventTargets => ({
+    async list() {
+      return [
+        {
+          script,
+          versionId,
+          eventToken,
+          handlers: ["queue"] as const,
+          consumers: [{ ...CONSUMER, queue }],
+          crons: [],
+        },
+      ];
+    },
+  });
+  const firstPump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: target(SCRIPT, VERSION, TOKEN, QUEUE),
+    clock: () => new Date(millis),
+  });
+  const otherPump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: target(otherScript, "v-other-fixture", "event-token-other-fixture", otherQueue),
+    clock: () => new Date(millis),
+  });
+  await enqueue(1);
+  await enqueue(1, { queue: otherQueue });
+
+  expect(await firstPump.tick()).toBe(1);
+  expect(await rows()).toMatchObject([{ queue_id: otherQueue }]);
+  expect(await otherPump.tick()).toBe(1);
+  expect(
+    runtime.deliveries
+      .map((delivery) => ({
+        worker: delivery.worker,
+        logicalWorkerId: delivery.event.logicalWorkerId,
+        queue: delivery.event.queue,
+        messageId: delivery.event.messages?.[0]?.messageId,
+      }))
+      .sort((left, right) => left.worker.localeCompare(right.worker)),
+  ).toEqual([
+    {
+      worker: SCRIPT,
+      logicalWorkerId: SCRIPT,
+      queue: QUEUE_NAME,
+      messageId: `m-${QUEUE}-0-${millis}`,
+    },
+    {
+      worker: otherScript,
+      logicalWorkerId: otherScript,
+      queue: QUEUE_NAME,
+      messageId: `m-${otherQueue}-0-${millis}`,
+    },
+  ]);
   expect(await rows()).toEqual([]);
 });
 
@@ -395,7 +530,7 @@ test("a batch too large for one envelope never reaches the dead-letter queue", a
           maxBatchSize: 100,
           maxBatchTimeoutSeconds: 0,
           maxRetries: 0,
-          deadLetterQueue: { queue: DLQ, ...RETENTION },
+          deadLetterQueue: { queue: DLQ, queueName: DLQ_NAME, ...RETENTION },
         },
       ],
     }),
@@ -451,7 +586,12 @@ test("moves a message to the dead-letter queue once its redeliveries are spent",
     sql,
     runtime: runtime.runtime,
     targets: targets({
-      consumers: [{ ...CONSUMER, deadLetterQueue: { queue: DLQ, ...RETENTION } }],
+      consumers: [
+        {
+          ...CONSUMER,
+          deadLetterQueue: { queue: DLQ, queueName: DLQ_NAME, ...RETENTION },
+        },
+      ],
     }),
     clock: () => new Date(millis),
     randomId: () => `dead-${millis}`,
@@ -468,6 +608,39 @@ test("moves a message to the dead-letter queue once its redeliveries are spent",
   expect(settled[0]).toMatchObject({ queue_id: DLQ, deliveries: 0 });
   // A NEW message there: new identity, new acceptance instant, count from one.
   expect(String(settled[0]?.message_id)).not.toContain(QUEUE);
+});
+
+test("routes dead-letter bytes by native id and exposes the DLQ logical name", async () => {
+  const runtime = recordingRuntime();
+  runtime.answer = (delivery) =>
+    delivery.event.queue === QUEUE_NAME ? retryEvery(delivery) : acknowledgeEvery(delivery);
+  const primary = {
+    ...CONSUMER,
+    maxRetries: 0,
+    deadLetterQueue: { queue: DLQ, queueName: DLQ_NAME, ...RETENTION },
+  };
+  const deadLetterConsumer = {
+    ...CONSUMER,
+    queue: DLQ,
+    queueName: DLQ_NAME,
+    maxRetries: 0,
+  };
+  let minted = 0;
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets({ consumers: [primary, deadLetterConsumer] }),
+    clock: () => new Date(millis),
+    randomId: () => `id-${++minted}`,
+  });
+  await enqueue(1);
+
+  expect(await pump.tick()).toBe(2);
+  expect(runtime.deliveries.map((delivery) => delivery.event.queue)).toEqual([
+    QUEUE_NAME,
+    DLQ_NAME,
+  ]);
+  expect(await rows()).toEqual([]);
 });
 
 test("drops an exhausted message when no dead-letter queue is declared", async () => {

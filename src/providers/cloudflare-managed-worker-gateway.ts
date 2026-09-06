@@ -25,10 +25,13 @@ export const TAKOSERVER_MANAGED_WORKER_GATEWAY_PROP = "takoserverManagedWorkerGa
 export const TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS = Object.freeze({
   host: "takoserver.managed-worker-host-route@v1",
   worker: "takoserver.managed-worker-release-route@v1",
-  queue: "takoserver.managed-worker-queue-route@v1",
+  queue: "takoserver.managed-worker-queue-route@v2",
   schedule: "takoserver.managed-worker-schedule-route@v1",
   tombstone: "takoserver.managed-worker-route-tombstone@v1",
 } as const);
+/** Persisted before queue routes carried the portable AtLeastOnceQueue identity. */
+export const TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA =
+  "takoserver.managed-worker-queue-route@v1" as const;
 export const TAKOSERVER_MANAGED_WORKER_ROUTE_TOMBSTONE_SCHEMA =
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.tombstone;
 
@@ -47,6 +50,7 @@ const MAX_EVENT_RESPONSE_BYTES = 64 * 1024;
 const MAX_RETRY_DELAY_SECONDS = 86_400;
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,511}$/u;
 const QUEUE_NAME = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$/u;
+const PORTABLE_QUEUE_NAME = /^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const HOSTNAME =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u;
 const textEncoder = new TextEncoder();
@@ -73,6 +77,8 @@ export interface ManagedWorkerQueueRoute {
   readonly schema: typeof TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue;
   readonly generation: number;
   readonly logicalWorkerId: string;
+  /** Exact AtLeastOnceQueue.metadata.name exposed by worker.runtime. */
+  readonly portableQueueName: string;
 }
 
 export interface ManagedWorkerScheduleRoute {
@@ -177,11 +183,12 @@ export function parseManagedWorkerReleaseRoute(value: unknown): ManagedWorkerRel
 /** Parse and validate one provider-authored Queue route document. */
 export function parseManagedWorkerQueueRoute(value: unknown): ManagedWorkerQueueRoute {
   if (!isRecord(value)) throw new TypeError("managed Worker Queue route is invalid");
-  exactKeys(value, ["schema", "generation", "logicalWorkerId"]);
+  exactKeys(value, ["schema", "generation", "logicalWorkerId", "portableQueueName"]);
   if (
     value.schema !== TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue ||
     !isGeneration(value.generation) ||
-    !isRouteToken(value.logicalWorkerId)
+    !isRouteToken(value.logicalWorkerId) ||
+    !isPortableQueueName(value.portableQueueName)
   ) {
     throw new TypeError("managed Worker Queue route is invalid");
   }
@@ -189,6 +196,7 @@ export function parseManagedWorkerQueueRoute(value: unknown): ManagedWorkerQueue
     schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
     generation: value.generation,
     logicalWorkerId: value.logicalWorkerId,
+    portableQueueName: value.portableQueueName,
   });
 }
 
@@ -619,6 +627,10 @@ async function dispatchQueue(
     return;
   }
   if (routeRead.kind !== "valid") {
+    // A v1 route has no authoritative portable Queue name. Cloudflare can
+    // only re-attempt this delivery, which may consume native retry/retention
+    // budget; an exact QueueConsumer reapply upgrades the route before any
+    // customer Worker is invoked.
     settleRetry(batch.messages);
     return;
   }
@@ -635,7 +647,12 @@ async function dispatchQueue(
   // bodies retried itself into the dead-letter queue without the Worker ever
   // being invoked. Each chunk below is an envelope this gateway can actually
   // send, and each is settled on its own answer.
-  const chunks = splitQueueBatch(batch, route.logicalWorkerId, release.deploymentId);
+  const chunks = splitQueueBatch(
+    batch,
+    route.portableQueueName,
+    route.logicalWorkerId,
+    release.deploymentId,
+  );
   let settlementError: unknown;
   for (const chunk of chunks) {
     try {
@@ -741,6 +758,7 @@ async function dispatchQueueChunk(
  */
 function splitQueueBatch(
   batch: ManagedWorkerMessageBatch,
+  portableQueueName: string,
   logicalWorkerId: string,
   deploymentId: string,
 ): readonly ManagedWorkerQueueChunk[] {
@@ -763,7 +781,7 @@ function splitQueueBatch(
     overhead =
       utf8Length(
         JSON.stringify(
-          queueEnvelope(batch.batchId, batch.queue, logicalWorkerId, deploymentId, []),
+          queueEnvelope(batch.batchId, portableQueueName, logicalWorkerId, deploymentId, []),
         ),
       ) + idSuffixBytes;
   } catch {
@@ -802,7 +820,7 @@ function splitQueueBatch(
       return {
         event: queueEnvelope(
           batchId,
-          batch.queue,
+          portableQueueName,
           logicalWorkerId,
           deploymentId,
           values as readonly ManagedWorkerQueueMessage[],
@@ -919,6 +937,9 @@ function queueEnvelope(
 ): ManagedWorkerQueueEvent {
   if (!isRouteToken(batchId)) {
     throw new TypeError("managed Worker Queue batch id is invalid");
+  }
+  if (!isPortableQueueName(queue)) {
+    throw new TypeError("managed Worker portable Queue name is invalid");
   }
   if (messages.length > MAX_QUEUE_MESSAGES) {
     throw new TypeError("managed Worker Queue event holds too many messages");
@@ -1405,6 +1426,15 @@ function canonicalCron(value: string): string {
 
 function isQueueName(value: unknown): value is string {
   return typeof value === "string" && QUEUE_NAME.test(value);
+}
+
+/** Exact portable Resource-name grammar used by AtLeastOnceQueue.metadata.name. */
+export function isManagedWorkerPortableQueueName(value: unknown): value is string {
+  return isPortableQueueName(value);
+}
+
+function isPortableQueueName(value: unknown): value is string {
+  return typeof value === "string" && PORTABLE_QUEUE_NAME.test(value);
 }
 
 function routeToken(value: string, label: string): string {

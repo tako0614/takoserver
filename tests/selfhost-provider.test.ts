@@ -24,6 +24,7 @@ import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-inpu
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostDataPlaneAccess,
+  createSelfhostEventTargets,
   createSelfhostProvider,
   type SelfhostDataPlaneMaintenance,
   selfhostDatabasePath,
@@ -3774,7 +3775,9 @@ describe("the SQLite migration ledger", () => {
  */
 describe("attaching a Queue Consumer and a Cron Trigger", () => {
   const QUEUE_ID = "tsq-attachment-fixture";
+  const QUEUE_NAME = "delivery";
   const DLQ_ID = "tsq-attachment-fixture-dlq";
+  const DLQ_NAME = "delivery-dlq";
   const EVENTS = {
     async forgetSchedules() {},
   };
@@ -3806,7 +3809,7 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
 
   const consumerSpec = {
     worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-    queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+    queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
     maxBatchSize: 10,
     maxBatchTimeoutSeconds: 1,
     maxRetries: 3,
@@ -3839,6 +3842,112 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" }, cron },
       relations: [relation("/worker", "ModuleWorker", "hello")],
     });
+
+  test("persists logical queue names separately from native routing ids", async () => {
+    const local = provider({ events: EVENTS });
+    const script = await publish(local);
+    expect(
+      await applyConsumer(
+        local,
+        {
+          deadLetterQueue: {
+            apiVersion: EDGE_API,
+            kind: "AtLeastOnceQueue",
+            name: DLQ_NAME,
+          },
+        },
+        [queueRelation("/deadLetterQueue", DLQ_NAME, DLQ_ID)],
+      ),
+    ).toMatchObject({ phase: "succeeded" });
+
+    const persisted = JSON.parse(
+      readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as { consumers?: readonly unknown[] };
+    const expectedConsumers = [
+      {
+        queue: QUEUE_ID,
+        queueName: QUEUE_NAME,
+        maxBatchSize: 10,
+        maxBatchTimeoutSeconds: 1,
+        maxConcurrency: 4,
+        maxRetries: 3,
+        retryDelaySeconds: 60,
+        deadLetterQueue: {
+          queue: DLQ_ID,
+          queueName: DLQ_NAME,
+          messageRetentionSeconds: 345_600,
+          deliveryDelaySeconds: 0,
+        },
+      },
+    ] as const;
+    expect(persisted.consumers).toEqual(expectedConsumers);
+    expect((await createSelfhostEventTargets(root).list())[0]?.consumers).toEqual(
+      expectedConsumers,
+    );
+  });
+
+  test("requires authoritative reapply for a legacy attachment before delivery resumes", async () => {
+    const local = provider({ events: EVENTS });
+    const script = await publish(local);
+    const deadLetterSpec = {
+      deadLetterQueue: {
+        apiVersion: EDGE_API,
+        kind: "AtLeastOnceQueue",
+        name: DLQ_NAME,
+      },
+    };
+    const deadLetterRelation = queueRelation("/deadLetterQueue", DLQ_NAME, DLQ_ID);
+    const applied = await applyConsumer(local, deadLetterSpec, [deadLetterRelation]);
+    if (applied.phase !== "succeeded") throw new Error("the Queue Consumer did not attach");
+    const path = join(root, "selfhost", "scripts", `${script}.json`);
+    const legacy = JSON.parse(readFileSync(path, "utf8")) as {
+      consumers: Array<Record<string, unknown>>;
+    };
+    for (const consumer of legacy.consumers) {
+      delete consumer.queueName;
+      if (
+        typeof consumer.deadLetterQueue === "object" &&
+        consumer.deadLetterQueue !== null &&
+        !Array.isArray(consumer.deadLetterQueue)
+      ) {
+        delete (consumer.deadLetterQueue as Record<string, unknown>).queueName;
+      }
+    }
+    await writeFile(path, JSON.stringify(legacy));
+
+    const relations = [
+      relation("/worker", "ModuleWorker", "hello"),
+      queueRelation("/queue", QUEUE_NAME, QUEUE_ID),
+      deadLetterRelation,
+    ];
+    expect(
+      await local.observe({
+        offering: offering("QueueConsumer"),
+        nativeId: applied.result.nativeId,
+        identity: identity("hello-consumer"),
+        spec: { ...consumerSpec, ...deadLetterSpec },
+        relations,
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "not_found",
+        message: "the Queue Consumer must be reapplied to restore its portable queue identity",
+      },
+    });
+
+    expect(await applyConsumer(local, deadLetterSpec, [deadLetterRelation])).toMatchObject({
+      phase: "succeeded",
+    });
+    expect(
+      (JSON.parse(readFileSync(path, "utf8")) as { consumers: Array<Record<string, unknown>> })
+        .consumers[0],
+    ).toMatchObject({
+      queue: QUEUE_ID,
+      queueName: QUEUE_NAME,
+      deadLetterQueue: { queue: DLQ_ID, queueName: DLQ_NAME },
+    });
+  });
 
   test("says it is delivering and scheduled only when this machine runs both", async () => {
     const configured = provider({ events: EVENTS });
@@ -3986,6 +4095,26 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       ],
     });
     expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", message: "the Queue Consumer is incomplete" },
+    });
+  });
+
+  test("refuses a deployed queue relation whose name cannot enter worker.runtime", async () => {
+    const local = provider({ events: EVENTS });
+    await publish(local);
+    expect(
+      await local.apply({
+        operationId: "op_consumer",
+        offering: offering("QueueConsumer"),
+        identity: identity("hello-consumer"),
+        spec: consumerSpec,
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          queueRelation("/queue", "Delivery_Internal", QUEUE_ID),
+        ],
+      }),
+    ).toMatchObject({
       phase: "failed",
       failure: { code: "invalid_spec", message: "the Queue Consumer is incomplete" },
     });

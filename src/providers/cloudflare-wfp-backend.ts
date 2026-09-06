@@ -37,10 +37,12 @@ import {
   managedObjectReceiptInstanceName,
 } from "./cloudflare-managed-object-receipt.ts";
 import {
+  isManagedWorkerPortableQueueName,
   managedWorkerHostRouteKey,
   managedWorkerQueueRouteKey,
   managedWorkerReleaseRouteKey,
   managedWorkerScheduleRouteKey,
+  parseManagedWorkerQueueRoute,
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
 } from "./cloudflare-managed-worker-gateway.ts";
 import type {
@@ -2533,19 +2535,32 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     const resourceUid = input.identity.uid;
     const worker = relationDeployment(input.relations, "/worker", "worker");
     const queue = relationDeployment(input.relations, "/queue", "queue");
+    const queueResource = relationResource(input.relations, "/queue", "AtLeastOnceQueue");
     const queueName = relationOutput(input.relations, "/queue", "queueName");
-    const deadLetter = relationDeployment(input.relations, "/deadLetterQueue", "queue", true);
-    const deadLetterName = deadLetter
+    const portableQueueName = queueResource?.metadata.name;
+    const declaredDeadLetter = input.spec.deadLetterQueue !== undefined;
+    const deadLetter = declaredDeadLetter
+      ? relationDeployment(input.relations, "/deadLetterQueue", "queue")
+      : null;
+    const deadLetterResource = declaredDeadLetter
+      ? relationResource(input.relations, "/deadLetterQueue", "AtLeastOnceQueue")
+      : null;
+    const deadLetterName = declaredDeadLetter
       ? relationOutput(input.relations, "/deadLetterQueue", "queueName")
       : undefined;
+    const portableDeadLetterQueueName = deadLetterResource?.metadata.name;
     const settings = consumerSettings(input.spec);
     if (
       !resourceUid ||
       !worker ||
       !queue ||
       !queueName ||
+      !isManagedWorkerPortableQueueName(portableQueueName) ||
       !settings ||
-      (deadLetter && !deadLetterName)
+      (declaredDeadLetter &&
+        (!deadLetter ||
+          !deadLetterName ||
+          !isManagedWorkerPortableQueueName(portableDeadLetterQueueName)))
     ) {
       return failed("invalid_spec", "the managed Queue Consumer is incomplete");
     }
@@ -2556,12 +2571,14 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       ...(deadLetterName ? { dead_letter_queue: deadLetterName } : {}),
     };
     const descriptorDigest = await digestJson({
-      schema: "takoserver.cloudflare-wfp-queue-consumer@v1",
+      schema: "takoserver.cloudflare-wfp-queue-consumer@v2",
       providerId: this.#providerId,
       resourceUid,
       logicalWorkerId: worker.name,
       queueId: queue.name,
       queueName,
+      portableQueueName,
+      portableDeadLetterQueueName: portableDeadLetterQueueName ?? null,
       desired,
     });
     const provisionalNativeId = `consumer:${queue.name}:pending-${(await digestText(resourceUid)).slice(7, 47)}`;
@@ -2583,7 +2600,13 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       logicalWorkerId: worker.name,
       operationId: input.operationId,
       descriptorDigest,
-      observed: { queueId: queue.name, queueName, desired },
+      observed: {
+        queueId: queue.name,
+        queueName,
+        portableQueueName,
+        portableDeadLetterQueueName: portableDeadLetterQueueName ?? null,
+        desired,
+      },
       ...(input.previous ? { predecessor: { nativeId: input.previous.nativeId } } : {}),
     });
     if (claim.outcome === "conflict") {
@@ -2723,7 +2746,27 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
     const current = await this.#state.route("queue", routeKey);
     let route = current;
-    if (!input.previous) {
+    if (input.previous) {
+      if (
+        current?.state !== "active" ||
+        current.ownerNativeId !== routeOwnerNativeId ||
+        current.value.logicalWorkerId !== worker.name
+      ) {
+        return failed("conflict", "the managed Queue route changed");
+      }
+      route = await this.#state.putRoute({
+        kind: "queue",
+        key: routeKey,
+        ownerNativeId: routeOwnerNativeId,
+        operationId: routeMutationOperationId,
+        predecessor: { kind: "exact", route: current },
+        value: {
+          schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
+          logicalWorkerId: worker.name,
+          portableQueueName,
+        },
+      });
+    } else {
       if (
         current?.state === "active" &&
         (current.ownerNativeId !== routeOwnerNativeId ||
@@ -2748,14 +2791,9 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
         value: {
           schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
           logicalWorkerId: worker.name,
+          portableQueueName,
         },
       });
-    } else if (
-      current?.state !== "active" ||
-      current.ownerNativeId !== routeOwnerNativeId ||
-      current.value.logicalWorkerId !== worker.name
-    ) {
-      return failed("conflict", "the managed Queue route changed");
     }
     if (!route) {
       return input.previous
@@ -2774,6 +2812,8 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       consumerId,
       queueId: queue.name,
       queueName,
+      portableQueueName,
+      portableDeadLetterQueueName: portableDeadLetterQueueName ?? null,
       scriptName: worker.name,
       gatewayWorkerName: this.gatewayWorkerName,
       routeKey,
@@ -3298,8 +3338,29 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
     }
     const desired = record(receipt.observed.consumerClosure);
     const routeKey = text(receipt.observed.routeKey);
-    if (!desired || !routeKey)
-      return failed("provider_error", "the Queue Consumer receipt is malformed");
+    const nativeQueueName = text(receipt.observed.queueName);
+    const portableQueueName = text(receipt.observed.portableQueueName);
+    const routeGeneration = integer(receipt.observed.routeGeneration);
+    let expectedRouteKey: string | undefined;
+    try {
+      expectedRouteKey = nativeQueueName ? managedWorkerQueueRouteKey(nativeQueueName) : undefined;
+    } catch {
+      expectedRouteKey = undefined;
+    }
+    if (
+      !desired ||
+      !routeKey ||
+      !expectedRouteKey ||
+      routeKey !== expectedRouteKey ||
+      !isManagedWorkerPortableQueueName(portableQueueName) ||
+      routeGeneration === undefined ||
+      routeGeneration < 1
+    ) {
+      return failed(
+        "not_found",
+        "the managed Queue Consumer must be reapplied to restore its portable queue identity",
+      );
+    }
     const read = await this.#client.json(
       "GET",
       `/accounts/${encodeURIComponent(this.#accountId)}/queues/${encodeURIComponent(native.parent)}/consumers/${encodeURIComponent(native.name)}`,
@@ -3318,12 +3379,25 @@ export class CloudflareWfpBackend implements CloudflareWorkerBackend {
       return failed("provider_error", "the Queue Consumer readback closure drifted");
     }
     const route = await this.#state.route("queue", routeKey);
+    let routeValue: ReturnType<typeof parseManagedWorkerQueueRoute> | null;
+    try {
+      routeValue = route?.state === "active" ? parseManagedWorkerQueueRoute(route.value) : null;
+    } catch {
+      routeValue = null;
+    }
     if (
       route?.state !== "active" ||
       route.ownerNativeId !== `consumer:${resourceUid}` ||
-      route.value.logicalWorkerId !== receipt.logicalWorkerId
+      route.generation !== routeGeneration ||
+      !routeValue ||
+      routeValue.generation !== routeGeneration ||
+      routeValue.logicalWorkerId !== receipt.logicalWorkerId ||
+      routeValue.portableQueueName !== portableQueueName
     ) {
-      return failed("not_found", "the managed Queue Consumer route is absent");
+      return failed(
+        "not_found",
+        "the managed Queue Consumer must be reapplied to restore its portable queue identity",
+      );
     }
     return succeeded({ nativeId, observed: receipt.observed as JsonObject, outputs: {} });
   }

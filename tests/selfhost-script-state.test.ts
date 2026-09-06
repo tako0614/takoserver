@@ -19,6 +19,50 @@ afterEach(() => {
 });
 
 describe("self-host Worker script state", () => {
+  test("round-trips native and portable queue identities across restart", async () => {
+    const firstProcess = createSelfhostScriptStateStore({ root });
+    await firstProcess.write("script-one", null, {
+      activeVersion: "v-one",
+      domains: [],
+      consumers: [
+        {
+          queue: "tsq-native-delivery",
+          queueName: "delivery",
+          maxBatchSize: 10,
+          maxBatchTimeoutSeconds: 1,
+          maxConcurrency: 2,
+          maxRetries: 3,
+          retryDelaySeconds: 60,
+          deadLetterQueue: {
+            queue: "tsq-native-delivery-dlq",
+            queueName: "delivery-dlq",
+            messageRetentionSeconds: 345_600,
+            deliveryDelaySeconds: 0,
+          },
+        },
+      ],
+    });
+
+    const restartedProcess = createSelfhostScriptStateStore({ root });
+    expect((await restartedProcess.read("script-one")).state.consumers).toEqual([
+      {
+        queue: "tsq-native-delivery",
+        queueName: "delivery",
+        maxBatchSize: 10,
+        maxBatchTimeoutSeconds: 1,
+        maxConcurrency: 2,
+        maxRetries: 3,
+        retryDelaySeconds: 60,
+        deadLetterQueue: {
+          queue: "tsq-native-delivery-dlq",
+          queueName: "delivery-dlq",
+          messageRetentionSeconds: 345_600,
+          deliveryDelaySeconds: 0,
+        },
+      },
+    ]);
+  });
+
   test("fails closed without replacing a malformed existing state", async () => {
     await mkdir(root, { recursive: true });
     const path = join(root, "script-one.json");

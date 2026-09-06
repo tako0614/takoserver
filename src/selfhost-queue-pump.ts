@@ -15,7 +15,10 @@ import {
   type SelfhostQueueDecision,
   selfhostQueueEvent,
 } from "./providers/selfhost-events.ts";
-import type { SelfhostQueueConsumerAttachment } from "./providers/selfhost-script-state.ts";
+import {
+  isSelfhostPortableQueueName,
+  type SelfhostQueueConsumerAttachment,
+} from "./providers/selfhost-script-state.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
 /**
@@ -162,6 +165,24 @@ interface DeliveryOutcome {
   readonly answered: boolean;
 }
 
+type DeliverableQueueConsumer = SelfhostQueueConsumerAttachment & {
+  readonly queueName: string;
+  readonly deadLetterQueue?: NonNullable<SelfhostQueueConsumerAttachment["deadLetterQueue"]> & {
+    readonly queueName: string;
+  };
+};
+
+/** Legacy attachments retain their messages until an authoritative reapply names every queue. */
+function isDeliverableQueueConsumer(
+  consumer: SelfhostQueueConsumerAttachment,
+): consumer is DeliverableQueueConsumer {
+  return (
+    isSelfhostPortableQueueName(consumer.queueName) &&
+    (consumer.deadLetterQueue === undefined ||
+      isSelfhostPortableQueueName(consumer.deadLetterQueue.queueName))
+  );
+}
+
 export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): SelfhostQueuePump {
   const now = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? (() => crypto.randomUUID());
@@ -189,7 +210,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    * would have to throw away, and throwing away a batch is what a queue must
    * never do.
    */
-  const budgetFor = (target: SelfhostEventTarget, consumer: SelfhostQueueConsumerAttachment) =>
+  const budgetFor = (target: SelfhostEventTarget, consumer: DeliverableQueueConsumer) =>
     MAX_SELFHOST_EVENT_REQUEST_BYTES -
     utf8Bytes(
       JSON.stringify({
@@ -198,7 +219,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
         batchId: "",
         logicalWorkerId: target.script,
         deploymentId: target.versionId,
-        queue: consumer.queue,
+        queue: consumer.queueName,
         messages: [],
       }),
     ) -
@@ -212,7 +233,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    * timeout has not elapsed, or another pass took the rows first.
    */
   const reserve = async (
-    consumer: SelfhostQueueConsumerAttachment,
+    consumer: DeliverableQueueConsumer,
     millis: number,
     budget: number,
   ): Promise<ReservedBatch | null> => {
@@ -321,7 +342,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    */
   const deliver = async (
     target: SelfhostEventTarget,
-    consumer: SelfhostQueueConsumerAttachment,
+    consumer: DeliverableQueueConsumer,
     reserved: ReservedBatch,
     deadlineMillis: number,
   ): Promise<DeliveryOutcome> => {
@@ -331,7 +352,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
         batchId: randomId(),
         script: target.script,
         publication: target.versionId,
-        queue: consumer.queue,
+        queue: consumer.queueName,
         messages: reserved.messages.map((message) => ({
           messageId: message.messageId,
           timestampMillis: message.enqueuedAtMillis,
@@ -395,7 +416,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    */
   const split = async (
     target: SelfhostEventTarget,
-    consumer: SelfhostQueueConsumerAttachment,
+    consumer: DeliverableQueueConsumer,
     reserved: ReservedBatch,
     deadlineMillis: number,
   ): Promise<DeliveryOutcome> => {
@@ -510,6 +531,9 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     target: SelfhostEventTarget,
     consumer: SelfhostQueueConsumerAttachment,
   ): Promise<number> => {
+    // Checked before the first SQL read, lease, attempt increment, or
+    // settlement. The native id cannot be reversed into the logical name.
+    if (!isDeliverableQueueConsumer(consumer)) return 0;
     const key = `${target.script} ${consumer.queue}`;
     const start = now().getTime();
     const waiting = silence.get(key);

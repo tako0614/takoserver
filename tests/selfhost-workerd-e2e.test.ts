@@ -815,6 +815,7 @@ export default {
 `;
 
 const QUEUE_ID = "tsq-e2e-delivery";
+const QUEUE_NAME = "delivery";
 const DLQ_ID = "tsq-e2e-delivery-dlq";
 const CRON = "* * * * *";
 
@@ -899,7 +900,7 @@ async function bootEvents(): Promise<{
       queueProducerBindings: [
         {
           name: "QUEUE",
-          resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+          resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
         },
       ],
     },
@@ -913,7 +914,7 @@ async function bootEvents(): Promise<{
         `selfhost-kv:${KV_NAMESPACE}:op_kv`,
         { namespaceId: KV_NAMESPACE },
       ),
-      queueRelation("/queueProducerBindings/0/resource", "delivery", QUEUE_ID),
+      queueRelation("/queueProducerBindings/0/resource", QUEUE_NAME, QUEUE_ID),
     ],
   });
   expect(version.phase).toBe("succeeded");
@@ -957,7 +958,7 @@ async function bootEvents(): Promise<{
     identity: identity("hello-consumer"),
     spec: {
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery" },
+      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
       deadLetterQueue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: "delivery-dlq" },
       maxBatchSize: 10,
       maxBatchTimeoutSeconds: 0,
@@ -967,7 +968,7 @@ async function bootEvents(): Promise<{
     },
     relations: [
       relation("/worker", "ModuleWorker", "hello"),
-      queueRelation("/queue", "delivery", QUEUE_ID),
+      queueRelation("/queue", QUEUE_NAME, QUEUE_ID),
       queueRelation("/deadLetterQueue", "delivery-dlq", DLQ_ID),
     ],
   });
@@ -1019,7 +1020,7 @@ test.skipIf(WORKERD === null)(
     };
     expect(observed.seen.map((entry) => entry.note).sort()).toEqual(["one", "three", "two"]);
     expect(observed.seen.every((entry) => entry.attempts === 1)).toBe(true);
-    expect(observed.seen.every((entry) => entry.queue === QUEUE_ID)).toBe(true);
+    expect(observed.seen.every((entry) => entry.queue === QUEUE_NAME)).toBe(true);
     // Acknowledged means gone: a second pass has nothing left to deliver.
     expect(await pump.tick()).toBe(0);
     expect(await sql.query("SELECT message_id FROM selfhost_queue_messages", [])).toEqual([]);

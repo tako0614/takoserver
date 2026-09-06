@@ -433,6 +433,24 @@ undeliverable message belongs — and every message beside it in the same batch 
 delivered normally. Takoserver's own producer facade caps a message at 127 000
 bytes, so this is a message some other producer put on the queue.
 
+Cloudflare's `batch.queue` is the provider-native ingress name (`tsq-*`), not
+the Queue identity the portable Worker ABI exposes. The gateway continues to
+use that native name as the D1 route key. A queue route v2 separately carries
+the exact `AtLeastOnceQueue.metadata.name`; after selecting the route, the
+gateway projects only that value as the customer event's `queue` field. Native
+queue ids and names remain the authority for provisioning, consumer attachment,
+dead-letter routing, and ingress.
+
+The route-version transition is deliberately fail-closed in both mixed
+directions. An older gateway rejects a v2 document, and the current gateway
+rejects a v1 document that has no portable name. In either case it invokes no
+customer Worker and explicitly retries every native message. That refusal is
+not lossless parking: Cloudflare counts the attempt against the consumer's retry
+and retention policy, so a prolonged mixed rollout can move messages to the
+dead-letter queue or exhaust retention. There is no migration that guesses a
+portable name from `tsq-*`; an authoritative reapply of the exact QueueConsumer
+keeps its existing native consumer and CAS-replaces its exact route with v2.
+
 ## Retired Cloudflare ObjectBucket drain
 
 One closed recovery mode remains for Deployments already recorded under the

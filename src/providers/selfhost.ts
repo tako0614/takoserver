@@ -69,6 +69,7 @@ import {
 } from "./selfhost-runtime-bindings.ts";
 import {
   createSelfhostScriptStateStore,
+  isSelfhostPortableQueueName,
   type SelfhostQueueConsumerAttachment,
   type SelfhostQueueTarget,
   type SelfhostScriptState,
@@ -170,7 +171,6 @@ const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 /** The Form's own grammar and ceiling for a `kvBindings`/`sqliteBindings` name. */
 const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
 const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
-
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 /**
  * How long a ledger statement waits for a tenant's lock, in milliseconds.
@@ -2004,7 +2004,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const attachedQueue = (
     input: { readonly relations?: readonly ProviderRelation[] },
     pointer: string,
-  ): SelfhostQueueTarget | null => {
+  ): (SelfhostQueueTarget & { readonly queueName: string }) | null => {
     const relation = input.relations?.find((candidate) => candidate.pointer === pointer);
     const queue = selfhostNamespaceTarget(
       relation,
@@ -2013,7 +2013,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       databasePath,
     );
     const settings = queueSettings(relation);
-    return queue && settings ? { queue, ...settings } : null;
+    const queueName = relation?.resource.metadata.name;
+    return queue && settings && isSelfhostPortableQueueName(queueName)
+      ? { queue, queueName, ...settings }
+      : null;
   };
 
   /** One required integer limit of a Queue Consumer, inside its Form's range. */
@@ -2110,6 +2113,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const attachment: SelfhostQueueConsumerAttachment = {
       queue: queue.queue,
+      queueName: queue.queueName,
       maxBatchSize: consumerLimit(input.spec, "maxBatchSize", 1, 100),
       maxBatchTimeoutSeconds: consumerLimit(input.spec, "maxBatchTimeoutSeconds", 0, 60),
       maxConcurrency: consumerLimit(input.spec, "maxConcurrency", 1, 250),
@@ -2775,13 +2779,30 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           case "QueueConsumer": {
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             const queue = attachedQueue(input, "/queue");
-            if (!worker || !queue) {
+            const declaredDeadLetter = input.spec.deadLetterQueue !== undefined;
+            const deadLetterQueue = declaredDeadLetter
+              ? attachedQueue(input, "/deadLetterQueue")
+              : null;
+            if (!worker || !queue || (declaredDeadLetter && !deadLetterQueue)) {
               return failed("not_found", "the Queue Consumer has no attachment relations");
             }
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const { state } = await readScriptState(script);
-            if (!(state.consumers ?? []).some((entry) => entry.queue === queue.queue)) {
+            const attached = (state.consumers ?? []).find((entry) => entry.queue === queue.queue);
+            if (!attached) {
               return failed("not_found", "the Queue Consumer is not durably attached");
+            }
+            if (
+              attached.queueName !== queue.queueName ||
+              (deadLetterQueue
+                ? attached.deadLetterQueue?.queue !== deadLetterQueue.queue ||
+                  attached.deadLetterQueue.queueName !== deadLetterQueue.queueName
+                : attached.deadLetterQueue !== undefined)
+            ) {
+              return failed(
+                "not_found",
+                "the Queue Consumer must be reapplied to restore its portable queue identity",
+              );
             }
             return succeeded({
               nativeId: input.nativeId,

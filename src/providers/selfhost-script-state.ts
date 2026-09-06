@@ -16,6 +16,14 @@ const SCRIPT_STATE_MUTEXES = new Map<string, Promise<void>>();
  */
 export interface SelfhostQueueConsumerAttachment {
   readonly queue: string;
+  /**
+   * Portable `AtLeastOnceQueue.metadata.name` exposed to the Worker runtime.
+   *
+   * Optional only while reading an attachment persisted by an older Host. Such
+   * an attachment is retained for authoritative reapply, but is never delivered
+   * until the exact relation supplies this value.
+   */
+  readonly queueName?: string;
   readonly maxBatchSize: number;
   readonly maxBatchTimeoutSeconds: number;
   readonly maxConcurrency: number;
@@ -28,8 +36,15 @@ export interface SelfhostQueueConsumerAttachment {
 /** A queue a message can be put into, with the retention that queue promises. */
 export interface SelfhostQueueTarget {
   readonly queue: string;
+  /** Portable `AtLeastOnceQueue.metadata.name`; see the legacy note above. */
+  readonly queueName?: string;
   readonly messageRetentionSeconds: number;
   readonly deliveryDelaySeconds: number;
+}
+
+/** Whether a value is the exact portable AtLeastOnceQueue Resource name grammar. */
+export function isSelfhostPortableQueueName(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9-]{0,62}$/u.test(value);
 }
 
 export interface SelfhostScriptState {
@@ -319,6 +334,7 @@ function persistedConsumers(value: unknown): readonly SelfhostQueueConsumerAttac
     const record = entry as Record<string, unknown>;
     const known = new Set([
       "queue",
+      "queueName",
       "maxBatchSize",
       "maxBatchTimeoutSeconds",
       "maxConcurrency",
@@ -330,7 +346,8 @@ function persistedConsumers(value: unknown): readonly SelfhostQueueConsumerAttac
       throw new SelfhostScriptStateStoreError("corrupt");
     }
     const consumer: SelfhostQueueConsumerAttachment = {
-      queue: queueName(record.queue),
+      queue: nativeQueueId(record.queue),
+      ...(record.queueName === undefined ? {} : { queueName: portableQueueName(record.queueName) }),
       maxBatchSize: bounded(record.maxBatchSize, 1, 100),
       maxBatchTimeoutSeconds: bounded(record.maxBatchTimeoutSeconds, 0, 60),
       maxConcurrency: bounded(record.maxConcurrency, 1, 250),
@@ -346,6 +363,12 @@ function persistedConsumers(value: unknown): readonly SelfhostQueueConsumerAttac
   if (new Set(queues).size !== queues.length) {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
+  const portableNames = consumers.flatMap((consumer) =>
+    consumer.queueName === undefined ? [] : [consumer.queueName],
+  );
+  if (new Set(portableNames).size !== portableNames.length) {
+    throw new SelfhostScriptStateStoreError("corrupt");
+  }
   return [...consumers].sort((left, right) => (left.queue < right.queue ? -1 : 1));
 }
 
@@ -354,12 +377,13 @@ function persistedQueueTarget(value: unknown): SelfhostQueueTarget {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   const record = value as Record<string, unknown>;
-  const known = new Set(["queue", "messageRetentionSeconds", "deliveryDelaySeconds"]);
+  const known = new Set(["queue", "queueName", "messageRetentionSeconds", "deliveryDelaySeconds"]);
   if (Object.keys(record).some((key) => !known.has(key))) {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   return {
-    queue: queueName(record.queue),
+    queue: nativeQueueId(record.queue),
+    ...(record.queueName === undefined ? {} : { queueName: portableQueueName(record.queueName) }),
     messageRetentionSeconds: bounded(record.messageRetentionSeconds, 60, 1_209_600),
     deliveryDelaySeconds: bounded(record.deliveryDelaySeconds, 0, 43_200),
   };
@@ -383,8 +407,16 @@ function persistedCrons(value: unknown): readonly string[] {
 }
 
 /** A queue id this provider minted, never a customer-chosen string. */
-function queueName(value: unknown): string {
+function nativeQueueId(value: unknown): string {
   if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(value)) {
+    throw new SelfhostScriptStateStoreError("corrupt");
+  }
+  return value;
+}
+
+/** The exact AtLeastOnceQueue Resource name exposed through worker.runtime. */
+function portableQueueName(value: unknown): string {
+  if (!isSelfhostPortableQueueName(value)) {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   return value;

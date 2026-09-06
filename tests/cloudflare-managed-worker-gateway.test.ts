@@ -20,11 +20,13 @@ import {
   managedWorkerReleaseRouteKey,
   managedWorkerScheduleRouteKey,
   parseManagedWorkerGatewayProps,
+  parseManagedWorkerQueueRoute,
   parseManagedWorkerRouteTombstone,
   TAKOSERVER_MANAGED_WORKER_EVENT_CONTENT_TYPE,
   TAKOSERVER_MANAGED_WORKER_EVENT_PATH,
   TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
   TAKOSERVER_MANAGED_WORKER_GATEWAY_PROP,
+  TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA,
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
   TAKOSERVER_MANAGED_WORKER_ROUTE_TOMBSTONE_SCHEMA,
 } from "../src/providers/cloudflare-managed-worker-gateway.ts";
@@ -129,11 +131,12 @@ function hostRoute(logicalWorkerId = "worker_1") {
   };
 }
 
-function queueRoute(logicalWorkerId = "worker_1") {
+function queueRoute(logicalWorkerId = "worker_1", portableQueueName = "events") {
   return {
     schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
     generation: 1,
     logicalWorkerId,
+    portableQueueName,
   };
 }
 
@@ -204,6 +207,24 @@ test("route documents require generation and exact release basis points", () => 
       generation: 2,
     }).generation,
   ).toBe(2);
+});
+
+test("Queue route v2 requires an exact portable Resource name", () => {
+  expect(parseManagedWorkerQueueRoute(queueRoute("worker_1", "jobs"))).toEqual(
+    queueRoute("worker_1", "jobs"),
+  );
+  for (const portableQueueName of ["Jobs", "jobs-", "1jobs", "j".repeat(64), "jobs.main"]) {
+    expect(() => parseManagedWorkerQueueRoute(queueRoute("worker_1", portableQueueName))).toThrow(
+      "managed Worker Queue route is invalid",
+    );
+  }
+  expect(() =>
+    parseManagedWorkerQueueRoute({
+      schema: TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA,
+      generation: 1,
+      logicalWorkerId: "worker_1",
+    }),
+  ).toThrow();
 });
 
 test("HTTP dispatch reads host then release routes and passes strict trusted props", async () => {
@@ -319,6 +340,159 @@ test("Queue dispatch uses exact encoded-bytes ABI and settles decisions", async 
       body: { encoding: "base64", data: "CAc=" },
     },
   ]);
+});
+
+test("Queue dispatch routes by native name but exposes the portable Queue name", async () => {
+  const suffix = crypto.randomUUID();
+  const customerModule = `takoserver-managed-queue-identity-${suffix}.mjs`;
+  const customerPath = join("/tmp", customerModule);
+  const wrapperPath = join("/tmp", `takoserver-managed-queue-identity-wrapper-${suffix}.mjs`);
+  await Bun.write(
+    customerPath,
+    `let observedQueue;
+export function readObservedQueue() { return observedQueue; }
+export default {
+  queue(batch) {
+    observedQueue = batch.queue;
+    if (batch.queue !== "jobs") throw new Error("portable queue identity was not projected");
+  },
+};
+`,
+  );
+  await Bun.write(
+    wrapperPath,
+    managedWorkerEntrypointSource({
+      originalMainModule: customerModule,
+      declaredHandlers: ["queue"],
+      bindings: [],
+    }),
+  );
+  try {
+    const wrapper = await import(`${wrapperPath}?${suffix}`);
+    const state = new MemoryState();
+    const nativeQueueName = "tsq-tenant-a-7f1a2b3c";
+    put(
+      state,
+      "queue",
+      managedWorkerQueueRouteKey(nativeQueueName),
+      queueRoute("worker_1", "jobs"),
+    );
+    put(state, "worker", managedWorkerReleaseRouteKey("worker_1"), releaseRoute());
+    const dispatcher: ManagedWorkerDispatchNamespace = {
+      get(_scriptName, props) {
+        return {
+          fetch: (request) => wrapper.default.fetch(request, {}, { props }),
+        };
+      },
+    };
+    const message = fakeMessage("m1", 1, "hello");
+    await createCloudflareManagedWorkerGateway({
+      state,
+      dispatcher,
+      identity: { gatewayId: "gateway-test", environment: "integration" },
+    }).queue({ batchId: "batch-identity", queue: nativeQueueName, messages: [message] });
+
+    const customer = (await import(customerPath)) as { readObservedQueue(): unknown };
+    expect(customer.readObservedQueue()).toBe("jobs");
+    expect(messageState(message)).toBe("ack");
+  } finally {
+    await rm(customerPath, { force: true });
+    await rm(wrapperPath, { force: true });
+  }
+});
+
+test("native Queue routes isolate tenants that use the same portable name", async () => {
+  const state = new MemoryState();
+  const dispatcher = new RecordingDispatcher();
+  const nativeA = "tsq-tenant-a-11111111";
+  const nativeB = "tsq-tenant-b-22222222";
+  put(state, "queue", managedWorkerQueueRouteKey(nativeA), queueRoute("worker_a", "jobs"));
+  put(state, "queue", managedWorkerQueueRouteKey(nativeB), queueRoute("worker_b", "jobs"));
+  put(
+    state,
+    "worker",
+    managedWorkerReleaseRouteKey("worker_a"),
+    releaseRoute("worker_a", "customer-a"),
+  );
+  put(
+    state,
+    "worker",
+    managedWorkerReleaseRouteKey("worker_b"),
+    releaseRoute("worker_b", "customer-b"),
+  );
+  const respond = () => {
+    const event = dispatcher.calls[dispatcher.calls.length - 1]?.body as {
+      readonly messages: readonly { readonly messageId: string }[];
+    };
+    return Response.json({
+      protocol: TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
+      kind: "queue",
+      decisions: event.messages.map(({ messageId }) => ({ messageId, outcome: "ack" })),
+    });
+  };
+  dispatcher.responses.set("customer-a", respond);
+  dispatcher.responses.set("customer-b", respond);
+  const first = fakeMessage("m-a", 1);
+  const second = fakeMessage("m-b", 1);
+  const worker = gateway(state, dispatcher);
+  await worker.queue({ batchId: "batch-a", queue: nativeA, messages: [first] });
+  await worker.queue({ batchId: "batch-b", queue: nativeB, messages: [second] });
+
+  expect(dispatcher.calls.map(({ scriptName }) => scriptName)).toEqual([
+    "customer-a",
+    "customer-b",
+  ]);
+  expect(dispatcher.calls.map(({ body }) => (body as { readonly queue: string }).queue)).toEqual([
+    "jobs",
+    "jobs",
+  ]);
+  expect([messageState(first), messageState(second)]).toEqual(["ack", "ack"]);
+});
+
+test("a legacy Queue route retries before customer dispatch", async () => {
+  const nativeQueueName = "tsq-tenant-a-legacy";
+  const row = {
+    owner_native_id: "consumer:legacy",
+    generation: 1,
+    operation_id: "legacy-route-operation",
+    state: "active",
+    value_json: JSON.stringify({
+      schema: TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA,
+      generation: 1,
+      logicalWorkerId: "worker_1",
+    }),
+  };
+  const database: ManagedWorkerD1Database = {
+    withSession(constraint) {
+      expect(constraint).toBe("first-primary");
+      return {
+        prepare() {
+          return {
+            bind() {
+              return this;
+            },
+            async first() {
+              return row;
+            },
+            async run() {
+              return { meta: { changes: 0 } };
+            },
+          } as ManagedWorkerD1Statement;
+        },
+      } as ManagedWorkerD1Session;
+    },
+  };
+  const state = createD1ManagedWorkerGatewayState({ database, providerId: "provider-1" });
+  const dispatcher = new RecordingDispatcher();
+  const message = fakeMessage("m-legacy", 1);
+  await createCloudflareManagedWorkerGateway({ state, dispatcher }).queue({
+    batchId: "batch-legacy",
+    queue: nativeQueueName,
+    messages: [message],
+  });
+
+  expect(messageState(message)).toBe("retry");
+  expect(dispatcher.calls).toEqual([]);
 });
 
 test("Queue object bodies fail closed and retry settlement attempts every message", async () => {

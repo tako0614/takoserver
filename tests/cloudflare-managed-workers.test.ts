@@ -34,6 +34,7 @@ import {
 } from "../src/providers/cloudflare-managed-object-receipt.ts";
 import {
   managedWorkerHostRouteKey,
+  TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA,
   TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS,
 } from "../src/providers/cloudflare-managed-worker-gateway.ts";
 import {
@@ -2304,6 +2305,7 @@ test("deployment promotion changes only the logical release route and keeps the 
 
 test("Queue and Schedule triggers attach only the Takoserver gateway and route through D1", async () => {
   const sql = createEphemeralSql();
+  const state = new ManagedWorkerState("cloudflare.wfp.integration", sql);
   const calls: Array<{ method: string; path: string; body: string }> = [];
   let schedules: string[] = [];
   let queueConsumer: Readonly<Record<string, unknown>> | undefined;
@@ -2418,11 +2420,20 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
   schedules = ["* * * * *"];
   expect(await provider.apply(cronApply)).toMatchObject({ phase: "succeeded" });
 
-  const queue = related("/queue", stored("AtLeastOnceQueue", "queue_yurucommu_jobs", {}), {
+  const queue = related("/queue", stored("AtLeastOnceQueue", "queue_yurucommu_jobs", {}, "jobs"), {
     nativeId: "queue:queue-id",
     offeringId: technical("AtLeastOnceQueue").id,
     outputs: { queueId: "queue-id", queueName: "tsq-yurucommu-jobs" },
   });
+  const deadLetterQueue = related(
+    "/deadLetterQueue",
+    stored("AtLeastOnceQueue", "queue_yurucommu_dead_letters", {}, "dead-letter-jobs"),
+    {
+      nativeId: "queue:dead-letter-queue-id",
+      offeringId: technical("AtLeastOnceQueue").id,
+      outputs: { queueId: "dead-letter-queue-id", queueName: "tsq-yurucommu-dead-letters" },
+    },
+  );
   const consumerApply = {
     operationId: "consumer-yurucommu-jobs",
     operationMode: "initial" as const,
@@ -2439,8 +2450,13 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
       maxRetries: 3,
       retryDelaySeconds: 1,
       maxConcurrency: 5,
+      deadLetterQueue: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "AtLeastOnceQueue",
+        name: "dead-letter-jobs",
+      },
     },
-    relations: [worker, queue],
+    relations: [worker, queue, deadLetterQueue],
   };
   queueConsumer = {
     type: "worker",
@@ -2490,6 +2506,7 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
       retry_delay: 1,
       max_concurrency: 5,
     },
+    dead_letter_queue: "tsq-yurucommu-dead-letters",
     consumer_id: "consumer-gateway",
   } as const;
   expect(queueConsumer as Readonly<Record<string, unknown>> | undefined).toEqual(committedConsumer);
@@ -2513,19 +2530,18 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
       spec: { cron: "* * * * *" },
     }),
   ).toMatchObject({ phase: "succeeded" });
-  expect(
-    await provider.observe({
-      offering: queueConsumerOffering,
-      nativeId: consumerNativeId,
-      identity: {
-        tenantRef: "organization_yurucommu",
-        space: "production",
-        name: "jobs",
-        uid: "consumer_yurucommu_jobs",
-      },
-      spec: {},
-    }),
-  ).toMatchObject({ phase: "succeeded" });
+  const consumerObserve = {
+    offering: queueConsumerOffering,
+    nativeId: consumerNativeId,
+    identity: {
+      tenantRef: "organization_yurucommu",
+      space: "production",
+      name: "jobs",
+      uid: "consumer_yurucommu_jobs",
+    },
+    spec: {},
+  };
+  expect(await provider.observe(consumerObserve)).toMatchObject({ phase: "succeeded" });
 
   const routes = await sql.query(
     `SELECT route_kind, route_key, state, value_json
@@ -2540,11 +2556,111 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
     { route_kind: "queue", route_key: "queue/v1/tsq-yurucommu-jobs", state: "active" },
     { route_kind: "schedule", route_key: "schedule/v1/*%20*%20*%20*%20*", state: "active" },
   ]);
+  const queueRoute = routes.find(({ route_kind }) => route_kind === "queue");
+  expect(JSON.parse(String(queueRoute?.value_json ?? "{}"))).toEqual({
+    generation: 1,
+    logicalWorkerId: "tsw-logical-yurucommu",
+    portableQueueName: "jobs",
+    schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
+  });
+  expect(await state.receiptByResourceUid(consumerApply.identity.uid)).toMatchObject({
+    observed: {
+      queueName: "tsq-yurucommu-jobs",
+      portableQueueName: "jobs",
+      portableDeadLetterQueueName: "dead-letter-jobs",
+      consumerClosure: { dead_letter_queue: "tsq-yurucommu-dead-letters" },
+    },
+  });
   expect(queueConsumer).toMatchObject({ script_name: "takoserver-dispatch" });
   expect(calls.some(({ path }) => path.includes("tsw-logical-yurucommu"))).toBe(false);
   expect(calls.some(({ path }) => path.includes("/subdomain"))).toBe(false);
 
-  const state = new ManagedWorkerState("cloudflare.wfp.integration", sql);
+  // Routes written before v2 contain only the native ingress name and Worker.
+  // They remain retry-only until this exact Consumer relation is reapplied.
+  const legacyDescriptorDigest = `sha256:${"1".repeat(64)}`;
+  expect(
+    (
+      await sql.run(
+        `UPDATE cloudflare_managed_worker_routes
+         SET value_json = json_set(
+           json_remove(value_json, '$.portableQueueName'),
+           '$.schema', ?
+         )
+         WHERE provider_id = ? AND route_kind = 'queue' AND route_key = ?`,
+        [
+          TAKOSERVER_MANAGED_WORKER_LEGACY_QUEUE_ROUTE_SCHEMA,
+          "cloudflare.wfp.integration",
+          "queue/v1/tsq-yurucommu-jobs",
+        ],
+      )
+    ).changes,
+  ).toBe(1);
+  expect(
+    (
+      await sql.run(
+        `UPDATE cloudflare_managed_worker_receipts
+         SET descriptor_digest = ?,
+             observed_json = json_remove(
+               observed_json,
+               '$.portableQueueName',
+               '$.portableDeadLetterQueueName'
+             )
+         WHERE provider_id = ? AND resource_uid = ?`,
+        [legacyDescriptorDigest, "cloudflare.wfp.integration", consumerApply.identity.uid],
+      )
+    ).changes,
+  ).toBe(1);
+  expect(await provider.observe(consumerObserve)).toMatchObject({
+    phase: "failed",
+    failure: {
+      code: "not_found",
+      message:
+        "the managed Queue Consumer must be reapplied to restore its portable queue identity",
+    },
+  });
+  const nativeConsumerMutationsBeforeReapply = calls.filter(
+    ({ method, path }) => method !== "GET" && path.includes("/queues/queue-id/consumers"),
+  ).length;
+  const reapplyOperationId = "consumer-yurucommu-jobs-portable-identity-reapply";
+  expect(
+    await provider.apply({
+      ...consumerApply,
+      operationId: reapplyOperationId,
+      previous: { nativeId: consumerNativeId, spec: consumerApply.spec },
+    }),
+  ).toMatchObject({ phase: "succeeded", result: { nativeId: consumerNativeId } });
+  expect(
+    calls.filter(
+      ({ method, path }) => method !== "GET" && path.includes("/queues/queue-id/consumers"),
+    ),
+  ).toHaveLength(nativeConsumerMutationsBeforeReapply);
+  expect(await provider.observe(consumerObserve)).toMatchObject({ phase: "succeeded" });
+  expect(await state.route("queue", "queue/v1/tsq-yurucommu-jobs")).toMatchObject({
+    generation: 2,
+    ownerNativeId: `consumer:${consumerApply.identity.uid}`,
+    value: {
+      generation: 2,
+      logicalWorkerId: "tsw-logical-yurucommu",
+      portableQueueName: "jobs",
+      schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
+    },
+  });
+  const repairedReceipt = await state.receiptByResourceUid(consumerApply.identity.uid);
+  expect(repairedReceipt).toMatchObject({
+    nativeId: consumerNativeId,
+    operationId: reapplyOperationId,
+    observed: {
+      consumerId: "consumer-gateway",
+      queueId: "queue-id",
+      queueName: "tsq-yurucommu-jobs",
+      portableQueueName: "jobs",
+      portableDeadLetterQueueName: "dead-letter-jobs",
+      routeGeneration: 2,
+    },
+  });
+  expect(repairedReceipt?.descriptorDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  expect(repairedReceipt?.descriptorDigest).not.toBe(legacyDescriptorDigest);
+
   expect(
     await state.beginReceiptDelete({
       resourceUid: "cron_yurucommu_minute",
@@ -2639,6 +2755,102 @@ test("Queue and Schedule triggers attach only the Takoserver gateway and route t
       .filter(({ path }) => path.includes("/workers/scripts/"))
       .every(({ path }) => path.includes("/workers/scripts/takoserver-dispatch/schedules")),
   ).toBe(true);
+});
+
+test("Queue Consumers reject invalid portable primary and dead-letter names before effects", async () => {
+  const sql = createEphemeralSql();
+  let cloudflareCalls = 0;
+  const provider = new CloudflareProvider({
+    id: "cloudflare.wfp.integration",
+    accountId: "acct_1",
+    offerings: [queueConsumerOffering],
+    artifacts,
+    authorize: () => "Bearer test-token",
+    apiOrigin: "https://api.cloudflare.test/client/v4",
+    workerBackend: managedBackend(sql),
+    async fetch() {
+      cloudflareCalls += 1;
+      throw new Error("invalid portable queue identity reached Cloudflare");
+    },
+  });
+  const worker = related("/worker", stored("ModuleWorker", "worker_queue_names", {}), {
+    nativeId: "worker:tsw-queue-names",
+    offeringId: offering.id,
+    outputs: { scriptName: "tsw-queue-names" },
+  });
+  const queue = (pointer: string, uid: string, portableName: string, nativeName: string) =>
+    related(pointer, stored("AtLeastOnceQueue", uid, {}, portableName), {
+      nativeId: `queue:${uid}`,
+      offeringId: technical("AtLeastOnceQueue").id,
+      outputs: { queueId: uid, queueName: nativeName },
+    });
+  const spec = {
+    maxBatchSize: 10,
+    maxBatchTimeoutSeconds: 5,
+    maxRetries: 3,
+    retryDelaySeconds: 1,
+    maxConcurrency: 5,
+  };
+  const input = (uid: string) => ({
+    operationId: `apply-${uid}`,
+    operationMode: "initial" as const,
+    offering: queueConsumerOffering,
+    identity: {
+      tenantRef: "organization_queue_names",
+      space: "production",
+      name: uid,
+      uid,
+    },
+    spec,
+  });
+
+  expect(
+    await provider.apply({
+      ...input("consumer_invalid_primary"),
+      relations: [worker, queue("/queue", "queue-invalid-primary", "Jobs", "tsq-invalid-primary")],
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  expect(
+    await provider.apply({
+      ...input("consumer_invalid_dead_letter"),
+      spec: {
+        ...spec,
+        deadLetterQueue: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "AtLeastOnceQueue",
+          name: "dead-",
+        },
+      },
+      relations: [
+        worker,
+        queue("/queue", "queue-valid-primary", "jobs", "tsq-valid-primary"),
+        queue("/deadLetterQueue", "queue-invalid-dead-letter", "dead-", "tsq-dead-letter"),
+      ],
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  expect(
+    await provider.apply({
+      ...input("consumer_missing_dead_letter"),
+      spec: {
+        ...spec,
+        deadLetterQueue: {
+          apiVersion: "edge.forms.takoform.com",
+          kind: "AtLeastOnceQueue",
+          name: "missing-dead-letter",
+        },
+      },
+      relations: [
+        worker,
+        queue("/queue", "queue-valid-missing-dead-letter", "jobs", "tsq-valid-missing"),
+      ],
+    }),
+  ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+  expect(cloudflareCalls).toBe(0);
+  const state = new ManagedWorkerState("cloudflare.wfp.integration", sql);
+  expect(await state.receiptByResourceUid("consumer_invalid_primary")).toBeNull();
+  expect(await state.receiptByResourceUid("consumer_invalid_dead_letter")).toBeNull();
+  expect(await state.receiptByResourceUid("consumer_missing_dead_letter")).toBeNull();
+  expect(await state.activeRoutes("queue")).toEqual([]);
 });
 
 test("schedule reconciliation prevents an older whole-set PUT from overwriting a newer generation", async () => {
@@ -2983,6 +3195,7 @@ test("Queue Consumer creation cleans its exact native result when the route CAS 
             value: {
               schema: TAKOSERVER_MANAGED_WORKER_ROUTE_SCHEMAS.queue,
               logicalWorkerId: "tsw-replacement",
+              portableQueueName: "replacement-jobs",
             },
           }),
         ).not.toBeNull();
@@ -3049,7 +3262,7 @@ test("Queue Consumer creation cleans its exact native result when the route CAS 
   );
 });
 
-function stored(kind: string, uid: string, spec: JsonObject) {
+function stored(kind: string, uid: string, spec: JsonObject, name = kind.toLowerCase()) {
   const forms = kind === "ObjectBucket" ? currentTakoformCandidates().forms : released.forms;
   const form = forms.find((candidate) => candidate.identity.formRef.kind === kind);
   if (!form) throw new Error(`released ${kind} Form is missing`);
@@ -3058,7 +3271,7 @@ function stored(kind: string, uid: string, spec: JsonObject) {
     kind,
     form: form.identity,
     metadata: {
-      name: kind.toLowerCase(),
+      name,
       space: "production",
       uid,
       generation: "1",
