@@ -4,7 +4,6 @@ import { createMemoryObjectStore } from "./objects-mem.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import type { TakoformArtifactTransport } from "./takoform/artifacts.ts";
-import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { createTakoformHost as assembleTakoformHost } from "./takoform/host.ts";
 import { createTakoformHostAuthority } from "./takoform/host-authority.ts";
 import { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
@@ -44,7 +43,6 @@ export interface EphemeralTakoformHostOptions {
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
-  readonly workerModuleInspector?: WorkerModuleInspector;
   readonly provision?: ProvisionLanePorts;
   readonly blockingRelations?: (
     tenantId: string,
@@ -81,9 +79,6 @@ export function createTakoformHost(options: EphemeralTakoformHostOptions): Takof
     ...(options.artifacts ? { artifacts: options.artifacts } : {}),
     ...(options.clock ? { clock: options.clock } : {}),
     ...(options.randomId ? { randomId: options.randomId } : {}),
-    ...(options.workerModuleInspector
-      ? { workerModuleInspector: options.workerModuleInspector }
-      : {}),
     ...(options.provision ? { provision: options.provision } : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
   });

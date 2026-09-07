@@ -1,12 +1,11 @@
 # Running the Bun provisioner
 
-Production Cloudflare execution runs in the named, route-less
-`CloudflareProviderExecutor` Worker; see
-[ADR 0001](adr/0001-provision-from-the-worker.md). Set its zones on the reviewed
-deploy target and keep its scoped token only in that executor's secret binding.
-The public API Worker holds a typed service binding and credential-free proxy.
-The Bun entry is a different composition: it always executes current Provider3
-Edge Forms on the local workerd-backed provider.
+Production Cloudflare execution and managed capacity are owned by the private
+deployment composition; this public Bun provisioner does not host that runtime
+or its provider credentials. The public API Worker exposes only its typed,
+credential-free public contract. The Bun entry is a different composition: it
+always executes current Provider3 Edge Forms on the local workerd-backed
+provider.
 
 The Bun process can expose that provider through one authenticated endpoint for
 an explicitly composed external control-plane client. A provider call enters,
@@ -29,7 +28,9 @@ pack. Relevant variables are:
 |---|---|
 | `TAKOSERVER_PROVISIONER_TOKEN` | Shared endpoint credential. Without it the provisioning path is not served. |
 | `TAKOSERVER_DATA_ROOT` / `TAKOSERVER_DB` | Durable local state. |
-| `TAKOSERVER_WORKERD_BINARY` | Optional explicit workerd binary. |
+| `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact closed-graph workerd artifact. Takoserver verifies it, snapshots those bytes under the private data root, and uses only that snapshot for inspection and serving. Without it, or when its digest or resolver probe disagrees, Worker execution is disabled while unrelated self-host capabilities remain available. |
+| `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to serve `POST /v1/selfhost/tenant-run-credentials`; otherwise that path is a 404. |
+| `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated runner-credential key identity (default `takoserver-selfhost-tenant-run`). It must differ from the ordinary runtime signing key id; each validated id owns a separate `0600` private-key file under the data root. |
 | `TAKOSERVER_WORKER_ENDPOINT_SUFFIX` / `TAKOSERVER_SUFFIXES` | Addresses the local provider may issue. |
 | `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths for the Worker socket. Both or neither. |
 | `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text. |
@@ -45,8 +46,40 @@ not provider-selection authority. `TAKOSERVER_D1_DATABASE_ID` and
 before any local directory, database, or key is opened because request-time
 control and artifact writes require capabilities their HTTP adapters do not
 provide. `TAKOSERVER_ZONES` is rejected because DNS and
-Worker-route authority belongs to the private production provider executor. The retired
+Worker-route authority belongs to the private deployment owner. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
+
+### Self-host runner credentials
+
+The optional runner-credential endpoint is Host-specific authenticated HTTP on
+the ordinary public listener. It is not route-less and it is not protected by
+being on a private network. Only an organization API key with
+`resources:write` may call it; a session, read-only key, existing tenant-run
+credential, missing credential, or key from another organization is refused.
+Its closed body has `spaceRef`, `runRef`, and an optional
+`workerEndpointOriginReservationId`. The organization is derived from the API
+key and `tenantRef` is the exact `spaceRef`; neither can be supplied separately.
+
+When a reservation id is present, the endpoint reads it through the same
+organization-scoped reservation authority used by provider apply. Missing,
+foreign, released, and expired reservations are refused before signing, and
+provider bind revalidates the reservation against the exact Ready Worker at
+apply time. A successful response is `{ "token": "…", "expiresAt": "…" }`
+with `Cache-Control: private, no-store`. Tokens are reusable only for their
+fixed 300-second lifetime; no issuance ledger or idempotency receipt is added.
+
+Self-host admission replaces, rather than falls back to, the Hosted
+sponsorship-ledger admission port. It pins the dedicated key id and a lifetime
+of at most 300 seconds after the ordinary JWT signature, issuer, audience,
+active-key, time, and closed-claim checks. Revoking the dedicated key in
+`runtime_grant_keys` takes effect within the verifier's existing key-cache
+window (10 seconds by default), and every bearer already issued expires within
+five minutes. At boot and before every issuance, self-host signs and verifies a
+domain-separated challenge against the exact active registry row. A stale
+private-key file, same-id public-key mismatch, missing row, or revoked row stops
+issuance; it does not overwrite or revive registry authority. The Cloudflare
+public Worker neither mounts this endpoint nor imports either private
+tenant-run signer.
 
 ### The Cloudflare token
 
@@ -59,8 +92,8 @@ session. Grant only what the selected Bun inputs use:
 
 The ordinary Bun stable provider does not need Workers Scripts, Workers Routes,
 or DNS permission. Production Cloudflare Worker execution and zone authority
-belong to the route-less `src/entry-cloudflare-provider-executor.ts`; the public
-`src/entry-worker.ts` reaches it only through the typed service binding.
+belong to the private deployment owner; this public process does not select a
+managed runtime or receive its credentials.
 
 `TAKOSERVER_CF_TOKEN_FILE` may be used instead of `CLOUDFLARE_API_TOKEN`: the
 file is read at the moment of each call, so a rotation does not need a restart.
@@ -82,14 +115,66 @@ for arbitrary SQL on this machine. `TAKOSERVER_DATA_PLANE_PORT` fixes the port
 when an operator needs a stable one; otherwise the kernel chooses and the
 process prints `self-host data planes listening on 127.0.0.1:<port>` at startup.
 
+### Worker Version module verification
+
+The control plane validates the Form's declared schema and relations. It does
+not execute tenant code or infer exported handlers from JavaScript syntax.
+Module-load verification belongs to provider execution, before a Worker Version
+can succeed. Aliases, factories, computed properties and getters are accepted
+when their runtime value satisfies the exact declared Worker ABI.
+
+The self-host provider calls the mandatory `WorkerdRuntime.inspectModule` seam
+before acquiring sensitive inputs. The ordinary Bun entry selects the same
+workerd binary for inspection and serving. Inspection receives copied module
+bytes and handler names only, in a fresh process with no environment variables,
+bindings, listening sockets or outbound network capability. A hard wall timeout
+and output cap bound the attempt. Runtime absence is retryable unavailability,
+never successful verification. No application handler is invoked by this check.
+
+Publication compares the verified metadata and actual module and static-asset bytes with the
+materialization it will publish, including retained pre-canonical metadata.
+Observation and adoption compare the requested bundle/asset identities and
+handler set with the retained Version before re-inspecting its bytes. An old
+Version without its handler declaration requires authoritative reapply. Apply
+recovery also compares the retained module/asset snapshot's actual bytes and recorded runtime
+declarations before settling a sensitive-input receipt.
+
+Serving registers every importable module once in the application provenance
+namespace, with its declared JavaScript, UTF-8 text, ArrayBuffer or compiled
+Wasm media type; filenames do not select the type. Source maps remain retained
+evidence and are never registered for imports. The media map survives runtime
+manifest readback and restart. The serving wrapper, like the inspector,
+captures a callable own getter once and keeps that function for subsequent
+invocations.
+
+The generated prelude and entrypoint occupy a separate Host-private provenance
+namespace. The prelude captures the Host's intrinsics before tenant evaluation;
+the entrypoint then statically imports the exact application main, so ordinary
+V8 startup evaluation remains available without giving an application
+referrer Host privilege. A logical spelling may exist once in each namespace:
+there is no tenant-reserved filename or built-in-looking prefix. Host-private
+code may reach its own namespace and the one configured application main.
+Application code — including static imports, re-exports, dynamic imports,
+direct `eval`, `Function`, and async-function constructors — may resolve only
+the declared application graph. Unknown generated-script provenance defaults
+to application, never Host-private.
+
+The self-host artifact and serving tests prove this closed resolver only for the
+local workerd path. Managed customer execution is a separate private
+capability with its own provider-owned resolver and live qualification; local
+workerd evidence does not qualify a managed runtime.
+Class-backed Actor/Workflow capabilities without an executable provider
+implementation remain unsupported on both discovery and mutation paths.
+
 ### What workerd is given
 
-Publishing a Version with data bindings generates two modules and renders three
-services for one script:
+Publishing a Version registers the application graph plus Host-private prelude
+and entrypoint modules. Data bindings add the private facade module and render
+three services for one script:
 
 | Service | What it runs | What it holds |
 |---|---|---|
-| `<script>` | The generated entrypoint plus the tenant's main module | The Version's own `vars`, and a plain service binding to `<script>-selfhost-data` |
+| `<script>` | The Host-private prelude and entrypoint plus the declared application graph, with the exact application main as the only provenance bridge | The Version's own `vars`, and a plain service binding to `<script>-selfhost-data` |
 | `<script>-selfhost-data` | A Takoserver-owned facade module, no tenant code | The Version's plane token and a service binding to the origin below |
 | `<script>-selfhost-data-origin` | Nothing; an `externalServer` | The loopback address of the planes |
 
@@ -98,6 +183,63 @@ A Worker with a Queue Consumer or a Cron Trigger attached gets one more:
 | Service | What it runs | What it holds |
 |---|---|---|
 | `<script>-selfhost-events` | A Takoserver-owned gate module, no tenant code | The Version's event token, and a service binding naming the script's `takoserverSelfhostEvents` entrypoint |
+
+A Version with a static-asset attachment adds three operator-private services:
+
+| Service | What it does | What it holds |
+|---|---|---|
+| `<script>-assets-files` | Reads the script's operator-private flat asset directory | Exact immutable asset bytes under Host-generated ordinal keys |
+| `<script>-assets` | Admits one runtime URL pathname and performs exact lookup or SPA fallback | A binding to the private files service, `notFoundHandling`, and the exact logical-path map with media type, size, and digest |
+| `<script>-asset-router` | Composes the asset lookup with the tenant Worker | Private bindings to both services and the exact `runWorkerFirst` value |
+
+The public hostname routes through `<script>-asset-router`; the Host's internal
+readiness hostname still reaches the Worker directly. None of these bindings is
+declared on the tenant service or projected by the generated entrypoint. In
+particular, an asset attachment does not invent `env.ASSETS`; a Version may
+independently declare an ordinary variable with that name and receives exactly
+that value.
+
+Logical paths never become paths in the workerd filesystem. The Host assigns
+each ordered inventory entry a flat private key, and keeps the logical
+path-to-key map and layout discriminator in the operator-private runtime
+manifest. Consequently `foo` and `foo/bar.txt` remain two distinct valid
+assets. The physical asset tree is a sibling of the tenant module tree, so a
+valid module named `__assets/asset-00000` cannot overlap or replace an asset.
+Reload and restart validate that the private map and the exact file set, sizes,
+digests, and bytes still agree before serving the script.
+
+Every successful exact or SPA response uses the normalized media type declared
+for that logical path in the Static Asset Bundle manifest. The runtime has no
+filename-extension table and no fallback content type; a misleading filename
+such as `app.bin` still serves as `text/css` when that is the artifact evidence.
+
+With `runWorkerFirst=false`, an exact asset or a valid SPA fallback answers
+before `fetch`; only a marked asset miss reaches the Worker. With
+`runWorkerFirst=true`, a non-404 Worker response (including an error) is final;
+only a Worker 404 reaches assets, and that exact Worker 404 is returned if the
+asset stage also misses. A Version without assets goes straight to the Worker.
+
+Asset lookup starts from the runtime URL `pathname`, ignores query and fragment,
+strictly decodes percent escapes once, and strips exactly one leading slash.
+The decoded logical path is at most 240 characters, and each nonempty segment
+starts with an ASCII letter, digit, or underscore, as required by the frozen
+artifact manifest grammar. The root pathname remains the canonical empty miss.
+Encoded separators, repeated or empty segments, dot segments, backslashes,
+controls, Unicode noncharacters, malformed escapes, and invalid UTF-8 fail
+closed when asset lookup occurs and never enter SPA fallback. The declared
+asset-first or Worker-first ordering still decides when that lookup occurs. SPA
+publication is refused before materialization and before any sensitive-input
+lease when the manifest has no exact `index.html`.
+
+The immutable Version materialization persists `runWorkerFirst`, every declared
+media type, and its flat physical-layout discriminator, and includes all of
+them in the materialization digest. A retained asset Version written by an
+older Host without any one of those facts remains readable only as legacy
+evidence. Replay, recovery, observation, route/trigger/deployment adoption, and
+publication return retryable unavailability instead of guessing. Create and
+apply a newly named Worker Version with complete artifact evidence; the
+create-only old materialization and read-only recovery path are never rewritten
+in place.
 
 The object route travels the same three services; only its framing differs, and
 the facade streams it through rather than reading it.
@@ -206,42 +348,14 @@ group/other bit remains. New body files are opened `O_EXCL | O_NOFOLLOW` with
 `0600`. This is deliberately a permission/symlink boundary, not a claim that
 the process proves filesystem ownership or stable inode identity.
 
-Multipart receipts are rows rather than isolate memory. Here those rows live in
-the self-host control database; on the managed Workers-for-Platforms runtime
-they live in a provider-owned Durable Object exported only by the dedicated
-route-less receipt-authority Worker. The internet-routed dispatch gateway owns
-the SQLite/dispatch path and carries no receipt namespace or R2 S3/proof
-credential. In either wrapper a
-restart between `createMultipartUpload` and `completeMultipartUpload` preserves
-the part sizes and etags used to validate completion. ADR 0007 records the two
-authority placements.
-
-The managed path has a stronger native-create boundary. The receipt Durable
-Object orchestration, not the tenant wrapper, is the sole multipart-create
-authority. Its provider-private bounded SigV4 adapter lists the exact object key,
-persists that upload-id baseline, installs a recovery alarm, consumes one durable
-create grant, and lists again. Exactly one new native upload is adopted; zero
-new uploads retry reconciliation without another create; multiple candidates or
-a reused native upload id enter the permanent
-`operator_reconciliation_required` fence. Alarm recovery aborts a single late
-delta instead of exposing it. Active receipts expire after seven days, terminal
-receipts are retained for seven days, and each alarm/GC turn handles at most 64
-receipts. Permanent ambiguity has no automatic next action and is not collected.
-
-Operators read that condition only through the receipt authority's narrow
-provider-executor service-binding RPC and the provider-owned
-`managedObjectBucketReceiptStatus({ identity, bucketName })` capability. Its
-`operatorReconciliationRequired` count and `repairRequired` boolean are scoped
-to the exact Resource UID, Deployment incarnation, Resource generation, provider,
-and bucket. It is not a tenant route or an `edge.objects` method. Destroy uses a
-separate operation-scoped admin proof: prepare first fences new creates and drains
-native multipart pages; only after the R2 bucket deletion and authoritative
-absence readback may commit remove the Durable Object storage. A `destroying`
-lifecycle is also `repairRequired`: after an ambiguous R2 delete, only the original
-opaque provider handle may continue absence readback and commit; it does not replay
-`DELETE`, and there is no automatic clear/adopt operation. Missing proof or private
-S3 credentials keeps both status/mutation authority fail-closed and never falls
-back to a tenant-native create.
+Multipart receipts are rows rather than isolate memory. In the self-host path
+they live in the local control database; a managed provider stores them behind
+its own private backend authority. The public provisioner does not expose that
+authority's service binding, credentials, route, or operator orchestration.
+Across both placements, a restart between `createMultipartUpload` and
+`completeMultipartUpload` preserves the part sizes and etags used to validate
+completion. The portable `edge.objects` contract remains the same, while
+managed-provider qualification and recovery evidence are private operations.
 
 **On self-host, destroying a bucket that still holds an object is refused.** The Form's
 desired state is empty, so nothing in it could ask this Host to empty one, and
@@ -298,39 +412,20 @@ control database, and a `WorkerCronTrigger` becomes a next-fire instant beside
 it; two loops in the process — one every second for queues, one every five for
 schedules — decide when either is due and invoke the Worker over HTTP.
 
-The event itself is the managed backend's envelope, unchanged:
-`takoserver.managed-worker-event@v1`, posted to
-`/.well-known/takoserver/managed-worker-events/v1` with the same content types.
-A Worker's `queue` handler therefore receives the same portable batch here as on
-Cloudflare — `acknowledge` / `retry` / `acknowledgeAll` / `retryAll`, bodies as
-`{encoding: "base64", data}` — and `scheduled` the same `{cron, scheduledTime}`.
-Two things differ and are named rather than hidden: `logicalWorkerId` and
-`deploymentId` are the workerd script name and the exact Worker Version, which
-are the only such identities this Host has; and where the managed wrapper trusts
-`ctx.props` that only a dispatch namespace can set, this one trusts a gate.
+The event envelope is the portable
+`takoserver.managed-worker-event@v1` shape shared by the local and managed
+implementations. A Worker's `queue` handler receives
+`acknowledge` / `retry` / `acknowledgeAll` / `retryAll` with bodies as
+`{encoding: "base64", data}`, and `scheduled` receives `{cron, scheduledTime}`.
+`logicalWorkerId` and `deploymentId` are runtime identities (the local script
+name and exact Worker Version); they are evidence, not provider selectors.
 
-That gate is the reason the delivery cannot be forged. workerd's router forwards
-by `Host`, and anything that can reach the runtime's port can name a hostname —
-so an event hostname that reached the script itself would let any such caller
-invoke another tenant's `queue` handler. Instead `<script>.selfhost-events.invalid`
-reaches `<script>-selfhost-events`, a Takoserver-owned service running one
-constant module, which compares a per-Version token in constant time and rewrites
-the request into a fixed method, URL, and header set before forwarding it to the
-script's `takoserverSelfhostEvents` export. That export is a *named* entrypoint:
-the router hands customer traffic to the default one, so a request to the event
-path at the Worker's own hostname reaches `fetch`, which does not know what an
-event is. The token is declared on the gate and nowhere else, exactly as the
-plane token is declared on the data facade.
-
-The token is therefore the whole defence, and it is worth saying so plainly:
-workerd binds one socket for everything it serves, so the event hostname is
-reachable from wherever that port is reachable — the same interface a customer's
-own traffic arrives on. Anything that can address the port can name
-`<script>.selfhost-events.invalid`; what it cannot do is present the 32 random
-bytes the gate compares, and every refusal is the same bare `404`. There is no
-rate limit, because guessing 32 bytes is not a thing a rate limit is needed for.
-Put the runtime's port where the provisioning endpoint goes — behind a tunnel or
-on a private interface — and this is one lock rather than the only one.
+On self-host, delivery enters through the Host's authenticated internal gate and
+then reaches the named `takoserverSelfhostEvents` entrypoint. The gate keeps
+event delivery separate from ordinary customer `fetch` traffic and refuses
+invalid or expired credentials. Managed dispatch routing and its private
+service/receipt authorities are owned by the private deployment composition and
+are not exposed by this public provisioner.
 
 ### What a Consumer's numbers mean here
 
@@ -413,43 +508,14 @@ refused rather than half-served — before anything durable moves, so a refused
 attachment leaves no attachment behind. Publishing a new Version is what changes
 that.
 
-### How the managed backend does the same thing
+### Managed runtime boundary
 
-The managed Cloudflare backend projects the same envelope with the same 2 MiB
-ceiling, and it used to settle a batch it could not build as a whole-batch
-`retry()`, which counts — so a managed consumer with a large `maxBatchSize` and
-bodies near the producer's 127 000-byte ceiling retried itself into the
-dead-letter queue without the Worker ever being invoked. The gateway cannot ask
-Queues for a smaller batch the way this Host can take one; what it can do is cut
-the batch it was handed. It now delivers the messages in envelope-sized chunks —
-at most a hundred messages, at most 2 MiB serialized — and settles each chunk on
-its own answer, so a batch that is too large by count or by bytes reaches the
-Worker rather than the dead-letter queue.
-
-One case remains, and it is the one no split can reach: a single message whose
-own encoded body does not fit an envelope. It is left unsettled — costing a
-redelivery and, eventually, the dead-letter queue, which is where an
-undeliverable message belongs — and every message beside it in the same batch is
-delivered normally. Takoserver's own producer facade caps a message at 127 000
-bytes, so this is a message some other producer put on the queue.
-
-Cloudflare's `batch.queue` is the provider-native ingress name (`tsq-*`), not
-the Queue identity the portable Worker ABI exposes. The gateway continues to
-use that native name as the D1 route key. A queue route v2 separately carries
-the exact `AtLeastOnceQueue.metadata.name`; after selecting the route, the
-gateway projects only that value as the customer event's `queue` field. Native
-queue ids and names remain the authority for provisioning, consumer attachment,
-dead-letter routing, and ingress.
-
-The route-version transition is deliberately fail-closed in both mixed
-directions. An older gateway rejects a v2 document, and the current gateway
-rejects a v1 document that has no portable name. In either case it invokes no
-customer Worker and explicitly retries every native message. That refusal is
-not lossless parking: Cloudflare counts the attempt against the consumer's retry
-and retention policy, so a prolonged mixed rollout can move messages to the
-dead-letter queue or exhaust retention. There is no migration that guesses a
-portable name from `tsq-*`; an authoritative reapply of the exact QueueConsumer
-keeps its existing native consumer and CAS-replaces its exact route with v2.
+The managed implementation consumes the same portable event envelope and
+queue/cron limits described above, but its dispatch, route, and receipt
+authorities are private. This public provisioner does not expose provider-native
+queue identifiers, managed gateway routes, or private service bindings. Consult
+the private deployment runbook for operator qualification and recovery; the
+portable Worker contract remains the authority for application behavior.
 
 ## Retired Cloudflare ObjectBucket drain
 

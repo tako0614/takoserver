@@ -69,13 +69,15 @@ function unseeded() {
   };
 }
 
-async function committedAuthority() {
+async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "ModuleWorker") {
   const fixture = unseeded();
-  const form = first(fixture.catalog.forms, "candidate form");
+  const form = fixture.catalog.forms.find((candidate) => candidate.identity.formRef.kind === kind);
+  if (!form) throw new Error(`${kind} candidate form missing`);
   const packageDigest = form.identity.packageDigest;
   if (packageDigest === undefined) throw new Error("candidate package digest missing");
+  const packageDirectory = kind === "ActorNamespace" ? "actor-namespace" : "module-worker";
   const directory = new URL(
-    "./fixtures/takoform-v1/forms/candidates/edge.forms.takoform.com/module-worker/",
+    `./fixtures/takoform-v1/forms/candidates/edge.forms.takoform.com/${packageDirectory}/`,
     import.meta.url,
   );
   const manifest = (await Bun.file(new URL("package-index.json", directory)).json()) as JsonObject;
@@ -671,6 +673,35 @@ describe("durable read-only Takoform Host authority", () => {
     expect(catalog.forms[0]?.form.desiredSchema).toEqual(fixture.form.desiredSchema);
     await expect(
       withoutImplementation.authorizeMutation({
+        operation: "create",
+        context: CONTEXT,
+        formRef: fixture.form.identity.formRef,
+      }),
+    ).rejects.toMatchObject({ code: "form_unavailable", status: 503 });
+  });
+
+  test("keeps an admitted class package unsupported even with active support heads", async () => {
+    const fixture = await committedAuthority("ActorNamespace");
+    const catalog = await fixture.authority.catalog(CONTEXT);
+    expect(catalog.forms).toHaveLength(1);
+    expect(catalog.forms[0]).toMatchObject({
+      form: {
+        identity: {
+          formRef: fixture.form.identity.formRef,
+          packageDigest: fixture.packageDigest,
+          implementationDigest: fixture.implementationDigest,
+        },
+      },
+      supported: false,
+      availability: {
+        executable: false,
+        activated: false,
+        availableToPrincipal: false,
+      },
+    });
+
+    await expect(
+      fixture.authority.authorizeMutation({
         operation: "create",
         context: CONTEXT,
         formRef: fixture.form.identity.formRef,

@@ -110,6 +110,8 @@ export function createStandaloneProviderComposition(input: {
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  /** Whether the entry verified the exact closed-graph workerd artifact. */
+  readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
   readonly workerEndpointSuffix?: string;
   /** `https` only where this machine's workerd socket terminates TLS. */
@@ -139,6 +141,9 @@ export function createStandaloneProviderComposition(input: {
       edge: input.edge,
       dataRoot: input.dataRoot,
       runtime: input.runtime,
+      ...(input.workerRuntimeAvailable === undefined
+        ? {}
+        : { workerRuntimeAvailable: input.workerRuntimeAvailable }),
       artifacts: input.artifacts,
       edgeForms: true,
       ...(input.workerEndpointSuffix ? { workerEndpointSuffix: input.workerEndpointSuffix } : {}),

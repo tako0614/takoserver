@@ -132,8 +132,10 @@ describe("integration Cloudflare credential resolver", () => {
   test("integration consumes Wrangler OAuth once and never passes its bearer to children", async () => {
     delete process.env.CLOUDFLARE_API_TOKEN;
     const secret = "oauth-token-only-in-process";
+    const privateWrangler = "/private-composition/node_modules/.bin/wrangler";
     const calls: { command: readonly string[]; env: Readonly<Record<string, string>> }[] = [];
     const credential = await resolveCloudflareCredential("integration", {
+      wranglerPath: privateWrangler,
       run: async (command, options) => {
         calls.push({ command, env: options?.env ?? {} });
         return {
@@ -149,6 +151,7 @@ describe("integration Cloudflare credential resolver", () => {
       WRANGLER_WRITE_LOGS: "false",
     });
     expect(calls).toHaveLength(1);
+    expect(calls[0]?.command[0]).toBe(privateWrangler);
     expect(calls[0]?.command.slice(-3)).toEqual(["auth", "token", "--json"]);
     expect(calls[0]?.env).toEqual({
       WRANGLER_WRITE_LOGS: "false",

@@ -79,6 +79,7 @@ export {
 } from "./compat.ts";
 export { ControlError, createControlRoutes } from "./control.ts";
 export { createDataAiRoutes, type DataAiRoutes } from "./data-ai.ts";
+export { edgeProviderOffering, objectBucketProviderOffering } from "./edge-forms.ts";
 export { bytesDigest, canonicalDigest, canonicalJson } from "./json.ts";
 export {
   createLedger,
@@ -88,6 +89,7 @@ export {
   LedgerError,
   type Wallet,
 } from "./ledger.ts";
+export { migrateSqlite } from "./migrate-sqlite.ts";
 export { createMemoryObjectStore } from "./objects-mem.ts";
 export { createR2ObjectStore } from "./objects-r2.ts";
 export { openApiDocument, openApiPaths } from "./openapi.ts";
@@ -97,10 +99,12 @@ export type {
   JsonValue,
   ObjectStore,
   ObjectStoreAccess,
+  Row,
   Sql,
   SqlAccess,
   SqlWrite,
 } from "./ports.ts";
+export { createProviderDriver, ProviderMutationRecoveryError } from "./provider-driver.ts";
 export {
   createProviderMetering,
   type ProviderMeteringReport,
@@ -217,6 +221,8 @@ export { createMemorySql, createSqliteSql } from "./sql-sqlite.ts";
 export { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { InMemoryTakoformResourceDriver } from "./takoform/memory-driver.ts";
+export { stableProductionTakoformCatalog } from "./takoform/stable-production-catalog.ts";
+export { createTakoformStore } from "./takoform/store.ts";
 export type {
   InstalledTakoformBinding,
   InstalledTakoformForm,
@@ -233,7 +239,6 @@ export type {
   TakoformV1Alpha3FormRef,
 } from "./takoform/types.ts";
 export { TakoformHostError } from "./takoform/types.ts";
-export { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 export {
   TAKOFORM_EDGE_OBJECTS_INTERFACE,
   TAKOFORM_PROVIDER_V211_OBJECT_BUCKET_FORM,

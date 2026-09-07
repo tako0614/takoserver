@@ -84,6 +84,10 @@ export interface WorkerClosureTransitionOptions {
   readonly state?: WorkerState;
   readonly migrations?: WorkerMigrationReader;
   readonly outputDirectory?: string;
+  /** Checkout whose source and migration bytes define the publication. */
+  readonly sourceRepositoryRoot?: string;
+  /** Wrangler executable selected by the composing owner. */
+  readonly wranglerPath?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
   /** Owner-private secret input root override for portable tests. */
@@ -135,6 +139,7 @@ export async function runWorkerClosureTransition(
     );
   }
   const run = options.run ?? runCommand;
+  const sourceRepositoryRoot = resolve(options.sourceRepositoryRoot ?? REPOSITORY);
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
@@ -143,6 +148,7 @@ export async function runWorkerClosureTransition(
       : await resolveCloudflareCredential(invocation.environment, {
           cloudflareEnvironment: options.cloudflareEnvironment,
           run,
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         });
   const environment = credential?.childEnvironment ?? {};
   // A transition exists to publish a corrected target. Prove that the
@@ -164,10 +170,6 @@ export async function runWorkerClosureTransition(
     if (state === null) throw preflightError("Worker state is unavailable");
     const providerExecutorQualification = providerExecutorQualificationReader({
       target,
-      commit: invocation.commit,
-      state: cloudflareState,
-      environment,
-      run,
       ...(options.providerExecutorQualification === undefined
         ? {}
         : { injected: options.providerExecutorQualification }),
@@ -187,14 +189,16 @@ export async function runWorkerClosureTransition(
     }
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
-      main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
+      main: resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
+      sourceRepositoryRoot,
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
     const migrations =
-      options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
+      options.migrations ??
+      remoteMigrationReader(inspectionConfig, environment, run, sourceRepositoryRoot);
     const history = await currentHistory("preflight", target, state);
     const selector = invocation.closurePredecessorVersionId;
 
@@ -276,6 +280,8 @@ export async function runWorkerClosureTransition(
       root,
       target,
       commit: source.commit,
+      sourceRepositoryRoot,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       run,
       environment,
       writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
@@ -283,6 +289,7 @@ export async function runWorkerClosureTransition(
           path,
           main,
           commit: source.commit,
+          sourceRepositoryRoot,
           ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
           ...(bundleDigestHex === undefined
             ? {}
@@ -339,7 +346,7 @@ export async function runWorkerClosureTransition(
     }
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
     const upload = await run(
-      wranglerCommand([
+      deployWranglerCommand(options.wranglerPath, [
         "deploy",
         prepared.bundlePath,
         "--no-bundle",
@@ -667,14 +674,22 @@ function remoteMigrationReader(
   configPath: string,
   environment: Readonly<Record<string, string>>,
   run: ClosureTransitionProcess,
+  sourceRepositoryRoot = REPOSITORY,
 ): WorkerMigrationReader {
   return {
     async read() {
-      const local = readMigrationArtifact();
+      const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
       const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
       return { local: local.names, applied: remote.applied };
     },
   };
+}
+
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
 }
 
 function phaseError(phase: DeployPhase, message: string, detail?: string) {

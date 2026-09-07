@@ -68,9 +68,6 @@ export function createConfiguredHistoricalTakoformHost(
     ...(options.deferredOperations?.leaseMilliseconds
       ? { providerMutationLeaseMilliseconds: options.deferredOperations.leaseMilliseconds }
       : {}),
-    ...(options.workerModuleInspector
-      ? { workerModuleInspector: options.workerModuleInspector }
-      : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }

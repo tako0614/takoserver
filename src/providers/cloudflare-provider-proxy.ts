@@ -18,10 +18,8 @@ import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
 } from "./cloudflare-edge-meter-contract.ts";
-import {
-  type CloudflareProviderExecutorRpc,
-  isCloudflareProviderArtifactConsumption,
-} from "./cloudflare-provider-executor-rpc.ts";
+import { isCloudflareProviderArtifactConsumption } from "./cloudflare-provider-executor-codec.ts";
+import type { CloudflareProviderExecutorRpc } from "./cloudflare-provider-executor-port.ts";
 import {
   cloudflareWfpOwnsOffering,
   createCloudflareNativeReadbackDescriptor,

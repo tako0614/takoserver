@@ -19,12 +19,6 @@ import {
   parseExactArtifactRecoveryLostAck,
   runExactArtifactRecoveryOperator,
 } from "../exact-artifact-recovery.ts";
-import {
-  cloudflareProviderExecutorDependencies,
-  inspectCloudflareProviderExecutor,
-  remoteCloudflareProviderExecutorSchema,
-} from "./cloudflare-provider-executor.ts";
-import { readCloudflareProviderExecutorSecrets } from "./cloudflare-provider-executor-secrets.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
 import {
@@ -32,10 +26,21 @@ import {
   type SelectedFormAuthorityTarget,
   writeFormAuthorityConfig,
 } from "./form-authority.ts";
-import { REPOSITORY, requireEnvironment, runCommand, wranglerCommand } from "./process.ts";
+import {
+  REPOSITORY,
+  requireEnvironment,
+  resolveCloudflareCredential,
+  runCommand,
+  wranglerCommand,
+} from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import { writeCloudflareProviderExecutorConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
+import {
+  assertProviderExecutorUnchanged,
+  type ProviderExecutorInspection,
+  providerExecutorQualificationReader,
+  type WorkerProviderExecutorQualification,
+} from "./worker.ts";
 import { prepareWorkerArtifact, type WorkerArtifactProcess } from "./worker-artifact.ts";
 import {
   assertExactSecretInventory,
@@ -142,8 +147,13 @@ export interface ExactArtifactRecoveryDeployOptions {
   readonly state?: ExactArtifactRecoveryCloudflareState;
   readonly requestPath?: string;
   readonly lostAckPath?: string;
-  readonly providerExecutorSecretsPath?: string;
   readonly operatorPrivateJwkPath?: string;
+  /** Exact credential scope selected by the private deploy owner. */
+  readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  /** Live value-free executor qualification selected by the private deploy owner. */
+  readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
+  readonly sourceRepositoryRoot?: string;
+  readonly wranglerPath?: string;
   readonly outputDirectory?: string;
   readonly review?: string;
   readonly fetcher?: typeof fetch;
@@ -186,10 +196,25 @@ export async function runExactArtifactRecoveryDeployment(
   if (target.environment !== invocation.environment) {
     throw preflightError("exact artifact recovery invocation and target environments differ");
   }
+  const providerExecutorQualification = providerExecutorQualificationReader({
+    target,
+    ...(options.providerExecutorQualification === undefined
+      ? {}
+      : { injected: options.providerExecutorQualification }),
+  });
+  if (providerExecutorQualification === null) {
+    throw preflightError("exact artifact recovery requires provider-executor qualification");
+  }
+  const providerExecutorBefore = await providerExecutorQualification.read("preflight");
   const ownsRuntime = options.runtime === undefined;
   const runtime =
     options.runtime ??
-    (await createExactArtifactRecoveryDeployRuntime(invocation, target, options));
+    (await createExactArtifactRecoveryDeployRuntime(
+      invocation,
+      target,
+      options,
+      providerExecutorBefore,
+    ));
   try {
     const before = await runtime.inspect();
     const planned = planExactArtifactRecoveryDeployment(before);
@@ -216,6 +241,9 @@ export async function runExactArtifactRecoveryDeployment(
         reason: planned.reason,
       };
     }
+    if (!providerExecutorBefore.ready) {
+      throw preflightError("exact artifact recovery requires the exact selected provider executor");
+    }
     const source = await qualifySource({
       environment: invocation.environment,
       commit: invocation.commit,
@@ -234,8 +262,12 @@ export async function runExactArtifactRecoveryDeployment(
         );
       }
     }
+    const providerExecutorAtMutation = await providerExecutorQualification.read("preflight");
+    assertProviderExecutorUnchanged(providerExecutorBefore, providerExecutorAtMutation);
     const effect = await runtime.apply(planned.action);
     const after = await runtime.inspect();
+    const providerExecutorAfter = await providerExecutorQualification.read("verification");
+    assertProviderExecutorUnchanged(providerExecutorBefore, providerExecutorAfter, "verification");
     assertDeploymentAdvanced(planned.action, before, after);
     return {
       kind: "takoserver.exact-artifact-recovery-apply@v1",
@@ -271,6 +303,8 @@ interface ExactRecoveryRuntimeContext {
   readonly childEnvironment: Readonly<Record<string, string>>;
   readonly root: string;
   readonly run: WorkerArtifactProcess;
+  readonly sourceRepositoryRoot: string;
+  readonly wranglerPath?: string;
   readonly fetcher: typeof fetch;
   readonly clock: () => Date;
   readonly randomId: () => string;
@@ -283,6 +317,7 @@ async function createExactArtifactRecoveryDeployRuntime(
   invocation: ExactArtifactRecoveryDeployInvocation,
   target: DeployTarget,
   options: ExactArtifactRecoveryDeployOptions,
+  providerExecutor: ProviderExecutorInspection,
 ): Promise<ExactArtifactRecoveryDeployRuntime> {
   requiredRecoveryTarget(target);
   requiredOperatorTarget(target);
@@ -293,9 +328,6 @@ async function createExactArtifactRecoveryDeployRuntime(
   }
   const requestPath =
     options.requestPath ?? requireEnvironment("TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH");
-  const providerExecutorSecretsPath =
-    options.providerExecutorSecretsPath ??
-    requireEnvironment("TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH");
   const operatorPrivateJwkPath =
     options.operatorPrivateJwkPath ??
     requireEnvironment("TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH");
@@ -306,9 +338,19 @@ async function createExactArtifactRecoveryDeployRuntime(
     requestDigest: loaded.requestDigest,
     commit: invocation.commit,
   });
-  const providerSecrets = readCloudflareProviderExecutorSecrets(providerExecutorSecretsPath);
-  const apiToken = providerSecrets.values.CLOUDFLARE_API_TOKEN;
-  const childEnvironment = { CLOUDFLARE_API_TOKEN: apiToken };
+  if (options.cloudflareEnvironment === undefined) {
+    throw preflightError(
+      "exact artifact recovery requires owner-injected Cloudflare credential scope",
+    );
+  }
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential(invocation.environment, {
+    cloudflareEnvironment: options.cloudflareEnvironment,
+    run,
+    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+  });
+  const apiToken = credential.token;
+  const childEnvironment = credential.childEnvironment;
   const state =
     options.state ??
     new CloudflareState({
@@ -326,31 +368,8 @@ async function createExactArtifactRecoveryDeployRuntime(
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-exact-recovery-deploy-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
-  const providerConfig = writeCloudflareProviderExecutorConfig(target, {
-    path: join(root, "provider-executor-inspection.jsonc"),
-    main: resolve(REPOSITORY, "src/entry-cloudflare-provider-executor.ts"),
-  });
-  const run = options.run ?? runCommand;
-  const providerSchema = remoteCloudflareProviderExecutorSchema(
-    providerConfig,
-    childEnvironment,
-    run,
-  );
-  const providerDependencies = cloudflareProviderExecutorDependencies(
-    state,
-    target,
-    invocation.commit,
-  );
   const providerReady = async (): Promise<boolean> => {
-    const inspection = await inspectCloudflareProviderExecutor(
-      "preflight",
-      state,
-      providerSchema,
-      providerDependencies,
-      target,
-      { commit: invocation.commit },
-    );
-    return inspection.ready && (await recoveryMigrationApplied(sql));
+    return providerExecutor.ready && (await recoveryMigrationApplied(sql));
   };
   const context: ExactRecoveryRuntimeContext = {
     invocation,
@@ -363,6 +382,8 @@ async function createExactArtifactRecoveryDeployRuntime(
     childEnvironment,
     root,
     run,
+    sourceRepositoryRoot: resolve(options.sourceRepositoryRoot ?? REPOSITORY),
+    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
     fetcher,
     clock: options.clock ?? (() => new Date()),
     randomId: options.randomId ?? randomUUID,
@@ -1156,7 +1177,9 @@ async function publishRecoveryWorker(
     root,
     target: context.target,
     commit: context.invocation.commit,
-    main: resolve(REPOSITORY, "src/entry-exact-artifact-recovery-worker.ts"),
+    sourceRepositoryRoot: context.sourceRepositoryRoot,
+    ...(context.wranglerPath === undefined ? {} : { wranglerPath: context.wranglerPath }),
+    main: resolve(context.sourceRepositoryRoot, "src/entry-exact-artifact-recovery-worker.ts"),
     dryRunCommand: "versions-upload",
     environment: context.childEnvironment,
     run: context.run,
@@ -1254,7 +1277,12 @@ async function publishRecoveryGateway(
     root,
     target: context.target,
     commit: context.invocation.commit,
-    main: resolve(REPOSITORY, "src/entry-integration-form-authority-operator-worker.ts"),
+    sourceRepositoryRoot: context.sourceRepositoryRoot,
+    ...(context.wranglerPath === undefined ? {} : { wranglerPath: context.wranglerPath }),
+    main: resolve(
+      context.sourceRepositoryRoot,
+      "src/entry-integration-form-authority-operator-worker.ts",
+    ),
     dryRunCommand: "versions-upload",
     environment: context.childEnvironment,
     run: context.run,
@@ -1384,10 +1412,11 @@ async function retireRecoveryWorker(
   const root = operationRoot(context, "worker-retire");
   const configPath = writeExactArtifactRecoveryWorkerConfig({
     path: join(root, "wrangler.jsonc"),
-    main: resolve(REPOSITORY, "src/entry-exact-artifact-recovery-worker.ts"),
+    main: resolve(context.sourceRepositoryRoot, "src/entry-exact-artifact-recovery-worker.ts"),
     target: context.target,
     request: context.loaded.request,
     requestDigest: context.loaded.requestDigest,
+    sourceRepositoryRoot: context.sourceRepositoryRoot,
     ...(before.worker.handoff === null ? {} : { handoff: before.worker.handoff }),
   });
   const expectedHistory = await readWorkerHistory(context.state, workerName);
@@ -1407,7 +1436,14 @@ async function retireRecoveryWorker(
       throw preflightError("exact recovery Worker retirement re-fence failed");
     }
     const deleted = await context.run(
-      wranglerCommand(["delete", "--name", workerName, "--config", configPath, "--force"]),
+      deployWranglerCommand(context.wranglerPath, [
+        "delete",
+        "--name",
+        workerName,
+        "--config",
+        configPath,
+        "--force",
+      ]),
       { env: context.childEnvironment },
     );
     if (deleted.exitCode !== 0) {
@@ -1844,12 +1880,20 @@ export function planExactArtifactRecoveryDeployment(
   );
 }
 
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
+}
+
 export function writeExactArtifactRecoveryWorkerConfig(input: {
   readonly path: string;
   readonly main: string;
   readonly target: DeployTarget;
   readonly request: ArtifactRecoveryRequest;
   readonly requestDigest: Digest;
+  readonly sourceRepositoryRoot?: string;
   readonly handoff?: ArtifactRecoveryLostAckAuthorization;
 }): string {
   const recovery = requiredRecoveryTarget(input.target);
@@ -1881,7 +1925,7 @@ export function writeExactArtifactRecoveryWorkerConfig(input: {
         binding: "STATE_DB",
         database_name: input.target.d1.databaseName,
         database_id: input.target.d1.databaseId,
-        migrations_dir: resolve(REPOSITORY, "migrations"),
+        migrations_dir: resolve(input.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
       },
     ],
     r2_buckets: [{ binding: "OBJECTS", bucket_name: input.target.r2.bucketName }],

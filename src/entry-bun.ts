@@ -35,6 +35,11 @@ import {
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
+import {
+  assertActiveSelfhostTenantRunCredentialSigningKey,
+  assertSelfhostTenantRunCredentialKeyConfiguration,
+  createSelfhostTenantRunCredentials,
+} from "./selfhost-tenant-run-credentials.ts";
 import { ensureSigningKey } from "./signing-key.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
 import {
@@ -44,9 +49,9 @@ import {
 } from "./standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
-import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
+import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
-import { createWorkerdSupervisor, findWorkerd } from "./workerd-supervisor.ts";
+import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
 
 /**
  * The self-hosted entry and its local or account-backed provisioners.
@@ -256,8 +261,14 @@ if (workerEndpointPublication.diagnostic) {
   process.stderr.write(`${workerEndpointPublication.diagnostic}\n`);
 }
 
+const workerdSelection = await selectClosedGraphWorkerd({
+  binary: process.env.TAKOSERVER_WORKERD_BINARY,
+  privateRoot: join(dataRoot === ":memory:" ? ".takoserver" : dataRoot, "runtime-probes"),
+});
+const workerdBinary = workerdSelection.binary;
+if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
 const workerd = createWorkerdSupervisor({
-  binary: process.env.TAKOSERVER_WORKERD_BINARY ?? findWorkerd(process.cwd()),
+  binary: workerdBinary,
   spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
   log: (message) => process.stdout.write(`${message}\n`),
   readiness: async () => {
@@ -413,6 +424,7 @@ const providerArtifacts = {
  */
 const workerdRuntime = createWorkerdRuntime({
   root: dataRoot,
+  binary: workerdBinary,
   port: workerdPort,
   ...(workerdTls ? { tls: workerdTls } : {}),
   isReady: () => workerd.isReady(),
@@ -465,6 +477,7 @@ const providerComposition = createStandaloneProviderComposition({
   stableForms: currentCandidates.forms,
   dataRoot,
   runtime: workerdRuntime,
+  workerRuntimeAvailable: workerdBinary !== null,
   artifacts: providerArtifacts,
   ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
     ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
@@ -566,8 +579,19 @@ const provision = createProvisionerEndpoint({
 
 // A machine standing on its own makes a signing key, keeps it under the data
 // root, and registers the half that verifies it.
+const signingKeyId = process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local";
+const selfhostTenantRunCredentialsEnabled =
+  process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS === "1";
+const selfhostTenantRunCredentialKeyId =
+  process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID ?? "takoserver-selfhost-tenant-run";
+if (selfhostTenantRunCredentialsEnabled) {
+  assertSelfhostTenantRunCredentialKeyConfiguration({
+    credentialKeyId: selfhostTenantRunCredentialKeyId,
+    ordinarySigningKeyId: signingKeyId,
+  });
+}
 const signingKey = await ensureSigningKey({
-  keyId: process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local",
+  keyId: signingKeyId,
   privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
   path: join(dataRoot, "signing-key.jwk"),
   sql,
@@ -582,6 +606,32 @@ const signingKey = await ensureSigningKey({
     process.stdout.write(`generated a signing key at ${path}\n`);
   },
 });
+const selfhostTenantRunCredentialSigningKey = selfhostTenantRunCredentialsEnabled
+  ? await ensureSigningKey({
+      keyId: selfhostTenantRunCredentialKeyId,
+      path: join(
+        dataRoot,
+        `selfhost-tenant-run-signing-key.${selfhostTenantRunCredentialKeyId}.jwk`,
+      ),
+      sql,
+      readFile: (path) =>
+        readFile(path, "utf8").then(
+          (text) => text,
+          () => null,
+        ),
+      async writeFile(path, contents) {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, contents, { mode: 0o600 });
+        process.stdout.write("generated a self-host tenant-run signing key under the data root\n");
+      },
+    })
+  : undefined;
+if (selfhostTenantRunCredentialSigningKey) {
+  await assertActiveSelfhostTenantRunCredentialSigningKey({
+    signingKey: selfhostTenantRunCredentialSigningKey,
+    runtimeGrantKeys: sql,
+  });
+}
 
 const configuredAi = aiGateway();
 const app = buildApp({
@@ -609,7 +659,20 @@ const app = buildApp({
   providerPacks,
   offerings,
   artifacts: artifactStore,
-  workerModuleInspector: createJavaScriptWorkerModuleInspector(),
+  ...(selfhostTenantRunCredentialSigningKey
+    ? {
+        selfhostTenantRunCredentialAuthority: (originReservations) =>
+          createSelfhostTenantRunCredentials({
+            issuer: publicOrigin,
+            signingKey: selfhostTenantRunCredentialSigningKey,
+            ordinarySigningKeyId: signingKey.keyId,
+            runtimeGrantKeys: sql,
+            originReservations,
+            clock,
+            randomId: () => crypto.randomUUID().replaceAll("-", ""),
+          }),
+      }
+    : {}),
   ...(runtimeInputs ? { runtimeInputs } : {}),
   clock,
 });

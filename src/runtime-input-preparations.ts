@@ -86,6 +86,15 @@ export interface RuntimeInputPreparationInput {
   readonly bindings: Readonly<Record<string, string>>;
 }
 
+/**
+ * Private authorization carried by a tenant-run caller of the preparation
+ * route. Organization API-key callers omit it and retain their existing
+ * organization-wide administration of preparation rows.
+ */
+export interface RuntimeInputPreparationScope {
+  readonly space: string;
+}
+
 export type RuntimeInputPreparationStatus = "prepared" | "accepted" | "dispatched" | "consumed";
 
 export interface RuntimeInputPreparationProjection {
@@ -223,10 +232,14 @@ export class RuntimeInputPreparationError extends Error {
 }
 
 export interface RuntimeInputPreparations {
-  prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
+  prepare(
+    input: RuntimeInputPreparationInput,
+    scope?: RuntimeInputPreparationScope,
+  ): Promise<RuntimeInputPreparationProjection>;
   read(
     organizationId: string,
     operationKey: string,
+    scope?: RuntimeInputPreparationScope,
   ): Promise<RuntimeInputPreparationProjection | null>;
   claim(input: RuntimeInputClaimInput): Promise<RuntimeInputClaim>;
   abort(input: RuntimeInputClaimIdentity): Promise<void>;
@@ -254,10 +267,14 @@ export interface RuntimeInputAuthority {
   readonly canonicalPublicOrigin: string;
   /** Closed control-plane surface used only by authenticated HTTP routes. */
   readonly preparations: {
-    prepare(input: RuntimeInputPreparationInput): Promise<RuntimeInputPreparationProjection>;
+    prepare(
+      input: RuntimeInputPreparationInput,
+      scope?: RuntimeInputPreparationScope,
+    ): Promise<RuntimeInputPreparationProjection>;
     read(
       organizationId: string,
       operationKey: string,
+      scope?: RuntimeInputPreparationScope,
     ): Promise<RuntimeInputPreparationProjection | null>;
     revoke(organizationId: string, operationKey: string): Promise<void>;
   };
@@ -323,8 +340,9 @@ export function createRuntimeInputAuthority(
   return {
     canonicalPublicOrigin: options.canonicalPublicOrigin,
     preparations: {
-      prepare: (input) => internals.prepare(input),
-      read: (organizationId, operationKey) => internals.read(organizationId, operationKey),
+      prepare: (input, scope) => internals.prepare(input, scope),
+      read: (organizationId, operationKey, scope) =>
+        internals.read(organizationId, operationKey, scope),
       revoke: (organizationId, operationKey) => internals.revoke(organizationId, operationKey),
     },
     leases: {
@@ -457,8 +475,8 @@ export function createRuntimeInputPreparations(
   };
 
   return {
-    async prepare(input) {
-      const normalized = await normalizePreparation(input, hostOrigin);
+    async prepare(input, scope) {
+      const normalized = await normalizePreparation(input, hostOrigin, scope);
       const preparationId = await derivePreparationId(
         normalized.organizationId,
         normalized.operationKey,
@@ -470,6 +488,7 @@ export function createRuntimeInputPreparations(
         normalized.operationKey,
       );
       if (existing) {
+        assertPreparationVisible(existing, normalized.authorizedSpace);
         if (existing.state === "prepared" && existing.expires_at > now) {
           return await adoptExisting(existing, normalized, keys);
         }
@@ -494,7 +513,7 @@ export function createRuntimeInputPreparations(
               claimed_resource_uid, space, worker_name, worker_resource_uid, bundle_name,
               consumed_receipt_digest, expires_at, created_at, updated_at, consumed_at, revoked_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 1,
-                   NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL)`,
+                   NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL)`,
           [
             normalized.organizationId,
             normalized.operationKey,
@@ -505,6 +524,7 @@ export function createRuntimeInputPreparations(
             sealed.ciphertext,
             sealed.nonce,
             sealed.keyId,
+            normalized.authorizedSpace,
             expiresAt,
             now,
             now,
@@ -518,6 +538,7 @@ export function createRuntimeInputPreparations(
           normalized.organizationId,
           normalized.operationKey,
         );
+        if (raced) assertPreparationVisible(raced, normalized.authorizedSpace);
         if (raced?.state === "prepared" && raced.expires_at > now) {
           return await adoptExisting(raced, normalized, keys);
         }
@@ -539,7 +560,7 @@ export function createRuntimeInputPreparations(
         claim_owner: null,
         claim_expires_at: null,
         claimed_resource_uid: null,
-        space: null,
+        space: normalized.authorizedSpace,
         worker_name: null,
         worker_resource_uid: null,
         bundle_name: null,
@@ -548,11 +569,13 @@ export function createRuntimeInputPreparations(
       });
     },
 
-    async read(organizationId, operationKey) {
+    async read(organizationId, operationKey, scope) {
       validateOpaqueId(organizationId);
       validateOperationKey(operationKey);
+      const authorizedSpace = normalizePreparationScope(scope);
       const row = await readRow(options.sql, organizationId, operationKey);
       if (!row) return null;
+      if (!preparationVisible(row, authorizedSpace)) return null;
       const now = options.clock().getTime();
       if (rowExpired(row, now)) {
         await expireExact(options.sql, row, now);
@@ -587,6 +610,7 @@ export function createRuntimeInputPreparations(
       if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(candidate, normalized);
       assertExecutingApply(candidate, executing);
+      assertPreparedSpace(candidate, normalized.target.space);
       if (
         candidate.preparation_id !==
         (await derivePreparationId(normalized.organizationId, normalized.operationKey))
@@ -618,6 +642,7 @@ export function createRuntimeInputPreparations(
                worker_resource_uid = ?, bundle_name = ?, updated_at = ?
            WHERE organization_id = ? AND operation_key = ? AND state = 'prepared'
              AND fence = ? AND expires_at > ? AND apply_commitment = ?
+             AND (space IS NULL OR space = ?)
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
@@ -637,6 +662,7 @@ export function createRuntimeInputPreparations(
             candidate.fence,
             now,
             executing,
+            normalized.target.space,
             normalized.organizationId,
             normalized.target.workerResourceUid,
           ],
@@ -963,6 +989,8 @@ interface NormalizedPreparation {
   readonly applyCommitment: `sha256:${string}`;
   readonly bindingNames: readonly string[];
   readonly bindings: Readonly<Record<string, string>>;
+  /** Present only when an admitted tenant-run caller prepared the row. */
+  readonly authorizedSpace: string | null;
 }
 
 type PreparationRow = Row & {
@@ -1078,6 +1106,13 @@ function assertNames(row: PreparationRow, input: NormalizedClaimInput): void {
     row.operation_key !== input.operationKey ||
     row.binding_names_json !== JSON.stringify(input.bindingNames)
   ) {
+    throw new RuntimeInputPreparationError("conflict", 409);
+  }
+}
+
+/** A scoped prepare fixes the target Space before any secret bytes are sealed. */
+function assertPreparedSpace(row: PreparationRow, targetSpace: string): void {
+  if (row.space !== null && row.space !== targetSpace) {
     throw new RuntimeInputPreparationError("conflict", 409);
   }
 }
@@ -1459,6 +1494,7 @@ async function adoptExisting(
 async function normalizePreparation(
   input: RuntimeInputPreparationInput,
   hostOrigin: string,
+  scope?: RuntimeInputPreparationScope,
 ): Promise<NormalizedPreparation> {
   validateOpaqueId(input.organizationId);
   validateOperationKey(input.operationKey);
@@ -1474,7 +1510,26 @@ async function normalizePreparation(
     applyCommitment,
     bindingNames: names,
     bindings,
+    authorizedSpace: normalizePreparationScope(scope),
   };
+}
+
+function normalizePreparationScope(scope?: RuntimeInputPreparationScope): string | null {
+  if (scope === undefined) return null;
+  if (typeof scope !== "object" || scope === null || !isSpaceId(scope.space)) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  return scope.space;
+}
+
+function preparationVisible(row: PreparationRow, authorizedSpace: string | null): boolean {
+  return authorizedSpace === null || row.space === authorizedSpace;
+}
+
+function assertPreparationVisible(row: PreparationRow, authorizedSpace: string | null): void {
+  if (!preparationVisible(row, authorizedSpace)) {
+    throw new RuntimeInputPreparationError("operation_not_found", 404);
+  }
 }
 
 function validatedBindings(value: Record<string, unknown>): {

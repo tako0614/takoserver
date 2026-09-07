@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { lstat, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest, canonicalDigest } from "../src/json.ts";
@@ -72,6 +72,69 @@ async function materializerFixture(source?: string) {
     manifestDigest: fixture.manifestDigest,
   } as const;
   return { fixture, materializer, input };
+}
+
+async function assetMaterializerFixture(
+  paths: readonly string[],
+  mediaTypes: Readonly<Record<string, string>> = {},
+) {
+  const workerBytes = new TextEncoder().encode("export default { fetch() {} }");
+  const workerDigest = await bytesDigest(workerBytes);
+  const workerManifest = {
+    apiVersion: "artifacts.takoform.com/v1alpha1",
+    kind: "WorkerBundle" as const,
+    mainModule: "index.js",
+    modules: [
+      {
+        name: "index.js",
+        mediaType: "application/javascript+module",
+        size: workerBytes.byteLength,
+        digest: workerDigest,
+      },
+    ],
+  } satisfies SelfhostVersionArtifactManifest;
+  const workerManifestDigest = await canonicalDigest(workerManifest);
+  const blobs = new Map<string, Uint8Array>([[workerDigest, workerBytes]]);
+  const files = await Promise.all(
+    paths.map(async (path) => {
+      const bytes = new TextEncoder().encode(`asset:${path}`);
+      const digest = await bytesDigest(bytes);
+      blobs.set(digest, bytes);
+      return {
+        path,
+        mediaType: mediaTypes[path] ?? (path.endsWith(".html") ? "text/html" : "text/css"),
+        size: bytes.byteLength,
+        digest,
+      };
+    }),
+  );
+  const assetManifest = {
+    apiVersion: "artifacts.takoform.com/v1alpha1",
+    kind: "StaticAssetBundle" as const,
+    files,
+  } satisfies SelfhostVersionArtifactManifest;
+  const assetManifestDigest = await canonicalDigest(assetManifest);
+  const artifacts = {
+    async manifest(_tenantRef: string, digest: string) {
+      if (digest === workerManifestDigest) return workerManifest;
+      if (digest === assetManifestDigest) return assetManifest;
+      return null;
+    },
+    async blob(digest: string) {
+      return blobs.get(digest) ?? null;
+    },
+  };
+  const input = {
+    tenantRef: "tenant-a",
+    script: "script-a",
+    versionId: "version-a",
+    manifestDigest: workerManifestDigest,
+  } as const;
+  return {
+    input,
+    assetManifestDigest,
+    materializer: createSelfhostVersionMaterializer({ root, artifacts }),
+  };
 }
 
 describe("self-host Worker Version materialization", () => {
@@ -167,6 +230,281 @@ describe("self-host Worker Version materialization", () => {
     await rm(join(root, input.script, input.versionId, "meta.json"));
     expect(await materializer.inspect(input)).toEqual({ state: "corrupt" });
   });
+
+  test("routing order is immutable materialization identity and survives readback", async () => {
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([
+      "index.html",
+      "styles/app.css",
+    ]);
+    const assetFirst = await materializer.prepare({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "single-page-application",
+        runWorkerFirst: false,
+      },
+    });
+    const workerFirst = await materializer.prepare({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "single-page-application",
+        runWorkerFirst: true,
+      },
+    });
+    expect(workerFirst.materializationDigest).not.toBe(assetFirst.materializationDigest);
+
+    await materializer.materialize(
+      {
+        ...input,
+        assets: {
+          manifestDigest: assetManifestDigest,
+          notFoundHandling: "single-page-application",
+          runWorkerFirst: true,
+        },
+      },
+      workerFirst,
+    );
+    const restarted = createSelfhostVersionMaterializer({
+      root,
+      artifacts: {
+        async manifest() {
+          throw new Error("readback must not consult artifact storage");
+        },
+        async blob() {
+          throw new Error("readback must not consult artifact storage");
+        },
+      },
+    });
+    const retained = await restarted.readSnapshot(input);
+    expect(retained.state).toBe("present");
+    if (retained.state !== "present") throw new Error("asset materialization was not retained");
+    expect(retained.prepared.meta.assets).toMatchObject({
+      manifestDigest: assetManifestDigest,
+      notFoundHandling: "single-page-application",
+      runWorkerFirst: true,
+      storageLayout: "flat-ordinal-v1",
+    });
+    expect([...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>).keys()]).toEqual([
+      "index.html",
+      "styles/app.css",
+    ]);
+  });
+
+  test("materializes prefix-colliding logical asset paths as distinct flat files", async () => {
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([
+      "foo",
+      "foo/bar.txt",
+    ]);
+    await materializer.materialize({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+      },
+    });
+
+    const retained = await materializer.readSnapshot(input);
+    expect(retained.state).toBe("present");
+    if (retained.state !== "present") throw new Error("asset materialization was not retained");
+    expect(
+      [...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>)].map(([path, bytes]) => [
+        path,
+        new TextDecoder().decode(bytes),
+      ]),
+    ).toEqual([
+      ["foo", "asset:foo"],
+      ["foo/bar.txt", "asset:foo/bar.txt"],
+    ]);
+    const physical = await import("node:fs/promises").then(({ readdir }) =>
+      readdir(join(root, input.script, input.versionId, "assets"), { withFileTypes: true }),
+    );
+    expect(physical).toHaveLength(2);
+    expect(physical.every((entry) => entry.isFile())).toBe(true);
+  });
+
+  test.each([".env", "dir/.x", ".well-known/info", "a/.hidden/main.js"])(
+    "refuses asset path %s outside the frozen manifest grammar before materialization",
+    async (path) => {
+      const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([path]);
+      await expect(
+        materializer.materialize({
+          ...input,
+          assets: {
+            manifestDigest: assetManifestDigest,
+            notFoundHandling: "none",
+            runWorkerFirst: false,
+          },
+        }),
+      ).rejects.toMatchObject({ code: "invalid_spec" });
+      expect((await materializer.readSnapshot(input)).state).toBe("absent");
+    },
+  );
+
+  test("asset media is immutable identity even when the bytes are unchanged", async () => {
+    const css = await assetMaterializerFixture(["app.bin"], { "app.bin": "text/css" });
+    const cssInput = {
+      ...css.input,
+      assets: {
+        manifestDigest: css.assetManifestDigest,
+        notFoundHandling: "none" as const,
+        runWorkerFirst: false,
+      },
+    };
+    const cssPrepared = await css.materializer.prepare(cssInput);
+    await css.materializer.materialize(cssInput, cssPrepared);
+
+    const vendor = await assetMaterializerFixture(["app.bin"], {
+      "app.bin": "application/vnd.takos.theme",
+    });
+    const vendorInput = {
+      ...vendor.input,
+      assets: {
+        manifestDigest: vendor.assetManifestDigest,
+        notFoundHandling: "none" as const,
+        runWorkerFirst: false,
+      },
+    };
+    const vendorPrepared = await vendor.materializer.prepare(vendorInput);
+    expect(vendorPrepared.materializationDigest).not.toBe(cssPrepared.materializationDigest);
+    await expect(
+      vendor.materializer.materialize(vendorInput, vendorPrepared),
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  test("flat asset readback rejects missing and stale physical entries", async () => {
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([
+      "foo",
+      "foo/bar.txt",
+    ]);
+    await materializer.materialize({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+      },
+    });
+    const assetsRoot = join(root, input.script, input.versionId, "assets");
+    await writeFile(join(assetsRoot, "asset-99999"), "stale");
+    expect((await materializer.readSnapshot(input)).state).toBe("corrupt");
+    await rm(join(assetsRoot, "asset-99999"));
+    await rm(join(assetsRoot, "asset-00001"));
+    expect((await materializer.readSnapshot(input)).state).toBe("corrupt");
+  });
+
+  test("retains a legacy asset record without inventing its missing routing order", async () => {
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([
+      "index.html",
+    ]);
+    await materializer.materialize({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+      },
+    });
+    const metaPath = join(root, input.script, input.versionId, "meta.json");
+    const legacy = JSON.parse(await readFile(metaPath, "utf8")) as {
+      materializationDigest: string;
+      assets: { runWorkerFirst?: boolean };
+      [key: string]: unknown;
+    };
+    delete legacy.assets.runWorkerFirst;
+    const { materializationDigest: _oldDigest, ...legacyPayload } = legacy;
+    legacy.materializationDigest = await canonicalDigest(legacyPayload);
+    await writeFile(metaPath, JSON.stringify(legacy), "utf8");
+
+    const retained = await materializer.readSnapshot(input);
+    expect(retained.state).toBe("present");
+    if (retained.state !== "present") throw new Error("legacy asset record was not retained");
+    expect(retained.prepared.meta.assets).toMatchObject({
+      manifestDigest: assetManifestDigest,
+      notFoundHandling: "none",
+    });
+    expect(retained.prepared.meta.assets?.runWorkerFirst).toBeUndefined();
+  });
+
+  test("retains legacy asset media and physical layout only as unknown evidence", async () => {
+    const media = await assetMaterializerFixture(["index.html"]);
+    const request = {
+      ...media.input,
+      assets: {
+        manifestDigest: media.assetManifestDigest,
+        notFoundHandling: "none" as const,
+        runWorkerFirst: false,
+      },
+    };
+    await media.materializer.materialize(request);
+    const metaPath = join(root, media.input.script, media.input.versionId, "meta.json");
+    const mediaLegacy = JSON.parse(await readFile(metaPath, "utf8")) as {
+      materializationDigest: string;
+      assets: { files: Array<{ mediaType?: string }> };
+      [key: string]: unknown;
+    };
+    delete mediaLegacy.assets.files[0]?.mediaType;
+    const { materializationDigest: _mediaDigest, ...mediaPayload } = mediaLegacy;
+    mediaLegacy.materializationDigest = await canonicalDigest(mediaPayload);
+    await writeFile(metaPath, JSON.stringify(mediaLegacy));
+    const retainedMedia = await media.materializer.readSnapshot(media.input);
+    expect(retainedMedia.state).toBe("present");
+    if (retainedMedia.state !== "present") throw new Error("legacy media was not retained");
+    expect(retainedMedia.prepared.meta.assets?.files[0]?.mediaType).toBeUndefined();
+
+    await rm(root, { recursive: true, force: true });
+    const layout = await assetMaterializerFixture(["index.html"]);
+    const layoutRequest = {
+      ...layout.input,
+      assets: {
+        manifestDigest: layout.assetManifestDigest,
+        notFoundHandling: "none" as const,
+        runWorkerFirst: false,
+      },
+    };
+    await layout.materializer.materialize(layoutRequest);
+    const layoutMetaPath = join(root, layout.input.script, layout.input.versionId, "meta.json");
+    const layoutLegacy = JSON.parse(await readFile(layoutMetaPath, "utf8")) as {
+      materializationDigest: string;
+      assets: { storageLayout?: string };
+      [key: string]: unknown;
+    };
+    const assetsRoot = join(root, layout.input.script, layout.input.versionId, "assets");
+    await rename(join(assetsRoot, "asset-00000"), join(assetsRoot, "index.html"));
+    delete layoutLegacy.assets.storageLayout;
+    const { materializationDigest: _layoutDigest, ...layoutPayload } = layoutLegacy;
+    layoutLegacy.materializationDigest = await canonicalDigest(layoutPayload);
+    await writeFile(layoutMetaPath, JSON.stringify(layoutLegacy));
+    const retainedLayout = await layout.materializer.readSnapshot(layout.input);
+    expect(retainedLayout.state).toBe("present");
+    if (retainedLayout.state !== "present") throw new Error("legacy layout was not retained");
+    expect(retainedLayout.prepared.meta.assets?.storageLayout).toBeUndefined();
+  });
+
+  test("SPA admission and routing shape are refused before filesystem mutation", async () => {
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([
+      "styles/app.css",
+    ]);
+    const invalid = [
+      {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "single-page-application",
+        runWorkerFirst: false,
+      },
+      {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "none",
+        runWorkerFirst: undefined,
+      },
+    ] as const;
+    for (const assets of invalid) {
+      await expect(
+        materializer.materialize({ ...input, assets: assets as never }),
+      ).rejects.toMatchObject({ code: "invalid_spec" });
+      await expect(lstat(join(root, input.script))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
 });
 
 function offering(kind: string): ProviderOffering {
@@ -220,6 +558,9 @@ function relation(
 }
 
 const runtime: WorkerdRuntime = {
+  async inspectModule(input) {
+    return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+  },
   async write() {},
   async remove() {},
   async reload() {},

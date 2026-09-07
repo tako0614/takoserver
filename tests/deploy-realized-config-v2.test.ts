@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   effectiveSigningKeyId,
   expectedWorkerSecrets,
-  writeCloudflareProviderExecutorConfig,
   writeWorkerConfig,
 } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -30,13 +29,34 @@ const target = {
     workerName: "takoserver-sponsorship-authority",
     organizationId: "org_hosted",
     credentialKeyId: "sponsorship-credential-key",
-    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: `${"B".repeat(42)}A` },
     receiptKeyId: "receipt-key",
     receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
   },
 } satisfies DeployTarget;
 
 describe("realized Worker configuration", () => {
+  test("reads the neutral config only from the explicit source checkout", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-explicit-source-"));
+    try {
+      const neutral = JSON.parse(
+        readFileSync(join(import.meta.dir, "..", "wrangler.jsonc"), "utf8"),
+      ) as Record<string, unknown>;
+      neutral.compatibility_date = "2026-09-07";
+      writeFileSync(join(root, "wrangler.jsonc"), `${JSON.stringify(neutral, null, 2)}\n`);
+      const path = writeWorkerConfig(target, {
+        path: join(root, "realized.json"),
+        main: join(root, "worker.js"),
+        commit: "a".repeat(40),
+        sourceRepositoryRoot: root,
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      expect(config.compatibility_date).toBe("2026-09-07");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("realizes the pre-0043 artifact I/O compatibility mode as an exact version binding", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-"));
     try {
@@ -74,7 +94,7 @@ describe("realized Worker configuration", () => {
     }
   });
 
-  test("keeps parent credentials only in the route-less provider executor", () => {
+  test("binds a generic managed executor without inheriting its parent credentials", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-provider-executor-config-"));
     const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
     const supplied = {
@@ -89,22 +109,10 @@ describe("realized Worker configuration", () => {
         main: join(root, "public.js"),
         commit: "a".repeat(40),
       });
-      const executorPath = writeCloudflareProviderExecutorConfig(supplied, {
-        path: join(root, "executor.json"),
-        main: join(root, "executor.js"),
-      });
       const publicConfig = JSON.parse(readFileSync(publicPath, "utf8")) as {
         services: unknown;
         vars: Record<string, string>;
         secrets: { required: string[] };
-      };
-      const executorConfig = JSON.parse(readFileSync(executorPath, "utf8")) as {
-        workers_dev: boolean;
-        preview_urls: boolean;
-        services: unknown;
-        vars: Record<string, string>;
-        secrets: { required: string[] };
-        [key: string]: unknown;
       };
 
       expect(publicConfig.services).toEqual([
@@ -121,33 +129,6 @@ describe("realized Worker configuration", () => {
       expect(publicConfig.vars).not.toHaveProperty("TAKOSERVER_ZONES");
       expect(publicConfig.secrets.required).not.toContain("CLOUDFLARE_API_TOKEN");
       expect(JSON.stringify(publicConfig)).not.toContain("TAKOSERVER_WASABI_");
-
-      expect(executorConfig.workers_dev).toBe(false);
-      expect(executorConfig.preview_urls).toBe(false);
-      expect(executorConfig).not.toHaveProperty("routes");
-      expect(executorConfig).not.toHaveProperty("route");
-      expect(executorConfig.services).toEqual([
-        {
-          binding: "MANAGED_WORKER_AUTHORITY",
-          service: cloudflareProviderExecutor.gatewayWorkerName,
-          entrypoint: "TakoserverManagedWorkerAuthority",
-        },
-        {
-          binding: "MANAGED_OBJECT_RECEIPT_AUTHORITY",
-          service: cloudflareProviderExecutor.receiptAuthorityWorkerName,
-          entrypoint: "TakoserverManagedObjectReceiptAuthority",
-        },
-      ]);
-      expect(executorConfig.vars).toMatchObject({
-        CLOUDFLARE_ACCOUNT_ID: supplied.accountId,
-        TAKOSERVER_CLOUDFLARE_PROVIDER_INSTALLATION_ID:
-          cloudflareProviderExecutor.providerInstallationId,
-        TAKOSERVER_CLOUDFLARE_DISPATCH_NAMESPACE: cloudflareProviderExecutor.dispatchNamespace,
-      });
-      expect(executorConfig.secrets.required).toEqual([
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING",
-      ]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

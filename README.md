@@ -2,7 +2,11 @@
 
 An Open Source, Self-Hostable PaaS with a [Takoform](https://takoform.com) Host
 for declarative infrastructure and ordinary data APIs for already-standardized
-services. The public Host is the one literal `forms.takoform.com/v1` lane.
+services. This repository owns the generic Host foundation and the self-host
+plugin. The managed Workers-for-Platforms implementation is a separately
+supplied, non-public operator backend; it is not needed to build or run the OSS
+self-host distribution. Where the control plane itself runs is an independent
+deployment choice. The public Host is the one literal `forms.takoform.com/v1` lane.
 Production installs only exact package bytes generated from one canonical,
 source-pinned Takoform commit. That downstream pin is Takoserver adoption
 authority, not a Takoform release, Form promotion, or claim that the current
@@ -19,29 +23,15 @@ supply. Provider bucket names, regions, endpoints, credentials, and supply
 documents remain inside the selected Provider Pack and Deployment; none is
 Resource desired, observed, output, discovery, or Worker binding state.
 
-Both Cloudflare Worker backends carry that Binding. The ordinary-workers
+Both Cloudflare Worker backends carry that Binding. The OSS ordinary-workers
 backend uploads the tenant's exact bundle bytes with no wrapper, so the
-declared name carries Cloudflare's native R2 binding. The managed
-Workers-for-Platforms backend keeps the customer module as a user Worker and
-projects the same nine-method `edge.objects` facade from its provider-authored
-wrapper. Its raw R2 binding and provider-owned receipt Durable Object namespace
-are hidden capabilities, never projected into the tenant handler environment.
-The namespace points across scripts to a dedicated route-less receipt-authority
-Worker; the internet-routed dispatch gateway carries neither that namespace nor
-the R2 S3 access key, secret key, or receipt proof secret. The Durable Object owns
-multipart lifecycle state under an opaque identity derived from provider,
-Resource UID, Deployment incarnation, and Resource generation. Its orchestration
-is the only native multipart-create authority: a private bounded SigV4 adapter
-persists the exact-key upload-id baseline, issues one durable create grant, and
-adopts only one synchronous list delta. A private R2 marker separately reconciles
-a lost completion acknowledgement. Seven-day active expiry and seven-day
-terminal retention run in batches of 64; an ambiguous multi-delta create remains
-permanently visible as `operatorReconciliationRequired` instead of being guessed
-or garbage-collected. A destruction fence likewise reports `repairRequired`
-until the original opaque delete handle proves provider absence and commits;
-it never authorizes a second R2 `DELETE`. No bucket name, region, endpoint, credential, Durable
-Object name, or receipt authority enters the Takoform contract. ADR 0007 records
-the runtime-specific shapes and their divergence from
+declared name carries Cloudflare's native R2 binding. The separately supplied
+managed backend exposes the same nine-method `edge.objects` facade while
+keeping provider-native capabilities out of the tenant environment. Its
+operator owns multipart recovery, retention, and destruction reconciliation;
+uncertain provider effects are not reported as success or retried blindly.
+No bucket name, region, endpoint, credential, or provider authority enters the
+Takoform contract. ADR 0007 records the original implementation decision and its divergence from
 [ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md).
 
 Takoserver serves no public S3-credential or managed standard-service retail
@@ -167,6 +157,9 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_DATA_ROOT` | Objects, databases, published Workers, and the signing key. |
 | `TAKOSERVER_DB` | Control database. A file under the data root by default. |
 | `PORT` | Where the API and console API listen. |
+| `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact pinned closed-graph artifact. An absent, substituted, or behaviorally incompatible binary disables Worker execution without silently selecting the npm workerd. |
+| `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to mount the self-host runner-credential route. Absent or any other value leaves it at 404. |
+| `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated key identity for self-host runner credentials. Changing it creates a separate private key file under the data root; it must differ from `TAKOSERVER_SIGNING_KEY_ID`. |
 | `TAKOSERVER_WORKERD_PORT` | Where published Workers are served. |
 | `TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE` | PEM paths. With both, workerd terminates TLS on that port and Worker endpoints are published as `https://`. |
 | `TAKOSERVER_WORKERD_TLS_CERT` / `TAKOSERVER_WORKERD_TLS_KEY` | The same two halves as PEM text, for a deployment that has no file to point at. |
@@ -180,6 +173,22 @@ Everything lives under one directory, `.takoserver` by default.
 | `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
 | `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
 | `TAKOSERVER_AI_TOKEN` | Direct upstream bearer secret when a file is not used. |
+
+When explicitly enabled, `POST /v1/selfhost/tenant-run-credentials` is a
+Host-specific authenticated HTTP route, not a route-less service or a
+private-network API. It accepts only a `resources:write` organization API key
+(never a browser session or another tenant-run token) and the exact JSON body
+`{"spaceRef":"…","runRef":"…","workerEndpointOriginReservationId":"…"}`;
+the reservation member is optional. The organization is always taken from the
+key, and a supplied reservation must still be live under that organization.
+The returned bearer lasts exactly 300 seconds. Its dedicated Ed25519 key is
+persisted as a `0600` file under `TAKOSERVER_DATA_ROOT`; revoking that key in
+`runtime_grant_keys` takes effect after the existing verifier cache (10 seconds
+by default), while expiry bounds every already-issued bearer to five minutes.
+At boot and before each issuance, the Host proves that private key against the
+exact active public half in the registry; a stale file, reused id, or revoked
+row fails closed and is never overwritten or revived automatically.
+The Cloudflare public Worker does not compose this route or import its signer.
 
 Without a certificate the Worker socket speaks plain HTTP and the origin this
 Host hands a Worker is `http://`, truthfully — an `https://` address the runtime
@@ -296,19 +305,26 @@ copying it and moving one is moving it:
   operator-key.jwk    signs operator assertions
   objects/            customer objects, and uploaded bundles under art/
   databases/          customer SQL databases
+  runtime-probes/     verified workerd snapshot and transient resolver probes
   workers/            published Workers and the workerd config
 ```
 
 Published Workers are served by a workerd process Takoserver starts on the first
 publish and leaves watching its configuration — a deploy rewrites the config,
 and no other tenant's in-flight requests are dropped for it. A machine without
-the workerd binary fails Worker serving activation, rather than recording a
-false serving state; storage and databases remain independently available.
+the exact artifact, digest, and executable closed-graph resolver capability
+does not advertise or activate Worker serving, rather than recording a false
+serving state; storage and databases remain independently available. At boot,
+Takoserver copies the verified bytes into its private data root and executes
+that snapshot for both inspection and serving. Replacing the configured input
+path therefore cannot silently change the runtime identity of an already
+running process.
 
-A Worker that declares static assets gets them: the files are served ahead of
-the script through an `ASSETS` binding, and `notFoundHandling` decides what an
-unmatched path means, so a single-page application survives a reload here the
-same way it does on Cloudflare.
+A Worker that declares static assets gets them through Host-private asset
+services; no native `ASSETS` binding is exposed to tenant code.
+`runWorkerFirst` and `notFoundHandling` decide routing and fallback, so a
+single-page application survives reload without adding an undeclared tenant
+capability.
 
 ## Running it on Cloudflare
 
@@ -396,12 +412,17 @@ halves of the same mutation. The private request states this Host's own
 canonical public origin and commits to the exact public apply it authorizes —
 method, path, `If-None-Match: *`, and body — and Takoserver recomputes that
 commitment and echoes it back, so a caller can prove the Host bound the values
-to the request it meant. Replaying the key with a different apply or different
-values is a conflict, not an overwrite. The provider lease claims that exact
-identity before any asset or Worker Version mutation, erases ciphertext in the
-dispatch CAS, and settles only after provider readback. `GET` is the value-free
-recovery read: it never returns a value and never asks the caller to send the
-secrets a second time.
+to the request it meant. A `resources:write` organization API key retains the
+organization-wide preparation surface. The self-host runner instead reuses its
+already-admitted tenant-run credential for `PUT|GET`: Takoserver opens the exact
+create-only WorkerVersion apply, pre-binds the handoff to its Space, and returns
+`operation_not_found` for an unknown or different Space. `DELETE` remains an
+organization-key operation. Replaying the key with a different apply or
+different values is a conflict, not an overwrite. The provider lease claims
+that exact identity before any asset or Worker Version mutation, erases
+ciphertext in the dispatch CAS, and settles only after provider readback. `GET`
+is the value-free recovery read: it never returns a value and never asks the
+caller to send the secrets a second time.
 
 Activation later proves the released, Ready `WorkerEndpoint`, its exact worker
 relation, provider placement, and canonical output. Deactivation retains the
@@ -482,6 +503,32 @@ below, and everything above them remains provider-neutral.
 `scripts/check-imports.ts` enforces the layering as a gate rather than a
 convention: core, adapters, domain, routes, composition, entries — and a
 per-entry ban, so the Workers entry cannot reach a filesystem it does not have.
+
+Provider embedders use the curated `@takoserver/core/provider-extension` source
+export at their selected exact package/source pin. The shared Cloudflare adapter
+does not construct the managed WfP implementation. Its managed `workerBackend`
+selection supplies a synchronous `create(context)` factory, called once at
+construction with the adapter's resolved identity, credential callback, artifact
+reader and an independent cloned Offering snapshot. Namespace, gateway and
+installation configuration stay in the operator's factory closure. A missing,
+asynchronous, incomplete or wrong-kind backend is a startup error, never an
+ordinary-Workers fallback; the deprecated ordinary endpoint suffix cannot be
+combined with that factory.
+
+This is an in-process composition seam, not another Host API or serialized
+credential format. The public Worker imports only the credential-free executor
+RPC port and pure wire validation; the execution authority stays behind the
+operator's route-less executor. Concrete WfP runtime and its dedicated deploy
+surfaces belong to the non-public implementation, not this package. The
+`@takoserver/core/deploy-extension` export shares deploy primitives without
+copying the Host's lifecycle code. The `@takoserver/core/testing` export supplies
+shared composition fixtures to downstream conformance tests; neither export
+defines another network API or Form version.
+
+Existing shared D1 migration history remains here, with one schema owner. A
+managed extension may bind that same operator-selected database, but it does
+not copy the migration lineage or become a second schema writer. Source
+separation alone is not proof of a deployed managed installation.
 
 Three properties are worth knowing before reading the code:
 

@@ -1,7 +1,6 @@
 import type { Clock, ObjectStoreAccess, Sql } from "../ports.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./artifacts.ts";
 import { installedBindings } from "./bindings.ts";
-import type { WorkerModuleInspector } from "./engine.ts";
 import { createTakoformEngine } from "./engine.ts";
 import { installedForms } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
@@ -39,7 +38,6 @@ export interface CreateTakoformHostOptions {
   readonly artifacts?: TakoformArtifactTransport;
   readonly clock?: Clock;
   readonly randomId?: () => string;
-  readonly workerModuleInspector?: WorkerModuleInspector;
   /** Optional asynchronous lifecycle policy; production may compose durable operations. */
   readonly deferredOperations?: DeferredOperationsConfiguration;
   /** Exact Host-owned standard-service resolver, scoped by tenant and Space. */
@@ -87,9 +85,6 @@ export function createTakoformHost(options: CreateTakoformHostOptions): Takoform
     randomId,
     ...(options.deferredOperations?.leaseMilliseconds
       ? { providerMutationLeaseMilliseconds: options.deferredOperations.leaseMilliseconds }
-      : {}),
-    ...(options.workerModuleInspector
-      ? { workerModuleInspector: options.workerModuleInspector }
       : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
     ...(options.standardServiceResolver

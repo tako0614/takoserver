@@ -17,6 +17,62 @@ export type DeployProcess = (
   options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
 
+export interface DeployProcessContext {
+  readonly repositoryRoot: string;
+  readonly wranglerPath: string;
+  readonly run: DeployProcess;
+  readonly wranglerCommand: (args: readonly string[]) => readonly string[];
+}
+
+/**
+ * Binds the generic deploy child-process boundary to its owning checkout.
+ *
+ * The public package and a private extension must never share a guessed cwd or
+ * Wrangler binary: each published artifact is qualified from its own source
+ * identity. Credential sanitization remains common and is applied to every
+ * bound runner.
+ */
+export function createDeployProcess(input: {
+  readonly repositoryRoot: string;
+  readonly wranglerPath?: string;
+}): DeployProcessContext {
+  const repositoryRoot = resolve(input.repositoryRoot);
+  const wranglerPath = resolve(
+    input.wranglerPath ?? resolve(repositoryRoot, "node_modules/.bin/wrangler"),
+  );
+  const run: DeployProcess = async (command, options = {}) => {
+    const [executable, ...args] = command;
+    if (executable === undefined) throw new TypeError("a command is required");
+    const child = Bun.spawn([executable, ...args], {
+      cwd: repositoryRoot,
+      stdin: options.input === undefined ? "ignore" : "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: sanitizedChildEnvironment(options.env),
+    });
+    if (options.input !== undefined) {
+      const stdin = child.stdin;
+      if (!stdin) throw new TypeError("the child process did not expose the requested stdin pipe");
+      stdin.write(options.input);
+      stdin.end();
+    }
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { exitCode, stdout, stderr };
+  };
+  return {
+    repositoryRoot,
+    wranglerPath,
+    run,
+    wranglerCommand: (args) => [wranglerPath, ...args],
+  };
+}
+
+const DEFAULT_DEPLOY_PROCESS = createDeployProcess({ repositoryRoot: REPOSITORY });
+
 /**
  * The credential used by a Cloudflare deploy invocation.
  *
@@ -136,6 +192,7 @@ export async function resolveCloudflareCredential(
   options: {
     readonly cloudflareEnvironment?: Readonly<Record<string, string>> | undefined;
     readonly run?: DeployProcess;
+    readonly wranglerPath?: string;
   } = {},
 ): Promise<CloudflareCredential> {
   const explicitToken =
@@ -168,7 +225,7 @@ export async function resolveCloudflareCredential(
     // returned bearer to stdout, and Wrangler's default 0644 debug log would
     // otherwise persist that bearer on disk. The OAuth token must remain inside
     // Wrangler's stored profile rather than entering this child environment.
-    result = await run(wranglerCommand(["auth", "token", "--json"]), {
+    result = await run(deployWranglerCommand(options.wranglerPath, ["auth", "token", "--json"]), {
       env: { ...WRANGLER_OAUTH_CHILD_ENVIRONMENT },
     });
   } catch {
@@ -183,6 +240,13 @@ export async function resolveCloudflareCredential(
     childEnvironment: { ...WRANGLER_OAUTH_CHILD_ENVIRONMENT },
     source: "oauth",
   };
+}
+
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
 }
 
 function isExactCredentialToken(value: string): boolean {
@@ -203,27 +267,7 @@ export async function runCommand(
     readonly input?: string;
   } = {},
 ): Promise<CommandResult> {
-  const [executable, ...args] = command;
-  if (executable === undefined) throw new TypeError("a command is required");
-  const child = Bun.spawn([executable, ...args], {
-    cwd: REPOSITORY,
-    stdin: options.input === undefined ? "ignore" : "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    env: sanitizedChildEnvironment(options.env),
-  });
-  if (options.input !== undefined) {
-    const stdin = child.stdin;
-    if (!stdin) throw new TypeError("the child process did not expose the requested stdin pipe");
-    stdin.write(options.input);
-    stdin.end();
-  }
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, stdout, stderr };
+  return await DEFAULT_DEPLOY_PROCESS.run(command, options);
 }
 
 /**
@@ -251,5 +295,5 @@ export async function runChecked(
 }
 
 export function wranglerCommand(args: readonly string[]): readonly string[] {
-  return [WRANGLER, ...args];
+  return DEFAULT_DEPLOY_PROCESS.wranglerCommand(args);
 }

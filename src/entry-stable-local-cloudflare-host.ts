@@ -23,7 +23,6 @@ import type {
   TakoformResourceDriver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
-import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { loadProviderEraTestCatalog } from "./worker-stable-local-composition.ts";
 
 const STABLE_API_PATH = "/apis/forms.takoform.com/v1";
@@ -137,7 +136,6 @@ export async function startStableLocalCloudflareHost(input: {
     forms,
     bindings: catalog.bindings,
     driver,
-    workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     authenticate: async (request) =>
       request.headers.get("authorization") === `Bearer ${input.token}`
         ? {

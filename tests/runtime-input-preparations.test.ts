@@ -191,6 +191,33 @@ test("seals one runtime-input set and projects it without any value", async () =
   expect(rows[0]?.host_operation_id).toBeNull();
 });
 
+test("pre-binds a tenant-run preparation to its Space without changing legacy identity", async () => {
+  const scoped = await runtimeInputFixture();
+  const legacy = await runtimeInputFixture();
+  await scoped.authority.preparations.prepare(preparationInput(), { space: "default" });
+  await legacy.authority.preparations.prepare(preparationInput());
+
+  const [scopedRow] = await scoped.sql.query(
+    "SELECT preparation_id, space FROM worker_runtime_input_preparations WHERE organization_id = ? AND operation_key = ?",
+    ["org_01", OPERATION_KEY],
+  );
+  const [legacyRow] = await legacy.sql.query(
+    "SELECT preparation_id, space FROM worker_runtime_input_preparations WHERE organization_id = ? AND operation_key = ?",
+    ["org_01", OPERATION_KEY],
+  );
+  expect(scopedRow).toEqual({ preparation_id: legacyRow?.preparation_id, space: "default" });
+  expect(legacyRow?.space).toBeNull();
+  expect(
+    await scoped.authority.preparations.read("org_01", OPERATION_KEY, { space: "default" }),
+  ).toMatchObject({ status: "prepared" });
+  expect(
+    await scoped.authority.preparations.read("org_01", OPERATION_KEY, { space: "other" }),
+  ).toBeNull();
+  await expect(
+    scoped.authority.preparations.prepare(preparationInput(), { space: "other" }),
+  ).rejects.toMatchObject({ code: "operation_not_found", status: 404 });
+});
+
 test("refuses a preparation addressed to another Host origin", async () => {
   const { sql, authority } = await runtimeInputFixture();
   await expect(

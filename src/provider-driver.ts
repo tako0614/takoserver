@@ -92,6 +92,7 @@ export interface CreateProviderDriverOptions {
   readonly originReservations?: Pick<
     WorkerEndpointOriginReservations,
     | "mintForWorker"
+    | "bind"
     | "assignEndpoint"
     | "cancelEndpointAssignment"
     | "releaseEndpointAssignment"
@@ -969,6 +970,23 @@ export function createProviderDriver(
             // is the caller's to supply, and there is nothing to mint.
             if (!minted) throw new TakoformHostError("unsupported_capability", 422);
             reservationId = minted.reservationId;
+          } else {
+            try {
+              // A supplied reservation is only prepared until this exact
+              // WorkerEndpoint create. Bind it to the resolved Ready Worker
+              // before assigning the endpoint witness or crossing into the
+              // Provider. Host-minted reservations are already bound by
+              // `mintForWorker`, so they intentionally skip this transition.
+              await originReservations.bind({
+                organizationId: input.tenantId,
+                reservationId,
+                space: input.space,
+                workerName: worker.metadata.name,
+                workerResourceUid: worker.metadata.uid,
+              });
+            } catch (error) {
+              throw endpointReservationHostError(error);
+            }
           }
           try {
             endpointAssignment = await originReservations.assignEndpoint({

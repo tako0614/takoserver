@@ -16,6 +16,8 @@ import { bytesDigest, canonicalDigest, canonicalJson, isSha256Digest } from "../
  */
 export const SELFHOST_VERSION_MATERIALIZATION_FORMAT =
   "takoserver.selfhost-version-materialization@v1" as const;
+/** Physical layout for assets whose logical paths may be filesystem prefixes. */
+export const SELFHOST_ASSET_STORAGE_LAYOUT = "flat-ordinal-v1" as const;
 
 const SELFHOST_VERSION_STAGING_FORMAT = "takoserver.selfhost-version-staging@v1" as const;
 const META_FILE = "meta.json";
@@ -29,7 +31,7 @@ const MAX_ASSET_ENTRIES = 16_384;
 const MAX_BUNDLE_BYTES = 10_485_760;
 const MAX_DECLARED_BYTES = MAX_BUNDLE_BYTES;
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
-const SAFE_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
+const SAFE_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 const DIGEST = /^sha256:[A-Za-z0-9._-]{1,128}$/u;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const MODULE_MEDIA = new Set([
@@ -70,7 +72,8 @@ export interface SelfhostVersionMaterializationRequest {
   readonly manifestDigest: string;
   readonly assets?: {
     readonly manifestDigest: string;
-    readonly notFoundHandling: string;
+    readonly notFoundHandling: "none" | "single-page-application";
+    readonly runWorkerFirst: boolean;
   };
 }
 
@@ -89,7 +92,11 @@ export interface SelfhostVersionMaterializationMeta {
   readonly modules: readonly SelfhostVersionInventoryEntry[];
   readonly assets?: {
     readonly manifestDigest: string;
-    readonly notFoundHandling: string;
+    readonly notFoundHandling: "none" | "single-page-application";
+    /** Absent only on a retained record written before routing order was persisted. */
+    readonly runWorkerFirst?: boolean;
+    /** Absent only on a retained record whose files used their logical paths on disk. */
+    readonly storageLayout?: typeof SELFHOST_ASSET_STORAGE_LAYOUT;
     readonly files: readonly SelfhostVersionInventoryEntry[];
   };
 }
@@ -109,6 +116,29 @@ export interface PreparedSelfhostVersionMaterialization {
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly assets?: ReadonlyMap<string, Uint8Array>;
 }
+
+/** The retained executable graph must be the graph whose actual bytes were verified. */
+export function sameSelfhostVersionSnapshot(
+  actual: Pick<
+    PreparedSelfhostVersionMaterialization,
+    "materializationDigest" | "modules" | "assets"
+  >,
+  expected: Pick<
+    PreparedSelfhostVersionMaterialization,
+    "materializationDigest" | "modules" | "assets"
+  >,
+): boolean {
+  return (
+    actual.materializationDigest === expected.materializationDigest &&
+    sameSnapshotBytes(actual.modules, expected.modules) &&
+    sameOptionalSnapshotBytes(actual.assets, expected.assets)
+  );
+}
+
+export type SelfhostVersionSnapshot =
+  | { readonly state: "absent" }
+  | { readonly state: "corrupt" }
+  | { readonly state: "present"; readonly prepared: PreparedSelfhostVersionMaterialization };
 
 export type SelfhostVersionMaterializationErrorCode = "invalid_spec" | "conflict" | "unavailable";
 
@@ -240,12 +270,21 @@ export interface SelfhostVersionMaterializer {
   /** Publish a prepared version using create-only atomic directory publication. */
   materialize(
     input: SelfhostVersionMaterializationRequest,
+    verified?: Pick<
+      PreparedSelfhostVersionMaterialization,
+      "materializationDigest" | "modules" | "assets"
+    >,
   ): Promise<PreparedSelfhostVersionMaterialization>;
   /** Inspect only the committed version directory; never cleans or writes. */
   inspect(input: {
     readonly script: string;
     readonly versionId: string;
   }): Promise<SelfhostVersionInspection>;
+  /** Read the verified committed module and asset bytes without consulting artifacts or secrets. */
+  readSnapshot(input: {
+    readonly script: string;
+    readonly versionId: string;
+  }): Promise<SelfhostVersionSnapshot>;
   /** Remove only marker-proven abandoned sibling staging directories. */
   cleanAbandonedStaging(input: {
     readonly script: string;
@@ -392,13 +431,13 @@ export function createSelfhostVersionMaterializer(
     if (input.assets) {
       if (
         !DIGEST.test(input.assets.manifestDigest) ||
-        typeof input.assets.notFoundHandling !== "string" ||
-        input.assets.notFoundHandling.length === 0 ||
-        input.assets.notFoundHandling.length > 128
+        (input.assets.notFoundHandling !== "none" &&
+          input.assets.notFoundHandling !== "single-page-application") ||
+        typeof input.assets.runWorkerFirst !== "boolean"
       ) {
         throw new SelfhostVersionMaterializationError(
           "invalid_spec",
-          "the Static Asset Bundle digest is invalid",
+          "the Static Asset Bundle routing declaration is invalid",
         );
       }
       const assetManifest = await resolveManifest(
@@ -416,12 +455,29 @@ export function createSelfhostVersionMaterializer(
         }
       }
       const assets = await resolveEntries(assetManifest, "StaticAssetBundle");
+      if (assets.some((entry) => typeof entry.mediaType !== "string")) {
+        throw new SelfhostVersionMaterializationError(
+          "invalid_spec",
+          "the Static Asset Bundle must declare every file's media type",
+        );
+      }
+      if (
+        input.assets.notFoundHandling === "single-page-application" &&
+        !assets.some((entry) => entry.path === "index.html")
+      ) {
+        throw new SelfhostVersionMaterializationError(
+          "invalid_spec",
+          "single-page application assets require index.html",
+        );
+      }
       const resolvedAssets = await resolveBytes(options.artifacts, assets, MAX_BUNDLE_BYTES);
       const normalizedAssets = resolvedAssets.entries;
       assetBytes = resolvedAssets.bytes;
       assetsMeta = {
         manifestDigest: input.assets.manifestDigest,
         notFoundHandling: input.assets.notFoundHandling,
+        runWorkerFirst: input.assets.runWorkerFirst,
+        storageLayout: SELFHOST_ASSET_STORAGE_LAYOUT,
         files: normalizedAssets,
       };
     }
@@ -451,6 +507,10 @@ export function createSelfhostVersionMaterializer(
 
   const materialize = async (
     input: SelfhostVersionMaterializationRequest,
+    verified?: Pick<
+      PreparedSelfhostVersionMaterialization,
+      "materializationDigest" | "modules" | "assets"
+    >,
   ): Promise<PreparedSelfhostVersionMaterialization> => {
     const { parent, finalPath } = pathsFor(input.script, input.versionId);
     return await withMaterializationMutex(finalPath, async () => {
@@ -459,9 +519,30 @@ export function createSelfhostVersionMaterializer(
       // missing blob leaves the committed final entirely untouched.
       await cleanAbandonedStaging(input);
       const prepared = await prepare(input);
-      const current = await inspectPath(finalPath, fileSystem);
+      if (verified !== undefined && !sameSelfhostVersionSnapshot(prepared, verified)) {
+        throw new SelfhostVersionMaterializationError(
+          "conflict",
+          "the Worker Version changed after semantic verification",
+        );
+      }
+      const currentModules = verified === undefined ? undefined : new Map<string, Uint8Array>();
+      const currentAssets = verified === undefined ? undefined : new Map<string, Uint8Array>();
+      const current = await inspectPath(finalPath, fileSystem, currentModules, currentAssets);
       if (current.state === "present") {
-        if (current.digest === prepared.materializationDigest) return prepared;
+        if (
+          current.digest === prepared.materializationDigest &&
+          (!verified ||
+            (currentModules !== undefined &&
+              sameSelfhostVersionSnapshot(
+                {
+                  materializationDigest: current.digest,
+                  modules: currentModules,
+                  ...(current.meta.assets && currentAssets ? { assets: currentAssets } : {}),
+                },
+                verified,
+              )))
+        )
+          return prepared;
         throw new SelfhostVersionMaterializationError(
           "conflict",
           "the committed Worker Version has a different materialization digest",
@@ -550,7 +631,28 @@ export function createSelfhostVersionMaterializer(
     });
   };
 
-  return { prepare, materialize, inspect, cleanAbandonedStaging };
+  return {
+    prepare,
+    materialize,
+    inspect,
+    cleanAbandonedStaging,
+    async readSnapshot(input) {
+      const { finalPath } = pathsFor(input.script, input.versionId);
+      const modules = new Map<string, Uint8Array>();
+      const assets = new Map<string, Uint8Array>();
+      const inspected = await inspectPath(finalPath, fileSystem, modules, assets);
+      if (inspected.state !== "present") return inspected;
+      return {
+        state: "present",
+        prepared: {
+          materializationDigest: inspected.digest,
+          meta: inspected.meta,
+          modules,
+          ...(inspected.meta.assets ? { assets } : {}),
+        },
+      };
+    },
+  };
 }
 
 async function resolveManifest(
@@ -770,6 +872,33 @@ async function resolveBytes(
   };
 }
 
+function sameSnapshotBytes(
+  actual: ReadonlyMap<string, Uint8Array>,
+  expected: ReadonlyMap<string, Uint8Array>,
+): boolean {
+  // Retained pre-canonical manifests can contain opaque historical digests.
+  // Their metadata identity is preserved, but cannot stand in for the bytes
+  // that the fresh semantic inspector actually evaluated.
+  if (actual.size !== expected.size) return false;
+  for (const [name, wanted] of expected) {
+    const bytes = actual.get(name);
+    if (!bytes || bytes.length !== wanted.length) return false;
+    for (let index = 0; index < bytes.length; index += 1) {
+      if (bytes[index] !== wanted[index]) return false;
+    }
+  }
+  return true;
+}
+
+function sameOptionalSnapshotBytes(
+  actual: ReadonlyMap<string, Uint8Array> | undefined,
+  expected: ReadonlyMap<string, Uint8Array> | undefined,
+): boolean {
+  if ((actual === undefined) !== (expected === undefined)) return false;
+  if (actual === undefined || expected === undefined) return true;
+  return sameSnapshotBytes(actual, expected);
+}
+
 function materializationPayload(input: {
   readonly manifestDigest: string;
   readonly mainModule: string;
@@ -788,6 +917,8 @@ function materializationPayload(input: {
 async function inspectPath(
   finalPath: string,
   fileSystem: SelfhostVersionMaterializationFileSystem,
+  moduleBytes?: Map<string, Uint8Array>,
+  assetBytes?: Map<string, Uint8Array>,
 ): Promise<SelfhostVersionInspection> {
   let stat: Awaited<ReturnType<SelfhostVersionMaterializationFileSystem["lstat"]>>;
   try {
@@ -827,7 +958,9 @@ async function inspectPath(
     }),
   );
   if (expectedDigest !== meta.materializationDigest) return { state: "corrupt" };
-  if (!(await verifyTree(join(finalPath, MODULES_DIRECTORY), meta.modules, fileSystem))) {
+  if (
+    !(await verifyTree(join(finalPath, MODULES_DIRECTORY), meta.modules, fileSystem, moduleBytes))
+  ) {
     return { state: "corrupt" };
   }
   const topLevel = await fileSystem.readdir(finalPath).catch((error) => {
@@ -848,7 +981,15 @@ async function inspectPath(
   }
   if (
     meta.assets &&
-    !(await verifyTree(join(finalPath, ASSETS_DIRECTORY), meta.assets.files, fileSystem))
+    !(await verifyTree(
+      join(finalPath, ASSETS_DIRECTORY),
+      meta.assets.files,
+      fileSystem,
+      assetBytes,
+      meta.assets.storageLayout === SELFHOST_ASSET_STORAGE_LAYOUT
+        ? (_entry, index) => assetStorageName(index)
+        : (entry) => entry.path,
+    ))
   ) {
     return { state: "corrupt" };
   }
@@ -873,18 +1014,25 @@ function parseMeta(value: unknown): SelfhostVersionMaterializationMeta | null {
   let assets: SelfhostVersionMaterializationMeta["assets"];
   if (value.assets !== undefined) {
     if (!isRecord(value.assets)) return null;
+    const requiredAssetKeys = ["files", "manifestDigest", "notFoundHandling"];
+    const assetKeys = Object.keys(value.assets);
     if (
-      JSON.stringify(Object.keys(value.assets).sort()) !==
-      JSON.stringify(["files", "manifestDigest", "notFoundHandling"])
+      requiredAssetKeys.some((key) => !assetKeys.includes(key)) ||
+      assetKeys.some(
+        (key) => ![...requiredAssetKeys, "runWorkerFirst", "storageLayout"].includes(key),
+      )
     ) {
       return null;
     }
+    const hasRoutingOrder = Object.hasOwn(value.assets, "runWorkerFirst");
+    const hasStorageLayout = Object.hasOwn(value.assets, "storageLayout");
     if (
       typeof value.assets.manifestDigest !== "string" ||
       !DIGEST.test(value.assets.manifestDigest) ||
-      typeof value.assets.notFoundHandling !== "string" ||
-      value.assets.notFoundHandling.length === 0 ||
-      value.assets.notFoundHandling.length > 128
+      (value.assets.notFoundHandling !== "none" &&
+        value.assets.notFoundHandling !== "single-page-application") ||
+      (hasRoutingOrder && typeof value.assets.runWorkerFirst !== "boolean") ||
+      (hasStorageLayout && value.assets.storageLayout !== SELFHOST_ASSET_STORAGE_LAYOUT)
     ) {
       return null;
     }
@@ -893,6 +1041,8 @@ function parseMeta(value: unknown): SelfhostVersionMaterializationMeta | null {
     assets = {
       manifestDigest: value.assets.manifestDigest,
       notFoundHandling: value.assets.notFoundHandling,
+      ...(hasRoutingOrder ? { runWorkerFirst: value.assets.runWorkerFirst as boolean } : {}),
+      ...(hasStorageLayout ? { storageLayout: SELFHOST_ASSET_STORAGE_LAYOUT } : {}),
       files,
     };
   }
@@ -966,6 +1116,9 @@ async function verifyTree(
   root: string,
   expected: readonly SelfhostVersionInventoryEntry[],
   fileSystem: SelfhostVersionMaterializationFileSystem,
+  verifiedBytes?: Map<string, Uint8Array>,
+  storageName: (entry: SelfhostVersionInventoryEntry, index: number) => string = (entry) =>
+    entry.path,
 ): Promise<boolean> {
   let rootStat: Awaited<ReturnType<SelfhostVersionMaterializationFileSystem["lstat"]>>;
   try {
@@ -975,11 +1128,21 @@ async function verifyTree(
     throw unavailable(error);
   }
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return false;
+  const expectedStorage = expected.map((entry, index) => ({
+    entry,
+    path: storageName(entry, index),
+  }));
+  if (
+    expectedStorage.some(({ path }) => !safeArtifactPath(path)) ||
+    new Set(expectedStorage.map(({ path }) => path)).size !== expectedStorage.length
+  ) {
+    return false;
+  }
   const actual = new Set<string>();
   const expectedDirectories = new Set<string>();
-  for (const entry of expected) {
-    let directory = entry.path.includes("/")
-      ? entry.path.slice(0, entry.path.lastIndexOf("/"))
+  for (const stored of expectedStorage) {
+    let directory = stored.path.includes("/")
+      ? stored.path.slice(0, stored.path.lastIndexOf("/"))
       : "";
     while (directory) {
       expectedDirectories.add(directory);
@@ -1011,10 +1174,13 @@ async function verifyTree(
     return true;
   };
   if (!(await visit(root, ""))) return false;
-  if (actual.size !== expected.length || expected.some((entry) => !actual.has(entry.path)))
+  if (
+    actual.size !== expectedStorage.length ||
+    expectedStorage.some(({ path }) => !actual.has(path))
+  )
     return false;
-  for (const entry of expected) {
-    const path = join(root, entry.path);
+  for (const { entry, path: storedPath } of expectedStorage) {
+    const path = join(root, storedPath);
     let stat: Awaited<ReturnType<SelfhostVersionMaterializationFileSystem["lstat"]>>;
     try {
       stat = await fileSystem.lstat(path);
@@ -1028,6 +1194,7 @@ async function verifyTree(
     });
     if (bytes.byteLength !== entry.size) return false;
     if (isSha256Digest(entry.digest) && (await bytesDigest(bytes)) !== entry.digest) return false;
+    verifiedBytes?.set(entry.path, new Uint8Array(bytes));
   }
   return true;
 }
@@ -1060,11 +1227,24 @@ async function writeStagingDirectory(
     await writeTreeFile(fileSystem, join(stagingPath, MODULES_DIRECTORY), path, bytes, directories);
   }
   if (prepared.assets) {
-    for (const [path, bytes] of prepared.assets) {
+    if (prepared.meta.assets?.storageLayout !== SELFHOST_ASSET_STORAGE_LAYOUT) {
+      throw new SelfhostVersionMaterializationError(
+        "invalid_spec",
+        "the Static Asset Bundle storage layout is unknown",
+      );
+    }
+    for (const [index, entry] of prepared.meta.assets.files.entries()) {
+      const bytes = prepared.assets.get(entry.path);
+      if (!bytes) {
+        throw new SelfhostVersionMaterializationError(
+          "invalid_spec",
+          "the Static Asset Bundle snapshot is incomplete",
+        );
+      }
       await writeTreeFile(
         fileSystem,
         join(stagingPath, ASSETS_DIRECTORY),
-        path,
+        assetStorageName(index),
         bytes,
         directories,
       );
@@ -1179,6 +1359,11 @@ function safeArtifactPath(value: unknown): value is string {
   if (typeof value !== "string" || value.length < 1 || value.length > MAX_PATH_LENGTH) return false;
   if (!SAFE_PATH.test(value)) return false;
   return value.split("/").every((segment) => segment !== "." && segment !== "..");
+}
+
+/** Stable one-level filename for one ordered logical asset inventory entry. */
+function assetStorageName(index: number): string {
+  return `asset-${index.toString(10).padStart(5, "0")}`;
 }
 
 function validMediaType(

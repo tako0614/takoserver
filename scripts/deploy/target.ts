@@ -197,10 +197,13 @@ const BASE64URL_32 = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
 const ORGANIZATION_ID = /^org_[A-Za-z0-9][A-Za-z0-9._:-]{0,123}$/u;
 
-export function targetPath(environment: DeployEnvironment): string {
+export function targetPath(
+  environment: DeployEnvironment,
+  repositoryRoot: string = REPOSITORY,
+): string {
   const variable = `TAKOSERVER_DEPLOY_TARGET_${environment.toUpperCase()}`;
   const candidate = process.env[variable] ?? `.deploy/targets/${environment}.json`;
-  return isAbsolute(candidate) ? candidate : resolve(REPOSITORY, candidate);
+  return isAbsolute(candidate) ? candidate : resolve(repositoryRoot, candidate);
 }
 
 export function loadTarget(path: string, environment: DeployEnvironment): DeployTarget {

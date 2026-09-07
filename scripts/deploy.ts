@@ -1,21 +1,15 @@
 import { isAbsolute } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
-import { runCloudflareProviderExecutor } from "./deploy/cloudflare-provider-executor.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
-import { runExactArtifactRecoveryDeployment } from "./deploy/exact-artifact-recovery.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
-import { runManagedObjectReceiptAuthority } from "./deploy/managed-object-receipt-authority.ts";
-import { runManagedWorkerDispatchNamespace } from "./deploy/managed-worker-dispatch-namespace.ts";
-import { runManagedWorkerGateway } from "./deploy/managed-worker-gateway.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
-import { runPublicParentTokenRetirement } from "./deploy/public-parent-token-retirement.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import {
@@ -27,11 +21,7 @@ import {
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
-import {
-  loadManagedWorkerDispatchNamespaceTarget,
-  loadTarget,
-  targetPath,
-} from "./deploy/target.ts";
+import { loadTarget, targetPath } from "./deploy/target.ts";
 import { isWorkerVersionId, runWorker } from "./deploy/worker.ts";
 import { runWorkerClosureTransition } from "./deploy/worker-closure-transition.ts";
 import type { WorkerClosureDelta } from "./deploy/worker-state.ts";
@@ -81,25 +71,6 @@ const USAGE = `takoserver deploy
   Worker has no Version at all, together with
   --bootstrap-probe-predecessor-version=<uuid>. The pinned identity-probe Version must already be
   the exact predecessor missing only FORM_AUTHORITY; it is checked again at the mutation fence.
-  takoserver-managed-object-receipt-authority --apply reads the exact operator-private
-  TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH and publishes all three required secrets with
-  code and the receipt Durable Object in one Wrangler operation. Rehearsal/production bootstrap
-  also requires TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH.
-  Its MANAGED_PROVIDER_ID comes only from the target's Cloudflare provider-executor installation,
-  deliberately distinct from the gateway's legacy provider-pack identity.
-  cloudflare-provider-executor --apply reads the exact operator-private
-  TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH. The canonical owner-only file contains only
-  CLOUDFLARE_API_TOKEN and TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING; code and both secret bindings are
-  published together. Deploy in dependency order: receipt authority, managed gateway, provider
-  executor, then the public Worker. The executor accepts --reverse only with --apply.
-  takoserver-public-parent-token-retirement accepts only the fixed status/apply selector above.
-  It binds the target-selected public Worker to the exact route-less executor before deleting only
-  the public CLOUDFLARE_API_TOKEN. It never reads the executor's owner-private credential file.
-  takoserver-exact-artifact-recovery is integration-only. Status/apply read the canonical owner-only
-  TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH, the existing provider-executor secrets path and
-  the Form-authority operator private JWK. Each apply performs one status-planned transition. Only
-  a post-quiescence handoff reads TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH.
-
 The target descriptor is selected only by the exact environment. There is no
 deploy-plan flag, ledger, target override or mixed mutation controller.
 `;
@@ -210,9 +181,6 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
-  if (surfaceValue === "takoserver-public-parent-token-retirement" && args.length !== 4) {
-    return null;
-  }
   let action: ParsedInvocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
@@ -572,8 +540,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       surfaceValue === "takoserver-integration-form-authority-operator-worker" ||
       surfaceValue === "takoserver-integration-form-authority" ||
       surfaceValue === "takoserver-integration-form-authority-deactivation" ||
-      surfaceValue === "takoserver-integration-e2e-credentials" ||
-      surfaceValue === "takoserver-exact-artifact-recovery") &&
+      surfaceValue === "takoserver-integration-e2e-credentials") &&
     environment !== "integration"
   ) {
     return null;
@@ -633,9 +600,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     reverse &&
     !(
       surfaceValue === "takoserver-sponsorship-public-route-retirement" ||
-      surfaceValue === "takoserver-host-runtime-topology-retirement" ||
-      surfaceValue === "takoserver-managed-worker-gateway" ||
-      surfaceValue === "cloudflare-provider-executor"
+      surfaceValue === "takoserver-host-runtime-topology-retirement"
     )
   ) {
     return null;
@@ -710,21 +675,6 @@ function isSurface(value: string | undefined): value is Surface {
 }
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
-  if (invocation.surface === "takoserver-managed-worker-dispatch-namespace") {
-    const namespaceTarget = loadManagedWorkerDispatchNamespaceTarget(
-      targetPath(invocation.environment),
-      invocation.environment,
-    );
-    return await runManagedWorkerDispatchNamespace(
-      {
-        surface: invocation.surface,
-        action: invocation.action,
-        environment: invocation.environment,
-        commit: invocation.commit,
-      },
-      namespaceTarget,
-    );
-  }
   const target = loadTarget(targetPath(invocation.environment), invocation.environment);
   const scopeTransition =
     invocation.formAuthorityScopeTransitionPath === undefined
@@ -802,16 +752,6 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       );
     case "takoserver-sponsorship-authority-worker":
       return await runSponsorshipAuthority(
-        {
-          surface: invocation.surface,
-          action: invocation.action,
-          environment: invocation.environment,
-          commit: invocation.commit,
-        },
-        target,
-      );
-    case "takoserver-public-parent-token-retirement":
-      return await runPublicParentTokenRetirement(
         {
           surface: invocation.surface,
           action: invocation.action,
@@ -900,48 +840,6 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           ...(invocation.organizationId === undefined
             ? {}
             : { organizationId: invocation.organizationId }),
-        },
-        target,
-      );
-    case "takoserver-managed-object-receipt-authority":
-      return await runManagedObjectReceiptAuthority(
-        {
-          surface: invocation.surface,
-          action: invocation.action,
-          environment: invocation.environment,
-          commit: invocation.commit,
-        },
-        target,
-      );
-    case "takoserver-managed-worker-gateway":
-      return await runManagedWorkerGateway(
-        {
-          surface: invocation.surface,
-          action: invocation.action,
-          environment: invocation.environment,
-          commit: invocation.commit,
-          ...(invocation.reverse ? { reverse: true } : {}),
-        },
-        target,
-      );
-    case "cloudflare-provider-executor":
-      return await runCloudflareProviderExecutor(
-        {
-          surface: invocation.surface,
-          action: invocation.action,
-          environment: invocation.environment,
-          commit: invocation.commit,
-          ...(invocation.reverse ? { reverse: true } : {}),
-        },
-        target,
-      );
-    case "takoserver-exact-artifact-recovery":
-      return await runExactArtifactRecoveryDeployment(
-        {
-          surface: invocation.surface,
-          action: invocation.action,
-          environment: invocation.environment,
-          commit: invocation.commit,
         },
         target,
       );

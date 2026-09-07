@@ -129,9 +129,42 @@ released provider ever wrote one.
 
 - v2 is not a second contract offered alongside v1.
 - An operation key is not a bearer credential. It never replaces Host
-  authentication, authorization, or idempotency; the organization is taken only
-  from the authenticated API key.
+  authentication, authorization, or idempotency; organization and Space come
+  only from the authenticated authority described in the amendment below.
 - A secret value never becomes identity.
+
+## Amendment — 2026-09-07: the admitted tenant run may prepare within its Space
+
+The original decision allowed only a `resources:write` organization API key to
+prepare, read, or revoke a handoff. That omitted the actual self-host execution
+path: the same short-lived tenant-run credential that is admitted to perform the
+public apply must prepare its runtime inputs after planning and before that
+apply. Giving it organization-wide control would exceed the credential's
+existing public Host authority.
+
+`PUT` and `GET` therefore also accept the Host's existing, fully admitted
+tenant-run credential. This is not a second JWT verifier or an admission
+fallback: the control route consumes the result of the same active-key,
+signature, issuer, audience, time, closed-claim, and deployment-specific
+admission used by the public Host lane. The credential supplies the
+organization and its one canonical Space. `runRef` remains issuance
+correlation; it is not a narrower authorization scope, so two runs admitted to
+the same Space retain the same public authority.
+
+Before a scoped `PUT` seals any value, the Host strictly parses the committed
+public body and proves that the method, path, create fence, and body name one
+create-only `WorkerVersion` in that credential's exact Space. The existing
+`space` column is written at preparation time. Scoped `PUT` and `GET` expose
+only a row carrying the same Space; an absent, legacy `NULL`, or other-Space row
+is `operation_not_found` and cannot be mutated. The public claim independently
+re-proves that stored Space and the exact apply commitment.
+
+The API-key path, operation identity `H(organization, operationKey)`, and
+replay/lease lifecycle do not change. Existing API-key-created `NULL` rows stay
+available to organization writers and can still be spent by an exact public
+apply, but are never readable through a tenant credential. `DELETE` remains
+`resources:write` API-key-only because runner recovery does not need
+organization-wide revocation authority.
 
 ## Amendment — 2026-09-02: the lease port carries the executing apply
 

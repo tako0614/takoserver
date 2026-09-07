@@ -10,6 +10,7 @@ import {
   writeExactArtifactRecoveryWorkerConfig,
 } from "../scripts/deploy/exact-artifact-recovery.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import type { WorkerProviderExecutorQualification } from "../scripts/deploy/worker.ts";
 import {
   ARTIFACT_RECOVERY_REQUEST_FORMAT,
   ARTIFACT_RECOVERY_RETENTION_FORMAT,
@@ -84,6 +85,30 @@ const request = {
 } as ArtifactRecoveryRequest;
 
 describe("exact artifact recovery deploy lifecycle", () => {
+  test("fails closed without owner-injected live executor qualification", async () => {
+    await expect(
+      runExactArtifactRecoveryDeployment(
+        {
+          surface: "takoserver-exact-artifact-recovery",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          runtime: {
+            async inspect() {
+              throw new Error("runtime must not be inspected");
+            },
+            async apply() {
+              throw new Error("status must be read-only");
+            },
+          },
+        },
+      ),
+    ).rejects.toThrow("owner-injected live qualification");
+  });
+
   test("plans publication, execution, binding-backed purge, then retirement in order", () => {
     const base = {
       executorReady: true,
@@ -265,6 +290,7 @@ describe("exact artifact recovery deploy lifecycle", () => {
         },
         target,
         {
+          providerExecutorQualification: readyExecutorQualification(),
           review: "reviewer@example.test",
           runtime: {
             async inspect() {
@@ -475,7 +501,12 @@ describe("exact artifact recovery deploy lifecycle", () => {
         commit: COMMIT,
       },
       target,
-      { runtime, review: "reviewer@example.test", run: cleanRemoteSourceRun },
+      {
+        runtime,
+        review: "reviewer@example.test",
+        run: cleanRemoteSourceRun,
+        providerExecutorQualification: readyExecutorQualification(),
+      },
     );
     expect(applied).toEqual(["publish_worker"]);
     expect(result).toMatchObject({
@@ -524,6 +555,7 @@ describe("exact artifact recovery deploy lifecycle", () => {
       },
       target,
       {
+        providerExecutorQualification: readyExecutorQualification(),
         runtime: {
           async inspect() {
             return snapshot;
@@ -548,6 +580,7 @@ describe("exact artifact recovery deploy lifecycle", () => {
       },
       target,
       {
+        providerExecutorQualification: readyExecutorQualification(),
         runtime: {
           async inspect() {
             return snapshot;
@@ -561,6 +594,33 @@ describe("exact artifact recovery deploy lifecycle", () => {
     expect(repeated.quiescenceEvidenceDigest).toBe(result.quiescenceEvidenceDigest);
   });
 });
+
+function readyExecutorQualification(): WorkerProviderExecutorQualification {
+  return {
+    async read() {
+      return {
+        status: "ready",
+        ready: true,
+        managedExact: true,
+        routeLess: true,
+        schemaReady: true,
+        dependencies: {
+          ready: true,
+          receiptAuthorityReady: true,
+          receiptAuthorityVersionId: "30000000-0000-4000-8000-000000000046",
+          managedWorkerGatewayReady: true,
+          managedWorkerGatewayVersionId: GATEWAY_VERSION,
+        },
+        versionId: "40000000-0000-4000-8000-000000000046",
+        deploymentId: "50000000-0000-4000-8000-000000000046",
+        previousVersionId: null,
+        commit: COMMIT,
+        bundleDigestHex: "6".repeat(64),
+        moduleDigestHex: "7".repeat(64),
+      };
+    },
+  };
+}
 
 async function cleanRemoteSourceRun(command: readonly string[]) {
   const key = command.join(" ");

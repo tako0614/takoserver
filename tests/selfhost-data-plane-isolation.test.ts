@@ -7,6 +7,7 @@ import { createEphemeralSql } from "../src/compat.ts";
 import type { ControlRoutes } from "../src/control.ts";
 import {
   SELFHOST_WORKER_DATA_PLANE_BINDING,
+  SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
 } from "../src/providers/selfhost-data-service.ts";
 import {
@@ -255,8 +256,11 @@ test("only a loopback address with a real port may be published", async () => {
     dataPlane: { address, module: "__takoserver-selfhost-data.js", vars: [] },
   });
   const modules = new Map([["index.js", new TextEncoder().encode("export default {};")]]);
+  const hostModules = new Map([
+    [SELFHOST_WORKER_DATA_SERVICE_MODULE, new TextEncoder().encode(selfhostDataServiceSource())],
+  ]);
   for (const address of ["127.0.0.1:8787", "[::1]:1", "127.0.0.1:65535"]) {
-    await runtime.write("sw1", site(address), modules);
+    await runtime.write("sw1", site(address), modules, undefined, hostModules);
   }
   for (const address of [
     // A name is a resolver answer, not an address: it may be `::1` where the
@@ -272,8 +276,8 @@ test("only a loopback address with a real port may be published", async () => {
     "127.0.0.1:8787 ",
     "example.com:8787",
   ]) {
-    await expect(runtime.write("sw1", site(address), modules)).rejects.toThrow(
-      "unusable data plane address",
-    );
+    await expect(
+      runtime.write("sw1", site(address), modules, undefined, hostModules),
+    ).rejects.toThrow("unusable data plane address");
   }
 });

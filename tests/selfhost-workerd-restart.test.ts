@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
-import { createWorkerdSupervisor, findWorkerd } from "../src/workerd-supervisor.ts";
+import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
 
 /**
  * A self-host survives its own restart.
@@ -21,7 +21,9 @@ import { createWorkerdSupervisor, findWorkerd } from "../src/workerd-supervisor.
  * again without publishing anything.
  */
 
-const WORKERD = findWorkerd(resolve(import.meta.dir, ".."));
+// A restart must prove the binary Takoserver is allowed to serve with, not the
+// legacy package runtime that the production selector deliberately rejects.
+const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
 const HOSTNAME = "restart.localhost";
 const MODULE = `export default {
   async fetch() {

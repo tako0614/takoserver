@@ -295,7 +295,6 @@ describe("public Cloudflare parent-token retirement", () => {
         status: "drift",
         ready: false,
         routeLess: false,
-        settingsExact: false,
       });
       await expect(
         applyFixture(fixture, root, readyExecutorQualification(exposed)),
@@ -993,11 +992,6 @@ function executorInspection(overrides: Partial<ExecutorInspection> = {}): Execut
     commit: COMMIT,
     bundleDigestHex: "d".repeat(64),
     moduleDigestHex: "d".repeat(64),
-    moduleBytes: new Uint8Array([1]),
-    bindingsExact: true,
-    secretsExact: true,
-    settingsExact: true,
-    migrationExact: true,
     ...overrides,
   };
 }

@@ -41,7 +41,6 @@ import {
 } from "./takoform/artifact-reconciler.ts";
 import { createTakoformArtifacts, type TakoformArtifactTransport } from "./takoform/artifacts.ts";
 import { installedBindings } from "./takoform/bindings.ts";
-import type { WorkerModuleInspector } from "./takoform/engine.ts";
 import { createTakoformEngine } from "./takoform/engine.ts";
 import { installedForms, sameFormRef } from "./takoform/forms.ts";
 import { type CreateTakoformHostOptions, createTakoformHost } from "./takoform/host.ts";
@@ -62,7 +61,14 @@ import type {
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
-import { createTokenService, type SigningKey, TokenError } from "./token.ts";
+import {
+  createTokenService,
+  type SigningKey,
+  type TakoformTenantRunTokenClaims,
+  type TenantRunCredentialAdmission,
+  type TenantRunCredentialIssuance,
+  TokenError,
+} from "./token.ts";
 import {
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
@@ -129,10 +135,15 @@ export interface AppPorts {
   readonly hostAuthority?: TakoformHostAuthority;
   readonly offerings: readonly Offering[];
   readonly signingKey?: SigningKey;
+  /**
+   * Host-specific authority factory. Only the Bun entry supplies it; the
+   * public Worker graph retains sponsorship-ledger admission and no signer.
+   */
+  readonly selfhostTenantRunCredentialAuthority?: (
+    originReservations: Pick<WorkerEndpointOriginReservations, "read">,
+  ) => TenantRunCredentialAdmission & TenantRunCredentialIssuance;
   /** Shared with a provider that publishes committed bundles. */
   readonly artifacts?: TakoformArtifactTransport;
-  /** Parses committed worker bytes without executing tenant code. */
-  readonly workerModuleInspector?: WorkerModuleInspector;
   /**
    * Replaces the Takoform Host entirely. Used by conformance tests that need to
    * drive the lane with their own authentication; production never sets it.
@@ -250,6 +261,15 @@ export function buildApp(ports: AppPorts): App {
           deployments,
         })
       : undefined);
+  if (ports.selfhostTenantRunCredentialAuthority && !originReservations) {
+    throw new TypeError(
+      "self-host tenant-run credentials require an endpoint reservation authority",
+    );
+  }
+  const selfhostTenantRunCredentials =
+    ports.selfhostTenantRunCredentialAuthority && originReservations
+      ? ports.selfhostTenantRunCredentialAuthority(originReservations)
+      : undefined;
   const attachments = createAttachmentService({
     store: createAttachmentStore(ports.sql, clock),
     deployments,
@@ -291,7 +311,53 @@ export function buildApp(ports: AppPorts): App {
     issuer: ports.publicOrigin,
     clock,
     ...(ports.signingKey ? { signingKey: ports.signingKey } : {}),
+    ...(selfhostTenantRunCredentials
+      ? { tenantRunCredentialAdmission: selfhostTenantRunCredentials }
+      : {}),
   });
+  const authenticateTenantRunCredential = async (
+    authorization: string | null,
+  ): Promise<{
+    readonly claims: TakoformTenantRunTokenClaims;
+    readonly principal: {
+      readonly tenantId: string;
+      readonly principalId: string;
+      readonly scope: {
+        readonly space: string;
+        readonly mode: "tenant-run";
+        readonly workerEndpointOriginReservationId?: string;
+      };
+    };
+  } | null> => {
+    const bearer = authorization?.startsWith("Bearer ")
+      ? authorization.slice("Bearer ".length)
+      : null;
+    if (!bearer) return null;
+    try {
+      const claims = await tokens.verifyTakoformTenantRunToken(bearer);
+      return {
+        claims,
+        principal: {
+          tenantId: claims.organizationId,
+          // Keep the existing per-credential principal identity. Tenant-run
+          // authorization is canonically Space-wide; runRef is issuance
+          // correlation, not a second resource-plane scope.
+          principalId: `run:${claims.tokenId}`,
+          scope: {
+            space: claims.spaceRef,
+            mode: "tenant-run",
+            ...(claims.workerEndpointOriginReservationId
+              ? {
+                  workerEndpointOriginReservationId: claims.workerEndpointOriginReservationId,
+                }
+              : {}),
+          },
+        },
+      };
+    } catch {
+      return null;
+    }
+  };
 
   const defaultProviderDriver =
     ports.driver === undefined
@@ -386,30 +452,15 @@ export function buildApp(ports: AppPorts): App {
         return owned ? { tenantId: organizationId, principalId: actor.hostPrincipalId } : null;
       }
 
+      const tenantRun = await authenticateTenantRunCredential(authorization);
+      if (tenantRun) return tenantRun.principal;
       const bearer = authorization?.startsWith("Bearer ")
         ? authorization.slice("Bearer ".length)
         : null;
       if (!bearer) return null;
       try {
-        try {
-          const claims = await tokens.verifyTakoformTenantRunToken(bearer);
-          return {
-            tenantId: claims.organizationId,
-            principalId: `run:${claims.tokenId}`,
-            scope: {
-              space: claims.spaceRef,
-              mode: "tenant-run" as const,
-              ...(claims.workerEndpointOriginReservationId
-                ? {
-                    workerEndpointOriginReservationId: claims.workerEndpointOriginReservationId,
-                  }
-                : {}),
-            },
-          };
-        } catch {
-          // Exact-Resource reservation tokens share the Takoform audience
-          // but have a closed, disjoint claim shape.
-        }
+        // Exact-Resource reservation tokens share the Takoform audience with
+        // the tenant-run credential above but have a closed, disjoint shape.
         const claims = await tokens.verifyTakoformRunToken(bearer);
         const reservation = await reseller.reservation({
           organizationId: claims.organizationId,
@@ -468,7 +519,6 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.hostBindings ? { bindings: ports.hostBindings } : {}),
     driver,
     ...(ports.artifacts ? { artifacts: ports.artifacts } : {}),
-    ...(ports.workerModuleInspector ? { workerModuleInspector: ports.workerModuleInspector } : {}),
     ...(ports.standardServiceResolver
       ? { standardServiceResolver: ports.standardServiceResolver }
       : {}),
@@ -522,6 +572,8 @@ export function buildApp(ports: AppPorts): App {
     catalog,
     reseller,
     tokens,
+    authenticateTenantRunCredential: async (authorization) =>
+      (await authenticateTenantRunCredential(authorization))?.claims ?? null,
     settlement: ports.settlement,
     clock,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
@@ -535,6 +587,7 @@ export function buildApp(ports: AppPorts): App {
     ...(artifactConsumerRepair ? { artifactConsumerRepair } : {}),
     ...(ports.runtimeInputs ? { runtimeInputs: ports.runtimeInputs.preparations } : {}),
     ...(originReservations ? { originReservations } : {}),
+    ...(selfhostTenantRunCredentials ? { selfhostTenantRunCredentials } : {}),
     ...(driver.runtimeInputPolicy ? { runtimeInputPolicy: driver.runtimeInputPolicy } : {}),
   });
 
@@ -664,9 +717,6 @@ export function createStaticTestTakoformHost(
     stableReviewConstraintPhases: true,
     clock,
     randomId,
-    ...(options.workerModuleInspector
-      ? { workerModuleInspector: options.workerModuleInspector }
-      : {}),
     ...(options.blockingRelations ? { blockingRelations: options.blockingRelations } : {}),
     ...(options.standardServiceResolver
       ? { standardServiceResolver: options.standardServiceResolver }

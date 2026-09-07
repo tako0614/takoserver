@@ -64,6 +64,31 @@ export interface TakoformTenantRunTokenClaims {
   readonly tokenId: string;
 }
 
+/**
+ * The post-cryptographic authority decision for a tenant-run credential.
+ *
+ * `TokenService` calls this only after the JWT has passed active-key,
+ * signature, issuer, audience, time, lifetime, and closed-claim validation.
+ * An implementation therefore decides only whether that already-opened
+ * credential came from the one authority this deployment selected.
+ */
+export interface TenantRunCredentialAdmission {
+  assertAdmitted(input: {
+    readonly claims: TakoformTenantRunTokenClaims;
+    readonly keyId: string;
+  }): Promise<void>;
+}
+
+/** The narrow capability mounted by a self-host composition that may mint one run bearer. */
+export interface TenantRunCredentialIssuance {
+  issue(input: {
+    readonly organizationId: string;
+    readonly spaceRef: string;
+    readonly runRef: string;
+    readonly workerEndpointOriginReservationId?: string;
+  }): Promise<{ readonly token: string; readonly expiresAt: string }>;
+}
+
 export type TokenErrorCode =
   | "malformed_token"
   | "unknown_key"
@@ -148,6 +173,8 @@ export interface CreateTokenServiceOptions {
   readonly maxProvisionTokenLifetimeSeconds?: number;
   readonly maxTakoformRunTokenLifetimeSeconds?: number;
   readonly keyCacheSeconds?: number;
+  /** Absent preserves the dedicated Hosted sponsorship admission ledger. */
+  readonly tenantRunCredentialAdmission?: TenantRunCredentialAdmission;
 }
 
 export function createTokenService(options: CreateTokenServiceOptions): TokenService {
@@ -159,6 +186,8 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
   );
   const keyCacheSeconds = options.keyCacheSeconds ?? 10;
   const keys = createKeyCache(options.sql, clock, keyCacheSeconds);
+  const tenantRunCredentialAdmission =
+    options.tenantRunCredentialAdmission ?? sponsorshipCredentialAdmission(options.sql);
 
   const sign = async (
     audience: string,
@@ -319,7 +348,7 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     async verifyTakoformTenantRunToken(token) {
       const opened = await open(token, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime);
       const claims = takoformTenantRunClaims(opened.payload);
-      await assertAdmittedSponsorshipCredential(options.sql, claims, opened.keyId);
+      await tenantRunCredentialAdmission.assertAdmitted({ claims, keyId: opened.keyId });
       return claims;
     },
 
@@ -334,41 +363,40 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
 }
 
 /**
- * A tenant-run JWT is not authoritative merely because an active Takoserver
- * key signed it. The route-less authority first appends one immutable
- * admission row and records the dedicated credential key identity. Verification
- * pins the JWT `kid` and scope to that row, so the public Worker's ordinary
- * signing key cannot mint an accepted sponsorship credential.
+ * The default tenant-run admission is Hosted sponsorship's immutable issuance
+ * row. A self-host composition must replace this whole port explicitly; the
+ * verifier never tries one authority and then falls back to another. In both
+ * cases an active Takoserver key and a valid signature alone are insufficient.
  */
-async function assertAdmittedSponsorshipCredential(
-  sql: Sql,
-  claims: TakoformTenantRunTokenClaims,
-  keyId: string,
-): Promise<void> {
-  let rows: readonly Record<string, unknown>[];
-  try {
-    rows = await sql.query(
-      `SELECT token_id, org_id, tenant_ref, issued_at_epoch_seconds,
-              expires_at_epoch_seconds, credential_key_id
-       FROM sponsorship_credential_issuance_operations
-       WHERE token_id = ? LIMIT 2`,
-      [claims.tokenId],
-    );
-  } catch {
-    throw new TokenError("state_unavailable");
-  }
-  const row = rows.length === 1 ? rows[0] : undefined;
-  if (
-    !row ||
-    row.token_id !== claims.tokenId ||
-    row.org_id !== claims.organizationId ||
-    row.tenant_ref !== claims.tenantRef ||
-    row.issued_at_epoch_seconds !== claims.issuedAtEpochSeconds ||
-    row.expires_at_epoch_seconds !== claims.expiresAtEpochSeconds ||
-    row.credential_key_id !== keyId
-  ) {
-    fail("invalid_credential_authority");
-  }
+function sponsorshipCredentialAdmission(sql: Sql): TenantRunCredentialAdmission {
+  return {
+    async assertAdmitted({ claims, keyId }) {
+      let rows: readonly Record<string, unknown>[];
+      try {
+        rows = await sql.query(
+          `SELECT token_id, org_id, tenant_ref, issued_at_epoch_seconds,
+                  expires_at_epoch_seconds, credential_key_id
+           FROM sponsorship_credential_issuance_operations
+           WHERE token_id = ? LIMIT 2`,
+          [claims.tokenId],
+        );
+      } catch {
+        throw new TokenError("state_unavailable");
+      }
+      const row = rows.length === 1 ? rows[0] : undefined;
+      if (
+        !row ||
+        row.token_id !== claims.tokenId ||
+        row.org_id !== claims.organizationId ||
+        row.tenant_ref !== claims.tenantRef ||
+        row.issued_at_epoch_seconds !== claims.issuedAtEpochSeconds ||
+        row.expires_at_epoch_seconds !== claims.expiresAtEpochSeconds ||
+        row.credential_key_id !== keyId
+      ) {
+        fail("invalid_credential_authority");
+      }
+    },
+  };
 }
 
 /**

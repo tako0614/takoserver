@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { bytesDigest } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
   type ApplyInput,
@@ -12,6 +13,7 @@ import {
   type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
   type ProviderNativeAbsenceUnknownReason,
+  type ProviderNativeReadbackAuthority,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
   type ProviderOffering,
@@ -47,7 +49,7 @@ import {
 } from "../takoform/limits.ts";
 import {
   internalHostname,
-  WORKERD_ASSETS_BINDING,
+  type WorkerdModuleMediaType,
   type WorkerdRuntime,
 } from "../workerd-runtime.ts";
 import { parseSelfhostCron } from "./selfhost-cron.ts";
@@ -90,9 +92,16 @@ import {
 } from "./selfhost-version-bindings.ts";
 import {
   createSelfhostVersionMaterializer,
+  type PreparedSelfhostVersionMaterialization,
+  SELFHOST_ASSET_STORAGE_LAYOUT,
   SelfhostVersionMaterializationError,
   type SelfhostVersionMaterializationRequest,
+  sameSelfhostVersionSnapshot,
 } from "./selfhost-version-materialization.ts";
+import {
+  selfhostWorkerPreludeModuleName,
+  selfhostWorkerPreludeSource,
+} from "./selfhost-worker-prelude.ts";
 import {
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
@@ -233,6 +242,8 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** Exact technical relation authorities for post-delete native readback. */
+  readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
   /** Where databases, materialized versions, and script state live. */
   readonly dataRoot: string;
   /** The runtime deployments publish into. */
@@ -578,6 +589,62 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       throw error;
     }
   };
+  const readVersionSnapshot = async (script: string, versionId: string) => {
+    try {
+      return await versionMaterializer.readSnapshot({ script, versionId });
+    } catch (error) {
+      if (error instanceof SelfhostVersionMaterializationError) {
+        throw new SelfhostFailure(
+          failed(error.code, materializationMessage(error), error.code === "unavailable"),
+        );
+      }
+      throw error;
+    }
+  };
+  const hasUnknownAssetRouting = (prepared: PreparedSelfhostVersionMaterialization): boolean =>
+    Boolean(prepared.meta.assets && typeof prepared.meta.assets.runWorkerFirst !== "boolean");
+  const hasUnknownAssetMedia = (prepared: PreparedSelfhostVersionMaterialization): boolean =>
+    Boolean(prepared.meta.assets?.files.some((entry) => typeof entry.mediaType !== "string"));
+  const hasUnknownAssetStorage = (prepared: PreparedSelfhostVersionMaterialization): boolean =>
+    Boolean(
+      prepared.meta.assets && prepared.meta.assets.storageLayout !== SELFHOST_ASSET_STORAGE_LAYOUT,
+    );
+  const unknownAssetRouting = (): ProviderTicket =>
+    failed(
+      "unavailable",
+      "the Worker Version's asset routing order is unknown; create and apply a new Worker Version",
+      true,
+    );
+  const unknownAssetMedia = (): ProviderTicket =>
+    failed(
+      "unavailable",
+      "the Worker Version's asset media types are unknown; create and apply a new Worker Version",
+      true,
+    );
+  const unknownAssetStorage = (): ProviderTicket =>
+    failed(
+      "unavailable",
+      "the Worker Version's asset storage layout is unknown; create and apply a new Worker Version",
+      true,
+    );
+  const assetContractFailure = (
+    prepared: PreparedSelfhostVersionMaterialization,
+  ): ProviderTicket | null => {
+    if (hasUnknownAssetRouting(prepared)) return unknownAssetRouting();
+    if (hasUnknownAssetMedia(prepared)) return unknownAssetMedia();
+    if (hasUnknownAssetStorage(prepared)) return unknownAssetStorage();
+    return null;
+  };
+  /** Refuses legacy ambiguity before a route, trigger, or deployment is recorded. */
+  const preflightVersionAssetContract = async (
+    script: string,
+    versionId: string,
+  ): Promise<void> => {
+    const retained = await readVersionSnapshot(script, versionId);
+    if (retained.state !== "present") return;
+    const failure = assetContractFailure(retained.prepared);
+    if (failure) throw new SelfhostFailure(failure);
+  };
 
   const serves = (hostname: string): boolean => {
     const suffixes = options.suffixes ?? [];
@@ -750,19 +817,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     bindings: StoredSelfhostVersionBindings | null,
     events: boolean,
     generation: string,
-    /**
-     * Host-owned service bindings the rendered site gives the tenant service.
-     *
-     * Derived from what this publication actually renders rather than assumed,
-     * because the generated entrypoint builds `env` from a list and a binding
-     * missing from that list is a binding the module loses. Attaching a Cron
-     * Trigger must not be the thing that empties `env.ASSETS`.
-     */
-    services: readonly string[],
   ): {
     source: Uint8Array;
     facade: Uint8Array | null;
     gate: Uint8Array | null;
+    preludeModule: string;
     publication: string;
     token: SelfhostVersionBinding | null;
     eventToken: SelfhostVersionBinding | null;
@@ -790,23 +849,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ),
       );
     }
-    for (const generated of [
-      SELFHOST_WORKER_ENTRYPOINT_MODULE,
-      SELFHOST_WORKER_DATA_SERVICE_MODULE,
-      SELFHOST_WORKER_EVENT_SERVICE_MODULE,
-    ]) {
-      if (mainModule === generated) {
-        throw new SelfhostFailure(
-          failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
-        );
-      }
-    }
     // The generation, not the version: two publications of one Version differ
     // when its routes do, and a readiness answer has to be attributable to the
     // exact configuration that asked for it or a stale one passes for it.
     // Hashed because the generation carries customer hostnames and this string
     // is compiled into a module the tenant's own isolate loads.
     const publication = createHash("sha256").update(generation, "utf8").digest("hex");
+    const preludeModule = selfhostWorkerPreludeModuleName(mainModule);
     let source: string;
     try {
       source = selfhostWorkerEntrypointSource({
@@ -817,7 +866,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         originalMainModule: mainModule,
         declaredHandlers: bindings.handlers,
         ...(events ? { events: true } : {}),
-        ...(services.length > 0 ? { services: [...services] } : {}),
         bindings: [
           ...bindings.vars.map((binding) => ({
             name: binding.name,
@@ -849,6 +897,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       source: new TextEncoder().encode(source),
       facade: plane ? new TextEncoder().encode(selfhostDataServiceSource()) : null,
       gate: events ? new TextEncoder().encode(selfhostEventServiceSource()) : null,
+      preludeModule,
       publication,
       // The token names the version it was minted for, so the plane resolves
       // one record rather than searching every version for a matching secret.
@@ -1030,16 +1079,47 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       await runtimeOperation(() => runtime.reload());
       return;
     }
-    const versionDirectory = join(versionsRoot, script, state.activeVersion);
-    const inspected = await inspectVersion(script, state.activeVersion);
+    const inspected = await readVersionSnapshot(script, state.activeVersion);
     if (inspected.state === "absent" || inspected.state === "corrupt") {
       throw new SelfhostFailure(
         failed("provider_error", "the active Worker Version is not materialized on this machine"),
       );
     }
-    const meta = inspected.meta;
-    const modules = await readTree(join(versionDirectory, "modules"));
-    const assets = meta.assets ? await readTree(join(versionDirectory, "assets")) : undefined;
+    const meta = inspected.prepared.meta;
+    const assetFailure = assetContractFailure(inspected.prepared);
+    if (assetFailure) throw new SelfhostFailure(assetFailure);
+    // Register the complete importable graph with its declared media. Auxiliary
+    // evidence remains in the retained bundle, never in the runtime registry.
+    const modules = new Map<string, Uint8Array>();
+    const moduleMediaTypes: Record<string, WorkerdModuleMediaType> = Object.create(null);
+    for (const entry of meta.modules) {
+      const mediaType = entry.mediaType ?? "application/javascript+module";
+      if (mediaType === "application/source-map+json") continue;
+      if (
+        mediaType !== "application/javascript+module" &&
+        mediaType !== "text/plain" &&
+        mediaType !== "application/octet-stream" &&
+        mediaType !== "application/wasm"
+      ) {
+        throw new SelfhostFailure(failed("invalid_spec", "the Worker module media is unsupported"));
+      }
+      const bytes = inspected.prepared.modules.get(entry.path);
+      if (!bytes) {
+        throw new SelfhostFailure(
+          failed("provider_error", "the Worker module snapshot is incomplete"),
+        );
+      }
+      modules.set(entry.path, bytes);
+      moduleMediaTypes[entry.path] = mediaType;
+    }
+    const assets = inspected.prepared.assets;
+    const assetMediaTypes: Record<string, string> = Object.create(null);
+    for (const entry of meta.assets?.files ?? []) {
+      // `assetContractFailure` above makes this narrowing authoritative. A
+      // retained record without the fact is never published with an inferred
+      // value from its filename.
+      assetMediaTypes[entry.path] = entry.mediaType as string;
+    }
     const hostnames = [
       ...(state.endpointHostname ? [state.endpointHostname] : []),
       ...state.domains,
@@ -1048,6 +1128,16 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // materialized tree, so a republish projects exactly what its apply
     // recorded and nothing a later edit of the directory could introduce.
     const bindings = await readVersionBindings(script, state.activeVersion);
+    if (!bindings?.handlers) {
+      throw new SelfhostFailure(
+        failed("unavailable", "the Worker Version requires authoritative reapply", true),
+      );
+    }
+    const verificationFailure = await verifyPreparedWorkerModule(
+      inspected.prepared,
+      bindings.handlers,
+    );
+    if (verificationFailure) throw new SelfhostFailure(verificationFailure);
     const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
     const generation = await runtimeGeneration(script, state);
     const projection = wrapperProjection(
@@ -1057,32 +1147,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       bindings,
       receivesEvents(state),
       generation,
-      meta.assets ? [WORKERD_ASSETS_BINDING] : [],
     );
+    const hostModules = new Map<string, Uint8Array>();
     if (projection) {
       // Written into the workerd script directory, never into the version
       // directory: `materializationDigest` means "the bytes the tenant
       // committed", and a module this Host generated is not one of them.
       //
-      // A tenant module under either generated name would be overwritten here
-      // and silently replaced, so the publication stops instead.
-      for (const generated of [
-        SELFHOST_WORKER_ENTRYPOINT_MODULE,
-        SELFHOST_WORKER_DATA_SERVICE_MODULE,
-        SELFHOST_WORKER_EVENT_SERVICE_MODULE,
-      ]) {
-        if (modules.has(generated)) {
-          throw new SelfhostFailure(
-            failed("invalid_spec", "the Worker bundle claims this Host's entrypoint module name"),
-          );
-        }
-      }
-      modules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
+      // Host modules and tenant modules are different runtime namespaces and
+      // different physical trees. Equal logical names are therefore valid and
+      // cannot overwrite or shadow one another.
+      hostModules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
+      hostModules.set(
+        projection.preludeModule,
+        new TextEncoder().encode(selfhostWorkerPreludeSource()),
+      );
       if (projection.facade) {
-        modules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
+        hostModules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
       }
       if (projection.gate) {
-        modules.set(SELFHOST_WORKER_EVENT_SERVICE_MODULE, projection.gate);
+        hostModules.set(SELFHOST_WORKER_EVENT_SERVICE_MODULE, projection.gate);
       }
     }
     await runtimeOperation(() =>
@@ -1090,15 +1174,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         script,
         {
           directory: script,
-          mainModule: projection ? SELFHOST_WORKER_ENTRYPOINT_MODULE : meta.mainModule,
+          mainModule: meta.mainModule,
+          ...(projection ? { hostEntrypoint: SELFHOST_WORKER_ENTRYPOINT_MODULE } : {}),
+          ...(projection ? { hostModules: [projection.preludeModule] } : {}),
+          modules: Object.keys(moduleMediaTypes).filter((name) => name !== meta.mainModule),
+          moduleMediaTypes,
           hostnames,
           generation,
-          ...(meta.assets ? { assets: { notFoundHandling: meta.assets.notFoundHandling } } : {}),
+          ...(meta.assets
+            ? {
+                assets: {
+                  notFoundHandling: meta.assets.notFoundHandling,
+                  runWorkerFirst: meta.assets.runWorkerFirst as boolean,
+                  mediaTypes: assetMediaTypes,
+                },
+              }
+            : {}),
           ...(vars.length > 0 ? { vars } : {}),
           ...(projection
             ? {
-                generatedEntrypoint: true,
-                modules: [meta.mainModule],
                 // The token rides on the facade service's own binding list, so
                 // it is never a binding of the service that runs tenant code.
                 ...(projection.facade && projection.token
@@ -1126,6 +1220,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         },
         modules,
         assets,
+        hostModules,
       ),
     );
     await runtimeOperation(() => runtime.reload());
@@ -1472,6 +1567,49 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return [...handlers].sort();
   };
 
+  /** Artifact identities shared by apply, recovery, and adoption; no artifact or secret reads. */
+  const declaredVersionArtifacts = (
+    input: Pick<ApplyInput, "spec" | "relations">,
+  ): Pick<SelfhostVersionMaterializationRequest, "manifestDigest" | "assets"> => {
+    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
+    const manifestDigest =
+      typeof bundle?.spec.manifestDigest === "string" ? bundle.spec.manifestDigest : null;
+    if (!manifestDigest) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Worker Version is incomplete"));
+    }
+    const assetsSpec =
+      typeof input.spec.assets === "object" && input.spec.assets !== null
+        ? (input.spec.assets as JsonObject)
+        : null;
+    if (!assetsSpec) return { manifestDigest };
+    if (
+      (assetsSpec.notFoundHandling !== "none" &&
+        assetsSpec.notFoundHandling !== "single_page_application") ||
+      typeof assetsSpec.runWorkerFirst !== "boolean"
+    ) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version asset routing declaration is invalid"),
+      );
+    }
+    const assetBundle = relationResource(input.relations, "/assets/bundle", "StaticAssetBundle");
+    const assetsDigest =
+      typeof assetBundle?.spec.manifestDigest === "string" ? assetBundle.spec.manifestDigest : null;
+    if (!assetsDigest) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Static Asset Bundle is unavailable"));
+    }
+    return {
+      manifestDigest,
+      assets: {
+        manifestDigest: assetsDigest,
+        notFoundHandling:
+          assetsSpec.notFoundHandling === "single_page_application"
+            ? "single-page-application"
+            : "none",
+        runWorkerFirst: assetsSpec.runWorkerFirst,
+      },
+    };
+  };
+
   /**
    * Records the environment and the declared handlers for one immutable
    * version.
@@ -1502,6 +1640,51 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     });
   };
 
+  /** No environment, authority, or artifact resolver crosses this runtime seam. */
+  const verifyPreparedWorkerModule = async (
+    prepared: PreparedSelfhostVersionMaterialization,
+    handlers: readonly SelfhostWorkerHandlerName[],
+  ): Promise<ProviderTicket | null> => {
+    if (typeof options.runtime.inspectModule !== "function") {
+      return failed("unavailable", "the Worker module verifier is unavailable", true);
+    }
+    try {
+      const modules = await Promise.all(
+        prepared.meta.modules.map(async (entry) => {
+          const bytes = prepared.modules.get(entry.path);
+          if (!bytes || bytes.byteLength !== entry.size) {
+            throw new Error("prepared_worker_module_missing");
+          }
+          return {
+            name: entry.path,
+            // prepare already checked the artifact's declared digest. This
+            // snapshot uses exact byte identity even for retained pre-canonical
+            // local manifests; their resource identity is not rewritten.
+            digest: await bytesDigest(bytes),
+            mediaType: entry.mediaType ?? "application/javascript+module",
+            bytes,
+          };
+        }),
+      );
+      const result = await options.runtime.inspectModule({
+        mainModule: prepared.meta.mainModule,
+        modules,
+        declaredHandlers: handlers,
+      });
+      if (result.outcome === "valid") return null;
+      if (result.outcome === "invalid") {
+        return failed(
+          "invalid_spec",
+          `the Worker module failed ${result.error}; declared handlers: ${handlers.join(", ") || "(none)"}`,
+        );
+      }
+    } catch {
+      // Neither an operational exception nor a missing verifier proves that
+      // customer code is invalid. They also must never authorize publication.
+    }
+    return failed("unavailable", "the Worker module could not be verified", true);
+  };
+
   const applyWorkerVersion = async (input: ApplyInput): Promise<ProviderTicket> => {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
     const requiredSensitive = sensitiveBindingNames(input.spec.requiredSensitiveVars);
@@ -1513,12 +1696,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
-    const manifestDigest =
-      typeof bundle?.spec.manifestDigest === "string" ? bundle.spec.manifestDigest : null;
-    if (!worker || !manifestDigest) {
+    if (!worker) {
       return failed("invalid_spec", "the Worker Version is incomplete");
     }
+    const artifacts = declaredVersionArtifacts(input);
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const versionId = await versionIdOf(input.identity.tenantRef, {
       space: input.identity.space,
@@ -1537,28 +1718,34 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const handlers = declaredHandlers(input.spec);
     const dataPlane = dataBindings.length > 0 ? { bindings: dataBindings } : undefined;
-    const assetsSpec =
-      typeof input.spec.assets === "object" && input.spec.assets !== null
-        ? (input.spec.assets as JsonObject)
-        : null;
-    let assetsInput: SelfhostVersionMaterializationRequest["assets"] | undefined;
-    if (assetsSpec) {
-      const assetBundle = relationResource(input.relations, "/assets/bundle", "StaticAssetBundle");
-      const assetsDigest =
-        typeof assetBundle?.spec.manifestDigest === "string"
-          ? assetBundle.spec.manifestDigest
-          : null;
-      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      assetsInput = {
-        manifestDigest: assetsDigest,
-        notFoundHandling:
-          assetsSpec.notFoundHandling === "single_page_application"
-            ? "single-page-application"
-            : "none",
-      };
-    }
 
-    // The lease is claimed before anything is materialized, so a Worker Version
+    let prepared: PreparedSelfhostVersionMaterialization;
+    try {
+      prepared = await versionMaterializer.prepare({
+        tenantRef: input.identity.tenantRef,
+        script,
+        versionId,
+        ...artifacts,
+      });
+    } catch (error) {
+      if (error instanceof SelfhostVersionMaterializationError) {
+        return failed(error.code, materializationMessage(error), error.code === "unavailable");
+      }
+      throw error;
+    }
+    const retained = await readVersionSnapshot(script, versionId);
+    if (retained.state === "present") {
+      const failure = assetContractFailure(retained.prepared);
+      if (failure) return failure;
+    }
+    if (hasUnknownAssetMedia(prepared)) {
+      return failed("invalid_spec", "the static asset manifest has no media type for every file");
+    }
+    const verificationFailure = await verifyPreparedWorkerModule(prepared, handlers);
+    if (verificationFailure) return verificationFailure;
+
+    // The lease is claimed only after the credential-free module check, and
+    // before anything is materialized, so a Worker Version
     // whose secrets this Host cannot obtain leaves nothing behind on disk.
     let lease: ProviderRuntimeInputLease | undefined;
     if (requiredSensitive.length > 0 && runtimeInputTarget) {
@@ -1612,13 +1799,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
     let materialized: Awaited<ReturnType<typeof versionMaterializer.materialize>>;
     try {
-      materialized = await versionMaterializer.materialize({
-        tenantRef: input.identity.tenantRef,
-        script,
-        versionId,
-        manifestDigest,
-        ...(assetsInput ? { assets: assetsInput } : {}),
-      });
+      materialized = await versionMaterializer.materialize(
+        {
+          tenantRef: input.identity.tenantRef,
+          script,
+          versionId,
+          ...artifacts,
+        },
+        prepared,
+      );
     } catch (error) {
       const aborted = lease ? await abortRuntimeLease(lease) : null;
       if (aborted) return aborted;
@@ -1655,7 +1844,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (
       inspected.state !== "present" ||
       inspected.digest !== materialized.materializationDigest ||
-      !sameBindingNames(recorded, vars, requiredSensitive, dataBindings)
+      !sameVersionDeclaration(recorded, handlers, vars, requiredSensitive, dataBindings)
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
     }
@@ -1713,12 +1902,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-    const bundle = relationResource(input.relations, "/bundle", "WorkerBundle");
-    const manifestDigest =
-      typeof bundle?.spec.manifestDigest === "string" ? bundle.spec.manifestDigest : null;
-    if (!worker || !manifestDigest) {
+    if (!worker) {
       return failed("invalid_spec", "the Worker Version is incomplete");
     }
+    const artifacts = declaredVersionArtifacts(input);
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const versionId = await versionIdOf(input.identity.tenantRef, {
       space: input.identity.space,
@@ -1735,45 +1922,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "this deployment serves no data plane, so the Worker Version's bindings cannot be projected",
       );
     }
-    // Read for its refusal only: a Version whose handler declaration is invalid
-    // is not one this recovery can confirm.
-    declaredHandlers(input.spec);
-    const dataPlane = dataBindings.length > 0 ? { bindings: dataBindings } : undefined;
-    const assetsSpec =
-      typeof input.spec.assets === "object" && input.spec.assets !== null
-        ? (input.spec.assets as JsonObject)
-        : null;
-    let assetsInput: SelfhostVersionMaterializationRequest["assets"] | undefined;
-    if (assetsSpec) {
-      const assetBundle = relationResource(input.relations, "/assets/bundle", "StaticAssetBundle");
-      const assetsDigest =
-        typeof assetBundle?.spec.manifestDigest === "string"
-          ? assetBundle.spec.manifestDigest
-          : null;
-      if (!assetsDigest) return failed("invalid_spec", "the Static Asset Bundle is unavailable");
-      assetsInput = {
-        manifestDigest: assetsDigest,
-        notFoundHandling:
-          assetsSpec.notFoundHandling === "single_page_application"
-            ? "single-page-application"
-            : "none",
-      };
-    }
+    const handlers = declaredHandlers(input.spec);
     let expected: Awaited<ReturnType<typeof versionMaterializer.prepare>>;
     try {
       expected = await versionMaterializer.prepare({
         tenantRef: input.identity.tenantRef,
         script,
         versionId,
-        manifestDigest,
-        ...(dataPlane ? { dataPlane } : {}),
-        ...(assetsInput ? { assets: assetsInput } : {}),
+        ...artifacts,
       });
     } catch (error) {
       if (error instanceof SelfhostVersionMaterializationError) {
         return failed(error.code, materializationMessage(error), error.code === "unavailable");
       }
       throw error;
+    }
+    const materialized = await readVersionSnapshot(script, versionId);
+    const recorded = await readVersionBindings(script, versionId);
+    if (materialized.state === "present") {
+      const failure = assetContractFailure(materialized.prepared);
+      if (failure) return failure;
     }
     // Readback-only from here down. Recovery never materializes, never writes a
     // binding, and never asks for the values again: a dispatched handoff has
@@ -1797,8 +1965,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         return failed("denied", "required sensitive Worker runtime inputs are unavailable");
       }
     }
-    const materialized = await inspectVersion(script, versionId);
-    const recorded = await readVersionBindings(script, versionId);
     // Proven absence, and the only shape of it this Host can prove: no file on
     // this machine holds these values. The binding record is the only place they
     // ever land here — the version directory is materialized before dispatch and
@@ -1828,22 +1994,24 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (materialized.state === "corrupt") {
       return failed("provider_error", "the Worker Version materialization is corrupt");
     }
-    if (materialized.digest !== expected.materializationDigest) {
+    if (!sameSelfhostVersionSnapshot(materialized.prepared, expected)) {
       return failed(
         "conflict",
         "the committed Worker Version materialization conflicts with this recovery",
       );
     }
-    if (!sameBindingNames(recorded, vars, requiredSensitive, dataBindings)) {
+    if (!sameVersionDeclaration(recorded, handlers, vars, requiredSensitive, dataBindings)) {
       return failed("not_found", "the Worker Version environment was not recorded");
     }
+    const verificationFailure = await verifyPreparedWorkerModule(materialized.prepared, handlers);
+    if (verificationFailure) return verificationFailure;
     if (recoveryLease) {
       try {
         await recoveryLease.settle(
           await versionRuntimeInputReceiptDigest({
             script,
             versionId,
-            materializationDigest: materialized.digest,
+            materializationDigest: materialized.prepared.materializationDigest,
             bindingsDigest: recorded?.digest ?? null,
             bindingNames: requiredSensitive,
           }),
@@ -1858,7 +2026,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         scriptName: script,
         versionId,
         materialized: true,
-        materializationDigest: materialized.digest,
+        materializationDigest: materialized.prepared.materializationDigest,
         ...(vars.length > 0 ? { varNames: vars.map((binding) => binding.name) } : {}),
         ...(requiredSensitive.length > 0 ? { sensitiveVarNames: requiredSensitive } : {}),
         ...(dataBindings.length > 0
@@ -1868,7 +2036,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       outputs: {
         scriptName: script,
         versionId,
-        materializationDigest: materialized.digest,
+        materializationDigest: materialized.prepared.materializationDigest,
       },
     });
   };
@@ -1904,6 +2072,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // serves; the requested split is recorded so what was asked for and what
     // this machine can do are both visible.
     const active = weighted.reduce((best, entry) => (entry.weight > best.weight ? entry : best));
+    await preflightVersionAssetContract(script, active.versionId);
     const current = await readScriptState(script);
     await writeScriptState(script, current, { ...current.state, activeVersion: active.versionId });
     try {
@@ -1925,6 +2094,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const address = endpointAddress(input);
     const current = await readScriptState(script);
+    if (current.state.activeVersion) {
+      await preflightVersionAssetContract(script, current.state.activeVersion);
+    }
     if (current.state.endpointHostname !== address.hostname) {
       await writeScriptState(script, current, {
         ...current.state,
@@ -1969,6 +2141,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const current = await readScriptState(script);
+    if (current.state.activeVersion) {
+      await preflightVersionAssetContract(script, current.state.activeVersion);
+    }
     if (!current.state.domains.includes(hostname)) {
       await writeScriptState(script, current, {
         ...current.state,
@@ -2035,6 +2210,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   ): Promise<void> => {
     const current = await readScriptState(script);
     const next = change(current.state);
+    if (next.activeVersion) {
+      await preflightVersionAssetContract(script, next.activeVersion);
+    }
     // Read the active Version's record BEFORE anything durable moves. A Version
     // published before this Host recorded handlers has neither a handler list
     // nor an event token, so nothing would ever be delivered to it — and
@@ -2349,6 +2527,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    ...(options.nativeReadbackAuthorities
+      ? { nativeReadbackAuthorities: structuredClone(options.nativeReadbackAuthorities) }
+      : {}),
     // Derived from the lease port's presence, never from a config flag. A
     // machine that advertised a non-zero ceiling without somewhere to seal a
     // value would turn a clean 422 at admission into a failure at apply.
@@ -2654,25 +2835,59 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               space: input.identity.space,
               name: input.identity.name,
             });
-            const materialized = await inspectVersion(script, versionId);
+            const materialized = await readVersionSnapshot(script, versionId);
             if (materialized.state === "absent") {
               return failed("not_found", "the Worker Version is not materialized");
             }
             if (materialized.state === "corrupt") {
               return failed("provider_error", "the Worker Version materialization is corrupt");
             }
+            const assetFailure = assetContractFailure(materialized.prepared);
+            if (assetFailure) return assetFailure;
+            const bindings = await readVersionBindings(script, versionId);
+            if (!bindings?.handlers) {
+              return failed(
+                "unavailable",
+                "the Worker Version requires authoritative reapply",
+                true,
+              );
+            }
+            // Import and observe must prove the caller's declaration, not
+            // merely find some valid retained version at the same address.
+            const artifacts = declaredVersionArtifacts(input);
+            const meta = materialized.prepared.meta;
+            if (
+              meta.manifestDigest !== artifacts.manifestDigest ||
+              meta.assets?.manifestDigest !== artifacts.assets?.manifestDigest ||
+              meta.assets?.notFoundHandling !== artifacts.assets?.notFoundHandling ||
+              meta.assets?.runWorkerFirst !== artifacts.assets?.runWorkerFirst
+            ) {
+              return failed("conflict", "the retained Worker Version has different artifacts");
+            }
+            const handlers = declaredHandlers(input.spec);
+            if (!sameStrings(bindings.handlers, handlers)) {
+              return failed(
+                "conflict",
+                "the retained Worker Version has different declared handlers",
+              );
+            }
+            const verificationFailure = await verifyPreparedWorkerModule(
+              materialized.prepared,
+              handlers,
+            );
+            if (verificationFailure) return verificationFailure;
             return succeeded({
               nativeId: input.nativeId,
               observed: {
                 scriptName: script,
                 versionId,
                 materialized: true,
-                materializationDigest: materialized.digest,
+                materializationDigest: materialized.prepared.materializationDigest,
               },
               outputs: {
                 scriptName: script,
                 versionId,
-                materializationDigest: materialized.digest,
+                materializationDigest: materialized.prepared.materializationDigest,
               },
             });
           }
@@ -3993,21 +4208,28 @@ async function versionRuntimeInputReceiptDigest(input: {
 }
 
 /**
- * Whether the recorded environment is exactly the one this apply declares.
+ * Whether the immutable runtime projection matches the desired declaration.
  *
- * Names only. A recovery compares what it can prove from durable state against
- * what the desired spec asks for; it never opens a value to do it.
+ * Sensitive variables compare names only; their values are not in desired state.
+ * Public variables, handlers, and resolved data bindings compare their actual
+ * declarations too, so readback cannot settle a different serving projection.
  */
-function sameBindingNames(
+function sameVersionDeclaration(
   recorded: StoredSelfhostVersionBindings | null,
+  handlers: readonly SelfhostWorkerHandlerName[],
   vars: readonly SelfhostVersionBinding[],
   sensitiveNames: readonly string[],
   dataBindings: readonly SelfhostVersionDataBinding[],
 ): boolean {
-  const expectedVars = vars.map((binding) => binding.name).sort();
+  if (!recorded?.handlers || !sameStrings(recorded.handlers, handlers)) return false;
+  const canonicalVars = (entries: readonly SelfhostVersionBinding[]): string =>
+    JSON.stringify(
+      [...entries]
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map((binding) => [binding.name, binding.kind, binding.value]),
+    );
   const expectedSensitive = [...sensitiveNames].sort();
-  const observedVars = (recorded?.vars ?? []).map((binding) => binding.name).sort();
-  const observedSensitive = (recorded?.sensitiveVars ?? []).map((binding) => binding.name).sort();
+  const observedSensitive = recorded.sensitiveVars.map((binding) => binding.name).sort();
   // A data binding's target is compared too, not merely its name: an `env.DB`
   // pointed at a different database is the same environment by name and a
   // different one by every meaning that matters.
@@ -4024,7 +4246,7 @@ function sameBindingNames(
         ]),
     );
   return (
-    JSON.stringify(expectedVars) === JSON.stringify(observedVars) &&
+    canonicalVars(vars) === canonicalVars(recorded.vars) &&
     JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive) &&
     canonicalData(dataBindings) === canonicalData(recorded?.dataPlane?.bindings ?? [])
   );
@@ -4039,23 +4261,6 @@ function materializationMessage(error: SelfhostVersionMaterializationError): str
     case "unavailable":
       return "the Worker Version materialization is unavailable";
   }
-}
-
-/** Reads every file under a directory into module-name → bytes. */
-async function readTree(root: string): Promise<Map<string, Uint8Array>> {
-  const result = new Map<string, Uint8Array>();
-  const entries = await readdir(root, { withFileTypes: true, recursive: true }).catch(() => []);
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const parent = join(entry.parentPath ?? root);
-    const path = join(parent, entry.name);
-    const name = path
-      .slice(root.length + 1)
-      .split("\\")
-      .join("/");
-    result.set(name, new Uint8Array(await readFile(path)));
-  }
-  return result;
 }
 
 function sqlitePathOf(nativeId: string, databasePath: (name: string) => string): string | null {

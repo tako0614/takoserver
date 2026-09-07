@@ -21,6 +21,7 @@ import type { TakoformDriverRelation, TakoformStoredResource } from "../src/tako
 import {
   type WorkerEndpointOriginAssignment,
   WorkerEndpointOriginReservationError,
+  type WorkerEndpointOriginReservations,
 } from "../src/worker-endpoint-origin-reservations.ts";
 
 const clock = () => new Date("2026-09-01T00:00:00.000Z");
@@ -123,6 +124,11 @@ async function fixture(input: {
   readonly recoverDelete?: Provider["recoverDelete"];
   readonly activationFails?: boolean;
   readonly assignmentAckLost?: boolean;
+  /** Fails the private bind transition for a supplied prepared reservation. */
+  readonly bindFailure?: {
+    readonly code: "conflict" | "backend_unavailable";
+    readonly status: 409 | 503;
+  };
   /** Fails the wallet capture, which is the one step after activation. */
   readonly captureFails?: boolean;
   /** Whether this installation derives its own endpoint address. */
@@ -191,6 +197,8 @@ async function fixture(input: {
   };
   const exactAssignment = assignment();
   let assignmentLookup: WorkerEndpointOriginAssignment | null = exactAssignment;
+  let bindCalls = 0;
+  const bindInputs: Parameters<WorkerEndpointOriginReservations["bind"]>[0][] = [];
   let assignCalls = 0;
   let cancelCalls = 0;
   let releaseCalls = 0;
@@ -220,6 +228,36 @@ async function fixture(input: {
             offeringId: "fake.endpoint",
             offeringDigest: `sha256:${"a".repeat(64)}`,
           } as const);
+    },
+    async bind(bindInput: Parameters<WorkerEndpointOriginReservations["bind"]>[0]) {
+      events.push("reservation.bind");
+      bindCalls += 1;
+      bindInputs.push(bindInput);
+      if (input.bindFailure) {
+        throw new WorkerEndpointOriginReservationError(
+          input.bindFailure.code,
+          input.bindFailure.status,
+        );
+      }
+      return {
+        organizationId: tenantId,
+        reservationId: bindInput.reservationId,
+        canonicalPublicOrigin: exactAssignment.canonicalPublicOrigin,
+        revision: exactAssignment.reservationRevision,
+        expiresAtEpochMilliseconds: Date.parse("2026-09-01T01:00:00.000Z"),
+        requestedSubdomain: "community",
+        binding: {
+          space: bindInput.space,
+          workerName: bindInput.workerName,
+          workerResourceUid: bindInput.workerResourceUid,
+          workerResourceRevision: "1",
+        },
+        status: "bound" as const,
+        providerPackRef: exactAssignment.placement.providerPackRef,
+        providerInstallationRef: exactAssignment.placement.providerInstallationRef,
+        offeringId: "fake.endpoint",
+        offeringDigest: `sha256:${"a".repeat(64)}` as const,
+      };
     },
     async assignEndpoint() {
       events.push("reservation.assign");
@@ -323,7 +361,15 @@ async function fixture(input: {
     applyInput,
     events,
     providerInputs,
-    calls: () => ({ assignCalls, cancelCalls, releaseCalls, activateCalls, deactivateCalls }),
+    calls: () => ({
+      bindCalls,
+      assignCalls,
+      cancelCalls,
+      releaseCalls,
+      activateCalls,
+      deactivateCalls,
+    }),
+    bindInputs,
     setAssignmentLookup(value: WorkerEndpointOriginAssignment | null) {
       assignmentLookup = value;
     },
@@ -350,6 +396,7 @@ test("an ordinary key gets a Host-minted reservation when the address is derived
     "provider.apply",
     "reservation.activate",
   ]);
+  expect(context.calls()).toMatchObject({ bindCalls: 0, assignCalls: 1 });
 });
 
 test("WorkerEndpoint create is refused where no address is derived and none was supplied", async () => {
@@ -367,7 +414,57 @@ test("a supplied reservation is used as it is, and nothing is minted beside it",
     ...context.applyInput,
     workerEndpointOriginReservationId: "reservation-01",
   });
-  expect(context.events).toEqual(["reservation.assign", "provider.apply", "reservation.activate"]);
+  expect(context.events).toEqual([
+    "reservation.bind",
+    "reservation.assign",
+    "provider.apply",
+    "reservation.activate",
+  ]);
+  expect(context.bindInputs).toEqual([
+    {
+      organizationId: tenantId,
+      reservationId: "reservation-01",
+      space: "default",
+      workerName: "community",
+      workerResourceUid: workerUid,
+    },
+  ]);
+  expect(context.calls()).toMatchObject({ bindCalls: 1, assignCalls: 1 });
+});
+
+test("a supplied prepared reservation must bind before assignment and provider dispatch", async () => {
+  const context = await fixture({ bindFailure: { code: "conflict", status: 409 } });
+  await expect(
+    context.driver.apply({
+      ...context.applyInput,
+      workerEndpointOriginReservationId: "reservation-01",
+    }),
+  ).rejects.toMatchObject({ code: "resource_busy", status: 409 });
+  expect(context.events).toEqual(["reservation.bind"]);
+  expect(context.bindInputs).toEqual([
+    {
+      organizationId: tenantId,
+      reservationId: "reservation-01",
+      space: "default",
+      workerName: "community",
+      workerResourceUid: workerUid,
+    },
+  ]);
+  expect(context.calls()).toMatchObject({ bindCalls: 1, assignCalls: 0 });
+  expect(context.providerInputs).toHaveLength(0);
+});
+
+test("a supplied prepared reservation surfaces bind backend failure before assignment", async () => {
+  const context = await fixture({ bindFailure: { code: "backend_unavailable", status: 503 } });
+  await expect(
+    context.driver.apply({
+      ...context.applyInput,
+      workerEndpointOriginReservationId: "reservation-01",
+    }),
+  ).rejects.toMatchObject({ code: "backend_unavailable", status: 503 });
+  expect(context.events).toEqual(["reservation.bind"]);
+  expect(context.calls()).toMatchObject({ bindCalls: 1, assignCalls: 0 });
+  expect(context.providerInputs).toHaveLength(0);
 });
 
 test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async () => {
@@ -378,8 +475,9 @@ test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async 
       workerEndpointOriginReservationId: "reservation-01",
     }),
   ).rejects.toMatchObject({ code: "insufficient_funds", status: 402 });
-  expect(context.events).toEqual(["reservation.assign", "reservation.cancel"]);
+  expect(context.events).toEqual(["reservation.bind", "reservation.assign", "reservation.cancel"]);
   expect(context.calls()).toEqual({
+    bindCalls: 1,
     assignCalls: 1,
     cancelCalls: 1,
     releaseCalls: 0,
@@ -413,12 +511,14 @@ test("releases an assignment the provider never got activated, and gates the rec
     }),
   ).rejects.toMatchObject({ code: "resource_busy", status: 409 });
   expect(context.events).toEqual([
+    "reservation.bind",
     "reservation.assign",
     "provider.apply",
     "reservation.activate",
     "reservation.cancel",
   ]);
   expect(context.calls()).toEqual({
+    bindCalls: 1,
     assignCalls: 1,
     cancelCalls: 1,
     releaseCalls: 0,
@@ -460,8 +560,14 @@ test("refuses a receipt its Form cannot publish before the assignment is activat
       workerEndpointOriginReservationId: "reservation-01",
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
-  expect(context.events).toEqual(["reservation.assign", "provider.apply", "reservation.cancel"]);
+  expect(context.events).toEqual([
+    "reservation.bind",
+    "reservation.assign",
+    "provider.apply",
+    "reservation.cancel",
+  ]);
   expect(context.calls()).toEqual({
+    bindCalls: 1,
     assignCalls: 1,
     cancelCalls: 1,
     releaseCalls: 0,
@@ -488,6 +594,7 @@ test("gives back an assignment whose mutation failed after it was activated", as
     }),
   ).rejects.toThrow("wallet capture failed");
   expect(context.events).toEqual([
+    "reservation.bind",
     "reservation.assign",
     "provider.apply",
     "reservation.activate",
@@ -495,6 +602,7 @@ test("gives back an assignment whose mutation failed after it was activated", as
     "reservation.release",
   ]);
   expect(context.calls()).toEqual({
+    bindCalls: 1,
     assignCalls: 1,
     cancelCalls: 0,
     releaseCalls: 1,
@@ -531,23 +639,42 @@ test("recovery convergence resumes the exact assignment after process death befo
     code: "backend_unavailable",
     status: 503,
   });
-  expect(context.events).toEqual(["reservation.assign"]);
+  expect(context.events).toEqual(["reservation.bind", "reservation.assign"]);
 
   const recovered = await context.driver.apply({ ...command, operationMode: "recovery" });
   expect(recovered.outputs).toMatchObject({ hostname: "reserved.endpoint.test" });
   expect(context.events).toEqual([
+    "reservation.bind",
     "reservation.assign",
+    "reservation.bind",
     "reservation.assign",
     "provider.converge",
     "reservation.activate",
   ]);
   expect(context.calls()).toEqual({
+    bindCalls: 2,
     assignCalls: 2,
     cancelCalls: 0,
     releaseCalls: 0,
     activateCalls: 1,
     deactivateCalls: 0,
   });
+  expect(context.bindInputs).toEqual([
+    {
+      organizationId: tenantId,
+      reservationId: "reservation-01",
+      space: "default",
+      workerName: "community",
+      workerResourceUid: workerUid,
+    },
+    {
+      organizationId: tenantId,
+      reservationId: "reservation-01",
+      space: "default",
+      workerName: "community",
+      workerResourceUid: workerUid,
+    },
+  ]);
   expect(context.providerInputs).toHaveLength(1);
   expect(context.providerInputs[0]?.operationId).toBe(command.operationId);
   expect(context.providerInputs[0]?.workerEndpointOriginAssignment).toEqual({

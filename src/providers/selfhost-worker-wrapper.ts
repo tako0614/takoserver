@@ -10,6 +10,11 @@ import {
   SELFHOST_WORKER_EVENT_PATH,
   SELFHOST_WORKER_EVENT_PROTOCOL,
 } from "./selfhost-events.ts";
+import { selfhostWorkerPreludeModuleName } from "./selfhost-worker-prelude.ts";
+import {
+  WORKER_MODULE_HANDLER_NAMES,
+  type WorkerModuleHandlerName,
+} from "./worker-module-semantic-inspection.ts";
 
 /**
  * The entrypoint a self-hosted Worker Version is actually published as.
@@ -70,9 +75,9 @@ import {
  * `acknowledge`/`retry`/`acknowledgeAll`/`retryAll`, same base64 body, same
  * whole-batch default — so a Worker sees one contract on both backends.
  */
-export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
+export const SELFHOST_WORKER_HANDLER_NAMES = WORKER_MODULE_HANDLER_NAMES;
 
-export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[number];
+export type SelfhostWorkerHandlerName = WorkerModuleHandlerName;
 
 export const SELFHOST_WORKER_EDGE_KV_BINDING_KIND = "edge.kv@1.0.0" as const;
 export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
@@ -113,8 +118,9 @@ export const SELFHOST_WORKER_ENTRYPOINT_MODULE = "__takoserver-selfhost-entrypoi
 /**
  * Where this Host asks a published pair whether the tenant module really loads.
  *
- * The wrapper validates the declared handlers when it first imports the tenant
- * module, and until this existed that first import was a customer's request:
+ * The wrapper validates the declared handlers when it first consumes the
+ * already-imported tenant namespace, and until this existed that first
+ * consumption was a customer's request:
  * a version declaring a handler its module does not export was published, and
  * the attachment it enabled dropped the event. So the publication asks first,
  * through the workerd router, and the answer names the publication that gave
@@ -175,12 +181,12 @@ export function selfhostReadinessAnswer(
 /**
  * What to tell an operator when the publication's own load probe says no.
  *
- * A module that throws while being imported and a module missing a declared
- * handler are different defects in different files, and the probe could only
- * say the second. An operator following "does not export every handler it
- * declares" against a module that exports all of them looks in the wrong
- * place; the real cause — a missing built-in, a top-level throw — was visible
- * only by running the runtime by hand.
+ * A namespace accessor that throws while the wrapper validates it and a module
+ * missing a declared handler are different defects, and the probe used to say
+ * only the second. Import-time graph failures are refused earlier by the
+ * semantic inspector. An operator following "does not export every handler it
+ * declares" against a module that exports all of them still looks in the wrong
+ * place, so this layer preserves the distinction for failures it can observe.
  */
 export function selfhostReadinessFailureMessage(
   failure: SelfhostReadinessFailure | undefined,
@@ -304,21 +310,6 @@ export interface SelfhostWorkerEntrypointSourceInput {
    * delivers to publishes the module it would have published anyway.
    */
   readonly events?: boolean;
-  /**
-   * Host-owned service bindings the tenant's own workerd service carries.
-   *
-   * `ASSETS` is the one today. It is declared on the tenant service by the
-   * runtime rather than projected from a Version's own environment, so a module
-   * published through this entrypoint would lose it unless the entrypoint hands
-   * it on: the whole point of the projection is that `env` contains exactly
-   * what it should, and the asset layer is part of what it should.
-   *
-   * The list is the caller's, derived from what the site actually renders,
-   * rather than a name this module assumes. Nothing secret is ever on this
-   * service, so passing one of its bindings through gives away nothing that
-   * `import { env } from "cloudflare:workers"` would not have.
-   */
-  readonly services?: readonly string[];
 }
 
 const ARTIFACT_PART_NAME = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
@@ -346,10 +337,10 @@ const HANDLER_NAMES = new Set<string>(SELFHOST_WORKER_HANDLER_NAMES);
 export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSourceInput): string {
   const normalized = normalizeSourceInput(input);
   const moduleSpecifier = `./${normalized.originalMainModule}`;
+  const preludeSpecifier = `./${selfhostWorkerPreludeModuleName(normalized.originalMainModule)}`;
   const configuration = {
-    declaredHandlers: [...normalized.declaredHandlers].sort(),
+    declaredHandlers: normalized.declaredHandlers,
     bindings: normalized.bindings,
-    services: normalized.services,
   };
   // `fetch` is always exported, whether or not the version declared it. The
   // readiness route lives on it, and a version that declares only `queue` must
@@ -415,7 +406,79 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
 `
     : "";
 
-  return `const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
+  return `import {
+  SafeApply,
+  SafeReflect,
+  SafeReflectGet,
+  SafeOwnKeys,
+  SafeArrayIsArray,
+  SafeArrayBufferIsView,
+  SafeArrayBufferSlice,
+  SafeAtob,
+  SafeBtoa,
+  SafeError,
+  SafeTypeError,
+  SafeJSONParse,
+  SafeJSONStringify,
+  SafeMap,
+  SafeMapGet,
+  SafeMapHas,
+  SafeMapSet,
+  SafeMapDelete,
+  SafeMathAbs,
+  SafeMathMin,
+  SafeNumberIsFinite,
+  SafeNumberIsSafeInteger,
+  SafeNumberMaxSafeInteger,
+  SafeObject,
+  SafeObjectCreate,
+  SafeObjectFreeze,
+  SafeObjectGetOwnPropertyDescriptor,
+  SafeObjectGetPrototypeOf,
+  SafeObjectHasOwn,
+  SafeObjectKeys,
+  SafeObjectPrototype,
+  SafeObjectSetPrototypeOf,
+  SafePromise,
+  SafePromiseResolve,
+  SafePromiseThen,
+  SafeRegExpTest,
+  SafeReadableStream,
+  SafeReadableStreamLockedGet,
+  SafeReadableStreamControllerClose,
+  SafeReadableStreamControllerEnqueue,
+  SafeResponse,
+  SafeResponseText,
+  SafeResponseBodyGet,
+  SafeResponseHeadersGet,
+  SafeResponseStatusGet,
+  SafeStringCharCodeAt,
+  SafeSymbol,
+  SafeURL,
+  SafeHeadersGet,
+  SafeRequestText,
+  SafeRequestUrlGet,
+  SafeRequestMethodGet,
+  SafeRequestHeadersGet,
+  SafeURLPathnameGet,
+  SafeURLHostnameGet,
+  SafeStringFromCharCode,
+  SafeTextDecoder,
+  SafeTextDecoderDecode,
+  SafeTextEncoder,
+  SafeTextEncoderEncode,
+  SafeUint8Array,
+  SafeUint8ArraySet,
+  SafeDataViewBufferGet,
+  SafeDataViewByteLengthGet,
+  SafeDataViewByteOffsetGet,
+  SafeTypedArrayBufferGet,
+  SafeTypedArrayByteLengthGet,
+  SafeTypedArrayByteOffsetGet,
+} from ${JSON.stringify(preludeSpecifier)};
+import * as TenantWorkerModule from ${JSON.stringify(moduleSpecifier)};
+
+const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
 const DATA_SERVICE = ${JSON.stringify(SELFHOST_WORKER_DATA_SERVICE_BINDING)};
 const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
 const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)};
@@ -444,76 +507,6 @@ const MAX_EVENT_BYTES = ${MAX_SELFHOST_EVENT_RESPONSE_BYTES};
 const MAX_QUEUE_MESSAGES = ${MAX_SELFHOST_QUEUE_MESSAGES};
 const MAX_QUEUE_MESSAGE_BYTES = ${MAX_SELFHOST_QUEUE_MESSAGE_BYTES};
 const MAX_QUEUE_DELAY_SECONDS = ${MAX_SELFHOST_QUEUE_DELAY_SECONDS};
-
-// Captured before the tenant module is imported: after its first request its
-// code has run, and anything it replaced on a shared prototype would otherwise
-// be what this module calls while holding the plane token.
-const SafeApply = Reflect.apply;
-const SafeOwnKeys = Reflect.ownKeys;
-const SafeArrayIsArray = Array.isArray;
-const SafeArrayBufferIsView = ArrayBuffer.isView;
-const SafeArrayBufferSlice = ArrayBuffer.prototype.slice;
-const SafeAtob = atob;
-const SafeBtoa = btoa;
-const SafeError = Error;
-const SafeTypeError = TypeError;
-const SafeJSONParse = JSON.parse;
-const SafeJSONStringify = JSON.stringify;
-const SafeMap = Map;
-const SafeMapGet = Map.prototype.get;
-const SafeMapHas = Map.prototype.has;
-const SafeMapSet = Map.prototype.set;
-const SafeMapDelete = Map.prototype.delete;
-const SafeMathAbs = Math.abs;
-const SafeMathMin = Math.min;
-const SafeNumberIsFinite = Number.isFinite;
-const SafeNumberIsSafeInteger = Number.isSafeInteger;
-const SafeNumberMaxSafeInteger = Number.MAX_SAFE_INTEGER;
-const SafeObject = Object;
-const SafeObjectCreate = Object.create;
-const SafeObjectFreeze = Object.freeze;
-const SafeObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
-const SafeObjectGetPrototypeOf = Object.getPrototypeOf;
-const SafeObjectHasOwn = Object.hasOwn;
-const SafeObjectKeys = Object.keys;
-const SafeObjectPrototype = Object.prototype;
-const SafeObjectSetPrototypeOf = Object.setPrototypeOf;
-const SafePromise = Promise;
-const SafePromiseResolve = Promise.resolve;
-const SafePromiseThen = Promise.prototype.then;
-const SafeRegExpTest = RegExp.prototype.test;
-const SafeReadableStream = ReadableStream;
-const SafeReadableStreamLockedGet = captureGetter(ReadableStream.prototype, "locked");
-const SafeReadableStreamControllerClose = ReadableStreamDefaultController.prototype.close;
-const SafeReadableStreamControllerEnqueue = ReadableStreamDefaultController.prototype.enqueue;
-const SafeResponse = Response;
-const SafeResponseText = Response.prototype.text;
-const SafeResponseBodyGet = captureGetter(Response.prototype, "body");
-const SafeResponseHeadersGet = captureGetter(Response.prototype, "headers");
-const SafeResponseStatusGet = captureGetter(Response.prototype, "status");
-const SafeStringCharCodeAt = String.prototype.charCodeAt;
-const SafeSymbol = Symbol;
-const SafeURL = URL;
-const SafeHeadersGet = Headers.prototype.get;
-const SafeRequestText = Request.prototype.text;
-const SafeRequestUrlGet = captureGetter(Request.prototype, "url");
-const SafeRequestMethodGet = captureGetter(Request.prototype, "method");
-const SafeRequestHeadersGet = captureGetter(Request.prototype, "headers");
-const SafeURLPathnameGet = captureGetter(URL.prototype, "pathname");
-const SafeURLHostnameGet = captureGetter(URL.prototype, "hostname");
-const SafeStringFromCharCode = String.fromCharCode;
-const SafeTextDecoder = TextDecoder;
-const SafeTextDecoderDecode = TextDecoder.prototype.decode;
-const SafeTextEncoder = TextEncoder;
-const SafeTextEncoderEncode = TextEncoder.prototype.encode;
-const SafeUint8Array = Uint8Array;
-const SafeUint8ArraySet = Uint8Array.prototype.set;
-const SafeDataViewBufferGet = captureGetter(DataView.prototype, "buffer");
-const SafeDataViewByteLengthGet = captureGetter(DataView.prototype, "byteLength");
-const SafeDataViewByteOffsetGet = captureGetter(DataView.prototype, "byteOffset");
-const SafeTypedArrayBufferGet = captureGetter(Uint8Array.prototype, "buffer");
-const SafeTypedArrayByteLengthGet = captureGetter(Uint8Array.prototype, "byteLength");
-const SafeTypedArrayByteOffsetGet = captureGetter(Uint8Array.prototype, "byteOffset");
 
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]*$/u;
@@ -564,17 +557,7 @@ const QUEUE_ERROR_CODES = [
 ];
 const encoder = new SafeTextEncoder();
 const CONFIGURATION = sealGeneratedConfiguration(RAW_CONFIGURATION);
-let originalPromise;
-
-function captureGetter(prototype, name) {
-  let current = prototype;
-  while (current) {
-    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [current, name]);
-    if (descriptor && typeof descriptor.get === "function") return descriptor.get;
-    current = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [current]);
-  }
-  throw new SafeTypeError("self-host Worker intrinsic is unavailable");
-}
+const HANDLER_ORDER = SafeApply(SafeObjectFreeze, SafeObject, [${JSON.stringify([...SELFHOST_WORKER_HANDLER_NAMES])}]);
 
 export default SafeApply(SafeObjectFreeze, SafeObject, [{
 ${handlers}
@@ -593,12 +576,15 @@ function statusResponse(status) {
 }
 
 /**
- * The publication's own answer to "does the tenant module really load".
+ * The publication's own answer to "does the tenant namespace satisfy its
+ * declaration".
  *
- * It imports the module and validates the declared handlers — the same work the
- * first customer request would have done, moved to a moment where failing is
- * still a refusal rather than a dropped event. Nothing about the tenant crosses
- * the seam: a module that throws is a 500 and a status, never a message.
+ * The semantic inspector has already imported the application graph before a
+ * Version reaches this entrypoint. The readiness route validates the declared
+ * handlers — the same namespace consumption the first customer request would
+ * otherwise perform — while failing is still a refusal rather than a dropped
+ * event. Nothing about the tenant crosses the seam: a validation failure is a
+ * 500 and a status, never a public message.
  */
 /**
  * The readiness route can never take the tenant's request down with it.
@@ -676,13 +662,14 @@ async function readiness(request) {
  * Why the module did not load, in the two shapes that mean different things.
  *
  * A declared handler that is not exported is a defect in the Version's own
- * declaration. A module that throws while being imported is a defect in the
- * bundle — a missing built-in, a top-level assertion, an unsupported API — and
- * naming it "does not export every handler it declares" sends the operator to
- * read a list of exports that is complete. The distinction is the marker this
- * wrapper puts on its own refusals; anything else came out of the tenant's
- * module and is reported as the class and message it was, trimmed of control
- * characters and truncated.
+ * declaration. A tenant accessor that throws while this Host consumes the
+ * already-imported namespace is a defect in the bundle, and naming it "does
+ * not export every handler it declares" sends the operator to read a list of
+ * exports that is complete. Import-time failures are refused earlier by the
+ * semantic inspector. The distinction here is the marker this wrapper puts on
+ * its own refusals; anything else came out of the tenant's module and is
+ * reported as the class and message it was, trimmed of control characters and
+ * truncated.
  *
  * Nothing is read out of the module: no binding, no environment value, no
  * stack. What crosses is the text the module itself put on the error, which is
@@ -752,15 +739,9 @@ function sealGeneratedConfiguration(raw) {
     bindings[index] = SafeApply(SafeObjectFreeze, SafeObject, [descriptor]);
   }
   SafeApply(SafeObjectFreeze, SafeObject, [bindings]);
-  const services = internalArray();
-  for (let index = 0; index < raw.services.length; index += 1) {
-    services[index] = raw.services[index];
-  }
-  SafeApply(SafeObjectFreeze, SafeObject, [services]);
   const configuration = SafeObjectCreate(null);
   configuration.declaredHandlers = declaredHandlers;
   configuration.bindings = bindings;
-  configuration.services = services;
   return SafeApply(SafeObjectFreeze, SafeObject, [configuration]);
 }
 
@@ -769,13 +750,23 @@ function internalArray() {
 }
 
 const DECLARATION_MARK = SafeSymbol("takoserver-selfhost-declaration-failure");
+let originalLoaded = false;
+let originalFailed = false;
+let originalValue;
+let originalFailure;
 
 function loadOriginal() {
-  if (!originalPromise) {
-    const loading = import(${JSON.stringify(moduleSpecifier)});
-    originalPromise = SafeApply(SafePromiseThen, loading, [validateOriginal]);
+  if (!originalLoaded) {
+    originalLoaded = true;
+    try {
+      originalValue = validateOriginal(TenantWorkerModule);
+    } catch (error) {
+      originalFailed = true;
+      originalFailure = error;
+    }
   }
-  return originalPromise;
+  if (originalFailed) throw originalFailure;
+  return originalValue;
 }
 
 /**
@@ -784,6 +775,11 @@ function loadOriginal() {
  * The Version told this Host which events it answers, and the aggregate rules
  * upstream gate an attachment on that declaration. A module that does not
  * export one of them would accept the attachment and drop the event.
+ * Every handler own-property is inspected in the contract's canonical order,
+ * including undeclared callable exports, exactly as the semantic inspector
+ * did before publication. An own accessor is resolved once here, before
+ * readiness succeeds; the callable it yields is retained so later requests
+ * cannot observe a tenant mutation of the exported property.
  */
 function validateOriginal(loaded) {
   if (!loaded || (typeof loaded !== "object" && typeof loaded !== "function") || !SafeObjectHasOwn(loaded, "default")) {
@@ -797,18 +793,30 @@ function validateOriginal(loaded) {
   if (prototype !== SafeObjectPrototype && prototype !== null) {
     throw declarationError("the default export is not a plain object");
   }
+  const describedHandlers = SafeObjectCreate(null);
   const handlers = SafeObjectCreate(null);
+  for (let index = 0; index < HANDLER_ORDER.length; index += 1) {
+    const handler = HANDLER_ORDER[index];
+    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [original, handler]);
+    if (!descriptor) continue;
+    describedHandlers[handler] = true;
+    const value = SafeApply(SafeReflectGet, SafeReflect, [original, handler, original]);
+    if (typeof value === "function") handlers[handler] = value;
+  }
   for (let index = 0; index < CONFIGURATION.declaredHandlers.length; index += 1) {
     const handler = CONFIGURATION.declaredHandlers[index];
-    const descriptor = SafeApply(SafeObjectGetOwnPropertyDescriptor, SafeObject, [original, handler]);
-    if (!descriptor) {
+    if (!SafeObjectHasOwn(describedHandlers, handler)) {
       throw declarationError("declared handler " + handler + " is not exported");
     }
-    if (!SafeObjectHasOwn(descriptor, "value") || typeof descriptor.value !== "function") {
+    if (!SafeObjectHasOwn(handlers, handler)) {
       throw declarationError("declared handler " + handler + " is not a function");
     }
-    handlers[handler] = descriptor.value;
   }
+  const finalPrototype = SafeApply(SafeObjectGetPrototypeOf, SafeObject, [original]);
+  if (finalPrototype !== SafeObjectPrototype && finalPrototype !== null) {
+    throw declarationError("the default export is not a plain object");
+  }
+  SafeApply(SafeObjectFreeze, SafeObject, [handlers]);
   return { target: original, handlers };
 }
 
@@ -828,17 +836,6 @@ function projectEnv(rawEnv) {
     throw portableError("backend_unavailable");
   }
   const projected = SafeObjectCreate(null);
-  // The Host's own service bindings first, so a Version that declared a var
-  // under one of these names still gets the value it declared. On this service
-  // they carry no secret: the plane token and the event token live on services
-  // the tenant holds no binding to at all.
-  for (let index = 0; index < CONFIGURATION.services.length; index += 1) {
-    const name = CONFIGURATION.services[index];
-    // Absent rather than undefined when the runtime did not declare it: a
-    // binding that is not there must look exactly like one that was never
-    // named, or a module testing for it reads a lie.
-    if (SafeObjectHasOwn(rawEnv, name)) projected[name] = rawEnv[name];
-  }
   let call;
   let objectCall;
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
@@ -2504,11 +2501,10 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   readonly publication: string;
   readonly probeHostname: string;
   readonly events: boolean;
-  readonly services: string[];
 } {
   const fields = dataProperties(input, "input");
-  // `events` and `services` are optional, so the accepted key set is built from
-  // what is present rather than one shape being a superset nothing checks.
+  // `events` is optional, so the accepted key set is built from what is present
+  // rather than one shape being a superset nothing checks.
   exactNormalizedKeys(
     fields,
     [
@@ -2518,14 +2514,11 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
       "publication",
       "probeHostname",
       ...(Object.hasOwn(fields, "events") ? ["events"] : []),
-      ...(Object.hasOwn(fields, "services") ? ["services"] : []),
     ],
     "input",
   );
   if (Object.hasOwn(fields, "events") && typeof fields.events !== "boolean") invalid("events");
   validateArtifactPartName(fields.originalMainModule);
-  if (fields.originalMainModule === SELFHOST_WORKER_ENTRYPOINT_MODULE)
-    invalid("originalMainModule");
   if (typeof fields.publication !== "string" || !PUBLICATION.test(fields.publication)) {
     invalid("publication");
   }
@@ -2538,15 +2531,16 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   }
   const declaredHandlersInput = dataArray(fields.declaredHandlers, "declaredHandlers");
   if (declaredHandlersInput.length < 1) invalid("declaredHandlers");
-  const declaredHandlers: SelfhostWorkerHandlerName[] = [];
   const handlerSet = new Set<string>();
   for (const handler of declaredHandlersInput) {
     if (typeof handler !== "string" || !HANDLER_NAMES.has(handler) || handlerSet.has(handler)) {
       invalid("declaredHandlers");
     }
     handlerSet.add(handler);
-    declaredHandlers.push(handler as SelfhostWorkerHandlerName);
   }
+  const declaredHandlers = SELFHOST_WORKER_HANDLER_NAMES.filter((handler) =>
+    handlerSet.has(handler),
+  );
   const bindingInputs = dataArray(fields.bindings, "bindings");
   const bindings: SelfhostWorkerBindingDescriptor[] = [];
   const publicNames = new Set<string>();
@@ -2575,27 +2569,6 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     });
   }
   const events = fields.events === true;
-  // The Host's own service bindings, held to the same grammar workerd will
-  // accept and to this module's reserved prefix, so a caller cannot ask the
-  // entrypoint to hand on a name this Host keeps for itself.
-  const services: string[] = [];
-  if (Object.hasOwn(fields, "services")) {
-    const seen = new Set<string>();
-    for (const name of dataArray(fields.services, "services")) {
-      if (
-        typeof name !== "string" ||
-        name.length === 0 ||
-        name.length > 64 ||
-        !BINDING_NAME.test(name) ||
-        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
-        seen.has(name)
-      ) {
-        invalid("services");
-      }
-      seen.add(name);
-      services.push(name);
-    }
-  }
   // A wrapper with no data binding and no event is not a degenerate wrapper: it
   // is the load probe. The entrypoint imports the tenant module and answers
   // whether it loaded, and a publication that carried no facade used to skip
@@ -2609,7 +2582,6 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
     publication: fields.publication,
     probeHostname: fields.probeHostname,
     events,
-    services,
   };
 }
 

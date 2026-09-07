@@ -48,13 +48,13 @@ import {
   cloudflareR2EdgeObjectsMaterial,
   EDGE_OBJECTS_BINDING_REF,
 } from "./cloudflare-runtime-bindings.ts";
-import { CloudflareWfpBackend } from "./cloudflare-wfp-backend.ts";
 import type {
   ArtifactBytes,
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareWorkerBackend,
+  CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
 } from "./cloudflare-worker-backend.ts";
 import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migration-policy.ts";
@@ -65,8 +65,9 @@ export type {
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
-  CloudflareWorkersForPlatformsBackendOptions,
+  CloudflareWorkersForPlatformsBackendFactoryOptions,
   TakoformBundleManifest,
 } from "./cloudflare-worker-backend.ts";
 
@@ -261,19 +262,26 @@ export class CloudflareProvider implements Provider {
         ? {}
         : { workerEndpointSuffix: options.workerEndpointSuffix }),
     };
+    if (
+      workerBackend.kind === "workers-for-platforms" &&
+      options.workerEndpointSuffix !== undefined
+    ) {
+      throw new TypeError(
+        "managed Workers-for-Platforms backend cannot be combined with workerEndpointSuffix",
+      );
+    }
     this.#workerEndpointSuffix =
       workerBackend.kind === "ordinary-workers" ? workerBackend.workerEndpointSuffix : undefined;
     this.#workerBackend =
       workerBackend.kind === "workers-for-platforms"
-        ? new CloudflareWfpBackend({
-            ...workerBackend,
+        ? createManagedWorkerBackend(workerBackend.create, {
             providerId: this.id,
             accountId: this.#accountId,
             apiOrigin: this.#origin,
             authorize: this.#authorize,
             fetch: this.#fetch,
             artifacts: this.#artifacts,
-            offerings: this.offerings,
+            offerings: structuredClone(this.offerings),
             ...(this.#runtimeInputs === undefined ? {} : { runtimeInputs: this.#runtimeInputs }),
             workerCompatibilityDate: this.#workerCompatibilityDate,
           })
@@ -2634,6 +2642,62 @@ export class CloudflareProvider implements Provider {
         : {}),
     };
   }
+}
+
+function createManagedWorkerBackend(
+  create: unknown,
+  context: Readonly<CloudflareWorkerBackendFactoryContext>,
+): CloudflareWorkerBackend {
+  if (typeof create !== "function") {
+    throw new TypeError("managed Workers-for-Platforms backend factory must be callable");
+  }
+  const candidate = create(context) as unknown;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    typeof (candidate as { readonly then?: unknown }).then === "function" ||
+    (candidate as { readonly kind?: unknown }).kind !== "workers-for-platforms" ||
+    !hasValidWorkerBackendMethods(candidate)
+  ) {
+    throw new TypeError(
+      "managed Workers-for-Platforms backend factory returned an invalid backend",
+    );
+  }
+  return candidate as CloudflareWorkerBackend;
+}
+
+const REQUIRED_WORKER_BACKEND_METHODS = [
+  "deriveOrigin",
+  "owns",
+  "apply",
+  "recoverApply",
+  "convergeApply",
+  "observe",
+  "delete",
+  "recoverDelete",
+  "createNativeReadbackDescriptor",
+  "verifyNativeAbsence",
+  "verifyArtifactConsumption",
+] as const;
+
+const OPTIONAL_WORKER_BACKEND_METHODS = [
+  "readSqliteMigrationLedger",
+  "applySqliteMigrationSuffix",
+  "managedScheduleReconciliationStatus",
+  "reconcileManagedSchedules",
+  "managedObjectBucketReceiptStatus",
+  "prepareManagedObjectBucketDestroy",
+  "commitManagedObjectBucketDestroy",
+] as const;
+
+function hasValidWorkerBackendMethods(candidate: object): boolean {
+  const backend = candidate as Record<string, unknown>;
+  return (
+    REQUIRED_WORKER_BACKEND_METHODS.every((method) => typeof backend[method] === "function") &&
+    OPTIONAL_WORKER_BACKEND_METHODS.every(
+      (method) => backend[method] === undefined || typeof backend[method] === "function",
+    )
+  );
 }
 
 function sanitizedTransportError(

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
@@ -12,12 +13,12 @@ import {
   createSelfhostProvider,
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
+import { SELFHOST_WORKER_PRELUDE_MODULE } from "../src/providers/selfhost-worker-prelude.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createSelfhostObjectStore } from "../src/selfhost-object-store.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
-import { findWorkerd } from "../src/workerd-supervisor.ts";
 
 /**
  * The whole self-hosted lane, end to end, with nothing simulated.
@@ -49,7 +50,9 @@ const NOTES_MIGRATION = {
   sql: NOTES_MIGRATION_SQL,
 };
 const HOSTNAME = "e2e.localhost";
-const WORKERD = findWorkerd(resolve(import.meta.dir, ".."));
+// This suite is serving evidence only for the pinned native runtime. Falling
+// back to the npm workerd would exercise the known-open resolver instead.
+const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
 
 const TENANT_MODULE = `export default {
   async fetch(request, env) {
@@ -155,6 +158,104 @@ const TENANT_MODULE = `export default {
   },
 };
 `;
+
+const STARTUP_CLOSED_GRAPH_MODULE = `const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const attempts = {
+  relative: () => import("./undeclared.js"),
+  cloudflare: () => import("cloudflare:workers"),
+  node: () => import("node:process"),
+  workerd: () => import("workerd:unsafe"),
+  eval: () => eval('import("cloudflare:sockets")'),
+  Function: () => Function('return import("node:process")')(),
+  AsyncFunction: () => AsyncFunction('return import("workerd:unsafe")')(),
+};
+const captures = Object.entries(attempts).map(([name, attempt]) => {
+  try {
+    return [name, Promise.resolve(attempt()).then(
+      () => "resolved",
+      (error) => String(error).includes("No such module") ? "module_not_found" : String(error),
+    )];
+  } catch (error) {
+    return [name, Promise.resolve(
+      String(error).includes("No such module") ? "module_not_found" : String(error),
+    )];
+  }
+});
+export default {
+  async fetch() {
+    const refusals = {};
+    for (const [name, capture] of captures) refusals[name] = await capture;
+    return Response.json(refusals);
+  },
+};
+`;
+
+interface BootGraphModule {
+  readonly name: string;
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+  readonly digest?: string;
+}
+
+/**
+ * A complete import graph whose names deliberately do not describe their
+ * media. The map passed to the Host is the only source of truth: the `.txt`
+ * file is JavaScript, while the `.js` files are text and binary data.
+ */
+const COMPLETE_GRAPH_MODULE = `import { graphValues } from "./helper.txt";
+
+let getterReads = 0;
+export default {
+  get fetch() {
+    getterReads += 1;
+    return async () => Response.json({ ...graphValues(), getterReads });
+  },
+};
+`;
+
+const COMPLETE_GRAPH_ADDITIONAL_MODULES: readonly BootGraphModule[] = [
+  {
+    name: "helper.txt",
+    mediaType: "application/javascript+module",
+    bytes: new TextEncoder().encode(`import message from "./message.js";
+import payload from "./payload.js";
+import wasm from "./empty.wasm";
+
+export function graphValues() {
+  return {
+    helperLoaded: true,
+    text: message,
+    dataIsArrayBuffer: payload instanceof ArrayBuffer,
+    data: Array.from(new Uint8Array(payload)),
+    wasmIsModule: wasm instanceof WebAssembly.Module,
+  };
+}
+`),
+  },
+  {
+    name: "message.js",
+    mediaType: "text/plain",
+    bytes: new TextEncoder().encode("portable graph text"),
+  },
+  {
+    name: "payload.js",
+    mediaType: "application/octet-stream",
+    bytes: new Uint8Array([0, 1, 2, 255]),
+  },
+  {
+    name: "empty.wasm",
+    mediaType: "application/wasm",
+    bytes: new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+  },
+  {
+    // This is intentionally not JavaScript. The semantic verifier admits it as
+    // auxiliary evidence, and publication must not put it in workerd's module
+    // registry where an import could evaluate it.
+    name: "index.js.map",
+    mediaType: "application/source-map+json",
+    bytes: new TextEncoder().encode("this is intentionally not JavaScript"),
+  },
+];
 
 function offering(kind: string): ProviderOffering {
   return {
@@ -284,11 +385,35 @@ async function boot(
    * the publication. A test that publishes *while* the runtime is up asks.
    */
   watchConfig = false,
+  additionalModules: readonly BootGraphModule[] = [],
+  mainModule = "index.js",
 ): Promise<{
   readonly origin: string;
   readonly local: ReturnType<typeof createSelfhostProvider>;
   readonly planeOrigin: string;
+  readonly runtime: ReturnType<typeof createWorkerdRuntime>;
 }> {
+  const graphModules = additionalModules.map((entry, index) => ({
+    ...entry,
+    digest: entry.digest ?? `sha256:graph-${index}`,
+  }));
+  const indexBytes = new TextEncoder().encode(tenantModule);
+  const moduleBlobs = new Map<string, Uint8Array>([
+    ["sha256:index.js", indexBytes],
+    ...graphModules.map((entry) => [entry.digest, entry.bytes] as const),
+  ]);
+  const workerManifestModules = [
+    ...(additionalModules.length === 0
+      ? [{ name: mainModule, digest: "sha256:index.js" }]
+      : [
+          {
+            name: mainModule,
+            digest: "sha256:index.js",
+            mediaType: "application/javascript+module",
+          },
+        ]),
+    ...graphModules.map(({ name, digest, mediaType }) => ({ name, digest, mediaType })),
+  ];
   const sql = createEphemeralSql();
   const access = createSelfhostDataPlaneAccess(root);
   const served = serveSelfhostDataPlanes({
@@ -327,6 +452,7 @@ async function boot(
   };
   const runtime = createWorkerdRuntime({
     root,
+    binary: WORKERD,
     port: workerdPort,
     isReady: () => true,
     ...(watchConfig ? { onReload: start } : {}),
@@ -342,8 +468,8 @@ async function boot(
         if (digest === "sha256:worker") {
           return {
             kind: "WorkerBundle",
-            mainModule: "index.js",
-            modules: [{ name: "index.js", digest: "sha256:index.js" }],
+            mainModule,
+            modules: workerManifestModules,
           };
         }
         // A second bundle whose module cannot load at all, used to prove the
@@ -357,7 +483,8 @@ async function boot(
           : null;
       },
       async blob(digest) {
-        if (digest === "sha256:index.js") return new TextEncoder().encode(tenantModule);
+        const graphBlob = moduleBlobs.get(digest);
+        if (graphBlob) return new Uint8Array(graphBlob);
         return digest === "sha256:unloadable.js"
           ? new TextEncoder().encode(UNLOADABLE_MODULE)
           : null;
@@ -462,11 +589,67 @@ async function boot(
   expect(endpoint.phase).toBe("succeeded");
 
   await start();
-  return { origin, local, planeOrigin: `http://${served.address}` };
+  return { origin, local, planeOrigin: `http://${served.address}`, runtime };
 }
 
 const ask = (origin: string, path: string) =>
   fetch(`${origin}${path}`, { headers: { host: HOSTNAME } });
+
+test.skipIf(WORKERD === null)(
+  "a tenant main named exactly like the Host prelude serves across a runtime restart",
+  async () => {
+    const { origin } = await boot(
+      `export default {
+  async fetch() { return new Response("tenant prelude spelling"); },
+};`,
+      false,
+      [],
+      SELFHOST_WORKER_PRELUDE_MODULE,
+    );
+    expect(await (await ask(origin, "/")).text()).toBe("tenant prelude spelling");
+
+    workerd?.kill();
+    await workerd?.exited;
+    workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(await reachable(`${origin}/`)).toBe(true);
+    expect(await (await ask(origin, "/after-restart")).text()).toBe("tenant prelude spelling");
+  },
+  60_000,
+);
+
+/** Sends the request-target byte spelling without a client URL normalization pass. */
+function rawAsk(
+  origin: string,
+  target: string,
+): Promise<{ readonly status: number; readonly body: string }> {
+  const endpoint = new URL(origin);
+  return new Promise((resolvePromise, reject) => {
+    const request = httpRequest(
+      {
+        hostname: endpoint.hostname,
+        port: endpoint.port,
+        method: "GET",
+        path: target,
+        headers: { host: HOSTNAME, connection: "close" },
+      },
+      (response) => {
+        const chunks: Uint8Array[] = [];
+        response.on("data", (chunk: Uint8Array) => chunks.push(new Uint8Array(chunk)));
+        response.on("end", () => {
+          resolvePromise({
+            status: response.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    request.once("error", reject);
+    request.end();
+  });
+}
 
 /** A module workerd refuses to load, for exactly the reason it names. */
 const UNLOADABLE_MODULE = `import "node:path";
@@ -474,6 +657,26 @@ const UNLOADABLE_MODULE = `import "node:path";
 export default {
   async fetch() {
     return new Response("unreachable");
+  },
+};
+`;
+
+/**
+ * The handler access order is observable because worker.runtime accepts own
+ * accessors and promises to capture each result once. The semantic inspector
+ * and the serving wrapper must therefore read the same properties in the same
+ * order, or a Version can pass one phase and be refused by the other.
+ */
+const ORDER_SENSITIVE_HANDLER_MODULE = `let scheduledRead = false;
+
+export default {
+  async fetch() { return new Response("canonical handler order"); },
+  get scheduled() {
+    scheduledRead = true;
+    return async () => {};
+  },
+  get queue() {
+    return scheduledRead ? async () => {} : null;
   },
 };
 `;
@@ -593,18 +796,92 @@ test.skipIf(WORKERD === null)(
   async () => {
     const { origin } = await boot();
     const response = await ask(origin, "/smuggle");
-    // `import { env } from "cloudflare:workers"` is the raw environment of the
-    // service, not the projected object — so leaving a binding out of the
-    // projection never hid it. Two things make this empty: the token and the
-    // plane address are declared on a separate Host-owned service, and
-    // `disallow_importable_env` is set on this one.
+    // The closed application graph does not grant an ambient builtin exception.
+    // The token and plane address also remain on a separate Host-owned service.
     expect(await response.json()).toEqual({
-      importable: { keys: [], token: null, service: "undefined" },
+      importable: { error: "Error" },
       handlerToken: null,
       handlerService: "undefined",
     });
   },
   30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "the serving runtime keeps startup eval and every import constructor inside the application graph",
+  async () => {
+    const { origin } = await boot(STARTUP_CLOSED_GRAPH_MODULE);
+    expect(await (await ask(origin, "/")).json()).toEqual({
+      relative: "module_not_found",
+      cloudflare: "module_not_found",
+      node: "module_not_found",
+      workerd: "module_not_found",
+      eval: "module_not_found",
+      Function: "module_not_found",
+      AsyncFunction: "module_not_found",
+    });
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "serves a complete Worker graph with exact media and a cached accessor handler",
+  async () => {
+    const { origin, runtime } = await boot(
+      COMPLETE_GRAPH_MODULE,
+      false,
+      COMPLETE_GRAPH_ADDITIONAL_MODULES,
+    );
+
+    const config = await Bun.file(join(root, "workers", "workerd.capnp")).text();
+    expect(config).toMatch(
+      /\(name = "helper\.txt", esModule = embed "[^"]+\/application\/module-\d+", role = application\)/u,
+    );
+    expect(config).toMatch(
+      /\(name = "message\.js", text = embed "[^"]+\/application\/module-\d+", role = application\)/u,
+    );
+    expect(config).toMatch(
+      /\(name = "payload\.js", data = embed "[^"]+\/application\/module-\d+", role = application\)/u,
+    );
+    expect(config).toMatch(
+      /\(name = "empty\.wasm", wasm = embed "[^"]+\/application\/module-\d+", role = application\)/u,
+    );
+    expect(config).not.toContain("index.js.map");
+
+    const expected = {
+      helperLoaded: true,
+      text: "portable graph text",
+      dataIsArrayBuffer: true,
+      data: [0, 1, 2, 255],
+      wasmIsModule: true,
+      getterReads: 1,
+    };
+    const first = await ask(origin, "/graph");
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual(expected);
+    const second = await ask(origin, "/graph-again");
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(expected);
+
+    // Re-render from the durable site manifest and restart a fresh workerd
+    // process. The exact media map must survive that readback, and the cached
+    // own getter must still be observed only during the wrapper's readiness
+    // import, not once per request.
+    if (!workerd) throw new Error("the graph workerd did not start");
+    workerd.kill();
+    await workerd.exited;
+    workerd = undefined;
+    expect(await runtime.restore()).toHaveLength(1);
+    workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(await reachable(origin)).toBe(true);
+    const afterRestart = await ask(origin, "/after-restart");
+    expect(afterRestart.status).toBe(200);
+    expect(await afterRestart.json()).toEqual(expected);
+  },
+  60_000,
 );
 
 test.skipIf(WORKERD === null)(
@@ -660,12 +937,13 @@ test.skipIf(WORKERD === null)(
 /**
  * The load probe runs for every publication, including the simplest one.
  *
- * The generated entrypoint is what imports the tenant module and answers
- * whether it loaded, and it used to be written only for a Version that bound a
- * facade or received an event. A Worker with neither was therefore published
- * without being asked: an unloadable module deployed, reported `Ready=True`,
- * and failed with a 500 on the first real request, while only workerd's own
- * stderr said `No such module`.
+ * The semantic inspector imports the application graph before publication,
+ * and the generated entrypoint validates its already-imported namespace. The
+ * entrypoint used to be written only for a Version that bound a facade or
+ * received an event. A Worker with neither was therefore published without
+ * being asked: an unloadable module deployed, reported `Ready=True`, and
+ * failed with a 500 on the first real request, while only workerd's own stderr
+ * said `No such module`.
  */
 test.skipIf(WORKERD === null)(
   "publishing a Version with no bindings whose module cannot load is refused",
@@ -687,7 +965,12 @@ test.skipIf(WORKERD === null)(
         }),
       ],
     });
-    expect(version.phase).toBe("succeeded");
+    expect(version).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    if (version.phase !== "failed") throw new Error("the unloadable Version was accepted");
+    expect(version.failure.message).toContain("module_not_found");
 
     const deployment = await local.apply({
       operationId: "op_deploy_unloadable",
@@ -713,11 +996,8 @@ test.skipIf(WORKERD === null)(
     });
     expect(deployment).toMatchObject({
       phase: "failed",
-      failure: { code: "invalid_spec", retryable: false },
     });
     if (deployment.phase !== "failed") throw new Error("the unloadable Version was published");
-    expect(deployment.failure.message).toContain("the Worker Version's module failed to load");
-    expect(deployment.failure.message).toContain("node:path");
   },
   30_000,
 );
@@ -729,10 +1009,10 @@ test.skipIf(WORKERD === null)(
     // The fixture module exports `fetch` and nothing else. Declaring
     // `scheduled` used to publish successfully and fail on the first event the
     // attachment delivered — the wrapper validates its declaration when it
-    // first imports the tenant module, and until now that first import was a
-    // customer's request.
+    // first consumes the already-imported namespace, and until now that first
+    // consumption was a customer's request.
     expect(await publishVersion(local, "hello-v2", ["fetch", "scheduled"])).toEqual({
-      version: "succeeded",
+      version: "failed",
       deployment: "failed",
     });
     // A Version that declares only what it exports still publishes.
@@ -740,6 +1020,18 @@ test.skipIf(WORKERD === null)(
       version: "succeeded",
       deployment: "succeeded",
     });
+  },
+  30_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "semantic inspection and serving capture handler getters in one canonical order",
+  async () => {
+    const { local, origin } = await boot(ORDER_SENSITIVE_HANDLER_MODULE, true);
+    expect(
+      await publishVersion(local, "hello-canonical-handlers", ["fetch", "scheduled", "queue"]),
+    ).toEqual({ version: "succeeded", deployment: "succeeded" });
+    expect(await (await ask(origin, "/after-publication")).text()).toBe("canonical handler order");
   },
   30_000,
 );
@@ -853,7 +1145,12 @@ async function bootEvents(): Promise<{
   const workerdPort = Number(reserved.port);
   reserved.stop(true);
   const origin = `http://127.0.0.1:${workerdPort}`;
-  const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
+  const runtime = createWorkerdRuntime({
+    root,
+    binary: WORKERD,
+    port: workerdPort,
+    isReady: () => true,
+  });
   const local = createSelfhostProvider({
     offerings: [],
     dataRoot: root,
@@ -1059,9 +1356,9 @@ test.skipIf(WORKERD === null)(
     const { origin, script, workerdPort } = await bootEvents();
     const reach = await ask(origin, "/reach");
     expect(await reach.json()).toEqual({
-      // `disallow_importable_env` empties this, and the token and the gate's
-      // service binding were never on this service to begin with.
-      importable: [],
+      // No undeclared builtin is visible; the token and gate service binding
+      // were never on this service to begin with.
+      importable: ["Error"],
       handlerKeys: ["KV", "QUEUE"],
       token: null,
       target: "undefined",
@@ -1114,6 +1411,13 @@ test.skipIf(WORKERD === null)(
  * readiness route was never rendered, so the publication was never checked.
  */
 const SITE_INDEX = "<!doctype html><title>site</title>";
+const SITE_ASSET = "served by the Host-owned asset service";
+const SITE_MISLEADING_CSS = "body { color: rebeccapurple; }";
+const SITE_VENDOR_ASSET = "vendor asset";
+const SITE_INDEX_MEDIA = "application/vnd.takos.shell+html";
+const SITE_VENDOR_MEDIA = "application/vnd.takos.theme";
+const SITE_PREFIX_FILE = "logical foo";
+const SITE_PREFIX_CHILD = "logical foo child";
 
 const ASSETS_EVENT_MODULE = `export default {
   async fetch(request, env) {
@@ -1122,23 +1426,65 @@ const ASSETS_EVENT_MODULE = `export default {
       const answer = await env.ASSETS.fetch("http://assets.invalid/index.html");
       return Response.json({ status: answer.status, body: await answer.text() });
     }
+    if (url.pathname === "/declared-assets") {
+      return Response.json({ assets: env.ASSETS });
+    }
     return Response.json({ assets: typeof env.ASSETS });
   },
   async scheduled() {},
 };
 `;
 
+const ASSET_ROUTING_MODULE = `export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    if (path === "/worker-ok") {
+      return new Response("worker ok", { headers: { "x-worker": "ok" } });
+    }
+    if (path === "/throws" || url.searchParams.has("throw")) throw new Error("worker failure");
+    return new Response("worker miss: " + path, {
+      status: 404,
+      headers: { "x-worker": "preserved" },
+    });
+  },
+};
+`;
+
+const COLLIDING_ASSET_MODULE = `export default {
+  async fetch(request) {
+    if (new URL(request.url).pathname !== "/module-collision") {
+      return new Response("worker miss", { status: 404 });
+    }
+    const loaded = await import("./__assets/asset-00000");
+    return new Response(loaded.default);
+  },
+};
+`;
+const COLLIDING_TEXT_MODULE = "tenant module bytes remain distinct";
+
 /** Publishes an assets Worker that binds no data plane, and boots it watching. */
 async function bootEventsOnly(input: {
   readonly module: string;
   readonly handlers: readonly string[];
-  /** Returns the deployment ticket instead of asserting it succeeded. */
-  readonly deploymentTicket?: boolean;
+  readonly runWorkerFirst?: boolean;
+  readonly notFoundHandling?: "none" | "single_page_application";
+  readonly includeAssets?: boolean;
+  readonly vars?: Readonly<Record<string, string>>;
+  readonly modules?: readonly BootGraphModule[];
+  /** Returns the version ticket before attempting deployment. */
+  readonly versionTicket?: boolean;
 }): Promise<{
   readonly origin: string;
   readonly local: ReturnType<typeof createSelfhostProvider>;
-  readonly deployment?: Awaited<ReturnType<ReturnType<typeof createSelfhostProvider>["apply"]>>;
+  readonly runtime: ReturnType<typeof createWorkerdRuntime>;
+  readonly version?: Awaited<ReturnType<ReturnType<typeof createSelfhostProvider>["apply"]>>;
 }> {
+  const includeAssets = input.includeAssets ?? true;
+  const additionalModules = (input.modules ?? []).map((entry, index) => ({
+    ...entry,
+    digest: entry.digest ?? `sha256:event-graph-${index}`,
+  }));
   const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const workerdPort = Number(reserved.port);
   reserved.stop(true);
@@ -1156,6 +1502,7 @@ async function bootEventsOnly(input: {
   };
   const runtime = createWorkerdRuntime({
     root,
+    binary: WORKERD,
     port: workerdPort,
     isReady: () => true,
     onReload: start,
@@ -1174,20 +1521,53 @@ async function bootEventsOnly(input: {
           return {
             kind: "WorkerBundle",
             mainModule: "index.js",
-            modules: [{ name: "index.js", digest: "sha256:index.js" }],
+            modules: [
+              { name: "index.js", digest: "sha256:index.js" },
+              ...additionalModules.map(({ name, digest, mediaType }) => ({
+                name,
+                digest,
+                mediaType,
+              })),
+            ],
           };
         }
         if (digest === "sha256:site") {
           return {
             kind: "StaticAssetBundle",
-            files: [{ path: "index.html", digest: "sha256:index.html" }],
+            files: [
+              {
+                path: "index.html",
+                digest: "sha256:index.html",
+                mediaType: SITE_INDEX_MEDIA,
+              },
+              { path: "asset.txt", digest: "sha256:asset.txt", mediaType: "text/plain" },
+              { path: "app.bin", digest: "sha256:app.bin", mediaType: "text/css" },
+              {
+                path: "app.css",
+                digest: "sha256:app.css",
+                mediaType: SITE_VENDOR_MEDIA,
+              },
+              { path: "foo", digest: "sha256:foo", mediaType: "text/plain" },
+              {
+                path: "foo/bar.txt",
+                digest: "sha256:foo-bar.txt",
+                mediaType: "text/plain",
+              },
+            ],
           };
         }
         return null;
       },
       async blob(digest) {
         if (digest === "sha256:index.js") return new TextEncoder().encode(input.module);
+        const additional = additionalModules.find((entry) => entry.digest === digest);
+        if (additional) return additional.bytes;
         if (digest === "sha256:index.html") return new TextEncoder().encode(SITE_INDEX);
+        if (digest === "sha256:asset.txt") return new TextEncoder().encode(SITE_ASSET);
+        if (digest === "sha256:app.bin") return new TextEncoder().encode(SITE_MISLEADING_CSS);
+        if (digest === "sha256:app.css") return new TextEncoder().encode(SITE_VENDOR_ASSET);
+        if (digest === "sha256:foo") return new TextEncoder().encode(SITE_PREFIX_FILE);
+        if (digest === "sha256:foo-bar.txt") return new TextEncoder().encode(SITE_PREFIX_CHILD);
         return null;
       },
     },
@@ -1204,32 +1584,39 @@ async function bootEventsOnly(input: {
     ).phase,
   ).toBe("succeeded");
 
-  expect(
-    (
-      await local.apply({
-        operationId: "op_version",
-        offering: offering("WorkerVersion"),
-        identity: identity("hello-v1"),
-        spec: {
-          bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
-          handlers: [...input.handlers],
-          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-          assets: {
-            bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
-            notFoundHandling: "none",
-            runWorkerFirst: false,
-          },
-        },
-        relations: [
-          relation("/worker", "ModuleWorker", "hello"),
-          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
-          relation("/assets/bundle", "StaticAssetBundle", "site", {
-            manifestDigest: "sha256:site",
-          }),
-        ],
-      })
-    ).phase,
-  ).toBe("succeeded");
+  const version = await local.apply({
+    operationId: "op_version",
+    offering: offering("WorkerVersion"),
+    identity: identity("hello-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: [...input.handlers],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      ...(input.vars ? { vars: input.vars } : {}),
+      ...(includeAssets
+        ? {
+            assets: {
+              bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+              notFoundHandling: input.notFoundHandling ?? "none",
+              runWorkerFirst: input.runWorkerFirst ?? false,
+            },
+          }
+        : {}),
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ...(includeAssets
+        ? [
+            relation("/assets/bundle", "StaticAssetBundle", "site", {
+              manifestDigest: "sha256:site",
+            }),
+          ]
+        : []),
+    ],
+  });
+  if (input.versionTicket) return { origin, local, runtime, version };
+  expect(version.phase).toBe("succeeded");
 
   const deployment = await local.apply({
     operationId: "op_deploy",
@@ -1249,7 +1636,6 @@ async function bootEventsOnly(input: {
       relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
     ],
   });
-  if (input.deploymentTicket) return { origin, local, deployment };
   expect(deployment.phase).toBe("succeeded");
 
   expect(
@@ -1269,7 +1655,7 @@ async function bootEventsOnly(input: {
   ).toBe("succeeded");
 
   await start();
-  return { origin, local };
+  return { origin, local, runtime };
 }
 
 /**
@@ -1302,30 +1688,21 @@ const attachCron = (local: ReturnType<typeof createSelfhostProvider>, cron: stri
   });
 
 test.skipIf(WORKERD === null)(
-  "attaching a cron trigger leaves an assets Worker's env.ASSETS exactly where it was",
+  "static assets stay Host-owned and never become a tenant ASSETS binding",
   async () => {
     const { origin, local } = await bootEventsOnly({
       module: ASSETS_EVENT_MODULE,
       handlers: ["fetch", "scheduled"],
     });
-    // No attachment yet: no generated entrypoint, and the asset binding comes
-    // straight off the tenant's own service.
-    // No attachment yet: no generated entrypoint, and the asset binding comes
-    // straight off the tenant's own service.
-    expect(await (await served(origin, "/asset")).json()).toEqual({
-      status: 200,
-      body: SITE_INDEX,
-    });
+    // The Host may route through its private asset service, but that service is
+    // never one of the application module's native bindings.
+    expect(await (await served(origin, "/worker-env")).json()).toEqual({ assets: "undefined" });
 
     expect((await attachCron(local, "0 * * * *")).phase).toBe("succeeded");
 
-    // Now published through the generated entrypoint, which builds `env`
-    // itself. A binding the runtime declared and the projection forgot is a
-    // Worker that starts throwing the moment an unrelated cron is attached.
-    expect(await (await served(origin, "/asset")).json()).toEqual({
-      status: 200,
-      body: SITE_INDEX,
-    });
+    // A generated entrypoint must not introduce the same hidden binding when
+    // an unrelated event attachment republishes the Version.
+    expect(await (await served(origin, "/worker-env")).json()).toEqual({ assets: "undefined" });
     // And the gate is really in front of it.
     const config = await Bun.file(join(root, "workers", "workerd.capnp")).text();
     expect(config).toContain("-selfhost-events");
@@ -1335,12 +1712,239 @@ test.skipIf(WORKERD === null)(
 );
 
 test.skipIf(WORKERD === null)(
+  "asset-first routing serves an exact static asset before invoking fetch",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch", "scheduled"],
+    });
+
+    const response = await served(origin, "/index.html");
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(SITE_INDEX);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "worker-first routing keeps a non-404 fetch response ahead of an exact asset",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch", "scheduled"],
+      runWorkerFirst: true,
+    });
+
+    const response = await served(origin, "/index.html");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ assets: "undefined" });
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "both asset orders preserve fallback, worker 404, and fetch errors",
+  async () => {
+    const assetFirst = await bootEventsOnly({
+      module: ASSET_ROUTING_MODULE,
+      handlers: ["fetch"],
+    });
+    expect(await (await served(assetFirst.origin, "/asset.txt?throw=1")).text()).toBe(SITE_ASSET);
+    expect(await (await served(assetFirst.origin, "/worker-ok")).text()).toBe("worker ok");
+    const assetFirstMissing = await ask(assetFirst.origin, "/both-miss");
+    expect(assetFirstMissing.status).toBe(404);
+    expect(assetFirstMissing.headers.get("x-worker")).toBe("preserved");
+    expect(await assetFirstMissing.text()).toBe("worker miss: /both-miss");
+
+    workerd?.kill();
+    await workerd?.exited;
+    workerd = undefined;
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-e2e-"));
+
+    const workerFirst = await bootEventsOnly({
+      module: ASSET_ROUTING_MODULE,
+      handlers: ["fetch"],
+      runWorkerFirst: true,
+    });
+    expect(await (await served(workerFirst.origin, "/asset.txt")).text()).toBe(SITE_ASSET);
+    const workerFirstMissing = await ask(workerFirst.origin, "/both-miss");
+    expect(workerFirstMissing.status).toBe(404);
+    expect(workerFirstMissing.headers.get("x-worker")).toBe("preserved");
+    expect(await workerFirstMissing.text()).toBe("worker miss: /both-miss");
+    const thrown = await served(workerFirst.origin, "/asset.txt?throw=1");
+    expect(thrown.status).toBe(500);
+    expect(await thrown.text()).not.toBe(SITE_ASSET);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "worker-first assets support a Version with no fetch handler and preserve its 404 on a miss",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: `export default { async scheduled() {} };`,
+      handlers: ["scheduled"],
+      runWorkerFirst: true,
+    });
+
+    expect(await (await served(origin, "/asset.txt")).text()).toBe(SITE_ASSET);
+    const missing = await ask(origin, "/missing");
+    expect(missing.status).toBe(404);
+    expect(missing.headers.has("x-takoserver-selfhost-asset-miss")).toBe(false);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "ASSETS is absent unless the user declares that ordinary value",
+  async () => {
+    const absent = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch"],
+      includeAssets: false,
+    });
+    expect(await (await served(absent.origin, "/worker-env")).json()).toEqual({
+      assets: "undefined",
+    });
+
+    workerd?.kill();
+    await workerd?.exited;
+    workerd = undefined;
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-e2e-"));
+
+    const declared = await bootEventsOnly({
+      module: ASSETS_EVENT_MODULE,
+      handlers: ["fetch"],
+      vars: { ASSETS: "user-declared" },
+    });
+    expect(await (await served(declared.origin, "/declared-assets")).json()).toEqual({
+      assets: "user-declared",
+    });
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "SPA fallback accepts only a valid runtime pathname and invalid pathnames fail closed",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: `export default { fetch() { return new Response("worker", { status: 418 }); } };`,
+      handlers: ["fetch"],
+      notFoundHandling: "single_page_application",
+    });
+    expect(await (await served(origin, "/valid-route")).text()).toBe(SITE_INDEX);
+    expect(await (await served(origin, `/${"a".repeat(240)}`)).text()).toBe(SITE_INDEX);
+    // Query never becomes part of the asset key.
+    expect(await (await served(origin, "/asset.txt?cache=one")).text()).toBe(SITE_ASSET);
+    // The contract begins at the runtime URL pathname. workerd applies URL
+    // canonicalization at HTTP ingress, so this spelling reaches the Worker as
+    // `/index.html` and is the same valid exact-path lookup.
+    expect((await rawAsk(origin, "/nested/../index.html")).body).toBe(SITE_INDEX);
+
+    for (const target of [
+      "/.env",
+      "/dir/.x",
+      "/%2Eenv",
+      "/dir/%2Ex",
+      `/${"a".repeat(241)}`,
+      "/nested//path",
+      "/nested%2Findex.html",
+      "/nested%5Cindex.html",
+      // An encoded question mark is pathname data after the one strict decode,
+      // and cannot match the manifest's relative-path grammar.
+      "/asset.txt%3Fcache=one",
+      "/trailing/",
+      "/%00",
+      "/%EF%B7%90",
+      "/%C0%AF",
+      "/%ZZ",
+    ]) {
+      const response = await rawAsk(origin, target);
+      expect({ target, status: response.status, body: response.body }).toEqual({
+        target,
+        status: 404,
+        body: "not found\n",
+      });
+    }
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "static responses use the manifest media type for exact and SPA assets",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: ASSET_ROUTING_MODULE,
+      handlers: ["fetch"],
+      notFoundHandling: "single_page_application",
+    });
+
+    const misleading = await served(origin, "/app.bin");
+    expect(await misleading.text()).toBe(SITE_MISLEADING_CSS);
+    expect(misleading.headers.get("content-type")).toBe("text/css");
+
+    const vendor = await served(origin, "/app.css");
+    expect(await vendor.text()).toBe(SITE_VENDOR_ASSET);
+    expect(vendor.headers.get("content-type")).toBe(SITE_VENDOR_MEDIA);
+
+    const spa = await served(origin, "/valid-spa-route");
+    expect(await spa.text()).toBe(SITE_INDEX);
+    expect(spa.headers.get("content-type")).toBe(SITE_INDEX_MEDIA);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "prefix-colliding logical asset paths both survive publication and HTTP lookup",
+  async () => {
+    const { origin } = await bootEventsOnly({
+      module: ASSET_ROUTING_MODULE,
+      handlers: ["fetch"],
+    });
+    expect(await (await served(origin, "/foo")).text()).toBe(SITE_PREFIX_FILE);
+    expect(await (await served(origin, "/foo/bar.txt")).text()).toBe(SITE_PREFIX_CHILD);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "private asset storage cannot overwrite a colliding tenant module across restart",
+  async () => {
+    const { origin, runtime } = await bootEventsOnly({
+      module: COLLIDING_ASSET_MODULE,
+      modules: [
+        {
+          name: "__assets/asset-00000",
+          mediaType: "text/plain",
+          bytes: new TextEncoder().encode(COLLIDING_TEXT_MODULE),
+        },
+      ],
+      handlers: ["fetch"],
+    });
+    expect(await (await served(origin, "/module-collision")).text()).toBe(COLLIDING_TEXT_MODULE);
+    expect(await (await served(origin, "/index.html")).text()).toBe(SITE_INDEX);
+
+    const running = workerd;
+    if (!running) throw new Error("workerd did not start");
+    running.kill();
+    await running.exited;
+    workerd = undefined;
+    expect(await runtime.restore()).toHaveLength(1);
+    expect(await (await served(origin, "/module-collision")).text()).toBe(COLLIDING_TEXT_MODULE);
+    expect(await (await served(origin, "/index.html")).text()).toBe(SITE_INDEX);
+  },
+  60_000,
+);
+
+test.skipIf(WORKERD === null)(
   "publishing a Version that declares queue and never exports it is refused",
   async () => {
-    const { deployment } = await bootEventsOnly({
+    const { version } = await bootEventsOnly({
       module: ASSETS_EVENT_MODULE,
       handlers: ["fetch", "queue"],
-      deploymentTicket: true,
+      versionTicket: true,
     });
     // The fixture exports `fetch` and `scheduled`. This used to publish, and
     // only the Consumer attachment — the thing that first asked for a generated
@@ -1348,17 +1952,15 @@ test.skipIf(WORKERD === null)(
     // events-only script even that succeeded, and every batch it enabled 500ed
     // straight into the dead-letter queue. Now every publication is probed, so
     // the declaration is checked where it is made.
-    expect(deployment).toMatchObject({
+    expect(version).toMatchObject({
       phase: "failed",
       failure: {
         code: "invalid_spec",
-        // Which handler, and in which way. The fixture exports `fetch` and
-        // `scheduled`, so "does not export every handler it declares" would
-        // send an operator to read a list that is right about two of three.
-        message:
-          "the Worker Version's module is not what it declares: declared handler queue is not exported",
+        retryable: false,
+        message: expect.stringContaining("handler_not_exported"),
       },
     });
+    expect(workerd).toBeUndefined();
   },
   60_000,
 );
@@ -1538,7 +2140,12 @@ async function bootObjects(tenantModule: string = OBJECT_MODULE): Promise<{
   const workerdPort = Number(reserved.port);
   reserved.stop(true);
   const origin = `http://127.0.0.1:${workerdPort}`;
-  const runtime = createWorkerdRuntime({ root, port: workerdPort, isReady: () => true });
+  const runtime = createWorkerdRuntime({
+    root,
+    binary: WORKERD,
+    port: workerdPort,
+    isReady: () => true,
+  });
   const local = createSelfhostProvider({
     offerings: [],
     dataRoot: root,
@@ -1736,7 +2343,7 @@ test.skipIf(WORKERD === null)(
     expect(body.other).toBe("undefined");
     expect(body.dataService).toBe("undefined");
     expect(body.token).toBeNull();
-    expect(body.importable).toEqual([]);
+    expect(body.importable).toEqual(["threw:Error"]);
     // And the planes are not reachable by address from tenant code at all:
     // workerd's default outbound network refuses loopback, so the attempt
     // throws rather than reaching a status of any kind.

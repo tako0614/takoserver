@@ -3,7 +3,7 @@ import {
   TAKOSERVER_MANAGED_WORKER_EVENT_PATH,
   TAKOSERVER_MANAGED_WORKER_EVENT_PROTOCOL,
   TAKOSERVER_MANAGED_WORKER_EVENT_RESPONSE_CONTENT_TYPE,
-} from "./cloudflare-managed-worker-gateway.ts";
+} from "./worker-event-protocol.ts";
 
 /**
  * How a queue batch and a cron match reach a self-hosted Worker.

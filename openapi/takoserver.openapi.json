@@ -20,7 +20,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "A session secret, an organization API key, or a resource-scoped token, depending on the route."
+        "description": "A session secret, an organization API key, a tenant-run Space-scoped token, or a resource-scoped token, depending on the route."
       }
     },
     "schemas": {
@@ -1503,6 +1503,7 @@
     "/v1/takoform/worker-runtime-input-preparations/{operationKey}": {
       "put": {
         "summary": "Prepare one encrypted Worker runtime-input handoff",
+        "description": "An organization resources:write API key may prepare across the organization. An admitted tenant-run credential may prepare only when this exact create-only WorkerVersion apply targets the credential's Space.",
         "parameters": [
           {
             "name": "operationKey",
@@ -1560,7 +1561,7 @@
             }
           },
           "401": {
-            "description": "Organization API key required",
+            "description": "Organization API key or admitted tenant-run credential required",
             "content": {
               "application/json": {
                 "schema": {
@@ -1570,7 +1571,17 @@
             }
           },
           "403": {
-            "description": "The key lacks resources:write",
+            "description": "Authenticated caller is not an eligible organization writer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The tenant credential and apply or handoff Space do not match",
             "content": {
               "application/json": {
                 "schema": {
@@ -1603,6 +1614,7 @@
       },
       "get": {
         "summary": "Read a Worker runtime-input handoff without secret values",
+        "description": "An organization resources:write API key may read across the organization. An admitted tenant-run credential sees only handoffs pre-bound to its exact Space.",
         "parameters": [
           {
             "name": "operationKey",
@@ -1640,7 +1652,7 @@
             }
           },
           "401": {
-            "description": "Organization API key required",
+            "description": "Organization API key or admitted tenant-run credential required",
             "content": {
               "application/json": {
                 "schema": {
@@ -1650,7 +1662,7 @@
             }
           },
           "403": {
-            "description": "The key lacks resources:write",
+            "description": "Authenticated caller is not an eligible organization writer",
             "content": {
               "application/json": {
                 "schema": {
@@ -1660,7 +1672,7 @@
             }
           },
           "404": {
-            "description": "No live handoff exists for this operation key",
+            "description": "No live handoff exists in the caller's authority for this key",
             "content": {
               "application/json": {
                 "schema": {

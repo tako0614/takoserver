@@ -2,12 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CloudflareProviderExecutorInspection } from "../scripts/deploy/cloudflare-provider-executor.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type {
+  ProviderExecutorInspection,
   WorkerMigrationReader,
   WorkerProviderExecutorQualification,
   WorkerState,
@@ -306,8 +306,8 @@ function ok(stdout: string): CommandResult {
 }
 
 function providerExecutorInspection(
-  overrides: Partial<CloudflareProviderExecutorInspection> = {},
-): CloudflareProviderExecutorInspection {
+  overrides: Partial<ProviderExecutorInspection> = {},
+): ProviderExecutorInspection {
   const digest = "8".repeat(64);
   return {
     status: "ready",
@@ -328,17 +328,12 @@ function providerExecutorInspection(
     commit: COMMIT,
     bundleDigestHex: digest,
     moduleDigestHex: digest,
-    moduleBytes: Uint8Array.from([1, 2, 3]),
-    bindingsExact: true,
-    secretsExact: true,
-    settingsExact: true,
-    migrationExact: true,
     ...overrides,
   };
 }
 
 function qualification(
-  ...inspections: readonly CloudflareProviderExecutorInspection[]
+  ...inspections: readonly ProviderExecutorInspection[]
 ): WorkerProviderExecutorQualification {
   let index = 0;
   return {

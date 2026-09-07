@@ -166,6 +166,8 @@ const WORKER_ENDPOINT_ORIGIN_ACTIVATION_OPERATIONS = {
 const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
   put: {
     summary: "Prepare one encrypted Worker runtime-input handoff",
+    description:
+      "An organization resources:write API key may prepare across the organization. An admitted tenant-run credential may prepare only when this exact create-only WorkerVersion apply targets the credential's Space.",
     parameters: runtimeInputPathParameters(),
     requestBody: {
       required: true,
@@ -178,20 +180,23 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
     responses: {
       "200": runtimeInputResponse("Prepared value-free handoff projection"),
       "400": errorResponse("Malformed request, wrong Host origin, or wrong operation key"),
-      "401": errorResponse("Organization API key required"),
-      "403": errorResponse("The key lacks resources:write"),
+      "401": errorResponse("Organization API key or admitted tenant-run credential required"),
+      "403": errorResponse("Authenticated caller is not an eligible organization writer"),
+      "404": errorResponse("The tenant credential and apply or handoff Space do not match"),
       "409": errorResponse("The operation key already carries a different or spent handoff"),
       "503": errorResponse("Sealing or authority unavailable"),
     },
   },
   get: {
     summary: "Read a Worker runtime-input handoff without secret values",
+    description:
+      "An organization resources:write API key may read across the organization. An admitted tenant-run credential sees only handoffs pre-bound to its exact Space.",
     parameters: runtimeInputPathParameters(),
     responses: {
       "200": runtimeInputResponse("Value-free lifecycle projection"),
-      "401": errorResponse("Organization API key required"),
-      "403": errorResponse("The key lacks resources:write"),
-      "404": errorResponse("No live handoff exists for this operation key"),
+      "401": errorResponse("Organization API key or admitted tenant-run credential required"),
+      "403": errorResponse("Authenticated caller is not an eligible organization writer"),
+      "404": errorResponse("No live handoff exists in the caller's authority for this key"),
     },
   },
   delete: {
@@ -692,7 +697,7 @@ export const openApiDocument = {
         type: "http",
         scheme: "bearer",
         description:
-          "A session secret, an organization API key, or a resource-scoped token, " +
+          "A session secret, an organization API key, a tenant-run Space-scoped token, or a resource-scoped token, " +
           "depending on the route.",
       },
     },

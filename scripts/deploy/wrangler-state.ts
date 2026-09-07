@@ -40,6 +40,7 @@ export interface WranglerWorkerStateOptions {
   readonly publicOrigin?: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
+  readonly wranglerPath?: string;
 }
 
 /**
@@ -56,6 +57,7 @@ export class WranglerWorkerState implements WorkerState {
   readonly #workerName: string;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #run: WranglerProcess;
+  readonly #wranglerPath: string | undefined;
 
   constructor(input: WranglerWorkerStateOptions) {
     if (!isAbsolute(input.configPath) || input.configPath.length === 0) {
@@ -91,6 +93,7 @@ export class WranglerWorkerState implements WorkerState {
     this.#workerName = input.workerName;
     this.#environment = Object.freeze({ ...(input.environment ?? {}) });
     this.#run = input.run ?? runCommand;
+    this.#wranglerPath = input.wranglerPath;
   }
 
   async workerDeployments(workerName: string): Promise<readonly unknown[]> {
@@ -153,7 +156,9 @@ export class WranglerWorkerState implements WorkerState {
   async #json(command: readonly string[], label: string): Promise<unknown> {
     let result: CommandResult;
     try {
-      result = await this.#run(wranglerCommand(command), { env: this.#environment });
+      result = await this.#run(deployWranglerCommand(this.#wranglerPath, command), {
+        env: this.#environment,
+      });
     } catch {
       throw preflightError(`${label} could not be started`);
     }
@@ -696,6 +701,7 @@ export async function publishWranglerVersion(input: {
   readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
+  readonly wranglerPath?: string;
 }): Promise<WranglerVersionPublication> {
   if (!isAbsolute(input.root) || !isAbsolute(input.bundlePath) || !isAbsolute(input.configPath)) {
     throw preflightError("Wrangler version publication requires absolute artifact paths");
@@ -730,6 +736,7 @@ export async function deployWranglerLifecycleChange(input: {
   readonly secretsFilePath?: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
+  readonly wranglerPath?: string;
 }): Promise<WranglerLifecycleDeployment> {
   if (
     !isAbsolute(input.root) ||
@@ -758,7 +765,7 @@ export async function deployWranglerLifecycleChange(input: {
   rmSync(outputPath, { force: true });
   const deployed = await runPublicationCommand(
     input.run ?? runCommand,
-    wranglerCommand([
+    deployWranglerCommand(input.wranglerPath, [
       "deploy",
       input.bundlePath,
       "--name",
@@ -805,6 +812,7 @@ async function publishWranglerVersionWhileLeased(
     readonly assertPredecessorStillCurrent: () => Promise<void>;
     readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
     readonly environment?: Readonly<Record<string, string>>;
+    readonly wranglerPath?: string;
   },
   run: WranglerProcess,
 ): Promise<WranglerVersionPublication> {
@@ -817,7 +825,7 @@ async function publishWranglerVersionWhileLeased(
 
   const upload = await runPublicationCommand(
     run,
-    wranglerCommand([
+    deployWranglerCommand(input.wranglerPath, [
       "versions",
       "upload",
       input.bundlePath,
@@ -875,7 +883,7 @@ async function publishWranglerVersionWhileLeased(
 
   const deployed = await runPublicationCommand(
     run,
-    wranglerCommand([
+    deployWranglerCommand(input.wranglerPath, [
       "versions",
       "deploy",
       `${uploaded.versionId}@100%`,
@@ -924,6 +932,7 @@ export async function deployExistingWranglerVersion(input: {
   readonly assertCurrentStillExpected: () => Promise<void>;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
+  readonly wranglerPath?: string;
 }): Promise<WranglerExistingVersionDeployment> {
   if (!isAbsolute(input.root) || !isAbsolute(input.configPath)) {
     throw preflightError("Wrangler existing Version deployment requires absolute paths");
@@ -947,7 +956,7 @@ export async function deployExistingWranglerVersion(input: {
   rmSync(outputPath, { force: true });
   const deployed = await runPublicationCommand(
     input.run ?? runCommand,
-    wranglerCommand([
+    deployWranglerCommand(input.wranglerPath, [
       "versions",
       "deploy",
       `${input.versionId}@100%`,
@@ -982,6 +991,13 @@ export async function deployExistingWranglerVersion(input: {
     );
   }
   return { versionId: input.versionId, deploymentId: deployment.deploymentId };
+}
+
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
 }
 
 async function runPublicationCommand(

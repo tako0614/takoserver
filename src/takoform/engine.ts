@@ -74,11 +74,7 @@ import {
   validateWorkerDeploymentRemoval,
   workerServiceCondition,
 } from "./worker-aggregate.ts";
-import {
-  validateClassHolderRuntime,
-  validateWorkerBundleRuntime,
-  validateWorkerVersionRuntime,
-} from "./worker-runtime-contract.ts";
+import { validateClassHolderRuntime } from "./worker-runtime-contract.ts";
 
 /**
  * The Takoform resource lifecycle.
@@ -94,18 +90,6 @@ import {
 export interface ArtifactResolver {
   resolveManifest(tenantId: string, digest: string): Promise<TakoformArtifactManifest | null>;
   resolveBlob(tenantId: string, digest: string): Promise<Uint8Array | null>;
-}
-
-export interface WorkerModuleInspector {
-  inspect(input: {
-    readonly digest: string;
-    readonly mediaType: string;
-    readonly bytes: Uint8Array;
-  }): Promise<{
-    readonly loadable: boolean;
-    readonly handlers: readonly string[];
-    readonly classes?: readonly string[];
-  }>;
 }
 
 export interface EngineContext {
@@ -212,7 +196,6 @@ export interface CreateTakoformEngineOptions {
   readonly randomId: () => string;
   /** Test/host override; normally aligned with the durable operation lease. */
   readonly providerMutationLeaseMilliseconds?: number;
-  readonly workerModuleInspector?: WorkerModuleInspector;
   readonly allowBodyGenerationFence?: boolean;
   readonly allowReviewSpecDigest?: boolean;
   readonly standardServiceResolver?: TakoformStandardServiceResolver;
@@ -979,13 +962,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("resource_not_found", 404);
       }
       await requireArtifact(form, body.spec, context.tenantId);
-      await validateWorkerBundleRuntime({
-        tenantId: context.tenantId,
-        form,
-        spec: body.spec,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
       await resolveStandardServiceSlots({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -1238,26 +1214,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         relations,
       });
-      await validateWorkerVersionRuntime({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        relations,
-        store,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
-      await validateClassHolderRuntime({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        relations,
-        store,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
+      validateClassHolderRuntime(form);
       const saga = await store.acceptProviderMutationSaga(proposedSaga);
       const opId = saga.operationId;
       const uid = saga.resourceUid;
@@ -1665,13 +1622,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       );
       form = authority.form;
       await requireArtifact(form, body.spec, context.tenantId);
-      await validateWorkerBundleRuntime({
-        tenantId: context.tenantId,
-        form,
-        spec: body.spec,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
       await resolveStandardServiceSlots({
         tenantId: context.tenantId,
         space: body.metadata.space,
@@ -1744,26 +1694,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         relations,
       });
-      await validateWorkerVersionRuntime({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        relations,
-        store,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
-      await validateClassHolderRuntime({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        relations,
-        store,
-        artifacts,
-        ...(options.workerModuleInspector ? { inspector: options.workerModuleInspector } : {}),
-      });
+      validateClassHolderRuntime(form);
       const proposedImportId = context.durableOperation?.id ?? operationId();
       const proposedResourceUid =
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);

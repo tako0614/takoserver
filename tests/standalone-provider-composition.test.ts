@@ -12,6 +12,9 @@ import { stableProductionTakoformCatalog } from "../src/takoform/stable-producti
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 const runtime: WorkerdRuntime = {
+  async inspectModule(input) {
+    return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+  },
   async write() {},
   async remove() {},
   async reload() {},

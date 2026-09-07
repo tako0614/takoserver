@@ -5,13 +5,6 @@ import {
   artifactBlobIoCompatibilityAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
-import {
-  type CloudflareProviderExecutorInspection,
-  type CloudflareProviderExecutorState,
-  cloudflareProviderExecutorDependencies,
-  inspectCloudflareProviderExecutor,
-  remoteCloudflareProviderExecutorSchema,
-} from "./cloudflare-provider-executor.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -31,7 +24,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import { writeCloudflareProviderExecutorConfig, writeWorkerConfig } from "./realized-config.ts";
+import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import {
   activePublicJwk,
@@ -90,6 +83,10 @@ export interface WorkerOptions {
   readonly state?: WorkerState;
   readonly migrations?: WorkerMigrationReader;
   readonly outputDirectory?: string;
+  /** Checkout whose source and migration bytes define the publication. */
+  readonly sourceRepositoryRoot?: string;
+  /** Wrangler executable selected by the composing owner. */
+  readonly wranglerPath?: string;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly review?: string;
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
@@ -101,8 +98,36 @@ export interface WorkerOptions {
   readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
 }
 
+/** Immutable, value-free projection read by public lifecycle code. */
+export interface ProviderExecutorDependencyInspection {
+  readonly ready: boolean;
+  readonly receiptAuthorityReady: boolean;
+  readonly receiptAuthorityVersionId: string | null;
+  readonly managedWorkerGatewayReady: boolean;
+  readonly managedWorkerGatewayVersionId: string | null;
+}
+
+/**
+ * Provider-neutral qualification supplied by the owner of a managed backend.
+ * Concrete module bytes, credentials and provider state never cross this seam.
+ */
+export interface ProviderExecutorInspection {
+  readonly status: "absent" | "ready" | "stale" | "drift";
+  readonly ready: boolean;
+  readonly managedExact: boolean;
+  readonly routeLess: boolean;
+  readonly schemaReady: boolean;
+  readonly dependencies: ProviderExecutorDependencyInspection;
+  readonly versionId: string | null;
+  readonly deploymentId: string | null;
+  readonly previousVersionId: string | null;
+  readonly commit: string | null;
+  readonly bundleDigestHex: string | null;
+  readonly moduleDigestHex: string | null;
+}
+
 export interface WorkerProviderExecutorQualification {
-  read(phase: "preflight" | "verification"): Promise<CloudflareProviderExecutorInspection>;
+  read(phase: "preflight" | "verification"): Promise<ProviderExecutorInspection>;
 }
 
 interface WorkerInspection {
@@ -141,6 +166,7 @@ export async function runWorker(
     }
   }
   const run = options.run ?? runCommand;
+  const sourceRepositoryRoot = resolve(options.sourceRepositoryRoot ?? REPOSITORY);
   const credential =
     invocation.environment === "integration" &&
     options.state !== undefined &&
@@ -149,6 +175,7 @@ export async function runWorker(
       : await resolveCloudflareCredential(invocation.environment, {
           cloudflareEnvironment: options.cloudflareEnvironment,
           run,
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         });
   const environment = credential?.childEnvironment ?? {};
   // Before any live read or upload: the selected target must compose the
@@ -165,10 +192,6 @@ export async function runWorker(
   if (state === null) throw preflightError("Worker state is unavailable");
   const providerExecutorQualification = providerExecutorQualificationReader({
     target,
-    commit: invocation.commit,
-    state: cloudflareState,
-    environment,
-    run,
     ...(options.providerExecutorQualification === undefined
       ? {}
       : { injected: options.providerExecutorQualification }),
@@ -215,14 +238,16 @@ export async function runWorker(
   try {
     const inspectionConfig = writeWorkerConfig(target, {
       path: join(root, "inspect-wrangler.jsonc"),
-      main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
+      main: resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts"),
       commit: invocation.commit,
+      sourceRepositoryRoot,
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "historical-pre-jit" as const } }),
     });
     const migrations =
-      options.migrations ?? remoteMigrationReader(inspectionConfig, environment, run);
+      options.migrations ??
+      remoteMigrationReader(inspectionConfig, environment, run, sourceRepositoryRoot);
     const signingDatabase =
       target.integrationE2eCredentialAuthority === undefined
         ? undefined
@@ -360,6 +385,8 @@ export async function runWorker(
       root,
       target,
       commit: source.commit,
+      sourceRepositoryRoot,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       run,
       environment,
       ...(versionPublication ? { dryRunCommand: "versions-upload" as const } : {}),
@@ -368,6 +395,7 @@ export async function runWorker(
           path,
           main,
           commit: source.commit,
+          sourceRepositoryRoot,
           ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
           ...(bundleDigestHex === undefined
             ? {}
@@ -465,6 +493,7 @@ export async function runWorker(
         lease: publicationLease,
         environment,
         run,
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         assertPredecessorStillCurrent: async () => {
           const current = await inspectWorker("preflight", target, state, migrations, {
             ...(beforeAuthorityProfile === undefined
@@ -485,7 +514,7 @@ export async function runWorker(
     } else {
       publication = await (async () => {
         const upload = await run(
-          wranglerCommand([
+          deployWranglerCommand(options.wranglerPath, [
             "deploy",
             bundlePath,
             "--no-bundle",
@@ -616,54 +645,17 @@ export async function runWorker(
 
 export function providerExecutorQualificationReader(input: {
   readonly target: DeployTarget;
-  readonly commit: string;
-  readonly state: CloudflareProviderExecutorState | null;
-  readonly environment: Readonly<Record<string, string>>;
-  readonly run: WorkerProcess;
   readonly injected?: WorkerProviderExecutorQualification;
 }): WorkerProviderExecutorQualification | null {
   if (input.target.cloudflareProviderExecutor === undefined) return null;
   if (input.injected !== undefined) return input.injected;
-  if (input.state === null) {
-    throw preflightError(
-      "a public Worker test state with Cloudflare supplies must inject provider-executor qualification",
-    );
-  }
-  const dependencies = cloudflareProviderExecutorDependencies(
-    input.state,
-    input.target,
-    input.commit,
+  throw preflightError(
+    "a target with a managed provider executor requires owner-injected live qualification",
   );
-  return {
-    async read(phase) {
-      const root = mkdtempSync(join(tmpdir(), "takoserver-public-executor-inspection-"));
-      try {
-        const configPath = writeCloudflareProviderExecutorConfig(input.target, {
-          path: join(root, "wrangler.jsonc"),
-          main: resolve(REPOSITORY, "src/entry-cloudflare-provider-executor.ts"),
-        });
-        const schema = remoteCloudflareProviderExecutorSchema(
-          configPath,
-          input.environment,
-          input.run,
-        );
-        return await inspectCloudflareProviderExecutor(
-          phase,
-          input.state as CloudflareProviderExecutorState,
-          schema,
-          dependencies,
-          input.target,
-          { commit: input.commit },
-        );
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    },
-  };
 }
 
 export function providerExecutorStatus(
-  inspection: CloudflareProviderExecutorInspection | null,
+  inspection: ProviderExecutorInspection | null,
 ): Record<string, unknown> {
   return inspection === null
     ? { cloudflareProviderExecutor: { required: false } }
@@ -686,7 +678,7 @@ export function providerExecutorStatus(
 
 export function withProviderExecutorQualification(
   result: Record<string, unknown>,
-  inspection: CloudflareProviderExecutorInspection | null,
+  inspection: ProviderExecutorInspection | null,
 ): Record<string, unknown> {
   return {
     ...result,
@@ -698,8 +690,8 @@ export function withProviderExecutorQualification(
 }
 
 export function assertProviderExecutorUnchanged(
-  expected: CloudflareProviderExecutorInspection,
-  actual: CloudflareProviderExecutorInspection,
+  expected: ProviderExecutorInspection,
+  actual: ProviderExecutorInspection,
   phase: "preflight" | "verification" = "preflight",
 ): void {
   if (
@@ -882,14 +874,22 @@ function remoteMigrationReader(
   configPath: string,
   environment: Readonly<Record<string, string>>,
   run: WorkerProcess,
+  sourceRepositoryRoot = REPOSITORY,
 ): WorkerMigrationReader {
   return {
     async read() {
-      const local = readMigrationArtifact();
+      const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
       const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
       return { local: local.names, applied: remote.applied };
     },
   };
+}
+
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
 }
 
 async function sourceDiff(

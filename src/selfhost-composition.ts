@@ -8,7 +8,11 @@ import {
 } from "./deployment-composition.ts";
 import { type EdgeFormBundle, edgeProviderOffering } from "./edge-forms.ts";
 import { HOSTED_EDGE_IDENTITY_CLASSES } from "./hosted-edge-supplies.ts";
-import type { Provider, ProviderOffering } from "./provider-port.ts";
+import type {
+  Provider,
+  ProviderNativeReadbackAuthority,
+  ProviderOffering,
+} from "./provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "./provider-runtime-input-port.ts";
 import {
   canonicalWorkerEndpointOrigin,
@@ -96,6 +100,8 @@ export interface SelfhostCompositionOptions {
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  /** False when this process did not verify the pinned closed-graph artifact. */
+  readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
   /** Whether the released Edge Family is offered. On by default upstream. */
   readonly edgeForms: boolean;
@@ -134,6 +140,7 @@ export interface SelfhostComposition extends DeploymentComposition {
 export function createSelfhostComposition(
   options: SelfhostCompositionOptions,
 ): SelfhostComposition {
+  const workerRuntimeAvailable = options.workerRuntimeAvailable !== false;
   const objectBucketOffering = edgeProviderOffering(options.edge.objectBucket.form, {
     id: "storage.object.standard",
     displayName: "Object bucket",
@@ -142,6 +149,7 @@ export function createSelfhostComposition(
 
   const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [];
   const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
+  const technicalRelationOfferings: ProviderOffering[] = [];
 
   if (options.edgeForms) {
     for (const form of options.stableForms) {
@@ -149,6 +157,9 @@ export function createSelfhostComposition(
       const kind = form.identity.formRef.kind;
       if (form.role === "identity") {
         if (!(kind in SELFHOST_IDENTITY_CLASSES)) continue;
+        if (!workerRuntimeAvailable && (kind === "ModuleWorker" || kind === "ObjectBucket")) {
+          continue;
+        }
         const resourceClass =
           SELFHOST_IDENTITY_CLASSES[kind as keyof typeof SELFHOST_IDENTITY_CLASSES];
         const offering = edgeProviderOffering(form, {
@@ -159,15 +170,24 @@ export function createSelfhostComposition(
         technicalOfferings.push(offering);
         continue;
       }
-      if (HOST_INTRINSIC.has(kind) || !SELFHOST_EDGE_RELATION_KINDS.has(kind)) continue;
-      technicalOfferings.push(
-        edgeProviderOffering(form, { id: `selfhost.edge.stable-v1.${kind.toLowerCase()}` }),
-      );
+      if (
+        HOST_INTRINSIC.has(kind) ||
+        !SELFHOST_EDGE_RELATION_KINDS.has(kind) ||
+        !workerRuntimeAvailable
+      ) {
+        continue;
+      }
+      const offering = edgeProviderOffering(form, {
+        id: `selfhost.edge.stable-v1.${kind.toLowerCase()}`,
+      });
+      technicalOfferings.push(offering);
+      technicalRelationOfferings.push(offering);
     }
     for (const form of options.edge.forms) {
       const kind = form.identity.formRef.kind;
       if (form.role === "identity") {
         if (!(kind in HOSTED_EDGE_IDENTITY_CLASSES)) continue;
+        if (!workerRuntimeAvailable && kind === "ModuleWorker") continue;
         const resourceClass =
           HOSTED_EDGE_IDENTITY_CLASSES[kind as keyof typeof HOSTED_EDGE_IDENTITY_CLASSES];
         const offering = edgeProviderOffering(form, {
@@ -178,17 +198,29 @@ export function createSelfhostComposition(
         continue;
       }
       if (HOST_INTRINSIC.has(kind)) continue;
+      if (!workerRuntimeAvailable && SELFHOST_EDGE_RELATION_KINDS.has(kind)) continue;
       // The relation-owned Forms are provider capabilities, not retail items.
       // Exactly one technical projection per exact Form, so the provider
       // driver can inherit it from the identity Deployment.
-      technicalOfferings.push(
-        edgeProviderOffering(form, { id: `selfhost.edge.${kind.toLowerCase()}` }),
-      );
+      const offering = edgeProviderOffering(form, {
+        id: `selfhost.edge.${kind.toLowerCase()}`,
+      });
+      technicalOfferings.push(offering);
+      technicalRelationOfferings.push(offering);
     }
   }
 
+  const sellableIdentityKinds = new Set(
+    identityOfferings.map(({ offering }) => offering.form.kind),
+  );
+  const nativeReadbackAuthorities = createSelfhostNativeReadbackAuthorities(
+    technicalRelationOfferings,
+    sellableIdentityKinds,
+  );
+
   const provider = createSelfhostProvider({
     offerings: technicalOfferings,
+    nativeReadbackAuthorities,
     dataRoot: options.dataRoot,
     runtime: options.runtime,
     artifacts: options.artifacts,
@@ -323,6 +355,46 @@ const SELFHOST_EDGE_RELATION_KINDS = new Set([
   "WorkerCronTrigger",
   "QueueConsumer",
 ]);
+
+const SELFHOST_RELATION_READBACK_ANCHORS: Readonly<Record<string, readonly string[]>> = {
+  WorkerVersion: ["ModuleWorker"],
+  WorkerDeployment: ["ModuleWorker"],
+  WorkerCustomDomain: ["ModuleWorker"],
+  WorkerEndpoint: ["ModuleWorker"],
+  WorkerCronTrigger: ["ModuleWorker"],
+  QueueConsumer: ["ModuleWorker", "AtLeastOnceQueue"],
+};
+
+function createSelfhostNativeReadbackAuthorities(
+  relationOfferings: readonly ProviderOffering[],
+  sellableIdentityKinds: ReadonlySet<string>,
+): readonly ProviderNativeReadbackAuthority[] {
+  const authorities = relationOfferings.flatMap((offering) => {
+    const anchors = SELFHOST_RELATION_READBACK_ANCHORS[offering.form.kind];
+    if (!anchors?.every((anchor) => sellableIdentityKinds.has(anchor))) return [];
+    return [
+      {
+        offeringId: offering.id,
+        providerInstallationRef: PROVIDER_INSTALLATION_REF,
+        form: structuredClone(offering.form),
+      },
+    ];
+  });
+  const identities = authorities.map((authority) =>
+    [
+      authority.offeringId,
+      authority.providerInstallationRef,
+      authority.form.apiVersion,
+      authority.form.kind,
+      authority.form.definitionVersion,
+      authority.form.schemaDigest,
+    ].join("\u0000"),
+  );
+  if (new Set(identities).size !== identities.length) {
+    throw new TypeError("self-host native readback authorities must be unique");
+  }
+  return authorities;
+}
 
 /**
  * Environment variables an operator sets to give this machine's Worker socket a

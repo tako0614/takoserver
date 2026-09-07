@@ -360,6 +360,7 @@ export function createTakoformHostAuthority(
       support.supported &&
       currentImplementationProfile &&
       implementationCandidate !== null &&
+      !form.workerClassRuntime &&
       narrowedOperations.length > 0;
     return {
       formRefKey,

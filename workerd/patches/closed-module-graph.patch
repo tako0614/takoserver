@@ -1,0 +1,2682 @@
+diff --git a/build/deps/v8.MODULE.bazel b/build/deps/v8.MODULE.bazel
+index 18db5f3df946b23b927036fe482b95d6371cd375..c7e1d770d475191e1a9db251a98fc932eb49ff46 100644
+--- a/build/deps/v8.MODULE.bazel
++++ b/build/deps/v8.MODULE.bazel
+@@ -61,6 +61,7 @@ PATCHES = [
+     "0036-Fix-ExtendedMap-layout-on-Windows.patch",
+     "0037-Fix-CFunction-MemorySpan-declarations-on-Windows.patch",
+     "0038-Properly-depend-on-llvm-libc.patch",
++    "0039-Preserve-generated-script-host-options-for-dynamic-import.patch",
+ ]
+ 
+ http_archive(
+diff --git a/docs/reference/detail/new-module-registry.md b/docs/reference/detail/new-module-registry.md
+index 7ce15a2804d49b72513fe086ec7c65db1a280acd..c22d683f746586f7bd4aff5edf71f6075f07ce98 100644
+--- a/docs/reference/detail/new-module-registry.md
++++ b/docs/reference/detail/new-module-registry.md
+@@ -55,8 +55,14 @@ The new module registry was designed to address several limitations of the legac
+    registry had no `import.meta` support.
+ 
+ 7. **Modular bundle architecture.** The `ModuleBundle` abstraction allows
+-   composing registries from multiple independent sources (worker bundle, builtins,
+-   internal-only, fallback) without coupling them.
++   composing registries from multiple independent sources (application bundle,
++   host-private bundle, builtins, internal-only, fallback) without coupling them.
++
++8. **Optional closed application graph.** A worker can opt into provenance-aware
++   resolution. Application modules then resolve only explicitly declared application
++   definitions. Host-private modules occupy a separate namespace and can resolve only
++   that namespace plus the exact configured application main. The same logical name may
++   exist in both namespaces without sharing definition or instance identity.
+ 
+ ## Architecture Overview
+ 
+@@ -72,12 +78,14 @@ ModuleRegistry (kj::AtomicRefcounted)
+   |-- bundleBase: const jsg::Url&          (e.g. "file:///bundle/")
+   |-- schemaLoader: capnp::SchemaLoader    (for capnp modules)
+   |-- maybeEvalCallback: EvalCallback      (ensures eval outside IoContext)
++  |-- closedApplicationMain: Maybe<Url>    (opt-in application bridge)
+   +-- impl: kj::MutexGuarded<Impl>
+-        +-- bundles: FixedArray<Array<Own<ModuleBundle>>, 4>
++        +-- bundles: FixedArray<Array<Own<ModuleBundle>>, 5>
+               [kBundle]      -> worker bundle modules
+               [kBuiltin]     -> runtime builtins importable by user code
+               [kBuiltinOnly] -> internal-only modules
+               [kFallback]    -> fallback service (local dev only)
++              [kHostPrivate] -> host entrypoint and prelude modules
+ ```
+ 
+ ### Per-Isolate Layer (owned by `JsContext`, destroyed with context)
+@@ -127,6 +135,7 @@ map to multiple rows, so a unique URL index would collide.
+ | `BUILTIN`      | 1     | Runtime-provided, importable by user code (e.g. `node:buffer`) |
+ | `BUILTIN_ONLY` | 2     | Runtime-internal, only importable by other builtins            |
+ | `FALLBACK`     | 3     | Dynamically resolved from fallback service (local dev only)    |
++| `HOST_PRIVATE` | 4     | Configured host entrypoint/prelude namespace                   |
+ 
+ ### `Module::Flags` bitmask
+ 
+@@ -269,8 +278,9 @@ Used only for local development (`workerd` binary). Contains a single
+ 
+ ### `BundleBuilder` — Building Worker Bundle Modules
+ 
+-`BundleBuilder` creates `BUNDLE`-type modules. Module names are processed relative
+-to the `bundleBase` URL (typically `file:///bundle/`):
++`BundleBuilder` creates `BUNDLE`-type application modules or `HOST_PRIVATE` modules.
++Module names are processed relative to the `bundleBase` URL (typically
++`file:///bundle/`):
+ 
+ ```cpp
+ BundleBuilder builder(bundleBase);
+@@ -285,7 +295,10 @@ Name normalization (`normalizeModuleName`):
+ 1. Parse name as URL relative to `bundleBase`.
+ 2. Normalize path (remove `.`/`..`, normalize percent-encoding).
+ 3. Strip fragments and query parameters.
+-4. Validate: must be subordinate to `bundleBase`, no `cloudflare:` or `workerd:` protocol.
++4. Validate file URLs are subordinate to `bundleBase`.
++5. Without the closed-graph opt-in, retain the historical reservation of
++   `cloudflare:`, `workerd:`, and `data:` names. With the opt-in, all declared
++   names are ordinary namespace-local identities; no tenant prefix is reserved.
+ 
+ ### `BuiltinBuilder` — Building Runtime Modules
+ 
+@@ -305,7 +318,8 @@ auto bundle = builder.finish();
+ ### Lookup Priority by Context Type
+ 
+ When `ModuleRegistry::lookup()` is called, it acquires an exclusive lock on the
+-`MutexGuarded<Impl>` and searches bundles in order:
++`MutexGuarded<Impl>` and searches bundles in order. With no module policy, the
++historical table remains in effect:
+ 
+ | `ResolveContext::Type` | Search order                     | Use case                                   |
+ | ---------------------- | -------------------------------- | ------------------------------------------ |
+@@ -314,6 +328,26 @@ When `ModuleRegistry::lookup()` is called, it acquires an exclusive lock on the
+ | `BUILTIN_ONLY`         | kBuiltinOnly only                | Internal modules importing other internals |
+ | `PUBLIC_BUILTIN`       | kBuiltin only                    | `process.getBuiltinModule()` and similar   |
+ 
++With the closed application graph enabled, provenance changes only the
++application-facing rows. Runtime-internal resolution remains available:
++
++| `ResolveContext::Type` | Search order                                      |
++| ---------------------- | ------------------------------------------------- |
++| `BUNDLE`               | kBundle only                                      |
++| `HOST_PRIVATE`         | exact application main in kBundle, else kHostPrivate |
++| `HOST_PRIVATE_ENTRY`   | kHostPrivate only                                 |
++| `PUBLIC_BUILTIN`       | no lookup                                          |
++| `BUILTIN`              | kBuiltin -> kBuiltinOnly                           |
++| `BUILTIN_ONLY`         | kBuiltinOnly only                                  |
++
++`HOST_PRIVATE_ENTRY` is used only for the direct worker entrypoint lookup. It
++keeps a host entrypoint distinct when the application main has the same URL.
++Normal host-private imports use `HOST_PRIVATE`, where the configured application
++main is the sole bridge into the application namespace. Missing application and
++host-private lookups never consult builtins or fallback services. The
++`node:process` redirect and `process.getBuiltinModule()` shortcut are also
++suppressed for application-facing closed-graph resolution.
++
+ ### Complete Resolution Sequence (Static Import)
+ 
+ ```
+@@ -322,7 +356,7 @@ User code: import { foo } from './bar.js'
+ 1. V8 calls resolveModuleCallback<false>(context, specifier, attrs, referrer)
+ 
+ 2. Look up referrer in IsolateModuleRegistry by v8::Module identity
+-   -> Determines referrer's type (BUNDLE/BUILTIN/BUILTIN_ONLY)
++   -> Determines referrer's type (BUNDLE/HOST_PRIVATE/BUILTIN/BUILTIN_ONLY)
+    -> Gets referrer's URL for relative resolution
+ 
+ 3. Normalize specifier:
+@@ -363,25 +397,27 @@ User code: const mod = await import('./bar.js')
+ 2. Parse import attributes (throws for unrecognized keys; `type` validated
+    against the resolved module's ContentType)
+ 
+-3. Parse referrer from resource_name. Modules created by this registry always
+-   use their canonical URL as the ScriptOrigin name (including CJS-style eval
+-   functions), so this parse succeeds for them. Scripts with non-URL origin
+-   names (service-worker mains, eval'd code) fall back to bundleBase, and the
+-   referrer lookup below then fails with a clear "Referring module not found"
+-   TypeError.
++3. Parse the relative-resolution base from `resource_name`. Modules created by
++   this registry use their canonical URL as the ScriptOrigin name. The patched
++   V8 callback retains the ultimate eval origin for this value, so direct eval
++   and Function-constructor imports preserve normal relative-URL semantics.
+ 
+ 4. Normalize specifier (same as static: node: prefix, process redirect, URL resolve)
+ 
+-5. IsolateModuleRegistry::dynamicResolve(js, normalizedSpec, referrer, rawSpec, sourcePhase)
+-   a. Identify the referrer: probe the resolutions map for the referrer URL
+-      across context types in resolution-priority order (BUNDLE first). V8
+-      supplies only the URL string, and with shadowing one URL can have entries
+-      under multiple types, so referrer typing is a policy choice favoring the
+-      bundle module.
+-   b. Build ResolveContext { type from referrer's module, source=DYNAMIC_IMPORT, ... }
+-   c. findResolved or resolveWithCaching (same as static)
+-   d. Call module.evaluate(js, v8Module, observer, maybeEvaluate) -> Promise
+-   e. Chain: .then(namespace -> resolve Promise with module namespace)
++5. IsolateModuleRegistry::dynamicResolve(js, normalizedSpec, referrer, rawSpec,
++   sourcePhase, referrerType)
++   a. When the closed graph is enabled, read provenance from an unforgeable
++      host-defined option attached when the actual ESM or CJS script is compiled.
++      V8 reports the actual generated script's options separately from its eval
++      origin URL. Direct eval and Function-constructor scripts have no module
++      provenance and therefore default to `BUNDLE` (application), never
++      `HOST_PRIVATE`.
++   b. With no policy, preserve the historical URL probe across context types in
++      resolution-priority order (`BUNDLE` first).
++   c. Build ResolveContext { type, source=DYNAMIC_IMPORT, ... }
++   d. findResolved or resolveWithCaching (same as static)
++   e. Call module.evaluate(js, v8Module, observer, maybeEvaluate) -> Promise
++   f. Chain: .then(namespace -> resolve Promise with module namespace)
+ 
+ 6. Return Promise to V8
+ 
+@@ -528,8 +564,10 @@ handler for CommonJS-style modules:
+    the JSG object as extension object (providing `module`, `exports`, `require`).
+    The module's canonical URL is used as the compiled script's origin name: V8
+    reports the origin as the referrer for dynamic `import()` performed by the
+-   script, which is how the dynamic import callback identifies the referring
+-   module. This also makes CJS stack-trace filenames consistent with ESM ones.
++   script. The application or host-private context is also attached as a
++   host-defined option, so dynamic `import()` and the context object's `require()`
++   enforce the same namespace policy. This also makes CJS stack-trace filenames
++   consistent with ESM ones.
+ 3. Calls the compiled function.
+ 4. Extracts `exports` from the JSG object and sets them on the module namespace.
+ 
+@@ -545,8 +583,13 @@ Worker bundle module names (from config) are processed through `processModuleNam
+ 1. **Normalize**: resolve relative to `bundleBase`, remove `.`/`..`, normalize
+    percent-encoding, strip query/fragment.
+ 2. **Validate URL structure**: must be subordinate to `bundleBase` path.
+-3. **Protocol restrictions**: `cloudflare:`, `workerd:`, and `data:` protocols
+-   are forbidden in bundle module names (reserved for runtime use).
++3. **Protocol restrictions without module policy**: `cloudflare:`, `workerd:`,
++   and `data:` protocols remain forbidden in bundle module names for backward
++   compatibility.
++4. **Closed-graph names**: when the provenance-aware module policy is enabled,
++   explicitly declared application and host-private names may use any protocol.
++   Builtin-looking and host-generated-looking names have no special authority;
++   identity is the pair of provenance namespace and normalized URL.
+ 
+ Result: a `file:///bundle/<path>` URL for file-protocol modules, or a fully
+ qualified URL for other protocols.
+diff --git a/src/workerd/api/commonjs.c++ b/src/workerd/api/commonjs.c++
+index 8240f2d54d3a9f42a4953d66d23622270451db74..eeb41455475819a3e0bc45edcf5e7842d177a71a 100644
+--- a/src/workerd/api/commonjs.c++
++++ b/src/workerd/api/commonjs.c++
+@@ -26,14 +26,20 @@ kj::String pathnameAsRelativePath(const jsg::Url& url) {
+ }
+ }  // namespace
+ 
+-CommonJsModuleContext::CommonJsModuleContext(jsg::Lock& js, kj::Path path)
++CommonJsModuleContext::CommonJsModuleContext(
++    jsg::Lock& js, kj::Path path, jsg::ModuleRegistry::Type type)
+     : module(js.alloc<CommonJsModuleObject>(js, path.toString(true))),
+       pathOrSpecifier(kj::mv(path)),
++      legacyResolveOption(type == jsg::ModuleRegistry::Type::HOST_PRIVATE
++              ? jsg::ModuleRegistry::ResolveOption::HOST_PRIVATE
++              : jsg::ModuleRegistry::ResolveOption::DEFAULT),
+       exports(js, module->getExports(js)) {}
+ 
+-CommonJsModuleContext::CommonJsModuleContext(jsg::Lock& js, const jsg::Url& specifier)
++CommonJsModuleContext::CommonJsModuleContext(
++    jsg::Lock& js, const jsg::Url& specifier, jsg::ResolveObserver::Context contextType)
+     : module(js.alloc<CommonJsModuleObject>(js, kj::str(specifier.getHref()))),
+       pathOrSpecifier(specifier.clone()),
++      newResolutionContext(contextType),
+       exports(js, module->getExports(js)) {}
+ 
+ jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier) {
+@@ -46,8 +52,7 @@ jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier)
+   if (isNewModuleRegistryEnabled(FeatureFlags::get(js))) {
+     auto& referrer = KJ_ASSERT_NONNULL(pathOrSpecifier.tryGet<jsg::Url>());
+     KJ_IF_SOME(ns,
+-        jsg::modules::ModuleRegistry::tryResolveModuleNamespace(js, specifier,
+-            jsg::modules::ResolveContext::Type::BUNDLE,
++        jsg::modules::ModuleRegistry::tryResolveModuleNamespace(js, specifier, newResolutionContext,
+             jsg::modules::ResolveContext::Source::REQUIRE, referrer,
+             jsg::modules::UnwrapDefault::YES)) {
+       return ns;
+@@ -78,11 +83,10 @@ jsg::JsValue CommonJsModuleContext::require(jsg::Lock& js, kj::String specifier)
+   // require() is only exposed to worker bundle modules so the resolve here is only
+   // permitted to require worker bundle or built-in modules. Internal modules are
+   // excluded.
+-  auto& info =
+-      JSG_REQUIRE_NONNULL(modulesForResolveCallback->resolve(js, targetPath, path,
+-                              jsg::ModuleRegistry::ResolveOption::DEFAULT,
+-                              jsg::ModuleRegistry::ResolveMethod::REQUIRE, specifier.asPtr()),
+-          Error, "No such module \"", targetPath.toString(), "\".");
++  auto& info = JSG_REQUIRE_NONNULL(
++      modulesForResolveCallback->resolve(js, targetPath, path, legacyResolveOption,
++          jsg::ModuleRegistry::ResolveMethod::REQUIRE, specifier.asPtr()),
++      Error, "No such module \"", targetPath.toString(), "\".");
+   // Adding imported from suffix here not necessary like it is for resolveCallback, since we have a
+   // js stack that will include the parent module's name and location of the failed require().
+ 
+diff --git a/src/workerd/api/commonjs.h b/src/workerd/api/commonjs.h
+index 833604a47f8888e6f7009198d8fef4c5a40a5560..a74eeb8ea5470fe550c8f744bac3a17770c1170c 100644
+--- a/src/workerd/api/commonjs.h
++++ b/src/workerd/api/commonjs.h
+@@ -33,8 +33,12 @@ class CommonJsModuleObject final: public jsg::Object {
+ 
+ class CommonJsModuleContext final: public jsg::Object {
+  public:
+-  CommonJsModuleContext(jsg::Lock& js, kj::Path path);
+-  CommonJsModuleContext(jsg::Lock& js, const jsg::Url& url);
++  CommonJsModuleContext(jsg::Lock& js,
++      kj::Path path,
++      jsg::ModuleRegistry::Type type = jsg::ModuleRegistry::Type::BUNDLE);
++  CommonJsModuleContext(jsg::Lock& js,
++      const jsg::Url& url,
++      jsg::ResolveObserver::Context contextType = jsg::ResolveObserver::Context::BUNDLE);
+ 
+   jsg::JsValue require(jsg::Lock& js, kj::String specifier);
+ 
+@@ -71,6 +75,9 @@ class CommonJsModuleContext final: public jsg::Object {
+   // implementation. If it is a jsg::Url, then we are using the new module
+   // registry implementation.
+   kj::OneOf<kj::Path, jsg::Url> pathOrSpecifier;
++  jsg::ModuleRegistry::ResolveOption legacyResolveOption =
++      jsg::ModuleRegistry::ResolveOption::DEFAULT;
++  jsg::ResolveObserver::Context newResolutionContext = jsg::ResolveObserver::Context::BUNDLE;
+   jsg::JsRef<jsg::JsValue> exports;
+ };
+ 
+@@ -78,8 +85,10 @@ class CommonJsModuleContext final: public jsg::Object {
+ template <typename LockType>
+ struct CommonJsImpl: public jsg::ModuleRegistry::CommonJsModuleInfo::CommonJsModuleProvider {
+   jsg::Ref<api::CommonJsModuleContext> context;
+-  CommonJsImpl(jsg::Lock& js, kj::Path path)
+-      : context(js.alloc<api::CommonJsModuleContext>(js, kj::mv(path))) {}
++  CommonJsImpl(jsg::Lock& js,
++      kj::Path path,
++      jsg::ModuleRegistry::Type type = jsg::ModuleRegistry::Type::BUNDLE)
++      : context(js.alloc<api::CommonJsModuleContext>(js, kj::mv(path), type)) {}
+   KJ_DISALLOW_COPY_AND_MOVE(CommonJsImpl);
+   jsg::JsObject getContext(jsg::Lock& js) override {
+     auto& lock = kj::downcast<LockType>(js);
+diff --git a/src/workerd/api/node/process.c++ b/src/workerd/api/node/process.c++
+index 31909c20a2b7c9af1fcfd74e1513742ca8ede5d5..d3433c27c88d3ad2b8d4d3bea5fa78fa1d0e2361 100644
+--- a/src/workerd/api/node/process.c++
++++ b/src/workerd/api/node/process.c++
+@@ -38,6 +38,7 @@ jsg::JsValue ProcessModule::getBuiltinModule(jsg::Lock& js, kj::String specifier
+ 
+   auto registry = jsg::ModuleRegistry::from(js);
+   if (registry == nullptr) return js.undefined();
++  if (registry->isApplicationGraphClosed()) return js.undefined();
+ 
+   // getBuiltinModule is a user-facing API that must only return modules that
+   // are normally importable by user code. Default to BUILTIN_ONLY which only
+diff --git a/src/workerd/io/worker-modules.h b/src/workerd/io/worker-modules.h
+index 47221ca48dc695cde7dfa024061a344e4e22468a..35b1de6b3e7ecfb960489097457e9ed6e065220a 100644
+--- a/src/workerd/io/worker-modules.h
++++ b/src/workerd/io/worker-modules.h
+@@ -127,10 +127,27 @@ static kj::Arc<jsg::modules::ModuleRegistry> newWorkerModuleRegistry(
+       schemaLoader.load(schema);
+     }
+ 
+-    jsg::modules::ModuleBundle::BundleBuilder bundleBuilder(bundleBase);
++    bool closedApplicationGraph = source.modulePolicy != kj::none;
++    KJ_IF_SOME(policy, source.modulePolicy) {
++      builder.setClosedApplicationGraph(policy.applicationMain);
++    }
++
++    // APPLICATION and HOST_PRIVATE are separate definition bundles. Keeping
++    // them separate permits identical logical names without aliasing module
++    // identity or cache entries across provenance namespaces.
++    jsg::modules::ModuleBundle::BundleBuilder applicationBuilder(
++        bundleBase, jsg::modules::Module::Type::BUNDLE, closedApplicationGraph);
++    jsg::modules::ModuleBundle::BundleBuilder hostPrivateBuilder(
++        bundleBase, jsg::modules::Module::Type::HOST_PRIVATE, closedApplicationGraph);
++    bool hasHostPrivateModules = false;
+     using namespace workerd::api::pyodide;
+ 
+     for (auto& def: source.modules) {
++      bool isHostPrivate = def.role == Worker::Script::ModuleRole::HOST_PRIVATE;
++      hasHostPrivateModules = hasHostPrivateModules || isHostPrivate;
++      auto& bundleBuilder = isHostPrivate ? hostPrivateBuilder : applicationBuilder;
++      auto resolutionContext = isHostPrivate ? jsg::modules::ResolveContext::Type::HOST_PRIVATE
++                                             : jsg::modules::ResolveContext::Type::BUNDLE;
+       KJ_SWITCH_ONEOF(def.content) {
+         KJ_CASE_ONEOF(content, Worker::Script::EsModule) {
+           jsg::modules::Module::Flags flags = jsg::modules::Module::Flags::ESM;
+@@ -138,7 +155,13 @@ static kj::Arc<jsg::modules::ModuleRegistry> newWorkerModuleRegistry(
+           // Entry points are required to be ESM (enforced at resolution via
+           // RequireOption::REQUIRE_ESM), so a non-ESM main module never receives
+           // the flag here; the worker fails at startup instead.
+-          if (def.name == source.mainModule) {
++          bool isConfiguredEntrypoint =
++              def.name == source.mainModule && def.role == source.mainModuleRole;
++          bool isApplicationMain = false;
++          KJ_IF_SOME(policy, source.modulePolicy) {
++            isApplicationMain = !isHostPrivate && def.name == policy.applicationMain;
++          }
++          if (isConfiguredEntrypoint || isApplicationMain) {
+             flags = flags | jsg::modules::Module::Flags::MAIN;
+           }
+           if (content.ownBody != kj::none) {
+@@ -197,7 +220,7 @@ static kj::Arc<jsg::modules::ModuleRegistry> newWorkerModuleRegistry(
+           }
+           bundleBuilder.addSyntheticModule(def.name,
+               jsg::modules::Module::newCjsStyleModuleHandler<api::CommonJsModuleContext,
+-                  TypeWrapper>(content.body),
++                  TypeWrapper>(content.body, resolutionContext),
+               KJ_MAP(name, named) { return kj::str(name); });
+           break;
+         }
+@@ -269,7 +292,10 @@ static kj::Arc<jsg::modules::ModuleRegistry> newWorkerModuleRegistry(
+       }
+     }
+ 
+-    builder.add(bundleBuilder.finish());
++    builder.add(applicationBuilder.finish());
++    if (hasHostPrivateModules) {
++      builder.add(hostPrivateBuilder.finish());
++    }
+   }
+ 
+   // Now perform any Worker::Api-specific setup.
+@@ -328,7 +354,8 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> tryCompileLegacyModule(jsg::Lock& js,
+     kj::StringPtr name,
+     const Worker::Script::ModuleContent& moduleContent,
+     const jsg::CompilationObserver& observer,
+-    CompatibilityFlags::Reader featureFlags) {
++    CompatibilityFlags::Reader featureFlags,
++    jsg::ModuleRegistry::Type type = jsg::ModuleRegistry::Type::BUNDLE) {
+   auto& lock = kj::downcast<typename JsgIsolate::Lock>(js);
+   KJ_SWITCH_ONEOF(moduleContent) {
+     KJ_CASE_ONEOF(content, Worker::Script::TextModule) {
+@@ -357,12 +384,17 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> tryCompileLegacyModule(jsg::Lock& js,
+     KJ_CASE_ONEOF(content, Worker::Script::EsModule) {
+       // TODO(soon): Make sure passing nullptr to compile cache is desired.
+       return jsg::ModuleRegistry::ModuleInfo(js, name, content.body, nullptr /* compile cache */,
+-          jsg::ModuleInfoCompileOption::BUNDLE, observer);
++          type == jsg::ModuleRegistry::Type::HOST_PRIVATE
++              ? jsg::ModuleInfoCompileOption::HOST_PRIVATE
++              : jsg::ModuleInfoCompileOption::BUNDLE,
++          observer, type);
+     }
+     KJ_CASE_ONEOF(content, Worker::Script::CommonJsModule) {
+       return jsg::ModuleRegistry::ModuleInfo(js, name, content.namedExports,
+           jsg::ModuleRegistry::CommonJsModuleInfo(lock, name, content.body,
+-              kj::heap<api::CommonJsImpl<typename JsgIsolate::Lock>>(js, kj::Path::parse(name))));
++              kj::heap<api::CommonJsImpl<typename JsgIsolate::Lock>>(
++                  js, kj::Path::parse(name), type),
++              type));
+     }
+     KJ_CASE_ONEOF(content, Worker::Script::PythonModule) {
+       // Nothing to do. Handled elsewhere.
+diff --git a/src/workerd/io/worker-source.h b/src/workerd/io/worker-source.h
+index 5f68ca95043b2274140e7d6e06666262a12cffe6..8e1743cc41591f6fead3bb956e76376dfd65fc45 100644
+--- a/src/workerd/io/worker-source.h
++++ b/src/workerd/io/worker-source.h
+@@ -83,15 +83,21 @@ struct WorkerSource {
+       ObsoletePythonRequirement,
+       CapnpModule>;
+ 
++  enum class ModuleRole {
++    APPLICATION,
++    HOST_PRIVATE,
++  };
++
+   struct Module {
+     kj::StringPtr name;
+     ModuleContent content;
++    ModuleRole role = ModuleRole::APPLICATION;
+ 
+     // Hack for tests: register this as an internal module. Not allowed in production.
+     bool treatAsInternalForTest = false;
+ 
+     Module clone() {
+-      Module result{.name = name};
++      Module result{.name = name, .role = role};
+ 
+       // TODO(cleanup): kj::OneOf should have a clone() method.
+       KJ_SWITCH_ONEOF(content) {
+@@ -194,13 +200,22 @@ struct WorkerSource {
+ 
+   // Representation of source code for a worker using ES Modules syntax.
+   struct ModulesSource {
++    struct ModulePolicy {
++      kj::StringPtr applicationMain;
++    };
++
+     // Path to the main module, which can be looked up in the module registry. Pointer is valid
+     // only until the Script constructor returns.
+     kj::StringPtr mainModule;
++    ModuleRole mainModuleRole = ModuleRole::APPLICATION;
+ 
+     // All the Worker's modules.
+     kj::Array<Module> modules;
+ 
++    // Present only when provenance-aware, closed application module
++    // resolution is enabled for this worker.
++    kj::Maybe<ModulePolicy> modulePolicy;
++
+     // The worker may have a bundle of capnp schemas attached.
+     capnp::List<capnp::schema::Node>::Reader capnpSchemas;
+ 
+@@ -213,7 +228,9 @@ struct WorkerSource {
+     ModulesSource clone() {
+       return {
+         .mainModule = mainModule,
++        .mainModuleRole = mainModuleRole,
+         .modules = KJ_MAP(m, modules) { return m.clone(); },
++        .modulePolicy = modulePolicy,
+         .capnpSchemas = capnpSchemas,
+         .isPython = isPython,
+         .pythonMemorySnapshot = pythonMemorySnapshot,
+diff --git a/src/workerd/io/worker.c++ b/src/workerd/io/worker.c++
+index 72610c32cca3d9db38ac45d9583588345edef60a..23dd838d8f123624341d1e1f431481b53f379f44 100644
+--- a/src/workerd/io/worker.c++
++++ b/src/workerd/io/worker.c++
+@@ -872,7 +872,12 @@ struct Worker::Script::Impl {
+   // modules and bindings.
+   kj::Maybe<kj::Own<capnp::SchemaLoader>> maybeSchemaLoader;
+ 
+-  kj::OneOf<jsg::NonModuleScript, kj::Path> unboundScriptOrMainModule;
++  struct MainModule {
++    kj::Path specifier;
++    jsg::ModuleResolveContext resolveContext;
++  };
++
++  kj::OneOf<jsg::NonModuleScript, MainModule> unboundScriptOrMainModule;
+ 
+   kj::Array<CompiledGlobal> globals;
+ 
+@@ -1537,7 +1542,12 @@ Worker::Script::Script(kj::Own<const Isolate> isolateParam,
+                   isolate->getApi().compileModules(
+                       lock, modulesSource, *isolate, kj::mv(artifacts), parentSpan.addRef());
+                 }
+-                impl->unboundScriptOrMainModule = kj::Path::parse(modulesSource.mainModule);
++                impl->unboundScriptOrMainModule = (Impl::MainModule{
++                  .specifier = kj::Path::parse(modulesSource.mainModule),
++                  .resolveContext = modulesSource.mainModuleRole == ModuleRole::HOST_PRIVATE
++                      ? jsg::ModuleResolveContext::HOST_PRIVATE_ENTRY
++                      : jsg::ModuleResolveContext::APPLICATION,
++                });
+               }
+             }
+ 
+@@ -1804,6 +1814,7 @@ void Worker::setupContextInternalScripts(jsg::Lock& lock, v8::Local<v8::Context>
+ namespace {
+ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
+     const kj::Path& mainModule,
++    jsg::ModuleResolveContext resolveContext,
+     jsg::JsContext<api::ServiceWorkerGlobalScope>& jsContext,
+     const Worker::Script& script,
+     ExceptionOrDuration& limitErrorOrTime) {
+@@ -1833,7 +1844,8 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
+   // synchronously accessing those globals. Resolving them here ensures that they are
+   // ready to go before we begin evaluating the main module.
+   auto featureFlags = FeatureFlags::get(js);
+-  if (featureFlags.getNodeJsCompatV2() && isNewModuleRegistryEnabled(featureFlags)) {
++  if (featureFlags.getNodeJsCompatV2() && isNewModuleRegistryEnabled(featureFlags) &&
++      !js.isApplicationModuleGraphClosed()) {
+     JSG_REQUIRE_NONNULL(js.resolveModule("node:process", jsg::RequireEsm::YES), Error,
+         "Failed to initialize node:process module");
+     JSG_REQUIRE_NONNULL(js.resolveModule("node:buffer", jsg::RequireEsm::YES), Error,
+@@ -1848,7 +1860,7 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
+         Error, "Failed to initialize node-internal:internal_timers_global_override module");
+   }
+ 
+-  return js.resolveModule(mainModule.toString(false), jsg::RequireEsm::YES);
++  return js.resolveModule(mainModule.toString(false), jsg::RequireEsm::YES, resolveContext);
+ }
+ }  // anonymous namespace
+ 
+@@ -2012,9 +2024,10 @@ Worker::Worker(kj::Own<const Script> scriptParam,
+                 // things go boom.
+                 lock.runMicrotasks();
+               }
+-              KJ_CASE_ONEOF(mainModule, kj::Path) {
++              KJ_CASE_ONEOF(mainModule, Worker::Script::Impl::MainModule) {
+                 KJ_IF_SOME(ns,
+-                    tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
++                    tryResolveMainModule(lock, mainModule.specifier, mainModule.resolveContext,
++                        *jsContext, *script, limitErrorOrTime)) {
+                   impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
+                   impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
+ 
+diff --git a/src/workerd/io/worker.h b/src/workerd/io/worker.h
+index 90fdf04de873d2b9a350adaf97fe93159dc5208d..1d50c941ee11908fb2b869e8ca9377d425973bc6 100644
+--- a/src/workerd/io/worker.h
++++ b/src/workerd/io/worker.h
+@@ -286,6 +286,7 @@ class Worker::Script: public kj::AtomicRefcounted {
+   using ObsoletePythonRequirement = WorkerSource::ObsoletePythonRequirement;
+   using CapnpModule = WorkerSource::CapnpModule;
+   using ModuleContent = WorkerSource::ModuleContent;
++  using ModuleRole = WorkerSource::ModuleRole;
+   using Module = WorkerSource::Module;
+   using ScriptSource = WorkerSource::ScriptSource;
+   using ModulesSource = WorkerSource::ModulesSource;
+diff --git a/src/workerd/jsg/AGENTS.md b/src/workerd/jsg/AGENTS.md
+index 496a7a272446d631197e60d09f79eba33b9df09e..a2bb7b3aff04338427ba6ce7401473e536c62f01 100644
+--- a/src/workerd/jsg/AGENTS.md
++++ b/src/workerd/jsg/AGENTS.md
+@@ -111,6 +111,16 @@ These rules MUST be followed when writing or modifying JSG code:
+     caller may pass `InstantiateModuleOptions::ALLOW_PENDING_EVALUATION` to receive the
+     pending evaluation promise instead of an error.
+ 
++13. **Closed module graphs MUST preserve provenance as identity, not as a name
++    convention.** When the worker opts in, application and host-private modules
++    are separate namespaces and may use the same logical name. Application
++    resolution sees only explicitly declared application modules; host-private
++    resolution sees its own namespace plus the exact configured application
++    main. Unknown and eval/Function-generated referrers default to application
++    provenance. Do not infer privilege from URLs, reserve tenant prefixes, consult
++    fallback/builtin modules after a closed miss, or rewrite source to approximate
++    this boundary. Policy-off resolution must retain its historical behavior.
++
+ The `jsg-visit-for-gc` clang-tidy check (`//tools/clang-tidy:workerd-lint`)
+ automatically detects missing `visitForGc` implementations and unvisited fields
+ across the codebase, enforcing invariants 1 and 2 at build time.
+diff --git a/src/workerd/jsg/README.md b/src/workerd/jsg/README.md
+index be8a83f73ba71d4923e36b0c29efcf22c0d4c82d..6d50e308eee9ff44ab46acb06fa54b1f16854c7d 100644
+--- a/src/workerd/jsg/README.md
++++ b/src/workerd/jsg/README.md
+@@ -470,11 +470,21 @@ Both may take additional `TypeHandler<T>&` trailing parameters.
+ 
+ ## Module System Overview
+ 
+-| Type       | Description                                     | Resolution priority                      |
+-| ---------- | ----------------------------------------------- | ---------------------------------------- |
+-| `BUNDLE`   | Worker bundle (user code)                       | From bundle: Bundle → Builtin → Fallback |
+-| `BUILTIN`  | Runtime modules (`node:*`, `cloudflare:*`)      | From builtin: Builtin → Internal         |
+-| `INTERNAL` | Only importable by builtins (`node-internal:*`) | From internal: Internal only             |
++| Type           | Description                                          | Historical resolution priority           |
++| -------------- | ---------------------------------------------------- | ---------------------------------------- |
++| `BUNDLE`       | Worker bundle (application code)                     | From bundle: Bundle → Builtin → Fallback |
++| `HOST_PRIVATE` | Opt-in host entrypoint/prelude namespace             | Not used without module policy           |
++| `BUILTIN`      | Runtime modules (`node:*`, `cloudflare:*`)           | From builtin: Builtin → Internal         |
++| `INTERNAL`     | Only importable by builtins (`node-internal:*`)      | From internal: Internal only             |
++
++An opt-in closed module policy changes application-facing resolution in both
++module implementations. `BUNDLE` can resolve only declared `BUNDLE` definitions;
++`HOST_PRIVATE` can resolve declared host-private definitions plus the exact
++configured application main. Direct host entrypoint resolution is a distinct
++context, so application and host definitions with the same logical name retain
++separate identities. Unattributed and generated eval/Function scripts default to
++application provenance. Builtin and fallback behavior is unchanged when the
++policy is absent.
+ 
+ ## Module Info Types
+ 
+diff --git a/src/workerd/jsg/jsg.c++ b/src/workerd/jsg/jsg.c++
+index ef93bf206652cb388e316298d1989e733693fe40..0984bf894f175459cd0407ca0960a30c24fdd2c2 100644
+--- a/src/workerd/jsg/jsg.c++
++++ b/src/workerd/jsg/jsg.c++
+@@ -444,20 +444,27 @@ kj::Maybe<JsObject> Lock::resolvePublicBuiltinModule(kj::StringPtr specifier) {
+       .map([](JsValue val) { return KJ_ASSERT_NONNULL(val.tryCast<JsObject>()); });
+ }
+ 
+-kj::Maybe<JsObject> Lock::resolveModule(kj::StringPtr specifier, RequireEsm requireEsm) {
++kj::Maybe<JsObject> Lock::resolveModule(
++    kj::StringPtr specifier, RequireEsm requireEsm, ModuleResolveContext resolveContext) {
+   auto& isolate = IsolateBase::from(v8Isolate);
+   if (isolate.isUsingNewModuleRegistry()) {
+-    return jsg::modules::ModuleRegistry::tryResolveModuleNamespace(*this, specifier,
+-        jsg::modules::ResolveContext::Type::BUNDLE, jsg::modules::ResolveContext::Source::INTERNAL,
+-        kj::none, jsg::modules::UnwrapDefault::NO, requireEsm)
++    auto type = resolveContext == ModuleResolveContext::HOST_PRIVATE_ENTRY
++        ? jsg::modules::ResolveContext::Type::HOST_PRIVATE_ENTRY
++        : jsg::modules::ResolveContext::Type::BUNDLE;
++    return jsg::modules::ModuleRegistry::tryResolveModuleNamespace(*this, specifier, type,
++        jsg::modules::ResolveContext::Source::INTERNAL, kj::none, jsg::modules::UnwrapDefault::NO,
++        requireEsm)
+         .map([](JsValue val) { return KJ_ASSERT_NONNULL(val.tryCast<JsObject>()); });
+   }
+ 
+   auto moduleRegistry = jsg::ModuleRegistry::from(*this);
+   if (moduleRegistry == nullptr) return kj::none;
+   auto spec = kj::Path::parse(specifier);
+-  auto& info = JSG_REQUIRE_NONNULL(
+-      moduleRegistry->resolve(*this, spec), Error, kj::str("No such module: ", specifier));
++  auto option = resolveContext == ModuleResolveContext::HOST_PRIVATE_ENTRY
++      ? ModuleRegistry::ResolveOption::HOST_PRIVATE_ENTRY
++      : ModuleRegistry::ResolveOption::DEFAULT;
++  auto& info = JSG_REQUIRE_NONNULL(moduleRegistry->resolve(*this, spec, kj::none, option), Error,
++      kj::str("No such module: ", specifier));
+   JSG_REQUIRE(!requireEsm || info.maybeSynthetic == kj::none, TypeError,
+       "Main module must be an ES module.");
+   auto module = info.module.getHandle(*this);
+@@ -465,6 +472,15 @@ kj::Maybe<JsObject> Lock::resolveModule(kj::StringPtr specifier, RequireEsm requ
+   return JsObject(module->GetModuleNamespace().As<v8::Object>());
+ }
+ 
++bool Lock::isApplicationModuleGraphClosed() {
++  auto& isolate = IsolateBase::from(v8Isolate);
++  if (isolate.isUsingNewModuleRegistry()) {
++    return modules::ModuleRegistry::isApplicationGraphClosed(*this);
++  }
++  auto* registry = ModuleRegistry::from(*this);
++  return registry != nullptr && registry->isApplicationGraphClosed();
++}
++
+ void ExternalMemoryTarget::maybeDeferAdjustment(ssize_t amount) const {
+   // Carefully check whether `isolate` is locked by the current thread. Note that there's a
+   // possibility that the isolate is being torn down in a different thread, which means we cannot
+diff --git a/src/workerd/jsg/jsg.h b/src/workerd/jsg/jsg.h
+index 3104a7f8ce9f6aae0287d75fc794cce9b8c807cd..971f46b2e19c97cf3c52cff0c8cf09872e4fa9ef 100644
+--- a/src/workerd/jsg/jsg.h
++++ b/src/workerd/jsg/jsg.h
+@@ -868,6 +868,10 @@ class IsolateLiveness: public kj::AtomicRefcounted {
+ 
+ class Lock;
+ WD_STRONG_BOOL(RequireEsm);
++enum class ModuleResolveContext {
++  APPLICATION,
++  HOST_PRIVATE_ENTRY,
++};
+ 
+ template <typename T>
+ class WeakV8Ref;
+@@ -3252,8 +3256,11 @@ class Lock {
+ 
+   // Resolve a module namespace from the given specifier.
+   // This variation includes modules from the worker bundle.
+-  kj::Maybe<JsObject> resolveModule(
+-      kj::StringPtr specifier, RequireEsm requireEsm = RequireEsm::NO);
++  kj::Maybe<JsObject> resolveModule(kj::StringPtr specifier,
++      RequireEsm requireEsm = RequireEsm::NO,
++      ModuleResolveContext resolveContext = ModuleResolveContext::APPLICATION);
++
++  bool isApplicationModuleGraphClosed();
+ 
+   // Returns the capnp::SchemaLoader for this isolate/context
+   template <typename T>
+diff --git a/src/workerd/jsg/modules-new-test.c++ b/src/workerd/jsg/modules-new-test.c++
+index 4049d72f90238cc933f54008b611e73c731295c3..003402cf8bef8d59b4ac32d96baf530fd65ded09 100644
+--- a/src/workerd/jsg/modules-new-test.c++
++++ b/src/workerd/jsg/modules-new-test.c++
+@@ -336,6 +336,53 @@ KJ_TEST("A registry with empty bundles") {
+ 
+ // ======================================================================================
+ 
++KJ_TEST("Closed application resolution does not consult builtins or fallback") {
++  ResolveObserverImpl observer;
++  bool fallbackCalled = false;
++
++  ModuleRegistry::Builder closedBuilder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK);
++  closedBuilder.setClosedApplicationGraph("main");
++  closedBuilder.add(ModuleBundle::BundleBuilder(BASE, Module::Type::BUNDLE, true).finish());
++  closedBuilder.add(ModuleBundle::BundleBuilder(BASE, Module::Type::HOST_PRIVATE, true).finish());
++  closedBuilder.add(ModuleBundle::BuiltinBuilder().finish());
++  closedBuilder.add(ModuleBundle::newFallbackBundle([&fallbackCalled](const ResolveContext&) {
++    fallbackCalled = true;
++    return kj::none;
++  }));
++  auto closedRegistry = closedBuilder.finish();
++
++  const auto missing = "file:///bundle/missing"_url;
++  for (auto type: {ResolveContext::Type::BUNDLE, ResolveContext::Type::PUBLIC_BUILTIN,
++         ResolveContext::Type::HOST_PRIVATE, ResolveContext::Type::HOST_PRIVATE_ENTRY}) {
++    ResolveContext context = {
++      .type = type,
++      .source = ResolveContext::Source::INTERNAL,
++      .normalizedSpecifier = missing,
++      .referrerNormalizedSpecifier = BASE,
++    };
++    KJ_ASSERT(closedRegistry->lookup(context, observer) == kj::none);
++  }
++  KJ_ASSERT(!fallbackCalled);
++
++  ModuleRegistry::Builder defaultBuilder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK);
++  defaultBuilder.add(ModuleBundle::BundleBuilder(BASE).finish());
++  defaultBuilder.add(ModuleBundle::newFallbackBundle([&fallbackCalled](const ResolveContext&) {
++    fallbackCalled = true;
++    return kj::none;
++  }));
++  auto defaultRegistry = defaultBuilder.finish();
++  ResolveContext defaultContext = {
++    .type = ResolveContext::Type::BUNDLE,
++    .source = ResolveContext::Source::INTERNAL,
++    .normalizedSpecifier = missing,
++    .referrerNormalizedSpecifier = BASE,
++  };
++  KJ_ASSERT(defaultRegistry->lookup(defaultContext, observer) == kj::none);
++  KJ_ASSERT(fallbackCalled);
++}
++
++// ======================================================================================
++
+ KJ_TEST("A user bundle with a single ESM module") {
+   ModuleBundle::BundleBuilder builder(BASE);
+ 
+diff --git a/src/workerd/jsg/modules-new.c++ b/src/workerd/jsg/modules-new.c++
+index f810391e4bc7716b751c8fc241602457d75fb016..c60313aba5ef417f2c4a5057f901d956f344e4a0 100644
+--- a/src/workerd/jsg/modules-new.c++
++++ b/src/workerd/jsg/modules-new.c++
+@@ -24,6 +24,43 @@ namespace {
+ // TODO(soon): Once ResolveObserver is injected per-isolate via attachToIsolate(),
+ // this can be removed.
+ ResolveObserver noopResolveObserver;
++
++constexpr int32_t MODULE_PROVENANCE_MAGIC = 0x57444d50;  // "WDMP"
++
++v8::Local<v8::Data> makeHostDefinedOptions(v8::Isolate* isolate, ResolveContext::Type contextType) {
++  auto options = v8::PrimitiveArray::New(isolate, 2);
++  options->Set(isolate, 0, v8::Int32::New(isolate, MODULE_PROVENANCE_MAGIC));
++  options->Set(isolate, 1, v8::Int32::New(isolate, static_cast<int32_t>(contextType)));
++  return options;
++}
++
++kj::Maybe<ResolveContext::Type> readHostDefinedOptions(
++    v8::Isolate* isolate, v8::Local<v8::Data> options) {
++  if (options.IsEmpty()) return kj::none;
++  auto values = options.As<v8::PrimitiveArray>();
++  if (values->Length() != 2) return kj::none;
++  auto magic = values->Get(isolate, 0);
++  auto type = values->Get(isolate, 1);
++  if (!magic->IsInt32() || !type->IsInt32() ||
++      magic.As<v8::Int32>()->Value() != MODULE_PROVENANCE_MAGIC) {
++    return kj::none;
++  }
++  switch (static_cast<ResolveContext::Type>(type.As<v8::Int32>()->Value())) {
++    case ResolveContext::Type::BUNDLE:
++      return ResolveContext::Type::BUNDLE;
++    case ResolveContext::Type::BUILTIN:
++      return ResolveContext::Type::BUILTIN;
++    case ResolveContext::Type::BUILTIN_ONLY:
++      return ResolveContext::Type::BUILTIN_ONLY;
++    case ResolveContext::Type::PUBLIC_BUILTIN:
++      return ResolveContext::Type::PUBLIC_BUILTIN;
++    case ResolveContext::Type::HOST_PRIVATE:
++      return ResolveContext::Type::HOST_PRIVATE;
++    case ResolveContext::Type::HOST_PRIVATE_ENTRY:
++      return ResolveContext::Type::HOST_PRIVATE_ENTRY;
++  }
++  return kj::none;
++}
+ }  // namespace
+ 
+ namespace {
+@@ -77,6 +114,9 @@ constexpr ResolveContext::Type moduleTypeToResolveContextType(Module::Type type)
+     case Module::Type::FALLBACK: {
+       return ResolveContext::Type::BUNDLE;
+     }
++    case Module::Type::HOST_PRIVATE: {
++      return ResolveContext::Type::HOST_PRIVATE;
++    }
+   }
+   KJ_UNREACHABLE;
+ }
+@@ -195,8 +235,9 @@ class EsModule final: public Module {
+   v8::MaybeLocal<v8::Module> getDescriptor(
+       Lock& js, const CompilationObserver& observer) const override {
+     auto metrics = observer.onEsmCompilationStart(js.v8Isolate, kj::str(id().getHref()),
+-        type() == Type::BUNDLE ? CompilationObserver::Option::BUNDLE
+-                               : CompilationObserver::Option::BUILTIN);
++        (type() == Type::BUNDLE || type() == Type::HOST_PRIVATE)
++            ? CompilationObserver::Option::BUNDLE
++            : CompilationObserver::Option::BUILTIN);
+ 
+     static constexpr int resourceLineOffset = 0;
+     static constexpr int resourceColumnOffset = 0;
+@@ -205,7 +246,8 @@ class EsModule final: public Module {
+     static constexpr bool resourceIsOpaque = false;
+     static constexpr bool isWasm = false;
+     v8::ScriptOrigin origin(js.str(id().getHref()), resourceLineOffset, resourceColumnOffset,
+-        resourceIsSharedCrossOrigin, scriptId, {}, resourceIsOpaque, isWasm, true);
++        resourceIsSharedCrossOrigin, scriptId, {}, resourceIsOpaque, isWasm, true,
++        makeHostDefinedOptions(js.v8Isolate, moduleTypeToResolveContextType(type())));
+ 
+     auto options = v8::ScriptCompiler::CompileOptions::kNoCompileOptions;
+     bool cacheWasRejected = false;
+@@ -651,6 +693,10 @@ class IsolateModuleRegistry final {
+     // apply that redirect here, as a last resort, so that a worker bundle module
+     // that intentionally shadows "node:process" (exactly as it could for any other
+     // built-in) gets first crack at resolving it above.
++    if (inner.isApplicationGraphClosed() && context.type != ResolveContext::Type::BUILTIN &&
++        context.type != ResolveContext::Type::BUILTIN_ONLY) {
++      JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", context.normalizedSpecifier.getHref()));
++    }
+     KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, context.normalizedSpecifier)) {
+       auto processSpec = kj::str(processUrl.getHref());
+       ResolveContext processContext = {
+@@ -680,7 +726,8 @@ class IsolateModuleRegistry final {
+       Url referrer,
+       kj::StringPtr rawSpecifier,
+       SourcePhase sourcePhase,
+-      kj::Maybe<kj::StringPtr> importType = kj::none) {
++      kj::Maybe<kj::StringPtr> importType = kj::none,
++      kj::Maybe<ResolveContext::Type> referrerType = kj::none) {
+     // Note: Takes v8::Local<v8::Module> and const Module& directly rather than
+     // Entry& for the same reason as require()'s evaluate lambda — the lookupCache
+     // table may rehash during evaluate(), invalidating Entry& references.
+@@ -696,37 +743,40 @@ class IsolateModuleRegistry final {
+     };
+ 
+     return js.wrapSimplePromise(js.tryCatch([&] -> Promise<Value> {
+-      // The host callback identifies the referring script only by its origin URL,
+-      // so probe the lookup cache for that URL across the context types in
+-      // resolution-priority order. The same URL can legitimately have entries
+-      // under multiple types — e.g. a worker-bundle module shadowing a builtin
+-      // name coexists with the real builtin — and V8 gives us only the URL
+-      // string, so this is inherently a policy choice: user-facing semantics
+-      // favor treating the referrer as the bundle module.
+-      //
+-      // The referrer should absolutely already be known to the registry (it is
+-      // currently executing) or something bad happened.
+-      static constexpr ResolveContext::Type kReferrerProbeOrder[] = {
+-        ResolveContext::Type::BUNDLE,
+-        ResolveContext::Type::BUILTIN,
+-        ResolveContext::Type::BUILTIN_ONLY,
+-        ResolveContext::Type::PUBLIC_BUILTIN,
+-      };
+-      kj::Maybe<Entry&> maybeReferring;
+-      for (auto type: kReferrerProbeOrder) {
+-        KJ_IF_SOME(found, findResolved(type, referrer)) {
+-          maybeReferring = found;
+-          break;
++      ResolveContext::Type type = ResolveContext::Type::BUNDLE;
++      if (inner.isApplicationGraphClosed()) {
++        // Closed-graph resolution uses the unforgeable metadata attached when
++        // V8 compiled the referring module. An eval/Function script has no
++        // such metadata and therefore stays APPLICATION. Do not infer host
++        // privilege from a caller-controlled origin URL.
++        type = referrerType.orDefault(ResolveContext::Type::BUNDLE);
++        if (type == ResolveContext::Type::HOST_PRIVATE_ENTRY) {
++          type = ResolveContext::Type::HOST_PRIVATE;
++        }
++      } else {
++        // Preserve the historical URL probing behavior while the policy is off.
++        static constexpr ResolveContext::Type kReferrerProbeOrder[] = {
++          ResolveContext::Type::BUNDLE,
++          ResolveContext::Type::BUILTIN,
++          ResolveContext::Type::BUILTIN_ONLY,
++          ResolveContext::Type::PUBLIC_BUILTIN,
++          ResolveContext::Type::HOST_PRIVATE,
++          ResolveContext::Type::HOST_PRIVATE_ENTRY,
++        };
++        kj::Maybe<Entry&> maybeReferring;
++        for (auto candidate: kReferrerProbeOrder) {
++          KJ_IF_SOME(found, findResolved(candidate, referrer)) {
++            maybeReferring = found;
++            break;
++          }
+         }
++        auto& referring = JSG_REQUIRE_NONNULL(maybeReferring, TypeError,
++            kj::str("Referring module not found in the registry: ", referrer.getHref()));
++        type = moduleTypeToResolveContextType(referring.module.type());
+       }
+-      auto& referring = JSG_REQUIRE_NONNULL(maybeReferring, TypeError,
+-          kj::str("Referring module not found in the registry: ", referrer.getHref()));
+ 
+-      // Now that we know the referrer module, we can set the context for the
+-      // next resolve. The "type" of the context is determined by the type of
+-      // the referring module.
+       ResolveContext context = {
+-        .type = moduleTypeToResolveContextType(referring.module.type()),
++        .type = type,
+         .source = ResolveContext::Source::DYNAMIC_IMPORT,
+         .normalizedSpecifier = normalizedSpecifier,
+         .referrerNormalizedSpecifier = referrer,
+@@ -807,6 +857,10 @@ class IsolateModuleRegistry final {
+       // apply that redirect here, as a last resort, so that a worker bundle module
+       // that intentionally shadows "node:process" gets first crack at resolving it
+       // above.
++      if (inner.isApplicationGraphClosed() && context.type != ResolveContext::Type::BUILTIN &&
++          context.type != ResolveContext::Type::BUILTIN_ONLY) {
++        JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", normalizedSpecifier.getHref()));
++      }
+       KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, normalizedSpecifier)) {
+         auto processSpec = kj::str(processUrl.getHref());
+         ResolveContext processContext = {
+@@ -911,6 +965,7 @@ class IsolateModuleRegistry final {
+         }
+ 
+         if (moduleDef.type() == Module::Type::BUNDLE ||
++            moduleDef.type() == Module::Type::HOST_PRIVATE ||
+             moduleDef.type() == Module::Type::FALLBACK) {
+           return ns;
+         }
+@@ -1070,6 +1125,14 @@ class IsolateModuleRegistry final {
+       // apply that redirect here, as a last resort, so that a worker bundle module
+       // that intentionally shadows "node:process" gets first crack at resolving it
+       // above.
++      if (inner.isApplicationGraphClosed() && context.type != ResolveContext::Type::BUILTIN &&
++          context.type != ResolveContext::Type::BUILTIN_ONLY) {
++        if ((option & RequireOption::RETURN_EMPTY) == RequireOption::RETURN_EMPTY) {
++          return {};
++        }
++        JSG_FAIL_REQUIRE(
++            Error, kj::str("Module not found: ", context.normalizedSpecifier.getHref()));
++      }
+       KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, context.normalizedSpecifier)) {
+         ResolveContext newContext{
+           .type = ResolveContext::Type::BUILTIN_ONLY,
+@@ -1103,6 +1166,10 @@ class IsolateModuleRegistry final {
+     return inner.getBundleBase();
+   }
+ 
++  bool isApplicationGraphClosed() const {
++    return inner.isApplicationGraphClosed();
++  }
++
+  private:
+   const ModuleRegistry& inner;
+   const CompilationObserver& observer;
+@@ -1435,7 +1502,8 @@ v8::MaybeLocal<v8::Promise> dynamicImportModuleCallback(v8::Local<v8::Context> c
+ 
+       KJ_IF_SOME(url, referrer.tryResolve(spec.asPtr())) {
+         return registry.dynamicResolve(js, url.clone(Url::EquivalenceOption::NORMALIZE_PATH),
+-            kj::mv(referrer), spec, isSourcePhase, importType);
++            kj::mv(referrer), spec, isSourcePhase, importType,
++            readHostDefinedOptions(js.v8Isolate, host_defined_options));
+       }
+ 
+       // We were not able to parse the specifier. We'll return a rejected promise.
+@@ -1802,6 +1870,8 @@ void ModuleBundle::getBuiltInBundleFromCapnp(BuiltinBuilder& builder,
+         break;
+       case Module::Type::FALLBACK:
+         break;
++      case Module::Type::HOST_PRIVATE:
++        break;
+     }
+     KJ_UNREACHABLE;
+   })();
+@@ -1866,9 +1936,13 @@ void ModuleBundle::Builder::ensureIsNotBundleSpecifier(const Url& id) {
+ 
+ // ======================================================================================
+ 
+-ModuleBundle::BundleBuilder::BundleBuilder(const jsg::Url& bundleBase)
+-    : ModuleBundle::Builder(Type::BUNDLE),
+-      bundleBase(bundleBase) {}
++ModuleBundle::BundleBuilder::BundleBuilder(
++    const jsg::Url& bundleBase, Type type, bool allowReservedModuleSpecifiers)
++    : ModuleBundle::Builder(type),
++      bundleBase(bundleBase),
++      allowReservedModuleSpecifiers(allowReservedModuleSpecifiers) {
++  KJ_ASSERT(type == Type::BUNDLE || type == Type::HOST_PRIVATE);
++}
+ 
+ namespace {
+ static constexpr auto BUNDLE_CLONE_OPTIONS = jsg::Url::EquivalenceOption::IGNORE_FRAGMENTS |
+@@ -1917,7 +1991,8 @@ jsg::Url normalizeModuleName(kj::StringPtr name, const jsg::Url& base) {
+   return KJ_ASSERT_NONNULL(base.tryResolve(urlPath));
+ }
+ 
+-bool isValidBundleModuleUrl(const jsg::Url& url, const jsg::Url& base) {
++bool isValidBundleModuleUrl(
++    const jsg::Url& url, const jsg::Url& base, bool allowReservedModuleSpecifiers) {
+   KJ_DASSERT(base.getProtocol() == "file:"_kj);
+   KJ_DASSERT(base.getPathname().endsWith("/"_kj));
+ 
+@@ -1925,18 +2000,20 @@ bool isValidBundleModuleUrl(const jsg::Url& url, const jsg::Url& base) {
+   // we can protect those namespaces for our own future use. Specifically, these
+   // should only be used by the runtime to refer to built-in modules. We don't
+   // restrict other non-standard protocols like node:
+-  KJ_REQUIRE(url.getProtocol() != "cloudflare:"_kj,
+-      "The cloudflare: protocol is reserved and cannot be used in module bundles");
+-  KJ_REQUIRE(url.getProtocol() != "workerd:"_kj,
+-      "The workerd: protocol is reserved and cannot be used in module bundles");
+-
+-  // Let's forbid data: URL use from module bundles. They are not yet supported
+-  // by the runtime due to dynamic eval restrictions. Even when we do support them
+-  // eventually, we want to be able to reserve the data: URL namespace for that
+-  // use. If we allowed worker bundles to use data: URLs that we could end up
+-  // requiring a compat flag later to actually properly enable them.
+-  KJ_REQUIRE(
+-      url.getProtocol() != "data:"_kj, "The data: protocol cannot be used in module bundles");
++  if (!allowReservedModuleSpecifiers) {
++    KJ_REQUIRE(url.getProtocol() != "cloudflare:"_kj,
++        "The cloudflare: protocol is reserved and cannot be used in module bundles");
++    KJ_REQUIRE(url.getProtocol() != "workerd:"_kj,
++        "The workerd: protocol is reserved and cannot be used in module bundles");
++
++    // Let's forbid data: URL use from module bundles. They are not yet supported
++    // by the runtime due to dynamic eval restrictions. Even when we do support them
++    // eventually, we want to be able to reserve the data: URL namespace for that
++    // use. If we allowed worker bundles to use data: URLs that we could end up
++    // requiring a compat flag later to actually properly enable them.
++    KJ_REQUIRE(
++        url.getProtocol() != "data:"_kj, "The data: protocol cannot be used in module bundles");
++  }
+ 
+   if (url.getProtocol() != "file:"_kj) {
+     // Different protocols are always OK
+@@ -1961,9 +2038,11 @@ bool isValidBundleModuleUrl(const jsg::Url& url, const jsg::Url& base) {
+ // This involves normalizing the name such that it is relative to the bundle base, removes
+ // any query parameters or fragments, removes dot and double-dot path segments, normalizes
+ // percent-encoding, and otherwise validates that the resulting URL is a valid URL.
+-const jsg::Url processModuleName(kj::StringPtr name, const jsg::Url& base) {
++const jsg::Url processModuleName(
++    kj::StringPtr name, const jsg::Url& base, bool allowReservedModuleSpecifiers) {
+   auto url = normalizeModuleName(name, base);
+-  KJ_REQUIRE(isValidBundleModuleUrl(url, base), "Invalid module name: ", name);
++  KJ_REQUIRE(isValidBundleModuleUrl(url, base, allowReservedModuleSpecifiers),
++      "Invalid module name: ", name);
+   return url;
+ }
+ 
+@@ -1973,7 +2052,7 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addSyntheticModule(kj:
+     EvaluateCallback callback,
+     kj::Array<kj::String> namedExports,
+     Module::ContentType contentType) {
+-  const auto url = processModuleName(name, bundleBase);
++  const auto url = processModuleName(name, bundleBase, allowReservedModuleSpecifiers);
+   add(url,
+       [url = url.clone(), callback = kj::mv(callback), namedExports = kj::mv(namedExports),
+           type = type(), contentType](const ResolveContext& context) mutable
+@@ -1987,7 +2066,7 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addSyntheticModule(kj:
+ 
+ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addEsmModule(
+     kj::StringPtr name, kj::ArrayPtr<const char> source, Module::Flags flags) {
+-  const auto url = processModuleName(name, bundleBase);
++  const auto url = processModuleName(name, bundleBase, allowReservedModuleSpecifiers);
+   add(url,
+       [url = url.clone(), source, flags, type = type()](const ResolveContext& context) mutable
+       -> kj::Maybe<kj::OneOf<kj::String, kj::Own<Module>>> {
+@@ -1999,7 +2078,7 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addEsmModule(
+ 
+ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addEsmModule(
+     kj::StringPtr name, kj::Array<const char> source, Module::Flags flags) {
+-  const auto url = processModuleName(name, bundleBase);
++  const auto url = processModuleName(name, bundleBase, allowReservedModuleSpecifiers);
+   add(url,
+       [url = url.clone(), source = kj::mv(source), flags, type = type()](
+           const ResolveContext& context) mutable
+@@ -2012,7 +2091,7 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addEsmModule(
+ 
+ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addWasmModule(
+     kj::StringPtr name, kj::ArrayPtr<const kj::byte> data) {
+-  const auto url = processModuleName(name, bundleBase);
++  const auto url = processModuleName(name, bundleBase, allowReservedModuleSpecifiers);
+   auto callback = jsg::modules::Module::newWasmModuleHandler(data);
+   add(url,
+       [url = url.clone(), callback = kj::mv(callback), type = type()](
+@@ -2027,8 +2106,8 @@ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::addWasmModule(
+ 
+ ModuleBundle::BundleBuilder& ModuleBundle::BundleBuilder::alias(
+     kj::StringPtr alias, kj::StringPtr name) {
+-  const auto id = processModuleName(name, bundleBase);
+-  const auto aliasUrl = processModuleName(alias, bundleBase);
++  const auto id = processModuleName(name, bundleBase, allowReservedModuleSpecifiers);
++  const auto aliasUrl = processModuleName(alias, bundleBase, allowReservedModuleSpecifiers);
+   Builder::alias(aliasUrl, id);
+   return *this;
+ }
+@@ -2069,6 +2148,7 @@ ModuleRegistry::Impl::Impl(kj::ArrayPtr<kj::Vector<kj::Own<ModuleBundle>>> vecto
+   bundles[kBuiltin] = vectors[kBuiltin].releaseAsArray();
+   bundles[kBuiltinOnly] = vectors[kBuiltinOnly].releaseAsArray();
+   bundles[kFallback] = vectors[kFallback].releaseAsArray();
++  bundles[kHostPrivate] = vectors[kHostPrivate].releaseAsArray();
+ }
+ 
+ ModuleRegistry::Builder::Builder(const jsg::Url& bundleBase, Options options)
+@@ -2094,6 +2174,12 @@ ModuleRegistry::Builder& ModuleRegistry::Builder::setEvalCallback(EvalCallback c
+   return *this;
+ }
+ 
++ModuleRegistry::Builder& ModuleRegistry::Builder::setClosedApplicationGraph(
++    kj::StringPtr applicationMain) {
++  closedApplicationMain = normalizeModuleName(applicationMain, bundleBase);
++  return *this;
++}
++
+ kj::Arc<ModuleRegistry> ModuleRegistry::Builder::finish() {
+   return kj::arc<ModuleRegistry>(this);
+ }
+@@ -2102,6 +2188,7 @@ ModuleRegistry::ModuleRegistry(ModuleRegistry::Builder* builder)
+     : bundleBase(builder->bundleBase.clone()),
+       impl(Impl(builder->bundles_.asPtr())),
+       maybeEvalCallback(kj::mv(builder->maybeEvalCallback)),
++      closedApplicationMain(kj::mv(builder->closedApplicationMain)),
+       schemaLoader(kj::mv(builder->schemaLoader)) {}
+ 
+ kj::Maybe<jsg::JsPromise> ModuleRegistry::evaluateImpl(jsg::Lock& js,
+@@ -2186,11 +2273,14 @@ kj::Maybe<const Module&> ModuleRegistry::lookupImpl(
+ 
+   switch (context.type) {
+     case ResolveContext::Type::BUNDLE: {
+-      // For bundle resolution, we only use Bundle, Builtin, and Fallback bundles,
+-      // in that order.
++      // With no policy, preserve the historical Bundle -> Builtin -> Fallback
++      // order. A closed application graph resolves only explicitly declared
++      // application modules.
+       MODULE_LOOKUP(context, kBundle);
+-      MODULE_LOOKUP(context, kBuiltin);
+-      MODULE_LOOKUP(context, kFallback);
++      if (!isApplicationGraphClosed()) {
++        MODULE_LOOKUP(context, kBuiltin);
++        MODULE_LOOKUP(context, kFallback);
++      }
+       break;
+     }
+     case ResolveContext::Type::BUILTIN: {
+@@ -2208,7 +2298,36 @@ kj::Maybe<const Module&> ModuleRegistry::lookupImpl(
+       // For public built-in resolution, we only use builtin bundles.
+       // This excludes both worker bundle modules and internal-only modules,
+       // returning only built-ins that are normally importable by user code.
+-      MODULE_LOOKUP(context, kBuiltin);
++      if (!isApplicationGraphClosed()) {
++        MODULE_LOOKUP(context, kBuiltin);
++      }
++      break;
++    }
++    case ResolveContext::Type::HOST_PRIVATE: {
++      // The application main is a single explicit bridge. Check it before the
++      // host namespace so an identically-spelled host definition remains a
++      // distinct identity rather than shadowing the application main.
++      KJ_IF_SOME(applicationMain, closedApplicationMain) {
++        if (context.normalizedSpecifier == applicationMain) {
++          ResolveContext applicationContext{
++            .type = ResolveContext::Type::BUNDLE,
++            .source = context.source,
++            .normalizedSpecifier = context.normalizedSpecifier,
++            .referrerNormalizedSpecifier = context.referrerNormalizedSpecifier,
++            .rawSpecifier = context.rawSpecifier,
++            .importType = context.importType,
++          };
++          MODULE_LOOKUP(applicationContext, kBundle);
++          break;
++        }
++      }
++      MODULE_LOOKUP(context, kHostPrivate);
++      break;
++    }
++    case ResolveContext::Type::HOST_PRIVATE_ENTRY: {
++      // Direct startup resolution must select host provenance even when the
++      // application main has the same URL.
++      MODULE_LOOKUP(context, kHostPrivate);
+       break;
+     }
+   }
+@@ -2296,6 +2415,10 @@ kj::Maybe<JsValue> ModuleRegistry::tryResolveModuleNamespace(Lock& js,
+   return JsValue(check(ns));
+ }
+ 
++bool ModuleRegistry::isApplicationGraphClosed(Lock& js) {
++  return IsolateModuleRegistry::from(js.v8Isolate).isApplicationGraphClosed();
++}
++
+ JsValue ModuleRegistry::resolve(Lock& js,
+     kj::StringPtr specifier,
+     kj::StringPtr exportName,
+@@ -2502,9 +2625,11 @@ Function<void()> Module::compileEvalFunction(Lock& js,
+     kj::StringPtr code,
+     kj::StringPtr name,
+     kj::Maybe<JsObject> compileExtensions,
+-    const CompilationObserver& observer) {
++    const CompilationObserver& observer,
++    ResolveContext::Type contextType) {
+   auto metrics = observer.onScriptCompilationStart(js.v8Isolate, name);
+-  v8::ScriptOrigin origin(js.str(name));
++  v8::ScriptOrigin origin(js.str(name), 0, 0, false, -1, {}, false, false, false,
++      makeHostDefinedOptions(js.v8Isolate, contextType));
+   v8::ScriptCompiler::Source source(js.str(code), origin);
+   auto fn = ([&] {
+     KJ_IF_SOME(ext, compileExtensions) {
+diff --git a/src/workerd/jsg/modules-new.h b/src/workerd/jsg/modules-new.h
+index ac6c93737cc9a3a5fb551884ad96233d41cca345..7daa1bca922885ac3b2f9b5b575fc7692151ffb8 100644
+--- a/src/workerd/jsg/modules-new.h
++++ b/src/workerd/jsg/modules-new.h
+@@ -22,6 +22,8 @@
+ #include <kj/refcount.h>
+ #include <kj/table.h>
+ 
++#include <type_traits>
++
+ namespace workerd::jsg::modules {
+ 
+ // Defines and implements workerd's (new) module loader subsystem.
+@@ -247,6 +249,7 @@ class Module {
+     BUILTIN,
+     BUILTIN_ONLY,
+     FALLBACK,
++    HOST_PRIVATE,
+   };
+ 
+   // The content type of the module, used to validate import attributes.
+@@ -435,7 +438,8 @@ class Module {
+       kj::StringPtr code,
+       kj::StringPtr name,
+       kj::Maybe<JsObject> compileExtensions,
+-      const CompilationObserver& observer) KJ_WARN_UNUSED_RESULT;
++      const CompilationObserver& observer,
++      ResolveContext::Type contextType = ResolveContext::Type::BUNDLE) KJ_WARN_UNUSED_RESULT;
+ 
+   // A CjsStyleModuleHandler is used for CommonJS style modules (including
+   // The template type T must be a jsg::Object that implements a getExports(Lock&)
+@@ -443,12 +447,19 @@ class Module {
+   // synthetic module. All methods and properties exposed by the template
+   // type T are exposed as additional globals within the executed scope.
+   template <typename T, typename TypeWrapper>
+-  static EvaluateCallback newCjsStyleModuleHandler(kj::StringPtr source) KJ_WARN_UNUSED_RESULT {
+-    return [source](Lock& js, const Url& id, const Module::ModuleNamespace& ns,
++  static EvaluateCallback newCjsStyleModuleHandler(kj::StringPtr source,
++      ResolveContext::Type contextType = ResolveContext::Type::BUNDLE) KJ_WARN_UNUSED_RESULT {
++    return [source, contextType](Lock& js, const Url& id, const Module::ModuleNamespace& ns,
+                const CompilationObserver& observer) mutable -> bool {
+       return js.tryCatch([&] {
+         auto& wrapper = TypeWrapper::from(js.v8Isolate);
+-        auto ext = js.alloc<T>(js, id);
++        auto ext = [&] {
++          if constexpr (std::is_constructible_v<T, Lock&, const Url&, ResolveContext::Type>) {
++            return js.template alloc<T>(js, id, contextType);
++          } else {
++            return js.template alloc<T>(js, id);
++          }
++        }();
+         ns.setDefault(js, ext->getExports(js));
+         // The module's canonical URL is used as the compiled script's origin name.
+         // V8 reports the origin name as the referrer for dynamic import() performed
+@@ -459,7 +470,8 @@ class Module {
+         // whose origins are always their canonical URLs.
+         auto href = kj::str(id.getHref());
+         auto fn = Module::compileEvalFunction(js, source, href,
+-            JsObject(wrapper.wrap(js, js.v8Context(), kj::none, ext.addRef())), observer);
++            JsObject(wrapper.wrap(js, js.v8Context(), kj::none, ext.addRef())), observer,
++            contextType);
+         fn(js);
+         // If there are named exports specified for the module namespace,
+         // then we want to examine the ext->getExports() to extract those.
+@@ -555,7 +567,9 @@ class ModuleBundle {
+   // Used to build a ModuleBundle representing modules sourced from a worker bundle.
+   class BundleBuilder final: public Builder {
+    public:
+-    BundleBuilder(const jsg::Url& bundleBase);
++    BundleBuilder(const jsg::Url& bundleBase,
++        Type type = Type::BUNDLE,
++        bool allowReservedModuleSpecifiers = false);
+     KJ_DISALLOW_COPY_AND_MOVE(BundleBuilder);
+ 
+     using EvaluateCallback = Module::EvaluateCallback;
+@@ -583,6 +597,7 @@ class ModuleBundle {
+ 
+    private:
+     const jsg::Url& bundleBase;
++    bool allowReservedModuleSpecifiers;
+   };
+ 
+   // Used to build a ModuleBundle representing modules sources from the runtime.
+@@ -677,7 +692,7 @@ WD_STRONG_BOOL(UnwrapDefault);
+ 
+ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBase {
+  private:
+-  enum BundleIndices { kBundle, kBuiltin, kBuiltinOnly, kFallback, kBundleCount };
++  enum BundleIndices { kBundle, kBuiltin, kBuiltinOnly, kFallback, kHostPrivate, kBundleCount };
+ 
+  public:
+   // The EvalCallback is used to to ensure evaluation of a module outside of an
+@@ -708,6 +723,8 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
+ 
+     Builder& setEvalCallback(EvalCallback callback) KJ_LIFETIMEBOUND;
+ 
++    Builder& setClosedApplicationGraph(kj::StringPtr applicationMain) KJ_LIFETIMEBOUND;
++
+     capnp::SchemaLoader& getSchemaLoader() {
+       return *schemaLoader;
+     }
+@@ -720,6 +737,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
+     const Options options;
+     kj::FixedArray<kj::Vector<kj::Own<ModuleBundle>>, ModuleRegistry::kBundleCount> bundles_;
+     kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
++    kj::Maybe<Url> closedApplicationMain;
+     kj::Own<capnp::SchemaLoader> schemaLoader;
+     friend class ModuleRegistry;
+   };
+@@ -758,6 +776,8 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
+       UnwrapDefault unwrapDefault = UnwrapDefault::NO,
+       RequireEsm requireEsm = RequireEsm::NO);
+ 
++  static bool isApplicationGraphClosed(Lock& js);
++
+   // The constructor is public because kj::heap requires is to be. Do not
+   // use the constructor directly. Use the ModuleRegistry::Builder
+   ModuleRegistry(ModuleRegistry::Builder* builder);
+@@ -767,6 +787,10 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
+     return bundleBase;
+   }
+ 
++  bool isApplicationGraphClosed() const {
++    return closedApplicationMain != kj::none;
++  }
++
+   const capnp::SchemaLoader& getSchemaLoader() const override {
+     return *schemaLoader;
+   }
+@@ -792,6 +816,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
+   // and must not rely on captured mutable state (the workerd callback captures
+   // nothing).
+   mutable kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
++  kj::Maybe<Url> closedApplicationMain;
+   kj::Own<capnp::SchemaLoader> schemaLoader;
+ 
+   struct ModuleRef {
+diff --git a/src/workerd/jsg/modules.c++ b/src/workerd/jsg/modules.c++
+index e76e335ff1277894684f41d0c35f79dcc74039ba..214a37390fa90ec7229eeb474752a8a84ba4cf37 100644
+--- a/src/workerd/jsg/modules.c++
++++ b/src/workerd/jsg/modules.c++
+@@ -14,6 +14,41 @@
+ 
+ namespace workerd::jsg {
+ 
++namespace {
++constexpr int32_t MODULE_PROVENANCE_MAGIC = 0x57444d50;  // "WDMP"
++}
++
++v8::Local<v8::Data> ModuleRegistry::makeHostDefinedOptions(v8::Isolate* isolate, Type type) {
++  auto options = v8::PrimitiveArray::New(isolate, 2);
++  options->Set(isolate, 0, v8::Int32::New(isolate, MODULE_PROVENANCE_MAGIC));
++  options->Set(isolate, 1, v8::Int32::New(isolate, static_cast<int32_t>(type)));
++  return options;
++}
++
++kj::Maybe<ModuleRegistry::Type> ModuleRegistry::readHostDefinedOptions(
++    v8::Isolate* isolate, v8::Local<v8::Data> options) {
++  if (options.IsEmpty()) return kj::none;
++  auto values = options.As<v8::PrimitiveArray>();
++  if (values->Length() != 2) return kj::none;
++  auto magic = values->Get(isolate, 0);
++  auto type = values->Get(isolate, 1);
++  if (!magic->IsInt32() || !type->IsInt32() ||
++      magic.As<v8::Int32>()->Value() != MODULE_PROVENANCE_MAGIC) {
++    return kj::none;
++  }
++  switch (static_cast<Type>(type.As<v8::Int32>()->Value())) {
++    case Type::BUNDLE:
++      return Type::BUNDLE;
++    case Type::BUILTIN:
++      return Type::BUILTIN;
++    case Type::INTERNAL:
++      return Type::INTERNAL;
++    case Type::HOST_PRIVATE:
++      return Type::HOST_PRIVATE;
++  }
++  return kj::none;
++}
++
+ namespace {
+ 
+ // Generalized module resolution callback that handles both evaluation and source phase imports
+@@ -56,9 +91,13 @@ v8::MaybeLocal<std::conditional_t<IsSourcePhase, v8::Object, v8::Module>> resolv
+       }
+     }
+ 
+-    // Handle process module redirection based on enable_nodejs_process_v2 flag
++    // Handle process module redirection based on enable_nodejs_process_v2 flag.
++    // A closed application or host-private referrer must resolve an explicitly
++    // declared module instead of inheriting this internal shortcut.
+     if constexpr (!IsSourcePhase) {
+-      if (spec == "node:process") {
++      if (spec == "node:process" &&
++          (!registry->isApplicationGraphClosed() || ref.type == ModuleRegistry::Type::BUILTIN ||
++              ref.type == ModuleRegistry::Type::INTERNAL)) {
+         auto specifierPath =
+             kj::Path::parse(isNodeJsProcessV2Enabled(js) ? "node-internal:public_process"_kj
+                                                          : "node-internal:legacy_process"_kj);
+@@ -76,6 +115,23 @@ v8::MaybeLocal<std::conditional_t<IsSourcePhase, v8::Object, v8::Module>> resolv
+     // then internalOnly will be false.
+     bool internalOnly =
+         ref.type == ModuleRegistry::Type::BUILTIN || ref.type == ModuleRegistry::Type::INTERNAL;
++    auto resolveOption = ModuleRegistry::ResolveOption::DEFAULT;
++    if (registry->isApplicationGraphClosed()) {
++      switch (ref.type) {
++        case ModuleRegistry::Type::BUNDLE:
++          resolveOption = ModuleRegistry::ResolveOption::APPLICATION_ONLY;
++          break;
++        case ModuleRegistry::Type::HOST_PRIVATE:
++          resolveOption = ModuleRegistry::ResolveOption::HOST_PRIVATE;
++          break;
++        case ModuleRegistry::Type::BUILTIN:
++        case ModuleRegistry::Type::INTERNAL:
++          resolveOption = ModuleRegistry::ResolveOption::INTERNAL_ONLY;
++          break;
++      }
++    } else if (internalOnly) {
++      resolveOption = ModuleRegistry::ResolveOption::INTERNAL_ONLY;
++    }
+ 
+     kj::Path targetPath = ([&] {
+       KJ_TRY {
+@@ -94,9 +150,7 @@ v8::MaybeLocal<std::conditional_t<IsSourcePhase, v8::Object, v8::Module>> resolv
+     })();
+ 
+     KJ_IF_SOME(resolved,
+-        registry->resolve(js, targetPath, ref.specifier,
+-            internalOnly ? ModuleRegistry::ResolveOption::INTERNAL_ONLY
+-                         : ModuleRegistry::ResolveOption::DEFAULT,
++        registry->resolve(js, targetPath, ref.specifier, resolveOption,
+             ModuleRegistry::ResolveMethod::IMPORT, spec.asPtr())) {
+       if constexpr (!IsSourcePhase) {
+         result = resolved.module.getHandle(js);
+@@ -119,9 +173,8 @@ v8::MaybeLocal<std::conditional_t<IsSourcePhase, v8::Object, v8::Module>> resolv
+       // We only need to do this if internalOnly is false.
+       if (!internalOnly && (spec.startsWith("node:") || spec.startsWith("cloudflare:"))) {
+         KJ_IF_SOME(resolve,
+-            registry->resolve(js, kj::Path::parse(spec), ref.specifier,
+-                ModuleRegistry::ResolveOption::DEFAULT, ModuleRegistry::ResolveMethod::IMPORT,
+-                spec.asPtr())) {
++            registry->resolve(js, kj::Path::parse(spec), ref.specifier, resolveOption,
++                ModuleRegistry::ResolveMethod::IMPORT, spec.asPtr())) {
+           if constexpr (!IsSourcePhase) {
+             result = resolve.module.getHandle(js);
+           } else {
+@@ -372,6 +425,7 @@ static CompilationObserver::Option convertOption(ModuleInfoCompileOption option)
+     case ModuleInfoCompileOption::BUILTIN:
+       return CompilationObserver::Option::BUILTIN;
+     case ModuleInfoCompileOption::BUNDLE:
++    case ModuleInfoCompileOption::HOST_PRIVATE:
+       return CompilationObserver::Option::BUNDLE;
+   }
+   KJ_UNREACHABLE;
+@@ -382,6 +436,7 @@ v8::Local<v8::Module> compileEsmModule(jsg::Lock& js,
+     kj::ArrayPtr<const char> content,
+     kj::ArrayPtr<const kj::byte> compileCache,
+     ModuleInfoCompileOption option,
++    ModuleRegistry::Type type,
+     const CompilationObserver& observer) {
+   // destroy the observer after compilation finished to indicate the end of the process.
+   auto compilationObserver =
+@@ -396,7 +451,8 @@ v8::Local<v8::Module> compileEsmModule(jsg::Lock& js,
+   constexpr bool isWasm = false;
+   constexpr bool isModule = true;
+   v8::ScriptOrigin origin(v8StrIntern(js.v8Isolate, name), resourceLineOffset, resourceColumnOffset,
+-      resourceIsSharedCrossOrigin, scriptId, {}, resourceIsOpaque, isWasm, isModule);
++      resourceIsSharedCrossOrigin, scriptId, {}, resourceIsOpaque, isWasm, isModule,
++      ModuleRegistry::makeHostDefinedOptions(js.v8Isolate, type));
+   v8::Local<v8::String> contentStr;
+ 
+   if (option == ModuleInfoCompileOption::BUILTIN) {
+@@ -446,8 +502,9 @@ ModuleRegistry::ModuleInfo::ModuleInfo(jsg::Lock& js,
+     kj::ArrayPtr<const char> content,
+     kj::ArrayPtr<const kj::byte> compileCache,
+     ModuleInfoCompileOption flags,
+-    const CompilationObserver& observer)
+-    : ModuleInfo(js, compileEsmModule(js, name, content, compileCache, flags, observer)) {}
++    const CompilationObserver& observer,
++    Type type)
++    : ModuleInfo(js, compileEsmModule(js, name, content, compileCache, flags, type, observer)) {}
+ 
+ ModuleRegistry::ModuleInfo::ModuleInfo(jsg::Lock& js,
+     kj::StringPtr name,
+diff --git a/src/workerd/jsg/modules.capnp b/src/workerd/jsg/modules.capnp
+index 434dc3b232f61dbf34e38a1dbc8df2e306356060..fe4a011203fa2076e44dc27249a2a691549f670f 100644
+--- a/src/workerd/jsg/modules.capnp
++++ b/src/workerd/jsg/modules.capnp
+@@ -39,4 +39,9 @@ enum ModuleType {
+ 
+   internal @2;
+   # Provided by runtime but can only imported by builtin modules.
++
++  hostPrivate @3;
++  # Provided by an opt-in worker configuration for its host entrypoint and
++  # prelude. It is a separate provenance namespace from `bundle`, even when a
++  # module has the same logical name in both namespaces.
+ }
+diff --git a/src/workerd/jsg/modules.h b/src/workerd/jsg/modules.h
+index 29f4d3f84b2914ea889cf1e993f083246aec05d2..0450ab4f4f08f1beed9abd3cfec6b27abda56cca 100644
+--- a/src/workerd/jsg/modules.h
++++ b/src/workerd/jsg/modules.h
+@@ -53,6 +53,11 @@ enum class ModuleInfoCompileOption {
+   // as an immutable, process-lifetime buffer that will never be destroyed, and caching
+   // the compilation data.
+   BUILTIN,
++
++  // Source supplied by a worker configuration for its host-private module
++  // namespace. It is compiled like bundle source, but carries host provenance
++  // for dynamic import resolution.
++  HOST_PRIVATE,
+ };
+ 
+ v8::Local<v8::WasmModuleObject> compileWasmModule(
+@@ -79,8 +84,22 @@ class ModuleRegistry {
+     BUILTIN_ONLY,
+     // Internal resolution. Check only internal builtins.
+     INTERNAL_ONLY,
++    // Resolve only within the declared application namespace. No built-ins or
++    // fallback service are consulted.
++    APPLICATION_ONLY,
++    // Resolve from a host-private referrer. The exact configured application
++    // main is bridged into the application namespace; every other target is
++    // resolved only in the host-private namespace.
++    HOST_PRIVATE,
++    // Resolve the configured worker entrypoint by exact host-private identity.
++    // This intentionally bypasses the application-main bridge, which is
++    // necessary when both identities have the same logical name.
++    HOST_PRIVATE_ENTRY,
+   };
+ 
++  static v8::Local<v8::Data> makeHostDefinedOptions(v8::Isolate* isolate, Type type);
++  static kj::Maybe<Type> readHostDefinedOptions(v8::Isolate* isolate, v8::Local<v8::Data> options);
++
+   static inline ModuleRegistry* from(jsg::Lock& js) {
+     return &KJ_ASSERT_NONNULL(jsg::getAlignedPointerFromEmbedderData<ModuleRegistry>(
+         js.v8Context(), jsg::ContextPointerSlot::MODULE_REGISTRY));
+@@ -108,18 +127,23 @@ class ModuleRegistry {
+     CommonJsModuleInfo(auto& lock,
+         kj::StringPtr name,
+         kj::StringPtr content,
+-        kj::Own<CommonJsModuleProvider> provider)
++        kj::Own<CommonJsModuleProvider> provider,
++        Type type = Type::BUNDLE)
+         : provider(kj::mv(provider)),
+-          evalFunc(initEvalFunc(lock, *this->provider, name, content)) {}
++          evalFunc(initEvalFunc(lock, *this->provider, name, content, type)) {}
+ 
+     CommonJsModuleInfo(CommonJsModuleInfo&&) = default;
+     CommonJsModuleInfo& operator=(CommonJsModuleInfo&&) = default;
+ 
+     jsg::JsValue getExports(jsg::Lock& js);
+ 
+-    static jsg::Function<void()> initEvalFunc(
+-        auto& lock, CommonJsModuleProvider& provider, kj::StringPtr name, kj::StringPtr content) {
+-      v8::ScriptOrigin origin(v8StrIntern(lock.v8Isolate, name));
++    static jsg::Function<void()> initEvalFunc(auto& lock,
++        CommonJsModuleProvider& provider,
++        kj::StringPtr name,
++        kj::StringPtr content,
++        Type type) {
++      v8::ScriptOrigin origin(v8StrIntern(lock.v8Isolate, name), 0, 0, false, -1, {}, false, false,
++          false, makeHostDefinedOptions(lock.v8Isolate, type));
+       v8::ScriptCompiler::Source source(v8Str(lock.v8Isolate, content), origin);
+       auto context = lock.v8Context();
+       v8::Local<v8::Object> handle = provider.getContext(lock);
+@@ -176,7 +200,8 @@ class ModuleRegistry {
+         kj::ArrayPtr<const char> content,
+         kj::ArrayPtr<const kj::byte> compileCache,
+         ModuleInfoCompileOption flags,
+-        const CompilationObserver& observer);
++        const CompilationObserver& observer,
++        Type type = Type::BUNDLE);
+ 
+     ModuleInfo(jsg::Lock& js,
+         kj::StringPtr name,
+@@ -229,10 +254,13 @@ class ModuleRegistry {
+ 
+   virtual kj::Maybe<ModuleRef> resolve(jsg::Lock& js, v8::Local<v8::Module> module) = 0;
+ 
++  virtual bool isApplicationGraphClosed() const = 0;
++
+   virtual Promise<Value> resolveDynamicImport(jsg::Lock& js,
+       const kj::Path& specifier,
+       const kj::Path& referrer,
+-      kj::StringPtr rawSpecifier) = 0;
++      kj::StringPtr rawSpecifier,
++      Type referrerType) = 0;
+ 
+   virtual Value resolveInternalImport(jsg::Lock& js, kj::StringPtr specifier) = 0;
+ 
+@@ -275,6 +303,14 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+ 
+   ModuleRegistryImpl(CompilationObserver& observer): observer(observer) {}
+ 
++  void enableClosedApplicationGraph(kj::Path applicationMain) {
++    closedApplicationMain = kj::mv(applicationMain);
++  }
++
++  bool isApplicationGraphClosed() const override {
++    return closedApplicationMain != kj::none;
++  }
++
+   static kj::Own<ModuleRegistryImpl<TypeWrapper>> install(
+       v8::Isolate* isolate, v8::Local<v8::Context> context, CompilationObserver& observer) {
+     auto registry = kj::heap<ModuleRegistryImpl<TypeWrapper>>(observer);
+@@ -293,16 +329,17 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+     dynamicImportHandler = kj::mv(func);
+   }
+ 
+-  void add(kj::Path& specifier, ModuleInfo&& info) {
++  void add(kj::Path& specifier, ModuleInfo&& info, Type type = Type::BUNDLE) {
+     // Report duplicates as a JS-visible error rather than letting the table
+     // insert below throw: a raw table exception surfaces to the user as an
+     // opaque "internal error" while this is a worker configuration mistake.
+     // (This matches the error the new module registry reports for the same
+     // mistake, which phrases the specifier as a URL rather than a path.)
+     using Key = Entry::Key;
+-    JSG_REQUIRE(entries.find(Key(specifier, Type::BUNDLE)) == kj::none, Error, "Module \"",
++    KJ_ASSERT(type == Type::BUNDLE || type == Type::HOST_PRIVATE);
++    JSG_REQUIRE(entries.find(Key(specifier, type)) == kj::none, Error, "Module \"",
+         specifier.toString(false), "\" already added to bundle");
+-    entries.insert(kj::heap<Entry>(specifier, Type::BUNDLE, kj::fwd<ModuleInfo>(info)));
++    entries.insert(kj::heap<Entry>(specifier, type, kj::fwd<ModuleInfo>(info)));
+   }
+ 
+   void addBuiltinModule(Module::Reader module) {
+@@ -387,14 +424,14 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+       kj::ArrayPtr<const char> sourceCode,
+       Type type = Type::BUILTIN,
+       kj::ArrayPtr<const kj::byte> compileCache = {}) {
+-    KJ_ASSERT(type != Type::BUNDLE);
++    KJ_ASSERT(type != Type::BUNDLE && type != Type::HOST_PRIVATE);
+     auto path = kj::Path::parse(specifier);
+     entries.insert(kj::heap<Entry>(path, type, sourceCode, compileCache));
+   }
+ 
+   void addBuiltinModule(
+       kj::StringPtr specifier, ModuleCallback factory, Type type = Type::BUILTIN) {
+-    KJ_ASSERT(type != Type::BUNDLE);
++    KJ_ASSERT(type != Type::BUNDLE && type != Type::HOST_PRIVATE);
+     auto path = kj::Path::parse(specifier);
+     entries.insert(kj::heap<Entry>(path, type, kj::mv(factory)));
+   }
+@@ -423,11 +460,40 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+       ResolveMethod method = ResolveMethod::IMPORT,
+       kj::Maybe<kj::StringPtr> rawSpecifier = kj::none) override {
+     using Key = Entry::Key;
++    if (option == ResolveOption::DEFAULT && isApplicationGraphClosed()) {
++      // User-facing helpers historically use DEFAULT. Under the opt-in policy,
++      // an otherwise-unattributed lookup is always application provenance.
++      option = ResolveOption::APPLICATION_ONLY;
++    }
++
+     if (option == ResolveOption::INTERNAL_ONLY) {
+       KJ_IF_SOME(entry, entries.find(Key(specifier, Type::INTERNAL))) {
+         return entry->module(js, observer, referrer, method);
+       }
+       return kj::none;
++    } else if (option == ResolveOption::APPLICATION_ONLY) {
++      KJ_IF_SOME(entry, entries.find(Key(specifier, Type::BUNDLE))) {
++        return entry->module(js, observer, referrer, method);
++      }
++      return kj::none;
++    } else if (option == ResolveOption::HOST_PRIVATE_ENTRY) {
++      KJ_IF_SOME(entry, entries.find(Key(specifier, Type::HOST_PRIVATE))) {
++        return entry->module(js, observer, referrer, method);
++      }
++      return kj::none;
++    } else if (option == ResolveOption::HOST_PRIVATE) {
++      KJ_IF_SOME(applicationMain, closedApplicationMain) {
++        if (specifier == applicationMain) {
++          KJ_IF_SOME(entry, entries.find(Key(specifier, Type::BUNDLE))) {
++            return entry->module(js, observer, referrer, method);
++          }
++          return kj::none;
++        }
++      }
++      KJ_IF_SOME(entry, entries.find(Key(specifier, Type::HOST_PRIVATE))) {
++        return entry->module(js, observer, referrer, method);
++      }
++      return kj::none;
+     } else if (option == ResolveOption::BUILTIN_ONLY) {
+       KJ_IF_SOME(entry, entries.find(Key(specifier, Type::BUILTIN))) {
+         return entry->module(js, observer, referrer, method);
+@@ -517,18 +583,33 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+   Promise<Value> resolveDynamicImport(jsg::Lock& js,
+       const kj::Path& specifier,
+       const kj::Path& referrer,
+-      kj::StringPtr rawSpecifier) override {
+-    // Here, we first need to determine if the referrer is a built-in module
+-    // or not. If it is a built-in, then we are only permitted to resolve
+-    // internal modules. If the worker bundle provided an override for the
+-    // built-in module, then the built-in was never registered and won't
+-    // be found.
+-    using Key = Entry::Key;
++      kj::StringPtr rawSpecifier,
++      Type referrerType) override {
+     auto resolveOption = ModuleRegistry::ResolveOption::DEFAULT;
+-    if (entries.find(Key(referrer, Type::BUNDLE)) != kj::none) {
+-      // The referrer is found in the module bundle, so we use the default.
+-    } else if (entries.find(Key(referrer, Type::BUILTIN)) != kj::none) {
+-      resolveOption = ModuleRegistry::ResolveOption::INTERNAL_ONLY;
++    if (isApplicationGraphClosed()) {
++      // The callback supplies unforgeable provenance from V8's host-defined
++      // script metadata. Missing or malformed metadata is normalized to
++      // BUNDLE by the callback, never HOST_PRIVATE.
++      switch (referrerType) {
++        case Type::BUNDLE:
++          resolveOption = ModuleRegistry::ResolveOption::APPLICATION_ONLY;
++          break;
++        case Type::HOST_PRIVATE:
++          resolveOption = ModuleRegistry::ResolveOption::HOST_PRIVATE;
++          break;
++        case Type::BUILTIN:
++        case Type::INTERNAL:
++          resolveOption = ModuleRegistry::ResolveOption::INTERNAL_ONLY;
++          break;
++      }
++    } else {
++      // Preserve historical path-based inference while the policy is off.
++      using Key = Entry::Key;
++      if (entries.find(Key(referrer, Type::BUNDLE)) != kj::none) {
++        // The referrer is found in the module bundle, so we use the default.
++      } else if (entries.find(Key(referrer, Type::BUILTIN)) != kj::none) {
++        resolveOption = ModuleRegistry::ResolveOption::INTERNAL_ONLY;
++      }
+     }
+ 
+     KJ_IF_SOME(info,
+@@ -578,6 +659,7 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+  private:
+   CompilationObserver& observer;
+   kj::Maybe<kj::Function<DynamicImportCallback>> dynamicImportHandler;
++  kj::Maybe<kj::Path> closedApplicationMain;
+ 
+   // When we build a bundle containing modules, we must build a table of modules to resolve imports.
+   //
+@@ -644,7 +726,7 @@ class ModuleRegistryImpl final: public ModuleRegistry {
+         }
+         KJ_CASE_ONEOF(src, kj::ArrayPtr<const char>) {
+           info = ModuleInfo(js, specifier.toString(), src, compileCache,
+-              ModuleInfoCompileOption::BUILTIN, observer);
++              ModuleInfoCompileOption::BUILTIN, observer, type);
+           return info.tryGet<ModuleInfo>();
+         }
+         KJ_CASE_ONEOF(src, ModuleCallback) {
+@@ -687,6 +769,8 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
+   auto& js = Lock::current();
+   auto registry = ModuleRegistry::from(js);
+   auto& wrapper = TypeWrapper::from(js.v8Isolate);
++  auto referrerType = ModuleRegistry::readHostDefinedOptions(js.v8Isolate, host_defined_options)
++                          .orDefault(ModuleRegistry::Type::BUNDLE);
+ 
+   // TODO(cleanup): This could probably be simplified using jsg::Promise
+   const auto makeRejected = [&](auto reason) {
+@@ -740,7 +824,9 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
+   }
+ 
+   // Handle process module redirection based on enable_nodejs_process_v2 flag
+-  if (spec == "node:process") {
++  if (spec == "node:process" &&
++      (!registry->isApplicationGraphClosed() || referrerType == ModuleRegistry::Type::BUILTIN ||
++          referrerType == ModuleRegistry::Type::INTERNAL)) {
+     auto processSpec = isNodeJsProcessV2Enabled(js) ? "node-internal:public_process"_kj
+                                                     : "node-internal:legacy_process"_kj;
+     try {
+@@ -790,7 +876,7 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
+ 
+   try {
+     return wrapper.wrap(js, context, kj::none,
+-        registry->resolveDynamicImport(js, specifierPath, referrerPath, spec));
++        registry->resolveDynamicImport(js, specifierPath, referrerPath, spec, referrerType));
+   } catch (JsExceptionThrown&) {
+     // If the tryCatch.Exception().IsEmpty() here is true, no JavaScript error
+     // was scheduled which can happen in a few edge cases. Treat it as if
+diff --git a/src/workerd/jsg/observer.h b/src/workerd/jsg/observer.h
+index 58495598efe2a09792dc8cc8c15d0267d75fedb9..0f1ec03e670735803dfbfcf5aacbebe75eaf67a0 100644
+--- a/src/workerd/jsg/observer.h
++++ b/src/workerd/jsg/observer.h
+@@ -41,6 +41,15 @@ struct ResolveObserver {
+     // by user-facing APIs like process.getBuiltinModule() that must not
+     // expose internal modules or return user bundle overrides.
+     PUBLIC_BUILTIN,
++    // A resolution originating from a host-private worker module. Under the
++    // closed-graph policy this can see host-private modules and the exact
++    // configured application main only.
++    HOST_PRIVATE,
++    // An internal direct lookup of the configured worker entrypoint in the
++    // host-private namespace. Kept distinct from HOST_PRIVATE so an
++    // application main with the same logical name cannot shadow the host
++    // entrypoint identity.
++    HOST_PRIVATE_ENTRY,
+   };
+ 
+   enum class Source {
+diff --git a/src/workerd/jsg/resource-test.c++ b/src/workerd/jsg/resource-test.c++
+index 19606776d6ea9d7955e9abfd67e80d7e1af4dd68..5761ce68a9d5158649ac6835c19a31add0ceef15 100644
+--- a/src/workerd/jsg/resource-test.c++
++++ b/src/workerd/jsg/resource-test.c++
+@@ -748,6 +748,50 @@ KJ_TEST("bundle installed works") {
+       "string", "THIS_IS_BUILTIN_FUNCTION");
+ }
+ 
++KJ_TEST("closed legacy module resolution does not consult fallback") {
++  JsBundleIsolate isolate(
++      v8System, v8::IsolateGroup::GetDefault(), nullptr, kj::heap<IsolateObserver>());
++  bool fallbackCalled = false;
++
++  isolate.runInLockScope([&](JsBundleIsolate::Lock& lock) {
++    IsolateBase::from(lock.v8Isolate)
++        .setModuleFallbackCallback(
++            [&fallbackCalled](jsg::Lock&, kj::StringPtr, kj::Maybe<kj::String>,
++                jsg::CompilationObserver&, jsg::ModuleRegistry::ResolveMethod,
++                kj::Maybe<kj::StringPtr>)
++                -> kj::Maybe<kj::OneOf<kj::String, jsg::ModuleRegistry::ModuleInfo>> {
++      fallbackCalled = true;
++      return kj::none;
++    });
++
++    JSG_WITHIN_CONTEXT_SCOPE(
++        lock, lock.newContext<JsBundleContext>().getHandle(lock.v8Isolate), [&](jsg::Lock& js) {
++      auto modules = ModuleRegistryImpl<JsBundleIsolate_TypeWrapper>::from(js);
++      auto applicationMain = kj::Path::parse("main");
++      auto missing = kj::Path::parse("missing");
++      modules->enableClosedApplicationGraph(applicationMain.clone());
++
++      KJ_EXPECT(modules->resolve(js, missing, applicationMain,
++                    ModuleRegistry::ResolveOption::DEFAULT) == kj::none);
++      KJ_EXPECT(modules->resolve(js, missing, applicationMain,
++                    ModuleRegistry::ResolveOption::APPLICATION_ONLY) == kj::none);
++      KJ_EXPECT(modules->resolve(js, missing, applicationMain,
++                    ModuleRegistry::ResolveOption::HOST_PRIVATE) == kj::none);
++      KJ_EXPECT(modules->resolve(js, missing, applicationMain,
++                    ModuleRegistry::ResolveOption::HOST_PRIVATE_ENTRY) == kj::none);
++      KJ_EXPECT(!fallbackCalled);
++    });
++
++    JSG_WITHIN_CONTEXT_SCOPE(
++        lock, lock.newContext<JsBundleContext>().getHandle(lock.v8Isolate), [&](jsg::Lock& js) {
++      auto modules = ModuleRegistryImpl<JsBundleIsolate_TypeWrapper>::from(js);
++      auto missing = kj::Path::parse("missing");
++      KJ_EXPECT(modules->resolve(js, missing) == kj::none);
++      KJ_EXPECT(fallbackCalled);
++    });
++  });
++}
++
+ // ========================================================================================
+ // Regression test for https://github.com/cloudflare/workerd/issues/4147
+ 
+diff --git a/src/workerd/server/workerd-api.c++ b/src/workerd/server/workerd-api.c++
+index 531de9903f29ae6011fad8e0b23e93c5948c923c..e0aff7beacbfb30ab40c4e190d99ea03bdc05469 100644
+--- a/src/workerd/server/workerd-api.c++
++++ b/src/workerd/server/workerd-api.c++
+@@ -380,8 +380,62 @@ Worker::Script::Source WorkerdApi::extractSource(kj::StringPtr name,
+         return readModuleConf(module, featureFlags, errorReporter);
+       };
+ 
++      kj::Maybe<Worker::Script::ModulesSource::ModulePolicy> modulePolicy;
++      if (conf.hasModulePolicy()) {
++        auto policy = conf.getModulePolicy();
++        if (policy.getApplicationMain().size() == 0) {
++          errorReporter.addError(
++              kj::str("modulePolicy.applicationMain must name an application module."));
++        } else {
++          modulePolicy = Worker::Script::ModulesSource::ModulePolicy{
++            .applicationMain = policy.getApplicationMain(),
++          };
++        }
++      }
++
++      // Module names identify entries only within their provenance namespace.
++      // In particular, an application module and host-private module may have
++      // the same logical name without colliding.
++      for (uint i = 0; i < moduleArray.size(); ++i) {
++        if (moduleArray[i].role == Worker::Script::ModuleRole::HOST_PRIVATE &&
++            modulePolicy == kj::none) {
++          errorReporter.addError(kj::str("Module \"", moduleArray[i].name,
++              "\" is hostPrivate but modulePolicy is not configured."));
++        }
++        for (uint j = 0; j < i; ++j) {
++          if (moduleArray[i].role == moduleArray[j].role &&
++              moduleArray[i].name == moduleArray[j].name) {
++            errorReporter.addError(
++                kj::str("Module \"", moduleArray[i].name, "\" is duplicated within the ",
++                    moduleArray[i].role == Worker::Script::ModuleRole::APPLICATION ? "application"
++                                                                                   : "host-private",
++                    " namespace."));
++          }
++        }
++      }
++
++      KJ_IF_SOME(policy, modulePolicy) {
++        bool foundApplicationMain = false;
++        for (auto& module: moduleArray) {
++          if (module.role == Worker::Script::ModuleRole::APPLICATION &&
++              module.name == policy.applicationMain) {
++            foundApplicationMain = true;
++            break;
++          }
++        }
++        if (!foundApplicationMain) {
++          errorReporter.addError(kj::str("modulePolicy.applicationMain \"", policy.applicationMain,
++              "\" does not name a declared application module."));
++        }
++      }
++
+       Worker::Script::ModulesSource result{
+-        .mainModule = modules[0].getName(), .modules = kj::mv(moduleArray), .isPython = isPython};
++        .mainModule = modules[0].getName(),
++        .mainModuleRole = moduleArray[0].role,
++        .modules = kj::mv(moduleArray),
++        .modulePolicy = modulePolicy,
++        .isPython = isPython,
++      };
+ 
+       return result;
+     }
+@@ -430,9 +484,10 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> tryCompileLegacyModule(jsg::Lock& js,
+     kj::StringPtr name,
+     const Worker::Script::ModuleContent& content,
+     const jsg::CompilationObserver& observer,
+-    CompatibilityFlags::Reader featureFlags) {
++    CompatibilityFlags::Reader featureFlags,
++    jsg::ModuleRegistry::Type type = jsg::ModuleRegistry::Type::BUNDLE) {
+   return modules::legacy::tryCompileLegacyModule<JsgWorkerdIsolate>(
+-      js, name, content, observer, featureFlags);
++      js, name, content, observer, featureFlags, type);
+ }
+ }  // namespace
+ 
+@@ -448,7 +503,8 @@ kj::Maybe<jsg::ModuleRegistry::ModuleInfo> WorkerdApi::tryCompileModule(jsg::Loc
+ Worker::Script::Module WorkerdApi::readModuleConf(config::Worker::Module::Reader conf,
+     CompatibilityFlags::Reader featureFlags,
+     kj::Maybe<Worker::ValidationErrorReporter&> errorReporter) {
+-  return {.name = conf.getName(), .content = [&]() -> Worker::Script::ModuleContent {
++  return {.name = conf.getName(),
++    .content = [&]() -> Worker::Script::ModuleContent {
+     switch (conf.which()) {
+       case config::Worker::Module::TEXT:
+         return Worker::Script::TextModule{conf.getText()};
+@@ -510,7 +566,10 @@ Worker::Script::Module WorkerdApi::readModuleConf(config::Worker::Module::Reader
+     } else {
+       KJ_FAIL_REQUIRE("unknown module type", (uint)conf.which());
+     }
+-  }()};
++  }(),
++    .role = conf.getRole() == config::Worker::Module::Role::HOST_PRIVATE
++        ? Worker::Script::ModuleRole::HOST_PRIVATE
++        : Worker::Script::ModuleRole::APPLICATION};
+ }
+ 
+ // Part of the original module registry implementation.
+@@ -526,12 +585,19 @@ void WorkerdApi::compileModules(jsg::Lock& lockParam,
+     using namespace workerd::api::pyodide;
+     auto featureFlags = getFeatureFlags();
+ 
++    KJ_IF_SOME(policy, source.modulePolicy) {
++      modules->enableClosedApplicationGraph(kj::Path::parse(policy.applicationMain));
++    }
++
+     for (auto& module: source.modules) {
+       auto path = kj::Path::parse(module.name);
++      auto type = module.role == Worker::Script::ModuleRole::HOST_PRIVATE
++          ? jsg::ModuleRegistry::Type::HOST_PRIVATE
++          : jsg::ModuleRegistry::Type::BUNDLE;
+       auto maybeInfo = tryCompileLegacyModule(
+-          lockParam, module.name, module.content, modules->getObserver(), featureFlags);
++          lockParam, module.name, module.content, modules->getObserver(), featureFlags, type);
+       KJ_IF_SOME(info, maybeInfo) {
+-        modules->add(path, kj::mv(info));
++        modules->add(path, kj::mv(info), type);
+       }
+     }
+ 
+diff --git a/src/workerd/server/workerd.capnp b/src/workerd/server/workerd.capnp
+index 43d59cd6848e71624a2837762fe56828d714f97f..501d2fa2c73274308a80eb0e52b4e4961bdf12a9 100644
+--- a/src/workerd/server/workerd.capnp
++++ b/src/workerd/server/workerd.capnp
+@@ -313,6 +313,21 @@ struct Worker {
+     #
+     # (`commonJsModule` should have been a group containing the body and `namedExports`, but it's
+     # too late to change now.)
++
++    role @11 :Role = application;
++    # Selects the provenance namespace in which this module is registered when
++    # `modulePolicy` is present. Names are unique within a namespace, but an
++    # application module and a host-private module may intentionally have the
++    # same name; they remain distinct module identities.
++
++    enum Role {
++      application @0;
++      # A module in the application's declared, importable graph.
++
++      hostPrivate @1;
++      # A module used by the host entrypoint or prelude. Application modules
++      # cannot resolve modules in this namespace.
++    }
+   }
+ 
+   compatibilityDate @3 :Text;
+@@ -785,6 +800,18 @@ struct Worker {
+   #
+   # If not set, `ctx.access.getIdentity()` resolves to `undefined` (even when `accessBlobHeader`
+   # is configured and `ctx.access.aud` is available).
++
++  modulePolicy @20 :ModulePolicy;
++  # Opts this worker into provenance-aware, closed application module
++  # resolution. When absent, module resolution retains its historical behavior.
++
++  struct ModulePolicy {
++    applicationMain @0 :Text;
++    # Exact name of the application entry module. A host-private module may
++    # bridge to this application module, but to no other application module by
++    # an out-of-namespace lookup. The configured worker entrypoint remains the
++    # first module in `modules` and may itself be host-private.
++  }
+ }
+ 
+ struct ExternalServer {
+diff --git a/src/workerd/tests/BUILD.bazel b/src/workerd/tests/BUILD.bazel
+index 298440ae427b301c9e704042890e7661b2baf3e4..b4710f7cbbf95f88510cc53bf680954d05f5620a 100644
+--- a/src/workerd/tests/BUILD.bazel
++++ b/src/workerd/tests/BUILD.bazel
+@@ -169,6 +169,16 @@ wd_test(
+     lint = False,
+ )
+ 
++wd_test(
++    src = "closed-module-graph-test.wd-test",
++    args = ["--experimental"],
++    data = [
++        "closed-module-graph-app.js",
++        "closed-module-graph-host.js",
++        "test.wasm",
++    ],
++)
++
+ wd_test(
+     src = "performance-test.wd-test",
+     data = ["performance-test.js"],
+diff --git a/patches/v8/0039-Preserve-generated-script-host-options-for-dynamic-import.patch b/patches/v8/0039-Preserve-generated-script-host-options-for-dynamic-import.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..829fe2626a2c508705d4e60bb0967466f05f1d23
+--- /dev/null
++++ b/patches/v8/0039-Preserve-generated-script-host-options-for-dynamic-import.patch
+@@ -0,0 +1,43 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Cloudflare Workers Runtime Team <workers-runtime@cloudflare.com>
++Date: Mon, 7 Sep 2026 00:00:00 +0000
++Subject: Preserve generated-script host options for dynamic import
++
++V8 historically replaces the script containing a dynamic import with its
++ultimate eval origin before invoking the embedder callback. This is necessary
++for relative URL resolution, but it also replaces the generated script's
++host-defined options with those of its origin. Embedders therefore cannot tell
++an import executed by eval() or a Function constructor from one executed by the
++originating module.
++
++Keep the actual referring script through to the callback setup. Continue using
++its ultimate eval origin for resource_name, preserving relative-resolution
++semantics, while reporting the actual script's host-defined options.
++
++diff --git a/src/execution/isolate.cc b/src/execution/isolate.cc
++index 444a6f1b4146720437bcec164e2771ffe1f02091..444a6f1b4146720437bcec164e2771ffe1f02091 100644
++--- a/src/execution/isolate.cc
+++++ b/src/execution/isolate.cc
++@@ -7272,7 +7272,8 @@ MaybeDirectHandle<JSPromise> Isolate::RunHostImportModuleDynamicallyCallback(
++     DirectHandle<Script> referrer = maybe_referrer.ToHandleChecked();
++     host_defined_options =
++         direct_handle(referrer->host_defined_options(), this);
++-    resource_name = direct_handle(referrer->name(), this);
+++    DirectHandle<Script> referrer_origin(referrer->GetEvalOrigin(), this);
+++    resource_name = direct_handle(referrer_origin->name(), this);
++   }
++ 
++   switch (phase) {
++diff --git a/src/runtime/runtime-module.cc b/src/runtime/runtime-module.cc
++index 381cff733c1b0a3b90fda8391392cfe07d3fd5e2..381cff733c1b0a3b90fda8391392cfe07d3fd5e2 100644
++--- a/src/runtime/runtime-module.cc
+++++ b/src/runtime/runtime-module.cc
++@@ -23,7 +23,7 @@ RUNTIME_FUNCTION(Runtime_DynamicImportCall) {
++   }
++ 
++   DirectHandle<Script> referrer_script(
++-      Cast<Script>(function->shared()->script())->GetEvalOrigin(), isolate);
+++      Cast<Script>(function->shared()->script()), isolate);
++   RETURN_RESULT_OR_FAILURE(
++       isolate, isolate->RunHostImportModuleDynamicallyCallback(
++                    referrer_script, specifier, phase, import_options));
+diff --git a/src/workerd/tests/closed-module-graph-app.js b/src/workerd/tests/closed-module-graph-app.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a3a0383b7ba9e856409c913af6bba1600a6eefd
+--- /dev/null
++++ b/src/workerd/tests/closed-module-graph-app.js
+@@ -0,0 +1,340 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++import * as declaredStatic from './declared.js';
++import * as textStatic from './text.txt';
++import * as dataStatic from './data.bin';
++import * as wasmStatic from './module.wasm';
++import * as tlaStatic from './tla.js';
++import { readThroughB, increment } from './cycle-a.js';
++import cloudflareShadow from 'cloudflare:sockets';
++import nodeProcessShadow from 'node:process';
++import workerdShadow from 'workerd:runtime';
++import internalLookingShadow from 'node-internal:public_process';
++import oldGeneratedShadow from '__takoserver_host_entry__.js';
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message);
++}
++
++function capture(promise) {
++  return Promise.resolve(promise).then(
++    (value) => ({ value }),
++    (error) => ({ error })
++  );
++}
++
++function isModuleNotFound(error) {
++  return (
++    error instanceof Error &&
++    /^(No such module|Module not found)/.test(error.message)
++  );
++}
++
++async function expectModuleNotFound(promise, label) {
++  const result = await capture(promise);
++  assert(result.error, `${label}: unexpectedly resolved`);
++  assert(
++    isModuleNotFound(result.error),
++    `${label}: unexpected error ${result.error?.stack ?? result.error}`
++  );
++}
++
++async function expectCapturedModuleNotFound(resultPromise, label) {
++  const result = await resultPromise;
++  assert(result.error, `${label}: unexpectedly resolved`);
++  assert(
++    isModuleNotFound(result.error),
++    `${label}: unexpected error ${result.error?.stack ?? result.error}`
++  );
++}
++
++const missingSpecifiers = [
++  './missing.js',
++  'cloudflare:workers',
++  'node:assert',
++  'workerd:missing',
++  './host-private.js',
++];
++
++// eval(), Function(), new Function(), and the AsyncFunction constructor are
++// only permitted during startup. Capture both positive and negative outcomes
++// now, while still executing in actual V8 startup evaluation.
++const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
++const startupGeneratedImports = {
++  eval: missingSpecifiers.map((specifier) =>
++    capture(eval(`import(${JSON.stringify(specifier)})`))
++  ),
++  function: missingSpecifiers.map((specifier) =>
++    capture(Function(`return import(${JSON.stringify(specifier)})`)())
++  ),
++  newFunction: missingSpecifiers.map((specifier) =>
++    capture(new Function(`return import(${JSON.stringify(specifier)})`)())
++  ),
++  asyncFunction: missingSpecifiers.map((specifier) =>
++    capture(new AsyncFunction(`return import(${JSON.stringify(specifier)})`)())
++  ),
++};
++
++const declaredGeneratedImports = {
++  eval: capture(eval('import("cloudflare:sockets")')),
++  function: capture(Function('return import("node:process")')()),
++  newFunction: capture(new Function('return import("workerd:runtime")')()),
++  asyncFunction: capture(
++    new AsyncFunction('return import("node-internal:public_process")')()
++  ),
++};
++
++let lexicalValue = 40;
++const directEvalLexicalResult = eval('lexicalValue + 2');
++
++export const applicationModuleIdentity = {
++  url: import.meta.url,
++  main: import.meta.main,
++  async test(_controller, env) {
++    if (env.EXPECT_IMPORT_META_MAIN) {
++      assert(
++        typeof import.meta.url === 'string',
++        'application import.meta.url missing'
++      );
++      assert(
++        import.meta.url.endsWith('/entry.js') || import.meta.url === 'entry.js',
++        `unexpected application import.meta.url: ${import.meta.url}`
++      );
++      assert(
++        import.meta.main === true,
++        'configured application main was not marked main'
++      );
++    } else {
++      assert(
++        import.meta.url === undefined,
++        'legacy import.meta.url semantics changed'
++      );
++      assert(
++        import.meta.main === undefined,
++        'legacy import.meta.main semantics changed'
++      );
++    }
++  },
++};
++
++export const declaredMediaAndNamespaceIdentity = {
++  async test() {
++    assert(
++      declaredStatic.marker === 'declared-application',
++      'declared JS did not load'
++    );
++    assert(
++      (await import('./declared.js')) === declaredStatic,
++      'static/dynamic JS namespace identity diverged'
++    );
++    assert(
++      textStatic.default === 'declared text',
++      'declared text did not load'
++    );
++    assert(
++      (await import('./text.txt')) === textStatic,
++      'static/dynamic text namespace identity diverged'
++    );
++    assert(
++      new TextDecoder().decode(dataStatic.default) === 'declared data',
++      'declared data did not load'
++    );
++    assert(
++      (await import('./data.bin')) === dataStatic,
++      'static/dynamic data namespace identity diverged'
++    );
++    assert(
++      wasmStatic.default instanceof WebAssembly.Module,
++      'declared Wasm did not load'
++    );
++    assert(
++      (await import('./module.wasm')) === wasmStatic,
++      'static/dynamic Wasm namespace identity diverged'
++    );
++    await WebAssembly.instantiate(wasmStatic.default, {});
++    assert(
++      tlaStatic.value === 42,
++      'declared top-level-await module did not settle'
++    );
++    assert(
++      (await import('./tla.js')) === tlaStatic,
++      'top-level-await namespace identity diverged'
++    );
++  },
++};
++
++export const cyclesLiveBindingsAndTdz = {
++  async test() {
++    assert(
++      readThroughB() === 1,
++      'cycle did not expose the initialized live binding'
++    );
++    increment();
++    assert(readThroughB() === 2, 'cycle did not preserve a live binding');
++
++    const result = await capture(import('./tdz-a.js'));
++    assert(
++      result.error instanceof ReferenceError,
++      `TDZ graph did not produce ReferenceError: ${result.error?.stack ?? result.error}`
++    );
++  },
++};
++
++export const declaredBuiltinLookingNames = {
++  async test() {
++    assert(
++      cloudflareShadow === 'tenant-cloudflare',
++      'cloudflare: declaration lost to builtin'
++    );
++    assert(
++      nodeProcessShadow === 'tenant-node',
++      'node:process declaration lost to shortcut'
++    );
++    assert(
++      workerdShadow === 'tenant-workerd',
++      'workerd: declaration lost to builtin'
++    );
++    assert(
++      internalLookingShadow === 'tenant-internal-looking',
++      'internal-looking application name was reserved'
++    );
++    assert(
++      oldGeneratedShadow === 'tenant-old-generated',
++      'old generated module spelling was reserved'
++    );
++    assert(
++      (await import('cloudflare:sockets')).default === cloudflareShadow,
++      'dynamic cloudflare: declaration did not retain tenant identity'
++    );
++    assert(
++      (await import('node:process')).default === nodeProcessShadow,
++      'dynamic node:process declaration did not retain tenant identity'
++    );
++    assert(
++      (await import('workerd:runtime')).default === workerdShadow,
++      'dynamic workerd: declaration did not retain tenant identity'
++    );
++  },
++};
++
++export const undeclaredDynamicImports = {
++  async test() {
++    for (const specifier of missingSpecifiers) {
++      await expectModuleNotFound(
++        import(specifier),
++        `dynamic import ${specifier}`
++      );
++    }
++  },
++};
++
++export const undeclaredStaticImportsAndReexports = {
++  async test() {
++    const wrappers = [
++      './bad-static-relative.js',
++      './bad-static-cloudflare.js',
++      './bad-static-node.js',
++      './bad-static-workerd.js',
++      './bad-static-host.js',
++      './bad-reexport-relative.js',
++      './bad-reexport-cloudflare.js',
++      './bad-reexport-node.js',
++      './bad-reexport-workerd.js',
++      './bad-reexport-host.js',
++    ];
++    for (const wrapper of wrappers) {
++      await expectModuleNotFound(
++        import(wrapper),
++        `static/re-export wrapper ${wrapper}`
++      );
++    }
++  },
++};
++
++export const startupEvalAndFunctionResolution = {
++  async test() {
++    assert(
++      directEvalLexicalResult === 42,
++      'direct eval lexical semantics changed'
++    );
++    for (const [kind, results] of Object.entries(startupGeneratedImports)) {
++      for (let i = 0; i < missingSpecifiers.length; ++i) {
++        await expectCapturedModuleNotFound(
++          results[i],
++          `${kind} import ${missingSpecifiers[i]}`
++        );
++      }
++    }
++
++    const positive = await Promise.all(Object.values(declaredGeneratedImports));
++    for (const [index, result] of positive.entries()) {
++      assert(
++        !result.error,
++        `generated declared import ${index} failed: ${result.error?.stack}`
++      );
++    }
++    assert(
++      positive[0].value.default === 'tenant-cloudflare',
++      'eval bypassed application identity'
++    );
++    assert(
++      positive[1].value.default === 'tenant-node',
++      'Function bypassed application identity'
++    );
++    assert(
++      positive[2].value.default === 'tenant-workerd',
++      'new Function bypassed application identity'
++    );
++    assert(
++      positive[3].value.default === 'tenant-internal-looking',
++      'AsyncFunction bypassed application identity'
++    );
++  },
++};
++
++export const commonJsResolution = {
++  async test() {
++    const declared = await import('./app-cjs.cjs');
++    let value = declared;
++    for (let i = 0; i < 3 && value?.marker === undefined; ++i)
++      value = value?.default;
++    assert(
++      value?.marker === 'application-cjs',
++      `application CommonJS resolved unexpected marker: ${value?.marker}`
++    );
++
++    const wrappers = [
++      './bad-require-relative.cjs',
++      './bad-require-cloudflare.cjs',
++      './bad-require-node.cjs',
++      './bad-require-workerd.cjs',
++      './bad-require-host.cjs',
++    ];
++    for (const wrapper of wrappers) {
++      await expectModuleNotFound(
++        import(wrapper),
++        `CommonJS require wrapper ${wrapper}`
++      );
++    }
++  },
++};
++
++export const builtinShortcutsAreClosed = {
++  test() {
++    assert(
++      globalThis.process &&
++        typeof globalThis.process.getBuiltinModule === 'function',
++      'runtime process global is unavailable'
++    );
++    assert(
++      globalThis.process.getBuiltinModule('node:assert') === undefined,
++      'process.getBuiltinModule escaped the declared application graph'
++    );
++    assert(
++      globalThis.process.getBuiltinModule('cloudflare:sockets') === undefined,
++      'getBuiltinModule observed a builtin or tenant shadow outside import resolution'
++    );
++  },
++};
+diff --git a/src/workerd/tests/closed-module-graph-host.js b/src/workerd/tests/closed-module-graph-host.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..99c533bf55762b355af285147cedf16cc67c5e48
+--- /dev/null
++++ b/src/workerd/tests/closed-module-graph-host.js
+@@ -0,0 +1,133 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++import * as applicationMain from './entry.js';
++import * as hostHelper from './host-private.js';
++import hostCjs from './host-cjs.cjs';
++
++export * from './host-private.js';
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message);
++}
++
++function capture(promise) {
++  return Promise.resolve(promise).then(
++    (value) => ({ value }),
++    (error) => ({ error })
++  );
++}
++
++function isModuleNotFound(error) {
++  return (
++    error instanceof Error &&
++    /^(No such module|Module not found)/.test(error.message)
++  );
++}
++
++// Host-authored dynamic import retains HOST_PRIVATE provenance. Generated
++// scripts deliberately do not: V8 gives eval/constructor scripts no policy
++// metadata, so they must default to APPLICATION rather than inherit privilege.
++const hostDynamicHelper = capture(import('./host-private.js'));
++const hostDynamicApplicationMain = capture(import('./entry.js'));
++const hostEvalPrivate = capture(eval('import("./host-private.js")'));
++const hostFunctionPrivate = capture(
++  Function('return import("./host-private.js")')()
++);
++const hostNewFunctionPrivate = capture(
++  new Function('return import("./host-private.js")')()
++);
++const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
++const hostAsyncFunctionPrivate = capture(
++  new AsyncFunction('return import("./host-private.js")')()
++);
++const hostEvalApplication = capture(eval('import("cloudflare:sockets")'));
++
++export const hostModuleIdentity = {
++  async test(_controller, env) {
++    assert(
++      applicationMain !== hostHelper,
++      'application main and host helper unexpectedly share a namespace'
++    );
++    assert(
++      import.meta.url === applicationMain.applicationModuleIdentity.url,
++      'same-spelling host/application identities lost their logical URL'
++    );
++    if (env.EXPECT_IMPORT_META_MAIN) {
++      assert(
++        import.meta.main === true,
++        'configured host entrypoint was not marked main'
++      );
++    } else {
++      assert(
++        import.meta.main === undefined,
++        'legacy host import.meta.main semantics changed'
++      );
++    }
++  },
++};
++
++export const hostDynamicResolution = {
++  async test() {
++    const helper = await hostDynamicHelper;
++    assert(
++      !helper.error,
++      `host dynamic private import failed: ${helper.error?.stack}`
++    );
++    assert(
++      helper.value === hostHelper,
++      'host dynamic namespace identity diverged'
++    );
++
++    const app = await hostDynamicApplicationMain;
++    assert(
++      !app.error,
++      `host dynamic application-main bridge failed: ${app.error?.stack}`
++    );
++    assert(
++      app.value === applicationMain,
++      'host application-main namespace identity diverged'
++    );
++  },
++};
++
++export const generatedHostCodeDefaultsToApplication = {
++  async test() {
++    for (const [kind, promise] of [
++      ['eval', hostEvalPrivate],
++      ['Function', hostFunctionPrivate],
++      ['new Function', hostNewFunctionPrivate],
++      ['AsyncFunction', hostAsyncFunctionPrivate],
++    ]) {
++      const result = await promise;
++      assert(result.error, `${kind} unexpectedly inherited host privilege`);
++      assert(
++        isModuleNotFound(result.error),
++        `${kind} produced unexpected error: ${result.error?.stack ?? result.error}`
++      );
++    }
++
++    const application = await hostEvalApplication;
++    assert(
++      !application.error,
++      `host eval did not default to application provenance: ${application.error?.stack}`
++    );
++    assert(
++      application.value.default === 'tenant-cloudflare',
++      'host eval resolved something other than the declared application module'
++    );
++  },
++};
++
++export const hostCommonJsResolution = {
++  test() {
++    let value = hostCjs;
++    for (let i = 0; i < 3 && value?.marker === undefined; ++i)
++      value = value?.default;
++    assert(
++      value?.marker === 'host-private-cjs',
++      `host CommonJS resolved unexpected marker: ${value?.marker}`
++    );
++  },
++};
+diff --git a/src/workerd/tests/closed-module-graph-test.wd-test b/src/workerd/tests/closed-module-graph-test.wd-test
+new file mode 100644
+index 0000000000000000000000000000000000000000..82e898834c409c38a209f56cc3051642b5bada5d
+--- /dev/null
++++ b/src/workerd/tests/closed-module-graph-test.wd-test
+@@ -0,0 +1,92 @@
++using Workerd = import "/workerd/workerd.capnp";
++
++# The first two definitions deliberately use the same logical name. Their
++# identities differ only by provenance; rejecting this configuration or
++# aliasing either definition to the other is a policy bug.
++const closedModules :List(Workerd.Worker.Module) = [
++  (name = "entry.js", esModule = embed "closed-module-graph-host.js", role = hostPrivate),
++  (name = "entry.js", esModule = embed "closed-module-graph-app.js"),
++
++  # HOST_PRIVATE -> HOST_PRIVATE -> exact APPLICATION main.
++  (name = "host-private.js", role = hostPrivate,
++   esModule = "import * as applicationMain from './entry.js';\nconst dynamicApplicationMain = import('./entry.js');\nexport * from './entry.js';\nexport const hostPrivateBridge = {\n  async test() {\n    if (await dynamicApplicationMain !== applicationMain) {\n      throw new Error('host bridge did not preserve application-main namespace identity');\n    }\n    if (typeof applicationMain.applicationModuleIdentity?.test !== 'function') {\n      throw new Error('host bridge did not resolve the configured application main');\n    }\n  },\n};\n"),
++
++  # CommonJS provenance uses two distinct definitions with one spelling.
++  (name = "host-cjs.cjs", role = hostPrivate,
++   commonJsModule = "module.exports = require('./shared-cjs-dep.cjs')"),
++  (name = "shared-cjs-dep.cjs", role = hostPrivate,
++   commonJsModule = "module.exports = { marker: 'host-private-cjs' }"),
++  (name = "shared-cjs-dep.cjs",
++   commonJsModule = "module.exports = { marker: 'application-cjs' }"),
++  (name = "app-cjs.cjs",
++   commonJsModule = "module.exports = require('./shared-cjs-dep.cjs')"),
++
++  # Declared application graph and non-JavaScript media.
++  (name = "declared.js", esModule = "export const marker = 'declared-application';"),
++  (name = "text.txt", text = "declared text"),
++  (name = "data.bin", data = "declared data"),
++  (name = "module.wasm", wasm = embed "test.wasm"),
++  (name = "tla.js", esModule = "await Promise.resolve(); export const value = 42;"),
++
++  # Cycles and live bindings.
++  (name = "cycle-a.js", esModule = "import { readA } from './cycle-b.js';\nexport let value = 1;\nexport const readThroughB = () => readA();\nexport const increment = () => ++value;\n"),
++  (name = "cycle-b.js", esModule = "import { value } from './cycle-a.js';\nexport const readA = () => value;\n"),
++
++  # This graph must fail with the native TDZ ReferenceError, not be rewritten.
++  (name = "tdz-a.js", esModule = "import { readA } from './tdz-b.js';\nexport const observed = readA();\nexport let value = 1;\n"),
++  (name = "tdz-b.js", esModule = "import { value } from './tdz-a.js';\nexport const readA = () => value;\n"),
++
++  # Explicit declarations win even when their spellings resemble runtime or
++  # previously-generated host modules. There is no reserved tenant prefix.
++  (name = "cloudflare:sockets", esModule = "export default 'tenant-cloudflare';"),
++  (name = "node:process", esModule = "export default 'tenant-node';"),
++  (name = "workerd:runtime", esModule = "export default 'tenant-workerd';"),
++  (name = "node-internal:public_process", esModule = "export default 'tenant-internal-looking';"),
++  (name = "__takoserver_host_entry__.js", esModule = "export default 'tenant-old-generated';"),
++
++  # Dynamically loading these declared wrappers exercises their static import
++  # and re-export resolution without making worker startup itself fail.
++  (name = "bad-static-relative.js", esModule = "import './missing.js';"),
++  (name = "bad-static-cloudflare.js", esModule = "import 'cloudflare:workers';"),
++  (name = "bad-static-node.js", esModule = "import 'node:assert';"),
++  (name = "bad-static-workerd.js", esModule = "import 'workerd:missing';"),
++  (name = "bad-static-host.js", esModule = "import './host-private.js';"),
++  (name = "bad-reexport-relative.js", esModule = "export * from './missing.js';"),
++  (name = "bad-reexport-cloudflare.js", esModule = "export * from 'cloudflare:workers';"),
++  (name = "bad-reexport-node.js", esModule = "export * from 'node:assert';"),
++  (name = "bad-reexport-workerd.js", esModule = "export * from 'workerd:missing';"),
++  (name = "bad-reexport-host.js", esModule = "export * from './host-private.js';"),
++
++  # CommonJS require() must use the same application-only policy.
++  (name = "bad-require-relative.cjs", commonJsModule = "require('./missing.cjs')"),
++  (name = "bad-require-cloudflare.cjs", commonJsModule = "require('cloudflare:workers')"),
++  (name = "bad-require-node.cjs", commonJsModule = "require('node:assert')"),
++  (name = "bad-require-workerd.cjs", commonJsModule = "require('workerd:missing')"),
++  (name = "bad-require-host.cjs", commonJsModule = "require('./host-private.js')"),
++];
++
++const legacyWorker :Workerd.Worker = (
++  modules = .closedModules,
++  compatibilityFlags = ["nodejs_compat_v2", "experimental", "allow_eval_during_startup"],
++  modulePolicy = (applicationMain = "entry.js"),
++  bindings = [(name = "EXPECT_IMPORT_META_MAIN", json = "false")],
++);
++
++const newRegistryWorker :Workerd.Worker = (
++  modules = .closedModules,
++  compatibilityFlags = [
++    "nodejs_compat_v2",
++    "new_module_registry",
++    "experimental",
++    "allow_eval_during_startup",
++  ],
++  modulePolicy = (applicationMain = "entry.js"),
++  bindings = [(name = "EXPECT_IMPORT_META_MAIN", json = "true")],
++);
++
++const unitTests :Workerd.Config = (
++  services = [
++    (name = "closed-module-graph-legacy", worker = .legacyWorker),
++    (name = "closed-module-graph-new", worker = .newRegistryWorker),
++  ],
++);

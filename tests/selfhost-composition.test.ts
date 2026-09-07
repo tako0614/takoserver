@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { createCatalog } from "../src/catalog.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { createProviderDriver, createProviderFormAvailability } from "../src/provider-driver.ts";
-import type { ProviderRelation } from "../src/provider-port.ts";
+import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import { resolveRuntimeBindingMaterialRoute } from "../src/provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
@@ -22,6 +23,9 @@ import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
  */
 
 const runtime: WorkerdRuntime = {
+  async inspectModule(input) {
+    return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+  },
   async write() {},
   async remove() {},
   async reload() {},
@@ -40,10 +44,15 @@ const leases: ProviderRuntimeInputLeasePort = {
   async abandon() {},
 };
 
-async function compose(edgeForms: boolean, runtimeInputs?: ProviderRuntimeInputLeasePort) {
+async function compose(
+  edgeForms: boolean,
+  runtimeInputs?: ProviderRuntimeInputLeasePort,
+  workerRuntimeAvailable?: boolean,
+  stableForms = stableProductionTakoformCatalog().forms,
+) {
   return createSelfhostComposition({
     edge: await buildEdgeForms(),
-    stableForms: stableProductionTakoformCatalog().forms,
+    stableForms,
     dataRoot: "/tmp/unused",
     runtime,
     artifacts: {
@@ -56,6 +65,7 @@ async function compose(edgeForms: boolean, runtimeInputs?: ProviderRuntimeInputL
     },
     edgeForms,
     ...(runtimeInputs ? { runtimeInputs } : {}),
+    ...(workerRuntimeAvailable === undefined ? {} : { workerRuntimeAvailable }),
     now: new Date("2026-06-01T00:00:00.000Z"),
   });
 }
@@ -108,6 +118,27 @@ function bucketRelation(
 }
 
 describe("the self-host catalog", () => {
+  test("does not advertise Worker execution when the pinned runtime is unavailable", async () => {
+    const composition = await compose(true, undefined, false);
+    expect(composition.offerings.map((offering) => offering.form.kind).sort()).toEqual([
+      "AtLeastOnceQueue",
+      "EdgeKVNamespace",
+      "SQLiteDatabase",
+    ]);
+    const workerKinds = new Set([
+      "ModuleWorker",
+      "WorkerVersion",
+      "WorkerDeployment",
+      "WorkerCustomDomain",
+      "WorkerEndpoint",
+      "WorkerCronTrigger",
+      "QueueConsumer",
+    ]);
+    expect(
+      composition.provider.offerings.some((offering) => workerKinds.has(offering.form.kind)),
+    ).toBe(false);
+  });
+
   test("offers stable Edge identities while keeping released beta identities drain-only", async () => {
     const composition = await compose(true);
     expect(composition.offerings.map((offering) => offering.form.kind).sort()).toEqual([
@@ -165,6 +196,175 @@ describe("the self-host catalog", () => {
       );
       expect(matches).toHaveLength(1);
     }
+  });
+
+  test("composes readback authority only for relation Forms with sellable anchors", async () => {
+    const composition = await compose(true);
+    const authorities = composition.provider.nativeReadbackAuthorities ?? [];
+    expect(authorities.map((authority) => authority.offeringId).sort()).toEqual([
+      "selfhost.edge.queueconsumer",
+      "selfhost.edge.stable-v1.queueconsumer",
+      "selfhost.edge.stable-v1.workercrontrigger",
+      "selfhost.edge.stable-v1.workercustomdomain",
+      "selfhost.edge.stable-v1.workerdeployment",
+      "selfhost.edge.stable-v1.workerendpoint",
+      "selfhost.edge.stable-v1.workerversion",
+      "selfhost.edge.workercrontrigger",
+      "selfhost.edge.workercustomdomain",
+      "selfhost.edge.workerdeployment",
+      "selfhost.edge.workerendpoint",
+      "selfhost.edge.workerversion",
+    ]);
+    const tuples = authorities.map((authority) =>
+      [
+        authority.offeringId,
+        authority.providerInstallationRef,
+        authority.form.apiVersion,
+        authority.form.kind,
+        authority.form.definitionVersion,
+        authority.form.schemaDigest,
+      ].join("\u0000"),
+    );
+    expect(new Set(tuples).size).toBe(authorities.length);
+    for (const authority of authorities) {
+      expect(authority.providerInstallationRef).toBe("local.primary");
+      expect(
+        composition.provider.offerings.find((offering) => offering.id === authority.offeringId)
+          ?.form,
+      ).toEqual(authority.form);
+    }
+
+    const stableForms = stableProductionTakoformCatalog().forms;
+    const withoutWorker = await compose(
+      true,
+      undefined,
+      undefined,
+      stableForms.filter((form) => form.identity.formRef.kind !== "ModuleWorker"),
+    );
+    expect(withoutWorker.provider.nativeReadbackAuthorities).toEqual([]);
+
+    const withoutQueue = await compose(
+      true,
+      undefined,
+      undefined,
+      stableForms.filter((form) => form.identity.formRef.kind !== "AtLeastOnceQueue"),
+    );
+    expect(
+      withoutQueue.provider.nativeReadbackAuthorities?.some(
+        (authority) => authority.form.kind === "QueueConsumer",
+      ),
+    ).toBe(false);
+    expect(
+      withoutQueue.provider.nativeReadbackAuthorities?.some(
+        (authority) => authority.form.kind === "WorkerVersion",
+      ),
+    ).toBe(true);
+
+    const runtimeUnavailable = await compose(true, undefined, false);
+    expect(runtimeUnavailable.provider.nativeReadbackAuthorities).toEqual([]);
+  });
+
+  test("lets the driver invoke a technical relation readback through its authority", async () => {
+    const composition = await compose(true);
+    const version = composition.provider.offerings.find(
+      (offering) => offering.id === "selfhost.edge.stable-v1.workerversion",
+    );
+    if (!version) throw new Error("stable WorkerVersion offering missing");
+    const nativeId = "selfhost-version:worker:v1";
+    const resourceUid = "uid-version-v1";
+    const deployment = {
+      tenantId: "org_demo",
+      id: "dep-version-v1",
+      resourceUid,
+      offeringId: version.id,
+      providerPackRef: composition.provider.id,
+      providerInstallationRef: "local.primary",
+      nativeId,
+      nativeClaimed: false,
+      state: "deleted" as const,
+      observed: {},
+      outputs: {
+        __takoserver: {
+          resourceUid,
+          space: "default",
+          name: "version-v1",
+          generation: "1",
+        },
+      },
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z",
+    };
+    const tombstone = {
+      tenantId: "org_demo",
+      resourceUid,
+      address: {
+        tenantId: "org_demo",
+        space: "default",
+        apiVersion: version.form.apiVersion,
+        kind: version.form.kind,
+        name: "version-v1",
+      },
+      formRef: version.form,
+      state: "closed" as const,
+      closureFence: 1,
+      effects: [
+        {
+          operationId: "op-version-delete",
+          kind: "delete" as const,
+          phase: "succeeded" as const,
+          operationMode: "initial" as const,
+          providerPackRef: composition.provider.id,
+          providerInstallationRef: "local.primary",
+          nativeId,
+        },
+      ],
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z",
+    };
+    let readbacks = 0;
+    const provider: Provider = {
+      ...composition.provider,
+      async verifyNativeAbsence(input) {
+        readbacks += 1;
+        if (!composition.provider.verifyNativeAbsence) {
+          throw new Error("self-host provider readback is unavailable");
+        }
+        return await composition.provider.verifyNativeAbsence(input);
+      },
+    };
+    const driver = createProviderDriver({
+      providers: [provider],
+      providerPacks: composition.providerPacks,
+      catalog: createCatalog(composition.offerings),
+      ledger: {} as never,
+      deployments: {
+        async forResource() {
+          return [deployment];
+        },
+      } as never,
+      deletions: {
+        async readResourceDeletion() {
+          return tombstone;
+        },
+        async cacheResourceDeletionEvidence() {
+          return true;
+        },
+      } as never,
+    });
+    if (!driver.verifyNativeAbsence) throw new Error("provider driver readback is unavailable");
+    const evidence = await driver.verifyNativeAbsence({
+      tenantId: "org_demo",
+      resourceUid,
+      space: "default",
+      name: "version-v1",
+    });
+    expect(readbacks).toBe(1);
+    expect(evidence).toMatchObject({
+      status: "absent",
+      source: "provider",
+      effectCount: 1,
+      deploymentCount: 1,
+    });
   });
 
   test("executes a stable ModuleWorker through the ordinary self-host provider", async () => {

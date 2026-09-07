@@ -1,7 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CloudflareProviderExecutorInspection } from "./cloudflare-provider-executor.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import {
   DeployError,
@@ -32,6 +31,7 @@ import {
 import type { DeployTarget } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
+  type ProviderExecutorInspection,
   providerExecutorQualificationReader,
   providerExecutorStatus,
   type WorkerProviderExecutorQualification,
@@ -83,6 +83,8 @@ export interface PublicParentTokenRetirementOptions {
   readonly state?: PublicParentTokenRetirementState;
   readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
   readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
+  readonly sourceRepositoryRoot?: string;
+  readonly wranglerPath?: string;
   readonly outputDirectory?: string;
   readonly review?: string;
   readonly publicationLease?: WranglerVersionPublicationLease;
@@ -130,6 +132,7 @@ export async function runPublicParentTokenRetirement(
       : await resolveCloudflareCredential(invocation.environment, {
           cloudflareEnvironment: options.cloudflareEnvironment,
           run,
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         });
   const environment = credential?.childEnvironment ?? {};
   const cloudflareState =
@@ -143,10 +146,6 @@ export async function runPublicParentTokenRetirement(
   if (state === null) throw preflightError("public parent-token retirement state is unavailable");
   const qualification = providerExecutorQualificationReader({
     target,
-    commit: invocation.commit,
-    state: cloudflareState,
-    environment,
-    run,
     ...(options.providerExecutorQualification === undefined
       ? {}
       : { injected: options.providerExecutorQualification }),
@@ -198,9 +197,13 @@ export async function runPublicParentTokenRetirement(
       root,
       target,
       commit: source.commit,
+      ...(options.sourceRepositoryRoot === undefined
+        ? {}
+        : { sourceRepositoryRoot: options.sourceRepositoryRoot }),
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       run,
       environment,
-      writeConfig: publicParentConfigWriter(target, source.commit),
+      writeConfig: publicParentConfigWriter(target, source.commit, options.sourceRepositoryRoot),
     });
     artifact = prepared.seal();
     artifact.assertUnchanged();
@@ -254,6 +257,7 @@ export async function runPublicParentTokenRetirement(
         configPath: prepared.configPath,
         environment,
         run,
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       });
       targetTouched = true;
       artifact.assertUnchanged();
@@ -321,6 +325,7 @@ export async function runPublicParentTokenRetirement(
       configPath: prepared.configPath,
       environment,
       run,
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
     });
     targetTouched = true;
     const after = await inspectPublicRetirementState("verification", target, state);
@@ -536,7 +541,7 @@ async function inspectPublicRetirementState(
 
 function statusResult(
   invocation: PublicParentTokenRetirementInvocation,
-  executor: CloudflareProviderExecutorInspection,
+  executor: ProviderExecutorInspection,
   inspected: PublicRetirementInspection,
 ): Record<string, unknown> {
   const complete = isCompleted(inspected, invocation.commit);
@@ -564,6 +569,7 @@ function statusResult(
 function publicParentConfigWriter(
   target: DeployTarget,
   commit: string,
+  sourceRepositoryRoot?: string,
 ): (input: {
   readonly path: string;
   readonly main: string;
@@ -575,6 +581,7 @@ function publicParentConfigWriter(
       path: input.path,
       main: input.main,
       commit,
+      ...(sourceRepositoryRoot === undefined ? {} : { sourceRepositoryRoot }),
       signingKeyId: target.signing.currentKeyId,
       transitionExpectedSecrets: publicParentSecrets(target),
       ...(input.formImplementationIdentity === undefined
@@ -608,11 +615,12 @@ async function runBindingRelease(input: {
   readonly configPath: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly run: PublicParentTokenRetirementProcess;
+  readonly wranglerPath?: string;
 }): Promise<void> {
   let result: CommandResult;
   try {
     result = await input.run(
-      wranglerCommand([
+      deployWranglerCommand(input.wranglerPath, [
         "deploy",
         input.bundlePath,
         "--no-bundle",
@@ -643,11 +651,12 @@ async function runParentTokenDeletion(input: {
   readonly configPath: string;
   readonly environment: Readonly<Record<string, string>>;
   readonly run: PublicParentTokenRetirementProcess;
+  readonly wranglerPath?: string;
 }): Promise<void> {
   let result: CommandResult;
   try {
     result = await input.run(
-      wranglerCommand([
+      deployWranglerCommand(input.wranglerPath, [
         "secret",
         "delete",
         PUBLIC_PARENT_TOKEN,
@@ -670,6 +679,13 @@ async function runParentTokenDeletion(input: {
       `exit=${result.exitCode}`,
     );
   }
+}
+
+function deployWranglerCommand(
+  wranglerPath: string | undefined,
+  args: readonly string[],
+): readonly string[] {
+  return wranglerPath === undefined ? wranglerCommand(args) : [wranglerPath, ...args];
 }
 
 function authorityProfileForCanonicalVersion(

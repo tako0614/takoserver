@@ -10,10 +10,11 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
+import { canonicalDigest } from "../src/json.ts";
 import type {
   ProviderOffering,
   ProviderRelation,
@@ -156,6 +157,31 @@ function versionDirectoryName(dataRoot: string, script: string): string {
   return first;
 }
 
+async function publishedModule(
+  dataRoot: string,
+  script: string,
+  provenance: "application" | "hostPrivate",
+  name: string,
+): Promise<string> {
+  const manifest = JSON.parse(
+    await readFile(join(dataRoot, "workers", script, "takoserver-site.json"), "utf8"),
+  ) as {
+    moduleFiles: Record<"application" | "hostPrivate", { name: string; key: string }[]>;
+  };
+  const entry = manifest.moduleFiles[provenance].find((candidate) => candidate.name === name);
+  if (!entry) throw new Error(`published ${provenance} module is absent: ${name}`);
+  return await readFile(
+    join(
+      dataRoot,
+      "workers",
+      script,
+      provenance === "application" ? "application" : "host-private",
+      entry.key,
+    ),
+    "utf8",
+  );
+}
+
 const endpointAssignment = (hostname = "reserved.localhost") => ({
   canonicalPublicOrigin: `https://${hostname}`,
   assignmentDigest: `sha256:${"e".repeat(64)}` as const,
@@ -173,6 +199,7 @@ afterEach(() => {
 
 interface ProviderCase {
   readonly modules?: Record<string, string>;
+  readonly siteFiles?: readonly string[];
   readonly events?: {
     forgetSchedules(script: string, cron?: string): Promise<void>;
   };
@@ -307,6 +334,9 @@ function servingRuntime(): {
   return {
     state: { log },
     runtime: {
+      async inspectModule(input) {
+        return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+      },
       async write(name, site) {
         log.push("write");
         await yieldTurn();
@@ -360,6 +390,9 @@ function flakyRuntime(): { runtime: WorkerdRuntime; state: FlakyRuntimeState } {
   return {
     state,
     runtime: {
+      async inspectModule(input) {
+        return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+      },
       async write() {
         state.writes += 1;
         if (state.failNextWrite) {
@@ -387,12 +420,24 @@ function flakyRuntime(): { runtime: WorkerdRuntime; state: FlakyRuntimeState } {
   };
 }
 
+const TEST_WORKER_SOURCE = "export default { fetch() {}, queue() {}, scheduled() {} };";
+
+function materializingRuntime(
+  options: Parameters<typeof createWorkerdRuntime>[0],
+): ReturnType<typeof createWorkerdRuntime> {
+  return Object.assign(createWorkerdRuntime(options), {
+    async inspectModule(input: Parameters<WorkerdRuntime["inspectModule"]>[0]) {
+      return { outcome: "valid" as const, exportedHandlers: [...input.declaredHandlers] };
+    },
+  });
+}
+
 function provider(options: ProviderCase = {}) {
-  const modules = options.modules ?? { "index.js": "export default {}" };
+  const modules = options.modules ?? { "index.js": TEST_WORKER_SOURCE };
   return createSelfhostProvider({
     offerings: [],
     dataRoot: root,
-    runtime: options.runtime ?? createWorkerdRuntime({ root, isReady: () => true }),
+    runtime: options.runtime ?? materializingRuntime({ root, isReady: () => true }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined
@@ -414,10 +459,11 @@ function provider(options: ProviderCase = {}) {
         if (digest === "sha256:site") {
           return {
             kind: "StaticAssetBundle",
-            files: [
-              { path: "index.html", digest: "sha256:index.html" },
-              { path: "app.css", digest: "sha256:app.css" },
-            ],
+            files: (options.siteFiles ?? ["index.html", "app.css"]).map((path) => ({
+              path,
+              digest: `sha256:${path}`,
+              mediaType: path === "index.html" ? "text/html" : "text/css",
+            })),
           };
         }
         return null;
@@ -565,6 +611,9 @@ describe("publishing a Worker through the Edge Family", () => {
     const asked: string[] = [];
     const local = provider({
       runtime: {
+        async inspectModule(input) {
+          return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+        },
         async write() {},
         async remove() {},
         async reload() {},
@@ -573,9 +622,8 @@ describe("publishing a Worker through the Edge Family", () => {
         },
         async probe(name, path) {
           asked.push(`${name} ${path}`);
-          // Nothing answered at all: this deployment does not run the runtime
-          // in this process, which is not a bad answer and never refuses a
-          // valid publication.
+          // Semantic loading has already passed the required verifier above.
+          // Serving-process activation is a separate readiness observation.
           return null;
         },
       },
@@ -644,20 +692,24 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(runtime.state.log).toEqual(["write", "reload", "probe", "write", "reload", "probe"]);
   });
 
-  test("refuses a bundle that carries a module under this Host's generated name", async () => {
+  test("keeps a tenant module under this Host's generated name in the application namespace", async () => {
     const local = provider({
       modules: {
-        "index.js": "export default {}",
+        "index.js": TEST_WORKER_SOURCE,
         "__takoserver-selfhost-entrypoint.js": "export default {}",
       },
     });
-    expect((await publishChain(local)).deployment).toMatchObject({
-      phase: "failed",
-      failure: {
-        code: "invalid_spec",
-        message: "the Worker bundle claims this Host's entrypoint module name",
-      },
-    });
+    const { script, deployment } = await publishChain(local);
+    expect(deployment).toMatchObject({ phase: "succeeded" });
+    expect(
+      await publishedModule(root, script, "application", "__takoserver-selfhost-entrypoint.js"),
+    ).toBe("export default {}");
+    expect(
+      await publishedModule(root, script, "hostPrivate", "__takoserver-selfhost-entrypoint.js"),
+    ).not.toBe("export default {}");
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(config).toContain("role = hostPrivate");
+    expect(config).toContain("role = application");
   });
 
   test("a deployment publishes the version's modules into workerd", async () => {
@@ -668,7 +720,7 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(config).toContain(`(name = "${script}", service = "${script}")`);
     // Relative, because workerd resolves an embed against the config's own
     // directory and silently fails to read an absolute one.
-    expect(config).toContain(`embed "${script}/index.js"`);
+    expect(config).toContain(`embed "${script}/application/module-00000"`);
     expect(config).not.toContain(`embed "${root}`);
   });
 
@@ -1004,11 +1056,17 @@ describe("publishing a Worker through the Edge Family", () => {
   });
 
   test("a differing Worker Version digest refuses overwrite and preserves the committed modules", async () => {
-    const first = provider({ modules: { "index.js": "a", "old.js": "b" } });
+    const first = provider({
+      modules: { "index.js": TEST_WORKER_SOURCE, "old.js": "export const old = 1;" },
+    });
     const script = await publish(first);
-    expect(await readFile(join(root, "workers", script, "old.js"), "utf8")).toBe("b");
+    expect(await publishedModule(root, script, "application", "old.js")).toBe(
+      "export const old = 1;",
+    );
 
-    const second = provider({ modules: { "index.js": "a2" } });
+    const second = provider({
+      modules: { "index.js": `${TEST_WORKER_SOURCE}\n// different bytes` },
+    });
     const worker = await second.apply({
       operationId: "op_worker",
       offering: offering("ModuleWorker"),
@@ -1037,8 +1095,10 @@ describe("publishing a Worker through the Edge Family", () => {
     // Immutable Worker Version identities are create-only. A module the new
     // bundle does not contain must not be able to erase or replace committed
     // bytes under the same identity.
-    expect(await readFile(join(root, "workers", script, "old.js"), "utf8")).toBe("b");
-    expect(await readFile(join(root, "workers", script, "index.js"), "utf8")).toBe("a");
+    expect(await publishedModule(root, script, "application", "old.js")).toBe(
+      "export const old = 1;",
+    );
+    expect(await publishedModule(root, script, "application", "index.js")).toBe(TEST_WORKER_SOURCE);
   });
 
   test("refuses a custom domain this deployment does not serve", async () => {
@@ -1154,7 +1214,7 @@ describe("publishing a Worker through the Edge Family", () => {
 
   test("does not treat a staged manifest as serving after reload fails", async () => {
     let failNextReload = false;
-    const runtime = createWorkerdRuntime({
+    const runtime = materializingRuntime({
       root,
       isReady: () => true,
       onReload: async () => {
@@ -1256,6 +1316,287 @@ describe("publishing a Worker through the Edge Family", () => {
       relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
     ],
     ...extra,
+  });
+
+  test("semantic module refusal precedes sensitive lease acquisition and materialization", async () => {
+    const { port, log } = fakeLeases(() => root);
+    let inspections = 0;
+    const runtime = Object.assign(createWorkerdRuntime({ root, isReady: () => true }), {
+      async inspectModule() {
+        inspections += 1;
+        return { outcome: "invalid" as const, error: "handler_not_exported" as const };
+      },
+    });
+    const local = provider({ runtime, runtimeInputs: port });
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+    expect(inspections).toBe(1);
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
+  test("asset routing admission precedes sensitive lease acquisition and materialization", async () => {
+    const cases = [
+      {
+        siteFiles: ["app.css"],
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+          notFoundHandling: "single_page_application",
+          runWorkerFirst: false,
+        },
+      },
+      {
+        siteFiles: ["index.html"],
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+          notFoundHandling: "none",
+        },
+      },
+    ] as const;
+    for (const fixture of cases) {
+      const { port, log } = fakeLeases(() => root);
+      const local = provider({ runtimeInputs: port, siteFiles: fixture.siteFiles });
+      const request = sensitiveApply({
+        spec: { ...sensitiveApply().spec, assets: fixture.assets },
+        relations: [
+          ...sensitiveApply().relations,
+          relation("/assets/bundle", "StaticAssetBundle", "site", {
+            manifestDigest: "sha256:site",
+          }),
+        ],
+      });
+
+      expect(await local.apply(request)).toMatchObject({
+        phase: "failed",
+        failure: { code: "invalid_spec", retryable: false },
+      });
+      expect(log.events).toEqual([]);
+      expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    }
+  });
+
+  test("an unavailable semantic verifier cannot publish or consume sensitive inputs", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const runtime = Object.assign(createWorkerdRuntime({ root, isReady: () => true }), {
+      async inspectModule() {
+        return { outcome: "unavailable" as const, retryable: true as const };
+      },
+    });
+    const local = provider({ runtime, runtimeInputs: port });
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+  });
+
+  test("semantic verification receives only the exact module graph before sensitive inputs", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const snapshots: unknown[] = [];
+    const runtime = Object.assign(createWorkerdRuntime({ root, isReady: () => true }), {
+      async inspectModule(input: unknown) {
+        snapshots.push(input);
+        expect(log.events).toEqual([]);
+        return { outcome: "valid" as const, exportedHandlers: ["fetch" as const] };
+      },
+    });
+    const modules = {
+      "index.js": 'import { handler } from "./handler.js"; export default { fetch: handler };',
+      "handler.js": 'export const handler = () => new Response("ok");',
+    };
+    const local = provider({ runtime, runtimeInputs: port, modules });
+
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "succeeded" });
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]).toEqual({
+      mainModule: "index.js",
+      declaredHandlers: ["fetch"],
+      modules: Object.entries(modules).map(([name, source]) => ({
+        name,
+        digest: `sha256:${createHash("sha256").update(source).digest("hex")}`,
+        mediaType: "application/javascript+module",
+        bytes: new TextEncoder().encode(source),
+      })),
+    });
+    expect(log.events).toEqual([
+      "acquire",
+      "dispatch",
+      expect.stringMatching(/^settle:sha256:[0-9a-f]{64}$/u),
+    ]);
+  });
+
+  for (const source of [
+    "export default { fetch() {} };",
+    "export default { fetch() {}, queue() {} };",
+  ]) {
+    test(`import refuses a different immutable handler declaration: ${source}`, async () => {
+      const { port, log } = fakeLeases(() => root);
+      const local = provider({ runtimeInputs: port, modules: { "index.js": source } });
+      const applied = await local.apply(sensitiveApply());
+      if (applied.phase !== "succeeded") throw new Error("the fixture version did not apply");
+      if (!local.adopt) throw new Error("the selfhost provider is missing import");
+      log.events.length = 0;
+      const changed = {
+        ...sensitiveApply(),
+        operationId: "op_import_version",
+        nativeId: applied.result.nativeId,
+        spec: { ...sensitiveApply().spec, handlers: ["fetch", "queue"] },
+      };
+      expect(await local.adopt(changed)).toMatchObject({
+        phase: "failed",
+        failure: { code: "conflict", retryable: false },
+      });
+      expect(await local.observe(changed)).toMatchObject({
+        phase: "failed",
+        failure: { code: "conflict", retryable: false },
+      });
+      expect(log.events).toEqual([]);
+    });
+  }
+
+  test("import refuses a different bundle instead of inspecting unrelated retained bytes", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const applied = await local.apply(sensitiveApply());
+    if (applied.phase !== "succeeded") throw new Error("the fixture version did not apply");
+    if (!local.adopt) throw new Error("the selfhost provider is missing import");
+    log.events.length = 0;
+    expect(
+      await local.adopt({
+        ...sensitiveApply(),
+        operationId: "op_import_other_bundle",
+        nativeId: applied.result.nativeId,
+        spec: {
+          ...sensitiveApply().spec,
+          bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "other-bundle" },
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/bundle", "WorkerBundle", "other-bundle", {
+            manifestDigest: "sha256:other-bundle",
+          }),
+        ],
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "conflict", retryable: false } });
+    expect(log.events).toEqual([]);
+  });
+
+  test("import accepts an identical projection with handler order normalized and no new lease", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({
+      runtimeInputs: port,
+      modules: { "index.js": "export default { fetch() {}, queue() {} };" },
+    });
+    const request = sensitiveApply({
+      spec: { ...sensitiveApply().spec, handlers: ["fetch", "queue"] },
+    });
+    const applied = await local.apply(request);
+    if (applied.phase !== "succeeded") throw new Error("the fixture version did not apply");
+    if (!local.adopt) throw new Error("the selfhost provider is missing import");
+    log.events.length = 0;
+    expect(
+      await local.adopt({
+        ...request,
+        operationId: "op_import_same_version",
+        nativeId: applied.result.nativeId,
+        spec: { ...sensitiveApply().spec, handlers: ["queue", "fetch"] },
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect(log.events).toEqual([]);
+  });
+
+  test("recovery cannot settle a handler projection different from the stored wrapper", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({
+      runtimeInputs: port,
+      modules: { "index.js": "export default { fetch() {}, queue() {} };" },
+    });
+    log.settleFails = true;
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "failed" });
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    log.settleFails = false;
+    log.events.length = 0;
+    expect(
+      await local.recoverApply({
+        ...sensitiveApply(),
+        operationMode: "recovery",
+        spec: { ...sensitiveApply().spec, handlers: ["fetch", "queue"] },
+      }),
+    ).toMatchObject({ phase: "failed" });
+    expect(log.events).not.toContainEqual(expect.stringMatching(/^settle:/u));
+    expect(log.events).not.toContain("acquire");
+    expect(log.events).not.toContain("dispatch");
+  });
+
+  test("recovery verifies retained bytes even when legacy metadata hides a same-size change", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const source = "export default { fetch() { return new Response('A'); } };";
+    const replacement = source.replace("'A'", "'B'");
+    const local = provider({ runtimeInputs: port, modules: { "index.js": source } });
+    const applied = await local.apply(sensitiveApply());
+    if (applied.phase !== "succeeded") throw new Error("the fixture version did not apply");
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    const { scriptName, versionId } = applied.result.outputs;
+    if (typeof scriptName !== "string" || typeof versionId !== "string")
+      throw new Error("missing version identity");
+    await writeFile(
+      join(root, "selfhost", "versions", scriptName, versionId, "modules", "index.js"),
+      replacement,
+    );
+    log.events.length = 0;
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+    });
+    expect(log.events).not.toContainEqual(expect.stringMatching(/^settle:/u));
+    expect(log.events).not.toContain("acquire");
+    expect(log.events).not.toContain("dispatch");
+  });
+
+  test("recovery cannot settle same-size substituted legacy static assets", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: {
+        ...base.spec,
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+          notFoundHandling: "single_page_application",
+          runWorkerFirst: false,
+        },
+      },
+      relations: [
+        ...base.relations,
+        relation("/assets/bundle", "StaticAssetBundle", "site", { manifestDigest: "sha256:site" }),
+      ],
+    });
+    log.settleFails = true;
+    expect(await local.apply(request)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    const versionsRoot = join(root, "selfhost", "versions");
+    const asset = readdirSync(versionsRoot, { recursive: true })
+      .map(String)
+      .find((path) => path.endsWith("/assets/asset-00000"));
+    if (!asset) throw new Error("the fixture asset did not materialize");
+    expect(readFileSync(join(versionsRoot, asset), "utf8")).toBe("<html>");
+    await writeFile(join(versionsRoot, asset), "<body>");
+    log.settleFails = false;
+    log.events.length = 0;
+    expect(await local.recoverApply({ ...request, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(log.events).not.toContainEqual(expect.stringMatching(/^settle:/u));
+    expect(log.events).not.toContain("acquire");
+    expect(log.events).not.toContain("dispatch");
   });
 
   test("a sensitive var named after this Host's reserved prefix is refused", async () => {
@@ -1612,6 +1953,9 @@ describe("publishing a Worker through the Edge Family", () => {
       assets?: ReadonlyMap<string, Uint8Array>;
     }[] = [];
     const runtime: WorkerdRuntime = {
+      async inspectModule(input) {
+        return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+      },
       async write(name, site, modules, assets) {
         written.push({ name, site, modules, ...(assets ? { assets } : {}) });
       },
@@ -1624,7 +1968,266 @@ describe("publishing a Worker through the Edge Family", () => {
     const local = provider({ runtime });
     await publish(local, true);
     expect([...(written[0]?.assets?.keys() ?? [])].sort()).toEqual(["app.css", "index.html"]);
-    expect(written[0]?.site.assets).toEqual({ notFoundHandling: "single-page-application" });
+    expect(written[0]?.site.assets).toEqual({
+      notFoundHandling: "single-page-application",
+      runWorkerFirst: false,
+      mediaTypes: {
+        "app.css": "text/css",
+        "index.html": "text/html",
+      },
+    });
+  });
+
+  test("legacy asset routing is refused before routes, triggers, or deployments move", async () => {
+    const local = provider();
+    const script = await publish(local, true);
+    const versionId = versionDirectoryName(root, script);
+    const metaPath = join(root, "selfhost", "versions", script, versionId, "meta.json");
+    const legacy = JSON.parse(await readFile(metaPath, "utf8")) as {
+      materializationDigest: string;
+      assets: { runWorkerFirst?: boolean };
+      [key: string]: unknown;
+    };
+    delete legacy.assets.runWorkerFirst;
+    const { materializationDigest: _oldDigest, ...legacyPayload } = legacy;
+    legacy.materializationDigest = await canonicalDigest(legacyPayload);
+    await writeFile(metaPath, JSON.stringify(legacy), "utf8");
+    const before = await readFile(metaPath, "utf8");
+
+    const versionInput = {
+      operationId: "op_version_legacy_assets",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v1"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+          notFoundHandling: "single_page_application",
+          runWorkerFirst: false,
+        },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+        relation("/assets/bundle", "StaticAssetBundle", "site", {
+          manifestDigest: "sha256:site",
+        }),
+      ],
+    } as const;
+    const failure = {
+      code: "unavailable",
+      message:
+        "the Worker Version's asset routing order is unknown; create and apply a new Worker Version",
+      retryable: true,
+    };
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const stateBefore = await readFile(statePath, "utf8");
+
+    expect(await local.apply(versionInput)).toMatchObject({ phase: "failed", failure });
+    if (!local.recoverApply) throw new Error("selfhost provider missing apply recovery");
+    expect(await local.recoverApply({ ...versionInput, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure,
+    });
+    expect(
+      await local.observe({
+        ...versionInput,
+        nativeId: `selfhost-version:${script}:${versionId}`,
+      }),
+    ).toMatchObject({ phase: "failed", failure });
+    const endpoint = await local.apply({
+      operationId: "op_endpoint_legacy_assets",
+      offering: offering("WorkerEndpoint"),
+      identity: identity("hello-endpoint"),
+      spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+      workerEndpointOriginAssignment: endpointAssignment(),
+    });
+    const domain = await local.apply({
+      operationId: "op_domain_legacy_assets",
+      offering: offering("WorkerCustomDomain"),
+      identity: identity("hello-domain"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        hostname: "legacy.localhost",
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    const trigger = await local.apply({
+      operationId: "op_cron_legacy_assets",
+      offering: offering("WorkerCronTrigger"),
+      identity: identity("hello-cron"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        cron: "0 * * * *",
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(endpoint).toMatchObject({ phase: "failed", failure });
+    expect(domain).toMatchObject({ phase: "failed", failure });
+    expect(trigger).toMatchObject({ phase: "failed", failure });
+    // All three declarations were refused, so none may become latent desired
+    // state that a later, valid Version accidentally publishes.
+    expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+
+    const nextVersion = await local.apply({
+      ...versionInput,
+      operationId: "op_version_after_legacy_assets",
+      identity: identity("hello-v2"),
+    });
+    expect(nextVersion.phase).toBe("succeeded");
+    const nextVersionId =
+      nextVersion.phase === "succeeded" ? String(nextVersion.result.outputs.versionId) : "";
+    const nextDeployment = await local.apply({
+      operationId: "op_deploy_after_legacy_assets",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v2" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-v2"),
+      ],
+    });
+    expect(nextDeployment.phase).toBe("succeeded");
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(config).not.toContain("reserved.localhost");
+    expect(config).not.toContain("legacy.localhost");
+    expect(config).not.toContain(`${script}-selfhost-events`);
+
+    // Selecting the legacy Version is also refused before it replaces the
+    // valid active Version. The serving manifest therefore remains the exact
+    // valid publication rather than a ghost deployment in durable state.
+    expect(
+      await local.apply({
+        operationId: "op_deploy_legacy_assets",
+        offering: offering("WorkerDeployment"),
+        identity: identity("hello-live"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          versions: [
+            {
+              workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+              weight: 10_000,
+            },
+          ],
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+        ],
+      }),
+    ).toMatchObject({ phase: "failed", failure });
+    expect(JSON.parse(await readFile(statePath, "utf8"))).toMatchObject({
+      activeVersion: nextVersionId,
+      domains: [],
+    });
+    expect(await readFile(metaPath, "utf8")).toBe(before);
+  });
+
+  test("legacy asset media and storage layout are never inferred or adopted", async () => {
+    const cases = [
+      {
+        message:
+          "the Worker Version's asset media types are unknown; create and apply a new Worker Version",
+        async makeLegacy(_versionRoot: string, meta: Record<string, unknown>) {
+          const assets = meta.assets as { files: Array<{ mediaType?: string }> };
+          delete assets.files[0]?.mediaType;
+        },
+      },
+      {
+        message:
+          "the Worker Version's asset storage layout is unknown; create and apply a new Worker Version",
+        async makeLegacy(versionRoot: string, meta: Record<string, unknown>) {
+          const assetsRoot = join(versionRoot, "assets");
+          await rename(join(assetsRoot, "asset-00000"), join(assetsRoot, "index.html"));
+          await rename(join(assetsRoot, "asset-00001"), join(assetsRoot, "app.css"));
+          delete (meta.assets as { storageLayout?: string }).storageLayout;
+        },
+      },
+    ] as const;
+
+    for (const [index, fixture] of cases.entries()) {
+      if (index > 0) {
+        rmSync(root, { recursive: true, force: true });
+        root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
+      }
+      const local = provider();
+      const script = await publish(local, true);
+      const versionId = versionDirectoryName(root, script);
+      const versionRoot = join(root, "selfhost", "versions", script, versionId);
+      const metaPath = join(versionRoot, "meta.json");
+      const legacy = JSON.parse(await readFile(metaPath, "utf8")) as Record<string, unknown> & {
+        materializationDigest: string;
+      };
+      await fixture.makeLegacy(versionRoot, legacy);
+      const { materializationDigest: _oldDigest, ...legacyPayload } = legacy;
+      legacy.materializationDigest = await canonicalDigest(legacyPayload);
+      await writeFile(metaPath, JSON.stringify(legacy));
+      const metaBefore = await readFile(metaPath, "utf8");
+      const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+      const stateBefore = await readFile(statePath, "utf8");
+      const versionInput = {
+        operationId: `op_version_legacy_asset_metadata_${index}`,
+        offering: offering("WorkerVersion"),
+        identity: identity("hello-v1"),
+        spec: {
+          bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+          handlers: ["fetch"],
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          assets: {
+            bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "site" },
+            notFoundHandling: "single_page_application",
+            runWorkerFirst: false,
+          },
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+          relation("/assets/bundle", "StaticAssetBundle", "site", {
+            manifestDigest: "sha256:site",
+          }),
+        ],
+      } as const;
+      const failure = {
+        code: "unavailable",
+        message: fixture.message,
+        retryable: true,
+      };
+
+      expect(await local.apply(versionInput)).toMatchObject({ phase: "failed", failure });
+      if (!local.recoverApply) throw new Error("selfhost provider missing apply recovery");
+      expect(
+        await local.recoverApply({ ...versionInput, operationMode: "recovery" }),
+      ).toMatchObject({ phase: "failed", failure });
+      expect(
+        await local.observe({
+          ...versionInput,
+          nativeId: `selfhost-version:${script}:${versionId}`,
+        }),
+      ).toMatchObject({ phase: "failed", failure });
+      expect(
+        await local.apply({
+          operationId: `op_endpoint_legacy_asset_metadata_${index}`,
+          offering: offering("WorkerEndpoint"),
+          identity: identity("hello-endpoint"),
+          spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" } },
+          relations: [relation("/worker", "ModuleWorker", "hello")],
+          workerEndpointOriginAssignment: endpointAssignment(),
+        }),
+      ).toMatchObject({ phase: "failed", failure });
+      expect(await readFile(statePath, "utf8")).toBe(stateBefore);
+      expect(await readFile(metaPath, "utf8")).toBe(metaBefore);
+    }
   });
 
   test("deleting the worker removes the script and its routes", async () => {
@@ -1644,7 +2247,7 @@ describe("publishing a Worker through the Edge Family", () => {
 
   test("recovers a local worker delete by readback without repeating the mutation", async () => {
     let reloads = 0;
-    const runtime = createWorkerdRuntime({
+    const runtime = materializingRuntime({
       root,
       isReady: () => true,
       onReload: async () => {
@@ -1689,7 +2292,10 @@ describe("KV and SQLite bindings", () => {
     // The tenant module is still declared, because the generated one imports
     // it; workerd resolves imports through the module registry this builds.
     expect(config).toContain(
-      `modules = [ (name = "__takoserver-selfhost-entrypoint.js", esModule = embed "${script}/__takoserver-selfhost-entrypoint.js"), (name = "index.js", esModule = embed "${script}/index.js") ]`,
+      `(name = "__takoserver-selfhost-entrypoint.js", esModule = embed "${script}/host-private/module-00000", role = hostPrivate)`,
+    );
+    expect(config).toContain(
+      `(name = "index.js", esModule = embed "${script}/application/module-00000", role = application)`,
     );
     expect(config).toContain(
       `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
@@ -1698,18 +2304,20 @@ describe("KV and SQLite bindings", () => {
     // that names the loopback address sits behind it.
     expect(config).toContain(`( name = "${script}-selfhost-data",
     worker = (
-      modules = [ (name = "__takoserver-selfhost-data.js", esModule = embed "${script}/__takoserver-selfhost-data.js") ],`);
+      modules = [ (name = "__takoserver-selfhost-data.js", esModule = embed "${script}/host-private/module-00002") ],`);
     expect(config).toContain(`( name = "${script}-selfhost-data-origin",
     external = ( address = "${address}", http = () )
   ),`);
     expect(config).toContain('(name = "LANE", text = "takoform-v1")');
     expect(config).toContain('compatibilityFlags = [ "disallow_importable_env" ]');
 
-    const generated = await readFile(
-      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
-      "utf8",
+    const generated = await publishedModule(
+      root,
+      script,
+      "hostPrivate",
+      "__takoserver-selfhost-entrypoint.js",
     );
-    expect(generated).toContain('import("./index.js")');
+    expect(generated).toContain('import * as TenantWorkerModule from "./index.js"');
     expect(generated).toContain('"kind":"edge.kv@1.0.0","publicName":"KV"');
     expect(generated).toContain('"kind":"edge.sql@1.0.0","publicName":"DB"');
   });
@@ -1744,13 +2352,17 @@ describe("KV and SQLite bindings", () => {
     expect(tenantService).not.toContain("__TAKOSERVER_SELFHOST_DATA_TOKEN");
 
     // The generated modules carry no credential of their own either.
-    const generated = await readFile(
-      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
-      "utf8",
+    const generated = await publishedModule(
+      root,
+      script,
+      "hostPrivate",
+      "__takoserver-selfhost-entrypoint.js",
     );
-    const facade = await readFile(
-      join(root, "workers", script, "__takoserver-selfhost-data.js"),
-      "utf8",
+    const facade = await publishedModule(
+      root,
+      script,
+      "hostPrivate",
+      "__takoserver-selfhost-data.js",
     );
     expect(generated).not.toContain(token as string);
     expect(generated).not.toContain("__TAKOSERVER_SELFHOST_DATA_TOKEN");
@@ -1760,9 +2372,11 @@ describe("KV and SQLite bindings", () => {
   test("the facade service is the only route out, and it names both its own", async () => {
     const local = provider({ dataPlaneAddress: address });
     const script = await publish(local, false, undefined, true);
-    const facade = await readFile(
-      join(root, "workers", script, "__takoserver-selfhost-data.js"),
-      "utf8",
+    const facade = await publishedModule(
+      root,
+      script,
+      "hostPrivate",
+      "__takoserver-selfhost-data.js",
     );
     // Two destinations, both constants of this Host's, and nothing a caller
     // writes on a request reaches either.
@@ -2356,9 +2970,11 @@ describe("bucketBindings on a self-host Worker Version", () => {
     });
     expect(deployment.phase).toBe("succeeded");
 
-    const entrypoint = await readFile(
-      join(root, "workers", script, "__takoserver-selfhost-entrypoint.js"),
-      "utf8",
+    const entrypoint = await publishedModule(
+      root,
+      script,
+      "hostPrivate",
+      "__takoserver-selfhost-entrypoint.js",
     );
     expect(entrypoint).toContain('"kind":"edge.objects@1.0.0","publicName":"MEDIA"');
     expect(entrypoint).toContain("createObjectsAdapter");
@@ -4000,7 +4616,22 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     ) as { crons?: readonly string[]; consumers?: readonly unknown[] };
     expect(state.crons ?? []).toEqual([]);
     expect(state.consumers ?? []).toEqual([]);
-    // And the script is not wedged: a later republish of it still succeeds.
+    // Missing declarations cannot be grandfathered into a verified Version.
+    expect(
+      await local.observe({
+        offering: offering("WorkerVersion"),
+        nativeId: "retained-version",
+        identity: identity("hello-v1"),
+        spec: { handlers: ["fetch"] },
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    // Authoritative reapply verifies the bytes and restores exact declarations;
+    // only then may the retained version be published again.
+    await publish(local);
     expect(
       (
         await local.apply({

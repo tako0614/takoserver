@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { canonicalWorkerEndpointOrigin } from "../src/provider-worker-endpoint-origin.ts";
 import {
   SELFHOST_TLS_ENVIRONMENT,
@@ -10,7 +10,6 @@ import {
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
-import { findWorkerd } from "../src/workerd-supervisor.ts";
 
 /**
  * The scheme the Host publishes and the scheme the socket serves are the same
@@ -25,7 +24,9 @@ import { findWorkerd } from "../src/workerd-supervisor.ts";
  * in.
  */
 
-const WORKERD = findWorkerd(resolve(import.meta.dir, ".."));
+// Native coverage is exact-artifact coverage. The npm dependency is the old,
+// open resolver and must never make this test look like serving evidence.
+const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
 const HOSTNAME = "tls-probe.localhost";
 
 let root: string;

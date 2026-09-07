@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  SELFHOST_WORKER_PRELUDE_MODULE,
+  selfhostWorkerPreludeModuleName,
+  selfhostWorkerPreludeSource,
+} from "../src/providers/selfhost-worker-prelude.ts";
+import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
@@ -18,6 +23,7 @@ import {
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_PROTOCOL,
@@ -92,6 +98,10 @@ async function loadGenerated(
   const tenantPath = join(root, input.originalMainModule);
   await mkdir(dirname(tenantPath), { recursive: true });
   await Bun.write(tenantPath, tenantSource);
+  await Bun.write(
+    join(root, selfhostWorkerPreludeModuleName(input.originalMainModule)),
+    selfhostWorkerPreludeSource(),
+  );
   const wrapperPath = join(root, "wrapper.mjs");
   await Bun.write(wrapperPath, selfhostWorkerEntrypointSource(input));
   const loaded = (await import(
@@ -390,7 +400,7 @@ test("a version that declares no fetch handler answers an HTTP request with 404"
   }
 });
 
-test("the readiness route loads the tenant module and names its own publication", async () => {
+test("the readiness route validates the tenant namespace and names its own publication", async () => {
   const { service } = plane([]);
   const generated = await loadGenerated(
     `export default { async fetch() { return new Response("tenant"); } };`,
@@ -453,19 +463,20 @@ test("the readiness route reports a declared handler the tenant module lacks", a
 });
 
 /**
- * A module that throws at import time and a module missing a declared handler
- * are different defects in different files. Reporting both as the second sent
- * the self-host end-to-end run's operator to read a complete export list: the
- * real cause was a dead `import path from "node:path"` in a dependency, and it
- * was visible only by running the runtime by hand.
+ * A tenant getter that throws while the Host validates its declared handler
+ * and a module missing that handler are different defects. Import-time
+ * failures are refused by the semantic inspector before this entrypoint is
+ * published; this route reports failures that can only occur while consuming
+ * the already-imported namespace.
  */
-test("the readiness route distinguishes an import-time failure from a missing export", async () => {
+test("the readiness route distinguishes a validation failure from a missing export", async () => {
   const { service } = plane([]);
-  // Bun resolves `node:path`, so the module that would fail on workerd is
-  // simulated by the same thing that failure is: a throw during import.
   const generated = await loadGenerated(
-    `throw new TypeError('No such module "node:path".\\n  imported from "tenant.js"');\n` +
-      `export default { async fetch() { return new Response("ok"); } };`,
+    `const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  get() { throw new TypeError('No such module "node:path".\\n  imported from "tenant.js"'); },
+});
+export default worker;`,
     KV_ONLY,
   );
   try {
@@ -492,6 +503,182 @@ test("the readiness route distinguishes an import-time failure from a missing ex
     expect(body.failure.message.length).toBeLessThanOrEqual(400);
     // biome-ignore lint/suspicious/noControlCharactersInRegex: proving none survive
     expect(body.failure.message).not.toMatch(/[\u0000-\u001f\u007f]/u);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a callable own getter is evaluated once across readiness and requests", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `let getterCalls = 0;
+let handlerCalls = 0;
+const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  configurable: true,
+  get() {
+    getterCalls += 1;
+    return function () {
+      handlerCalls += 1;
+      return Response.json({ getterCalls, handlerCalls });
+    };
+  },
+});
+export default worker;`,
+  );
+  try {
+    const readiness = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(readiness.status).toBe(200);
+
+    const first = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await first.json()).toEqual({ getterCalls: 1, handlerCalls: 1 });
+
+    const second = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await second.json()).toEqual({ getterCalls: 1, handlerCalls: 2 });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a captured getter handler keeps its original target after tenant mutation", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `let invocations = 0;
+const worker = Object.create(null);
+function captured() {
+  invocations += 1;
+  Object.defineProperty(this, "fetch", {
+    configurable: true,
+    value: () => new Response("replaced"),
+  });
+  return new Response(this === worker ? "original:" + invocations : "wrong-target");
+}
+Object.defineProperty(worker, "fetch", {
+  configurable: true,
+  get() { return captured; },
+});
+export default worker;`,
+  );
+  try {
+    const first = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await first.text()).toBe("original:1");
+
+    const second = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await second.text()).toBe("original:2");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a noncallable own getter refuses the declared handler", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  get() { return 42; },
+});
+export default worker;`,
+  );
+  try {
+    await expect(
+      generated.worker.fetch(new Request("https://worker.example/"), rawEnv(service), context),
+    ).rejects.toThrow("declared handler fetch is not a function");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("a throwing own getter refuses the publication as a module failure", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  get() { throw new Error("getter exploded"); },
+});
+export default worker;`,
+  );
+  try {
+    const answered = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+      }),
+      rawEnv(service),
+      context,
+    );
+    expect(answered.status).toBe(500);
+    expect(await answered.json()).toMatchObject({
+      failure: { reason: "module", message: "getter exploded" },
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("inherited and class-prototype defaults remain refused", async () => {
+  const { service } = plane([]);
+  for (const source of [
+    `const inherited = { fetch() {} };
+export default Object.create(inherited);`,
+    `class Worker { fetch() {} }
+export default new Worker();`,
+    `const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  get() {
+    Object.setPrototypeOf(worker, { changed: true });
+    return () => {};
+  },
+});
+export default worker;`,
+  ]) {
+    const generated = await loadGenerated(source);
+    try {
+      await expect(
+        generated.worker.fetch(new Request("https://worker.example/"), rawEnv(service), context),
+      ).rejects.toThrow("the default export is not a plain object");
+    } finally {
+      await generated.dispose();
+    }
+  }
+});
+
+test("the generated wrapper export is immutable", async () => {
+  const { service } = plane([]);
+  const generated = await loadGenerated(
+    `export default { fetch() { return new Response("original"); } };`,
+  );
+  try {
+    expect(Object.isFrozen(generated.worker)).toBe(true);
+    expect(Reflect.set(generated.worker, "fetch", () => new Response("replaced"))).toBe(false);
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.text()).toBe("original");
   } finally {
     await generated.dispose();
   }
@@ -575,9 +762,20 @@ test("a version with no facade still generates the entrypoint that probes it", (
     declaredHandlers: ["fetch"],
     bindings: [{ name: "LANE", type: "plain_text" }],
   });
-  expect(source).toContain('import("./index.js")');
+  expect(source).toContain('import * as TenantWorkerModule from "./index.js"');
+  expect(source).toContain(`from "./${SELFHOST_WORKER_PRELUDE_MODULE}"`);
   expect(source).toContain(SELFHOST_WORKER_READINESS_PATH);
   expect(source).toContain('"LANE"');
+});
+
+test("a tenant main may use the Host entrypoint's logical spelling", () => {
+  const source = selfhostWorkerEntrypointSource({
+    ...KV_ONLY,
+    originalMainModule: SELFHOST_WORKER_ENTRYPOINT_MODULE,
+  });
+  expect(source).toContain(
+    `import * as TenantWorkerModule from "./${SELFHOST_WORKER_ENTRYPOINT_MODULE}"`,
+  );
 });
 
 test("a main module that escapes its own directory is refused at generation", () => {
@@ -989,7 +1187,7 @@ test("a tenant that forges Symbol.hasInstance cannot move what counts as a strea
   }
 });
 
-test("the Host reports an import-time failure as one, and a missing export as one", async () => {
+test("the Host reports a namespace-consumption failure and a missing export distinctly", async () => {
   const envelope = (failure?: Record<string, unknown>) =>
     JSON.stringify({
       schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
@@ -1038,8 +1236,13 @@ test("the Host reports an import-time failure as one, and a missing export as on
 test("answers the readiness detail to this Host's probe and to nobody else", async () => {
   const { service } = plane([]);
   const generated = await loadGenerated(
-    `throw new TypeError('No such module "node:path". imported from "/srv/app/index.js"');\n` +
-      `export default { async fetch() { return new Response("ok"); } };`,
+    `const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", {
+  get() {
+    throw new TypeError('No such module "node:path". imported from "/srv/app/index.js"');
+  },
+});
+export default worker;`,
     KV_ONLY,
   );
   const ask = async (hostname: string) =>
@@ -1088,9 +1291,13 @@ test("answers the readiness detail to this Host's probe and to nobody else", asy
 test("a tenant cannot make the readiness route reject", async () => {
   const { service } = plane([]);
   const generated = await loadGenerated(
-    `throw new Proxy({}, { getOwnPropertyDescriptor() { throw new RangeError("trap"); },\n` +
-      `  get() { throw new RangeError("trap"); } });\n` +
-      `export default { async fetch() { return new Response("ok"); } };`,
+    `const failure = new Proxy({}, {
+  getOwnPropertyDescriptor() { throw new RangeError("trap"); },
+  get() { throw new RangeError("trap"); },
+});
+const worker = Object.create(null);
+Object.defineProperty(worker, "fetch", { get() { throw failure; } });
+export default worker;`,
     KV_ONLY,
   );
   try {

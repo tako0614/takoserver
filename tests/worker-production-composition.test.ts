@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { HOSTED_OBJECT_BUCKET_SUPPLIES_KIND } from "../src/hosted-object-bucket-supplies.ts";
-import type { CloudflareProviderExecutorRpc } from "../src/providers/cloudflare-provider-executor-rpc.ts";
+import type { CloudflareProviderExecutorRpc } from "../src/providers/cloudflare-provider-executor-port.ts";
 import { CloudflareProviderProxy } from "../src/providers/cloudflare-provider-proxy.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";

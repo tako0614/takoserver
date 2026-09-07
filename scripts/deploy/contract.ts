@@ -41,27 +41,6 @@ const integrationE2eReviewInput =
   "`TAKOSERVER_INDEPENDENT_REVIEW` is required for `--issue` and `--revoke`; `--status` does not read it.";
 const rehearsalReceiptInput =
   "`TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` is required for `--apply` in `rehearsal` and `production`; integration `--apply` and every `--status` action do not read it.";
-const managedObjectReceiptSecretsInput =
-  "`TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH` is required for `--apply` only and must name an exact canonical, link-free, owner-only 0600 JSON file outside the repository. It contains exactly the S3 access key id, S3 secret access key, and receipt proof secret; `--status` never reads it.";
-const managedObjectReceiptRehearsalInput =
-  "`TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH` is required only when `rehearsal` or `production` `--apply` installs the authority's fresh v1 Durable Object lifecycle; integration apply and every `--status` action do not read it.";
-const cloudflareProviderExecutorSecretsInput =
-  "`TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH` is required for both `--status` and `--apply` and must name one canonical, link-free, single-link, owner-only mode-0600 JSON file outside the repository. It contains exactly `CLOUDFLARE_API_TOKEN` and `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING`. Status uses the token only for direct authoritative readback and never copies the file; apply publishes the exact two values through Wrangler's single `--secrets-file` operation. Neither value enters argv, result JSON, generated configuration, build children, or diagnostics.";
-const exactArtifactRecoveryInput =
-  "Input contract: `TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH`, " +
-  "`TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH`, and " +
-  "`TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` are required for status and apply. " +
-  "Each names one canonical, link-free, single-link, owner-only mode-0600 file outside the repository. " +
-  "The recovery request is canonical v2 and is never emitted, passed in argv, or copied into the repository. " +
-  "The provider-executor file is reused as the only Cloudflare credential source; this surface adds no parent credential. " +
-  "`TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH` is read only for the post-quiescence successor " +
-  "step and must bind the status-emitted quiescence digest. `TAKOSERVER_INDEPENDENT_REVIEW` is required for apply only.";
-const providerExecutorTargetInput =
-  "Clean-checkout realization uses one freshly authored `takoserver.deploy-target@v2` at " +
-  "`/root/dev/takos/.operator-private/takoserver/<environment>/target.v2.json`, selected by its " +
-  "exact `TAKOSERVER_DEPLOY_TARGET_<ENVIRONMENT>` absolute path. It joins the current private " +
-  "Cloudflare supply projection atomically to `cloudflareProviderExecutor`, including exact " +
-  "`receiptAuthorityWorkerName`, and never copies the retired `.deploy/target.staging.json` shape.";
 const signingPublicJwkInput =
   "`TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` is required for `--apply` only; `--status` does not read it.";
 const signingPrivateJwkInput =
@@ -292,70 +271,7 @@ export const DEPLOY_CONTRACT = {
         "independent-review": review,
       },
     },
-    {
-      surface: "takoserver-public-parent-token-retirement",
-      target: "cloudflare-worker-secret:environment-selected-public-parent-token-retirement",
-      covers: [
-        "src",
-        "wrangler.jsonc",
-        "scripts/build-worker.ts",
-        "scripts/deploy.ts",
-        "scripts/deploy/public-parent-token-retirement.ts",
-        "scripts/deploy/cloudflare-provider-executor.ts",
-        "scripts/deploy/realized-config.ts",
-        "scripts/deploy/target.ts",
-        "scripts/deploy/worker-artifact.ts",
-        "scripts/deploy/worker-composition.ts",
-        "scripts/deploy/worker-live.ts",
-        "scripts/deploy/worker-state.ts",
-        "scripts/deploy/wrangler-state.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler", "flock"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
-      triggers: ["irreversible", "authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The reviewed takoserver.deploy-target@v2 selected only by environment ` +
-          "fixes the Cloudflare account, public Worker, route-less provider executor and public " +
-          "configuration. Apply runs the owner gate once, composes the target, then seals the exact " +
-          "selected-commit bundle and realized configuration before either effect. Its integration " +
-          "and rehearsal receipt carries the exact source.changedPaths inventory alongside distinct " +
-          "sealed artifact and Worker bundle digests." +
-          inputContract(applyReviewInput),
-        "post-conditions":
-          "Before retirement, authoritative executor readback proves the exact selected-commit " +
-          "route-less service has no route, custom domain, workers.dev endpoint or preview URL. " +
-          "The public Worker must have its exact CLOUDFLARE_PROVIDER_EXECUTOR service binding, " +
-          "selected source/artifact identity, routing closure and otherwise unchanged binding and " +
-          "secret inventory. Apply performs at most one exact binding/code release, then deletes " +
-          "only the public Worker's CLOUDFLARE_API_TOKEN once. It proves the token-free direct " +
-          "successor has the same script identity and every other binding and secret unchanged. " +
-          "Status is value-free and may adopt only an exact token-free canonical state or exact " +
-          "secret-created successor. This lane never reads, changes or removes the provider " +
-          "executor's owner-private credential file or either executor secret.",
-        reversal:
-          "This retirement is forward-only. Restoration of public parent authority requires a " +
-          "separately reviewed dedicated surface; the executor and its owner-private credentials remain.",
-        "failure-handling":
-          `${highRiskFailure} Exact executor and public-Worker same-host kernel leases span binding release, ` +
-          "pre-delete re-fence, secret deletion and final readback. A failed or lost binding-release " +
-          "acknowledgement stops before deletion; a failed or lost deletion acknowledgement stops " +
-          "without retry. Fresh --status distinguishes legacy, bound and exact completed states. " +
-          "Wrong account, Worker, environment, executor identity or exposure, source/version/config " +
-          "drift, extra binding or secret, changing history, and token absence before binding all fail closed. " +
-          "The two leases do not fence dashboard, direct-API or other-host actors; Cloudflare exposes " +
-          "no conditional secret-delete input, so an external change after the last pre-delete read " +
-          "is detected by final verification but cannot be undone by this forward-only lane.",
-        "pre-mutation-proof":
-          "Status and the apply re-fence must prove the exact route-less selected-commit executor, " +
-          "stable public history/routing/configuration, and the public CLOUDFLARE_API_TOKEN still " +
-          "present. If the executor binding is not yet exact, only the sealed exact binding release " +
-          "may precede deletion; token absence before that release is refused unless status proves " +
-          "an exact completed adoption.",
-        "independent-review": review,
-      },
-    },
+
     {
       surface: "takoserver-sponsorship-public-route-retirement",
       target: "cloudflare-worker:environment-selected-proof-gated-sponsorship-route-retirement",
@@ -1172,276 +1088,7 @@ export const DEPLOY_CONTRACT = {
         "independent-review": review,
       },
     },
-    {
-      surface: "takoserver-managed-object-receipt-authority",
-      target: "cloudflare-worker:environment-selected-route-less-object-receipt-authority",
-      covers: [
-        "src/providers/cloudflare-managed-object-receipt.ts",
-        "src/providers/cloudflare-managed-object-receipt-coordinator.ts",
-        "src/providers/cloudflare-managed-object-receipt-object.ts",
-        "src/providers/cloudflare-managed-object-s3.ts",
-        "src/entry-cloudflare-managed-object-receipt-authority.ts",
-        "wrangler.managed-object-receipt-authority.jsonc",
-        "managed-object-receipt-authority-worker-configuration.d.ts",
-        "tsconfig.managed-object-receipt-authority.json",
-        "scripts/deploy.ts",
-        "scripts/deploy/managed-object-receipt-authority.ts",
-        "scripts/deploy/managed-object-receipt-secrets.ts",
-        "scripts/deploy/wrangler-state.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_MANAGED_OBJECT_RECEIPT_SECRETS_PATH",
-        "TAKOSERVER_MANAGED_OBJECT_RECEIPT_AUTHORITY_REHEARSAL_RECEIPT_PATH",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-      ],
-      triggers: ["irreversible", "authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The route-less Worker name, exact managed ProviderInstallation id, account, ` +
-          "receipt Durable Object v1 lineage, and the three operator-private secret names are closed inputs. The Worker name and ProviderInstallation id come solely from `target.cloudflareProviderExecutor`; no duplicate environment selector can redirect them. The installation id is deliberately distinct from the gateway's provider-pack id. The secret source is an owned single-link mode-0600 canonical JSON file outside the repository; its values never enter argv, diagnostics, result JSON, generated config, or the public API/gateway Worker." +
-          inputContract(
-            applyReviewInput,
-            managedObjectReceiptSecretsInput,
-            managedObjectReceiptRehearsalInput,
-          ),
-        "post-conditions":
-          "Apply performs one Wrangler deploy with --secrets-file so code, the local receipt Durable Object namespace, its v1 migration, identity vars, and all three secrets are one Worker publication. Authoritative readback requires one exact module, the exact closed binding names, v1 lineage, workers.dev and previews disabled, and exhaustive absence from routes and account-level custom domains. The sealed release copy of the secret file is removed after success or failure, including caller-owned output directories.",
-        reversal:
-          "The v1 Durable Object migration has no down migration and is never removed while any tenant Version may hold its cross-script namespace capability. Code recovery is forward-only from authoritative deployment history; consumers are disabled and drained before this authority Worker can be retired.",
-        "failure-handling": `${highRiskFailure} A missing, extra, linked, multi-link, mis-owned, non-0600, non-canonical, oversized, or changing secret input fails before publication. An acknowledgement loss is never retried and reports only sanitized identity readback. Missing or extra bindings, any route or account-level custom-domain service mapping, or a non-v1 lineage keeps readiness false.`,
-        "pre-mutation-proof":
-          "Immediately before the single deployment, the lease-held provider history is re-fenced, the sealed artifact and secret copy remain exact, and production re-reads canonical owner-only rehearsal evidence for the same commit, module digest, null predecessor, v1 class, and empty mutation targets. Rehearsal writes that no-overwrite evidence only after exact authoritative readback; integration evidence is never production authority.",
-        "independent-review": review,
-      },
-    },
-    {
-      surface: "takoserver-managed-worker-dispatch-namespace",
-      target: "cloudflare-workers-dispatch-namespace:environment-selected-managed-worker-runtime",
-      covers: [
-        "scripts/deploy.ts",
-        "scripts/deploy/managed-worker-dispatch-namespace.ts",
-        "scripts/deploy/cloudflare-state.ts",
-        "scripts/deploy/target.ts",
-        "scripts/deploy/process.ts",
-        "scripts/deploy/qualification.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-        "TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH",
-      ],
-      triggers: ["irreversible", "authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The environment-selected operator target is the only account/name/id authority. ` +
-          "This surface reads only kind, environment, accountId and cloudflareProviderExecutor.dispatchNamespace/dispatchNamespaceId. " +
-          "It accepts that bootstrap projection without fabricated supplies; " +
-          "the complete Worker/executor target remains separately required for runtime deployment." +
-          inputContract(applyReviewInput),
-        "post-conditions":
-          "Status distinguishes absent, pin-existing, ready and drift through exact provider metadata. " +
-          "Apply rechecks absence, creates the selected name once and independently reads back its exact " +
-          "namespace id/name, zero scripts and trusted_workers=false. It returns created-needs-target-pin, " +
-          "not runtime readiness. Existing empty unpinned namespaces require explicit id pinning; " +
-          "gateway/executor readiness requires the pinned incarnation to exist with untrusted tenant isolation.",
-        reversal:
-          "No delete, rename, reverse or implicit recreation is exposed. A missing pinned id or an " +
-          "unexpected/nonempty unpinned namespace requires separate operator reconciliation; creation " +
-          "does not authorize adoption or retirement of another namespace.",
-        "failure-handling":
-          `${highRiskFailure} Creation never retries a failed or lost acknowledgement. Status reads no review or receipt. ` +
-          "Fresh rehearsal creation writes one no-overwrite external owned 0600 receipt under an owned 0700 directory. " +
-          "Fresh production creation requires and re-reads that exact successful same-commit rehearsal receipt " +
-          "at the final mutation fence. TAKOSERVER_MANAGED_WORKER_DISPATCH_NAMESPACE_REHEARSAL_RECEIPT_PATH " +
-          "is required only for rehearsal/production creation, never integration or status.",
-        "pre-mutation-proof":
-          "Integration may create the explicitly selected disposable namespace. Rehearsal must use clean " +
-          "remote source and prove a fresh empty untrusted namespace; production requires that exact " +
-          "source rehearsal receipt plus a fresh exact-name absence read before its sole create.",
-        "independent-review": review,
-      },
-    },
-    {
-      surface: "takoserver-managed-worker-gateway",
-      target: "cloudflare-workers-for-platforms:environment-selected-dispatch-gateway-route",
-      covers: [
-        "src/providers/cloudflare-managed-worker-gateway.ts",
-        "src/providers/cloudflare-managed-worker-sqlite.ts",
-        "src/providers/cloudflare-managed-worker-sqlite-object.ts",
-        "src/providers/cloudflare-managed-worker-wrapper.ts",
-        "src/entry-cloudflare-managed-worker-gateway.ts",
-        "wrangler.managed-worker-gateway.jsonc",
-        "managed-worker-gateway-worker-configuration.d.ts",
-        "tsconfig.managed-worker-gateway.json",
-        "scripts/deploy.ts",
-        "scripts/deploy/managed-worker-gateway.ts",
-        "scripts/deploy/managed-worker-dispatch-namespace.ts",
-        "scripts/deploy/cloudflare-state.ts",
-        "scripts/deploy/target.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "CLOUDFLARE_API_TOKEN",
-        "TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN",
-        "TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT",
-        "TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT",
-        "TAKOSERVER_MANAGED_WORKER_ZONE_ID",
-        "TAKOSERVER_MANAGED_WORKER_PROVIDER_ID",
-        "TAKOSERVER_MANAGED_WORKER_GATEWAY_ID",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-      ],
-      triggers: ["authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The gateway Worker bundle, DISPATCHER namespace, STATE_DB binding, ` +
-          "provider identity and exact route pattern are operator-selected inputs. The dispatch namespace name and id derive only from the environment-selected target; no namespace environment override is accepted. `TAKOSERVER_MANAGED_WORKER_ROUTE_PATTERN`, `TAKOSERVER_MANAGED_WORKER_GATEWAY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_LEGACY_SCRIPT`, `TAKOSERVER_MANAGED_WORKER_ZONE_ID`, `TAKOSERVER_MANAGED_WORKER_PROVIDER_ID`, and `TAKOSERVER_MANAGED_WORKER_GATEWAY_ID` are required alongside `CLOUDFLARE_API_TOKEN`. Integration may " +
-          "create only the explicitly configured staging wildcard; production starts from an exact " +
-          "readback of the legacy route and never guesses a zone, account, namespace or domain.",
-        "post-conditions":
-          "Status first qualifies the target-pinned untrusted dispatch namespace incarnation, then reads the complete exact-pattern route inventory and authoritative gateway deployment " +
-          "history. Apply stages one immutable Version, reads back its exact code ETag, STATE_DB, " +
-          "DISPATCHER, SQLite Durable Object, provider/gateway identity and workers.dev-disabled settings, " +
-          "then creates a separate 100 percent traffic deployment and proves the exact predecessor. Only " +
-          "after that proof and a fresh namespace identity fence may integration create the configured staging route or production replace the " +
-          "read-back legacy route; customer-specific routes remain untouched.",
-        reversal:
-          "Production reversal derives the immutable predecessor only from provider deployment history, " +
-          "proves that predecessor's exact code, bindings and settings, redeploys and reads it back without " +
-          "requiring the broken successor to be ready, then updates the recorded exact route id back to the " +
-          "read-back legacy script. Integration creation has no implicit production reversal.",
-        "failure-handling":
-          `${highRiskFailure} Missing, duplicate or drifted exact-pattern routes fail closed. Production ` +
-          "never adopts an unknown script, route id or domain; a lost acknowledgement stops before retry " +
-          "and requires exact status readback. The surface does not mutate live production from tests or " +
-          "from a guessed Cloudflare identifier." +
-          inputContract(applyReviewInput),
-        "independent-review": review,
-      },
-    },
-    {
-      surface: "cloudflare-provider-executor",
-      target: "cloudflare-worker:environment-selected-route-less-parent-provider-executor",
-      covers: [
-        "src/entry-cloudflare-provider-executor.ts",
-        "src/cloudflare-provider-surface.ts",
-        "src/providers/cloudflare-provider-executor-rpc.ts",
-        "src/providers/cloudflare-provider-proxy.ts",
-        "src/providers/cloudflare-readback-descriptor.ts",
-        "wrangler.cloudflare-provider-executor.jsonc",
-        "cloudflare-provider-executor-worker-configuration.d.ts",
-        "tsconfig.cloudflare-provider-executor.json",
-        "migrations/0045_cloudflare_provider_executor_operations.sql",
-        "scripts/deploy.ts",
-        "scripts/deploy/cloudflare-provider-executor.ts",
-        "scripts/deploy/cloudflare-provider-executor-secrets.ts",
-        "scripts/deploy/managed-worker-dispatch-namespace.ts",
-        "scripts/deploy/cloudflare-state.ts",
-        "scripts/deploy/target.ts",
-        "scripts/deploy/realized-config.ts",
-        "scripts/deploy/worker.ts",
-        "scripts/deploy/wrangler-state.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler"],
-      requiresEnv: [
-        "TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-      ],
-      triggers: ["authority"],
-      obligations: {
-        provenance:
-          `${exactSource} The target descriptor is the sole source of the executor Worker name, ` +
-          "provider installation, dispatch namespace, gateway, managed base domain, receipt authority, D1, R2 and account. The external credential file is a separate authority boundary." +
-          inputContract(
-            providerExecutorTargetInput,
-            applyReviewInput,
-            cloudflareProviderExecutorSecretsInput,
-          ),
-        "post-conditions":
-          "Status and post-apply readback require one exact immutable Version/module digest, exact D1/R2/dispatch/cross-Worker Durable Object/service/plain-text/secret binding closure, no local Durable Object migration, exact compatibility settings, workers.dev and preview URLs disabled, and exhaustive absence from routes and custom domains. Migration 0045 and its exact table/index shape must already be applied. The exact target-pinned untrusted dispatch namespace incarnation, selected-commit receipt authority and managed gateway must be ready first. Namespace identity is rechecked at mutation and readback boundaries. Namespace readiness precedes gateway deployment; receipt authority and gateway readiness precede executor deployment; only then may the public Worker qualify and bind this exact executor Version.",
-        reversal:
-          "`--apply --reverse` derives the immediate predecessor only from authoritative deployment history, verifies that predecessor's code and immutable binding/migration closure, deploys it at 100 percent under the same target lease, and proves the resulting history. It restores that predecessor Version, including its historical secret bindings; migration 0045 is additive and remains in place.",
-        "failure-handling":
-          `${highRiskFailure} Unknown or drifted predecessors, a missing dependency, missing migration 0045, any route/domain/workers.dev exposure, extra binding or secret, changing provider history, and unsafe or changing external secret material fail closed. The build receives neither executor secret. A lost publication acknowledgement is not retried and reports only sanitized Version/deployment identities; the operator must run this surface's fresh status before repair. ` +
-          cloudflareProviderExecutorSecretsInput,
-        "independent-review": review,
-      },
-    },
-    {
-      surface: "takoserver-exact-artifact-recovery",
-      target: "cloudflare-worker:integration-exact-one-shot-artifact-recovery",
-      covers: [
-        "migrations/0046_exact_artifact_recovery_receipts.sql",
-        "src/artifact-recovery.ts",
-        "src/artifact-recovery-owner-gc.ts",
-        "src/exact-artifact-recovery-worker.ts",
-        "src/entry-exact-artifact-recovery-worker.ts",
-        "src/integration-form-authority-gateway.ts",
-        "src/entry-integration-form-authority-operator-worker.ts",
-        "src/takoform/exact-artifact-recovery-prepare.ts",
-        "src/takoform/exact-artifact-recovery-coordinator.ts",
-        "scripts/exact-artifact-recovery.ts",
-        "scripts/deploy/exact-artifact-recovery.ts",
-        "scripts/deploy/target.ts",
-        "scripts/deploy.ts",
-      ],
-      requiresScripts: ["check", "deploy"],
-      requiresTools: ["bun", "wrangler", "flock"],
-      requiresEnv: [
-        "TAKOSERVER_EXACT_ARTIFACT_RECOVERY_REQUEST_PATH",
-        "TAKOSERVER_CLOUDFLARE_PROVIDER_EXECUTOR_SECRETS_PATH",
-        "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH",
-        "TAKOSERVER_EXACT_ARTIFACT_RECOVERY_LOST_ACK_PATH",
-        "TAKOSERVER_INDEPENDENT_REVIEW",
-      ],
-      triggers: ["irreversible", "authority"],
-      obligations: {
-        provenance:
-          `${exactSource} Integration only. One environment-selected target v2 fixes the existing ` +
-          "qualified provider executor, D1, R2, public Host identity, authenticated operator gateway, " +
-          "route-less incident Worker name, and explicit owner retention policy. The immutable recovery " +
-          "Version binds the canonical request digest, R2 identity, source commit/version and any separately " +
-          "reviewed lost-ack handoff. Every mutating apply, including integration, requires a clean exact " +
-          "commit reachable from a fetched remote ref. " +
-          exactArtifactRecoveryInput,
-        "post-conditions":
-          "Each apply performs at most one status-planned transition. Preparation is one D1 batch and the " +
-          "singleton authorizes only the exact 4 owners, 5 uploads, 2 replays, 28 members and 29 holds. " +
-          "The recovery Worker has no route, custom domain, workers.dev endpoint or preview URL; only the " +
-          "existing signed Form-authority gateway temporarily receives its exact service binding and Worker " +
-          "Version pin. The binding remains installed through the explicit retention deadline. The signed " +
-          "purge RPC then rechecks R2 absence and every D1 fence and uses the Worker's real " +
-          "D1Database.batch() to delete only incident details atomically and retains the compact terminal " +
-          "singleton/result digest. Only a durable purged readback permits restoring the ordinary gateway " +
-          "closure and deleting the route-less Worker.",
-        reversal:
-          "The one-shot authorization and terminal singleton are forward-only and never reset. Worker and " +
-          "gateway publications retain their immediate provider-history predecessors, but a completed delete " +
-          "is not reversed. Any new object identity or ETag needs a new reviewed operation and fence.",
-        "failure-handling":
-          `${highRiskFailure} A second descriptor, wrong tenant/cardinality/set digest/lineage/R2/source/retention ` +
-          "identity, provider or gateway drift, active uncertainty, root/hold/writer race, rolled-back batch, or " +
-          "unapplied migration fails closed. A delete_started candidate never issues a second R2 DELETE. The " +
-          "gateway capability must be removed before status emits the deterministic quiescence digest; only a " +
-          "new immutable successor carrying the matching external lost-ack descriptor may reconcile absence or " +
-          "apply a separately reviewed ETag retry. Publication/delete acknowledgement loss is status-only and " +
-          "is never blindly repeated. A lost purge acknowledgement is settled by durable singleton readback; " +
-          "the host never fabricates D1 transaction semantics over REST. Request, evidence, credential and " +
-          "object bytes never enter output or logs.",
-        "pre-mutation-proof":
-          "Fresh status proves migration 0046, the exact selected-commit provider executor and dependencies, " +
-          "the public Host/Form identity, exact Worker/gateway module and binding closures, exhaustive route/domain " +
-          "state, and the singleton/request fence. Apply then runs the complete owner gate and re-reads the same " +
-          "planned predecessor under the target-scoped publication lease before its single transition.",
-        "independent-review": review,
-      },
-    },
+
     {
       surface: "takoserver-org-api-key",
       target: "https:environment-selected-durable-organization-api-key",
@@ -1496,18 +1143,22 @@ export const DEPLOY_CONTRACT = {
       },
     },
   ],
-  otherProviderScripts: [
-    {
-      script: "build:cloudflare-provider-executor",
-      why: "This script runs Wrangler's strict --dry-run bundle build for the route-less provider executor into an artifact outdir only; it never publishes a Worker or changes credentials.",
-    },
-    {
-      script: "build:managed-object-receipt-authority",
-      why: "This script runs Wrangler's strict --dry-run bundle build for the route-less receipt authority into an artifact outdir only; it never publishes a Worker or changes secrets.",
-    },
-    {
-      script: "build:managed-worker-gateway",
-      why: "This script runs Wrangler's strict --dry-run bundle build into an artifact outdir only; it never publishes a Worker or mutates a provider target.",
-    },
-  ],
+  otherProviderScripts: [],
 } as const;
+
+type DeployContractSurface = (typeof DEPLOY_CONTRACT.surfaces)[number];
+type DeployContractSurfaceName = DeployContractSurface["surface"];
+
+function declaredSurface<Name extends DeployContractSurfaceName>(
+  name: Name,
+): Extract<DeployContractSurface, { readonly surface: Name }> {
+  const surface = DEPLOY_CONTRACT.surfaces.find((candidate) => candidate.surface === name);
+  if (surface === undefined) throw new TypeError(`missing deploy contract surface ${name}`);
+  return surface as Extract<DeployContractSurface, { readonly surface: Name }>;
+}
+
+/** Generic public Worker lifecycles that a private backend may qualify and compose. */
+export const GENERIC_WORKER_DEPLOY_CONTRACT_SURFACES = [
+  declaredSurface("takoserver-worker"),
+  declaredSurface("takoserver-worker-authority-cutover"),
+] as const;

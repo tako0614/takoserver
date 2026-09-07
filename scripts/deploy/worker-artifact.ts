@@ -8,7 +8,7 @@ import {
 } from "../../src/public-worker-implementation.ts";
 import { DeployError, preflightError } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
-import { type CommandResult, REPOSITORY, wranglerCommand } from "./process.ts";
+import { type CommandResult, REPOSITORY, WRANGLER } from "./process.ts";
 import { type SealedArtifact, sealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
@@ -48,6 +48,10 @@ export async function prepareWorkerArtifact(input: {
   readonly root: string;
   readonly target: DeployTarget;
   readonly commit: string;
+  /** Checkout whose source labels and entrypoints define this artifact. */
+  readonly sourceRepositoryRoot?: string;
+  /** Wrangler executable owned by that checkout. */
+  readonly wranglerPath?: string;
   readonly signingKeyId?: string;
   /** Absolute entrypoint used for the dry-run build. */
   readonly main?: string;
@@ -59,19 +63,23 @@ export async function prepareWorkerArtifact(input: {
   readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly run: WorkerArtifactProcess;
 }): Promise<PreparedWorkerArtifact> {
+  const sourceRepositoryRoot = resolve(input.sourceRepositoryRoot ?? REPOSITORY);
+  const wranglerPath = resolve(input.wranglerPath ?? WRANGLER);
   const build = join(input.root, "build");
   const release = join(input.root, "release");
   mkdirSync(build, { recursive: true, mode: 0o700 });
   mkdirSync(release, { recursive: true, mode: 0o700 });
-  const main = input.main ?? resolve(REPOSITORY, "src/entry-cloudflare-worker.ts");
+  const main = input.main ?? resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts");
   const formImplementationIdentity =
     input.target.formAuthority !== undefined &&
-    resolve(main) === resolve(REPOSITORY, "src/entry-cloudflare-worker.ts")
+    resolve(main) === resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts")
       ? await preparePublicFormImplementationPayload({
           root: join(input.root, "form-implementation-payload"),
           target: input.target,
           run: input.run,
           environment: input.environment,
+          sourceRepositoryRoot,
+          wranglerPath,
         })
       : undefined;
   const writeConfig =
@@ -81,6 +89,7 @@ export async function prepareWorkerArtifact(input: {
         path: config.path,
         main: config.main,
         commit: input.commit,
+        sourceRepositoryRoot,
         ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
         ...(config.formImplementationIdentity === undefined
           ? {}
@@ -106,7 +115,8 @@ export async function prepareWorkerArtifact(input: {
     ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
   });
   const built = await input.run(
-    wranglerCommand([
+    [
+      wranglerPath,
       ...(input.dryRunCommand === "versions-upload" ? ["versions", "upload"] : ["deploy"]),
       "--dry-run",
       "--strict",
@@ -114,7 +124,7 @@ export async function prepareWorkerArtifact(input: {
       buildConfig,
       "--outdir",
       build,
-    ]),
+    ],
     { env: input.environment ?? {} },
   );
   if (built.exitCode !== 0) {
@@ -126,7 +136,10 @@ export async function prepareWorkerArtifact(input: {
   }
   const source = exactBundle(build);
   const bundlePath = join(release, "worker.js");
-  writeFileSync(bundlePath, canonicalizeWorkerBundleSource(readFileSync(source, "utf8"), source));
+  writeFileSync(
+    bundlePath,
+    canonicalizeWorkerBundleSource(readFileSync(source, "utf8"), source, sourceRepositoryRoot),
+  );
   const bundleDigestHex = createHash("sha256").update(readFileSync(bundlePath)).digest("hex");
   const configPath = writeConfig({
     path: join(release, "wrangler.jsonc"),
@@ -154,6 +167,8 @@ async function preparePublicFormImplementationPayload(input: {
   readonly target: DeployTarget;
   readonly run: WorkerArtifactProcess;
   readonly environment?: Readonly<Record<string, string>> | undefined;
+  readonly sourceRepositoryRoot: string;
+  readonly wranglerPath: string;
 }): Promise<PublicFormImplementationIdentity> {
   assertPublicFormCapabilityTarget(input.target);
   const build = join(input.root, "build");
@@ -166,7 +181,7 @@ async function preparePublicFormImplementationPayload(input: {
     `${JSON.stringify(
       {
         name: "takoserver-public-form-runtime-payload",
-        main: resolve(REPOSITORY, "src/entry-public-form-runtime-payload.ts"),
+        main: resolve(input.sourceRepositoryRoot, "src/entry-public-form-runtime-payload.ts"),
         compatibility_date: "2026-08-17",
         compatibility_flags: ["nodejs_compat"],
         workers_dev: false,
@@ -178,7 +193,16 @@ async function preparePublicFormImplementationPayload(input: {
     { mode: 0o600 },
   );
   const built = await input.run(
-    wranglerCommand(["deploy", "--dry-run", "--strict", "--config", configPath, "--outdir", build]),
+    [
+      input.wranglerPath,
+      "deploy",
+      "--dry-run",
+      "--strict",
+      "--config",
+      configPath,
+      "--outdir",
+      build,
+    ],
     { env: input.environment ?? {} },
   );
   if (built.exitCode !== 0) {
@@ -190,7 +214,14 @@ async function preparePublicFormImplementationPayload(input: {
   }
   const source = exactBundle(build);
   const payloadPath = join(release, "form-implementation.js");
-  writeFileSync(payloadPath, canonicalizeWorkerBundleSource(readFileSync(source, "utf8"), source));
+  writeFileSync(
+    payloadPath,
+    canonicalizeWorkerBundleSource(
+      readFileSync(source, "utf8"),
+      source,
+      input.sourceRepositoryRoot,
+    ),
+  );
   const implementationPayloadDigest = `sha256:${createHash("sha256")
     .update(readFileSync(payloadPath))
     .digest("hex")}` as const;
@@ -207,8 +238,13 @@ async function preparePublicFormImplementationPayload(input: {
  * Preserve the labels while making repository-owned paths independent of the
  * caller's temp-directory depth, so one source commit has one artifact digest.
  */
-export function canonicalizeWorkerBundleSource(source: string, sourcePath: string): string {
-  const repositoryPrefix = `${REPOSITORY}${sep}`;
+export function canonicalizeWorkerBundleSource(
+  source: string,
+  sourcePath: string,
+  sourceRepositoryRoot = REPOSITORY,
+): string {
+  const repositoryRoot = resolve(sourceRepositoryRoot);
+  const repositoryPrefix = `${repositoryRoot}${sep}`;
   const absoluteSourcePath = resolve(sourcePath);
   return source
     .split("\n")
@@ -218,8 +254,8 @@ export function canonicalizeWorkerBundleSource(source: string, sourcePath: strin
       let base = dirname(absoluteSourcePath);
       while (true) {
         const candidate = resolve(base, label);
-        if (candidate === REPOSITORY || candidate.startsWith(repositoryPrefix)) {
-          return `// ${relative(REPOSITORY, candidate).split(sep).join("/")}`;
+        if (candidate === repositoryRoot || candidate.startsWith(repositoryPrefix)) {
+          return `// ${relative(repositoryRoot, candidate).split(sep).join("/")}`;
         }
         const parent = dirname(base);
         if (parent === base) break;

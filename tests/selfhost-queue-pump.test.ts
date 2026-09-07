@@ -82,6 +82,9 @@ function recordingRuntime(): {
       state.answer = next;
     },
     runtime: {
+      async inspectModule(input) {
+        return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+      },
       async write() {},
       async remove() {},
       async reload() {},

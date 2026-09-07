@@ -2085,11 +2085,13 @@ async function seedResource(
  * one looked it up in the ModuleWorker candidate list, never matched, and
  * refused every self-host WorkerEndpoint with `unsupported_capability` 422.
  */
-for (const { label, space } of [
-  { label: "ordinary", space: TARGET.space },
-  { label: "Takosumi tenant-scoped", space: TAKOSUMI_TENANT_SPACE },
+for (const { label, space, supplied } of [
+  { label: "ordinary", space: TARGET.space, supplied: false },
+  { label: "Takosumi tenant-scoped", space: TAKOSUMI_TENANT_SPACE, supplied: false },
+  { label: "ordinary", space: TARGET.space, supplied: true },
+  { label: "Takosumi tenant-scoped", space: TAKOSUMI_TENANT_SPACE, supplied: true },
 ] as const) {
-  test(`creates a WorkerEndpoint with no reservation in the ${label} Space`, async () => {
+  test(`creates a WorkerEndpoint with ${supplied ? "a prepared" : "no"} reservation in the ${label} Space`, async () => {
     const applied: ApplyInput[] = [];
     const harness = fixture({
       offerings: [sold(), soldEndpointOffering()],
@@ -2105,6 +2107,17 @@ for (const { label, space } of [
         });
       },
     });
+    // Prepare before the Worker exists, as a pre-Plan origin request does.
+    // Only the external Provider is a test double; binding and assignment use
+    // the real durable Host authority throughout this driver call.
+    const prepared = supplied
+      ? await harness.authority.prepare({
+          organizationId: "org_01",
+          reservationId: "reservation_preplan",
+          requestedSubdomain: REQUESTED_SUBDOMAIN,
+          expiresInSeconds: 600,
+        })
+      : undefined;
     await seedWorker(harness.sql, {
       organizationId: "org_01",
       space,
@@ -2140,15 +2153,35 @@ for (const { label, space } of [
         worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
       },
       relations: [workerRelation(space)],
+      ...(prepared ? { workerEndpointOriginReservationId: prepared.reservationId } : {}),
     });
 
-    const origin = "https://sw-community.org-01.workers.test";
+    const origin = supplied
+      ? "https://community-public.org-01.workers.test"
+      : "https://sw-community.org-01.workers.test";
     expect(receipt.outputs).toEqual({
-      hostname: "sw-community.org-01.workers.test",
+      hostname: supplied
+        ? "community-public.org-01.workers.test"
+        : "sw-community.org-01.workers.test",
       url: `${origin}/`,
     });
     expect(applied).toHaveLength(1);
     expect(applied[0]?.workerEndpointOriginAssignment?.canonicalPublicOrigin).toBe(origin);
+    if (prepared) {
+      expect(prepared.canonicalPublicOrigin).toBe(origin);
+      expect(await harness.authority.read("org_01", prepared.reservationId)).toMatchObject({
+        status: "activated",
+        canonicalPublicOrigin: origin,
+      });
+      expect(await harness.authority.endpointAssignment("org_01", "uid-endpoint-01")).toMatchObject(
+        {
+          reservationId: prepared.reservationId,
+          canonicalPublicOrigin: origin,
+          worker: { name: TARGET.workerName, uid: "uid-worker-01" },
+          endpoint: { space, name: TARGET.endpointName, uid: "uid-endpoint-01" },
+        },
+      );
+    }
 
     // The reservation this Host made for the caller: a derived id in the
     // Host-minted namespace, on the ModuleWorker's own Offering, activated by
@@ -2160,7 +2193,8 @@ for (const { label, space } of [
       ),
     ).toEqual([
       {
-        reservation_id: expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
+        reservation_id:
+          prepared?.reservationId ?? expect.stringMatching(/^hostmint-[0-9a-f]{40}$/u),
         offering_id: "worker.module.test",
         state: "activated",
         endpoint_resource_uid: "uid-endpoint-01",

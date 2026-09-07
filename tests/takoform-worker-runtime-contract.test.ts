@@ -38,46 +38,52 @@ test("a generic keyed exclusive constraint does not activate the worker class-ho
     },
     operations: ["create", "read", "delete"],
   };
-  await expect(
-    validateClassHolderRuntime({
-      tenantId: "tenant-a",
-      space: "main",
-      form,
-      spec: {
-        owner: { apiVersion: "example.forms.invalid", kind: "Owner", name: "one" },
-        key: "A",
+  expect(() => validateClassHolderRuntime(form)).not.toThrow();
+});
+
+test("a class holder with no deployment is refused by the apply guard", () => {
+  const form: InstalledTakoformForm = {
+    identity: {
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "ActorNamespace",
+        definitionVersion: "0.1.0",
+        schemaDigest: `sha256:${"a".repeat(64)}`,
       },
-      relations: [
-        {
-          pointer: "/owner",
-          relation: "/owner",
-          targetApiVersion: "example.forms.invalid",
-          targetKind: "Owner",
-          targetName: "one",
-          targetUid: "uid_owner",
-          targetFormRef: {
-            apiVersion: "example.forms.invalid",
-            kind: "Owner",
-            definitionVersion: "1.0.0",
-            schemaDigest: `sha256:${"e".repeat(64)}`,
-          },
-        },
-      ],
-      store: {
-        readResource: async () => {
-          throw new Error("generic exclusivity reached worker ABI resource lookup");
-        },
-        readRelations: async () => {
-          throw new Error("generic exclusivity reached worker ABI relation lookup");
-        },
-        resourcesByRelation: async () => {
-          throw new Error("generic exclusivity reached WorkerDeployment lookup");
-        },
+    },
+    role: "identity",
+    providedInterfaces: [
+      {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.actor",
+        version: "1.0.0",
+        schemaDigest: `sha256:${"b".repeat(64)}`,
       },
-      artifacts: {
-        resolveManifest: async () => null,
-        resolveBlob: async () => null,
+    ],
+    workerClassRuntime: {
+      providedInterface: "worker.actor",
+      className: "/className",
+      workerRelation: "/worker",
+      deploymentForm: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "WorkerDeployment",
       },
-    }),
-  ).resolves.toBeUndefined();
+      deploymentWorkerRelation: "/worker",
+      deploymentVersionRelation: "/versions/*/workerVersion",
+      versionBundleRelation: "/bundle",
+    },
+    desiredSchema: {
+      type: "object",
+      properties: {
+        className: { type: "string" },
+        worker: { type: "object" },
+      },
+      required: ["className", "worker"],
+    },
+    operations: ["create", "read", "delete"],
+  };
+
+  expect(() => validateClassHolderRuntime(form)).toThrow(
+    expect.objectContaining({ code: "unsupported_capability", status: 422 }),
+  );
 });

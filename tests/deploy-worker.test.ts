@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CloudflareProviderExecutorInspection } from "../scripts/deploy/cloudflare-provider-executor.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
+import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
   authoritySensitiveWorkerPaths,
   probeProduct,
@@ -217,7 +217,7 @@ describe("split Takoserver Worker surfaces", () => {
   test("public Worker status and apply fail closed on an unready provider executor", async () => {
     const current = fixture({ selectedTarget: executorTarget });
     const qualification = {
-      async read(): Promise<CloudflareProviderExecutorInspection> {
+      async read(): Promise<ProviderExecutorInspection> {
         return providerExecutorInspection(false);
       },
     };
@@ -394,6 +394,8 @@ describe("split Takoserver Worker surfaces", () => {
   });
 
   test("classifies every executable public Form P/I owner as authority", () => {
+    // Managed backend construction lives in the route-less executor. Its WfP
+    // implementation is no longer part of the public Form runtime payload.
     const expected = [
       "src/entry-public-form-runtime-payload.ts",
       "src/error-envelope.ts",
@@ -408,15 +410,9 @@ describe("split Takoserver Worker surfaces", () => {
       "src/provider-runtime-bindings.ts",
       "src/provider-runtime-input-port.ts",
       "src/provider-worker-endpoint-origin.ts",
-      "src/providers/cloudflare-managed-object-receipt.ts",
-      "src/providers/cloudflare-managed-worker-gateway.ts",
-      "src/providers/cloudflare-managed-worker-wrapper.ts",
       "src/providers/cloudflare-readback-descriptor.ts",
       "src/providers/cloudflare-runtime-bindings.ts",
-      "src/providers/cloudflare-wfp-backend.ts",
-      "src/providers/cloudflare-wfp-client.ts",
       "src/providers/cloudflare.ts",
-      "src/providers/managed-worker-state.ts",
       "src/providers/sqlite-migration-policy.ts",
       "src/public-form-implementation-build.ts",
       "src/public-form-runtime.ts",
@@ -1784,7 +1780,7 @@ describe("split Takoserver Worker surfaces", () => {
   });
 });
 
-function providerExecutorInspection(ready: boolean): CloudflareProviderExecutorInspection {
+function providerExecutorInspection(ready: boolean): ProviderExecutorInspection {
   const digest = "8".repeat(64);
   return {
     status: ready ? "ready" : "stale",
@@ -1805,11 +1801,6 @@ function providerExecutorInspection(ready: boolean): CloudflareProviderExecutorI
     commit: ready ? COMMIT : OTHER_COMMIT,
     bundleDigestHex: digest,
     moduleDigestHex: digest,
-    moduleBytes: Uint8Array.from([1, 2, 3]),
-    bindingsExact: true,
-    secretsExact: true,
-    settingsExact: true,
-    migrationExact: true,
   };
 }
 

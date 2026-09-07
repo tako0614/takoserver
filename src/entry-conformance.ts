@@ -30,7 +30,6 @@ import {
   increment,
   stripApplyReview,
 } from "./takoform/wire.ts";
-import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 
 /**
  * DISPOSABLE conformance build. Never production.
@@ -640,7 +639,6 @@ const host = createTakoformHost({
     pollsBeforeCommit: 1,
     retryAfterSeconds: 0,
   },
-  workerModuleInspector: createJavaScriptWorkerModuleInspector(),
   clock,
 });
 

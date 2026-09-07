@@ -11,7 +11,7 @@ import {
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
-import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-rpc.ts";
+import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
 import { embeddedPublicFormImplementationIdentity } from "./public-form-implementation-build.ts";
 import type {
@@ -26,7 +26,6 @@ import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { createTakoformStore } from "./takoform/store.ts";
-import { createJavaScriptWorkerModuleInspector } from "./takoform/worker-module-inspector.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
   createWorkerEndpointOriginReservationBindingHandle,
@@ -493,7 +492,6 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...(runtimeInputs ? { runtimeInputs } : {}),
     originReservations,
     artifacts,
-    workerModuleInspector: createJavaScriptWorkerModuleInspector(),
     ...(signingKey ? { signingKey } : {}),
     identity,
     identityProviders,

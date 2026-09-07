@@ -17,7 +17,7 @@ import {
 } from "./hosted-object-bucket-supplies.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
-import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-rpc.ts";
+import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
 import {
   CloudflareProviderProxy,
   createCloudflareProviderMeterProxySources,

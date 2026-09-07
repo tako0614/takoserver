@@ -38,8 +38,14 @@ import type {
   TakoformRuntimeInputPolicy,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+import { applyRequest } from "./takoform/wire.ts";
 import { TakosIdIdentityError } from "./takos-id-identity.ts";
-import { TokenError, type TokenService } from "./token.ts";
+import {
+  type TakoformTenantRunTokenClaims,
+  type TenantRunCredentialIssuance,
+  TokenError,
+  type TokenService,
+} from "./token.ts";
 import {
   HOST_MINTED_RESERVATION_PREFIX,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
@@ -67,6 +73,7 @@ const MAX_BODY_BYTES = 64 * 1_024;
  * are the real contract; this is only the outer refusal.
  */
 const MAX_RUNTIME_INPUT_BODY_BYTES = 4 * 1_024 * 1_024;
+const MAX_RUNTIME_INPUT_PUBLIC_APPLY_BODY_BYTES = 1 * 1_024 * 1_024;
 const RESOURCE_EXECUTION_EVIDENCE_PATH =
   /^\/v1\/organizations\/([^/]+)\/resources\/([^/]+)\/execution-evidence$/u;
 
@@ -149,8 +156,17 @@ export interface CreateControlRoutesOptions {
   readonly artifactConsumerRepair?: ArtifactConsumerRepair;
   /** Closed, encrypted handoff from the Takoserver companion provider to the Host. */
   readonly runtimeInputs?: RuntimeInputAuthority["preparations"];
+  /**
+   * The same post-signature tenant-run admission used by the public Host lane.
+   * Control never verifies or admits a second JWT vocabulary itself.
+   */
+  readonly authenticateTenantRunCredential?: (
+    authorization: string | null,
+  ) => Promise<Pick<TakoformTenantRunTokenClaims, "organizationId" | "spaceRef"> | null>;
   /** Value-free pre-mutation authority for one future stable Worker endpoint. */
   readonly originReservations?: WorkerEndpointOriginReservations;
+  /** Self-host-only, API-key-authenticated short-lived runner delegation. */
+  readonly selfhostTenantRunCredentials?: TenantRunCredentialIssuance;
   readonly runtimeInputPolicy?: Pick<TakoformRuntimeInputPolicy, "guaranteedMaximum">;
 }
 
@@ -176,7 +192,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     nativeResidual,
     artifactConsumerRepair,
     runtimeInputs,
+    authenticateTenantRunCredential,
     originReservations,
+    selfhostTenantRunCredentials,
     runtimeInputPolicy,
   } = options;
   const secureCookies = new URL(publicOrigin).protocol === "https:";
@@ -242,6 +260,26 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     return actor.organizationId;
   };
 
+  const runtimeInputWriter = async (
+    request: Request,
+  ): Promise<{ readonly organizationId: string; readonly tenantSpace?: string }> => {
+    const requestAuthorization = authorization(request);
+    const actor = await accounts.authenticate(requestAuthorization);
+    if (actor) {
+      if (
+        actor.kind !== "api_key" ||
+        !actor.organizationId ||
+        !grants(actor.scopes, "resources:write")
+      ) {
+        throw new AuthError("permission_denied");
+      }
+      return { organizationId: actor.organizationId };
+    }
+    const tenantRun = await authenticateTenantRunCredential?.(requestAuthorization);
+    if (!tenantRun) throw new AuthError("unauthenticated");
+    return { organizationId: tenantRun.organizationId, tenantSpace: tenantRun.spaceRef };
+  };
+
   return async (request, url) => {
     if (!url.pathname.startsWith("/v1/")) return null;
     try {
@@ -257,6 +295,34 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   };
 
   async function route(request: Request, url: URL): Promise<Response> {
+    if (url.pathname === "/v1/selfhost/tenant-run-credentials") {
+      if (!selfhostTenantRunCredentials || request.method !== "POST") {
+        controlError("not_found", 404);
+      }
+      const organizationId = await organizationWriter(request);
+      const body = await jsonObject(request);
+      exactKeys(body, ["spaceRef", "runRef"], ["workerEndpointOriginReservationId"]);
+      const issued = await selfhostTenantRunCredentials.issue({
+        organizationId,
+        spaceRef: credentialReference(body.spaceRef),
+        runRef: credentialReference(body.runRef),
+        ...(body.workerEndpointOriginReservationId === undefined
+          ? {}
+          : {
+              workerEndpointOriginReservationId: credentialReference(
+                body.workerEndpointOriginReservationId,
+              ),
+            }),
+      });
+      return Response.json(issued, {
+        status: 201,
+        headers: {
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+        },
+      });
+    }
+
     const originReservationActivation =
       /^\/v1\/worker-endpoint-origin-reservations\/([^/]+)\/activation$/u.exec(url.pathname);
     if (originReservationActivation) {
@@ -724,10 +790,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
-    // The private half of the runtime-input handoff. The organization is taken
-    // only from the authenticated key, and the operation key in the path is the
-    // same one the public apply will carry as its Idempotency-Key, so the two
-    // requests name one operation without the caller restating who they are.
+    // The private half of the runtime-input handoff. An organization writer
+    // retains its existing organization-wide administration. An admitted
+    // tenant-run credential instead carries the same exact Space scope as the
+    // public Host lane, and the public apply below proves that target before
+    // any value is sealed.
     const runtimeInputPreparation =
       /^\/v1\/takoform\/worker-runtime-input-preparations\/([^/]+)$/u.exec(url.pathname);
     if (runtimeInputPreparation) {
@@ -735,7 +802,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       // proved anything would make this route an unauthenticated oracle for
       // "this deployment is configured to hold sealed secrets", which is a fact
       // about the operator rather than about the requested operation.
-      const organizationId = await organizationWriter(request);
+      const runtimeInputAuthorization =
+        request.method === "DELETE"
+          ? { organizationId: await organizationWriter(request) }
+          : await runtimeInputWriter(request);
+      const { organizationId } = runtimeInputAuthorization;
       if (!runtimeInputs) controlError("operation_not_found", 404);
       const operationKey = segment(runtimeInputPreparation[1]);
       if (request.headers.get("idempotency-key") !== operationKey) {
@@ -755,22 +826,41 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         exactKeys(publicApply, ["method", "path", "fences", "body"]);
         const fences = record(publicApply.fences);
         exactKeys(fences, ["ifNoneMatch"]);
-        const prepared = await runtimeInputs.prepare({
-          organizationId,
-          operationKey,
-          canonicalPublicOrigin: bounded(body.canonicalPublicOrigin, 2_048),
-          publicApply: {
-            method: bounded(publicApply.method, 16),
-            path: bounded(publicApply.path, 8 * 1_024),
-            fences: { ifNoneMatch: bounded(fences.ifNoneMatch, 16) },
-            body: bounded(publicApply.body, 1_024 * 1_024),
+        const normalizedPublicApply = {
+          method: bounded(publicApply.method, 16),
+          path: bounded(publicApply.path, 8 * 1_024),
+          fences: { ifNoneMatch: bounded(fences.ifNoneMatch, 16) },
+          body: bounded(publicApply.body, MAX_RUNTIME_INPUT_PUBLIC_APPLY_BODY_BYTES),
+        };
+        if (
+          runtimeInputAuthorization.tenantSpace !== undefined &&
+          runtimeInputWorkerVersionSpace(normalizedPublicApply) !==
+            runtimeInputAuthorization.tenantSpace
+        ) {
+          controlError("operation_not_found", 404);
+        }
+        const prepared = await runtimeInputs.prepare(
+          {
+            organizationId,
+            operationKey,
+            canonicalPublicOrigin: bounded(body.canonicalPublicOrigin, 2_048),
+            publicApply: normalizedPublicApply,
+            bindings: stringRecord(body.bindings),
           },
-          bindings: stringRecord(body.bindings),
-        });
+          runtimeInputAuthorization.tenantSpace === undefined
+            ? undefined
+            : { space: runtimeInputAuthorization.tenantSpace },
+        );
         return Response.json(prepared, { headers });
       }
       if (request.method === "GET") {
-        const prepared = await runtimeInputs.read(organizationId, operationKey);
+        const prepared = await runtimeInputs.read(
+          organizationId,
+          operationKey,
+          runtimeInputAuthorization.tenantSpace === undefined
+            ? undefined
+            : { space: runtimeInputAuthorization.tenantSpace },
+        );
         if (!prepared) controlError("operation_not_found", 404);
         return Response.json(prepared, { headers });
       }
@@ -1422,6 +1512,15 @@ function tenantRef(value: unknown): string {
   return parsed;
 }
 
+/** Same closed opaque-reference grammar carried by a tenant-run JWT. */
+function credentialReference(value: unknown): string {
+  const parsed = text(value);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
 function resourceName(value: unknown): string {
   const parsed = text(value);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
@@ -1474,6 +1573,47 @@ function stringRecord(value: unknown): Readonly<Record<string, string>> {
     controlError("invalid_argument", 400);
   }
   return parsed as Readonly<Record<string, string>>;
+}
+
+/**
+ * Opens only enough of the already-committed public mutation to bind a
+ * tenant-run preparation to its canonical Space. The public Host will still
+ * perform the complete Form and review validation when that mutation is
+ * claimed; this private route must only ensure that the credential and the
+ * exact create it is preparing name the same Space.
+ */
+function runtimeInputWorkerVersionSpace(input: {
+  readonly method: string;
+  readonly path: string;
+  readonly fences: { readonly ifNoneMatch: string };
+  readonly body: string;
+}): string {
+  let resource: ReturnType<typeof applyRequest>;
+  try {
+    resource = applyRequest(
+      parseStrictJson(
+        new TextEncoder().encode(input.body),
+        MAX_RUNTIME_INPUT_PUBLIC_APPLY_BODY_BYTES,
+      ),
+    );
+  } catch (error) {
+    if (error instanceof StrictJsonError || error instanceof TakoformHostError) {
+      controlError("invalid_argument", 400);
+    }
+    throw error;
+  }
+  const expectedPath = `/apis/forms.takoform.com/v1/resources/${resource.apiVersion}/${resource.kind}/${resource.metadata.name}`;
+  if (
+    input.method !== "PUT" ||
+    input.fences.ifNoneMatch !== "*" ||
+    resource.kind !== "WorkerVersion" ||
+    resource.expectedUid !== undefined ||
+    resource.expectedGeneration !== undefined ||
+    input.path !== expectedPath
+  ) {
+    controlError("invalid_argument", 400);
+  }
+  return resource.metadata.space;
 }
 
 function segment(value: string | undefined): string {

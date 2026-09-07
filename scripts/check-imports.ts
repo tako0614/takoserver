@@ -7,7 +7,8 @@ const violations: string[] = [];
 // Cross-product firewall: no Takosumi source, package, or path may be reached.
 // ---------------------------------------------------------------------------
 
-const forbidden = /(?:^|[/@])takosumi(?:-cloud)?(?:$|[/])/iu;
+const forbidden =
+  /(?:^|[/@])takosumi(?:-cloud)?(?:$|[/])|(?:^|[/@])takoserver-private(?:$|[/])|^@takoserver\/private-/iu;
 const roots = ["src", "scripts", "tests"];
 
 for (const root of roots) {
@@ -69,13 +70,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/workerd-(?:runtime|supervisor)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/workerd-(?:artifact|runtime|supervisor|worker-module-inspector)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|worker-endpoint-origin-reservations|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -89,7 +90,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -108,7 +109,7 @@ const LAYERS: readonly Layer[] = [
   // to construct — but it stays below `entry`, which owns a running process.
   {
     name: "package-surface",
-    match: /^src\/index\.ts$/u,
+    match: /^src\/(?:index|provider-extension)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
 ];
@@ -158,6 +159,8 @@ const HOST_ONLY = [
   // Writing files and starting processes: a Worker can do neither.
   "src/workerd-runtime.ts",
   "src/workerd-supervisor.ts",
+  "src/workerd-worker-module-inspector.ts",
+  "src/workerd-artifact.ts",
   // The public Worker has D1 and R2 bindings. Credential-bearing HTTP
   // transports and the real Cloudflare provider belong only to the route-less
   // executor; see docs/adr/0001-provision-from-the-worker.md.
@@ -174,7 +177,9 @@ if (existsSync(WORKER_ENTRY)) {
   }
   for (const banned of [
     "src/providers/cloudflare.ts",
+    "src/providers/cloudflare-provider-executor-rpc.ts",
     "src/providers/cloudflare-wfp-backend.ts",
+    "src/providers/cloudflare-wfp-client.ts",
     "src/providers/cloudflare-worker-backend.ts",
     "src/providers/cloudflare-edge-meter.ts",
     "src/providers/cloudflare-r2-meter.ts",
@@ -202,30 +207,22 @@ if (existsSync(WORKER_ENTRY)) {
   }
 }
 
-const CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY = "src/entry-cloudflare-provider-executor.ts";
-if (existsSync(CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY)) {
-  const reachable = reachableFrom([CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY]);
-  for (const required of [
-    "src/providers/cloudflare.ts",
-    "src/providers/cloudflare-wfp-backend.ts",
-    "src/providers/cloudflare-edge-meter.ts",
-    "src/providers/cloudflare-r2-meter.ts",
-  ]) {
-    if (!reachable.has(required)) {
-      violations.push(`${CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY} does not reach required ${required}`);
+// WfP implementation and its process entries belong to takoserver-private.
+// This checks type-only imports too: an erased edge still couples the OSS
+// adapter/self-host source to a non-public implementation. Shared contracts,
+// pure helpers, and historical migrations remain in this repository.
+const PRIVATE_WFP_MODULE =
+  /(?:^|\/)(?:cloudflare-wfp-[^/]+|cloudflare-managed-(?:worker|object)-[^/]+|managed-worker-state|cloudflare-provider-executor-rpc|entry-cloudflare-(?:provider-executor|managed-worker-gateway|managed-object-receipt-authority))\.ts$/u;
+for (const root of roots) {
+  for (const path of walk(root)) {
+    if (!path.endsWith(".ts")) continue;
+    if (root === "src" && PRIVATE_WFP_MODULE.test(path)) {
+      violations.push(`${path} is a private WfP implementation; its owner is takoserver-private`);
     }
-  }
-  for (const banned of [
-    "src/app.ts",
-    "src/router.ts",
-    "src/openapi.ts",
-    "src/providers/wasabi.ts",
-    "src/providers/wasabi-meter.ts",
-  ]) {
-    if (reachable.has(banned)) {
-      violations.push(
-        `${CLOUDFLARE_PROVIDER_EXECUTOR_ENTRY} transitively imports forbidden ${banned}`,
-      );
+    for (const specifier of importsOf(path)) {
+      if (PRIVATE_WFP_MODULE.test(specifier)) {
+        violations.push(`${path} imports private WfP implementation ${specifier}`);
+      }
     }
   }
 }
@@ -268,6 +265,20 @@ const FORM_AUTHORITY_RPC_MODULES = [
 ];
 
 const SPONSORSHIP_AUTHORITY_ENTRY = "src/entry-sponsorship-authority-worker.ts";
+const PUBLIC_WORKER_ENTRIES = ["src/entry-cloudflare-worker.ts", "src/entry-worker.ts"];
+
+for (const entry of PUBLIC_WORKER_ENTRIES.filter(existsSync)) {
+  const reachable = reachableFrom([entry]);
+  for (const signer of [
+    "src/sponsorship-credential.ts",
+    "src/tenant-run-credential.ts",
+    "src/selfhost-tenant-run-credentials.ts",
+  ]) {
+    if (reachable.has(signer)) {
+      violations.push(`${entry} transitively imports private tenant-run signer ${signer}`);
+    }
+  }
+}
 
 for (const entry of PUBLIC_READER_ENTRIES.filter(existsSync)) {
   const reachable = reachableFrom([entry]);
@@ -291,6 +302,7 @@ if (existsSync(SPONSORSHIP_AUTHORITY_ENTRY)) {
     "src/sponsorship-authority.ts",
     "src/sponsorship-credential.ts",
     "src/sponsorship-issuance-receipt.ts",
+    "src/tenant-run-credential.ts",
     "src/sql-d1.ts",
     "src/token.ts",
   ]) {
