@@ -6,6 +6,15 @@ import {
   type ResourceExecutionCommit,
   type ResourceExecutionEvidenceResponse,
 } from "../resource-execution-evidence.ts";
+import {
+  decodeResourceDependencySet,
+  isResourceDependencyClaimKey,
+  RESOURCE_DEPENDENCY_PRIVATE_HOLDER,
+  type ResourceDependencySet,
+  resourceDependencyClaimKeys,
+  resourceDependencyClaimRange,
+  resourceDependencyTargetClaimRange,
+} from "./dependency-fence.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
 import {
   OPERATION_TTL_MILLISECONDS,
@@ -15,6 +24,7 @@ import {
 } from "./limits.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
 import {
+  crossResourcePrecondition,
   type TakoformDriverReceipt,
   TakoformHostError,
   type TakoformStoredResource,
@@ -169,6 +179,8 @@ export interface ResourceMutationCommit {
     readonly operationId: string;
   };
   readonly claimKeys?: readonly string[];
+  /** Exact internal relation targets held across provider dispatch and recovery. */
+  readonly dependencySet?: ResourceDependencySet;
   /** An identity-preserving no-op must leave the live Resource's committed claims untouched. */
   readonly preserveClaims?: true;
   readonly authorityFence?: TakoformAuthorityFence;
@@ -405,7 +417,11 @@ export interface TakoformStore {
     readonly operationId: string;
     readonly resourceUid: string;
     readonly leaseToken: string;
-  }): Promise<boolean>;
+    /** Omitted only by historical direct store callers with no dependency fence. */
+    readonly mode?: "initial" | "recovery";
+    readonly dependencyReservationOwnerId?: string;
+    readonly dependencySet?: ResourceDependencySet;
+  }): Promise<boolean | "dependency_changed">;
   /** Retains an accepted provider handle when completion was not observed. */
   recordProviderMutationOutcome(input: {
     readonly tenantId: string;
@@ -537,6 +553,26 @@ export interface TakoformStore {
   resourceClaimHolder(key: string): Promise<ResourceClaimHolder | null>;
   releaseResourceClaims(operationId: string): Promise<void>;
   releaseCommittedResourceClaims(tenantId: string, holderUid: string): Promise<void>;
+  /** Atomically reserves every exact target snapshot selected by one provider mutation. */
+  reserveResourceDependencies(input: {
+    readonly tenantId: string;
+    readonly holderUid: string;
+    readonly reservationOwnerId: string;
+    readonly dependencies: ResourceDependencySet;
+    readonly expiresAt: number;
+  }): Promise<void>;
+  /** Reads the complete dependency set marked for a dispatched saga, or no legacy set. */
+  readProviderMutationDependencies(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly operationId: string;
+  }): Promise<ResourceDependencySet | null>;
+  /** Releases only this source's uncommitted internal rows owned by this attempt. */
+  releaseResourceDependencies(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly ownerId: string;
+  }): Promise<void>;
 
   /**
    * Resources whose Form is no longer installed.
@@ -1374,71 +1410,135 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async prepareResourceDeletion(input): Promise<ResourceDeletionTombstone> {
       const timestamp = now();
-      await sql.run(
-        `INSERT OR IGNORE INTO tf_resource_deletion_attestations
-           (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
-            state, closure_fence, effects_json, evidence_json, evidence_ref,
-            evidence_effect_digest, evidence_checked_at, evidence_status,
-            created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?)`,
-        [
-          input.tenantId,
-          input.resourceUid,
-          input.address.space,
-          input.address.apiVersion,
-          input.address.kind,
-          input.address.name,
-          canonicalJson(input.formRef),
-          timestamp,
-          timestamp,
-        ],
+      const [targetClaimStart, targetClaimEnd] = await resourceDependencyTargetClaimRange(
+        input.tenantId,
+        input.resourceUid,
       );
-      const rows = await sql.query(
-        `SELECT * FROM tf_resource_deletion_attestations
-         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
-        [input.tenantId, input.resourceUid],
-      );
-      const existing = rows[0] ? resourceDeletionTombstone(rows[0]) : null;
-      if (
-        !existing ||
-        rows.length !== 1 ||
-        existing.address.space !== input.address.space ||
-        existing.address.apiVersion !== input.address.apiVersion ||
-        existing.address.kind !== input.address.kind ||
-        existing.address.name !== input.address.name ||
-        canonicalJson(existing.formRef) !== canonicalJson(input.formRef)
-      ) {
-        throw new TakoformHostError("resource_busy", 409);
-      }
-      if (existing.state === "live" || existing.state === "pending") {
-        await sql.run(
-          `UPDATE tf_resource_deletion_attestations
-           SET state = 'pending', updated_at = ?
-           WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
-             AND NOT EXISTS (
-               SELECT 1 FROM worker_runtime_input_preparations AS runtime_input
-               WHERE runtime_input.organization_id = ?
-                 AND runtime_input.worker_resource_uid = ?
-                 AND runtime_input.state = 'claimed'
-                 AND runtime_input.claim_expires_at > ?
-             )`,
-          [
-            timestamp,
-            input.tenantId,
-            input.resourceUid,
-            input.tenantId,
-            input.resourceUid,
-            timestamp,
-          ],
+      const guard = boundedGuard(`delete_dependency_${input.operationId}`);
+      const formRefJson = canonicalJson(input.formRef);
+      const available = `
+        NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims AS dependency
+          WHERE dependency.claim_key >= ? AND dependency.claim_key < ?
+            AND dependency.tenant_id = ?
+            AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tf_resources AS holder, json_each(holder.relations_json) AS relation
+          WHERE holder.tenant_id = ?
+            AND json_extract(relation.value, '$.targetUid') = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM worker_runtime_input_preparations AS runtime_input
+          WHERE runtime_input.organization_id = ?
+            AND runtime_input.worker_resource_uid = ?
+            AND runtime_input.state = 'claimed'
+            AND runtime_input.claim_expires_at > ?
+        )`;
+      const availableParams = (): readonly SqlParam[] => [
+        targetClaimStart,
+        targetClaimEnd,
+        input.tenantId,
+        timestamp,
+        input.tenantId,
+        input.resourceUid,
+        input.tenantId,
+        input.resourceUid,
+        timestamp,
+      ];
+      try {
+        await sql.batch([
+          {
+            // Provider deployment and intrinsic-resource absence evidence also
+            // uses this tombstone when no logical Resource row exists. The
+            // exact supplied incarnation remains authoritative; availability,
+            // not tf_resources presence, is the atomic deletion prerequisite.
+            sql: `INSERT OR IGNORE INTO tf_resource_deletion_attestations
+                    (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+                     state, closure_fence, effects_json, evidence_json, evidence_ref,
+                     evidence_effect_digest, evidence_checked_at, evidence_status,
+                     created_at, updated_at)
+                  SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', 1, '[]',
+                         NULL, NULL, NULL, NULL, NULL, ?, ?
+                  WHERE ${available}`,
+            params: [
+              input.tenantId,
+              input.resourceUid,
+              input.address.space,
+              input.address.apiVersion,
+              input.address.kind,
+              input.address.name,
+              formRefJson,
+              timestamp,
+              timestamp,
+              ...availableParams(),
+            ],
+          },
+          {
+            sql: `UPDATE tf_resource_deletion_attestations
+                  SET state = 'pending', updated_at = ?
+                  WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+                    AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                    AND form_ref_json = ? AND ${available}`,
+            params: [
+              timestamp,
+              input.tenantId,
+              input.resourceUid,
+              input.address.space,
+              input.address.apiVersion,
+              input.address.kind,
+              input.address.name,
+              formRefJson,
+              ...availableParams(),
+            ],
+          },
+          {
+            sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                  SELECT ?, CASE WHEN EXISTS (
+                    SELECT 1 FROM tf_resource_deletion_attestations
+                    WHERE tenant_id = ? AND resource_uid = ? AND state = 'pending'
+                      AND space = ? AND api_version = ? AND kind = ? AND name = ?
+                      AND form_ref_json = ? AND ${available}
+                  ) THEN 1 ELSE 0 END`,
+            params: [
+              guard,
+              input.tenantId,
+              input.resourceUid,
+              input.address.space,
+              input.address.apiVersion,
+              input.address.kind,
+              input.address.name,
+              formRefJson,
+              ...availableParams(),
+            ],
+          },
+          {
+            sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+            params: [guard],
+          },
+        ]);
+      } catch (error) {
+        if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        const identity = await sql.query(
+          `SELECT space, api_version, kind, name, form_ref_json, state
+           FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
+          [input.tenantId, input.resourceUid],
         );
-      }
-      const armedRows = await sql.query(
-        `SELECT state FROM tf_resource_deletion_attestations
-         WHERE tenant_id = ? AND resource_uid = ? LIMIT 2`,
-        [input.tenantId, input.resourceUid],
-      );
-      if (armedRows.length !== 1 || text(armedRows[0]?.state) !== "pending") {
-        throw new TakoformHostError("dependency_in_use", 409);
+        const row = identity[0];
+        if (
+          identity.length !== 1 ||
+          row?.space !== input.address.space ||
+          row.api_version !== input.address.apiVersion ||
+          row.kind !== input.address.kind ||
+          row.name !== input.address.name ||
+          row.form_ref_json !== formRefJson ||
+          (row.state !== "live" && row.state !== "pending")
+        ) {
+          throw new TakoformHostError("resource_busy", 409);
+        }
+        throw crossResourcePrecondition();
       }
       const recorded = await this.recordResourceEffect({
         tenantId: input.tenantId,
@@ -1687,53 +1787,225 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async markProviderMutationDispatch(input) {
       const timestamp = now();
-      const [marked] = await sql.batch([
+      const mode = input.mode ?? "initial";
+      const dependencies = input.dependencySet;
+      if (dependencies && !input.dependencyReservationOwnerId) {
+        throw new TypeError("dependency dispatch requires its reservation owner");
+      }
+      if (dependencies && dependencies.operationId !== input.operationId) {
+        throw new TypeError("dependency dispatch has the wrong operation identity");
+      }
+      const dependencyKeys = dependencies ? resourceDependencyClaimKeys(dependencies) : [];
+      if (
+        new Set(dependencyKeys).size !== dependencyKeys.length ||
+        dependencyKeys.some((key) => !isResourceDependencyClaimKey(key))
+      ) {
+        throw new TypeError("invalid provider dependency set");
+      }
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const dependencyKeysJson = dependencies ? resourceDependencyKeysJson(dependencies) : null;
+      const dependencyFencesJson = dependencies ? resourceDependencyFencesJson(dependencies) : null;
+      const sagaGuard = boundedGuard(`dispatch_saga_${input.leaseToken}`);
+      const targetGuard = boundedGuard(`dispatch_targets_${input.leaseToken}`);
+      const statements: SqlStatement[] = [
         {
-          sql: `UPDATE tf_provider_mutation_sagas
-                SET execution_started_at = ?, provider_outcome = 'running', updated_at = ?,
-                    expires_at = 253402300799999
-                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                  AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
-                  AND execution_lease_token = ? AND execution_lease_until > ?
-                  AND execution_started_at IS NULL`,
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN EXISTS (
+                  SELECT 1 FROM tf_provider_mutation_sagas
+                  WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND execution_lease_token = ? AND execution_lease_until > ?
+                    AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}
+                )${
+                  dependencies
+                    ? ` AND (
+                    SELECT COUNT(*) FROM tf_resource_claims
+                    WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                      AND claim_key >= ? AND claim_key < ?
+                      AND (state = 'committed' OR expires_at > ?)
+                  ) = json_array_length(?) AND NOT EXISTS (
+                    SELECT 1 FROM json_each(?) AS expected
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM tf_resource_claims AS dependency
+                      WHERE dependency.claim_key = CAST(expected.value AS TEXT)
+                        AND dependency.owner_operation_id = ? AND dependency.tenant_id = ?
+                        AND dependency.holder_uid = ?
+                        AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+                    )
+                  )`
+                    : ""
+                } THEN 1 ELSE 0 END`,
           params: [
-            timestamp,
-            timestamp,
+            sagaGuard,
             input.tenantId,
             input.operationId,
             input.resourceUid,
             timestamp,
             input.leaseToken,
             timestamp,
+            ...(dependencies
+              ? [
+                  input.dependencyReservationOwnerId as string,
+                  input.tenantId,
+                  input.resourceUid,
+                  dependencyStart,
+                  dependencyEnd,
+                  timestamp,
+                  dependencyKeysJson as string,
+                  dependencyKeysJson as string,
+                  input.dependencyReservationOwnerId as string,
+                  input.tenantId,
+                  input.resourceUid,
+                  timestamp,
+                ]
+              : []),
           ],
         },
-        {
-          // A deferred Host command and its dispatched provider saga become
-          // one non-expiring repair unit in this transactional batch. An
-          // immediate (non-deferred) mutation simply matches no Host row.
-          sql: `UPDATE tf_deferred_operations
-                SET expires_at = 253402300799999, updated_at = ?
-                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
-                  AND phase = 'committing'
-                  AND EXISTS (
-                    SELECT 1 FROM tf_provider_mutation_sagas AS saga
-                    WHERE saga.operation_id = tf_deferred_operations.id
-                      AND saga.tenant_id = tf_deferred_operations.tenant_id
-                      AND saga.resource_uid = tf_deferred_operations.resource_uid
-                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
-                      AND saga.execution_started_at IS NOT NULL
-                      AND saga.execution_lease_token = ?
-                  )`,
+      ];
+      if (dependencies) {
+        statements.push({
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN NOT EXISTS (
+                  SELECT 1 FROM json_each(?) AS fence
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM tf_resource_claims AS dependency
+                    WHERE dependency.claim_key = json_extract(fence.value, '$[0]')
+                      AND dependency.owner_operation_id = ?
+                      AND dependency.tenant_id = ? AND dependency.holder_uid = ?
+                      AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+                      AND EXISTS (
+                        SELECT 1 FROM tf_resources AS target
+                        WHERE target.tenant_id = dependency.tenant_id
+                          AND target.space = json_extract(fence.value, '$[1]')
+                          AND target.api_version = json_extract(fence.value, '$[2]')
+                          AND target.kind = json_extract(fence.value, '$[3]')
+                          AND target.name = json_extract(fence.value, '$[4]')
+                          AND target.uid = json_extract(fence.value, '$[5]')
+                          AND target.revision = json_extract(fence.value, '$[6]')
+                          AND EXISTS (
+                            SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+                            WHERE attestation.tenant_id = target.tenant_id
+                              AND attestation.resource_uid = target.uid
+                              AND attestation.space = target.space
+                              AND attestation.api_version = target.api_version
+                              AND attestation.kind = target.kind
+                              AND attestation.name = target.name
+                              AND attestation.form_ref_json = json_extract(fence.value, '$[7]')
+                              AND attestation.state = 'live'
+                          )
+                      )
+                  )
+                ) THEN 1 ELSE 0 END`,
           params: [
-            timestamp,
-            input.operationId,
+            targetGuard,
+            dependencyFencesJson as string,
+            input.dependencyReservationOwnerId as string,
             input.tenantId,
             input.resourceUid,
-            input.leaseToken,
+            timestamp,
           ],
-        },
-      ]);
-      return marked?.changes === 1;
+        });
+      }
+      const sagaStatementIndex = statements.length;
+      statements.push({
+        sql: `UPDATE tf_provider_mutation_sagas
+              SET execution_started_at = COALESCE(execution_started_at, ?),
+                  provider_outcome = CASE
+                    WHEN execution_started_at IS NULL THEN 'running'
+                    ELSE provider_outcome
+                  END,
+                  updated_at = ?, expires_at = 253402300799999
+              WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                AND execution_lease_token = ? AND execution_lease_until > ?
+                AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}`,
+        params: [
+          timestamp,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          timestamp,
+          input.leaseToken,
+          timestamp,
+        ],
+      });
+      if (dependencies) {
+        statements.push({
+          // A newly selected edge stays reserved: if the following on-dispatch
+          // ledger callback refuses before provider entry, proven-idle cleanup
+          // may remove it. Its horizon becomes the same non-expiring repair
+          // horizon as the dispatched saga; prior committed edges stay live.
+          sql: `UPDATE tf_resource_claims
+                SET owner_operation_id = ?,
+                    expires_at = CASE
+                      WHEN state = 'reserved' THEN 253402300799999
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                  AND claim_key >= ? AND claim_key < ?
+                  AND (state = 'committed' OR expires_at > ?)`,
+          params: [
+            input.operationId,
+            timestamp,
+            input.dependencyReservationOwnerId as string,
+            input.tenantId,
+            input.resourceUid,
+            dependencyStart,
+            dependencyEnd,
+            timestamp,
+          ],
+        });
+      }
+      statements.push({
+        // A deferred Host command and its dispatched provider saga become one
+        // non-expiring repair unit in this transactional batch. An immediate
+        // mutation simply matches no Host row.
+        sql: `UPDATE tf_deferred_operations
+              SET expires_at = 253402300799999, updated_at = ?
+              WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                AND phase = 'committing'
+                AND EXISTS (
+                  SELECT 1 FROM tf_provider_mutation_sagas AS saga
+                  WHERE saga.operation_id = tf_deferred_operations.id
+                    AND saga.tenant_id = tf_deferred_operations.tenant_id
+                    AND saga.resource_uid = tf_deferred_operations.resource_uid
+                    AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                    AND saga.execution_started_at IS NOT NULL
+                    AND saga.execution_lease_token = ?
+                )`,
+        params: [timestamp, input.operationId, input.tenantId, input.resourceUid, input.leaseToken],
+      });
+      if (dependencies) {
+        statements.push({
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token IN (?, ?)",
+          params: [targetGuard, sagaGuard],
+        });
+      } else {
+        statements.push({
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+          params: [sagaGuard],
+        });
+      }
+      try {
+        const results = await sql.batch(statements);
+        return results[sagaStatementIndex]?.changes === 1;
+      } catch (error) {
+        if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        if (!dependencies) return false;
+        if (
+          !(await resourceDependenciesStillCurrent(sql, now, {
+            tenantId: input.tenantId,
+            resourceUid: input.resourceUid,
+            ownerId: input.dependencyReservationOwnerId as string,
+            dependencies,
+          }))
+        ) {
+          return "dependency_changed";
+        }
+        return false;
+      }
     },
 
     async recordProviderMutationOutcome(input) {
@@ -1853,6 +2125,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const serialized = canonicalJson(input.receipt);
       const timestamp = now();
       const guard = boundedGuard(`receipt_${input.leaseToken}`);
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
       try {
         await sql.batch([
           {
@@ -1904,8 +2177,16 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   sql: `UPDATE tf_resource_claims
                         SET state = 'committed', expires_at = NULL, updated_at = ?
                         WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
-                          AND state = 'reserved'`,
-                  params: [timestamp, input.claimOwnerId, input.tenantId, input.resourceUid],
+                          AND state = 'reserved'
+                          AND NOT (claim_key >= ? AND claim_key < ?)`,
+                  params: [
+                    timestamp,
+                    input.claimOwnerId,
+                    input.tenantId,
+                    input.resourceUid,
+                    dependencyStart,
+                    dependencyEnd,
+                  ],
                 },
                 {
                   sql: `UPDATE tf_deferred_operations
@@ -1922,6 +2203,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                 },
               ]
             : []),
+          {
+            sql: `UPDATE tf_resource_claims
+                  SET state = 'committed', expires_at = NULL, updated_at = ?
+                  WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                    AND state = 'reserved' AND claim_key >= ? AND claim_key < ?`,
+            params: [
+              timestamp,
+              input.operationId,
+              input.tenantId,
+              input.resourceUid,
+              dependencyStart,
+              dependencyEnd,
+            ],
+          },
           {
             sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
             params: [guard],
@@ -2369,6 +2664,13 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         fenceDeleteRevision: fencesRevision,
       });
       const executionEvidenceGuard = boundedGuard(`evidence_${guard}`);
+      const dependencyGuards = resourceDependencyCommitGuards({
+        tokenBase: guard,
+        tenantId: operation.tenantId,
+        resourceUid: mutation.resourceUid,
+        operationId: operation.id,
+        dependencies: mutation.dependencySet,
+      });
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
@@ -2381,6 +2683,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       )`
         : "1 = 1";
       const statements: SqlStatement[] = [
+        ...dependencyGuards.statements,
         {
           sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                 SELECT ?, CASE WHEN ${operationFence} AND ${resourceFence}
@@ -2508,6 +2811,13 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...(mutation.preserveClaims
           ? []
           : claimCommitStatements({ ...operation, id: leaseToken }, claimKeys, timestamp)),
+        ...resourceDependencyCommitStatements({
+          tenantId: operation.tenantId,
+          resourceUid: mutation.resourceUid,
+          operationId: operation.id,
+          mutation,
+          timestamp,
+        }),
         {
           sql: `UPDATE tf_deferred_operations
                 SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
@@ -2547,6 +2857,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               },
             ]
           : []),
+        ...dependencyGuards.cleanup,
         {
           sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
           params: [executionEvidenceGuard],
@@ -2579,6 +2890,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async committedResourceClaimHolder(key) {
+      if (isResourceDependencyClaimKey(key)) return null;
       const rows = await sql.query(
         `SELECT tenant_id, holder_space, holder_api_version, holder_kind,
                 holder_name, holder_uid
@@ -2601,6 +2913,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async resourceClaimHolder(key) {
+      if (isResourceDependencyClaimKey(key)) return null;
       const rows = await sql.query(
         `SELECT tenant_id, holder_space, holder_api_version, holder_kind,
                 holder_name, holder_uid
@@ -2624,6 +2937,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async reserveResourceClaims(reservations, expiresAt) {
       if (reservations.length === 0) return;
+      if (reservations.some((reservation) => isResourceDependencyClaimKey(reservation.key))) {
+        throw new TypeError("Definition claims cannot enter the Host dependency namespace");
+      }
       const timestamp = now();
       const statements: SqlStatement[] = [
         {
@@ -2706,10 +3022,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async releaseResourceClaims(operationId) {
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
       await sql.run(
         `DELETE FROM tf_resource_claims
-         WHERE owner_operation_id = ? AND state = 'reserved'`,
-        [operationId],
+         WHERE owner_operation_id = ? AND state = 'reserved'
+           AND NOT (claim_key >= ? AND claim_key < ?)`,
+        [operationId, dependencyStart, dependencyEnd],
       );
     },
 
@@ -2718,6 +3036,224 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         `DELETE FROM tf_resource_claims
          WHERE tenant_id = ? AND holder_uid = ? AND state = 'committed'`,
         [tenantId, holderUid],
+      );
+    },
+
+    async reserveResourceDependencies(input) {
+      if (input.expiresAt <= now()) {
+        throw new TypeError("resource dependency reservation must expire in the future");
+      }
+      const keys = resourceDependencyClaimKeys(input.dependencies);
+      if (
+        keys.length === 0 ||
+        keys.some((key) => !isResourceDependencyClaimKey(key)) ||
+        new Set(keys).size !== keys.length
+      ) {
+        throw new TypeError("invalid resource dependency set");
+      }
+      const decoded = await decodeResourceDependencySet(
+        keys,
+        input.tenantId,
+        input.holderUid,
+        input.dependencies.operationId,
+      );
+      if (!decoded || canonicalJson(decoded) !== canonicalJson(input.dependencies)) {
+        throw new TypeError("resource dependency set does not match its durable payload");
+      }
+      const timestamp = now();
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const keysJson = resourceDependencyKeysJson(input.dependencies);
+      const fencesJson = resourceDependencyFencesJson(input.dependencies);
+      const targetGuard = boundedGuard(`dependency_targets_${input.reservationOwnerId}`);
+      const ownershipGuard = boundedGuard(`dependency_owner_${input.reservationOwnerId}`);
+      const statements: SqlStatement[] = [
+        {
+          sql: `DELETE FROM tf_resource_claims
+                WHERE state = 'reserved' AND expires_at <= ?
+                  AND claim_key >= ? AND claim_key < ?`,
+          params: [timestamp, dependencyStart, dependencyEnd],
+        },
+        {
+          // A target persisted by an older Host may not yet have an
+          // attestation. Opening every exact live incarnation in this same
+          // batch is safe: a concurrent delete either wins with `pending`, or
+          // this reservation wins and its deletion guard sees the hold.
+          sql: `INSERT OR IGNORE INTO tf_resource_deletion_attestations
+                  (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+                   state, closure_fence, effects_json, evidence_json, evidence_ref,
+                   evidence_effect_digest, evidence_checked_at, evidence_status,
+                   created_at, updated_at)
+                SELECT ?, json_extract(fence.value, '$[5]'), json_extract(fence.value, '$[1]'),
+                       json_extract(fence.value, '$[2]'), json_extract(fence.value, '$[3]'),
+                       json_extract(fence.value, '$[4]'), json_extract(fence.value, '$[7]'),
+                       'live', 0, '[]', NULL, NULL, NULL, NULL, NULL, ?, ?
+                FROM json_each(?) AS fence
+                WHERE EXISTS (
+                  SELECT 1 FROM tf_resources AS target
+                  WHERE target.tenant_id = ?
+                    AND target.space = json_extract(fence.value, '$[1]')
+                    AND target.api_version = json_extract(fence.value, '$[2]')
+                    AND target.kind = json_extract(fence.value, '$[3]')
+                    AND target.name = json_extract(fence.value, '$[4]')
+                    AND target.uid = json_extract(fence.value, '$[5]')
+                    AND target.revision = json_extract(fence.value, '$[6]')
+                )`,
+          params: [input.tenantId, timestamp, timestamp, fencesJson, input.tenantId],
+        },
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN NOT EXISTS (
+                  SELECT 1 FROM json_each(?) AS fence
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM tf_resources AS target
+                    WHERE target.tenant_id = ?
+                      AND target.space = json_extract(fence.value, '$[1]')
+                      AND target.api_version = json_extract(fence.value, '$[2]')
+                      AND target.kind = json_extract(fence.value, '$[3]')
+                      AND target.name = json_extract(fence.value, '$[4]')
+                      AND target.uid = json_extract(fence.value, '$[5]')
+                      AND target.revision = json_extract(fence.value, '$[6]')
+                      AND EXISTS (
+                        SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+                        WHERE attestation.tenant_id = target.tenant_id
+                          AND attestation.resource_uid = target.uid
+                          AND attestation.space = target.space
+                          AND attestation.api_version = target.api_version
+                          AND attestation.kind = target.kind AND attestation.name = target.name
+                          AND attestation.form_ref_json = json_extract(fence.value, '$[7]')
+                          AND attestation.state = 'live'
+                      )
+                  )
+                ) THEN 1 ELSE 0 END`,
+          params: [targetGuard, fencesJson, input.tenantId],
+        },
+        {
+          sql: `INSERT INTO tf_resource_claims
+                  (claim_key, tenant_id, holder_space, holder_api_version, holder_kind,
+                   holder_name, holder_uid, owner_operation_id, state, expires_at, updated_at)
+                SELECT CAST(dependency.value AS TEXT), ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?
+                FROM json_each(?) AS dependency
+                WHERE 1 = 1
+                ON CONFLICT (claim_key) DO UPDATE SET
+                  owner_operation_id = excluded.owner_operation_id,
+                  state = CASE
+                    WHEN tf_resource_claims.state = 'committed' THEN 'committed'
+                    ELSE 'reserved'
+                  END,
+                  expires_at = CASE
+                    WHEN tf_resource_claims.state = 'committed' THEN NULL
+                    ELSE excluded.expires_at
+                  END,
+                  updated_at = excluded.updated_at
+                WHERE (
+                  tf_resource_claims.tenant_id = excluded.tenant_id AND
+                  tf_resource_claims.holder_space = excluded.holder_space AND
+                  tf_resource_claims.holder_api_version = excluded.holder_api_version AND
+                  tf_resource_claims.holder_kind = excluded.holder_kind AND
+                  tf_resource_claims.holder_name = excluded.holder_name AND
+                  tf_resource_claims.holder_uid = excluded.holder_uid
+                ) OR (
+                  tf_resource_claims.state = 'reserved' AND
+                  tf_resource_claims.expires_at <= ?
+                )`,
+          params: [
+            input.tenantId,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+            input.holderUid,
+            input.reservationOwnerId,
+            input.expiresAt,
+            timestamp,
+            keysJson,
+            timestamp,
+          ],
+        },
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN (
+                  SELECT COUNT(*) FROM tf_resource_claims
+                  WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                    AND claim_key >= ? AND claim_key < ?
+                    AND (state = 'committed' OR expires_at > ?)
+                ) = json_array_length(?) AND NOT EXISTS (
+                  SELECT 1 FROM json_each(?) AS expected
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM tf_resource_claims AS dependency
+                    WHERE dependency.claim_key = CAST(expected.value AS TEXT)
+                      AND dependency.owner_operation_id = ? AND dependency.tenant_id = ?
+                      AND dependency.holder_space = ? AND dependency.holder_api_version = ?
+                      AND dependency.holder_kind = ? AND dependency.holder_name = ?
+                      AND dependency.holder_uid = ?
+                      AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+                  )
+                ) THEN 1 ELSE 0 END`,
+          params: [
+            ownershipGuard,
+            input.reservationOwnerId,
+            input.tenantId,
+            input.holderUid,
+            dependencyStart,
+            dependencyEnd,
+            timestamp,
+            keysJson,
+            keysJson,
+            input.reservationOwnerId,
+            input.tenantId,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+            RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+            input.holderUid,
+            timestamp,
+          ],
+        },
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token IN (?, ?)",
+          params: [targetGuard, ownershipGuard],
+        },
+      ];
+      await sql.batch(statements);
+    },
+
+    async readProviderMutationDependencies(input) {
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const rows = await sql.query(
+        `SELECT claim_key FROM tf_resource_claims
+         WHERE tenant_id = ? AND holder_uid = ? AND owner_operation_id = ?
+           AND claim_key >= ? AND claim_key < ?
+           AND (state = 'committed' OR expires_at > ?)
+         ORDER BY claim_key`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+          dependencyStart,
+          dependencyEnd,
+          now(),
+        ],
+      );
+      try {
+        return await decodeResourceDependencySet(
+          rows.map((row) => text(row.claim_key)),
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+        );
+      } catch {
+        throw new TakoformHostError("backend_unavailable", 503);
+      }
+    },
+
+    async releaseResourceDependencies(input) {
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      await sql.run(
+        `DELETE FROM tf_resource_claims
+         WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+           AND state = 'reserved'
+           AND claim_key >= ? AND claim_key < ?`,
+        [input.ownerId, input.tenantId, input.resourceUid, dependencyStart, dependencyEnd],
       );
     },
 
@@ -3504,6 +4040,13 @@ function providerMutationCommitStatements(input: {
     fenceDeleteRevision: true,
   });
   const executionEvidenceGuard = boundedGuard(`evidence_${input.guard}`);
+  const dependencyGuards = resourceDependencyCommitGuards({
+    tokenBase: input.guard,
+    tenantId: input.tenantId,
+    resourceUid: mutation.resourceUid,
+    operationId: input.operationId,
+    dependencies: mutation.dependencySet,
+  });
   const sagaFence = receiptJson
     ? `EXISTS (
     SELECT 1 FROM tf_provider_mutation_sagas AS saga
@@ -3533,6 +4076,7 @@ function providerMutationCommitStatements(input: {
   )`
     : "1 = 1";
   const statements: SqlStatement[] = [
+    ...dependencyGuards.statements,
     {
       sql: `INSERT INTO tf_operation_commit_guards (token, valid)
             SELECT ?, CASE WHEN ${sagaFence} AND ${claimFence}
@@ -3659,6 +4203,13 @@ function providerMutationCommitStatements(input: {
           mutation.kind === "delete" ? [] : claimKeys,
           input.now,
         )),
+    ...resourceDependencyCommitStatements({
+      tenantId: input.tenantId,
+      resourceUid: mutation.resourceUid,
+      operationId: input.operationId,
+      mutation,
+      timestamp: input.now,
+    }),
     ...(input.beforeOperationStatements ?? []),
     {
       sql: `INSERT OR IGNORE INTO tf_operations
@@ -3682,6 +4233,7 @@ function providerMutationCommitStatements(input: {
           },
         ]
       : []),
+    ...dependencyGuards.cleanup,
     {
       sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
       params: [executionEvidenceGuard],
@@ -4311,6 +4863,194 @@ function boundedGuard(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128);
 }
 
+function resourceDependencyKeysJson(dependencies: ResourceDependencySet): string {
+  return boundedResourceDependencyJson(resourceDependencyClaimKeys(dependencies), "keys");
+}
+
+function resourceDependencyFencesJson(dependencies: ResourceDependencySet): string {
+  return boundedResourceDependencyJson(
+    dependencies.fences.map((fence) => [
+      fence.key,
+      fence.target.space,
+      fence.target.apiVersion,
+      fence.target.kind,
+      fence.target.name,
+      fence.target.uid,
+      fence.target.revision,
+      canonicalJson(fence.target.formRef),
+    ]),
+    "targets",
+  );
+}
+
+/** D1 bounds each string parameter at 2,000,000 bytes, including JSON1 inputs. */
+function boundedResourceDependencyJson(value: unknown, label: string): string {
+  const serialized = canonicalJson(value);
+  if (new TextEncoder().encode(serialized).byteLength > 2_000_000) {
+    throw new TypeError(`resource dependency ${label} exceed the D1 parameter limit`);
+  }
+  return serialized;
+}
+
+/** Readback is only error classification; the preceding batch remains the permission boundary. */
+async function resourceDependenciesStillCurrent(
+  sql: Sql,
+  now: () => number,
+  input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly ownerId: string;
+    readonly dependencies: ResourceDependencySet;
+  },
+): Promise<boolean> {
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+  const expectedKeys = resourceDependencyClaimKeys(input.dependencies);
+  const rows = await sql.query(
+    `SELECT claim_key FROM tf_resource_claims
+     WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+       AND claim_key >= ? AND claim_key < ?
+       AND (state = 'committed' OR expires_at > ?)
+     ORDER BY claim_key`,
+    [input.ownerId, input.tenantId, input.resourceUid, dependencyStart, dependencyEnd, now()],
+  );
+  if (canonicalJson(rows.map((row) => text(row.claim_key))) !== canonicalJson(expectedKeys)) {
+    return false;
+  }
+  const targets = await sql.query(
+    `SELECT CASE WHEN NOT EXISTS (
+       SELECT 1 FROM json_each(?) AS fence
+       WHERE NOT EXISTS (
+         SELECT 1 FROM tf_resources AS target
+         WHERE target.tenant_id = ?
+           AND target.space = json_extract(fence.value, '$[1]')
+           AND target.api_version = json_extract(fence.value, '$[2]')
+           AND target.kind = json_extract(fence.value, '$[3]')
+           AND target.name = json_extract(fence.value, '$[4]')
+           AND target.uid = json_extract(fence.value, '$[5]')
+           AND target.revision = json_extract(fence.value, '$[6]')
+           AND EXISTS (
+             SELECT 1 FROM tf_resource_deletion_attestations AS attestation
+             WHERE attestation.tenant_id = target.tenant_id
+               AND attestation.resource_uid = target.uid
+               AND attestation.space = target.space
+               AND attestation.api_version = target.api_version
+               AND attestation.kind = target.kind AND attestation.name = target.name
+               AND attestation.form_ref_json = json_extract(fence.value, '$[7]')
+               AND attestation.state = 'live'
+           )
+       )
+     ) THEN 1 ELSE 0 END AS current`,
+    [resourceDependencyFencesJson(input.dependencies), input.tenantId],
+  );
+  return targets.length === 1 && targets[0]?.current === 1;
+}
+
+function resourceDependencyCommitGuards(input: {
+  readonly tokenBase: string;
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly operationId: string;
+  readonly dependencies: ResourceDependencySet | undefined;
+}): {
+  readonly statements: readonly SqlStatement[];
+  readonly cleanup: readonly SqlStatement[];
+} {
+  if (!input.dependencies) return { statements: [], cleanup: [] };
+  if (input.dependencies.operationId !== input.operationId) {
+    throw new TypeError("dependency commit has the wrong operation identity");
+  }
+  const keysJson = resourceDependencyKeysJson(input.dependencies);
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+  const guard = boundedGuard(`dependency_commit_${input.tokenBase}`);
+  const statements: SqlStatement[] = [
+    {
+      sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+            SELECT ?, CASE WHEN (
+              SELECT COUNT(*) FROM tf_resource_claims
+              WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                AND claim_key >= ? AND claim_key < ? AND state = 'committed'
+            ) = json_array_length(?) AND NOT EXISTS (
+              SELECT 1 FROM json_each(?) AS expected
+              WHERE NOT EXISTS (
+                SELECT 1 FROM tf_resource_claims AS dependency
+                WHERE dependency.claim_key = CAST(expected.value AS TEXT)
+                  AND dependency.owner_operation_id = ? AND dependency.tenant_id = ?
+                  AND dependency.holder_uid = ? AND dependency.state = 'committed'
+              )
+            ) THEN 1 ELSE 0 END`,
+      params: [
+        guard,
+        input.operationId,
+        input.tenantId,
+        input.resourceUid,
+        dependencyStart,
+        dependencyEnd,
+        keysJson,
+        keysJson,
+        input.operationId,
+        input.tenantId,
+        input.resourceUid,
+      ],
+    },
+  ];
+  return {
+    statements,
+    cleanup: [{ sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?", params: [guard] }],
+  };
+}
+
+function resourceDependencyCommitStatements(input: {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly operationId: string;
+  readonly mutation: ResourceMutationCommit;
+  readonly timestamp: number;
+}): readonly SqlStatement[] {
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+  if (input.mutation.kind === "delete") {
+    return [
+      {
+        sql: `DELETE FROM tf_resource_claims
+              WHERE tenant_id = ? AND holder_uid = ?
+                AND claim_key >= ? AND claim_key < ?`,
+        params: [input.tenantId, input.resourceUid, dependencyStart, dependencyEnd],
+      },
+    ];
+  }
+  if (!input.mutation.dependencySet) return [];
+  return [
+    {
+      sql: `UPDATE tf_resource_claims
+            SET state = 'committed', expires_at = NULL, updated_at = ?
+            WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+              AND claim_key >= ? AND claim_key < ?`,
+      params: [
+        input.timestamp,
+        input.operationId,
+        input.tenantId,
+        input.resourceUid,
+        dependencyStart,
+        dependencyEnd,
+      ],
+    },
+    {
+      // Obsolete committed edges remain live until this same Resource commit,
+      // then disappear atomically with the replacement relation set.
+      sql: `DELETE FROM tf_resource_claims
+            WHERE tenant_id = ? AND holder_uid = ?
+              AND claim_key >= ? AND claim_key < ?
+              AND owner_operation_id <> ?`,
+      params: [
+        input.tenantId,
+        input.resourceUid,
+        dependencyStart,
+        dependencyEnd,
+        input.operationId,
+      ],
+    },
+  ];
+}
+
 function claimCommitStatements(
   operation: {
     readonly id: string;
@@ -4321,6 +5061,7 @@ function claimCommitStatements(
   timestamp: number,
 ): readonly SqlStatement[] {
   const statements: SqlStatement[] = [];
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
   if (claimKeys.length > 0) {
     const placeholders = claimKeys.map(() => "?").join(", ");
     statements.push({
@@ -4333,15 +5074,29 @@ function claimCommitStatements(
     statements.push({
       sql: `DELETE FROM tf_resource_claims
             WHERE tenant_id = ? AND holder_uid = ?
+              AND NOT (claim_key >= ? AND claim_key < ?)
               AND claim_key NOT IN (${placeholders})`,
-      params: [operation.tenantId, operation.resourceUid, ...claimKeys],
+      params: [
+        operation.tenantId,
+        operation.resourceUid,
+        dependencyStart,
+        dependencyEnd,
+        ...claimKeys,
+      ],
     });
   } else {
     statements.push({
       sql: `DELETE FROM tf_resource_claims
-            WHERE (tenant_id = ? AND holder_uid = ?) OR
-                  (owner_operation_id = ? AND state = 'reserved')`,
-      params: [operation.tenantId, operation.resourceUid, operation.id],
+            WHERE NOT (claim_key >= ? AND claim_key < ?)
+              AND ((tenant_id = ? AND holder_uid = ?) OR
+                   (owner_operation_id = ? AND state = 'reserved'))`,
+      params: [
+        dependencyStart,
+        dependencyEnd,
+        operation.tenantId,
+        operation.resourceUid,
+        operation.id,
+      ],
     });
   }
   return statements;

@@ -45,6 +45,9 @@ import {
 
 /** Where this Host's readiness probe reaches a published script. */
 const PROBE_HOSTNAME = "sw-test.selfhost-internal.invalid";
+const INTERNAL_READINESS_CAPABILITY_HEADER = "x-takoserver-selfhost-runtime-readiness";
+const INTERNAL_READINESS_CAPABILITY_BINDING = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS";
+const INTERNAL_READINESS_CAPABILITY = "f".repeat(64);
 
 const KV_ONLY: SelfhostWorkerEntrypointSourceInput = {
   originalMainModule: "index.js",
@@ -119,11 +122,21 @@ function rawEnv(
   service: { fetch(url: string, init: RequestInit): Promise<Response> },
   extra: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  // No token: the generated entrypoint's service binding addresses this Host's
-  // own facade service, and the facade is what holds the credential. A raw
-  // environment carrying one here would be testing a topology that no longer
-  // exists.
-  return { [SELFHOST_WORKER_DATA_SERVICE_BINDING]: service, ...extra };
+  // The data-plane credential remains on its facade service. The readiness
+  // capability is different: workerd binds it to this Host-generated wrapper,
+  // which consumes it from rawEnv and never projects it to tenant code.
+  return {
+    [SELFHOST_WORKER_DATA_SERVICE_BINDING]: service,
+    ...extra,
+    [INTERNAL_READINESS_CAPABILITY_BINDING]: INTERNAL_READINESS_CAPABILITY,
+  };
+}
+
+function authenticatedReadinessHeaders(): Readonly<Record<string, string>> {
+  return {
+    [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL,
+    [INTERNAL_READINESS_CAPABILITY_HEADER]: INTERNAL_READINESS_CAPABILITY,
+  };
 }
 
 const context = { waitUntil() {} };
@@ -400,18 +413,67 @@ test("a version that declares no fetch handler answers an HTTP request with 404"
   }
 });
 
-test("the readiness route validates the tenant namespace and names its own publication", async () => {
+test("keeps scalar readiness private while public and service requests reach the tenant once", async () => {
   const { service } = plane([]);
   const generated = await loadGenerated(
-    `export default { async fetch() { return new Response("tenant"); } };`,
+    `let calls = 0;
+export default { async fetch(request) {
+  calls += 1;
+  return new Response("tenant:" + calls + ":" + await request.text());
+} };`,
   );
+  const env = rawEnv(service);
+  const magicHeaders = {
+    [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL,
+  };
   try {
-    const answered = await generated.worker.fetch(
+    const publicAnswer = await generated.worker.fetch(
       new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: magicHeaders,
+        body: "public",
       }),
-      rawEnv(service),
+      env,
+      context,
+    );
+    expect(await publicAnswer.text()).toBe("tenant:1:public");
+
+    // A service binding can choose the request URL and headers but cannot read
+    // this Host's private raw binding. Spoofing the internal hostname is still
+    // one ordinary tenant invocation.
+    const serviceAnswer = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: magicHeaders,
+        body: "service",
+      }),
+      env,
+      context,
+    );
+    expect(await serviceAnswer.text()).toBe("tenant:2:service");
+
+    const guessed = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: {
+          ...magicHeaders,
+          [INTERNAL_READINESS_CAPABILITY_HEADER]: "not-the-capability",
+        },
+      }),
+      env,
+      context,
+    );
+    expect(guessed.status).toBe(404);
+
+    const answered = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
+        method: "POST",
+        headers: {
+          ...magicHeaders,
+          [INTERNAL_READINESS_CAPABILITY_HEADER]: INTERNAL_READINESS_CAPABILITY,
+        },
+      }),
+      env,
       context,
     );
     expect(answered.status).toBe(200);
@@ -420,13 +482,6 @@ test("the readiness route validates the tenant namespace and names its own publi
       publication: "sw1.v1",
       handlers: ["fetch"],
     });
-    // Without the protocol header the same path is an ordinary tenant request.
-    const tenant = await generated.worker.fetch(
-      new Request(`https://worker.example${SELFHOST_WORKER_READINESS_PATH}`, { method: "POST" }),
-      rawEnv(service),
-      context,
-    );
-    expect(await tenant.text()).toBe("tenant");
   } finally {
     await generated.dispose();
   }
@@ -442,7 +497,7 @@ test("the readiness route reports a declared handler the tenant module lacks", a
     const answered = await generated.worker.fetch(
       new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,
@@ -483,7 +538,7 @@ export default worker;`,
     const answered = await generated.worker.fetch(
       new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,
@@ -530,7 +585,7 @@ export default worker;`,
     const readiness = await generated.worker.fetch(
       new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,
@@ -624,7 +679,7 @@ export default worker;`,
     const answered = await generated.worker.fetch(
       new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,
@@ -1226,14 +1281,7 @@ test("the Host reports a namespace-consumption failure and a missing export dist
   expect(selfhostReadinessAnswer('{"schema":"other"}')).toBeNull();
 });
 
-/**
- * The route lives on the tenant's default `fetch`, and every hostname the
- * publication claims — customer custom domains included — reaches that same
- * service. So the refusal is public, and what the module said about it must not
- * be: a module specifier or a source path is the bundle's business and the
- * operator's, not something to hand to anyone who can reach the address.
- */
-test("answers the readiness detail to this Host's probe and to nobody else", async () => {
+test("answers namespace-consumption detail only to the authenticated Host probe", async () => {
   const { service } = plane([]);
   const generated = await loadGenerated(
     `const worker = Object.create(null);
@@ -1245,34 +1293,15 @@ Object.defineProperty(worker, "fetch", {
 export default worker;`,
     KV_ONLY,
   );
-  const ask = async (hostname: string) =>
-    await generated.worker.fetch(
-      new Request(`https://${hostname}${SELFHOST_WORKER_READINESS_PATH}`, {
+  try {
+    const probed = await generated.worker.fetch(
+      new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,
     );
-  try {
-    for (const hostname of [
-      "worker.example",
-      "www.customer.test",
-      "sw-other.selfhost-internal.invalid",
-    ]) {
-      const public_ = await ask(hostname);
-      // Still an honest refusal, and still attributable to this publication.
-      expect(public_.status).toBe(500);
-      const body = (await public_.text()) as string;
-      expect(JSON.parse(body)).toEqual({
-        schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
-        publication: "sw1.v1",
-        handlers: ["fetch"],
-      });
-      expect(body).not.toContain("node:path");
-      expect(body).not.toContain("/srv/app");
-    }
-    const probed = await ask(PROBE_HOSTNAME);
     expect(((await probed.json()) as { failure: { message: string } }).failure.message).toContain(
       "node:path",
     );
@@ -1304,7 +1333,7 @@ export default worker;`,
     const answered = await generated.worker.fetch(
       new Request(`https://${PROBE_HOSTNAME}${SELFHOST_WORKER_READINESS_PATH}`, {
         method: "POST",
-        headers: { [SELFHOST_WORKER_READINESS_HEADER]: SELFHOST_WORKER_READINESS_PROTOCOL },
+        headers: authenticatedReadinessHeaders(),
       }),
       rawEnv(service),
       context,

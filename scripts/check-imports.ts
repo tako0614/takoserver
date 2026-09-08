@@ -70,7 +70,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs)\.ts$|^src\/workerd-(?:artifact|runtime|supervisor|worker-module-inspector)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment)\.ts$|^src\/workerd-(?:artifact|runtime|supervisor|worker-module-inspector)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {

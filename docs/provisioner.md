@@ -108,6 +108,20 @@ and 0040, each `SQLiteDatabase` is a file under `<data root>/databases`, and an
 `ObjectBucket` is a directory under `<data root>/selfhost/objects` with its
 metadata in the control database under migration 0041.
 
+An explicit self-host `SQLiteDatabase` deletion is destructive: it closes the
+cached connection, then removes that database's main file and SQLite sidecars
+(`-wal`, `-shm`, `-journal`). Close or filesystem failures do not settle as a
+successful delete; recovery observes the exact paths and can still report
+present or unknown. Both relative and absolute data-root configurations work.
+No startup scan or background sweep deletes files retained by an older release.
+Back up data before explicitly deleting a database that must be retained.
+
+New databases use the resource UID in their physical name, so recreating the
+same logical name does not reuse an earlier incarnation's file. Existing
+resources keep their exact recorded native identity and output path; they are
+not renamed or migrated on upgrade. Deleting a SQLite migration attachment
+does not delete the database to which it was attached.
+
 They are served on their own listener, bound to `127.0.0.1`, never on `PORT`.
 What authenticates there is a bearer token minted per Worker Version, and a
 route on the public origin would make that token an internet-facing credential
@@ -166,11 +180,87 @@ workerd evidence does not qualify a managed runtime.
 Class-backed Actor/Workflow capabilities without an executable provider
 implementation remain unsupported on both discovery and mutation paths.
 
+The self-host adapter executes a `WorkerDeployment` containing one to eight
+exact Versions with positive integer weights totaling `10000`. It retains each
+Version's immutable materialization, orders the set by Resource UID, and
+preflights every Version's bindings and assets before publishing one complete
+runtime generation. Each endpoint, domain or service fetch selects one Version;
+a Queue batch and a scheduled invocation each make one selection for the whole
+invocation. Selection uses the declared proportions, not declaration order,
+the largest weight, caller headers or URL affinity. A selected Version's failure
+does not trigger a retry against another Version.
+
+Activation is serialized and requires authenticated readback of the exact
+serving generation. Failed activation and rollback do not make the desired
+generation the event-delivery authority: events use the proven serving
+generation. These self-host checks do not qualify managed WfP execution or
+unsupported Actor capabilities.
+
+The self-host supervisor starts workerd in watch mode and accepts it only after
+the serving readiness probe succeeds. A failed initial start rejects the
+activation; it does not leave a background startup loop. Once accepted, an
+unexpected child exit automatically retries the same configuration, with an
+exponential delay from 100 milliseconds capped at five seconds. Each replacement
+must pass readiness before serving is considered ready. An explicit supervisor
+stop cancels recovery and invalidates late startup results; a later explicit
+start remains possible. Normal configuration reloads do not restart a healthy
+child. This recovers the workerd child while Takoserver is running, not the
+Takoserver process itself or unsupported Actor capabilities.
+
+### Explicit native DO capability check
+
+The pinned runtime's native primitives can be checked independently of portable
+Actor support:
+
+```sh
+TAKOSERVER_WORKERD_BINARY=/absolute/path/to/pinned/workerd bun test tests/workerd-native-do-capabilities.test.ts
+```
+
+This disposable, loopback-only smoke verifies the exact artifact through the
+normal selector. It checks SQL and identity persistence, native KV isolation
+from SQL reads/writes, an alarm delivered after a pre-deadline forced child
+termination/restart, and hibernation/reconstruction on the same live WebSocket
+with its attachment intact. The child inherits no operator environment and
+cannot make outbound network connections. A supplied invalid binary fails; an
+unset variable skips this optional native check rather than substituting the
+package runtime.
+
+This evidence does not advertise a Form or qualify a portable class ABI. It
+does not prove managed WfP execution, cross-generation invocation exclusion,
+code-update socket continuity, storage-format upgrades or machine power-loss
+recovery. Actor/Workflow support remains unavailable until the relevant exact
+contracts and provider execution are implemented and verified.
+
+Two additional opt-in fixtures investigate code handoff, separately from that
+capability check:
+
+```sh
+TAKOSERVER_WORKERD_BINARY=/absolute/path/to/pinned/workerd bun test tests/workerd-native-facets.test.ts tests/workerd-native-static-facets.test.ts
+```
+
+The first checks native per-ID scheduling, response-head completion and
+tail-free facet replacement. The second uses static class bindings and the
+existing closed application module graph, without WorkerLoader or a runtime
+patch change. A plain Host-private class delegates to a fixture application;
+declared imports work while builtin, Host-private and undeclared application
+imports fail, including generated dynamic imports. Tail-free A→B→A replacement
+preserves the facet ID and SQL data and invalidates old stubs.
+
+These are mechanism checks, not an implemented Actor adapter or a class ABI.
+They do not prove in-flight version handoff, code-update WebSocket continuity,
+weighted routing, or managed WfP behavior. The static fixture intentionally
+passes a test marker across the Host/application boundary; it is not a proof
+of production environment materialization. Outbound denial is configured, not
+behaviorally tested by an attempted connection in that fixture.
+
 ### What workerd is given
 
 Publishing a Version registers the application graph plus Host-private prelude
-and entrypoint modules. Data bindings add the private facade module and render
-three services for one script:
+and entrypoint modules. Each active Version receives its own private service
+graph below. A stable `<script>-selfhost-deployment` router selects among these
+graphs using the committed deployment weights; Version variants have no
+independent public hostname or service-target identity. Data bindings add the
+private facade module and render three services for each Version:
 
 | Service | What it runs | What it holds |
 |---|---|---|
@@ -192,8 +282,43 @@ A Version with a static-asset attachment adds three operator-private services:
 | `<script>-assets` | Admits one runtime URL pathname and performs exact lookup or SPA fallback | A binding to the private files service, `notFoundHandling`, and the exact logical-path map with media type, size, and digest |
 | `<script>-asset-router` | Composes the asset lookup with the tenant Worker | Private bindings to both services and the exact `runWorkerFirst` value |
 
-The public hostname routes through `<script>-asset-router`; the Host's internal
-readiness hostname still reaches the Worker directly. None of these bindings is
+A Version may also declare a `module-worker.service` binding (version `1.0.0`)
+to another `ModuleWorker` on this Host. The projected
+`worker.service@1.0.0` interface is a frozen object with only `fetch`. The
+provider resolves the exact Resource relation and pins the target Resource UID
+and its Host-derived script address in the caller's immutable Version record. It
+does not use a public `WorkerEndpoint`, caller-supplied URL, request `Host`, DNS,
+or a credential, and it does not expose the target's native environment or any
+operator-private service name.
+
+Each workerd reload resolves that pinned identity against the target's current
+active `WorkerDeployment`. The caller therefore follows changes to the target's
+active Version set without being republished. Disabled or zero-traffic state,
+deletion, a recreated same-name Resource with a different UID, and any active
+Version without `fetch`
+all fail closed as `Error` named `backend_unavailable` rather than falling back
+to a public route or a stale Version. Service calls use the target's stable
+weighted router, then the selected Version's asset router when applicable, so
+its published asset ordering and fallback remain part of its `fetch` behavior.
+The request method, URL, query, headers, and body,
+and the response status, headers, and body, cross the native service binding as
+streams. An uncaught target `fetch` exception becomes the Host's terminated
+`500` response; inability to dispatch rejects instead.
+
+The private router and unavailability marker exist only in Host-generated
+services. Their per-Version token is not projected into either tenant, and an
+ordinary target response is returned unchanged even if it uses the same header
+name. Distinct logical Workers may form cycles; workerd's existing invocation
+bounds apply, and no separate RPC or network protocol is introduced.
+
+A retained `@v1`-`@v3` binding record has no logical Worker UID. It continues to
+serve an otherwise unchanged non-service Version, but the Host never guesses
+that missing identity or makes it a service target. Publishing a newly named
+Version records the identity needed for target selection.
+
+The public hostname reaches the deployment router, then the selected Version's
+asset router when applicable. The Host's internal readiness hostname bypasses
+asset routing and checks every active Version. None of these bindings is
 declared on the tenant service or projected by the generated entrypoint. In
 particular, an asset attachment does not invent `env.ASSETS`; a Version may
 independently declare an ordinary variable with that name and receives exactly
@@ -256,11 +381,13 @@ opaque object-operation document — and the plane behind parses that field by
 field before it resolves a binding name. `disallow_importable_env` is set on the tenant's
 service as well, which is the second lock rather than the first.
 
-Publishing also asks the published services, over the workerd router, whether the
-tenant's module exports every handler the Version declared. A module that does
-not is refused there rather than accepted and drained of its first event. The
-probe is best effort: when no runtime answers — a composition that serves
-workerd elsewhere, or one that is still starting — the publication proceeds.
+Publishing also asks the published services, over the workerd router, whether
+every active Version exports its declared handlers. An exact failed answer
+rejects publication; a responding runtime that does not confirm the expected
+publication times out. The adapter skips this extra probe when no probe is
+supplied or no runtime answers initially. This does not waive the built-in
+supervisor's required serving-readiness check or make a staged activation count
+as serving.
 
 ### What a Worker's SQL binding may say
 

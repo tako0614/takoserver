@@ -1,7 +1,11 @@
 import { beforeEach, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
-import type { SelfhostEventTarget, SelfhostEventTargets } from "../src/providers/selfhost.ts";
+import type {
+  SelfhostEventSelection,
+  SelfhostEventTarget,
+  SelfhostEventTargets,
+} from "../src/providers/selfhost.ts";
 import { parseSelfhostCron } from "../src/providers/selfhost-cron.ts";
 import {
   SELFHOST_WORKER_EVENT_PROTOCOL,
@@ -22,6 +26,7 @@ import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 
 const SCRIPT = "sw-fixture";
 const VERSION = "v-fixture";
+const VERSION_UID = "worker-version-fixture";
 const TOKEN = "event-token-fixture";
 const CRON = "0 * * * *";
 
@@ -77,20 +82,28 @@ function recordingRuntime(): {
   };
 }
 
-function targets(overrides: Partial<SelfhostEventTarget> = {}): SelfhostEventTargets {
+function targets(
+  overrides: Partial<SelfhostEventTarget & SelfhostEventSelection> = {},
+): SelfhostEventTargets {
+  const { versionId, workerVersionUid, eventToken, handlers, ...target } = overrides;
   return {
     async list() {
       return [
         {
           script: SCRIPT,
-          versionId: VERSION,
-          eventToken: TOKEN,
-          handlers: ["fetch", "scheduled"],
           consumers: [],
           crons: [CRON],
-          ...overrides,
+          ...target,
         },
       ];
+    },
+    async select() {
+      return {
+        versionId: versionId ?? VERSION,
+        workerVersionUid: workerVersionUid ?? VERSION_UID,
+        eventToken: eventToken ?? TOKEN,
+        handlers: handlers ?? ["fetch", "scheduled"],
+      };
     },
   };
 }
@@ -103,7 +116,10 @@ beforeEach(() => {
   millis = Date.UTC(2026, 8, 2, 12, 30, 0);
 });
 
-const scheduler = (runtime: WorkerdRuntime, overrides: Partial<SelfhostEventTarget> = {}) =>
+const scheduler = (
+  runtime: WorkerdRuntime,
+  overrides: Partial<SelfhostEventTarget & SelfhostEventSelection> = {},
+) =>
   createSelfhostWorkerScheduler({
     sql,
     runtime,
@@ -217,7 +233,13 @@ test("never fires at a Worker that declared no scheduled handler", async () => {
   millis = Date.UTC(2026, 8, 2, 13, 0, 10);
   expect(await fire.tick()).toBe(0);
   expect(runtime.fires).toHaveLength(0);
-  expect(await state()).toEqual([]);
+  expect(await state()).toMatchObject([
+    {
+      next_fire_at_ms: Date.UTC(2026, 8, 2, 14, 0, 0),
+      running_until_ms: null,
+      last_fired_at_ms: null,
+    },
+  ]);
 });
 
 test("forgets the next-fire state of one trigger, or of a whole script", async () => {

@@ -32,8 +32,9 @@ const FORMAT_V1 = "takoserver.selfhost-version-bindings@v1";
 /** The shape that also carries the KV/SQL projection and its plane secret. */
 const FORMAT_V2 = "takoserver.selfhost-version-bindings@v2";
 /**
- * The shape every version writes now: handlers at the top level rather than
- * inside the data plane, and an event token beside the plane token.
+ * The historical shape that moved handlers to the top level rather than
+ * keeping them inside the data plane, and added an event token beside the
+ * plane token.
  *
  * Handlers moved because a Cron Trigger or a Queue Consumer is attached long
  * after the Version that answers it was published, and the wrapper that
@@ -47,6 +48,15 @@ const FORMAT_V2 = "takoserver.selfhost-version-bindings@v2";
  * already written.
  */
 const FORMAT_V3 = "takoserver.selfhost-version-bindings@v3";
+/**
+ * Adds the logical Worker identity and its worker.service projections.
+ *
+ * Both identities are Host Resource UIDs. A script name is derived from a
+ * logical address and is therefore reused after delete/recreate; retaining the
+ * UID beside it is what prevents an immutable caller Version from silently
+ * acquiring authority over the replacement Resource.
+ */
+const FORMAT_V4 = "takoserver.selfhost-version-bindings@v4";
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
   "edge.kv",
@@ -61,6 +71,7 @@ export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[n
 
 const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
 
 export interface SelfhostVersionBinding {
   readonly name: string;
@@ -103,6 +114,15 @@ export interface SelfhostVersionQueueSettings {
   readonly deliveryDelaySeconds: number;
 }
 
+/** One fetch-only worker.service projection pinned to one logical Worker. */
+export interface SelfhostVersionServiceBinding {
+  readonly name: string;
+  /** Stable provider script address; never a URL or public endpoint. */
+  readonly target: string;
+  /** Exact Resource incarnation the resolved relation pinned. */
+  readonly targetResourceUid: string;
+}
+
 /**
  * The half of a version's environment that needs a data plane behind it.
  *
@@ -116,6 +136,8 @@ export interface SelfhostVersionDataPlane {
 }
 
 export interface SelfhostVersionBindingSet {
+  /** Exact ModuleWorker Resource this immutable Version revises. */
+  readonly workerResourceUid: string;
   /**
    * The events the Version says its module answers.
    *
@@ -128,11 +150,15 @@ export interface SelfhostVersionBindingSet {
   readonly vars: readonly SelfhostVersionBinding[];
   /** Values delivered through the runtime-input lease, never from portable state. */
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
+  /** Fetch-only projections to other logical ModuleWorkers. */
+  readonly serviceBindings: readonly SelfhostVersionServiceBinding[];
   /** Absent when the version binds no namespace, queue, or database. */
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
 export interface StoredSelfhostVersionBindings {
+  /** Absent only on a retained @v1-@v3 record; it is never inferred. */
+  readonly workerResourceUid?: string;
   /**
    * Absent on a record an earlier build wrote with no data plane. Such a
    * Version publishes exactly as it did; it simply cannot be given a wrapper,
@@ -141,6 +167,8 @@ export interface StoredSelfhostVersionBindings {
   readonly handlers?: readonly SelfhostWorkerHandlerName[];
   readonly vars: readonly SelfhostVersionBinding[];
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
+  /** Absent only on a retained @v1-@v3 record. */
+  readonly serviceBindings?: readonly SelfhostVersionServiceBinding[];
   readonly dataPlane?: SelfhostVersionDataPlane;
   /** Salted commitment to this exact binding set; safe to place in a generation. */
   readonly digest: `sha256:${string}`;
@@ -178,16 +206,18 @@ export interface SelfhostVersionBindingStore {
    * adopts the stored record -- salt, plane token, and event token included --
    * rather than minting a generation the runtime would then have to chase.
    *
-   * "The same bindings" means the record already carries everything a record
-   * carries now. A `@v1` record does not: it predates the handler list, so it
-   * cannot be the record for a set that declares handlers, and adopting it
-   * would leave a Version that can never be given a wrapper or an event token.
-   * That one is rewritten, which is exactly the upgrade path -- it costs a new
-   * salt and a moved digest, and it has no plane token to lose because a `@v1`
-   * record is one with no data plane. A `@v2` record does carry handlers and
-   * does carry a plane token the serving configuration is authenticating with,
-   * so it is adopted rather than rewritten; the event token a `@v2` Version
-   * lacks arrives with the next Version published, which is what the docs say.
+   * "The same bindings" normally means the record already carries everything
+   * the current format carries. A legacy record that predates logical Worker
+   * identity may still be adopted when it declares no service binding, so an
+   * unrelated reconcile does not rotate a token used by the serving runtime.
+   * Its missing identity is never inferred: a newly published Version is what
+   * makes that logical Worker eligible as a worker.service target.
+   *
+   * A `@v1` record also predates the handler list. It cannot be adopted for a
+   * set that declares handlers and is rewritten, which costs a new salt but no
+   * plane token because `@v1` has no data plane. `@v2` and `@v3` records carry
+   * serving tokens and remain byte-for-byte stable when their declarations are
+   * otherwise unchanged and no service binding was added.
    */
   write(
     script: string,
@@ -270,7 +300,7 @@ export function createSelfhostVersionBindingStore(options: {
         ) {
           throw new SelfhostVersionBindingStoreError("unavailable");
         }
-        const raw = canonicalRecord(FORMAT_V3, salt, normalized, planeToken, eventToken);
+        const raw = canonicalRecord(FORMAT_V4, salt, normalized, planeToken, eventToken);
         const bytes = new TextEncoder().encode(raw);
         if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
         const temporary = `${path}.tmp`;
@@ -299,7 +329,7 @@ export function createSelfhostVersionBindingStore(options: {
         }
         return {
           ...normalized,
-          digest: digestOf(FORMAT_V3, salt, normalized, planeToken, eventToken),
+          digest: digestOf(FORMAT_V4, salt, normalized, planeToken, eventToken),
           ...(planeToken === undefined ? {} : { planeToken }),
           eventToken,
         };
@@ -383,20 +413,59 @@ export function normalizeSelfhostVersionBindingSet(
 }
 
 function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet {
+  if (typeof set.workerResourceUid !== "string" || !RESOURCE_UID.test(set.workerResourceUid)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   const handlers = normalizeHandlers(set.handlers);
   const vars = normalizeBindings(set.vars);
   const sensitiveVars = normalizeBindings(set.sensitiveVars);
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
+  const serviceBindings = normalizeServiceBindings(set.serviceBindings);
   const names = new Set<string>();
   for (const name of [
     ...vars.map((binding) => binding.name),
     ...sensitiveVars.map((binding) => binding.name),
     ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
+    ...serviceBindings.map((binding) => binding.name),
   ]) {
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
     names.add(name);
   }
-  return { handlers, vars, sensitiveVars, ...(dataPlane ? { dataPlane } : {}) };
+  return {
+    workerResourceUid: set.workerResourceUid,
+    handlers,
+    vars,
+    sensitiveVars,
+    serviceBindings,
+    ...(dataPlane ? { dataPlane } : {}),
+  };
+}
+
+function normalizeServiceBindings(
+  bindings: readonly SelfhostVersionServiceBinding[],
+): readonly SelfhostVersionServiceBinding[] {
+  if (!Array.isArray(bindings)) throw new SelfhostVersionBindingStoreError("corrupt");
+  const sorted = [...bindings].sort((left, right) => (left?.name < right?.name ? -1 : 1));
+  if (sorted.length > 64) throw new SelfhostVersionBindingStoreError("corrupt");
+  for (const binding of sorted) {
+    if (
+      typeof binding?.name !== "string" ||
+      binding.name.length === 0 ||
+      binding.name.length > 64 ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.name) ||
+      typeof binding.target !== "string" ||
+      !SCRIPT_NAME.test(binding.target) ||
+      typeof binding.targetResourceUid !== "string" ||
+      !RESOURCE_UID.test(binding.targetResourceUid)
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+  }
+  return sorted.map((binding) => ({
+    name: binding.name,
+    target: binding.target,
+    targetResourceUid: binding.targetResourceUid,
+  }));
 }
 
 /** The closed handler vocabulary, sorted, non-empty, without a duplicate. */
@@ -515,22 +584,45 @@ function normalizeBindings(
 /**
  * Whether the stored record already IS the record for this set.
  *
- * `left.handlers === undefined` is a `@v1` record, and a `@v1` record is not
- * the record for any set written now: it has no handler list, so it could not
- * have committed to the one presented here. Answering false rewrites it at
- * `@v3`, which is how a Version published by an earlier build gains the
- * handlers and the event token an attachment needs.
+ * `left.handlers === undefined` is a `@v1` record. It has no handler list, so
+ * it cannot have committed to the one presented here; answering false rewrites
+ * it in the current format and gives a Version with declared handlers the
+ * event token an attachment needs.
  */
 function sameBindings(
   left: StoredSelfhostVersionBindings,
   right: SelfhostVersionBindingSet,
 ): boolean {
+  // A retained pre-v4 record stays byte-for-byte valid for a Version that did
+  // not declare a service binding. Its owner UID is deliberately not inferred,
+  // so it cannot become a worker.service target until a new Version is
+  // published, but an unrelated reconcile must not rotate its tokens.
+  if (left.workerResourceUid === undefined || left.serviceBindings === undefined) {
+    return (
+      right.serviceBindings.length === 0 &&
+      left.handlers !== undefined &&
+      JSON.stringify({
+        handlers: left.handlers,
+        vars: left.vars,
+        sensitiveVars: left.sensitiveVars,
+        dataPlane: left.dataPlane ?? null,
+      }) ===
+        JSON.stringify({
+          handlers: right.handlers,
+          vars: right.vars,
+          sensitiveVars: right.sensitiveVars,
+          dataPlane: right.dataPlane ?? null,
+        })
+    );
+  }
   return (
     left.handlers !== undefined &&
     canonicalBindings({
+      workerResourceUid: left.workerResourceUid,
       handlers: left.handlers,
       vars: left.vars,
       sensitiveVars: left.sensitiveVars,
+      serviceBindings: left.serviceBindings,
       ...(left.dataPlane ? { dataPlane: left.dataPlane } : {}),
     }) === canonicalBindings(right)
   );
@@ -538,9 +630,11 @@ function sameBindings(
 
 function canonicalBindings(set: SelfhostVersionBindingSet): string {
   return JSON.stringify({
+    workerResourceUid: set.workerResourceUid,
     handlers: set.handlers,
     vars: set.vars,
     sensitiveVars: set.sensitiveVars,
+    serviceBindings: set.serviceBindings,
     dataPlane: set.dataPlane ?? null,
   });
 }
@@ -552,10 +646,10 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
  * Every format this Host has ever written is reproducible here, because that
  * proof is what tells a torn or tampered file from a good one. `@v1` and `@v2`
  * are read, never written: a machine published by an earlier build keeps
- * serving, and the next Version it publishes is written at `@v3`.
+ * serving, and the next Version it publishes is written at `@v4`.
  */
 function canonicalRecord(
-  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3,
+  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3 | typeof FORMAT_V4,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -596,12 +690,27 @@ function canonicalRecord(
       planeToken,
     });
   }
+  if (format === FORMAT_V3) {
+    return JSON.stringify({
+      format: FORMAT_V3,
+      salt,
+      handlers: set.handlers,
+      vars: set.vars,
+      sensitiveVars: set.sensitiveVars,
+      ...(plane ? { dataPlane: plane } : {}),
+      ...(planeToken === undefined ? {} : { planeToken }),
+      eventToken,
+    });
+  }
+  const current = set as SelfhostVersionBindingSet;
   return JSON.stringify({
-    format: FORMAT_V3,
+    format: FORMAT_V4,
     salt,
-    handlers: set.handlers,
-    vars: set.vars,
-    sensitiveVars: set.sensitiveVars,
+    workerResourceUid: current.workerResourceUid,
+    handlers: current.handlers,
+    vars: current.vars,
+    sensitiveVars: current.sensitiveVars,
+    serviceBindings: current.serviceBindings,
     ...(plane ? { dataPlane: plane } : {}),
     ...(planeToken === undefined ? {} : { planeToken }),
     eventToken,
@@ -610,9 +719,11 @@ function canonicalRecord(
 
 /** What a record read back carries, before it is proved to be one. */
 interface LegacySet {
+  readonly workerResourceUid?: string;
   readonly handlers?: readonly SelfhostWorkerHandlerName[];
   readonly vars: readonly SelfhostVersionBinding[];
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
+  readonly serviceBindings?: readonly SelfhostVersionServiceBinding[];
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
@@ -623,7 +734,7 @@ interface LegacySet {
  * generation string is not a place to put one.
  */
 function digestOf(
-  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3,
+  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3 | typeof FORMAT_V4,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -653,7 +764,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
         ? FORMAT_V2
         : record.format === FORMAT_V3 && isVersion3Keys(keys)
           ? FORMAT_V3
-          : null;
+          : record.format === FORMAT_V4 && isVersion4Keys(keys)
+            ? FORMAT_V4
+            : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -661,7 +774,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  const hasPlane = format === FORMAT_V2 || (format === FORMAT_V3 && "dataPlane" in record);
+  const hasPlane =
+    format === FORMAT_V2 ||
+    ((format === FORMAT_V3 || format === FORMAT_V4) && "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
     hasPlane &&
@@ -669,9 +784,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  const eventToken = format === FORMAT_V3 ? record.eventToken : undefined;
+  const eventToken = format === FORMAT_V3 || format === FORMAT_V4 ? record.eventToken : undefined;
   if (
-    format === FORMAT_V3 &&
+    (format === FORMAT_V3 || format === FORMAT_V4) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -680,12 +795,18 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   // because a Version with no binding declares them too.
   const legacyPlane = format === FORMAT_V2 ? parsedLegacyDataPlane(record.dataPlane) : null;
   const handlers =
-    format === FORMAT_V3
+    format === FORMAT_V3 || format === FORMAT_V4
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
         : undefined;
   const set = normalizeSetOrLegacy({
+    ...(format === FORMAT_V4
+      ? {
+          workerResourceUid: parsedResourceUid(record.workerResourceUid),
+          serviceBindings: parsedServiceBindings(record.serviceBindings),
+        }
+      : {}),
     ...(handlers ? { handlers } : {}),
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
@@ -726,6 +847,38 @@ function isVersion3Keys(keys: string): boolean {
   );
 }
 
+/** A `@v4` record always states identity and the complete service list. */
+function isVersion4Keys(keys: string): boolean {
+  return (
+    keys ===
+      "eventToken,format,handlers,salt,sensitiveVars,serviceBindings,vars,workerResourceUid" ||
+    keys ===
+      "dataPlane,eventToken,format,handlers,planeToken,salt,sensitiveVars,serviceBindings,vars,workerResourceUid"
+  );
+}
+
+function parsedResourceUid(value: unknown): string {
+  if (typeof value !== "string" || !RESOURCE_UID.test(value)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return value;
+}
+
+function parsedServiceBindings(value: unknown): readonly SelfhostVersionServiceBinding[] {
+  if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
+  return value.map((entry) => {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      Array.isArray(entry) ||
+      Object.keys(entry).sort().join(",") !== "name,target,targetResourceUid"
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    return entry as unknown as SelfhostVersionServiceBinding;
+  });
+}
+
 function parsedHandlers(value: unknown): readonly SelfhostWorkerHandlerName[] {
   if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
   for (const entry of value) {
@@ -736,17 +889,35 @@ function parsedHandlers(value: unknown): readonly SelfhostWorkerHandlerName[] {
 
 /** Normalizes a set that may predate handlers, without inventing any. */
 function normalizeSetOrLegacy(set: LegacySet): LegacySet {
-  const normalized = normalizeSet({
-    handlers: set.handlers ?? ["fetch"],
-    vars: set.vars,
-    sensitiveVars: set.sensitiveVars,
-    ...(set.dataPlane ? { dataPlane: set.dataPlane } : {}),
-  });
+  const handlers = normalizeHandlers(set.handlers ?? ["fetch"]);
+  const vars = normalizeBindings(set.vars);
+  const sensitiveVars = normalizeBindings(set.sensitiveVars);
+  const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
+  const serviceBindings =
+    set.serviceBindings === undefined ? undefined : normalizeServiceBindings(set.serviceBindings);
+  if (
+    set.workerResourceUid !== undefined &&
+    (typeof set.workerResourceUid !== "string" || !RESOURCE_UID.test(set.workerResourceUid))
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const names = new Set<string>();
+  for (const name of [
+    ...vars.map((binding) => binding.name),
+    ...sensitiveVars.map((binding) => binding.name),
+    ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
+    ...(serviceBindings ?? []).map((binding) => binding.name),
+  ]) {
+    if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
+    names.add(name);
+  }
   return {
-    ...(set.handlers ? { handlers: normalized.handlers } : {}),
-    vars: normalized.vars,
-    sensitiveVars: normalized.sensitiveVars,
-    ...(normalized.dataPlane ? { dataPlane: normalized.dataPlane } : {}),
+    ...(set.workerResourceUid ? { workerResourceUid: set.workerResourceUid } : {}),
+    ...(set.handlers ? { handlers } : {}),
+    vars,
+    sensitiveVars,
+    ...(serviceBindings ? { serviceBindings } : {}),
+    ...(dataPlane ? { dataPlane } : {}),
   };
 }
 

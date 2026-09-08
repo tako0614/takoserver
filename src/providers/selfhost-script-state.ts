@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import {
+  canonicalSelfhostWeightedVersions,
+  persistedSelfhostWeightedDeployment,
+  type SelfhostWeightedDeployment,
+} from "../selfhost-weighted-deployment.ts";
 
 const SCRIPT_STATE_MAX_BYTES = 64 * 1_024;
 const SCRIPT_STATE_MUTEXES = new Map<string, Promise<void>>();
@@ -48,7 +53,16 @@ export function isSelfhostPortableQueueName(value: unknown): value is string {
 }
 
 export interface SelfhostScriptState {
+  /**
+   * Retained scalar written by Hosts predating weighted deployments.
+   *
+   * It remains readable and servable as one 10,000-basis-point Version, but it
+   * does not contain the resolved WorkerVersion UID required to claim an exact
+   * current deployment. New writes use `deployment` exclusively.
+   */
   readonly activeVersion?: string;
+  /** Exact current traffic graph, in canonical WorkerVersion UID order. */
+  readonly deployment?: SelfhostWeightedDeployment;
   readonly endpointHostname?: string;
   readonly domains: readonly string[];
   /**
@@ -196,7 +210,7 @@ export function createSelfhostScriptStateStore(options: {
     } catch {
       throw new SelfhostScriptStateStoreError("corrupt");
     }
-    return { state: persistedState(parsed), revision: revision(bytes) };
+    return { state: persistedState(parsed, true), revision: revision(bytes) };
   };
 
   const locked = <T>(script: string, operation: () => Promise<T>): Promise<T> =>
@@ -222,7 +236,7 @@ export function createSelfhostScriptStateStore(options: {
         if (current.revision !== expectedRevision) {
           throw new SelfhostScriptStateStoreError("conflict");
         }
-        const normalized = persistedState(state);
+        const normalized = persistedState(state, false);
         const raw = JSON.stringify(normalized);
         const bytes = new TextEncoder().encode(raw);
         if (bytes.byteLength > SCRIPT_STATE_MAX_BYTES) {
@@ -286,7 +300,7 @@ function revision(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
 
-function persistedState(value: unknown): SelfhostScriptState {
+function persistedState(value: unknown, requireCanonicalDeployment: boolean): SelfhostScriptState {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
@@ -296,6 +310,7 @@ function persistedState(value: unknown): SelfhostScriptState {
     keys.some(
       (key) =>
         key !== "activeVersion" &&
+        key !== "deployment" &&
         key !== "endpointHostname" &&
         key !== "domains" &&
         key !== "consumers" &&
@@ -304,14 +319,30 @@ function persistedState(value: unknown): SelfhostScriptState {
     !Array.isArray(parsed.domains) ||
     parsed.domains.some((entry) => typeof entry !== "string") ||
     (parsed.activeVersion !== undefined && typeof parsed.activeVersion !== "string") ||
+    (parsed.activeVersion !== undefined && parsed.deployment !== undefined) ||
     (parsed.endpointHostname !== undefined && typeof parsed.endpointHostname !== "string")
   ) {
     throw new SelfhostScriptStateStoreError("corrupt");
   }
   const consumers = persistedConsumers(parsed.consumers);
   const crons = persistedCrons(parsed.crons);
+  let deployment: SelfhostWeightedDeployment | undefined;
+  if (parsed.deployment !== undefined) {
+    try {
+      deployment = requireCanonicalDeployment
+        ? persistedSelfhostWeightedDeployment(parsed.deployment)
+        : {
+            versions: canonicalSelfhostWeightedVersions(
+              (parsed.deployment as { readonly versions?: unknown }).versions,
+            ),
+          };
+    } catch {
+      throw new SelfhostScriptStateStoreError("corrupt");
+    }
+  }
   return {
     ...(typeof parsed.activeVersion === "string" ? { activeVersion: parsed.activeVersion } : {}),
+    ...(deployment ? { deployment } : {}),
     ...(typeof parsed.endpointHostname === "string"
       ? { endpointHostname: parsed.endpointHostname }
       : {}),

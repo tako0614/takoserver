@@ -1,5 +1,9 @@
 import type { Sql, SqlParam, SqlStatement } from "./ports.ts";
-import type { SelfhostEventTarget, SelfhostEventTargets } from "./providers/selfhost.ts";
+import type {
+  SelfhostEventSelection,
+  SelfhostEventTarget,
+  SelfhostEventTargets,
+} from "./providers/selfhost.ts";
 import {
   MAX_SELFHOST_EVENT_REQUEST_BYTES,
   MAX_SELFHOST_EVENT_RESPONSE_BYTES,
@@ -105,6 +109,8 @@ const MAX_NO_ANSWER_BACKOFF_MILLIS = 60_000;
  * different number every pass.
  */
 const MAX_BATCH_ID_BYTES = 512;
+/** The deployment identity uses the same bounded token grammar as a batch id. */
+const MAX_DEPLOYMENT_ID_BYTES = 512;
 /**
  * What one message costs inside the envelope besides its own values.
  *
@@ -218,7 +224,9 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
         kind: "queue",
         batchId: "",
         logicalWorkerId: target.script,
-        deploymentId: target.versionId,
+        // Selection happens only once there is an actual reserved batch. Hold
+        // the grammar's maximum here so every selected Version still fits.
+        deploymentId: "x".repeat(MAX_DEPLOYMENT_ID_BYTES),
         queue: consumer.queueName,
         messages: [],
       }),
@@ -342,6 +350,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    */
   const deliver = async (
     target: SelfhostEventTarget,
+    selected: SelfhostEventSelection,
     consumer: DeliverableQueueConsumer,
     reserved: ReservedBatch,
     deadlineMillis: number,
@@ -351,7 +360,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       event = selfhostQueueEvent({
         batchId: randomId(),
         script: target.script,
-        publication: target.versionId,
+        publication: selected.versionId,
         queue: consumer.queueName,
         messages: reserved.messages.map((message) => ({
           messageId: message.messageId,
@@ -362,7 +371,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       });
     } catch (error) {
       if (!(error instanceof SelfhostEventShapeError)) throw error;
-      return await split(target, consumer, reserved, deadlineMillis);
+      return await split(target, selected, consumer, reserved, deadlineMillis);
     }
     let answer: { readonly status: number; readonly body: string } | null | undefined;
     try {
@@ -373,7 +382,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
           accept: SELFHOST_WORKER_EVENT_RESPONSE_CONTENT_TYPE,
           [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
-          [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: target.eventToken,
+          [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: selected.eventToken,
         },
         body: JSON.stringify(event),
         timeoutMillis: boundedTimeout(deadlineMillis),
@@ -416,6 +425,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
    */
   const split = async (
     target: SelfhostEventTarget,
+    selected: SelfhostEventSelection,
     consumer: DeliverableQueueConsumer,
     reserved: ReservedBatch,
     deadlineMillis: number,
@@ -431,6 +441,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     await release(consumer, reserved.token, reserved.messages.slice(half), millis);
     return await deliver(
       target,
+      selected,
       consumer,
       { token: reserved.token, messages: reserved.messages.slice(0, half) },
       deadlineMillis,
@@ -552,7 +563,20 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       }
       if (reserved.length === 0) break;
       const outcomes = await Promise.all(
-        reserved.map((batch) => deliver(target, consumer, batch, deadline)),
+        reserved.map(async (batch): Promise<DeliveryOutcome> => {
+          let selected: SelfhostEventSelection | null = null;
+          try {
+            selected = await options.targets.select(target.script);
+          } catch {
+            // Selection is durable readback plus private entropy. A failure is
+            // this Host failing to ask, so this batch spends no delivery.
+          }
+          if (!selected?.handlers.includes("queue")) {
+            await release(consumer, batch.token, batch.messages, now().getTime());
+            return { settled: 0, answered: false };
+          }
+          return await deliver(target, selected, consumer, batch, deadline);
+        }),
       );
       let answered = false;
       for (const outcome of outcomes) {
@@ -569,10 +593,6 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
   };
 
   const drainTarget = async (target: SelfhostEventTarget): Promise<number> => {
-    // A Worker that never declared a `queue` handler cannot be handed a batch.
-    // The attachment upstream is gated on the declaration, so this is a second
-    // lock rather than the first.
-    if (!target.handlers.includes("queue")) return 0;
     let settled = 0;
     for (const consumer of target.consumers) {
       try {

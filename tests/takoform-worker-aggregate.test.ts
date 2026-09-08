@@ -17,6 +17,9 @@ const noClaims = {
   async committedResourceClaimHolder() {
     return null;
   },
+  async readResourceDeletion() {
+    return null;
+  },
 };
 
 /**
@@ -55,6 +58,62 @@ const versionRelation: TakoformStoredRelation = {
   targetUid: version.metadata.uid,
   targetFormRef: version.form.formRef,
 };
+
+function deploymentWorkerRelation(): TakoformStoredRelation {
+  return {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetApiVersion: worker.apiVersion,
+    targetKind: worker.kind,
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+    targetFormRef: worker.form.formRef,
+  };
+}
+
+async function validateDeploymentVersion(
+  input: {
+    readonly selectedVersion?: TakoformStoredResource;
+    readonly readResourceDeletion?: () => Promise<ResourceDeletionTombstone | null>;
+  } = {},
+): Promise<void> {
+  const selectedVersion = input.selectedVersion ?? version;
+  await validateWorkerAggregate({
+    tenantId: "tenant-a",
+    space: "conformance",
+    resourceName: "deployment",
+    form: {
+      identity: { formRef: { ...formRef, kind: "WorkerDeployment" } },
+      role: "deployment",
+      desiredSchema: {},
+      operations: ["create", "read", "update", "delete"],
+    },
+    spec: { versions: [{ weight: 10_000 }] },
+    relations: [deploymentWorkerRelation(), versionRelation],
+    store: {
+      async hostnameClaims() {
+        return [];
+      },
+      async queuePathReaches() {
+        return false;
+      },
+      async resourcesByRelation() {
+        return [];
+      },
+      async readResource() {
+        return selectedVersion;
+      },
+      async readRelations() {
+        return [deploymentWorkerRelation()];
+      },
+      ...noClaims,
+      async readResourceDeletion() {
+        return input.readResourceDeletion ? await input.readResourceDeletion() : null;
+      },
+    },
+  });
+}
 
 test("a ModuleWorker is Provisioning until a deployment serves fetch", async () => {
   const missing = await workerServiceCondition({
@@ -270,6 +329,73 @@ test("a WorkerDeployment requires exactly 10000 basis points", async () => {
       },
     }),
   ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+});
+
+test("a WorkerDeployment rejects a selected WorkerVersion that is not Ready", async () => {
+  const notReady = {
+    ...version,
+    status: {
+      ...version.status,
+      conditions: version.status.conditions.map((condition) => ({
+        ...condition,
+        status: "False" as const,
+        reason: "Provisioning" as const,
+      })),
+    },
+  };
+  await expect(validateDeploymentVersion({ selectedVersion: notReady })).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    hostCode: "cross_resource_precondition",
+  });
+});
+
+test("a WorkerDeployment rejects a selected WorkerVersion with stale status generation", async () => {
+  const stale = {
+    ...version,
+    metadata: { ...version.metadata, generation: "2" },
+  };
+  await expect(validateDeploymentVersion({ selectedVersion: stale })).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    hostCode: "cross_resource_precondition",
+  });
+});
+
+test("a WorkerDeployment rejects a selected WorkerVersion whose UID was replaced", async () => {
+  const replaced = {
+    ...version,
+    metadata: { ...version.metadata, uid: "replacement-version-uid" },
+  };
+  await expect(validateDeploymentVersion({ selectedVersion: replaced })).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    hostCode: "cross_resource_precondition",
+  });
+});
+
+test("a WorkerDeployment rejects a selected WorkerVersion whose delete is pending", async () => {
+  await expect(
+    validateDeploymentVersion({
+      readResourceDeletion: async () =>
+        tombstone(version.metadata.uid, "pending", "WorkerVersion", version.metadata.name),
+    }),
+  ).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    hostCode: "cross_resource_precondition",
+  });
+});
+
+test("a WorkerDeployment accepts a selected WorkerVersion that is Ready and not deleting", async () => {
+  let deletionReads = 0;
+  await validateDeploymentVersion({
+    readResourceDeletion: async () => {
+      deletionReads += 1;
+      return null;
+    },
+  });
+  expect(deletionReads).toBe(1);
 });
 
 test("a queue incarnation has at most one consumer", async () => {
@@ -499,6 +625,7 @@ test("an inward activation waits for the WorkerDeployment its own apply wave is 
       async readRelations() {
         return [];
       },
+      ...noClaims,
       // The deployment's own create holds the reserved `exclusive` claim until
       // it commits, which is exactly "somebody in this wave is making this
       // Worker serve"; the third sighting is the commit.
@@ -692,6 +819,8 @@ test("a WorkerDeployment delete whose holder never finishes leaving is refused r
 function tombstone(
   resourceUid: string,
   state: ResourceDeletionTombstone["state"],
+  kind = "WorkerEndpoint",
+  name = "endpoint",
 ): ResourceDeletionTombstone {
   return {
     tenantId: "tenant-a",
@@ -700,10 +829,10 @@ function tombstone(
       tenantId: "tenant-a",
       space: "conformance",
       apiVersion: formRef.apiVersion,
-      kind: "WorkerEndpoint",
-      name: "endpoint",
+      kind,
+      name,
     },
-    formRef: { ...formRef, kind: "WorkerEndpoint" },
+    formRef: { ...formRef, kind },
     state,
     closureFence: 1,
     effects: [],

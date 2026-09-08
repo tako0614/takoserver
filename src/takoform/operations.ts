@@ -722,6 +722,7 @@ function storedCommit(
           resource: mutation.resource,
           relations: mutation.relations,
           ...(mutation.claimKeys ? { claimKeys: mutation.claimKeys } : {}),
+          ...(mutation.dependencySet ? { dependencySet: mutation.dependencySet } : {}),
           ...(mutation.preserveClaims ? { preserveClaims: true as const } : {}),
         }
       : {}),

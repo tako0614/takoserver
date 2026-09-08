@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
-import { chmodSync, mkdirSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import type { JsonValue, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import type { SelfhostDataPlaneMaintenance, SelfhostGrantedQueue } from "./providers/selfhost.ts";
 import {
@@ -143,6 +143,8 @@ const UPLOAD_SWEEP_BATCH = 64;
 const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const VERSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const TOKEN_SECRET = /^[A-Za-z0-9_-]{16,128}$/u;
+const DATABASE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
+const SQLITE_SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
 
 type PlaneErrorCode =
   | "invalid_key"
@@ -175,6 +177,10 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
     root: options.objectRoot,
     ...(options.clock ? { clock: options.clock } : {}),
   });
+  // Keep the public/output path supplied by the provider unchanged for legacy
+  // records, but use one absolute Host-owned path for filesystem operations.
+  // The Bun entry's default `.takoserver` root is relative.
+  const databasePath = (name: string): string => resolve(options.databasePath(name));
 
   /**
    * One handle per database file, kept open.
@@ -183,13 +189,14 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
    * would both cost more than the statement and drop the connection-scoped
    * `total_changes()` counter the write count is derived from. A handle is only
    * safe to keep while the file it names is the file the Host means, so
-   * `forgetDatabase` is what a Resource lifecycle calls when that stops being
-   * true.
+   * `deleteDatabase` is what a Resource lifecycle calls when that stops being
+   * true. It closes the handle and removes the exact database incarnation,
+   * including SQLite's sidecar files; it never sweeps a directory.
    */
   const database = (name: string): Database => {
     const existing = databases.get(name);
     if (existing) return existing;
-    const path = options.databasePath(name);
+    const path = databasePath(name);
     let opened: Database | undefined;
     try {
       // Nothing creates the database root eagerly — a SQLite database on this
@@ -315,13 +322,20 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
       await options.sql.run("DELETE FROM selfhost_queue_messages WHERE queue_id = ?", [queueId]);
     },
 
-    forgetDatabase(name) {
+    deleteDatabase(name) {
+      if (!DATABASE_NAME.test(name)) {
+        throw new Error("refusing to remove a database with an invalid name");
+      }
+      const path = databasePath(name);
       const opened = databases.get(name);
-      if (!opened) return;
-      databases.delete(name);
-      try {
+      if (opened) {
+        // Keep the cache entry until close succeeds. A failed close must not
+        // be reported as a completed delete, and a retry needs the handle the
+        // first attempt could not release.
         opened.close();
-      } catch {}
+        databases.delete(name);
+      }
+      removeSqliteFiles(path);
     },
 
     async objectBucketOccupancy(bucketId) {
@@ -426,6 +440,59 @@ function privateDirectory(path: string): void {
   if ((statSync(path).mode & 0o077) !== 0) {
     throw new Error(`refusing to open a database under a group- or world-accessible directory`);
   }
+}
+
+/**
+ * Remove one exact SQLite file and the sidecars SQLite may leave beside it.
+ *
+ * This is intentionally an unlink-by-name operation, not a directory sweep:
+ * the caller has already resolved the Resource incarnation to `path`, and a
+ * different database must never be touched as collateral. `lstat` refuses
+ * symlinked parents/files and non-regular files so a malformed path cannot
+ * turn a lifecycle delete into an outside-tree mutation.
+ */
+function removeSqliteFiles(path: string): void {
+  if (!isAbsolute(path) || path.length === 0) {
+    throw new Error("refusing to remove a database at a non-absolute path");
+  }
+  const parent = dirname(path);
+  let parentStat: ReturnType<typeof lstatSync>;
+  try {
+    parentStat = lstatSync(parent);
+  } catch (error) {
+    if (isMissingFileError(error)) return;
+    throw error;
+  }
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    throw new Error("refusing to remove a database under a non-directory path");
+  }
+
+  const files: string[] = [];
+  for (const candidate of [path, ...SQLITE_SIDECAR_SUFFIXES.map((suffix) => `${path}${suffix}`)]) {
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(candidate);
+    } catch (error) {
+      if (isMissingFileError(error)) continue;
+      throw error;
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error("refusing to remove a non-regular SQLite file");
+    }
+    files.push(candidate);
+  }
+  for (const candidate of files) {
+    unlinkSync(candidate);
+  }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { readonly code?: unknown }).code === "ENOENT"
+  );
 }
 
 /**

@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -30,12 +31,14 @@ import {
   type SelfhostDataPlaneMaintenance,
   selfhostDatabasePath,
 } from "../src/providers/selfhost.ts";
+import { SELFHOST_WORKER_EVENT_PROTOCOL } from "../src/providers/selfhost-events.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import {
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createRuntimeInputAuthority } from "../src/runtime-input-preparations.ts";
+import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
 import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
@@ -50,11 +53,17 @@ import {
  * Running somebody's Worker on a machine you own is what makes a self-hosted
  * deployment a platform rather than a place to keep files. The chain under
  * test is the released Edge Family's: a WorkerVersion stores a committed
- * bundle, a WorkerDeployment publishes the winning version into workerd, and
+ * bundle, a single-version WorkerDeployment publishes it into workerd, and
  * the endpoint and domain attachments decide which hostnames route to it.
  */
 
 const EDGE_API = "edge.forms.takoform.com/v1beta1";
+const MODULE_WORKER_SERVICE_BINDING_REF = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.service",
+  version: "1.0.0",
+  schemaDigest: "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa",
+} as const;
 
 function offering(kind: string): ProviderOffering {
   return {
@@ -142,6 +151,10 @@ function deployedRelation(
 }
 
 const identity = (name: string) => ({ tenantRef: "org_demo", space: "default", name });
+const sqliteIdentity = (name: string, uid = `uid-${name}`) => ({
+  ...identity(name),
+  uid,
+});
 const readTarget = (name: string) => ({
   tenantId: "org_demo",
   resourceUid: `uid-${name}`,
@@ -163,21 +176,37 @@ async function publishedModule(
   provenance: "application" | "hostPrivate",
   name: string,
 ): Promise<string> {
-  const manifest = JSON.parse(
+  const stable = JSON.parse(
     await readFile(join(dataRoot, "workers", script, "takoserver-site.json"), "utf8"),
   ) as {
+    publicationStorageLayout?: string;
+    generationKey?: string;
     moduleFiles: Record<"application" | "hostPrivate", { name: string; key: string }[]>;
   };
+  let manifest = stable;
+  let moduleRoot = join(dataRoot, "workers", script);
+  if (
+    stable.publicationStorageLayout === "weighted-deployment-v1" &&
+    typeof stable.generationKey === "string"
+  ) {
+    const generationRoot = join(dataRoot, "workers", ".publications", script, stable.generationKey);
+    const deployment = JSON.parse(
+      await readFile(join(generationRoot, "deployment.json"), "utf8"),
+    ) as {
+      versions: {
+        storageKey: string;
+        manifest: typeof stable;
+      }[];
+    };
+    const version = deployment.versions[0];
+    if (!version) throw new Error("published deployment Version is absent");
+    manifest = version.manifest;
+    moduleRoot = join(generationRoot, version.storageKey);
+  }
   const entry = manifest.moduleFiles[provenance].find((candidate) => candidate.name === name);
   if (!entry) throw new Error(`published ${provenance} module is absent: ${name}`);
   return await readFile(
-    join(
-      dataRoot,
-      "workers",
-      script,
-      provenance === "application" ? "application" : "host-private",
-      entry.key,
-    ),
+    join(moduleRoot, provenance === "application" ? "application" : "host-private", entry.key),
     "utf8",
   );
 }
@@ -188,12 +217,15 @@ const endpointAssignment = (hostname = "reserved.localhost") => ({
 });
 
 let root: string;
+const configProbeServers = new Set<ReturnType<typeof Bun.serve>>();
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-"));
 });
 
 afterEach(() => {
+  for (const server of configProbeServers) server.stop(true);
+  configProbeServers.clear();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -432,6 +464,85 @@ function materializingRuntime(
   });
 }
 
+function normalizeGeneratedWorkerdConfig(config: string): string {
+  return config.replace(/[0-9a-f]{64}/gu, "<hash>");
+}
+
+function privateVersionService(config: string): string {
+  const name = /^ {2}\( name = "(selfhost-version-[0-9a-f]{64})",$/mu.exec(config)?.[1];
+  if (!name) throw new Error("private Worker Version service is absent");
+  return name;
+}
+
+/** A loopback watcher emulator that proves the exact config identity it loaded. */
+function probedMaterializingRuntime(
+  afterLoad?: (invocation: number, config: string) => void | Promise<void>,
+): { readonly runtime: ReturnType<typeof materializingRuntime>; readonly reloads: () => number } {
+  let serving: {
+    readonly identity: string;
+    readonly token: string;
+    readonly readinessPublication?: string;
+  } | null = null;
+  let reloads = 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (
+        serving?.readinessPublication &&
+        request.method === "POST" &&
+        url.pathname === SELFHOST_WORKER_READINESS_PATH
+      ) {
+        return Response.json({
+          schema: SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
+          publication: serving.readinessPublication,
+        });
+      }
+      if (
+        serving === null ||
+        request.method !== "POST" ||
+        request.headers.get("host") !== "runtime.selfhost-config.invalid" ||
+        url.pathname !== "/.well-known/takoserver/selfhost-runtime-config/v1" ||
+        request.headers.get("x-takoserver-selfhost-runtime-config") !== serving.token
+      ) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(null, {
+        status: 204,
+        headers: { "x-takoserver-selfhost-config-identity": serving.identity },
+      });
+    },
+  });
+  configProbeServers.add(server);
+  const port = server.port;
+  if (port === undefined) throw new Error("config probe did not bind a port");
+  return {
+    runtime: materializingRuntime({
+      root,
+      port,
+      isReady: () => true,
+      onReload: async (path) => {
+        const config = await readFile(path, "utf8");
+        const identity = /\(name = "CONFIG_IDENTITY", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+        const token = /\(name = "CONFIG_PROBE_TOKEN", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+        const readinessPublication = /\(name = "PUBLICATION", text = "([0-9a-f]{64})"\)/u.exec(
+          config,
+        )?.[1];
+        if (!identity || !token) throw new Error("invalid config probe declaration");
+        serving = {
+          identity,
+          token,
+          ...(readinessPublication ? { readinessPublication } : {}),
+        };
+        reloads += 1;
+        await afterLoad?.(reloads, config);
+      },
+    }),
+    reloads: () => reloads,
+  };
+}
+
 function provider(options: ProviderCase = {}) {
   const modules = options.modules ?? { "index.js": TEST_WORKER_SOURCE };
   return createSelfhostProvider({
@@ -518,8 +629,9 @@ async function publish(
   assets = false,
   vars?: Record<string, string | number>,
   dataBindings = false,
+  handlers: readonly string[] = ["fetch"],
 ): Promise<string> {
-  const { script, deployment } = await publishChain(local, assets, vars, dataBindings);
+  const { script, deployment } = await publishChain(local, assets, vars, dataBindings, handlers);
   expect(deployment.phase).toBe("succeeded");
   return script;
 }
@@ -530,6 +642,7 @@ async function publishChain(
   assets = false,
   vars?: Record<string, string | number>,
   dataBindings = false,
+  handlers: readonly string[] = ["fetch"],
 ): Promise<{ readonly script: string; readonly deployment: ProviderTicket }> {
   const worker = await local.apply({
     operationId: "op_worker",
@@ -546,7 +659,7 @@ async function publishChain(
     identity: identity("hello-v1"),
     spec: {
       bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
-      handlers: ["fetch"],
+      handlers,
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
       ...(vars ? { vars } : {}),
       ...(dataBindings ? DATA_BINDING_SPEC : {}),
@@ -597,6 +710,364 @@ async function publishChain(
 }
 
 describe("publishing a Worker through the Edge Family", () => {
+  test("publishes, observes, adopts, and deletes one exact canonical weighted deployment", async () => {
+    const local = provider();
+    const script = await publish(local);
+    const second = await local.apply({
+      operationId: "op_weighted_second_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v2"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    expect(second.phase).toBe("succeeded");
+    const input = {
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v2" },
+            weight: 1,
+          },
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+            weight: 9_999,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-v2"),
+        relation("/versions/1/workerVersion", "WorkerVersion", "hello-v1"),
+      ],
+    };
+    expect(await local.apply({ ...input, operationId: "op_split" })).toMatchObject({
+      phase: "succeeded",
+      result: {
+        observed: {
+          versions: expect.arrayContaining([
+            expect.objectContaining({ weight: 1 }),
+            expect.objectContaining({ weight: 9_999 }),
+          ]),
+        },
+      },
+    });
+    const durable = JSON.parse(
+      await readFile(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as {
+      deployment: {
+        versions: { versionId: string; workerVersionUid: string; weight: number }[];
+      };
+    };
+    expect(durable.deployment.versions).toEqual([
+      {
+        workerVersionUid: "uid-WorkerVersion-hello-v1",
+        versionId: expect.any(String),
+        weight: 9_999,
+      },
+      { workerVersionUid: "uid-WorkerVersion-hello-v2", versionId: expect.any(String), weight: 1 },
+    ]);
+    const observation = { ...input, nativeId: `selfhost-deployment:${script}:op_deploy` };
+    expect(await local.observe(observation)).toMatchObject({ phase: "succeeded" });
+    if (!local.adopt) throw new Error("the self-host adoption path is missing");
+    expect(await local.adopt({ ...observation, operationId: "op_adopt_split" })).toMatchObject({
+      phase: "succeeded",
+    });
+    expect(await local.delete({ ...observation, operationId: "op_delete_split" })).toMatchObject({
+      phase: "succeeded",
+    });
+  });
+
+  test("event selection follows the exact deployment restored after an update fails", async () => {
+    let rejectNextActivation = false;
+    const watched = probedMaterializingRuntime(() => {
+      if (rejectNextActivation) {
+        rejectNextActivation = false;
+        throw new Error("new weighted graph failed after the watcher loaded it");
+      }
+    });
+    const invoked: Array<{ readonly deploymentId?: string }> = [];
+    const runtime: WorkerdRuntime = {
+      ...watched.runtime,
+      async probe(name, path, init) {
+        if (init.route === "events") {
+          invoked.push(JSON.parse(init.body ?? "{}") as { deploymentId?: string });
+          return {
+            status: 200,
+            body: JSON.stringify({
+              protocol: SELFHOST_WORKER_EVENT_PROTOCOL,
+              kind: "schedule",
+              outcome: "ack",
+            }),
+          };
+        }
+        return (await watched.runtime.probe?.(name, path, init)) ?? null;
+      },
+    };
+    const local = provider({ runtime, events: { async forgetSchedules() {} } });
+    const script = await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+    const trigger = await local.apply({
+      operationId: "op_failed_weighted_cron",
+      offering: offering("WorkerCronTrigger"),
+      identity: identity("hello-cron"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        cron: "* * * * *",
+      },
+      relations: [relation("/worker", "ModuleWorker", "hello")],
+    });
+    expect(trigger.phase).toBe("succeeded");
+    const second = await local.apply({
+      operationId: "op_failed_weighted_second_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("hello-v2"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch", "scheduled"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    expect(second.phase).toBe("succeeded");
+    rejectNextActivation = true;
+    const failed = await local.apply({
+      operationId: "op_failed_weighted_update",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v2" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-v2"),
+      ],
+    });
+    expect(failed).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+
+    // Desired state no longer names v1, but workerd still does. The serving
+    // pointer remains a deletion fence until a later activation commits v2.
+    expect(
+      await local.delete({
+        operationId: "op_delete_restored_v1",
+        offering: offering("WorkerVersion"),
+        identity: identity("hello-v1"),
+        nativeId: `selfhost-version:${script}:restored-v1`,
+        spec: {},
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+
+    // Desired state records the retry, but the exact pointer/config/activation
+    // transaction proved and restored v1. Queue and cron selection must use
+    // that committed graph rather than select the unserved desired v2.
+    const targets = createSelfhostEventTargets(root, { basisPoint: () => 1 });
+    const selected = await targets.select(script);
+    expect(selected).toMatchObject({
+      workerVersionUid: "uid-WorkerVersion-hello-v1",
+    });
+    let selections = 0;
+    const countedTargets = {
+      list: () => targets.list(),
+      async select(selectedScript: string) {
+        selections += 1;
+        return await targets.select(selectedScript);
+      },
+    };
+    const sql = createEphemeralSql();
+    let now = Date.UTC(2026, 8, 8, 12, 0, 30);
+    const scheduler = createSelfhostWorkerScheduler({
+      sql,
+      runtime,
+      targets: countedTargets,
+      clock: () => new Date(now),
+    });
+    expect(await scheduler.tick()).toBe(0);
+    now = Date.UTC(2026, 8, 8, 12, 1, 10);
+    expect(await scheduler.tick()).toBe(1);
+    expect(selections).toBe(1);
+    expect(invoked.map(({ deploymentId }) => deploymentId)).toEqual([selected?.versionId]);
+  });
+
+  test("refuses a single-version deployment unless its weight is exactly 10000", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ runtime: runtime.runtime });
+    const script = await publish(local);
+    const statePath = join(root, "selfhost", "scripts", `${script}.json`);
+    const before = await readFile(statePath, "utf8");
+    runtime.state.log.length = 0;
+    for (const weight of [0, -1, 5_000, 10_001]) {
+      expect(
+        await local.apply({
+          operationId: `op_weight_${weight}`,
+          offering: offering("WorkerDeployment"),
+          identity: identity("hello-live"),
+          spec: {
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+            versions: [
+              {
+                workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+                weight,
+              },
+            ],
+          },
+          relations: [
+            relation("/worker", "ModuleWorker", "hello"),
+            relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+          ],
+        }),
+      ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+    }
+    expect(await readFile(statePath, "utf8")).toBe(before);
+    expect(runtime.state.log).toEqual([]);
+    expect(await runtime.runtime.has(script)).toBe(true);
+  });
+
+  test("observe proves the immutable service target and refuses a legacy record with no identity", async () => {
+    const local = provider();
+    const createWorker = async (name: string) => {
+      const ticket = await local.apply({
+        operationId: `op_observe_service_${name}`,
+        offering: offering("ModuleWorker"),
+        identity: identity(name),
+        spec: {},
+      });
+      if (ticket.phase !== "succeeded") throw new Error(`could not create ${name}`);
+      return ticket.result;
+    };
+    const caller = await createWorker("observe-caller");
+    const targetA = await createWorker("observe-target-a");
+    const targetB = await createWorker("observe-target-b");
+    const callerRelation = deployedRelation(
+      "/worker",
+      "ModuleWorker",
+      "observe-caller",
+      caller.nativeId,
+      caller.outputs,
+    );
+    const targetRelation = (name: string, result: typeof targetA): ProviderRelation => ({
+      ...deployedRelation(
+        "/serviceBindings/0/resource",
+        "ModuleWorker",
+        name,
+        result.nativeId,
+        result.outputs,
+      ),
+      bindingRef: MODULE_WORKER_SERVICE_BINDING_REF,
+    });
+    const versionSpec = (target: string) => ({
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: ["fetch"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "observe-caller" },
+      serviceBindings: [
+        {
+          name: "PEER",
+          resource: { apiVersion: EDGE_API, kind: "ModuleWorker", name: target },
+        },
+      ],
+    });
+    const bundleRelation = relation("/bundle", "WorkerBundle", "bundle", {
+      manifestDigest: "sha256:worker",
+    });
+    const applied = await local.apply({
+      operationId: "op_observe_service_version",
+      offering: offering("WorkerVersion"),
+      identity: identity("observe-caller-v1"),
+      spec: versionSpec("observe-target-a"),
+      relations: [callerRelation, bundleRelation, targetRelation("observe-target-a", targetA)],
+    });
+    if (applied.phase !== "succeeded") throw new Error("service Version did not apply");
+    const versionId = String(applied.result.outputs.versionId);
+    const record = join(
+      root,
+      "selfhost",
+      "version-bindings",
+      String(caller.outputs.scriptName),
+      `${versionId}.json`,
+    );
+    const before = await readFile(record, "utf8");
+    const exact = await local.observe({
+      offering: offering("WorkerVersion"),
+      nativeId: applied.result.nativeId,
+      identity: identity("observe-caller-v1"),
+      spec: versionSpec("observe-target-a"),
+      relations: [callerRelation, bundleRelation, targetRelation("observe-target-a", targetA)],
+    });
+    expect(exact).toMatchObject({ phase: "succeeded" });
+
+    const parsed = JSON.parse(before) as Record<string, unknown>;
+    const wrongOwner = JSON.stringify({ ...parsed, workerResourceUid: "uid-other-worker" });
+    await writeFile(record, wrongOwner, "utf8");
+    const changedOwner = await local.observe({
+      offering: offering("WorkerVersion"),
+      nativeId: applied.result.nativeId,
+      identity: identity("observe-caller-v1"),
+      spec: versionSpec("observe-target-a"),
+      relations: [callerRelation, bundleRelation, targetRelation("observe-target-a", targetA)],
+    });
+    expect(changedOwner).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(await readFile(record, "utf8")).toBe(wrongOwner);
+    await writeFile(record, before, "utf8");
+
+    const changedTarget = await local.observe({
+      offering: offering("WorkerVersion"),
+      nativeId: applied.result.nativeId,
+      identity: identity("observe-caller-v1"),
+      spec: versionSpec("observe-target-b"),
+      relations: [callerRelation, bundleRelation, targetRelation("observe-target-b", targetB)],
+    });
+    expect(changedTarget).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(await readFile(record, "utf8")).toBe(before);
+
+    const legacy = JSON.stringify({
+      format: "takoserver.selfhost-version-bindings@v3",
+      salt: parsed.salt,
+      handlers: parsed.handlers,
+      vars: parsed.vars,
+      sensitiveVars: parsed.sensitiveVars,
+      eventToken: parsed.eventToken,
+    });
+    await writeFile(record, legacy, "utf8");
+    const missingIdentity = await local.observe({
+      offering: offering("WorkerVersion"),
+      nativeId: applied.result.nativeId,
+      identity: identity("observe-caller-v1"),
+      spec: versionSpec("observe-target-a"),
+      relations: [callerRelation, bundleRelation, targetRelation("observe-target-a", targetA)],
+    });
+    expect(missingIdentity).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(await readFile(record, "utf8")).toBe(legacy);
+  });
+
   /**
    * Every publication is load-probed, including the simplest kind of Worker.
    *
@@ -717,10 +1188,15 @@ describe("publishing a Worker through the Edge Family", () => {
     const script = await publish(local);
 
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
-    expect(config).toContain(`(name = "${script}", service = "${script}")`);
+    const variant = privateVersionService(config);
+    expect(config).toContain(
+      `(name = "${script}-selfhost-deployment", service = "${script}-selfhost-deployment")`,
+    );
+    expect(config).not.toContain(`(name = "${variant}", service = "${variant}")`);
     // Relative, because workerd resolves an embed against the config's own
     // directory and silently fails to read an absolute one.
-    expect(config).toContain(`embed "${script}/application/module-00000"`);
+    expect(config).toContain(`.publications/${script}/`);
+    expect(config).toContain(`/version-00000/application/module-00000"`);
     expect(config).not.toContain(`embed "${root}`);
   });
 
@@ -746,7 +1222,7 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(meta).not.toContain("vars");
   });
 
-  test("a version without vars publishes exactly the bytes it always did", async () => {
+  test("absent and empty vars render the same Host-only readiness binding", async () => {
     const plain = provider();
     const plainScript = await publish(plain);
     const withoutVars = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
@@ -758,8 +1234,12 @@ describe("publishing a Worker through the Edge Family", () => {
     const withEmptyVars = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
 
     expect(emptyScript).toBe(plainScript);
-    expect(withEmptyVars).toBe(withoutVars);
-    expect(withoutVars).not.toContain('bindings = [ (name = "');
+    expect(normalizeGeneratedWorkerdConfig(withEmptyVars)).toBe(
+      normalizeGeneratedWorkerdConfig(withoutVars),
+    );
+    expect(withoutVars).toMatch(
+      /bindings = \[ \(name = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS", text = "[0-9a-f]{64}"\) \],/u,
+    );
   });
 
   test("refuses a var name the module could never find under that spelling", async () => {
@@ -1214,17 +1694,13 @@ describe("publishing a Worker through the Edge Family", () => {
 
   test("does not treat a staged manifest as serving after reload fails", async () => {
     let failNextReload = false;
-    const runtime = materializingRuntime({
-      root,
-      isReady: () => true,
-      onReload: async () => {
-        if (failNextReload) {
-          failNextReload = false;
-          throw new Error("runtime reload failed after staging");
-        }
-      },
+    const probed = probedMaterializingRuntime(() => {
+      if (failNextReload) {
+        failNextReload = false;
+        throw new Error("runtime reload failed after staging");
+      }
     });
-    const local = provider({ runtime });
+    const local = provider({ runtime: probed.runtime });
     await publish(local);
     failNextReload = true;
 
@@ -1754,7 +2230,9 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(holders.length).toBe(3);
     for (const [path, mode] of holders) {
       expect(mode).toBe(0o600);
-      expect(path).toMatch(/workerd\.capnp$|takoserver-site\.json$|version-bindings\//u);
+      expect(path).toMatch(
+        /workerd\.capnp$|takoserver-site\.json$|deployment\.json$|version-bindings\//u,
+      );
     }
   });
 
@@ -2128,7 +2606,15 @@ describe("publishing a Worker through the Edge Family", () => {
       }),
     ).toMatchObject({ phase: "failed", failure });
     expect(JSON.parse(await readFile(statePath, "utf8"))).toMatchObject({
-      activeVersion: nextVersionId,
+      deployment: {
+        versions: [
+          {
+            versionId: nextVersionId,
+            workerVersionUid: "uid-WorkerVersion-hello-v2",
+            weight: 10_000,
+          },
+        ],
+      },
       domains: [],
     });
     expect(await readFile(metaPath, "utf8")).toBe(before);
@@ -2246,15 +2732,8 @@ describe("publishing a Worker through the Edge Family", () => {
   });
 
   test("recovers a local worker delete by readback without repeating the mutation", async () => {
-    let reloads = 0;
-    const runtime = materializingRuntime({
-      root,
-      isReady: () => true,
-      onReload: async () => {
-        reloads += 1;
-      },
-    });
-    const local = provider({ runtime });
+    const probed = probedMaterializingRuntime();
+    const local = provider({ runtime: probed.runtime });
     const script = await publish(local);
     const input = {
       operationId: "op_worker_delete_recovery",
@@ -2265,7 +2744,7 @@ describe("publishing a Worker through the Edge Family", () => {
     };
     const deleted = await local.delete(input);
     expect(deleted).toMatchObject({ phase: "succeeded" });
-    const afterDeleteReloads = reloads;
+    const afterDeleteReloads = probed.reloads();
 
     if (!local.recoverDelete) throw new Error("selfhost provider missing delete recovery seam");
     const recovered = await local.recoverDelete({
@@ -2277,7 +2756,7 @@ describe("publishing a Worker through the Edge Family", () => {
       result: { nativeId: input.nativeId, observed: { deleted: true } },
     });
     // Recovery is a readback-only seam: no second remove/reload is allowed.
-    expect(reloads).toBe(afterDeleteReloads);
+    expect(probed.reloads()).toBe(afterDeleteReloads);
   });
 });
 
@@ -2289,23 +2768,30 @@ describe("KV and SQLite bindings", () => {
     const script = await publish(local, false, { LANE: "takoform-v1" }, true);
 
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const variant = privateVersionService(config);
     // The tenant module is still declared, because the generated one imports
     // it; workerd resolves imports through the module registry this builds.
-    expect(config).toContain(
-      `(name = "__takoserver-selfhost-entrypoint.js", esModule = embed "${script}/host-private/module-00000", role = hostPrivate)`,
+    expect(config).toMatch(
+      new RegExp(
+        `\\(name = "__takoserver-selfhost-entrypoint\\.js", esModule = embed "\\.publications/${script}/[0-9a-f]{64}/version-00000/host-private/module-00000", role = hostPrivate\\)`,
+        "u",
+      ),
+    );
+    expect(config).toMatch(
+      new RegExp(
+        `\\(name = "index\\.js", esModule = embed "\\.publications/${script}/[0-9a-f]{64}/version-00000/application/module-00000", role = application\\)`,
+        "u",
+      ),
     );
     expect(config).toContain(
-      `(name = "index.js", esModule = embed "${script}/application/module-00000", role = application)`,
-    );
-    expect(config).toContain(
-      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
+      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${variant}-selfhost-data")`,
     );
     // The service the tenant binds is a Worker of this Host's own, and the one
     // that names the loopback address sits behind it.
-    expect(config).toContain(`( name = "${script}-selfhost-data",
+    expect(config).toContain(`( name = "${variant}-selfhost-data",
     worker = (
-      modules = [ (name = "__takoserver-selfhost-data.js", esModule = embed "${script}/host-private/module-00002") ],`);
-    expect(config).toContain(`( name = "${script}-selfhost-data-origin",
+      modules = [ (name = "__takoserver-selfhost-data.js", esModule = embed ".publications/${script}/`);
+    expect(config).toContain(`( name = "${variant}-selfhost-data-origin",
     external = ( address = "${address}", http = () )
   ),`);
     expect(config).toContain('(name = "LANE", text = "takoform-v1")');
@@ -2328,6 +2814,7 @@ describe("KV and SQLite bindings", () => {
     const versionId = versionDirectoryName(root, script);
 
     const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const variant = privateVersionService(config);
     const token = config.match(
       /\(name = "__TAKOSERVER_SELFHOST_DATA_TOKEN", text = "([^"]+)"\)/u,
     )?.[1];
@@ -2343,11 +2830,11 @@ describe("KV and SQLite bindings", () => {
       .split(/^ {2}\( name = /mu)
       .filter((section) => section.includes("__TAKOSERVER_SELFHOST_DATA_TOKEN"));
     expect(services).toHaveLength(1);
-    expect(services[0]).toStartWith(`"${script}-selfhost-data"`);
+    expect(services[0]).toStartWith(`"${variant}-selfhost-data"`);
 
     const tenantService = config
       .split(/^ {2}\( name = /mu)
-      .find((section) => section.startsWith(`"${script}"`)) as string;
+      .find((section) => section.startsWith(`"${variant}"`)) as string;
     expect(tenantService).not.toContain(token as string);
     expect(tenantService).not.toContain("__TAKOSERVER_SELFHOST_DATA_TOKEN");
 
@@ -2466,7 +2953,9 @@ describe("KV and SQLite bindings", () => {
     expect(await publish(withoutPlane)).toBe(script);
     const plain = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
 
-    expect(configured.replaceAll(script, "<script>")).toBe(plain.replaceAll(script, "<script>"));
+    expect(normalizeGeneratedWorkerdConfig(configured.replaceAll(script, "<script>"))).toBe(
+      normalizeGeneratedWorkerdConfig(plain.replaceAll(script, "<script>")),
+    );
     // The generated entrypoint is there either way, because it is the load
     // probe rather than the facade. The facade service is what a Version that
     // binds nothing does not get.
@@ -2585,7 +3074,7 @@ describe("KV and SQLite bindings", () => {
 
   test("republishing after an endpoint attachment keeps the entrypoint and the token", async () => {
     const local = provider({ dataPlaneAddress: address });
-    const script = await publish(local, false, undefined, true);
+    await publish(local, false, undefined, true);
     const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
 
     const endpoint = await local.apply({
@@ -2599,6 +3088,7 @@ describe("KV and SQLite bindings", () => {
     expect(endpoint.phase).toBe("succeeded");
 
     const after = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    const variant = privateVersionService(after);
     const token = (input: string) =>
       input.match(/\(name = "__TAKOSERVER_SELFHOST_DATA_TOKEN", text = "([^"]+)"\)/u)?.[1];
     // A Worker Version is immutable, so a republish must not mint a second
@@ -2606,12 +3096,12 @@ describe("KV and SQLite bindings", () => {
     // Host no longer holds.
     expect(token(after)).toBe(token(before));
     expect(after).toContain(
-      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${script}-selfhost-data")`,
+      `(name = "__TAKOSERVER_SELFHOST_DATA", service = "${variant}-selfhost-data")`,
     );
     expect(after).toContain("reserved.localhost");
   });
 
-  test("deleting the version revokes the plane grant with it", async () => {
+  test("an active deployment fences Version deletion before its plane grant is revoked", async () => {
     const local = provider({ dataPlaneAddress: address });
     const script = await publish(local, false, undefined, true);
     const versionId = versionDirectoryName(root, script);
@@ -2621,15 +3111,31 @@ describe("KV and SQLite bindings", () => {
       sql: { DB: SQLITE_DATABASE },
     });
 
-    const deleted = await local.delete({
+    const versionDeleteInput = {
       operationId: "op_delete",
       offering: offering("WorkerVersion"),
       identity: identity("hello-v1"),
       nativeId: `selfhost-version:${script}:${versionId}`,
       spec: {},
       relations: [relation("/worker", "ModuleWorker", "hello")],
-    });
-    expect(deleted.phase).toBe("succeeded");
+    } as const;
+    const deleted = await local.delete(versionDeleteInput);
+    expect(deleted).toMatchObject({ phase: "failed", failure: { code: "conflict" } });
+    expect(await access.grant(script, versionId)).not.toBeNull();
+
+    expect(
+      await local.delete({
+        operationId: "op_delete_deployment",
+        offering: offering("WorkerDeployment"),
+        identity: identity("hello-live"),
+        nativeId: `selfhost-deployment:${script}:op_deploy`,
+        spec: {},
+        relations: [relation("/worker", "ModuleWorker", "hello")],
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect(
+      await local.delete({ ...versionDeleteInput, operationId: "op_delete_after_deployment" }),
+    ).toMatchObject({ phase: "succeeded" });
     expect(await access.grant(script, versionId)).toBeNull();
   });
 });
@@ -2717,6 +3223,80 @@ describe("local namespaces", () => {
     );
   });
 
+  test("a SQLite database recreated under the same name cannot be removed by its stale incarnation", async () => {
+    const forgotten: string[] = [];
+    const local = provider({
+      dataPlaneMaintenance: {
+        async deleteKvNamespace() {},
+        async deleteQueue() {},
+        deleteDatabase(name) {
+          forgotten.push(name);
+          rmSync(selfhostDatabasePath(root, name), { force: true });
+        },
+        async objectBucketOccupancy() {
+          return { objects: 0, uploads: 0 };
+        },
+        async deleteObjectBucket() {},
+        async sweepExpiredKv() {
+          return 0;
+        },
+        async sweepExpiredObjectUploads() {
+          return 0;
+        },
+        async reconcileOrphanObjectFiles() {
+          return 0;
+        },
+      },
+    });
+    expect(
+      await local.apply({
+        operationId: "op_sqlite_missing_uid",
+        offering: offering("SQLiteDatabase"),
+        identity: identity("same-name"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "failed", failure: { code: "invalid_spec", retryable: false } });
+    const before = await local.apply({
+      operationId: "op_sqlite_before",
+      offering: offering("SQLiteDatabase"),
+      identity: sqliteIdentity("same-name", "uid-sqlite-before"),
+      spec: {},
+    });
+    const after = await local.apply({
+      operationId: "op_sqlite_after",
+      offering: offering("SQLiteDatabase"),
+      identity: sqliteIdentity("same-name", "uid-sqlite-after"),
+      spec: {},
+    });
+    if (before.phase !== "succeeded" || after.phase !== "succeeded") {
+      throw new Error("SQLite database allocation failed");
+    }
+    const beforeName = String(before.result.observed.name);
+    const afterName = String(after.result.observed.name);
+    expect(afterName).not.toBe(beforeName);
+    expect(after.result.nativeId).not.toBe(before.result.nativeId);
+
+    await mkdir(join(root, "databases"), { recursive: true });
+    const beforePath = selfhostDatabasePath(root, beforeName);
+    const afterPath = selfhostDatabasePath(root, afterName);
+    writeFileSync(beforePath, "old-incarnation");
+    writeFileSync(afterPath, "new-incarnation");
+
+    expect(
+      await local.delete({
+        operationId: "op_sqlite_stale_delete",
+        offering: offering("SQLiteDatabase"),
+        nativeId: before.result.nativeId,
+        identity: sqliteIdentity("same-name", "uid-sqlite-before"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "succeeded", result: { observed: { deleted: true } } });
+    expect(existsSync(beforePath)).toBe(false);
+    expect(existsSync(afterPath)).toBe(true);
+    expect(readFileSync(afterPath, "utf8")).toBe("new-incarnation");
+    expect(forgotten).toEqual([beforeName]);
+  });
+
   test("an observation reports the queue id its messages are actually under", async () => {
     const local = provider();
     const queue = offering("AtLeastOnceQueue");
@@ -2764,13 +3344,15 @@ describe("local namespaces", () => {
   test("deleting a namespace or a database reaches the planes that hold them", async () => {
     const deletedNamespaces: string[] = [];
     const forgotten: string[] = [];
+    let filesystemFailure = false;
     const local = provider({
       dataPlaneMaintenance: {
         async deleteKvNamespace(namespaceId) {
           deletedNamespaces.push(namespaceId);
         },
         async deleteQueue() {},
-        forgetDatabase(name) {
+        deleteDatabase(name) {
+          if (filesystemFailure) throw new Error("filesystem unavailable");
           forgotten.push(name);
         },
         async objectBucketOccupancy() {
@@ -2812,7 +3394,7 @@ describe("local namespaces", () => {
     const database = await local.apply({
       operationId: "op_3",
       offering: offering("SQLiteDatabase"),
-      identity: identity("app"),
+      identity: sqliteIdentity("app"),
       spec: {},
     });
     if (database.phase !== "succeeded") throw new Error("database allocation failed");
@@ -2821,13 +3403,127 @@ describe("local namespaces", () => {
         operationId: "op_4",
         offering: offering("SQLiteDatabase"),
         nativeId: database.result.nativeId,
-        identity: identity("app"),
+        identity: sqliteIdentity("app"),
         spec: {},
       }),
     ).toMatchObject({ phase: "succeeded" });
-    // The file stays; the open handle on it must not, or a database declared
-    // again under the same name would be served through the old inode.
+    // The data-plane seam closes the handle and removes the exact database
+    // incarnation; this provider test verifies it is invoked with that name.
     expect(forgotten).toEqual([String(database.result.observed.name)]);
+
+    const malformed = await local.delete({
+      operationId: "op_bad_database",
+      offering: offering("SQLiteDatabase"),
+      nativeId: "selfhost-sqlite:../outside:op_bad_database",
+      identity: sqliteIdentity("app"),
+      spec: {},
+    });
+    expect(malformed).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec", retryable: false },
+    });
+
+    filesystemFailure = true;
+    const unavailable = await local.delete({
+      operationId: "op_filesystem_failure",
+      offering: offering("SQLiteDatabase"),
+      nativeId: database.result.nativeId,
+      identity: sqliteIdentity("app"),
+      spec: {},
+    });
+    expect(unavailable).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+
+    const noPlane = provider();
+    const noPlanePath = selfhostDatabasePath(root, String(database.result.observed.name));
+    await mkdir(join(root, "databases"), { recursive: true });
+    writeFileSync(noPlanePath, "durable-bytes");
+    const refusedWithoutPlane = await noPlane.delete({
+      operationId: "op_missing_data_plane",
+      offering: offering("SQLiteDatabase"),
+      nativeId: database.result.nativeId,
+      identity: sqliteIdentity("app"),
+      spec: {},
+    });
+    expect(refusedWithoutPlane).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    rmSync(noPlanePath, { force: true });
+    expect(
+      await noPlane.delete({
+        operationId: "op_missing_data_plane_retry",
+        offering: offering("SQLiteDatabase"),
+        nativeId: database.result.nativeId,
+        identity: sqliteIdentity("app"),
+        spec: {},
+      }),
+    ).toMatchObject({ phase: "succeeded", result: { observed: { deleted: true } } });
+  });
+
+  test("SQLite delete recovery treats sidecars or a newer file as present", async () => {
+    const local = provider();
+    const databaseName = "tsdb-delete-recovery";
+    const path = selfhostDatabasePath(root, databaseName);
+    await mkdir(join(root, "databases"), { recursive: true });
+    writeFileSync(path, "old-incarnation");
+    writeFileSync(`${path}-wal`, "old-wal");
+    const input = {
+      operationId: "op_delete_recovery",
+      offering: offering("SQLiteDatabase"),
+      nativeId: `selfhost-sqlite:${databaseName}:op_old`,
+      identity: sqliteIdentity("delete-recovery"),
+      spec: {},
+    };
+    if (!local.recoverDelete) throw new Error("selfhost provider is missing delete recovery");
+    if (!local.createNativeReadbackDescriptor || !local.verifyNativeAbsence) {
+      throw new Error("selfhost provider is missing SQLite absence readback");
+    }
+    const descriptor = local.createNativeReadbackDescriptor(input);
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: input.offering,
+        descriptor,
+        target: readTarget("delete-recovery"),
+      }),
+    ).toMatchObject({ outcome: "present" });
+    expect(readFileSync(path, "utf8")).toBe("old-incarnation");
+
+    rmSync(`${path}-wal`, { force: true });
+    rmSync(path, { force: true });
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "succeeded",
+      result: { observed: { deleted: true } },
+    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: input.offering,
+        descriptor,
+        target: readTarget("delete-recovery"),
+      }),
+    ).toMatchObject({ outcome: "absent" });
+
+    // A replacement at the same path is not absence for the old recovery
+    // proof, and the read-only check must not remove or rewrite it.
+    writeFileSync(path, "new-incarnation");
+    expect(await local.recoverDelete(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(
+      await local.verifyNativeAbsence({
+        offering: input.offering,
+        descriptor,
+        target: readTarget("delete-recovery"),
+      }),
+    ).toMatchObject({ outcome: "present" });
+    expect(readFileSync(path, "utf8")).toBe("new-incarnation");
   });
 
   test("the bucket keeps its pre-Edge readable name", async () => {
@@ -3143,7 +3839,7 @@ describe("the current ObjectBucket Form on a self-host", () => {
   ) => ({
     async deleteKvNamespace() {},
     async deleteQueue() {},
-    forgetDatabase() {},
+    deleteDatabase() {},
     async objectBucketOccupancy() {
       return { objects: state.objects, uploads: state.uploads };
     },
@@ -3505,7 +4201,7 @@ describe("the SQLite migration ledger", () => {
     const database = await local.apply({
       operationId: "op_db_large_history",
       offering: offering("SQLiteDatabase"),
-      identity: identity("large-history"),
+      identity: sqliteIdentity("large-history"),
       spec: {},
     });
     expect(database.phase).toBe("succeeded");
@@ -3591,7 +4287,7 @@ describe("the SQLite migration ledger", () => {
     const database = await local.apply({
       operationId: "op_db_empty_migration",
       offering: offering("SQLiteDatabase"),
-      identity: identity("empty-migration"),
+      identity: sqliteIdentity("empty-migration"),
       spec: {},
     });
     expect(database.phase).toBe("succeeded");
@@ -3684,7 +4380,7 @@ describe("the SQLite migration ledger", () => {
     const database = await local.apply({
       operationId: "op_db_retry_history",
       offering: offering("SQLiteDatabase"),
-      identity: identity("retry-history"),
+      identity: sqliteIdentity("retry-history"),
       spec: {},
     });
     expect(database.phase).toBe("succeeded");
@@ -4024,7 +4720,7 @@ describe("the SQLite migration ledger", () => {
     const database = await local.apply({
       operationId: "op_db_prefix_guard",
       offering: offering("SQLiteDatabase"),
-      identity: identity("prefix-guard"),
+      identity: sqliteIdentity("prefix-guard"),
       spec: {},
     });
     expect(database.phase).toBe("succeeded");
@@ -4102,7 +4798,7 @@ describe("the SQLite migration ledger", () => {
     const database = await local.apply({
       operationId: "op_db",
       offering: offering("SQLiteDatabase"),
-      identity: identity("main"),
+      identity: sqliteIdentity("main"),
       spec: {},
     });
     expect(database.phase).toBe("succeeded");
@@ -4606,7 +5302,7 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       failure: {
         code: "invalid_spec",
         message:
-          "the active Worker Version predates event delivery on this Host; publish a new Version",
+          "a deployed Worker Version predates event delivery on this Host; publish a new Version",
       },
     });
     // Refused BEFORE the durable state moved: nothing was attached, so nothing
@@ -4668,7 +5364,7 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       phase: "failed",
       failure: {
         code: "provider_error",
-        message: "the active Worker Version is not materialized on this machine",
+        message: "a deployed Worker Version is not materialized on this machine",
       },
     });
     rmSync(strayModule);
@@ -4914,7 +5610,7 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
         async deleteQueue(id) {
           dropped.push(id);
         },
-        forgetDatabase() {},
+        deleteDatabase() {},
         async objectBucketOccupancy() {
           return { objects: 0, uploads: 0 };
         },

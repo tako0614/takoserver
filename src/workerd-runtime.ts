@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   chmod,
@@ -13,6 +14,10 @@ import {
 } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { bytesDigest } from "./json.ts";
+import {
+  canonicalSelfhostWeightedVersions,
+  type SelfhostWeightedVersion,
+} from "./selfhost-weighted-deployment.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 
 /**
@@ -49,6 +54,15 @@ export interface WorkerdBinding {
   readonly value: string;
   /** `text` is a string; `json` is parsed by the runtime before the module sees it. */
   readonly kind: "text" | "json";
+}
+
+/** One Host-private native service binding on a tenant entrypoint. */
+export interface WorkerdServiceBinding {
+  readonly name: string;
+  readonly target: string;
+  readonly targetResourceUid: string;
+  /** Per-caller marker used only by the unavailable router. */
+  readonly unavailableToken: string;
 }
 
 /** Media types workerd can use for a module declaration in this runtime. */
@@ -110,6 +124,12 @@ export interface WorkerdSite {
   readonly hostnames: readonly string[];
   /** Durable identity of the desired publication, including its routes. */
   readonly generation?: string;
+  /** Exact logical Worker incarnation. Absent only on a retained legacy site. */
+  readonly workerResourceUid?: string;
+  /** Whether this exact active Version declared the worker.runtime fetch handler. */
+  readonly fetchHandler?: boolean;
+  /** Logical fetch bindings; target selection never consults a request URL. */
+  readonly serviceBindings?: readonly WorkerdServiceBinding[];
   /**
    * How the Host-owned HTTP router composes this script with its asset lookup.
    * Absent means it declared no assets and public traffic reaches the script
@@ -163,6 +183,31 @@ export interface WorkerdSite {
   readonly events?: WorkerdEventGate;
 }
 
+/** One exact private Version in a single logical Worker publication. */
+export interface WorkerdDeploymentVariant extends SelfhostWeightedVersion {
+  /** Version-scoped runtime declaration. Its routes and Worker identity are owned above it. */
+  readonly site: WorkerdSite;
+  readonly modules: ReadonlyMap<string, Uint8Array>;
+  readonly assets?: ReadonlyMap<string, Uint8Array>;
+  readonly hostModules?: ReadonlyMap<string, Uint8Array>;
+}
+
+/** The complete graph a logical Worker activates in one runtime write. */
+export interface WorkerdDeploymentPublication {
+  readonly generation: string;
+  readonly workerResourceUid: string;
+  readonly hostnames: readonly string[];
+  readonly versions: readonly WorkerdDeploymentVariant[];
+}
+
+/** Exact weighted identity behind the runtime's committed stable pointer. */
+export interface WorkerdActiveDeployment {
+  readonly generation: string;
+  readonly versions: readonly SelfhostWeightedVersion[];
+  /** Whether the committed graph contains the one logical event dispatcher. */
+  readonly events: boolean;
+}
+
 /** The gate service one script receives its events through. */
 export interface WorkerdEventGate {
   /** Module inside the script's directory that implements the gate. */
@@ -185,6 +230,12 @@ export interface WorkerdDataPlane {
 export interface WorkerdRuntime {
   /** Load one credential-free module snapshot in a fresh bounded runtime. */
   readonly inspectModule: ReturnType<typeof createWorkerdWorkerModuleInspector>["inspect"];
+  /**
+   * Atomically activates one complete weighted deployment, or removes its
+   * logical routes. Implementations without this capability must leave this
+   * absent; a provider may then refuse weighted publication before mutation.
+   */
+  publish?(name: string, publication: WorkerdDeploymentPublication | null): Promise<void>;
   /** Makes a published script's files present, replacing whatever was there. */
   write(
     name: string,
@@ -296,12 +347,34 @@ interface Manifest {
   readonly moduleFiles: WorkerdModuleStorageManifest;
   readonly hostnames: readonly string[];
   readonly generation?: string;
+  readonly workerResourceUid?: string;
+  readonly fetchHandler?: boolean;
+  readonly serviceBindings?: readonly WorkerdServiceBinding[];
   readonly assets?: WorkerdAssetManifest;
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
   readonly moduleMediaTypes?: Readonly<Record<string, WorkerdModuleMediaType>>;
   readonly dataPlane?: WorkerdDataPlane;
   readonly events?: WorkerdEventGate;
+}
+
+interface WorkerdDeploymentStoredVersion extends SelfhostWeightedVersion {
+  readonly storageKey: string;
+  readonly manifest: Manifest;
+}
+
+interface WorkerdDeploymentManifest {
+  readonly publicationStorageLayout: typeof WORKERD_DEPLOYMENT_STORAGE_LAYOUT;
+  readonly generation: string;
+  readonly workerResourceUid: string;
+  readonly hostnames: readonly string[];
+  readonly versions: readonly WorkerdDeploymentStoredVersion[];
+}
+
+interface WorkerdDeploymentPointer {
+  readonly publicationStorageLayout: typeof WORKERD_DEPLOYMENT_STORAGE_LAYOUT;
+  readonly generation: string;
+  readonly generationKey: string;
 }
 
 const MANIFEST = "takoserver-site.json";
@@ -325,6 +398,7 @@ const DATA_PLANE_BINDING = "__TAKOSERVER_SELFHOST_DATA_PLANE";
  */
 const EVENT_TARGET_BINDING = "__TAKOSERVER_SELFHOST_EVENT_TARGET";
 const EVENT_ENTRYPOINT = "takoserverSelfhostEvents";
+const SERVICE_UNAVAILABLE_TOKEN_BINDING = "UNAVAILABLE_TOKEN";
 /**
  * Compatibility flags for a script published through a generated entrypoint.
  *
@@ -352,14 +426,37 @@ const INTERNAL_ROUTE_SUFFIX = ".selfhost-internal.invalid";
  * Written after the customer routes for the same reason.
  */
 const EVENT_ROUTE_SUFFIX = ".selfhost-events.invalid";
+const CONFIG_PROBE_HOSTNAME = "runtime.selfhost-config.invalid";
+const CONFIG_PROBE_PATH = "/.well-known/takoserver/selfhost-runtime-config/v1";
+const CONFIG_PROBE_HEADER = "x-takoserver-selfhost-runtime-config";
+const CONFIG_IDENTITY_HEADER = "x-takoserver-selfhost-config-identity";
+const WORKER_READINESS_PATH = "/.well-known/takoserver/selfhost-worker-readiness/v1";
+const WORKER_READINESS_HEADER = "x-takoserver-selfhost-readiness";
+const WORKER_READINESS_PROTOCOL = "takoserver.selfhost-worker-readiness@v1";
+const INTERNAL_READINESS_CAPABILITY_HEADER = "x-takoserver-selfhost-runtime-readiness";
+const INTERNAL_READINESS_CAPABILITY_BINDING = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS";
 /** Operator-private sibling tree holding every script's flat static files. */
 const ASSETS_ROOT_DIRECTORY = "assets";
 /** Exact persisted meaning of the private physical asset keys. */
 const WORKERD_ASSET_STORAGE_LAYOUT = "flat-ordinal-v1" as const;
 /** Separate physical roots mirror the runtime's two module namespaces. */
 const WORKERD_MODULE_STORAGE_LAYOUT = "provenance-v1" as const;
+/** One immutable tree plus one stable, atomically replaced pointer. */
+const WORKERD_DEPLOYMENT_STORAGE_LAYOUT = "weighted-deployment-v1" as const;
+const DEPLOYMENT_MANIFEST = "deployment.json";
+const DEPLOYMENT_PUBLICATIONS_DIRECTORY = ".publications";
 const APPLICATION_MODULE_DIRECTORY = "application";
 const HOST_PRIVATE_MODULE_DIRECTORY = "host-private";
+const SERVICE_ROUTER_MODULE = "service-router.js";
+const DEPLOYMENT_ROUTER_MODULE = "deployment-router.js";
+const EVENT_DISPATCHER_MODULE = "event-dispatcher.js";
+const SERVICE_UNAVAILABLE_HEADER = "x-takoserver-selfhost-service-unavailable";
+
+function privateRuntimeToken(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+}
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
   const moduleInspector = createWorkerdWorkerModuleInspector({
@@ -373,6 +470,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const configPath = options.configPath ?? join(scriptsRoot, "workerd.capnp");
   const port = options.port ?? 8788;
   const activationPath = join(scriptsRoot, ".takoserver-active.json");
+  const configProbeToken = options.onReload === undefined ? "" : privateRuntimeToken();
+  // Separate from config identity: this capability authorizes only the
+  // Host-originated readiness path and is never bound into tenant code.
+  const internalReadinessCapability = privateRuntimeToken();
+  let activationTail: Promise<void> = Promise.resolve();
+
+  /** Shared config and activation truth have one commit order across scripts. */
+  const exclusiveActivation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const queued = activationTail;
+    const next = queued.then(operation, operation);
+    activationTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   const scriptDirectory = (name: string): string => {
     if (!/^[a-z0-9][a-z0-9_-]{0,127}$/u.test(name)) {
@@ -394,10 +507,13 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    * re-rendered by some other route would be the second place the router, the
    * asset shim and the socket are decided.
    */
-  const render = async (published: readonly Published[]): Promise<void> => {
+  const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
     await privateDirectory(scriptsRoot);
     for (const entry of published) await privateDirectory(join(scriptsRoot, entry.name));
-    const assetPublications = published.filter((candidate) => candidate.manifest.assets);
+    const assetPublications = published
+      .filter((candidate) => !candidate.weighted)
+      .flatMap((candidate) => candidate.variants)
+      .filter((candidate) => candidate.manifest.assets);
     if (assetPublications.length > 0) {
       await privateDirectory(assetsRoot);
       for (const entry of assetPublications) await privateDirectory(assetDirectory(entry.name));
@@ -408,22 +524,294 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
     await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
     await writeFile(join(scriptsRoot, "asset-router.js"), ASSET_ROUTER_SOURCE, "utf8");
+    await writeFile(join(scriptsRoot, SERVICE_ROUTER_MODULE), SERVICE_ROUTER_SOURCE, "utf8");
+    await writeFile(join(scriptsRoot, DEPLOYMENT_ROUTER_MODULE), DEPLOYMENT_ROUTER_SOURCE, "utf8");
+    await writeFile(join(scriptsRoot, EVENT_DISPATCHER_MODULE), EVENT_DISPATCHER_SOURCE, "utf8");
     await privateDirectory(dirname(configPath));
     // The rendered configuration contains every binding value, sensitive ones
     // included, so it is created `0600` and moved into place atomically.
-    await writePrivate(configPath, renderConfig(published, port, assetsRoot, options.tls), "utf8");
-    await options.onReload?.(configPath);
-    // A staged manifest is not runtime truth. Only after the reload hook
-    // returns successfully do we persist the generation actually activated;
-    // a failed reload therefore leaves the previous marker intact.
-    await writeActivation(
-      activationPath,
-      Object.fromEntries(published.map((entry) => [entry.name, entry.manifest.generation ?? null])),
+    await writePrivate(
+      configPath,
+      renderConfig(
+        published,
+        port,
+        assetsRoot,
+        options.tls,
+        configProbeToken,
+        internalReadinessCapability,
+      ),
+      "utf8",
     );
+  };
+
+  const activated = (published: readonly PublishedDeployment[]) =>
+    Object.fromEntries(published.map((entry) => [entry.name, entry.generation ?? null]));
+
+  const proveRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+    // A composition with no process hook intentionally stages files only. It
+    // cannot prove serving truth, but `has()` will still fail closed unless its
+    // composition supplies a live `isReady` probe.
+    if (options.onReload === undefined) return;
+    const expected = publishedGraphIdentity(published);
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      try {
+        const response = await fetch(
+          `${options.tls ? "https" : "http"}://127.0.0.1:${port}${CONFIG_PROBE_PATH}`,
+          {
+            method: "POST",
+            headers: {
+              host: CONFIG_PROBE_HOSTNAME,
+              [CONFIG_PROBE_HEADER]: configProbeToken,
+            },
+            ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
+            signal: AbortSignal.timeout(1_000),
+          },
+        );
+        if (response.status === 204 && response.headers.get(CONFIG_IDENTITY_HEADER) === expected) {
+          return;
+        }
+      } catch {
+        // The watcher may still be crossing to the atomically replaced file.
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("worker runtime did not confirm the rendered configuration");
+      }
+      await new Promise<void>((wake) => setTimeout(wake, 25));
+    }
+  };
+
+  /**
+   * Moves the complete configuration, runtime process, stable publication
+   * pointer, and activation truth as one recoverable transaction.
+   *
+   * `onReload` is an arbitrary process boundary: a throw does not prove that a
+   * watching workerd ignored the new config. Therefore every failure restores
+   * the prior config and calls the hook again. Only that successful second
+   * crossing proves the old graph is live; if it cannot be proved, activation
+   * truth is cleared rather than fabricated.
+   */
+  const activate = async (
+    published: readonly PublishedDeployment[],
+    previous: readonly PublishedDeployment[],
+    pointer?: { readonly commit: () => Promise<void>; readonly rollback: () => Promise<void> },
+  ): Promise<void> => {
+    try {
+      const before = activated(previous);
+      const after = activated(published);
+      const transitioning = new Set([...Object.keys(before), ...Object.keys(after)]);
+      const indeterminate = { ...before };
+      let changed = false;
+      for (const name of transitioning) {
+        if (before[name] === after[name]) continue;
+        delete indeterminate[name];
+        changed = true;
+      }
+      // A watcher may begin serving the new config before its stable pointer
+      // commits. Clear only the changing scripts first so an external event
+      // selector cannot mistake either side of that crossing for committed.
+      if (changed) await writeActivation(activationPath, indeterminate);
+      await writeRendered(published);
+      await options.onReload?.(configPath);
+      await proveRendered(published);
+      await pointer?.commit();
+      await writeActivation(activationPath, activated(published));
+    } catch (failure) {
+      try {
+        await pointer?.rollback();
+        // Re-render the exact prior graph with this process's private probe
+        // token. A config left by an earlier Host instance contains that
+        // instance's token, so restoring its bytes would make an otherwise
+        // successful rollback impossible for this process to authenticate.
+        await writeRendered(previous);
+        await options.onReload?.(configPath);
+        await proveRendered(previous);
+        // The graph just proved is the authority. A marker captured before
+        // this call may be stale after a crash between pointer commit and
+        // marker commit, especially during boot restore.
+        await writeActivation(activationPath, activated(previous));
+      } catch (rollbackFailure) {
+        // The child may now be serving either graph. No per-script marker is
+        // trustworthy across a failed process boundary, so fail closed for
+        // the whole runtime rather than claiming a rollback that was not seen.
+        await writeActivation(activationPath, {}).catch(() => undefined);
+        throw new AggregateError(
+          [failure, rollbackFailure],
+          "worker runtime activation state is unknown",
+        );
+      }
+      throw failure;
+    }
+  };
+
+  const stageDeployment = async (
+    name: string,
+    publication: WorkerdDeploymentPublication,
+  ): Promise<{
+    readonly pointer: WorkerdDeploymentPointer;
+    readonly deployment: PublishedDeployment;
+  }> => {
+    scriptDirectory(name);
+    if (typeof publication.generation !== "string") {
+      throw new Error("unusable worker deployment generation");
+    }
+    capnpText(publication.generation);
+    const workerResourceUid = validWorkerResourceUid(publication.workerResourceUid);
+    const hostnames = validDeploymentHostnames(publication.hostnames);
+    internalHostname(name);
+    eventHostname(name);
+    if (!Array.isArray(publication.versions)) {
+      throw new Error("unusable weighted worker deployment");
+    }
+    const canonical = canonicalSelfhostWeightedVersions(
+      publication.versions.map(({ versionId, workerVersionUid, weight }) => ({
+        versionId,
+        workerVersionUid,
+        weight,
+      })),
+    );
+    const byUid = new Map(
+      publication.versions.map((version) => [version.workerVersionUid, version]),
+    );
+    const preparedVersions: Array<{
+      readonly identity: SelfhostWeightedVersion;
+      readonly storageKey: string;
+      readonly prepared: PreparedWorkerdSite;
+    }> = [];
+    // This loop is deliberately complete before the first mkdir/write. A bad
+    // second Version must not stage state for the first one.
+    for (let index = 0; index < canonical.length; index += 1) {
+      const identity = canonical[index] as SelfhostWeightedVersion;
+      const variant = byUid.get(identity.workerVersionUid);
+      if (
+        !variant ||
+        variant.versionId !== identity.versionId ||
+        variant.weight !== identity.weight
+      ) {
+        throw new Error("unusable weighted worker deployment");
+      }
+      if (
+        variant.site.hostnames.length !== 0 ||
+        (variant.site.generation !== undefined &&
+          variant.site.generation !== publication.generation) ||
+        (variant.site.workerResourceUid !== undefined &&
+          variant.site.workerResourceUid !== workerResourceUid)
+      ) {
+        throw new Error("unusable private worker Version declaration");
+      }
+      const prepared = await prepareWorkerdSite(
+        {
+          ...variant.site,
+          hostnames: [],
+          generation: publication.generation,
+          workerResourceUid,
+        },
+        variant.modules,
+        variant.assets,
+        variant.hostModules,
+      );
+      if (!prepared.manifest.hostEntrypoint) {
+        throw new Error("weighted worker Versions require a Host entrypoint");
+      }
+      preparedVersions.push({
+        identity,
+        storageKey: `version-${index.toString(10).padStart(5, "0")}`,
+        prepared,
+      });
+    }
+    const eventShapes = new Set(
+      preparedVersions.map(({ prepared }) => prepared.manifest.events !== undefined),
+    );
+    if (eventShapes.size > 1) {
+      throw new Error("weighted worker Versions require one event capability shape");
+    }
+    const manifest: WorkerdDeploymentManifest = {
+      publicationStorageLayout: WORKERD_DEPLOYMENT_STORAGE_LAYOUT,
+      generation: publication.generation,
+      workerResourceUid,
+      hostnames,
+      versions: preparedVersions.map(({ identity, storageKey, prepared }) => ({
+        ...identity,
+        storageKey,
+        manifest: prepared.manifest,
+      })),
+    };
+    const manifestJson = JSON.stringify(manifest);
+    const generationKey = createHash("sha256").update(manifestJson, "utf8").digest("hex");
+    const publicationRoot = join(scriptsRoot, DEPLOYMENT_PUBLICATIONS_DIRECTORY, name);
+    const generationRoot = join(publicationRoot, generationKey);
+    const existing = await lstat(generationRoot).catch(() => null);
+    if (existing) {
+      if (!existing.isDirectory() || existing.isSymbolicLink()) {
+        throw new Error("unusable worker deployment snapshot");
+      }
+      const current = await readFile(join(generationRoot, DEPLOYMENT_MANIFEST), "utf8");
+      if (current !== manifestJson) throw new Error("conflicting worker deployment snapshot");
+    } else {
+      await privateDirectory(join(scriptsRoot, DEPLOYMENT_PUBLICATIONS_DIRECTORY));
+      await privateDirectory(publicationRoot);
+      const staging = join(publicationRoot, `.tmp-${crypto.randomUUID()}`);
+      try {
+        await privateDirectory(staging);
+        for (const version of preparedVersions) {
+          await writePreparedWorkerdSite(join(staging, version.storageKey), version.prepared);
+        }
+        await writePrivate(join(staging, DEPLOYMENT_MANIFEST), manifestJson, "utf8");
+        await rename(staging, generationRoot);
+      } finally {
+        await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+    const pointer: WorkerdDeploymentPointer = {
+      publicationStorageLayout: WORKERD_DEPLOYMENT_STORAGE_LAYOUT,
+      generation: publication.generation,
+      generationKey,
+    };
+    // Re-open every stored byte and manifest through the restart reader before
+    // this generation is eligible to enter a config.
+    const deployment = await readWeightedDeployment(scriptsRoot, name, pointer);
+    return { pointer, deployment };
   };
 
   return {
     inspectModule: (input) => moduleInspector.inspect(input),
+    async publish(name, publication) {
+      const directory = scriptDirectory(name);
+      const pointerPath = join(directory, MANIFEST);
+      // Byte capture and immutable generation staging can proceed in parallel
+      // for different Workers. Only the shared graph snapshot/commit is
+      // serialized; otherwise two valid publishes can each render a graph
+      // missing the other and the last config wins.
+      const staged = publication === null ? null : await stageDeployment(name, publication);
+      await exclusiveActivation(async () => {
+        const previous = await readPublished(scriptsRoot, assetsRoot);
+        const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
+        const next = (
+          staged === null
+            ? previous.filter((entry) => entry.name !== name)
+            : [...previous.filter((entry) => entry.name !== name), staged.deployment]
+        ).sort((left, right) => left.name.localeCompare(right.name));
+        const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
+        await activate(next, previous, {
+          commit: async () => {
+            await privateDirectory(directory);
+            if (pointerContents === null) {
+              await rm(pointerPath, { force: true });
+            } else {
+              await writePrivate(pointerPath, pointerContents, "utf8");
+            }
+          },
+          rollback: async () => {
+            await privateDirectory(directory);
+            if (beforePointer === null) {
+              await rm(pointerPath, { force: true });
+            } else {
+              await writePrivate(pointerPath, beforePointer, "utf8");
+            }
+          },
+        });
+      });
+    },
     async write(name, site, modules, assets, hostModules) {
       const directory = scriptDirectory(name);
       // Validate the declaration before removing the currently serving
@@ -452,6 +840,20 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         "Host-private",
       );
       const assetDeclaration = await validAssets(site.assets, assets);
+      const workerResourceUid =
+        site.workerResourceUid === undefined
+          ? undefined
+          : validWorkerResourceUid(site.workerResourceUid);
+      if (
+        (workerResourceUid === undefined) !== (site.fetchHandler === undefined) ||
+        (site.fetchHandler !== undefined && typeof site.fetchHandler !== "boolean")
+      ) {
+        throw new Error("unusable worker service identity");
+      }
+      const serviceBindings = validServiceBindings(site.serviceBindings ?? []);
+      if (serviceBindings.length > 0 && workerResourceUid === undefined) {
+        throw new Error("unusable worker service binding");
+      }
       // Replaced rather than merged: a module the new bundle does not contain
       // must not survive from the old one, where it would be loadable and
       // wrong.
@@ -499,6 +901,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           },
           hostnames: site.hostnames,
           ...(site.generation === undefined ? {} : { generation: site.generation }),
+          ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
+          ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
+          ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
           ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
           ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
           ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -516,22 +921,25 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     },
 
     async has(name, generation) {
-      const active = await readActivation(activationPath);
-      if (!(name in active)) return false;
-      if (generation !== undefined && active[name] !== generation) return false;
-      // A marker only records the generation the last successful reload
-      // attempted to activate. Without an explicit process-readiness probe
-      // there is no runtime truth to distinguish staged files from serving
-      // traffic, so fail closed and discard the marker.
-      if (options.isReady === undefined || !options.isReady()) {
-        // A dead child or failed boot invalidates the activation marker. Remove
-        // only the stale entry; other scripts may still have a live process.
-        const next = { ...active };
-        delete next[name];
-        await writeActivation(activationPath, next);
-        return false;
-      }
-      return true;
+      return await exclusiveActivation(async () => {
+        const active = await readActivation(activationPath);
+        if (!(name in active)) return false;
+        if (generation !== undefined && active[name] !== generation) return false;
+        // A marker only records the generation the last successful reload
+        // attempted to activate. Without an explicit process-readiness probe
+        // there is no runtime truth to distinguish staged files from serving
+        // traffic, so fail closed and discard the marker.
+        if (options.isReady === undefined || !options.isReady()) {
+          // A dead child or failed boot invalidates the activation marker.
+          // Serialize this read-modify-write with graph activation so it
+          // cannot erase a generation another publication just committed.
+          const next = { ...active };
+          delete next[name];
+          await writeActivation(activationPath, next);
+          return false;
+        }
+        return true;
+      });
     },
 
     async probe(name, path, init) {
@@ -542,6 +950,21 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         return null;
       }
       try {
+        const headers = new Headers(init.headers);
+        // The public `probe` shape does not grant callers a way to inject this
+        // internal capability. Only the exact readiness question on the
+        // Host-owned route receives it; event and arbitrary internal probes
+        // have any same-named input stripped.
+        headers.delete(INTERNAL_READINESS_CAPABILITY_HEADER);
+        if (
+          init.route !== "events" &&
+          init.method === "POST" &&
+          path === WORKER_READINESS_PATH &&
+          headers.get(WORKER_READINESS_HEADER) === WORKER_READINESS_PROTOCOL
+        ) {
+          headers.set(INTERNAL_READINESS_CAPABILITY_HEADER, internalReadinessCapability);
+        }
+        headers.set("host", hostname);
         // This Host asking its own runtime, over loopback, by address. Where the
         // socket terminates TLS the certificate names the endpoint suffix and
         // not `127.0.0.1`, so verifying it here would refuse every publication
@@ -551,7 +974,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           `${options.tls ? "https" : "http"}://127.0.0.1:${port}${path}`,
           {
             method: init.method,
-            headers: { ...init.headers, host: hostname },
+            headers,
             ...(init.body === undefined ? {} : { body: init.body }),
             ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
             // A readiness question is answered by this Host's own module and is
@@ -575,14 +998,19 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // starting a runtime for it would give every machine a workerd it never
       // asked for, which is exactly what deferring the start to the first
       // publish was avoiding.
-      const published = await readPublished(scriptsRoot, assetsRoot);
-      if (published.length === 0) return [];
-      await render(published);
-      return published.map((entry) => entry.name);
+      return await exclusiveActivation(async () => {
+        const published = await readPublished(scriptsRoot, assetsRoot);
+        if (published.length === 0) return [];
+        await activate(published, published);
+        return published.map((entry) => entry.name);
+      });
     },
 
     async reload() {
-      await render(await readPublished(scriptsRoot, assetsRoot));
+      await exclusiveActivation(async () => {
+        const published = await readPublished(scriptsRoot, assetsRoot);
+        await activate(published, published);
+      });
     },
   };
 }
@@ -645,6 +1073,10 @@ async function privateDirectory(path: string): Promise<void> {
  * publication that stops and says so.
  */
 const BINDING_NAME = /^[A-Za-z_][A-Za-z0-9._-]{0,127}$/u;
+const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
+const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
+const INTERNAL_SERVICE_BINDING = /^__TAKOSERVER_SELFHOST_SERVICE_[0-9]{5}$/u;
+const SERVICE_UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
 
 function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBinding[] {
   const seen = new Set<string>();
@@ -667,6 +1099,53 @@ function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBin
     capnpText(binding.value);
   }
   return bindings;
+}
+
+function validWorkerResourceUid(value: unknown): string {
+  if (typeof value !== "string" || !RESOURCE_UID.test(value)) {
+    throw new Error("unusable worker resource identity");
+  }
+  return value;
+}
+
+function validServiceBindings(
+  bindings: readonly WorkerdServiceBinding[],
+): readonly WorkerdServiceBinding[] {
+  if (!Array.isArray(bindings) || bindings.length > 64) {
+    throw new Error("unusable worker service binding");
+  }
+  const names = new Set<string>();
+  return bindings.map((candidate) => {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !==
+        "name,target,targetResourceUid,unavailableToken" ||
+      typeof candidate.name !== "string" ||
+      !INTERNAL_SERVICE_BINDING.test(candidate.name) ||
+      names.has(candidate.name) ||
+      typeof candidate.target !== "string" ||
+      !SCRIPT_NAME.test(candidate.target) ||
+      typeof candidate.targetResourceUid !== "string" ||
+      !RESOURCE_UID.test(candidate.targetResourceUid) ||
+      typeof candidate.unavailableToken !== "string" ||
+      !SERVICE_UNAVAILABLE_TOKEN.test(candidate.unavailableToken)
+    ) {
+      throw new Error("unusable worker service binding");
+    }
+    names.add(candidate.name);
+    capnpText(candidate.name);
+    capnpText(candidate.target);
+    capnpText(candidate.targetResourceUid);
+    capnpText(candidate.unavailableToken);
+    return {
+      name: candidate.name,
+      target: candidate.target,
+      targetResourceUid: candidate.targetResourceUid,
+      unavailableToken: candidate.unavailableToken,
+    };
+  });
 }
 
 /**
@@ -1073,6 +1552,108 @@ function validEventGate(gate: WorkerdEventGate): WorkerdEventGate {
   return gate;
 }
 
+interface PreparedWorkerdSite {
+  readonly manifest: Manifest;
+  readonly application: readonly SnapshottedModule[];
+  readonly hostPrivate: readonly SnapshottedModule[];
+  readonly assets?: readonly (readonly [string, Uint8Array])[];
+}
+
+/** Captures every byte and validates every binding before durable state moves. */
+async function prepareWorkerdSite(
+  site: WorkerdSite,
+  modules: ReadonlyMap<string, Uint8Array>,
+  assets: ReadonlyMap<string, Uint8Array> | undefined,
+  hostModules: ReadonlyMap<string, Uint8Array> | undefined,
+): Promise<PreparedWorkerdSite> {
+  const mainModule = validModules([site.mainModule])[0] as string;
+  const declaredModules = validModules(site.modules ?? [], site.mainModule);
+  const moduleMediaTypes = validModuleMediaTypes(
+    mainModule,
+    declaredModules,
+    site.moduleMediaTypes,
+  );
+  const hostEntrypoint =
+    site.hostEntrypoint === undefined
+      ? undefined
+      : (validModules([site.hostEntrypoint])[0] as string);
+  const declaredHostModules = validHostModuleNames(site, hostEntrypoint);
+  const applicationSnapshot = await snapshotModuleBytes(
+    modules,
+    [mainModule, ...declaredModules],
+    "application",
+  );
+  const hostSnapshot = await snapshotModuleBytes(
+    hostModules ?? new Map(),
+    declaredHostModules,
+    "Host-private",
+  );
+  const assetDeclaration = await validAssets(site.assets, assets);
+  const workerResourceUid =
+    site.workerResourceUid === undefined
+      ? undefined
+      : validWorkerResourceUid(site.workerResourceUid);
+  if (
+    (workerResourceUid === undefined) !== (site.fetchHandler === undefined) ||
+    (site.fetchHandler !== undefined && typeof site.fetchHandler !== "boolean")
+  ) {
+    throw new Error("unusable worker service identity");
+  }
+  const serviceBindings = validServiceBindings(site.serviceBindings ?? []);
+  if (serviceBindings.length > 0 && workerResourceUid === undefined) {
+    throw new Error("unusable worker service binding");
+  }
+  return {
+    manifest: {
+      mainModule: site.mainModule,
+      ...(hostEntrypoint === undefined ? {} : { hostEntrypoint }),
+      ...(site.hostModules && site.hostModules.length > 0
+        ? { hostModules: [...site.hostModules] }
+        : {}),
+      moduleStorageLayout: WORKERD_MODULE_STORAGE_LAYOUT,
+      moduleFiles: {
+        application: applicationSnapshot.manifest,
+        hostPrivate: hostSnapshot.manifest,
+      },
+      hostnames: validDeploymentHostnames(site.hostnames),
+      ...(site.generation === undefined ? {} : { generation: site.generation }),
+      ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
+      ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
+      ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
+      ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
+      ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
+      ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
+      ...(moduleMediaTypes ? { moduleMediaTypes } : {}),
+      ...(site.dataPlane ? { dataPlane: validDataPlane(site.dataPlane) } : {}),
+      ...(site.events ? { events: validEventGate(site.events) } : {}),
+    },
+    application: applicationSnapshot.entries,
+    hostPrivate: hostSnapshot.entries,
+    ...(assetDeclaration ? { assets: assetDeclaration.entries } : {}),
+  };
+}
+
+async function writePreparedWorkerdSite(
+  root: string,
+  prepared: PreparedWorkerdSite,
+): Promise<void> {
+  await privateDirectory(root);
+  await privateDirectory(join(root, APPLICATION_MODULE_DIRECTORY));
+  if (prepared.hostPrivate.length > 0) {
+    await privateDirectory(join(root, HOST_PRIVATE_MODULE_DIRECTORY));
+  }
+  if (prepared.assets) await privateDirectory(join(root, ASSETS_ROOT_DIRECTORY));
+  for (const entry of prepared.application) {
+    await writeFile(join(root, APPLICATION_MODULE_DIRECTORY, entry.key), entry.bytes);
+  }
+  for (const entry of prepared.hostPrivate) {
+    await writeFile(join(root, HOST_PRIVATE_MODULE_DIRECTORY, entry.key), entry.bytes);
+  }
+  for (const [assetName, bytes] of prepared.assets ?? []) {
+    await writeFile(join(root, ASSETS_ROOT_DIRECTORY, assetName), bytes);
+  }
+}
+
 /**
  * The hostname the router answers this Host's own questions about a script on.
  *
@@ -1166,14 +1747,36 @@ async function readActivation(path: string): Promise<Record<string, string | nul
 
 async function writeActivation(path: string, active: Record<string, string | null>): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.tmp`;
-  await writeFile(temporary, JSON.stringify(active), "utf8");
-  await rename(temporary, path);
+  const temporary = `${path}.tmp-${crypto.randomUUID()}`;
+  try {
+    await writeFile(temporary, JSON.stringify(active), "utf8");
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
 }
 
-interface Published {
+interface PublishedVariant {
+  /** Runtime-private service name; equal to the script only for legacy sites. */
   readonly name: string;
+  readonly logicalName: string;
+  /** Path relative to the generated config for module embeds. */
+  readonly storagePrefix: string;
+  /** Absolute immutable asset directory used by workerd's disk service. */
+  readonly assetRoot: string;
   readonly manifest: Manifest;
+  readonly versionId?: string;
+  readonly workerVersionUid?: string;
+  readonly weight?: number;
+}
+
+interface PublishedDeployment {
+  readonly name: string;
+  readonly generation?: string;
+  readonly workerResourceUid?: string;
+  readonly hostnames: readonly string[];
+  readonly weighted: boolean;
+  readonly variants: readonly PublishedVariant[];
 }
 
 /**
@@ -1183,7 +1786,7 @@ interface Published {
  * flat registry has no provenance layout and is rejected by readback rather
  * than silently serving with an open graph.
  */
-function hasHostEntrypoint(entry: Published): boolean {
+function hasHostEntrypoint(entry: PublishedVariant): boolean {
   return entry.manifest.hostEntrypoint !== undefined;
 }
 
@@ -1314,26 +1917,341 @@ async function readPublishedModuleSnapshot(
   return { application, hostPrivate };
 }
 
+async function readValidatedManifest(
+  moduleRoot: string,
+  assetRoot: string,
+  value: unknown,
+): Promise<Manifest> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("unusable worker runtime manifest");
+  }
+  let manifest = value as Manifest;
+  if (
+    typeof manifest.mainModule !== "string" ||
+    (manifest.generation !== undefined && typeof manifest.generation !== "string")
+  ) {
+    throw new Error("unusable worker runtime manifest");
+  }
+  validModules([manifest.mainModule]);
+  const declaredModules = validModules(manifest.modules ?? [], manifest.mainModule);
+  validModuleMediaTypes(manifest.mainModule, declaredModules, manifest.moduleMediaTypes);
+  const moduleFiles = await readPublishedModuleSnapshot(moduleRoot, manifest);
+  manifest = { ...manifest, moduleFiles };
+  const assets = await readPublishedAssetSnapshot(assetRoot, manifest.assets);
+  if (assets) manifest = { ...manifest, assets };
+  validBindings(manifest.vars ?? []);
+  if (manifest.workerResourceUid !== undefined) {
+    validWorkerResourceUid(manifest.workerResourceUid);
+  }
+  if (
+    (manifest.workerResourceUid === undefined) !== (manifest.fetchHandler === undefined) ||
+    (manifest.fetchHandler !== undefined && typeof manifest.fetchHandler !== "boolean")
+  ) {
+    throw new Error("unusable worker service identity");
+  }
+  const serviceBindings = validServiceBindings(manifest.serviceBindings ?? []);
+  if (serviceBindings.length > 0 && manifest.workerResourceUid === undefined) {
+    throw new Error("unusable worker service binding");
+  }
+  if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
+  if (manifest.events !== undefined) validEventGate(manifest.events);
+  return manifest;
+}
+
+function validDeploymentHostnames(value: unknown): readonly string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw new Error("unusable worker deployment hostnames");
+  }
+  const hostnames = value as readonly string[];
+  if (new Set(hostnames).size !== hostnames.length) {
+    throw new Error("unusable worker deployment hostnames");
+  }
+  for (const hostname of hostnames) capnpText(hostname);
+  return [...hostnames];
+}
+
+function privateVariantServiceName(
+  script: string,
+  generationKey: string,
+  workerVersionUid: string,
+): string {
+  const digest = createHash("sha256")
+    .update("takoserver.selfhost-private-version@v1\u0000", "utf8")
+    .update(script, "utf8")
+    .update("\u0000", "utf8")
+    .update(generationKey, "utf8")
+    .update("\u0000", "utf8")
+    .update(workerVersionUid, "utf8")
+    .digest("hex");
+  return `selfhost-version-${digest}`;
+}
+
+interface WeightedDeploymentSnapshot {
+  readonly pointer: WorkerdDeploymentPointer;
+  readonly deployment: WorkerdDeploymentManifest;
+  readonly generationRoot: string;
+  readonly hostnames: readonly string[];
+  readonly canonical: readonly SelfhostWeightedVersion[];
+}
+
+async function readWeightedDeploymentSnapshot(
+  scriptsRoot: string,
+  script: string,
+  pointerValue: unknown,
+): Promise<WeightedDeploymentSnapshot> {
+  if (
+    typeof pointerValue !== "object" ||
+    pointerValue === null ||
+    Array.isArray(pointerValue) ||
+    Object.keys(pointerValue).sort().join(",") !==
+      "generation,generationKey,publicationStorageLayout"
+  ) {
+    throw new Error("unusable worker deployment pointer");
+  }
+  const pointer = pointerValue as WorkerdDeploymentPointer;
+  if (
+    pointer.publicationStorageLayout !== WORKERD_DEPLOYMENT_STORAGE_LAYOUT ||
+    typeof pointer.generation !== "string" ||
+    typeof pointer.generationKey !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(pointer.generationKey)
+  ) {
+    throw new Error("unusable worker deployment pointer");
+  }
+  const generationRoot = join(
+    scriptsRoot,
+    DEPLOYMENT_PUBLICATIONS_DIRECTORY,
+    script,
+    pointer.generationKey,
+  );
+  const raw = await readFile(join(generationRoot, DEPLOYMENT_MANIFEST), "utf8");
+  if (createHash("sha256").update(raw, "utf8").digest("hex") !== pointer.generationKey) {
+    throw new Error("unusable worker deployment snapshot");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("unusable worker deployment manifest");
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).sort().join(",") !==
+      "generation,hostnames,publicationStorageLayout,versions,workerResourceUid"
+  ) {
+    throw new Error("unusable worker deployment manifest");
+  }
+  const deployment = parsed as WorkerdDeploymentManifest;
+  if (
+    deployment.publicationStorageLayout !== WORKERD_DEPLOYMENT_STORAGE_LAYOUT ||
+    deployment.generation !== pointer.generation ||
+    typeof deployment.workerResourceUid !== "string" ||
+    !Array.isArray(deployment.versions)
+  ) {
+    throw new Error("unusable worker deployment manifest");
+  }
+  validWorkerResourceUid(deployment.workerResourceUid);
+  const hostnames = validDeploymentHostnames(deployment.hostnames);
+  for (let index = 0; index < deployment.versions.length; index += 1) {
+    const stored = deployment.versions[index];
+    if (
+      !stored ||
+      typeof stored !== "object" ||
+      Array.isArray(stored) ||
+      Object.keys(stored).sort().join(",") !==
+        "manifest,storageKey,versionId,weight,workerVersionUid" ||
+      stored.storageKey !== `version-${index.toString(10).padStart(5, "0")}`
+    ) {
+      throw new Error("unusable worker deployment manifest");
+    }
+  }
+  const canonical = canonicalSelfhostWeightedVersions(
+    deployment.versions.map((version) => ({
+      versionId: version.versionId,
+      workerVersionUid: version.workerVersionUid,
+      weight: version.weight,
+    })),
+  );
+  for (let index = 0; index < deployment.versions.length; index += 1) {
+    const stored = deployment.versions[index] as WorkerdDeploymentStoredVersion;
+    const identity = canonical[index];
+    if (
+      !identity ||
+      stored.versionId !== identity.versionId ||
+      stored.workerVersionUid !== identity.workerVersionUid ||
+      stored.weight !== identity.weight
+    ) {
+      throw new Error("unusable worker deployment manifest");
+    }
+  }
+  return { pointer, deployment, generationRoot, hostnames, canonical };
+}
+
+async function readWeightedDeployment(
+  scriptsRoot: string,
+  script: string,
+  pointerValue: unknown,
+): Promise<PublishedDeployment> {
+  const { pointer, deployment, generationRoot, hostnames, canonical } =
+    await readWeightedDeploymentSnapshot(scriptsRoot, script, pointerValue);
+  const variants: PublishedVariant[] = [];
+  for (let index = 0; index < deployment.versions.length; index += 1) {
+    const stored = deployment.versions[index] as WorkerdDeploymentStoredVersion;
+    const identity = canonical[index];
+    if (
+      !identity ||
+      stored.versionId !== identity.versionId ||
+      stored.workerVersionUid !== identity.workerVersionUid ||
+      stored.weight !== identity.weight
+    ) {
+      throw new Error("unusable worker deployment manifest");
+    }
+    const moduleRoot = join(generationRoot, stored.storageKey);
+    const manifest = await readValidatedManifest(
+      moduleRoot,
+      join(moduleRoot, ASSETS_ROOT_DIRECTORY),
+      stored.manifest,
+    );
+    if (
+      manifest.generation !== deployment.generation ||
+      manifest.workerResourceUid !== deployment.workerResourceUid ||
+      manifest.hostnames.length !== 0
+    ) {
+      throw new Error("unusable worker deployment Version");
+    }
+    variants.push({
+      name: privateVariantServiceName(script, pointer.generationKey, stored.workerVersionUid),
+      logicalName: script,
+      storagePrefix: `${DEPLOYMENT_PUBLICATIONS_DIRECTORY}/${script}/${pointer.generationKey}/${stored.storageKey}`,
+      assetRoot: join(moduleRoot, ASSETS_ROOT_DIRECTORY),
+      manifest,
+      versionId: stored.versionId,
+      workerVersionUid: stored.workerVersionUid,
+      weight: stored.weight,
+    });
+  }
+  return {
+    name: script,
+    generation: deployment.generation,
+    workerResourceUid: deployment.workerResourceUid,
+    hostnames,
+    weighted: true,
+    variants,
+  };
+}
+
+async function readActivationStrict(path: string): Promise<Record<string, string | null>> {
+  const raw = await readFile(path, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw error;
+  });
+  if (raw === null) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("unusable worker activation marker");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("unusable worker activation marker");
+  }
+  const active: Record<string, string | null> = {};
+  for (const [name, generation] of Object.entries(parsed)) {
+    if (!SCRIPT_NAME.test(name) || (generation !== null && typeof generation !== "string")) {
+      throw new Error("unusable worker activation marker");
+    }
+    active[name] = generation;
+  }
+  return active;
+}
+
+/**
+ * Reads the immutable weighted identity that both the stable pointer and the
+ * last proven activation marker name. This is the event selector's serving
+ * authority: provider desired state may legitimately be one reconcile ahead
+ * after a failed activation, but it must never select an unserved Version.
+ */
+export async function readWorkerdActiveDeployment(
+  root: string,
+  script: string,
+): Promise<WorkerdActiveDeployment | null> {
+  if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
+  const scriptsRoot = join(root, "workers");
+  const activationPath = join(scriptsRoot, ".takoserver-active.json");
+  const before = await readActivationStrict(activationPath);
+  const activeGeneration = before[script];
+  if (typeof activeGeneration !== "string") return null;
+  const pointerRaw = await readFile(join(scriptsRoot, script, MANIFEST), "utf8").catch(
+    (error: unknown) => {
+      if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+      throw error;
+    },
+  );
+  if (pointerRaw === null) return null;
+  let pointer: unknown;
+  try {
+    pointer = JSON.parse(pointerRaw);
+  } catch {
+    throw new Error("unusable worker deployment pointer");
+  }
+  const snapshot = await readWeightedDeploymentSnapshot(scriptsRoot, script, pointer);
+  const eventShapes = new Set<boolean>();
+  for (const stored of snapshot.deployment.versions) {
+    const manifest: unknown = stored.manifest;
+    if (typeof manifest !== "object" || manifest === null || Array.isArray(manifest)) {
+      throw new Error("unusable worker deployment Version");
+    }
+    const identity = manifest as Partial<Manifest>;
+    if (
+      identity.generation !== snapshot.deployment.generation ||
+      identity.workerResourceUid !== snapshot.deployment.workerResourceUid ||
+      !Array.isArray(identity.hostnames) ||
+      identity.hostnames.length !== 0
+    ) {
+      throw new Error("unusable worker deployment Version");
+    }
+    if (identity.events !== undefined) validEventGate(identity.events);
+    eventShapes.add(identity.events !== undefined);
+  }
+  if (eventShapes.size !== 1) throw new Error("unusable worker deployment event graph");
+  const after = await readActivationStrict(activationPath);
+  if (after[script] !== activeGeneration || snapshot.deployment.generation !== activeGeneration) {
+    return null;
+  }
+  return {
+    generation: activeGeneration,
+    versions: snapshot.canonical,
+    events: eventShapes.has(true),
+  };
+}
+
 async function readPublished(
   scriptsRoot: string,
   assetsRoot: string,
-): Promise<readonly Published[]> {
+): Promise<readonly PublishedDeployment[]> {
   const entries = await readdir(scriptsRoot, { withFileTypes: true }).catch(() => []);
-  const published: Published[] = [];
+  const published: PublishedDeployment[] = [];
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
+    if (!entry.isDirectory() || !SCRIPT_NAME.test(entry.name)) continue;
     const raw = await readFile(join(scriptsRoot, entry.name, MANIFEST), "utf8").catch(() => null);
     if (raw === null) continue;
-    let manifest: Manifest;
+    let value: unknown;
     try {
-      manifest = JSON.parse(raw) as Manifest;
+      value = JSON.parse(raw);
     } catch {
+      if (raw.includes("publicationStorageLayout")) {
+        throw new Error("unusable worker deployment pointer");
+      }
       continue;
     }
     if (
-      typeof manifest.mainModule !== "string" ||
-      (manifest.generation !== undefined && typeof manifest.generation !== "string")
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      "publicationStorageLayout" in value
     ) {
+      published.push(await readWeightedDeployment(scriptsRoot, entry.name, value));
       continue;
     }
     // A manifest whose bindings cannot be rendered is not a script this process
@@ -1342,29 +2260,36 @@ async function readPublished(
     // proved here, not merely name validity: `capnpText` refuses a NUL or a
     // lone surrogate, and it is the only thing that stands between a torn or
     // tampered manifest and a `renderConfig` that throws for everyone.
+    let manifest: Manifest;
     try {
-      validModules([manifest.mainModule]);
-      const declaredModules = validModules(manifest.modules ?? [], manifest.mainModule);
-      validModuleMediaTypes(manifest.mainModule, declaredModules, manifest.moduleMediaTypes);
-      const moduleFiles = await readPublishedModuleSnapshot(
+      manifest = await readValidatedManifest(
         join(scriptsRoot, entry.name),
-        manifest,
-      );
-      manifest = { ...manifest, moduleFiles };
-      const assets = await readPublishedAssetSnapshot(
         join(assetsRoot, entry.name),
-        manifest.assets,
+        value,
       );
-      if (assets) manifest = { ...manifest, assets };
-      validBindings(manifest.vars ?? []);
-      if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
-      if (manifest.events !== undefined) validEventGate(manifest.events);
       internalHostname(entry.name);
       eventHostname(entry.name);
     } catch {
       continue;
     }
-    published.push({ name: entry.name, manifest });
+    published.push({
+      name: entry.name,
+      ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
+      ...(manifest.workerResourceUid === undefined
+        ? {}
+        : { workerResourceUid: manifest.workerResourceUid }),
+      hostnames: validDeploymentHostnames(manifest.hostnames),
+      weighted: false,
+      variants: [
+        {
+          name: entry.name,
+          logicalName: entry.name,
+          storagePrefix: entry.name,
+          assetRoot: join(assetsRoot, entry.name),
+          manifest,
+        },
+      ],
+    });
   }
   return published.sort((left, right) => left.name.localeCompare(right.name));
 }
@@ -1378,6 +2303,64 @@ function requiredStoredModule(
   return match;
 }
 
+function serviceRouterName(binding: WorkerdServiceBinding): string {
+  const digest = createHash("sha256")
+    .update("takoserver.selfhost-service-router@v1\u0000", "utf8")
+    .update(binding.target, "utf8")
+    .update("\u0000", "utf8")
+    .update(binding.targetResourceUid, "utf8")
+    .update("\u0000", "utf8")
+    .update(binding.unavailableToken, "utf8")
+    .digest("hex");
+  return `selfhost-service-${digest}`;
+}
+
+function variantFetchService(entry: PublishedVariant): string {
+  return entry.manifest.assets ? `${entry.name}-asset-router` : entry.name;
+}
+
+function logicalFetchService(entry: PublishedDeployment): string {
+  return entry.weighted
+    ? `${entry.name}-selfhost-deployment`
+    : variantFetchService(entry.variants[0] as PublishedVariant);
+}
+
+function logicalEventService(entry: PublishedDeployment): string | null {
+  if (entry.weighted) {
+    return entry.variants.every((variant) => variant.manifest.events !== undefined)
+      ? `${entry.name}-selfhost-events`
+      : null;
+  }
+  const variant = entry.variants[0];
+  return variant?.manifest.events ? `${variant.name}-selfhost-events` : null;
+}
+
+function publishedGraphIdentity(published: readonly PublishedDeployment[]): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify(
+        published.map((deployment) => ({
+          name: deployment.name,
+          generation: deployment.generation ?? null,
+          workerResourceUid: deployment.workerResourceUid ?? null,
+          hostnames: deployment.hostnames,
+          weighted: deployment.weighted,
+          variants: deployment.variants.map((variant) => ({
+            name: variant.name,
+            storagePrefix: variant.storagePrefix,
+            assetRoot: variant.assetRoot,
+            versionId: variant.versionId ?? null,
+            workerVersionUid: variant.workerVersionUid ?? null,
+            weight: variant.weight ?? null,
+            manifest: variant.manifest,
+          })),
+        })),
+      ),
+      "utf8",
+    )
+    .digest("hex");
+}
+
 /**
  * The configuration, rendered whole.
  *
@@ -1387,17 +2370,30 @@ function requiredStoredModule(
  * only honest answer when nobody has asked for that name.
  */
 function renderConfig(
-  published: readonly Published[],
+  published: readonly PublishedDeployment[],
   port: number,
-  assetsRoot: string,
+  _assetsRoot: string,
   tls?: WorkerdTlsKeypair,
+  configProbeToken?: string,
+  internalReadinessCapability = "",
 ): string {
-  const services = published
+  const variants = published.flatMap((deployment) => deployment.variants);
+  const graphIdentity = publishedGraphIdentity(published);
+  const services = variants
     .map((entry) => {
       const bindings = [
+        ...(hasHostEntrypoint(entry)
+          ? [
+              `(name = ${capnpText(INTERNAL_READINESS_CAPABILITY_BINDING)}, text = ${capnpText(internalReadinessCapability)})`,
+            ]
+          : []),
         ...(entry.manifest.dataPlane
           ? [`(name = "${DATA_SERVICE_BINDING}", service = "${entry.name}-selfhost-data")`]
           : []),
+        ...validServiceBindings(entry.manifest.serviceBindings ?? []).map(
+          (binding) =>
+            `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
+        ),
         ...validBindings(entry.manifest.vars ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -1444,7 +2440,7 @@ function renderConfig(
               : "application/javascript+module";
           const provenanceDirectory =
             role === "application" ? APPLICATION_MODULE_DIRECTORY : HOST_PRIVATE_MODULE_DIRECTORY;
-          return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${entry.name}/${provenanceDirectory}/${module.key}`)}, role = ${role})`;
+          return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${entry.storagePrefix}/${provenanceDirectory}/${module.key}`)}, role = ${role})`;
         })
         .join(", ");
       // Rendered only for a script published through a generated entrypoint, so
@@ -1473,13 +2469,13 @@ function renderConfig(
   // behavior; a second Host-owned service composes that lookup with the tenant
   // worker in the exact declared order. Neither binding is on the tenant
   // service, so `env.ASSETS` is never invented by this Host.
-  const assetServices = published
+  const assetServices = variants
     .filter((entry) => entry.manifest.assets)
     .map((entry) => {
       const assets = validAssetManifest(entry.manifest.assets);
       if (!assets) throw new Error("unusable worker asset manifest");
       return `  ( name = "${entry.name}-assets-files",
-    disk = ( path = ${capnpText(join(assetsRoot, entry.name))}, writable = false )
+    disk = ( path = ${capnpText(entry.assetRoot)}, writable = false )
   ),
   ( name = "${entry.name}-assets",
     worker = (
@@ -1506,6 +2502,40 @@ function renderConfig(
     })
     .join("\n");
 
+  // One private router per immutable caller binding. Its per-Version token is
+  // what makes the unavailable signal unforgeable by the target while letting
+  // an active response pass through byte-for-byte, headers and body stream
+  // included. Target selection is only the persisted script + Resource UID;
+  // the request URL and Host header are never consulted.
+  const publishedByName = new Map(published.map((entry) => [entry.name, entry] as const));
+  const routedBindings = new Map<string, WorkerdServiceBinding>();
+  for (const entry of variants) {
+    for (const binding of validServiceBindings(entry.manifest.serviceBindings ?? [])) {
+      routedBindings.set(serviceRouterName(binding), binding);
+    }
+  }
+  const serviceBindingServices = [...routedBindings]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, binding]) => {
+      const target = publishedByName.get(binding.target);
+      const active =
+        target?.workerResourceUid === binding.targetResourceUid &&
+        target.variants.every((variant) => variant.manifest.fetchHandler === true);
+      const targetService = target ? logicalFetchService(target) : binding.target;
+      return `  ( name = ${capnpText(name)},
+    worker = (
+      modules = [ (name = ${capnpText(SERVICE_ROUTER_MODULE)}, esModule = embed ${capnpText(SERVICE_ROUTER_MODULE)}) ],
+      bindings = [
+        (name = "${SERVICE_UNAVAILABLE_TOKEN_BINDING}", text = ${capnpText(binding.unavailableToken)}),${
+          active ? `\n        (name = "TARGET", service = ${capnpText(targetService)}),` : ""
+        }
+      ],
+      compatibilityDate = "2026-01-01",
+    )
+  ),`;
+    })
+    .join("\n");
+
   // One pair per script rather than one shared, so the configuration stays a
   // pure function of the manifests on disk: a script that binds no data plane
   // contributes neither service, and removing it removes both with it.
@@ -1514,7 +2544,7 @@ function renderConfig(
   // binding to this one and nothing else, so tenant code — by `env`, by
   // `cloudflare:workers`, or by any other route into its own isolate — has
   // nothing to find.
-  const dataServices = published
+  const dataServices = variants
     .filter((entry) => entry.manifest.dataPlane)
     .map((entry) => {
       const plane = validDataPlane(entry.manifest.dataPlane as WorkerdDataPlane);
@@ -1531,7 +2561,7 @@ function renderConfig(
       ].join(", ");
       return `  ( name = "${entry.name}-selfhost-data",
     worker = (
-      modules = [ (name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${entry.name}/${HOST_PRIVATE_MODULE_DIRECTORY}/${planeModule.key}`)}) ],
+      modules = [ (name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${entry.storagePrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${planeModule.key}`)}) ],
       bindings = [ ${facadeBindings} ],
       compatibilityDate = "2026-01-01",
     )
@@ -1546,7 +2576,7 @@ function renderConfig(
   // binding on this machine that names the script's event entrypoint; the
   // script itself is not reachable on the event hostname at all, and the
   // entrypoint the gate calls is a named export the router never addresses.
-  const eventServices = published
+  const eventGateServices = variants
     .filter((entry) => entry.manifest.events)
     .map((entry) => {
       const gate = validEventGate(entry.manifest.events as WorkerdEventGate);
@@ -1560,8 +2590,75 @@ function renderConfig(
       ].join(", ");
       return `  ( name = "${entry.name}-selfhost-events",
     worker = (
-      modules = [ (name = ${capnpText(gate.module)}, esModule = embed ${capnpText(`${entry.name}/${HOST_PRIVATE_MODULE_DIRECTORY}/${gateModule.key}`)}) ],
+      modules = [ (name = ${capnpText(gate.module)}, esModule = embed ${capnpText(`${entry.storagePrefix}/${HOST_PRIVATE_MODULE_DIRECTORY}/${gateModule.key}`)}) ],
       bindings = [ ${gateBindings} ],
+      compatibilityDate = "2026-01-01",
+    )
+  ),`;
+    })
+    .join("\n");
+
+  // One stable logical fetch service owns the weighted choice. Private
+  // variants are bound only here (and to their per-Version event gates), so
+  // they have no hostname, router binding, or service-binding identity of
+  // their own. Ordinary fetch forwards the original Request and returns the
+  // original Response; readiness alone fans out to prove the complete graph.
+  const deploymentRouterServices = published
+    .filter((entry) => entry.weighted)
+    .map((entry) => {
+      const table = entry.variants.map((variant, index) => ({
+        binding: `VERSION_${index.toString(10).padStart(5, "0")}`,
+        readinessBinding: `READINESS_${index.toString(10).padStart(5, "0")}`,
+        versionId: variant.versionId as string,
+        weight: variant.weight as number,
+      }));
+      const versionBindings = entry.variants.flatMap((variant, index) => [
+        `(name = ${capnpText(table[index]?.binding as string)}, service = ${capnpText(variantFetchService(variant))})`,
+        `(name = ${capnpText(table[index]?.readinessBinding as string)}, service = ${capnpText(variant.name)})`,
+      ]);
+      return `  ( name = ${capnpText(logicalFetchService(entry))},
+    worker = (
+      modules = [ (name = ${capnpText(DEPLOYMENT_ROUTER_MODULE)}, esModule = embed ${capnpText(DEPLOYMENT_ROUTER_MODULE)}) ],
+      bindings = [
+        (name = "VERSIONS", json = ${capnpText(JSON.stringify(table))}),
+        (name = "PUBLICATION", text = ${capnpText(
+          createHash("sha256")
+            .update(entry.generation as string, "utf8")
+            .digest("hex"),
+        )}),
+        (name = "INTERNAL_HOSTNAME", text = ${capnpText(internalHostname(entry.name))}),
+        (name = "INTERNAL_READINESS_CAPABILITY", text = ${capnpText(internalReadinessCapability)}),
+        ${versionBindings.join(",\n        ")}
+      ],
+      compatibilityDate = "2026-01-01",
+    )
+  ),`;
+    })
+    .join("\n");
+
+  // The public event hostname reaches one stable dispatcher. It reads only a
+  // bounded clone of the existing private envelope, requires this exact
+  // logical script and a currently weighted deployment id, then forwards the
+  // untouched original request to that Version's private token gate.
+  const eventDispatcherServices = published
+    .filter((entry) => entry.weighted && logicalEventService(entry) !== null)
+    .map((entry) => {
+      const table = entry.variants.map((variant, index) => ({
+        binding: `VERSION_${index.toString(10).padStart(5, "0")}`,
+        versionId: variant.versionId as string,
+      }));
+      const gateBindings = entry.variants.map(
+        (variant, index) =>
+          `(name = ${capnpText(table[index]?.binding as string)}, service = ${capnpText(`${variant.name}-selfhost-events`)})`,
+      );
+      return `  ( name = ${capnpText(logicalEventService(entry) as string)},
+    worker = (
+      modules = [ (name = ${capnpText(EVENT_DISPATCHER_MODULE)}, esModule = embed ${capnpText(EVENT_DISPATCHER_MODULE)}) ],
+      bindings = [
+        (name = "LOGICAL_WORKER", text = ${capnpText(entry.name)}),
+        (name = "VERSIONS", json = ${capnpText(JSON.stringify(table))}),
+        ${gateBindings.join(",\n        ")}
+      ],
       compatibilityDate = "2026-01-01",
     )
   ),`;
@@ -1570,9 +2667,9 @@ function renderConfig(
 
   const routes = [
     ...published.flatMap((entry) =>
-      entry.manifest.hostnames.map((hostname) => ({
+      entry.hostnames.map((hostname) => ({
         hostname,
-        service: entry.manifest.assets ? `${entry.name}-asset-router` : entry.name,
+        service: logicalFetchService(entry),
       })),
     ),
     // Last, so a customer domain that happens to claim one of these names
@@ -1581,30 +2678,35 @@ function renderConfig(
     // that bind a data plane: the entrypoint answers the readiness question and
     // a script this Host cannot ask is one it publishes without checking.
     ...published
-      .filter((entry) => hasHostEntrypoint(entry))
-      .map((entry) => ({ hostname: internalHostname(entry.name), service: entry.name })),
+      .filter((entry) => entry.variants.every((variant) => hasHostEntrypoint(variant)))
+      .map((entry) => ({
+        hostname: internalHostname(entry.name),
+        service: logicalFetchService(entry),
+      })),
     ...published
-      .filter((entry) => entry.manifest.events)
+      .filter((entry) => logicalEventService(entry) !== null)
       .map((entry) => ({
         hostname: eventHostname(entry.name),
-        service: `${entry.name}-selfhost-events`,
+        service: logicalEventService(entry) as string,
       })),
   ];
   const routeTable = JSON.stringify(Object.fromEntries(routes.map((r) => [r.hostname, r.service])));
+  const internalReadinessRoutes = JSON.stringify(
+    Object.fromEntries(
+      published
+        .filter((entry) => entry.variants.every((variant) => hasHostEntrypoint(variant)))
+        .map((entry) => [internalHostname(entry.name), logicalFetchService(entry)]),
+    ),
+  );
   const bindings = [
-    ...published.map((entry) => `      (name = "${entry.name}", service = "${entry.name}"),`),
+    ...published.map((entry) => {
+      const service = logicalFetchService(entry);
+      return `      (name = ${capnpText(service)}, service = ${capnpText(service)}),`;
+    }),
     ...published
-      .filter((entry) => entry.manifest.assets)
-      .map(
-        (entry) =>
-          `      (name = "${entry.name}-asset-router", service = "${entry.name}-asset-router"),`,
-      ),
-    ...published
-      .filter((entry) => entry.manifest.events)
-      .map(
-        (entry) =>
-          `      (name = "${entry.name}-selfhost-events", service = "${entry.name}-selfhost-events"),`,
-      ),
+      .map((entry) => logicalEventService(entry))
+      .filter((entry): entry is string => entry !== null)
+      .map((entry) => `      (name = ${capnpText(entry)}, service = ${capnpText(entry)}),`),
   ].join("\n");
 
   return `using Workerd = import "/workerd/workerd.capnp";
@@ -1612,12 +2714,16 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${dataServices === "" ? "" : `\n${dataServices}`}${eventServices === "" ? "" : `\n${eventServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],
       bindings = [
         (name = "ROUTES", text = ${JSON.stringify(routeTable)}),
+        (name = "INTERNAL_READINESS_ROUTES", text = ${capnpText(internalReadinessRoutes)}),
+        (name = "INTERNAL_READINESS_CAPABILITY", text = ${capnpText(internalReadinessCapability)}),
+        (name = "CONFIG_IDENTITY", text = ${capnpText(graphIdentity)}),
+        (name = "CONFIG_PROBE_TOKEN", text = ${capnpText(configProbeToken ?? "")}),
 ${bindings}
       ],
       compatibilityDate = "2026-01-01",
@@ -1653,9 +2759,32 @@ function socket(port: number, tls?: WorkerdTlsKeypair): string {
  * falling back to some script — is how one customer's traffic reaches another
  * customer's code without anybody noticing.
  */
-export const ROUTER_SOURCE = `export default {
+export const ROUTER_SOURCE = `const CONFIG_PROBE_HOSTNAME = ${JSON.stringify(CONFIG_PROBE_HOSTNAME)};
+const CONFIG_PROBE_PATH = ${JSON.stringify(CONFIG_PROBE_PATH)};
+const CONFIG_PROBE_HEADER = ${JSON.stringify(CONFIG_PROBE_HEADER)};
+const CONFIG_IDENTITY_HEADER = ${JSON.stringify(CONFIG_IDENTITY_HEADER)};
+const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(INTERNAL_READINESS_CAPABILITY_HEADER)};
+
+function refuse() {
+  return new Response(null, { status: 404 });
+}
+
+export default {
   async fetch(request, env) {
-    const host = new URL(request.url).hostname;
+    const url = new URL(request.url);
+    const host = url.hostname;
+    if (
+      request.method === "POST" &&
+      host === CONFIG_PROBE_HOSTNAME &&
+      url.pathname === CONFIG_PROBE_PATH &&
+      env.CONFIG_PROBE_TOKEN.length === 64 &&
+      request.headers.get(CONFIG_PROBE_HEADER) === env.CONFIG_PROBE_TOKEN
+    ) {
+      return new Response(null, {
+        status: 204,
+        headers: { [CONFIG_IDENTITY_HEADER]: env.CONFIG_IDENTITY },
+      });
+    }
     const routes = JSON.parse(env.ROUTES);
     const service = routes[host];
     if (!service || !env[service]) {
@@ -1664,7 +2793,177 @@ export const ROUTER_SOURCE = `export default {
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
     }
+    const capability = request.headers.get(INTERNAL_READINESS_CAPABILITY_HEADER);
+    if (capability !== null) {
+      const internal = JSON.parse(env.INTERNAL_READINESS_ROUTES);
+      if (
+        capability !== env.INTERNAL_READINESS_CAPABILITY ||
+        internal[host] !== service
+      ) return refuse();
+    }
     return env[service].fetch(request);
+  },
+};
+`;
+
+/** Stable private entropy router for one complete weighted deployment. */
+export const DEPLOYMENT_ROUTER_SOURCE = `const READINESS_PATH = ${JSON.stringify(WORKER_READINESS_PATH)};
+const READINESS_HEADER = ${JSON.stringify(WORKER_READINESS_HEADER)};
+const READINESS_PROTOCOL = ${JSON.stringify(WORKER_READINESS_PROTOCOL)};
+const READINESS_SCHEMA = "takoserver.selfhost-worker-readiness-result@v1";
+const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(INTERNAL_READINESS_CAPABILITY_HEADER)};
+const UINT32_RANGE = 0x1_0000_0000;
+const RANDOM_LIMIT = UINT32_RANGE - (UINT32_RANGE % 10000);
+
+function basisPoint() {
+  const words = new Uint32Array(1);
+  for (;;) {
+    crypto.getRandomValues(words);
+    const value = words[0];
+    if (value < RANDOM_LIMIT) return value % 10000;
+  }
+}
+
+function selected(versions) {
+  const point = basisPoint();
+  let upper = 0;
+  for (const version of versions) {
+    upper += version.weight;
+    if (point < upper) return version;
+  }
+  throw new Error("invalid weighted deployment");
+}
+
+function readinessAnswer(publication, status, failure) {
+  return new Response(JSON.stringify({
+    schema: READINESS_SCHEMA,
+    publication,
+    ...(failure ? { failure } : {}),
+  }), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+async function readiness(request, env) {
+  for (const version of env.VERSIONS) {
+    const response = await env[version.readinessBinding].fetch(request.clone());
+    const body = await response.text();
+    let answer;
+    try {
+      answer = body.length <= 8192 ? JSON.parse(body) : null;
+    } catch {
+      answer = null;
+    }
+    if (
+      !answer ||
+      answer.schema !== READINESS_SCHEMA ||
+      answer.publication !== version.versionId
+    ) {
+      return readinessAnswer(env.PUBLICATION, 503, { reason: "module" });
+    }
+    if (response.status !== 200) {
+      return readinessAnswer(env.PUBLICATION, response.status, answer.failure ?? { reason: "module" });
+    }
+  }
+  return readinessAnswer(env.PUBLICATION, 200);
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const capability = request.headers.get(INTERNAL_READINESS_CAPABILITY_HEADER);
+    const internalReadiness =
+      request.method === "POST" &&
+      url.hostname === env.INTERNAL_HOSTNAME &&
+      url.pathname === READINESS_PATH &&
+      request.headers.get(READINESS_HEADER) === READINESS_PROTOCOL &&
+      capability === env.INTERNAL_READINESS_CAPABILITY;
+    if (internalReadiness) {
+      return await readiness(request, env);
+    }
+    // A same-named header is Host-private. Never expose even an incorrect
+    // guess to tenant code, and never treat it as authority on another shape.
+    if (capability !== null) return new Response(null, { status: 404 });
+    const version = selected(env.VERSIONS);
+    // Selection is final. Transport failure propagates; no second Version is
+    // sampled and the original Request/Response streams are never rebuilt.
+    return await env[version.binding].fetch(request);
+  },
+};
+`;
+
+/** Stable dispatcher from one logical event route to one private Version gate. */
+export const EVENT_DISPATCHER_SOURCE = `const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
+const EVENT_HEADER = "x-takoserver-managed-worker-event";
+const EVENT_PROTOCOL = "takoserver.managed-worker-event@v1";
+const EVENT_CONTENT_TYPE = "application/vnd.takoserver.managed-worker-event.v1+json";
+const MAX_REQUEST_BYTES = ${2 * 1024 * 1024};
+
+function refuse() {
+  return new Response(null, { status: 404 });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (
+      request.method !== "POST" ||
+      url.pathname !== EVENT_PATH ||
+      request.headers.get(EVENT_HEADER) !== EVENT_PROTOCOL ||
+      request.headers.get("content-type") !== EVENT_CONTENT_TYPE
+    ) return refuse();
+    const declaredLength = request.headers.get("content-length");
+    if (declaredLength !== null && Number(declaredLength) > MAX_REQUEST_BYTES) return refuse();
+    let bytes;
+    let event;
+    try {
+      bytes = await request.clone().arrayBuffer();
+      if (bytes.byteLength > MAX_REQUEST_BYTES) return refuse();
+      event = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      return refuse();
+    }
+    if (
+      !event ||
+      typeof event !== "object" ||
+      event.logicalWorkerId !== env.LOGICAL_WORKER ||
+      typeof event.deploymentId !== "string"
+    ) return refuse();
+    const version = env.VERSIONS.find((candidate) => candidate.versionId === event.deploymentId);
+    if (!version || !env[version.binding]) return refuse();
+    // The selected private gate validates the original per-Version token and
+    // the full existing envelope. Unknown or no-longer-weighted ids stop here.
+    return await env[version.binding].fetch(request);
+  },
+};
+`;
+
+/**
+ * Private logical-worker router for one immutable caller binding.
+ *
+ * An active native response is returned without reconstruction, which is what
+ * preserves its stream and every response field. The token exists only on
+ * this Host-owned service and in the caller's Host-private wrapper. A target
+ * cannot manufacture the exact unavailable signal, even if it returns the
+ * same status and header name intentionally.
+ */
+export const SERVICE_ROUTER_SOURCE = `const HEADER = ${JSON.stringify(SERVICE_UNAVAILABLE_HEADER)};
+
+function unavailable(env) {
+  return new Response(null, {
+    status: 530,
+    headers: { [HEADER]: env.${SERVICE_UNAVAILABLE_TOKEN_BINDING} },
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    if (!env.TARGET || typeof env.TARGET.fetch !== "function") return unavailable(env);
+    // Native cancellation and request/response stream aborts are transport
+    // outcomes, not evidence that target selection failed. Let them propagate;
+    // the target wrapper has already converted an actual handler throw to 500.
+    return await env.TARGET.fetch(request);
   },
 };
 `;

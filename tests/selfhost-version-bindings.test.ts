@@ -28,9 +28,11 @@ afterEach(() => {
 });
 
 const SET = {
+  workerResourceUid: "uid-ModuleWorker-hello",
   handlers: ["fetch" as const],
   vars: [{ name: "LANE", value: "takoform-v1", kind: "text" as const }],
   sensitiveVars: [{ name: "ENCRYPTION_KEY", value: "placeholder-secret", kind: "text" as const }],
+  serviceBindings: [],
 };
 
 test("stores and returns one version's bindings", async () => {
@@ -45,10 +47,12 @@ test("stores and returns one version's bindings", async () => {
 test("keeps one salt for one version so a retry does not move its digest", async () => {
   const first = await store.write("sw-a", "v-1", SET);
   const second = await store.write("sw-a", "v-1", {
+    workerResourceUid: SET.workerResourceUid,
     // Order is normalized, so presenting the same set differently is the same set.
     handlers: ["fetch"],
     vars: [...SET.vars],
     sensitiveVars: [...SET.sensitiveVars],
+    serviceBindings: [],
   });
   expect(second.digest).toBe(first.digest);
 });
@@ -67,9 +71,11 @@ test("commits to the values with a salt rather than a guessable hash of them", a
 test("changing a value changes the digest", async () => {
   const first = await store.write("sw-a", "v-1", SET);
   const changed = await store.write("sw-a", "v-1", {
+    workerResourceUid: SET.workerResourceUid,
     handlers: ["fetch"],
     vars: SET.vars,
     sensitiveVars: [{ name: "ENCRYPTION_KEY", value: "rotated", kind: "text" }],
+    serviceBindings: [],
   });
   expect(changed.digest).not.toBe(first.digest);
 });
@@ -89,9 +95,11 @@ test("refuses a name that is not a script or a version", async () => {
 test("refuses a set that names the same binding twice", async () => {
   await expect(
     store.write("sw-a", "v-1", {
+      workerResourceUid: SET.workerResourceUid,
       handlers: ["fetch"],
       vars: [{ name: "SAME", value: "a", kind: "text" }],
       sensitiveVars: [{ name: "SAME", value: "b", kind: "text" }],
+      serviceBindings: [],
     }),
   ).rejects.toMatchObject({ code: "corrupt" });
 });

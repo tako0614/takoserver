@@ -75,10 +75,10 @@ const DECLARED_AUTHORITY_MODULES = [
  * back from).
  *
  * These are walked because a change to anything they depend on at runtime
- * changes what the authority does. They are leaf-ward: their whole closure is
- * ten modules, and every module in it beyond these five roots was already
- * classified through the public Form P/I closure below, so making the walk
- * authoritative widened the lane by exactly these five files and nothing else.
+ * changes what the authority does. They are leaf-ward: every module in their
+ * small closure beyond these five roots is already classified through the
+ * public Form P/I closure below, so making the walk authoritative widened the
+ * lane by exactly these five files and nothing else.
  *
  * Before this list existed, all five classified as *routine*. A change to the
  * claim state machine, to the seal key ring, or to the settlement path could be

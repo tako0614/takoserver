@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, constants as fsConstants } from "node:fs";
+import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { bytesDigest } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
@@ -44,13 +44,26 @@ import {
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
 import {
+  canonicalSelfhostWeightedVersions,
+  persistedSelfhostWeightedDeployment,
+  randomSelfhostDeploymentBasisPoint,
+  type SelfhostWeightedDeployment,
+  type SelfhostWeightedVersion,
+  selectSelfhostWeightedVersion,
+} from "../selfhost-weighted-deployment.ts";
+import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "../takoform/limits.ts";
 import {
   internalHostname,
+  readWorkerdActiveDeployment,
+  type WorkerdActiveDeployment,
+  type WorkerdDeploymentPublication,
+  type WorkerdDeploymentVariant,
   type WorkerdModuleMediaType,
   type WorkerdRuntime,
+  type WorkerdSite,
 } from "../workerd-runtime.ts";
 import { parseSelfhostCron } from "./selfhost-cron.ts";
 import {
@@ -87,6 +100,7 @@ import {
   SelfhostVersionBindingStoreError,
   type SelfhostVersionDataBinding,
   type SelfhostVersionQueueSettings,
+  type SelfhostVersionServiceBinding,
   type SelfhostWorkerHandlerName,
   type StoredSelfhostVersionBindings,
 } from "./selfhost-version-bindings.ts";
@@ -112,6 +126,7 @@ import {
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_PROTOCOL,
+  SELFHOST_WORKER_SERVICE_BINDING_KIND,
   selfhostReadinessAnswer,
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
@@ -149,11 +164,10 @@ import { assertSafeMigrationSql } from "./sqlite-migration-policy.ts";
  *   against it.
  * - **ModuleWorker / WorkerVersion / WorkerDeployment / WorkerEndpoint /
  *   WorkerCustomDomain** are executed for real: a version materializes its
- *   committed bundle to disk, a deployment publishes the winning version into
- *   the workerd runtime, and the endpoint and domain attachments decide which
- *   hostnames route to it. workerd cannot split traffic by percentage, so a
- *   weighted deployment serves its heaviest version and records the split it
- *   was asked for.
+ *   committed bundle to disk, one Deployment publishes its complete canonical
+ *   weighted graph into the workerd runtime, and the endpoint and domain
+ *   attachments decide which hostnames route to its one logical router.
+ *   Private Versions never acquire routes or service-binding identity.
  * - **WorkerCronTrigger / QueueConsumer** are executed when this deployment
  *   composed a pump and a scheduler, and recorded honestly when it did not. An
  *   attachment writes itself into the script's own durable state and
@@ -180,6 +194,13 @@ const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 /** The Form's own grammar and ceiling for a `kvBindings`/`sqliteBindings` name. */
 const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
 const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
+const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
+const SELFHOST_SERVICE_BINDING_REF = Object.freeze({
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.service",
+  version: "1.0.0",
+  schemaDigest: "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa",
+});
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
 /**
  * How long a ledger statement waits for a tenant's lock, in milliseconds.
@@ -349,8 +370,8 @@ export interface SelfhostDataPlaneMaintenance {
    * Resource, whether or not this deployment happens to run a pump.
    */
   deleteQueue(queueId: string): Promise<void>;
-  /** Closes and forgets the cached handle on one SQLite database. */
-  forgetDatabase(name: string): void;
+  /** Closes and removes one exact SQLite database incarnation and its sidecars. */
+  deleteDatabase(name: string): void;
   /**
    * What one bucket still holds.
    *
@@ -426,20 +447,25 @@ export function selfhostScriptStateRoot(dataRoot: string): string {
 }
 
 /**
- * One Worker this machine may have to deliver an event to.
+ * One logical Worker this machine may have to deliver an event to.
  *
- * `versionId` is the deployment identity carried in the envelope: it names the
- * exact immutable Version the handler will run in, which is the only
- * "deployment" a self-hosted machine has.
+ * The weighted Version is deliberately absent. A queue batch and a cron fire
+ * select it at their own invocation seam, after `list`, so one outer target
+ * never turns one message or schedule into one delivery per Version.
  */
 export interface SelfhostEventTarget {
   readonly script: string;
+  readonly consumers: readonly SelfhostQueueConsumerAttachment[];
+  readonly crons: readonly string[];
+}
+
+/** The exact immutable Version selected once for one event invocation. */
+export interface SelfhostEventSelection {
   readonly versionId: string;
+  readonly workerVersionUid: string;
   /** Presented to the gate in front of the Worker; never logged, never shown. */
   readonly eventToken: string;
   readonly handlers: readonly SelfhostWorkerHandlerName[];
-  readonly consumers: readonly SelfhostQueueConsumerAttachment[];
-  readonly crons: readonly string[];
 }
 
 /**
@@ -452,13 +478,24 @@ export interface SelfhostEventTarget {
 export interface SelfhostEventTargets {
   /** Every serving script with at least one Consumer or Trigger attached. */
   list(): Promise<readonly SelfhostEventTarget[]>;
+  /** Selects once from the script's current canonical deployment. */
+  select(script: string): Promise<SelfhostEventSelection | null>;
 }
 
-export function createSelfhostEventTargets(dataRoot: string): SelfhostEventTargets {
+export function createSelfhostEventTargets(
+  dataRoot: string,
+  options: {
+    readonly basisPoint?: () => number;
+    /** Testable serving-authority seam; production reads the runtime pointer. */
+    readonly activeDeployment?: (script: string) => Promise<WorkerdActiveDeployment | null>;
+  } = {},
+): SelfhostEventTargets {
   const scriptStates = createSelfhostScriptStateStore({ root: selfhostScriptStateRoot(dataRoot) });
   const bindings = createSelfhostVersionBindingStore({
     root: selfhostVersionBindingsRoot(dataRoot),
   });
+  const activeDeployment =
+    options.activeDeployment ?? ((script: string) => readWorkerdActiveDeployment(dataRoot, script));
   return {
     async list() {
       const entries = await readdir(selfhostScriptStateRoot(dataRoot)).catch(() => []);
@@ -477,27 +514,57 @@ export function createSelfhostEventTargets(dataRoot: string): SelfhostEventTarge
         }
         const consumers = state.consumers ?? [];
         const crons = state.crons ?? [];
-        if (!state.activeVersion || (consumers.length === 0 && crons.length === 0)) continue;
-        let stored: StoredSelfhostVersionBindings | null;
+        if (consumers.length === 0 && crons.length === 0) continue;
+        let active: WorkerdActiveDeployment | null;
         try {
-          stored = await bindings.read(script, state.activeVersion);
+          active = await activeDeployment(script);
         } catch {
+          // A missing, crossing, or malformed runtime pointer is not an event
+          // target. Reconcile/restore establishes a new exact active graph.
           continue;
         }
-        // A Version published before this Host could carry events has neither
-        // a token nor a recorded handler list. Nothing is delivered to it, and
-        // publishing a new Version is what changes that.
-        if (!stored?.eventToken || !stored.handlers) continue;
+        // A legacy scalar has no WorkerVersion UID, and a weighted graph with
+        // no dispatcher cannot receive an attachment. Both remain servable;
+        // event delivery waits for authoritative publication.
+        if (!active?.events) continue;
         targets.push({
           script,
-          versionId: state.activeVersion,
-          eventToken: stored.eventToken,
-          handlers: stored.handlers,
           consumers,
           crons,
         });
       }
       return targets;
+    },
+    async select(script) {
+      let active: WorkerdActiveDeployment | null;
+      try {
+        active = await activeDeployment(script);
+      } catch {
+        return null;
+      }
+      if (!active?.events) return null;
+      let selected: SelfhostWeightedVersion;
+      try {
+        selected = selectSelfhostWeightedVersion(
+          active.versions,
+          options.basisPoint?.() ?? randomSelfhostDeploymentBasisPoint(),
+        );
+      } catch {
+        return null;
+      }
+      let stored: StoredSelfhostVersionBindings | null;
+      try {
+        stored = await bindings.read(script, selected.versionId);
+      } catch {
+        return null;
+      }
+      if (!stored?.eventToken || !stored.handlers) return null;
+      return {
+        versionId: selected.versionId,
+        workerVersionUid: selected.workerVersionUid,
+        eventToken: stored.eventToken,
+        handlers: stored.handlers,
+      };
     },
   };
 }
@@ -678,7 +745,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: resource.name,
     });
 
+  // Keep the recorded output path stable for legacy relative data roots;
+  // filesystem callers use the normalized sibling below.
   const databasePath = (name: string): string => selfhostDatabasePath(dataRoot, name);
+  const databaseFilesystemPath = (name: string): string => resolve(databasePath(name));
 
   /**
    * The native name of one current ObjectBucket incarnation.
@@ -766,6 +836,38 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   // script with nothing attached contribute nothing, so their generation is
   // byte-for-byte what it was before either existed.
   const runtimeGeneration = async (script: string, state: SelfhostScriptState): Promise<string> => {
+    if (state.deployment) {
+      const versions = await Promise.all(
+        state.deployment.versions.map(async (version) => {
+          const [bindings, snapshot] = await Promise.all([
+            readVersionBindings(script, version.versionId),
+            readVersionSnapshot(script, version.versionId),
+          ]);
+          if (!bindings || snapshot.state !== "present") {
+            throw new SelfhostFailure(
+              failed(
+                "provider_error",
+                "a deployed Worker Version is not materialized on this machine",
+              ),
+            );
+          }
+          return {
+            ...version,
+            materializationDigest: snapshot.prepared.materializationDigest,
+            bindingsDigest: bindings.digest,
+          };
+        }),
+      );
+      const consumers = state.consumers ?? [];
+      const crons = state.crons ?? [];
+      return JSON.stringify({
+        deployment: { versions },
+        endpointHostname: state.endpointHostname ?? null,
+        domains: state.domains,
+        ...(consumers.length > 0 ? { consumers } : {}),
+        ...(crons.length > 0 ? { crons } : {}),
+      });
+    }
     const bindings = state.activeVersion
       ? await readVersionBindings(script, state.activeVersion)
       : null;
@@ -817,6 +919,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     bindings: StoredSelfhostVersionBindings | null,
     events: boolean,
     generation: string,
+    readinessPublication?: string,
   ): {
     source: Uint8Array;
     facade: Uint8Array | null;
@@ -825,6 +928,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     publication: string;
     token: SelfhostVersionBinding | null;
     eventToken: SelfhostVersionBinding | null;
+    services: readonly {
+      readonly name: string;
+      readonly target: string;
+      readonly targetResourceUid: string;
+      readonly unavailableToken: string;
+    }[];
   } | null => {
     const plane = bindings?.dataPlane;
     if (!bindings) return null;
@@ -849,12 +958,40 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ),
       );
     }
+    const serviceBindings = bindings.serviceBindings ?? [];
+    if (serviceBindings.length > 0 && !bindings.eventToken) {
+      throw new SelfhostFailure(
+        failed(
+          "invalid_spec",
+          "the active Worker Version predates service bindings on this Host; publish a new Version",
+        ),
+      );
+    }
+    const services = serviceBindings.map((binding, index) => ({
+      name: `${SELFHOST_WORKER_INTERNAL_BINDING_PREFIX}SELFHOST_SERVICE_${index
+        .toString(10)
+        .padStart(5, "0")}`,
+      target: binding.target,
+      targetResourceUid: binding.targetResourceUid,
+      // Domain-separated from the event gate token. It is compiled only into
+      // the Host-private wrapper and declared only on the Host-private router;
+      // the target receives neither and therefore cannot spoof unavailability.
+      unavailableToken: createHash("sha256")
+        .update("takoserver.selfhost-service-unavailable@v1\u0000", "utf8")
+        .update(bindings.eventToken as string, "utf8")
+        .update("\u0000", "utf8")
+        .update(binding.name, "utf8")
+        .update("\u0000", "utf8")
+        .update(binding.targetResourceUid, "utf8")
+        .digest("hex"),
+    }));
     // The generation, not the version: two publications of one Version differ
     // when its routes do, and a readiness answer has to be attributable to the
     // exact configuration that asked for it or a stale one passes for it.
     // Hashed because the generation carries customer hostnames and this string
     // is compiled into a module the tenant's own isolate loads.
-    const publication = createHash("sha256").update(generation, "utf8").digest("hex");
+    const publication =
+      readinessPublication ?? createHash("sha256").update(generation, "utf8").digest("hex");
     const preludeModule = selfhostWorkerPreludeModuleName(mainModule);
     let source: string;
     try {
@@ -885,6 +1022,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                     ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
                     : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
             publicName: binding.name,
+          })),
+          ...serviceBindings.map((binding, index) => ({
+            kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
+            publicName: binding.name,
+            internalName: services[index]?.name as string,
+            unavailableToken: services[index]?.unavailableToken as string,
           })),
         ],
       });
@@ -920,6 +1063,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               kind: "text",
             }
           : null,
+      services,
     };
   };
 
@@ -1010,6 +1154,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const receivesEvents = (state: SelfhostScriptState): boolean =>
     (state.consumers ?? []).length > 0 || (state.crons ?? []).length > 0;
 
+  const deployedVersionIds = (state: SelfhostScriptState): readonly string[] =>
+    state.deployment?.versions.map((version) => version.versionId) ??
+    (state.activeVersion ? [state.activeVersion] : []);
+
+  const hasDeployment = (state: SelfhostScriptState): boolean =>
+    state.deployment !== undefined || state.activeVersion !== undefined;
+
+  const preflightDeploymentAssets = async (
+    script: string,
+    state: SelfhostScriptState,
+  ): Promise<void> => {
+    for (const versionId of deployedVersionIds(state)) {
+      await preflightVersionAssetContract(script, versionId);
+    }
+  };
+
   /**
    * Whether an event attached to this script would actually reach it.
    *
@@ -1024,11 +1184,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     script: string,
     state: SelfhostScriptState,
   ): Promise<boolean> => {
-    if (!options.events || !state.activeVersion) return false;
+    if (!options.events || !state.deployment) return false;
     // A record this Host cannot read is not one it can deliver through, and an
     // observation is not the place to turn that into a failure.
-    const stored = await readVersionBindings(script, state.activeVersion).catch(() => null);
-    return Boolean(stored?.eventToken && stored.handlers);
+    const stored = await Promise.all(
+      state.deployment.versions.map((version) =>
+        readVersionBindings(script, version.versionId).catch(() => null),
+      ),
+    );
+    return stored.every((version) => Boolean(version?.eventToken && version.handlers));
   };
 
   /**
@@ -1071,18 +1235,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return next;
   };
 
-  /** Rewrites what workerd serves for one script from durable state alone. */
-  const publishScript = async (script: string): Promise<void> => {
-    const { state } = await readScriptState(script);
-    if (!state.activeVersion) {
-      await runtimeOperation(() => runtime.remove(script));
-      await runtimeOperation(() => runtime.reload());
-      return;
-    }
-    const inspected = await readVersionSnapshot(script, state.activeVersion);
+  interface PreparedRuntimeVersion {
+    readonly site: WorkerdSite;
+    readonly modules: ReadonlyMap<string, Uint8Array>;
+    readonly assets?: ReadonlyMap<string, Uint8Array>;
+    readonly hostModules: ReadonlyMap<string, Uint8Array>;
+    readonly workerResourceUid?: string;
+    readonly readinessPublication?: string;
+  }
+
+  /** Captures and verifies one immutable Version without mutating runtime state. */
+  const prepareRuntimeVersion = async (
+    script: string,
+    versionId: string,
+    state: SelfhostScriptState,
+    generation: string,
+    weighted: boolean,
+  ): Promise<PreparedRuntimeVersion> => {
+    const inspected = await readVersionSnapshot(script, versionId);
     if (inspected.state === "absent" || inspected.state === "corrupt") {
       throw new SelfhostFailure(
-        failed("provider_error", "the active Worker Version is not materialized on this machine"),
+        failed("provider_error", "a deployed Worker Version is not materialized on this machine"),
       );
     }
     const meta = inspected.prepared.meta;
@@ -1120,14 +1293,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       // value from its filename.
       assetMediaTypes[entry.path] = entry.mediaType as string;
     }
-    const hostnames = [
-      ...(state.endpointHostname ? [state.endpointHostname] : []),
-      ...state.domains,
-    ];
     // Environment comes from the version's own durable record, not from the
     // materialized tree, so a republish projects exactly what its apply
     // recorded and nothing a later edit of the directory could introduce.
-    const bindings = await readVersionBindings(script, state.activeVersion);
+    const bindings = await readVersionBindings(script, versionId);
     if (!bindings?.handlers) {
       throw new SelfhostFailure(
         failed("unavailable", "the Worker Version requires authoritative reapply", true),
@@ -1139,14 +1308,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     );
     if (verificationFailure) throw new SelfhostFailure(verificationFailure);
     const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
-    const generation = await runtimeGeneration(script, state);
     const projection = wrapperProjection(
       script,
-      state.activeVersion,
+      versionId,
       meta.mainModule,
       bindings,
       receivesEvents(state),
       generation,
+      weighted ? versionId : undefined,
     );
     const hostModules = new Map<string, Uint8Array>();
     if (projection) {
@@ -1169,62 +1338,223 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         hostModules.set(SELFHOST_WORKER_EVENT_SERVICE_MODULE, projection.gate);
       }
     }
-    await runtimeOperation(() =>
-      runtime.write(
-        script,
-        {
-          directory: script,
-          mainModule: meta.mainModule,
-          ...(projection ? { hostEntrypoint: SELFHOST_WORKER_ENTRYPOINT_MODULE } : {}),
-          ...(projection ? { hostModules: [projection.preludeModule] } : {}),
-          modules: Object.keys(moduleMediaTypes).filter((name) => name !== meta.mainModule),
-          moduleMediaTypes,
-          hostnames,
-          generation,
-          ...(meta.assets
-            ? {
-                assets: {
-                  notFoundHandling: meta.assets.notFoundHandling,
-                  runWorkerFirst: meta.assets.runWorkerFirst as boolean,
-                  mediaTypes: assetMediaTypes,
-                },
-              }
-            : {}),
-          ...(vars.length > 0 ? { vars } : {}),
-          ...(projection
-            ? {
-                // The token rides on the facade service's own binding list, so
-                // it is never a binding of the service that runs tenant code.
-                ...(projection.facade && projection.token
-                  ? {
-                      dataPlane: {
-                        address: options.dataPlaneAddress as string,
-                        module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
-                        vars: [projection.token],
-                      },
-                    }
-                  : {}),
-                // Same discipline for the event token, and one more thing: the
-                // gate is the only service holding a binding that names this
-                // script's event entrypoint.
-                ...(projection.gate && projection.eventToken
-                  ? {
-                      events: {
-                        module: SELFHOST_WORKER_EVENT_SERVICE_MODULE,
-                        vars: [projection.eventToken],
-                      },
-                    }
-                  : {}),
-              }
-            : {}),
-        },
-        modules,
-        assets,
-        hostModules,
+    return {
+      site: {
+        directory: script,
+        mainModule: meta.mainModule,
+        ...(projection ? { hostEntrypoint: SELFHOST_WORKER_ENTRYPOINT_MODULE } : {}),
+        ...(projection ? { hostModules: [projection.preludeModule] } : {}),
+        modules: Object.keys(moduleMediaTypes).filter((name) => name !== meta.mainModule),
+        moduleMediaTypes,
+        hostnames: weighted
+          ? []
+          : [...(state.endpointHostname ? [state.endpointHostname] : []), ...state.domains],
+        generation,
+        ...(bindings.workerResourceUid
+          ? {
+              workerResourceUid: bindings.workerResourceUid,
+              fetchHandler: bindings.handlers?.includes("fetch") === true,
+            }
+          : {}),
+        ...(projection && projection.services.length > 0
+          ? { serviceBindings: projection.services }
+          : {}),
+        ...(meta.assets
+          ? {
+              assets: {
+                notFoundHandling: meta.assets.notFoundHandling,
+                runWorkerFirst: meta.assets.runWorkerFirst as boolean,
+                mediaTypes: assetMediaTypes,
+              },
+            }
+          : {}),
+        ...(vars.length > 0 ? { vars } : {}),
+        ...(projection
+          ? {
+              // The token rides on the facade service's own binding list, so
+              // it is never a binding of the service that runs tenant code.
+              ...(projection.facade && projection.token
+                ? {
+                    dataPlane: {
+                      address: options.dataPlaneAddress as string,
+                      module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+                      vars: [projection.token],
+                    },
+                  }
+                : {}),
+              // Same discipline for the event token, and one more thing: the
+              // gate is the only service holding a binding that names this
+              // Version's event entrypoint.
+              ...(projection.gate && projection.eventToken
+                ? {
+                    events: {
+                      module: SELFHOST_WORKER_EVENT_SERVICE_MODULE,
+                      vars: [projection.eventToken],
+                    },
+                  }
+                : {}),
+            }
+          : {}),
+      },
+      modules,
+      ...(assets === undefined ? {} : { assets }),
+      hostModules,
+      ...(bindings.workerResourceUid === undefined
+        ? {}
+        : { workerResourceUid: bindings.workerResourceUid }),
+      ...(projection ? { readinessPublication: projection.publication } : {}),
+    };
+  };
+
+  /** Rewrites what workerd serves for one script from durable state alone. */
+  const prepareWeightedRuntimePublication = async (
+    script: string,
+    state: SelfhostScriptState & {
+      readonly deployment: NonNullable<SelfhostScriptState["deployment"]>;
+    },
+  ): Promise<WorkerdDeploymentPublication> => {
+    if (!runtime.publish) {
+      throw new SelfhostFailure(
+        failed("unavailable", "the Worker runtime cannot publish weighted Deployments"),
+      );
+    }
+    const generation = await runtimeGeneration(script, state);
+    const prepared = await Promise.all(
+      state.deployment.versions.map((version) =>
+        prepareRuntimeVersion(script, version.versionId, state, generation, true),
       ),
     );
+    const workerResourceUid = prepared[0]?.workerResourceUid;
+    if (
+      !workerResourceUid ||
+      prepared.some((version) => version.workerResourceUid !== workerResourceUid)
+    ) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the deployed Versions do not belong to one Worker"),
+      );
+    }
+    const variants: WorkerdDeploymentVariant[] = state.deployment.versions.map(
+      (identity, index) => {
+        const version = prepared[index] as PreparedRuntimeVersion;
+        return {
+          ...identity,
+          site: version.site,
+          modules: version.modules,
+          ...(version.assets === undefined ? {} : { assets: version.assets }),
+          hostModules: version.hostModules,
+        };
+      },
+    );
+    return {
+      generation,
+      workerResourceUid,
+      hostnames: [...(state.endpointHostname ? [state.endpointHostname] : []), ...state.domains],
+      versions: variants,
+    };
+  };
+
+  const preflightRuntimeDeployment = async (
+    script: string,
+    state: SelfhostScriptState & {
+      readonly deployment: NonNullable<SelfhostScriptState["deployment"]>;
+    },
+  ): Promise<void> => {
+    if (runtime.publish) {
+      await prepareWeightedRuntimePublication(script, state);
+      return;
+    }
+    if (state.deployment.versions.length !== 1) {
+      throw new SelfhostFailure(
+        failed("unavailable", "the Worker runtime cannot publish weighted Deployments"),
+      );
+    }
+    await prepareRuntimeVersion(
+      script,
+      state.deployment.versions[0]?.versionId as string,
+      state,
+      await runtimeGeneration(script, state),
+      false,
+    );
+  };
+
+  /** Rewrites what workerd serves for one script from durable state alone. */
+  const publishScript = async (script: string): Promise<void> => {
+    const { state } = await readScriptState(script);
+    if (state.deployment) {
+      if (!runtime.publish) {
+        if (state.deployment.versions.length !== 1) {
+          throw new SelfhostFailure(
+            failed("unavailable", "the Worker runtime cannot publish weighted Deployments"),
+          );
+        }
+        const identity = state.deployment.versions[0] as SelfhostWeightedVersion;
+        const generation = await runtimeGeneration(script, state);
+        const prepared = await prepareRuntimeVersion(
+          script,
+          identity.versionId,
+          state,
+          generation,
+          false,
+        );
+        await runtimeOperation(() =>
+          runtime.write(
+            script,
+            prepared.site,
+            prepared.modules,
+            prepared.assets,
+            prepared.hostModules,
+          ),
+        );
+        await runtimeOperation(() => runtime.reload());
+        if (prepared.readinessPublication) {
+          await probeReadiness(script, prepared.readinessPublication);
+        }
+        return;
+      }
+      // Every Version is captured and module-inspected before the single
+      // runtime call. A bad later variant cannot activate an earlier one.
+      const publication = await prepareWeightedRuntimePublication(script, {
+        ...state,
+        deployment: state.deployment,
+      });
+      await runtimeOperation(() =>
+        (runtime.publish as NonNullable<WorkerdRuntime["publish"]>)(script, publication),
+      );
+      await probeReadiness(
+        script,
+        createHash("sha256").update(publication.generation, "utf8").digest("hex"),
+      );
+      return;
+    }
+    if (!state.activeVersion) {
+      if (runtime.publish) {
+        await runtimeOperation(() =>
+          (runtime.publish as NonNullable<WorkerdRuntime["publish"]>)(script, null),
+        );
+      } else {
+        await runtimeOperation(() => runtime.remove(script));
+        await runtimeOperation(() => runtime.reload());
+      }
+      return;
+    }
+    // Retained scalar state has no authoritative WorkerVersion UID. It stays
+    // servable through the legacy reader, but it cannot be promoted into a
+    // fabricated weighted identity; a later exact reapply does that.
+    const generation = await runtimeGeneration(script, state);
+    const prepared = await prepareRuntimeVersion(
+      script,
+      state.activeVersion,
+      state,
+      generation,
+      false,
+    );
+    await runtimeOperation(() =>
+      runtime.write(script, prepared.site, prepared.modules, prepared.assets, prepared.hostModules),
+    );
     await runtimeOperation(() => runtime.reload());
-    if (projection) await probeReadiness(script, projection.publication);
+    if (prepared.readinessPublication) {
+      await probeReadiness(script, prepared.readinessPublication);
+    }
   };
 
   const endpointAddress = (
@@ -1343,6 +1673,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       .sort((left, right) => (left.name < right.name ? -1 : 1));
   };
 
+  type WorkerVersionDeclarationInput = Pick<ApplyInput, "identity" | "spec" | "relations">;
+
   /**
    * The Worker Version's KV, queue, and SQLite bindings, resolved to what they
    * address.
@@ -1356,7 +1688,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * approximately.
    */
   const declaredDataBindings = (
-    input: ApplyInput,
+    input: WorkerVersionDeclarationInput,
     reserved: ReadonlySet<string>,
   ): readonly SelfhostVersionDataBinding[] => {
     const bindings: SelfhostVersionDataBinding[] = [];
@@ -1541,6 +1873,104 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
+   * Fetch-only bindings to another realized ModuleWorker.
+   *
+   * The Host has already resolved the declaration to a pinned relation, but
+   * this is the provider's mutation boundary: the source Worker and target
+   * Worker must both be active realizations in this exact tenant, space,
+   * Provider Pack, and installation. The persisted target is the provider's
+   * stable script plus the pinned Resource UID, never a public endpoint. A
+   * WorkerDeployment is intentionally not required here; traffic activation is
+   * mutable and is resolved by workerd when an invocation is made.
+   */
+  const declaredServiceBindings = async (
+    input: WorkerVersionDeclarationInput,
+    callerScript: string,
+    reserved: ReadonlySet<string>,
+  ): Promise<readonly SelfhostVersionServiceBinding[]> => {
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version service bindings are invalid"),
+      );
+    };
+    const raw = input.spec.serviceBindings;
+    if (raw !== undefined && !Array.isArray(raw)) invalid();
+    const declared = Array.isArray(raw) ? (raw as readonly JsonValue[]) : [];
+    if (declared.length === 0) return [];
+    if (declared.length > MAX_WORKER_VERSION_DATA_BINDINGS) invalid();
+
+    const caller = input.relations?.find((candidate) => candidate.pointer === "/worker");
+    const callerDeployment = caller?.deployment;
+    if (
+      !caller ||
+      !callerDeployment ||
+      caller.resource.kind !== "ModuleWorker" ||
+      caller.targetUid !== caller.resource.metadata.uid ||
+      caller.resource.metadata.space !== input.identity.space ||
+      !RESOURCE_UID.test(caller.resource.metadata.uid) ||
+      callerDeployment.state !== "active" ||
+      callerDeployment.tenantId !== input.identity.tenantRef ||
+      callerDeployment.resourceUid !== caller.targetUid ||
+      parseSelfhostNativeId("ModuleWorker", callerDeployment.nativeId)?.script !== callerScript ||
+      callerDeployment.outputs.scriptName !== callerScript
+    ) {
+      return invalid();
+    }
+
+    const names = new Set(reserved);
+    const bindings: SelfhostVersionServiceBinding[] = [];
+    for (let index = 0; index < declared.length; index += 1) {
+      const declaration = isJsonObject(declared[index]) ? (declared[index] as JsonObject) : null;
+      const resource = isJsonObject(declaration?.resource)
+        ? (declaration?.resource as JsonObject)
+        : null;
+      const relation = input.relations?.find(
+        (candidate) => candidate.pointer === `/serviceBindings/${index}/resource`,
+      );
+      const deployment = relation?.deployment;
+      const bindingRef = relation?.bindingRef;
+      const name = typeof declaration?.name === "string" ? declaration.name : null;
+      if (!name || !resource || !relation || !deployment) return invalid();
+      if (
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        resource.apiVersion !== relation.resource.apiVersion ||
+        resource.kind !== "ModuleWorker" ||
+        resource.name !== relation?.resource.metadata.name ||
+        relation.relation !== "/serviceBindings/*/resource" ||
+        relation.resource.kind !== "ModuleWorker" ||
+        relation.resource.metadata.space !== input.identity.space ||
+        relation.targetUid !== relation.resource.metadata.uid ||
+        !RESOURCE_UID.test(relation.targetUid) ||
+        relation.targetUid === caller.targetUid ||
+        bindingRef?.apiVersion !== SELFHOST_SERVICE_BINDING_REF.apiVersion ||
+        bindingRef.name !== SELFHOST_SERVICE_BINDING_REF.name ||
+        bindingRef.version !== SELFHOST_SERVICE_BINDING_REF.version ||
+        bindingRef.schemaDigest !== SELFHOST_SERVICE_BINDING_REF.schemaDigest ||
+        deployment.state !== "active" ||
+        deployment.tenantId !== input.identity.tenantRef ||
+        deployment.resourceUid !== relation.targetUid ||
+        deployment.providerPackRef !== callerDeployment.providerPackRef ||
+        deployment.providerInstallationRef !== callerDeployment.providerInstallationRef
+      ) {
+        return invalid();
+      }
+      const target = await scriptOf(input.identity.tenantRef, relation.resource.metadata);
+      if (
+        parseSelfhostNativeId("ModuleWorker", deployment.nativeId)?.script !== target ||
+        deployment.outputs.scriptName !== target
+      ) {
+        return invalid();
+      }
+      names.add(name);
+      bindings.push({ name, target, targetResourceUid: relation.targetUid });
+    }
+    return bindings;
+  };
+
+  /**
    * The events the version says its module answers.
    *
    * Recorded for every Version now, because a Cron Trigger or a Queue Consumer
@@ -1695,8 +2125,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (requiredSensitive.length > 0 && !claimAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
+    const workerRelation = input.relations?.find((candidate) => candidate.pointer === "/worker");
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-    if (!worker) {
+    if (
+      !worker ||
+      !workerRelation ||
+      workerRelation.targetUid !== worker.metadata.uid ||
+      worker.metadata.space !== input.identity.space ||
+      !RESOURCE_UID.test(worker.metadata.uid)
+    ) {
       return failed("invalid_spec", "the Worker Version is incomplete");
     }
     const artifacts = declaredVersionArtifacts(input);
@@ -1710,6 +2147,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // declarative refusal and a refusal after dispatch would strand the
     // operation key with its ciphertext already erased.
     const dataBindings = declaredVersionBindings(input, vars, requiredSensitive);
+    const serviceBindings = await declaredServiceBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+      ]),
+    );
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
@@ -1743,6 +2189,18 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const verificationFailure = await verifyPreparedWorkerModule(prepared, handlers);
     if (verificationFailure) return verificationFailure;
+    if (serviceBindings.length > 0) {
+      const existing = await readVersionBindings(script, versionId);
+      if (
+        existing &&
+        (existing.workerResourceUid === undefined || existing.serviceBindings === undefined)
+      ) {
+        return failed(
+          "invalid_spec",
+          "the Worker Version predates service bindings on this Host; publish a new Version",
+        );
+      }
+    }
 
     // The lease is claimed only after the credential-free module check, and
     // before anything is materialized, so a Worker Version
@@ -1786,9 +2244,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     let bindingSet: SelfhostVersionBindingSet;
     try {
       bindingSet = normalizeSelfhostVersionBindingSet({
+        workerResourceUid: worker.metadata.uid,
         handlers,
         vars,
         sensitiveVars,
+        serviceBindings,
         ...(dataPlane ? { dataPlane } : {}),
       });
     } catch (error) {
@@ -1844,7 +2304,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (
       inspected.state !== "present" ||
       inspected.digest !== materialized.materializationDigest ||
-      !sameVersionDeclaration(recorded, handlers, vars, requiredSensitive, dataBindings)
+      !sameVersionDeclaration(
+        recorded,
+        worker.metadata.uid,
+        handlers,
+        vars,
+        requiredSensitive,
+        dataBindings,
+        serviceBindings,
+      )
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
     }
@@ -1877,6 +2345,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...(dataBindings.length > 0
           ? { dataBindingNames: dataBindings.map((binding) => binding.name) }
           : {}),
+        ...(serviceBindings.length > 0
+          ? { serviceBindingNames: serviceBindings.map((binding) => binding.name) }
+          : {}),
       },
       outputs: {
         scriptName: script,
@@ -1901,8 +2372,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
     }
+    const workerRelation = input.relations?.find((candidate) => candidate.pointer === "/worker");
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-    if (!worker) {
+    if (
+      !worker ||
+      !workerRelation ||
+      workerRelation.targetUid !== worker.metadata.uid ||
+      worker.metadata.space !== input.identity.space ||
+      !RESOURCE_UID.test(worker.metadata.uid)
+    ) {
       return failed("invalid_spec", "the Worker Version is incomplete");
     }
     const artifacts = declaredVersionArtifacts(input);
@@ -1916,6 +2394,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // declarative refusal and a refusal after dispatch would strand the
     // operation key with its ciphertext already erased.
     const dataBindings = declaredVersionBindings(input, vars, requiredSensitive);
+    const serviceBindings = await declaredServiceBindings(
+      input,
+      script,
+      new Set([
+        ...vars.map((binding) => binding.name),
+        ...requiredSensitive,
+        ...dataBindings.map((binding) => binding.name),
+      ]),
+    );
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
         "denied",
@@ -2000,7 +2487,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "the committed Worker Version materialization conflicts with this recovery",
       );
     }
-    if (!sameVersionDeclaration(recorded, handlers, vars, requiredSensitive, dataBindings)) {
+    if (
+      !sameVersionDeclaration(
+        recorded,
+        worker.metadata.uid,
+        handlers,
+        vars,
+        requiredSensitive,
+        dataBindings,
+        serviceBindings,
+      )
+    ) {
       return failed("not_found", "the Worker Version environment was not recorded");
     }
     const verificationFailure = await verifyPreparedWorkerModule(materialized.prepared, handlers);
@@ -2032,6 +2529,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         ...(dataBindings.length > 0
           ? { dataBindingNames: dataBindings.map((binding) => binding.name) }
           : {}),
+        ...(serviceBindings.length > 0
+          ? { serviceBindingNames: serviceBindings.map((binding) => binding.name) }
+          : {}),
       },
       outputs: {
         scriptName: script,
@@ -2041,40 +2541,104 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     });
   };
 
-  const applyWorkerDeployment = async (input: ApplyInput): Promise<ProviderTicket> => {
+  const declaredWorkerDeployment = async (
+    input: Pick<ApplyInput, "identity" | "spec" | "relations">,
+  ): Promise<{
+    readonly script: string;
+    readonly workerResourceUid: string;
+    readonly versions: readonly SelfhostWeightedVersion[];
+  }> => {
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+    const workerRelation = input.relations?.find((candidate) => candidate.pointer === "/worker");
     const declared = Array.isArray(input.spec.versions) ? input.spec.versions : [];
-    if (!worker || declared.length === 0) {
-      return failed("invalid_spec", "the Worker Deployment is incomplete");
+    if (
+      !worker ||
+      !workerRelation ||
+      workerRelation.targetUid !== worker.metadata.uid ||
+      worker.metadata.space !== input.identity.space ||
+      !RESOURCE_UID.test(worker.metadata.uid) ||
+      declared.length < 1 ||
+      declared.length > 8
+    ) {
+      throw new SelfhostFailure(failed("invalid_spec", "the Worker Deployment is incomplete"));
     }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-    const weighted: { versionId: string; weight: number }[] = [];
+    const weighted: SelfhostWeightedVersion[] = [];
     for (let index = 0; index < declared.length; index += 1) {
-      const version = relationResource(
-        input.relations,
-        `/versions/${index}/workerVersion`,
-        "WorkerVersion",
-      );
+      const pointer = `/versions/${index}/workerVersion`;
+      const version = relationResource(input.relations, pointer, "WorkerVersion");
+      const relation = input.relations?.find((candidate) => candidate.pointer === pointer);
       const entry =
-        typeof declared[index] === "object" && declared[index] !== null
+        typeof declared[index] === "object" &&
+        declared[index] !== null &&
+        !Array.isArray(declared[index])
           ? (declared[index] as JsonObject)
           : null;
-      const weight = Number.isSafeInteger(entry?.weight) ? Number(entry?.weight) : undefined;
-      if (!version || weight === undefined) {
-        return failed("invalid_spec", "a deployed version does not belong to this Worker");
+      const weight = entry?.weight;
+      if (
+        !version ||
+        !relation ||
+        relation.targetUid !== version.metadata.uid ||
+        version.metadata.space !== input.identity.space ||
+        !RESOURCE_UID.test(version.metadata.uid) ||
+        typeof weight !== "number" ||
+        !Number.isSafeInteger(weight)
+      ) {
+        throw new SelfhostFailure(
+          failed("invalid_spec", "a deployed version does not belong to this Worker"),
+        );
       }
       weighted.push({
         versionId: await versionIdOf(input.identity.tenantRef, version.metadata),
+        workerVersionUid: version.metadata.uid,
         weight,
       });
     }
-    // workerd routes whole requests, not basis points. The heaviest version
-    // serves; the requested split is recorded so what was asked for and what
-    // this machine can do are both visible.
-    const active = weighted.reduce((best, entry) => (entry.weight > best.weight ? entry : best));
-    await preflightVersionAssetContract(script, active.versionId);
+    let versions: readonly SelfhostWeightedVersion[];
+    try {
+      versions = canonicalSelfhostWeightedVersions(weighted);
+    } catch {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Deployment weights and Versions are invalid"),
+      );
+    }
+    return { script, workerResourceUid: worker.metadata.uid, versions };
+  };
+
+  const applyWorkerDeployment = async (input: ApplyInput): Promise<ProviderTicket> => {
+    const desired = await declaredWorkerDeployment(input);
+    if (!runtime.publish && desired.versions.length > 1) {
+      return failed("unavailable", "the Worker runtime cannot publish weighted Deployments");
+    }
+    for (const version of desired.versions) {
+      await preflightVersionAssetContract(desired.script, version.versionId);
+    }
+    const script = desired.script;
     const current = await readScriptState(script);
-    await writeScriptState(script, current, { ...current.state, activeVersion: active.versionId });
+    const { activeVersion: _legacyActiveVersion, ...retained } = current.state;
+    const next: SelfhostScriptState & {
+      readonly deployment: NonNullable<SelfhostScriptState["deployment"]>;
+    } = {
+      ...retained,
+      deployment: { versions: desired.versions },
+    };
+    // Full materialization, bindings, module inspection, event gates, and
+    // service UID fencing are prepared before durable activation state moves.
+    const preparedWorkerResourceUid = runtime.publish
+      ? (await prepareWeightedRuntimePublication(script, next)).workerResourceUid
+      : (
+          await prepareRuntimeVersion(
+            script,
+            desired.versions[0]?.versionId as string,
+            next,
+            await runtimeGeneration(script, next),
+            false,
+          )
+        ).workerResourceUid;
+    if (preparedWorkerResourceUid !== desired.workerResourceUid) {
+      return failed("invalid_spec", "the deployed Versions do not belong to this Worker");
+    }
+    await writeScriptState(script, current, next);
     try {
       await republish(script);
     } catch (error) {
@@ -2083,7 +2647,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     return succeeded({
       nativeId: nativeId(input, `selfhost-deployment:${script}`),
-      observed: { scriptName: script, activeVersionId: active.versionId, versions: weighted },
+      observed: {
+        scriptName: script,
+        ...(desired.versions.length === 1
+          ? { activeVersionId: desired.versions[0]?.versionId as string }
+          : {}),
+        versions: desired.versions.map(({ versionId, weight }) => ({ versionId, weight })),
+      },
       outputs: {},
     });
   };
@@ -2094,20 +2664,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const address = endpointAddress(input);
     const current = await readScriptState(script);
-    if (current.state.activeVersion) {
-      await preflightVersionAssetContract(script, current.state.activeVersion);
-    }
+    await preflightDeploymentAssets(script, current.state);
     if (current.state.endpointHostname !== address.hostname) {
-      await writeScriptState(script, current, {
+      const next = {
         ...current.state,
         endpointHostname: address.hostname,
-      });
+      };
+      if (next.deployment) {
+        await preflightRuntimeDeployment(script, {
+          ...next,
+          deployment: next.deployment,
+        });
+      }
+      await writeScriptState(script, current, next);
     }
     // Desired state may already contain this endpoint after a process died
     // during the previous republish. Reconcile runtime truth on every retry;
     // checking only the durable value would turn a failed reload into a false
     // success response.
-    if (current.state.activeVersion) {
+    if (hasDeployment(current.state)) {
       try {
         await republish(script);
       } catch (error) {
@@ -2141,19 +2716,24 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     const current = await readScriptState(script);
-    if (current.state.activeVersion) {
-      await preflightVersionAssetContract(script, current.state.activeVersion);
-    }
+    await preflightDeploymentAssets(script, current.state);
     if (!current.state.domains.includes(hostname)) {
-      await writeScriptState(script, current, {
+      const next = {
         ...current.state,
         domains: [...current.state.domains, hostname],
-      });
+      };
+      if (next.deployment) {
+        await preflightRuntimeDeployment(script, {
+          ...next,
+          deployment: next.deployment,
+        });
+      }
+      await writeScriptState(script, current, next);
     }
     // As with endpoint attachment, a committed domain is not proof that the
     // runtime accepted the corresponding route. Always retry publication while
     // a version is active, even when the desired domain list is unchanged.
-    if (current.state.activeVersion) {
+    if (hasDeployment(current.state)) {
       try {
         await republish(script);
       } catch (error) {
@@ -2210,29 +2790,43 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   ): Promise<void> => {
     const current = await readScriptState(script);
     const next = change(current.state);
-    if (next.activeVersion) {
-      await preflightVersionAssetContract(script, next.activeVersion);
-    }
+    await preflightDeploymentAssets(script, next);
     // Read the active Version's record BEFORE anything durable moves. A Version
     // published before this Host recorded handlers has neither a handler list
     // nor an event token, so nothing would ever be delivered to it — and
     // committing the attachment first meant that discovery happened inside
     // `republish`, with the attachment already written and every later
     // republish of the script failing on it.
-    if (receivesEvents(next) && next.activeVersion) {
-      const bindings = await readVersionBindings(script, next.activeVersion);
-      if (!bindings?.handlers || !bindings.eventToken) {
+    if (receivesEvents(next) && !next.deployment) {
+      throw new SelfhostFailure(
+        failed(
+          "invalid_spec",
+          "the active Worker Deployment requires authoritative reapply for event delivery",
+        ),
+      );
+    }
+    if (receivesEvents(next) && next.deployment) {
+      const bindings = await Promise.all(
+        next.deployment.versions.map((version) => readVersionBindings(script, version.versionId)),
+      );
+      if (bindings.some((version) => !version?.handlers || !version.eventToken)) {
         throw new SelfhostFailure(
           failed(
             "invalid_spec",
-            "the active Worker Version predates event delivery on this Host; publish a new Version",
+            "a deployed Worker Version predates event delivery on this Host; publish a new Version",
           ),
         );
       }
+      // Gate source and all Version-specific tokens are prepared before the
+      // attachment state is committed.
+      await preflightRuntimeDeployment(script, {
+        ...next,
+        deployment: next.deployment,
+      });
     }
     const moved = JSON.stringify(next) !== JSON.stringify(current.state);
     if (moved) await writeScriptState(script, current, next);
-    if (!next.activeVersion) return;
+    if (!hasDeployment(next)) return;
     try {
       // Always, even when the desired state was already this: a committed
       // attachment is not proof that the runtime accepted the gate it needs,
@@ -2399,7 +2993,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       case "SQLiteDatabase":
       case "sql_database": {
-        const name = await derivedProviderResourceName("tsdb", input.identity);
+        // A new database is a store, not an address label: include the
+        // Resource UID so same-name recreation gets a different file. An
+        // existing native id wins for updates/observation, which preserves
+        // recorded legacy address-derived databases without remapping their
+        // bytes. The Host driver fences delete to the active Deployment's
+        // native id and UID before this provider is called.
+        const name =
+          selfhostNamespaceName("selfhost-sqlite", existingNativeId) ??
+          (input.identity.uid
+            ? await derivedProviderResourceIncarnationName("tsdb", {
+                tenantRef: input.identity.tenantRef,
+                space: input.identity.space,
+                name: input.identity.name,
+                uid: input.identity.uid,
+              })
+            : null);
+        if (!name) {
+          throw new SelfhostFailure(
+            failed("invalid_spec", "the SQLite database declaration carries no Resource identity"),
+          );
+        }
         return {
           base: `selfhost-sqlite:${name}`,
           // Nothing is created eagerly: the file appears when something
@@ -2660,9 +3274,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           }
           case "SQLiteDatabase":
           case "sql_database":
-            return selfhostFileAbsence(
+            return selfhostSqliteAbsence(
               "SQLiteDatabase",
-              databasePath(parsed.databaseName ?? ""),
+              databaseFilesystemPath(parsed.databaseName ?? ""),
               input.descriptor,
               id,
             );
@@ -2723,7 +3337,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           const address = endpointAddress(input);
           const script = await scriptOf(input.identity.tenantRef, worker.metadata);
           const { state } = await readScriptState(script);
-          if (state.endpointHostname !== address.hostname || !state.activeVersion) {
+          if (state.endpointHostname !== address.hostname || !hasDeployment(state)) {
             return failed(
               "unavailable",
               "the Worker Endpoint apply outcome is indeterminate",
@@ -2828,8 +3442,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
           }
           case "WorkerVersion": {
+            const workerRelation = input.relations?.find(
+              (candidate) => candidate.pointer === "/worker",
+            );
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
-            if (!worker) return failed("not_found", "the Worker Version has no worker relation");
+            if (
+              !worker ||
+              !workerRelation ||
+              workerRelation.targetUid !== worker.metadata.uid ||
+              worker.metadata.space !== input.identity.space ||
+              !RESOURCE_UID.test(worker.metadata.uid)
+            ) {
+              return failed("not_found", "the Worker Version has no exact worker relation");
+            }
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const versionId = await versionIdOf(input.identity.tenantRef, {
               space: input.identity.space,
@@ -2871,6 +3496,16 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 "the retained Worker Version has different declared handlers",
               );
             }
+            // Observation has no opaque runtime Binding material, so it proves
+            // only the immutable ownership edge added by worker.service here;
+            // apply/recovery remain responsible for the full data projection.
+            const serviceBindings = await declaredServiceBindings(input, script, new Set());
+            if (!sameVersionAuthority(bindings, worker.metadata.uid, serviceBindings)) {
+              return failed(
+                "conflict",
+                "the retained Worker Version has different environment bindings",
+              );
+            }
             const verificationFailure = await verifyPreparedWorkerModule(
               materialized.prepared,
               handlers,
@@ -2896,10 +3531,23 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const { state } = await readScriptState(script);
+            const desired = await declaredWorkerDeployment(input);
+            if (!state.deployment) {
+              return state.activeVersion
+                ? failed(
+                    "unavailable",
+                    "the retained Worker Deployment requires authoritative reapply",
+                    true,
+                  )
+                : failed("not_found", "the Worker Deployment is not durably active");
+            }
+            if (JSON.stringify(state.deployment.versions) !== JSON.stringify(desired.versions)) {
+              return failed("conflict", "the retained Worker Deployment has different Versions");
+            }
             const serving = await runtimeOperation(async () =>
               runtime.has(script, await runtimeGeneration(script, state)),
             );
-            if (state.activeVersion && !serving) {
+            if (!serving) {
               return failed(
                 "unavailable",
                 "the Worker runtime is not serving the deployment",
@@ -2910,7 +3558,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               nativeId: input.nativeId,
               observed: {
                 scriptName: script,
-                ...(state.activeVersion ? { activeVersionId: state.activeVersion } : {}),
+                ...(desired.versions.length === 1
+                  ? { activeVersionId: desired.versions[0]?.versionId as string }
+                  : {}),
+                versions: desired.versions.map(({ versionId, weight }) => ({
+                  versionId,
+                  weight,
+                })),
                 serving,
               },
               outputs: {},
@@ -2921,7 +3575,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the Worker Endpoint has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const { state } = await readScriptState(script);
-            if (!state.endpointHostname || !state.activeVersion) {
+            if (!state.endpointHostname || !hasDeployment(state)) {
               return failed("not_found", "the Worker endpoint is not durably attached");
             }
             if (
@@ -2950,7 +3604,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (!worker) return failed("not_found", "the custom domain has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
             const { state } = await readScriptState(script);
-            if (!state.domains.includes(hostname) || !state.activeVersion) {
+            if (!state.domains.includes(hostname) || !hasDeployment(state)) {
               return failed("not_found", "the custom domain is not durably attached");
             }
             if (
@@ -3064,7 +3718,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               space: input.identity.space,
               name: input.identity.name,
             });
-            await runtimeOperation(() => runtime.remove(script));
+            if (runtime.publish) {
+              await runtimeOperation(() =>
+                (runtime.publish as NonNullable<WorkerdRuntime["publish"]>)(script, null),
+              );
+            } else {
+              await runtimeOperation(() => runtime.remove(script));
+              await runtimeOperation(() => runtime.reload());
+            }
             await rm(join(versionsRoot, script), { recursive: true, force: true });
             await bindingStoreOperation(() => versionBindings.removeScript(script));
             await removeScriptState(script);
@@ -3072,7 +3733,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // Worker declared again under the same name inherit a schedule
             // nobody asked for.
             await options.events?.forgetSchedules(script);
-            await runtimeOperation(() => runtime.reload());
             return done();
           }
           case "WorkerVersion": {
@@ -3084,6 +3744,33 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 name: input.identity.name,
               });
               const current = await readScriptState(script);
+              let active: WorkerdActiveDeployment | null = null;
+              if (runtime.publish) {
+                try {
+                  active = await readWorkerdActiveDeployment(dataRoot, script);
+                } catch {
+                  return failed(
+                    "unavailable",
+                    "the active Worker Deployment cannot be read for Version deletion",
+                    true,
+                  );
+                }
+                if (current.state.deployment && active === null) {
+                  return failed(
+                    "unavailable",
+                    "the active Worker Deployment is crossing generations",
+                    true,
+                  );
+                }
+              }
+              if (
+                current.state.deployment?.versions.some(
+                  (version) => version.versionId === versionId,
+                ) ||
+                active?.versions.some((version) => version.versionId === versionId)
+              ) {
+                return failed("conflict", "the Worker Version is still in an active Deployment");
+              }
               if (current.state.activeVersion === versionId) {
                 await writeScriptState(script, current, {
                   domains: current.state.domains,
@@ -3106,12 +3793,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (worker) {
               const script = await scriptOf(input.identity.tenantRef, worker.metadata);
               const current = await readScriptState(script);
-              await writeScriptState(script, current, {
-                domains: current.state.domains,
-                ...(current.state.endpointHostname
-                  ? { endpointHostname: current.state.endpointHostname }
-                  : {}),
-              });
+              const {
+                activeVersion: _activeVersion,
+                deployment: _deployment,
+                ...retained
+              } = current.state;
+              await writeScriptState(script, current, retained);
               await republish(script);
             }
             return done();
@@ -3121,13 +3808,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             if (worker) {
               const script = await scriptOf(input.identity.tenantRef, worker.metadata);
               const current = await readScriptState(script);
-              await writeScriptState(script, current, {
-                domains: current.state.domains,
-                ...(current.state.activeVersion
-                  ? { activeVersion: current.state.activeVersion }
-                  : {}),
-              });
-              if (current.state.activeVersion) await republish(script);
+              const { endpointHostname: _endpointHostname, ...retained } = current.state;
+              await writeScriptState(script, current, retained);
+              if (hasDeployment(current.state)) await republish(script);
             }
             return done();
           }
@@ -3144,7 +3827,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 ...current.state,
                 domains: current.state.domains.filter((entry) => entry !== hostname),
               });
-              if (current.state.activeVersion) await republish(script);
+              if (hasDeployment(current.state)) await republish(script);
             }
             return done();
           }
@@ -3207,12 +3890,21 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           }
           case "SQLiteDatabase":
           case "sql_database": {
-            // The file stays — removing durable bytes inside an apply is not
-            // this seam's job — but the open handle must not: it names an inode
-            // this Host no longer means, and a database declared again under
-            // the same name would be served through it.
+            // The Resource's own delete removes its durable bytes. The data
+            // plane closes the cached handle first, then unlinks only this
+            // exact database file and SQLite sidecars.
             const name = selfhostNamespaceName("selfhost-sqlite", input.nativeId);
-            if (name) options.dataPlaneMaintenance?.forgetDatabase(name);
+            if (!name) return failed("invalid_spec", "the SQLite database identity is malformed");
+            if (!options.dataPlaneMaintenance) {
+              return sqliteStorageState(databaseFilesystemPath(name)) === "absent"
+                ? done()
+                : failed("unavailable", "SQLite database storage is unavailable", true);
+            }
+            try {
+              options.dataPlaneMaintenance.deleteDatabase(name);
+            } catch {
+              return failed("unavailable", "the SQLite database could not be deleted", true);
+            }
             return done();
           }
           default:
@@ -3288,7 +3980,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // durable active generation. A different active generation may
             // still serve, which is fine for this non-active Version.
             const materialized = existsSync(join(versionsRoot, script, versionId));
-            return !materialized && current.state.activeVersion !== versionId
+            return !materialized &&
+              current.state.activeVersion !== versionId &&
+              !current.state.deployment?.versions.some((version) => version.versionId === versionId)
               ? done()
               : uncertain();
           }
@@ -3300,7 +3994,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const serving = await runtimeOperation(async () =>
               runtime.has(script, await runtimeGeneration(script, current.state)),
             );
-            return current.state.activeVersion === undefined && !serving ? done() : uncertain();
+            return current.state.activeVersion === undefined &&
+              current.state.deployment === undefined &&
+              !serving
+              ? done()
+              : uncertain();
           }
           case "WorkerEndpoint": {
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -3334,6 +4032,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // per-host route. When another route still serves the script we
             // cannot prove this route's absence, so fail closed.
             return !serving && current.state.domains.length === 0 ? done() : uncertain();
+          }
+          case "SQLiteDatabase":
+          case "sql_database": {
+            const name = selfhostNamespaceName("selfhost-sqlite", input.nativeId);
+            if (!name) return failed("not_found", "the SQLite database identity is malformed");
+            return sqliteStorageState(databaseFilesystemPath(name)) === "absent"
+              ? done()
+              : uncertain();
           }
           default:
             // Namespace resources have no mutable local object; their delete
@@ -3389,7 +4095,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         readonly nativeId: string;
         readonly target: ProviderSqliteMigrationReadTarget;
       }): Promise<ProviderValue<readonly ProviderSqliteMigrationIdentity[]>> => {
-        const path = sqlitePathOf(input.nativeId, databasePath);
+        const path = sqlitePathOf(input.nativeId, databaseFilesystemPath);
         if (!path) {
           return {
             ok: false,
@@ -3447,7 +4153,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         readonly expectedPrefix: readonly ProviderSqliteMigrationIdentity[];
         readonly migrations: readonly ProviderSqliteMigration[];
       }): Promise<ProviderValue<undefined>> => {
-        const path = sqlitePathOf(input.nativeId, databasePath);
+        const path = sqlitePathOf(input.nativeId, databaseFilesystemPath);
         if (!path) {
           return {
             ok: false,
@@ -3853,6 +4559,7 @@ class SelfhostReadbackMalformed extends Error {}
 interface ReadonlyScriptState {
   readonly exists: boolean;
   readonly activeVersion?: string;
+  readonly deployment?: SelfhostWeightedDeployment;
   readonly endpointHostname?: string;
   readonly domains: readonly string[];
   /** Native queue ids this script drains, in whatever order it was written. */
@@ -3879,12 +4586,14 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
     throw new SelfhostReadbackMalformed();
   }
   const activeVersion = parsed.activeVersion;
+  const rawDeployment = parsed.deployment;
   const endpointHostname = parsed.endpointHostname;
   const domains = parsed.domains;
   const consumers = parsed.consumers ?? [];
   const crons = parsed.crons ?? [];
   if (
     (activeVersion !== undefined && !safeSegment(activeVersion)) ||
+    (activeVersion !== undefined && rawDeployment !== undefined) ||
     (endpointHostname !== undefined && !normalizedHostname(endpointHostname)) ||
     domains.some((value) => !normalizedHostname(value)) ||
     !Array.isArray(consumers) ||
@@ -3894,6 +4603,7 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
     Object.keys(parsed).some(
       (key) =>
         key !== "activeVersion" &&
+        key !== "deployment" &&
         key !== "endpointHostname" &&
         key !== "domains" &&
         key !== "consumers" &&
@@ -3902,9 +4612,18 @@ async function readSelfhostState(root: string, script: string): Promise<Readonly
   ) {
     throw new SelfhostReadbackMalformed();
   }
+  let deployment: SelfhostWeightedDeployment | undefined;
+  if (rawDeployment !== undefined) {
+    try {
+      deployment = persistedSelfhostWeightedDeployment(rawDeployment);
+    } catch {
+      throw new SelfhostReadbackMalformed();
+    }
+  }
   return {
     exists: true,
     ...(typeof activeVersion === "string" ? { activeVersion } : {}),
+    ...(deployment === undefined ? {} : { deployment }),
     ...(typeof endpointHostname === "string" ? { endpointHostname } : {}),
     domains: domains.filter((value): value is string => typeof value === "string"),
     // Only the queue each consumer drains: the limits are the pump's business,
@@ -3964,6 +4683,49 @@ async function readSelfhostRuntimeManifest(
   } catch {
     throw new SelfhostReadbackMalformed();
   }
+  if (isJsonObject(parsed) && parsed.publicationStorageLayout !== undefined) {
+    if (
+      Object.keys(parsed).sort().join(",") !==
+        "generation,generationKey,publicationStorageLayout" ||
+      parsed.publicationStorageLayout !== "weighted-deployment-v1" ||
+      typeof parsed.generation !== "string" ||
+      typeof parsed.generationKey !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(parsed.generationKey)
+    ) {
+      throw new SelfhostReadbackMalformed();
+    }
+    const generationBytes = await readFile(
+      join(root, "workers", ".publications", script, parsed.generationKey, "deployment.json"),
+    ).catch(() => null);
+    if (
+      generationBytes === null ||
+      createHash("sha256").update(generationBytes).digest("hex") !== parsed.generationKey
+    ) {
+      throw new SelfhostReadbackMalformed();
+    }
+    let deployment: unknown;
+    try {
+      deployment = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(generationBytes),
+      );
+    } catch {
+      throw new SelfhostReadbackMalformed();
+    }
+    if (
+      !isJsonObject(deployment) ||
+      deployment.publicationStorageLayout !== "weighted-deployment-v1" ||
+      deployment.generation !== parsed.generation ||
+      !Array.isArray(deployment.hostnames) ||
+      deployment.hostnames.some((hostname) => !normalizedHostname(hostname))
+    ) {
+      throw new SelfhostReadbackMalformed();
+    }
+    return {
+      hostnames: deployment.hostnames.filter(
+        (hostname): hostname is string => typeof hostname === "string",
+      ),
+    };
+  }
   if (!isJsonObject(parsed) || !Array.isArray(parsed.hostnames)) {
     throw new SelfhostReadbackMalformed();
   }
@@ -4018,7 +4780,7 @@ async function verifySelfhostDeploymentAbsence(
   const state = await readSelfhostState(join(root, "selfhost", "scripts"), script);
   const activation = await readSelfhostActivation(root, script);
   const manifest = await readSelfhostRuntimeManifest(root, script);
-  return state.activeVersion || activation.present || manifest !== null
+  return state.activeVersion || state.deployment || activation.present || manifest !== null
     ? selfhostAbsence("present", descriptor, kind)
     : selfhostAbsence("absent", descriptor, kind);
 }
@@ -4043,13 +4805,39 @@ async function verifySelfhostRouteAbsence(
     : selfhostAbsence("absent", descriptor, kind);
 }
 
-function selfhostFileAbsence(
+const SQLITE_SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
+
+function selfhostSqliteAbsence(
   kind: string,
   path: string,
   descriptor: ProviderNativeReadbackDescriptor,
   provider: string,
 ): ProviderNativeAbsence {
-  return selfhostAbsence(existsSync(path) ? "present" : "absent", descriptor, kind, provider);
+  const state = sqliteStorageState(path);
+  return state === "unknown"
+    ? selfhostUnknown("transport", true)
+    : selfhostAbsence(state, descriptor, kind, provider);
+}
+
+function sqliteStorageState(path: string): "absent" | "present" | "unknown" {
+  const parent = dirname(path);
+  try {
+    const parentStat = lstatSync(parent);
+    if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) return "unknown";
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") return "absent";
+    return "unknown";
+  }
+  for (const candidate of [path, ...SQLITE_SIDECAR_SUFFIXES.map((suffix) => `${path}${suffix}`)]) {
+    try {
+      const stat = lstatSync(candidate);
+      if (!stat.isFile() || stat.isSymbolicLink()) return "present";
+      return "present";
+    } catch (error) {
+      if (errorCode(error) !== "ENOENT") return "unknown";
+    }
+  }
+  return "absent";
 }
 
 function selfhostAbsence(
@@ -4216,12 +5004,20 @@ async function versionRuntimeInputReceiptDigest(input: {
  */
 function sameVersionDeclaration(
   recorded: StoredSelfhostVersionBindings | null,
+  workerResourceUid: string,
   handlers: readonly SelfhostWorkerHandlerName[],
   vars: readonly SelfhostVersionBinding[],
   sensitiveNames: readonly string[],
   dataBindings: readonly SelfhostVersionDataBinding[],
+  serviceBindings: readonly SelfhostVersionServiceBinding[],
 ): boolean {
-  if (!recorded?.handlers || !sameStrings(recorded.handlers, handlers)) return false;
+  if (
+    !recorded?.handlers ||
+    !sameStrings(recorded.handlers, handlers) ||
+    !sameVersionAuthority(recorded, workerResourceUid, serviceBindings)
+  ) {
+    return false;
+  }
   const canonicalVars = (entries: readonly SelfhostVersionBinding[]): string =>
     JSON.stringify(
       [...entries]
@@ -4249,6 +5045,32 @@ function sameVersionDeclaration(
     canonicalVars(vars) === canonicalVars(recorded.vars) &&
     JSON.stringify(expectedSensitive) === JSON.stringify(observedSensitive) &&
     canonicalData(dataBindings) === canonicalData(recorded?.dataPlane?.bindings ?? [])
+  );
+}
+
+/**
+ * Whether the retained Version belongs to this exact Worker and names the
+ * exact logical worker.service targets. Legacy records remain valid only for a
+ * declaration with no services; once an authority edge exists, a missing
+ * owner UID is not inferred from a script name.
+ */
+function sameVersionAuthority(
+  recorded: StoredSelfhostVersionBindings | null,
+  workerResourceUid: string,
+  serviceBindings: readonly SelfhostVersionServiceBinding[],
+): boolean {
+  if (!recorded) return false;
+  const canonicalServices = (bindings: readonly SelfhostVersionServiceBinding[]): string =>
+    JSON.stringify(
+      [...bindings]
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .map((binding) => [binding.name, binding.target, binding.targetResourceUid]),
+    );
+  return (
+    (recorded.workerResourceUid === undefined
+      ? serviceBindings.length === 0
+      : recorded.workerResourceUid === workerResourceUid) &&
+    canonicalServices(serviceBindings) === canonicalServices(recorded.serviceBindings ?? [])
   );
 }
 

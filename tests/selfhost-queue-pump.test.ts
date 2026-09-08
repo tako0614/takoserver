@@ -1,7 +1,11 @@
 import { beforeEach, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
-import type { SelfhostEventTarget, SelfhostEventTargets } from "../src/providers/selfhost.ts";
+import type {
+  SelfhostEventSelection,
+  SelfhostEventTarget,
+  SelfhostEventTargets,
+} from "../src/providers/selfhost.ts";
 import {
   MAX_SELFHOST_EVENT_REQUEST_BYTES,
   MAX_SELFHOST_QUEUE_MESSAGE_BYTES,
@@ -30,6 +34,7 @@ const DLQ = "tsq-delivery-dlq";
 const DLQ_NAME = "delivery-dlq";
 const SCRIPT = "sw-fixture";
 const VERSION = "v-fixture";
+const VERSION_UID = "worker-version-fixture";
 const TOKEN = "event-token-fixture";
 
 const CONSUMER = {
@@ -135,20 +140,28 @@ function retryEvery(delivery: Delivery, delaySeconds?: number): { status: number
   };
 }
 
-function targets(overrides: Partial<SelfhostEventTarget> = {}): SelfhostEventTargets {
+function targets(
+  overrides: Partial<SelfhostEventTarget & SelfhostEventSelection> = {},
+): SelfhostEventTargets {
+  const { versionId, workerVersionUid, eventToken, handlers, ...target } = overrides;
   return {
     async list() {
       return [
         {
           script: SCRIPT,
-          versionId: VERSION,
-          eventToken: TOKEN,
-          handlers: ["fetch", "queue"],
           consumers: [CONSUMER],
           crons: [],
-          ...overrides,
+          ...target,
         },
       ];
+    },
+    async select() {
+      return {
+        versionId: versionId ?? VERSION,
+        workerVersionUid: workerVersionUid ?? VERSION_UID,
+        eventToken: eventToken ?? TOKEN,
+        handlers: handlers ?? ["fetch", "queue"],
+      };
     },
   };
 }
@@ -302,13 +315,18 @@ test("isolates native queues while exposing the same logical name in two tenants
       return [
         {
           script,
-          versionId,
-          eventToken,
-          handlers: ["queue"] as const,
           consumers: [{ ...CONSUMER, queue }],
           crons: [],
         },
       ];
+    },
+    async select() {
+      return {
+        versionId,
+        workerVersionUid: `${versionId}-uid`,
+        eventToken,
+        handlers: ["queue"] as const,
+      };
     },
   });
   const firstPump = createSelfhostQueuePump({

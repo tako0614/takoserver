@@ -1,5 +1,9 @@
 import type { Sql } from "./ports.ts";
-import type { SelfhostEventTarget, SelfhostEventTargets } from "./providers/selfhost.ts";
+import type {
+  SelfhostEventSelection,
+  SelfhostEventTarget,
+  SelfhostEventTargets,
+} from "./providers/selfhost.ts";
 import { parseSelfhostCron, type SelfhostCronSchedule } from "./providers/selfhost-cron.ts";
 import {
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
@@ -115,13 +119,14 @@ export function createSelfhostWorkerScheduler(
 
   const invoke = async (
     target: SelfhostEventTarget,
+    selected: SelfhostEventSelection,
     cron: string,
     scheduledTime: number,
   ): Promise<boolean> => {
     try {
       const event = selfhostScheduleEvent({
         script: target.script,
-        publication: target.versionId,
+        publication: selected.versionId,
         cron,
         scheduledTime,
       });
@@ -132,7 +137,7 @@ export function createSelfhostWorkerScheduler(
           "content-type": SELFHOST_WORKER_EVENT_CONTENT_TYPE,
           accept: SELFHOST_WORKER_EVENT_RESPONSE_CONTENT_TYPE,
           [SELFHOST_WORKER_EVENT_HEADER]: SELFHOST_WORKER_EVENT_PROTOCOL,
-          [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: target.eventToken,
+          [SELFHOST_WORKER_EVENT_TOKEN_HEADER]: selected.eventToken,
         },
         body: JSON.stringify(event),
         timeoutMillis: invocationTimeoutMillis,
@@ -150,8 +155,6 @@ export function createSelfhostWorkerScheduler(
       const targets = await options.targets.list();
       let fired = 0;
       for (const target of targets) {
-        // A Worker that never declared `scheduled` cannot be handed a match.
-        if (!target.handlers.includes("scheduled")) continue;
         for (const cron of target.crons) {
           const schedule = parseSelfhostCron(cron);
           // A recorded expression this Host cannot read fires nothing. The
@@ -184,7 +187,21 @@ export function createSelfhostWorkerScheduler(
             [lease, next, target.script, cron, state.nextFireAtMillis, millis],
           );
           if (claim.changes !== 1) continue;
-          const acknowledged = await invoke(target, cron, state.nextFireAtMillis);
+          // Select exactly once for this claimed cron invocation. Selection is
+          // deliberately after the claim: entropy is not spent for a future or
+          // already-owned minute, and a readback failure is the same no-answer
+          // outcome as a runtime restart. There is no cross-Version fallback.
+          let selected: SelfhostEventSelection | null = null;
+          try {
+            selected = await options.targets.select(target.script);
+          } catch {
+            // Durable readback and private entropy are Host work. A failure
+            // cannot be attributed to a tenant handler.
+          }
+          const acknowledged =
+            selected?.handlers.includes("scheduled") === true
+              ? await invoke(target, selected, cron, state.nextFireAtMillis)
+              : false;
           // Fenced on the exact lease this pass wrote, because the CAS above is
           // the only thing enforcing single flight and a release that did not
           // match it would clear a lease another pass had taken. And

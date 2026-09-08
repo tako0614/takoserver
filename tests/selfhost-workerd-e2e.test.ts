@@ -5,6 +5,7 @@ import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
+import type { JsonObject } from "../src/ports.ts";
 import type { ProviderOffering, ProviderRelation } from "../src/provider-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
@@ -50,6 +51,13 @@ const NOTES_MIGRATION = {
   sql: NOTES_MIGRATION_SQL,
 };
 const HOSTNAME = "e2e.localhost";
+const SERVICE_CALLER_HOSTNAME = "service-binding.localhost";
+const MODULE_WORKER_SERVICE_BINDING_REF = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.service",
+  version: "1.0.0",
+  schemaDigest: "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa",
+} as const;
 // This suite is serving evidence only for the pinned native runtime. Falling
 // back to the npm workerd would exercise the known-open resolver instead.
 const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
@@ -1111,6 +1119,45 @@ const QUEUE_NAME = "delivery";
 const DLQ_ID = "tsq-e2e-delivery-dlq";
 const CRON = "* * * * *";
 
+function weightedEventModule(version: string): string {
+  return `const VERSION = ${JSON.stringify(version)};
+export default {
+  async fetch(request, env) {
+    if (new URL(request.url).pathname === "/send") {
+      const ids = await env.QUEUE.sendBatch(["one", "two", "three"].map((note) => ({
+        body: JSON.stringify({ note }),
+      })));
+      return Response.json({ ids });
+    }
+    const read = async (key) => {
+      const bytes = await env.KV.get(key);
+      return bytes === null ? null : JSON.parse(new TextDecoder().decode(bytes));
+    };
+    return Response.json({ seen: await read("seen"), fired: await read("fired") });
+  },
+  async queue(batch, env) {
+    const messages = [];
+    for (const message of batch.messages) {
+      messages.push({
+        note: JSON.parse(atob(message.body.data)).note,
+        version: VERSION,
+        marker: env.MARKER,
+        attempts: message.attempts,
+      });
+      message.acknowledge();
+    }
+    await env.KV.put("seen", JSON.stringify({ messages, keys: Object.keys(env).sort() }));
+  },
+  async scheduled(controller, env) {
+    await env.KV.put("fired", JSON.stringify({
+      version: VERSION, marker: env.MARKER, cron: controller.cron,
+      time: controller.scheduledTime, keys: Object.keys(env).sort(),
+    }));
+  },
+};
+`;
+}
+
 function queueRelation(pointer: string, name: string, id: string): ProviderRelation {
   return deployed(
     pointer,
@@ -1122,8 +1169,19 @@ function queueRelation(pointer: string, name: string, id: string): ProviderRelat
   );
 }
 
+interface EventVersionFixture {
+  readonly name: string;
+  readonly module: string;
+  readonly weight: number;
+  readonly vars?: JsonObject;
+}
+
 /** Publishes a Worker that produces, consumes, and is scheduled, then boots it. */
-async function bootEvents(): Promise<{
+async function bootEvents(
+  versions: readonly EventVersionFixture[] = [
+    { name: "hello-v1", module: EVENT_MODULE, weight: 10_000 },
+  ],
+): Promise<{
   readonly origin: string;
   readonly script: string;
   readonly workerdPort: number;
@@ -1160,16 +1218,18 @@ async function bootEvents(): Promise<{
     events: { async forgetSchedules() {} },
     artifacts: {
       async manifest(_tenant, digest) {
-        return digest === "sha256:worker"
+        const version = versions.find((entry) => digest === `sha256:event-bundle-${entry.name}`);
+        return version
           ? {
               kind: "WorkerBundle",
               mainModule: "index.js",
-              modules: [{ name: "index.js", digest: "sha256:index.js" }],
+              modules: [{ name: "index.js", digest: `sha256:event-module-${version.name}` }],
             }
           : null;
       },
       async blob(digest) {
-        return digest === "sha256:index.js" ? new TextEncoder().encode(EVENT_MODULE) : null;
+        const version = versions.find((entry) => digest === `sha256:event-module-${entry.name}`);
+        return version ? new TextEncoder().encode(version.module) : null;
       },
     },
   });
@@ -1183,38 +1243,46 @@ async function bootEvents(): Promise<{
   expect(worker.phase).toBe("succeeded");
   const script = worker.phase === "succeeded" ? String(worker.result.outputs.scriptName) : "";
 
-  const version = await local.apply({
-    operationId: "op_version",
-    offering: offering("WorkerVersion"),
-    identity: identity("hello-v1"),
-    spec: {
-      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
-      handlers: ["fetch", "queue", "scheduled"],
-      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      kvBindings: [
-        { name: "KV", resource: { apiVersion: EDGE_API, kind: "EdgeKVNamespace", name: "cache" } },
+  for (const fixture of versions) {
+    const version = await local.apply({
+      operationId: `op_version_${fixture.name}`,
+      offering: offering("WorkerVersion"),
+      identity: identity(fixture.name),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: `bundle-${fixture.name}` },
+        handlers: ["fetch", "queue", "scheduled"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        ...(fixture.vars === undefined ? {} : { vars: fixture.vars }),
+        kvBindings: [
+          {
+            name: "KV",
+            resource: { apiVersion: EDGE_API, kind: "EdgeKVNamespace", name: "cache" },
+          },
+        ],
+        queueProducerBindings: [
+          {
+            name: "QUEUE",
+            resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/bundle", "WorkerBundle", `bundle-${fixture.name}`, {
+          manifestDigest: `sha256:event-bundle-${fixture.name}`,
+        }),
+        deployed(
+          "/kvBindings/0/resource",
+          "EdgeKVNamespace",
+          "cache",
+          `selfhost-kv:${KV_NAMESPACE}:op_kv`,
+          { namespaceId: KV_NAMESPACE },
+        ),
+        queueRelation("/queueProducerBindings/0/resource", QUEUE_NAME, QUEUE_ID),
       ],
-      queueProducerBindings: [
-        {
-          name: "QUEUE",
-          resource: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: QUEUE_NAME },
-        },
-      ],
-    },
-    relations: [
-      relation("/worker", "ModuleWorker", "hello"),
-      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
-      deployed(
-        "/kvBindings/0/resource",
-        "EdgeKVNamespace",
-        "cache",
-        `selfhost-kv:${KV_NAMESPACE}:op_kv`,
-        { namespaceId: KV_NAMESPACE },
-      ),
-      queueRelation("/queueProducerBindings/0/resource", QUEUE_NAME, QUEUE_ID),
-    ],
-  });
-  expect(version.phase).toBe("succeeded");
+    });
+    expect(version.phase).toBe("succeeded");
+  }
 
   const deployment = await local.apply({
     operationId: "op_deploy",
@@ -1222,16 +1290,16 @@ async function bootEvents(): Promise<{
     identity: identity("hello-live"),
     spec: {
       worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
-      versions: [
-        {
-          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
-          weight: 10_000,
-        },
-      ],
+      versions: versions.map((version) => ({
+        workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: version.name },
+        weight: version.weight,
+      })),
     },
     relations: [
       relation("/worker", "ModuleWorker", "hello"),
-      relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+      ...versions.map((version, index) =>
+        relation(`/versions/${index}/workerVersion`, "WorkerVersion", version.name),
+      ),
     ],
   });
   expect(deployment.phase).toBe("succeeded");
@@ -1290,6 +1358,7 @@ async function bootEvents(): Promise<{
   });
 
   workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
+    env: {},
     stdout: "ignore",
     stderr: "ignore",
   });
@@ -1348,6 +1417,88 @@ test.skipIf(WORKERD === null)(
     );
   },
   60_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "weighted native queue batches and cron invocations select one exact Version each",
+  async () => {
+    const { origin, sql, runtime, targets } = await bootEvents(
+      ["v1", "v2"].map((version) => ({
+        name: `hello-${version}`,
+        module: weightedEventModule(version),
+        weight: 5_000,
+        vars: { MARKER: `environment-${version}` },
+      })),
+    );
+    expect(await targets.list()).toHaveLength(1);
+    let selections = 0;
+    const countedTargets: typeof targets = {
+      list: () => targets.list(),
+      async select(script) {
+        selections += 1;
+        return targets.select(script);
+      },
+    };
+    const pump = createSelfhostQueuePump({ sql, runtime, targets: countedTargets });
+    let millis = Date.UTC(2026, 8, 8, 12, 0, 30);
+    const scheduler = createSelfhostWorkerScheduler({
+      sql,
+      runtime,
+      targets: countedTargets,
+      clock: () => new Date(millis),
+    });
+    expect(await scheduler.tick()).toBe(0);
+    expect(selections).toBe(0);
+    const queueVersions = new Set<string>();
+    const scheduledVersions = new Set<string>();
+    for (let index = 0; index < 64; index += 1) {
+      expect((await ask(origin, "/send")).status).toBe(200);
+      const beforeQueue = selections;
+      expect(await pump.tick()).toBe(3);
+      expect(selections - beforeQueue).toBe(1);
+      const observed = (await (await ask(origin, "/seen")).json()) as {
+        seen: {
+          keys: string[];
+          messages: { version: string; marker: string; note: string; attempts: number }[];
+        };
+      };
+      expect(observed.seen.keys).toEqual(["KV", "MARKER", "QUEUE"]);
+      expect(observed.seen.messages.map((message) => message.note).sort()).toEqual([
+        "one",
+        "three",
+        "two",
+      ]);
+      const batchVersions = new Set(observed.seen.messages.map((message) => message.version));
+      expect(batchVersions.size).toBe(1);
+      for (const message of observed.seen.messages) {
+        expect(["v1", "v2"]).toContain(message.version);
+        expect(message.marker).toBe(`environment-${message.version}`);
+        expect(message.attempts).toBe(1);
+        queueVersions.add(message.version);
+      }
+      expect(await pump.tick()).toBe(0);
+      expect(selections - beforeQueue).toBe(1);
+
+      millis += 60_000;
+      const beforeSchedule = selections;
+      expect(await scheduler.tick()).toBe(1);
+      expect(selections - beforeSchedule).toBe(1);
+      const scheduled = (await (await ask(origin, "/seen")).json()) as {
+        fired: { version: string; marker: string; cron: string; time: number; keys: string[] };
+      };
+      expect(["v1", "v2"]).toContain(scheduled.fired.version);
+      expect(scheduled.fired.marker).toBe(`environment-${scheduled.fired.version}`);
+      expect(scheduled.fired.cron).toBe(CRON);
+      expect(scheduled.fired.time).toBe(Math.floor(millis / 60_000) * 60_000);
+      expect(scheduled.fired.keys).toEqual(["KV", "MARKER", "QUEUE"]);
+      scheduledVersions.add(scheduled.fired.version);
+    }
+    // Native reachability of both branches, not a statistical ratio test.
+    expect([...queueVersions].sort()).toEqual(["v1", "v2"]);
+    expect([...scheduledVersions].sort()).toEqual(["v1", "v2"]);
+    expect(await sql.query("SELECT message_id FROM selfhost_queue_messages", [])).toEqual([]);
+  },
+  90_000,
 );
 
 test.skipIf(WORKERD === null)(
@@ -1677,6 +1828,880 @@ async function served(origin: string, path: string, attempts = 200): Promise<Res
   }
   return last ?? (await ask(origin, path));
 }
+
+const SERVICE_CALLER_MODULE = `export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/binding-shape") {
+      return Response.json({
+        env: Object.keys(env).sort(),
+        binding: Object.keys(env.PEER ?? {}).sort(),
+        frozen: Object.isFrozen(env.PEER),
+        rpc: typeof env.PEER?.rpc,
+      });
+    }
+    try {
+      if (url.pathname === "/string-init") {
+        return await env.PEER.fetch("https://caller-chosen.invalid/echo?source=string", {
+          method: "PATCH",
+          headers: { "x-service-probe": "string-init" },
+          body: "string request body",
+        });
+      }
+      if (url.pathname === "/abort-in-flight") {
+        const controller = new AbortController();
+        const pending = env.PEER.fetch("https://caller-chosen.invalid/slow", {
+          signal: controller.signal,
+        });
+        setTimeout(() => controller.abort(), 25);
+        return await pending;
+      }
+      return await env.PEER.fetch(request);
+    } catch (error) {
+      return Response.json({ name: error && error.name }, { status: 503 });
+    }
+  },
+};
+`;
+
+function serviceTargetModule(version: string): string {
+  return `const VERSION = ${JSON.stringify(version)};
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/identity") {
+      return Response.json({ version: VERSION, marker: env.MARKER, keys: Object.keys(env).sort() });
+    }
+    if (url.pathname === "/throw-v1") {
+      if (VERSION === "v1") throw new Error("selected target v1 failure");
+      return new Response(VERSION);
+    }
+    if (url.pathname === "/throw") throw new Error("target failure");
+    if (url.pathname === "/slow") {
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      return new Response("too late");
+    }
+    if (url.pathname === "/spoof") {
+      return new Response("target-owned 530", {
+        status: 530,
+        headers: { "x-takoserver-selfhost-service-unavailable": "guessed" },
+      });
+    }
+    if (url.pathname === "/stream") {
+      const reader = request.body && request.body.getReader();
+      if (!reader) return new Response("request body missing", { status: 400 });
+      const first = await reader.read();
+      const decoder = new TextDecoder();
+      const encoder = new TextEncoder();
+      const body = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(encoder.encode(VERSION + ":" + decoder.decode(first.value) + "|"));
+          const second = await reader.read();
+          controller.enqueue(encoder.encode(decoder.decode(second.value)));
+          controller.close();
+        },
+      });
+      return new Response(body, {
+        status: 207,
+        headers: {
+          "content-type": "text/plain",
+          "x-target-version": VERSION,
+          "x-seen-method": request.method,
+          "x-seen-query": url.search,
+          "x-seen-probe": request.headers.get("x-service-probe") ?? "",
+        },
+      });
+    }
+    if (url.pathname === "/echo") {
+      return new Response(await request.text(), {
+        status: 209,
+        headers: {
+          "x-target-version": VERSION,
+          "x-seen-host": url.hostname,
+          "x-seen-method": request.method,
+          "x-seen-query": url.search,
+          "x-seen-probe": request.headers.get("x-service-probe") ?? "",
+        },
+      });
+    }
+    return new Response(VERSION + ":worker miss", {
+      status: 404,
+      headers: { "x-target-version": VERSION },
+    });
+  },
+  async scheduled() {},
+};
+`;
+}
+
+/**
+ * Sends the second request chunk only after the first response chunk arrives.
+ * A fallback ends the request so a buffering regression fails with evidence
+ * instead of hanging the suite forever.
+ */
+function streamedServiceAsk(origin: string): Promise<{
+  readonly status: number;
+  readonly headers: Readonly<Record<string, string | string[] | undefined>>;
+  readonly body: string;
+  readonly firstResponseBeforeSecondRequest: boolean;
+}> {
+  const endpoint = new URL(origin);
+  return new Promise((resolvePromise, reject) => {
+    let settled = false;
+    let secondSent = false;
+    let firstResponseBeforeSecondRequest = false;
+    const request = httpRequest({
+      hostname: endpoint.hostname,
+      port: endpoint.port,
+      method: "POST",
+      path: "/stream?token=kept",
+      headers: {
+        host: SERVICE_CALLER_HOSTNAME,
+        "content-type": "application/octet-stream",
+        "transfer-encoding": "chunked",
+        "x-service-probe": "streaming",
+      },
+    });
+    const sendSecond = () => {
+      if (secondSent) return;
+      secondSent = true;
+      request.end("second");
+    };
+    const fallback = setTimeout(sendSecond, 3_000);
+    const deadline = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      request.destroy();
+      reject(new Error("the service-binding streaming probe timed out"));
+    }, 10_000);
+    request.on("response", (response) => {
+      const chunks: Uint8Array[] = [];
+      response.on("data", (chunk: Uint8Array) => {
+        chunks.push(new Uint8Array(chunk));
+        if (!secondSent) {
+          firstResponseBeforeSecondRequest = true;
+          clearTimeout(fallback);
+          sendSecond();
+        }
+      });
+      response.on("end", () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(fallback);
+        clearTimeout(deadline);
+        resolvePromise({
+          status: response.statusCode ?? 0,
+          headers: response.headers,
+          body: Buffer.concat(chunks).toString("utf8"),
+          firstResponseBeforeSecondRequest,
+        });
+      });
+    });
+    request.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallback);
+      clearTimeout(deadline);
+      reject(error);
+    });
+    request.write("first");
+  });
+}
+
+/**
+ * Two independently materialized Workers and one public endpoint. The target
+ * deliberately has no WorkerEndpoint: a service binding is logical Host
+ * routing, never a loop through public discovery.
+ */
+async function bootServiceBinding(): Promise<{
+  readonly origin: string;
+  readonly local: ReturnType<typeof createSelfhostProvider>;
+  readonly callerScript: string;
+  readonly targetWorkerNativeId: string;
+  readonly targetWorkerOutputs: Record<string, unknown>;
+  readonly targetV1NativeId: string;
+  readonly targetDeploymentInput: {
+    readonly offering: ProviderOffering;
+    readonly identity: ReturnType<typeof identity>;
+    readonly spec: JsonObject;
+    readonly relations: readonly ProviderRelation[];
+  };
+}> {
+  const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+  const workerdPort = Number(reserved.port);
+  reserved.stop(true);
+  const origin = `http://127.0.0.1:${workerdPort}`;
+  const start = async (): Promise<void> => {
+    if (workerd) return;
+    workerd = Bun.spawn(
+      [WORKERD as string, "serve", "--watch", join(root, "workers", "workerd.capnp")],
+      { env: {}, stdout: "ignore", stderr: "ignore" },
+    );
+    expect(await reachable(`${origin}/`)).toBe(true);
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    binary: WORKERD,
+    port: workerdPort,
+    isReady: () => true,
+    onReload: start,
+  });
+  const blobs = new Map<string, Uint8Array>([
+    ["sha256:caller.js", new TextEncoder().encode(SERVICE_CALLER_MODULE)],
+    ["sha256:target-v1.js", new TextEncoder().encode(serviceTargetModule("v1"))],
+    ["sha256:target-v2.js", new TextEncoder().encode(serviceTargetModule("v2"))],
+    ["sha256:target-v1-asset", new TextEncoder().encode("target asset v1")],
+    ["sha256:target-v2-asset", new TextEncoder().encode("target asset v2")],
+  ]);
+  const local = createSelfhostProvider({
+    offerings: [],
+    dataRoot: root,
+    runtime,
+    suffixes: ["localhost"],
+    artifacts: {
+      async manifest(_tenant, digest) {
+        if (digest === "sha256:caller-bundle") {
+          return {
+            kind: "WorkerBundle",
+            mainModule: "caller.js",
+            modules: [{ name: "caller.js", digest: "sha256:caller.js" }],
+          };
+        }
+        if (digest === "sha256:target-v1-bundle" || digest === "sha256:target-v2-bundle") {
+          const version = digest.includes("v1") ? "v1" : "v2";
+          return {
+            kind: "WorkerBundle",
+            mainModule: "target.js",
+            modules: [{ name: "target.js", digest: `sha256:target-${version}.js` }],
+          };
+        }
+        if (digest === "sha256:target-v1-assets" || digest === "sha256:target-v2-assets") {
+          const version = digest.includes("v1") ? "v1" : "v2";
+          return {
+            kind: "StaticAssetBundle",
+            files: [
+              {
+                path: "asset.txt",
+                digest: `sha256:target-${version}-asset`,
+                mediaType: "text/plain",
+              },
+            ],
+          };
+        }
+        return null;
+      },
+      async blob(digest) {
+        const bytes = blobs.get(digest);
+        return bytes ? new Uint8Array(bytes) : null;
+      },
+    },
+  });
+
+  const targetWorker = await local.apply({
+    operationId: "op_service_target_worker",
+    offering: offering("ModuleWorker"),
+    identity: identity("target"),
+    spec: {},
+  });
+  const callerWorker = await local.apply({
+    operationId: "op_service_caller_worker",
+    offering: offering("ModuleWorker"),
+    identity: identity("caller"),
+    spec: {},
+  });
+  expect(targetWorker.phase).toBe("succeeded");
+  expect(callerWorker.phase).toBe("succeeded");
+  if (targetWorker.phase !== "succeeded" || callerWorker.phase !== "succeeded") {
+    throw new Error("the service-binding Workers were not realized");
+  }
+  const targetWorkerRelation = deployed(
+    "/serviceBindings/0/resource",
+    "ModuleWorker",
+    "target",
+    targetWorker.result.nativeId,
+    targetWorker.result.outputs,
+  );
+  const serviceRelation: ProviderRelation = {
+    ...targetWorkerRelation,
+    bindingRef: MODULE_WORKER_SERVICE_BINDING_REF,
+  };
+  const callerWorkerRelation = deployed(
+    "/worker",
+    "ModuleWorker",
+    "caller",
+    callerWorker.result.nativeId,
+    callerWorker.result.outputs,
+  );
+  const targetOwnerRelation = deployed(
+    "/worker",
+    "ModuleWorker",
+    "target",
+    targetWorker.result.nativeId,
+    targetWorker.result.outputs,
+  );
+
+  const targetV1 = await local.apply({
+    operationId: "op_service_target_v1",
+    offering: offering("WorkerVersion"),
+    identity: identity("target-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "target-v1-bundle" },
+      handlers: ["fetch"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+      vars: { MARKER: "environment-v1" },
+      assets: {
+        bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "target-v1-assets" },
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+      },
+    },
+    relations: [
+      targetOwnerRelation,
+      relation("/bundle", "WorkerBundle", "target-v1-bundle", {
+        manifestDigest: "sha256:target-v1-bundle",
+      }),
+      relation("/assets/bundle", "StaticAssetBundle", "target-v1-assets", {
+        manifestDigest: "sha256:target-v1-assets",
+      }),
+    ],
+  });
+  expect(targetV1.phase).toBe("succeeded");
+  if (targetV1.phase !== "succeeded") throw new Error("the target Version was not materialized");
+
+  const callerVersion = await local.apply({
+    operationId: "op_service_caller_v1",
+    offering: offering("WorkerVersion"),
+    identity: identity("caller-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "caller-bundle" },
+      handlers: ["fetch"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "caller" },
+      serviceBindings: [
+        {
+          name: "PEER",
+          resource: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        },
+      ],
+    },
+    relations: [
+      callerWorkerRelation,
+      relation("/bundle", "WorkerBundle", "caller-bundle", {
+        manifestDigest: "sha256:caller-bundle",
+      }),
+      serviceRelation,
+    ],
+  });
+  expect(callerVersion.phase).toBe("succeeded");
+
+  expect(
+    (
+      await local.apply({
+        operationId: "op_service_caller_deployment",
+        offering: offering("WorkerDeployment"),
+        identity: identity("caller-live"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "caller" },
+          versions: [
+            {
+              workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "caller-v1" },
+              weight: 10_000,
+            },
+          ],
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "caller"),
+          relation("/versions/0/workerVersion", "WorkerVersion", "caller-v1"),
+        ],
+      })
+    ).phase,
+  ).toBe("succeeded");
+  expect(
+    (
+      await local.apply({
+        operationId: "op_service_caller_endpoint",
+        offering: offering("WorkerEndpoint"),
+        identity: identity("caller-endpoint"),
+        spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "caller" } },
+        relations: [relation("/worker", "ModuleWorker", "caller")],
+        workerEndpointOriginAssignment: {
+          canonicalPublicOrigin: `https://${SERVICE_CALLER_HOSTNAME}`,
+          assignmentDigest: `sha256:${"f".repeat(64)}`,
+        },
+      })
+    ).phase,
+  ).toBe("succeeded");
+  await start();
+
+  const targetDeploymentInput = {
+    offering: offering("WorkerDeployment"),
+    identity: identity("target-live"),
+    spec: {
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+      versions: [
+        {
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "target-v1" },
+          weight: 10_000,
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "target"),
+      relation("/versions/0/workerVersion", "WorkerVersion", "target-v1"),
+    ],
+  } as const;
+  return {
+    origin,
+    local,
+    callerScript: String(callerWorker.result.outputs.scriptName),
+    targetWorkerNativeId: targetWorker.result.nativeId,
+    targetWorkerOutputs: targetWorker.result.outputs,
+    targetV1NativeId: targetV1.result.nativeId,
+    targetDeploymentInput,
+  };
+}
+
+test.skipIf(WORKERD === null)(
+  "weighted deployment routes whole native fetches and service calls, then restores a reweighted generation",
+  async () => {
+    const setup = await bootServiceBinding();
+    const { local, origin, targetDeploymentInput } = setup;
+    const targetHostname = "weighted-target.localhost";
+    const targetOwner = deployed(
+      "/worker",
+      "ModuleWorker",
+      "target",
+      setup.targetWorkerNativeId,
+      setup.targetWorkerOutputs,
+    );
+    expect(
+      (
+        await local.apply({
+          operationId: "op_weighted_target_v2",
+          offering: offering("WorkerVersion"),
+          identity: identity("target-v2"),
+          spec: {
+            bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "target-v2-bundle" },
+            handlers: ["fetch"],
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+            vars: { MARKER: "environment-v2" },
+            assets: {
+              bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "target-v2-assets" },
+              notFoundHandling: "none",
+              runWorkerFirst: false,
+            },
+          },
+          relations: [
+            targetOwner,
+            relation("/bundle", "WorkerBundle", "target-v2-bundle", {
+              manifestDigest: "sha256:target-v2-bundle",
+            }),
+            relation("/assets/bundle", "StaticAssetBundle", "target-v2-assets", {
+              manifestDigest: "sha256:target-v2-assets",
+            }),
+          ],
+        })
+      ).phase,
+    ).toBe("succeeded");
+
+    const deployment = (versions: readonly { name: string; weight: number }[]) => ({
+      offering: targetDeploymentInput.offering,
+      identity: targetDeploymentInput.identity,
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        versions: versions.map(({ name, weight }) => ({
+          workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name },
+          weight,
+        })),
+      },
+      relations: [
+        targetOwner,
+        ...versions.map(({ name }, index) =>
+          relation(`/versions/${index}/workerVersion`, "WorkerVersion", name),
+        ),
+      ],
+    });
+    const balanced = deployment([
+      { name: "target-v1", weight: 5_000 },
+      { name: "target-v2", weight: 5_000 },
+    ]);
+    const applied = await local.apply({ ...balanced, operationId: "op_weighted_balanced" });
+    expect(applied.phase).toBe("succeeded");
+    if (applied.phase !== "succeeded") throw new Error("the weighted deployment failed");
+    expect(
+      (
+        await local.apply({
+          operationId: "op_weighted_target_endpoint",
+          offering: offering("WorkerEndpoint"),
+          identity: identity("target-endpoint"),
+          spec: { worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" } },
+          relations: [targetOwner],
+          workerEndpointOriginAssignment: {
+            canonicalPublicOrigin: `https://${targetHostname}`,
+            assignmentDigest: `sha256:${"e".repeat(64)}`,
+          },
+        })
+      ).phase,
+    ).toBe("succeeded");
+
+    const request = (hostname: string, path: string) =>
+      fetch(`${origin}${path}`, {
+        headers: { host: hostname },
+        signal: AbortSignal.timeout(5_000),
+      });
+    // This is native reachability/namespace smoke, not a statistical proof of
+    // exact proportions. Deterministic selector tests own interval boundaries.
+    for (const hostname of [targetHostname, SERVICE_CALLER_HOSTNAME]) {
+      const code = new Set<string>();
+      const assets = new Set<string>();
+      for (let index = 0; index < 64; index += 1) {
+        const response = await request(hostname, "/identity");
+        expect(response.status).toBe(200);
+        const result = (await response.json()) as {
+          version: string;
+          marker: string;
+          keys: string[];
+        };
+        expect(["v1", "v2"]).toContain(result.version);
+        expect(result.marker).toBe(`environment-${result.version}`);
+        expect(result.keys).toEqual(["MARKER"]);
+        code.add(result.version);
+        const asset = await request(hostname, "/asset.txt");
+        expect(asset.status).toBe(200);
+        const body = await asset.text();
+        expect(["target asset v1", "target asset v2"]).toContain(body);
+        assets.add(body);
+      }
+      expect([...code].sort()).toEqual(["v1", "v2"]);
+      expect([...assets].sort()).toEqual(["target asset v1", "target asset v2"]);
+    }
+    const stream = await streamedServiceAsk(origin);
+    const selected = stream.headers["x-target-version"];
+    if (typeof selected !== "string") throw new Error("selected target version header missing");
+    expect(["v1", "v2"]).toContain(selected);
+    expect(stream.status).toBe(207);
+    expect(stream.firstResponseBeforeSecondRequest).toBe(true);
+    expect(stream.body).toBe(`${selected}:first|second`);
+
+    const statuses = new Set<number>();
+    for (let index = 0; index < 64; index += 1) {
+      const response = await request(SERVICE_CALLER_HOSTNAME, "/throw-v1");
+      statuses.add(response.status);
+      const body = await response.text();
+      if (response.status === 200) expect(body).toBe("v2");
+    }
+    // A chosen v1 exception must not turn into a successful v2 retry.
+    expect([...statuses].sort()).toEqual([200, 500]);
+
+    const onlyB = deployment([{ name: "target-v2", weight: 10_000 }]);
+    expect((await local.apply({ ...onlyB, operationId: "op_weighted_only_b" })).phase).toBe(
+      "succeeded",
+    );
+    for (const hostname of [targetHostname, SERVICE_CALLER_HOSTNAME]) {
+      for (let index = 0; index < 16; index += 1) {
+        const response = await request(hostname, "/identity");
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({
+          version: "v2",
+          marker: "environment-v2",
+          keys: ["MARKER"],
+        });
+      }
+    }
+
+    workerd?.kill();
+    await workerd?.exited;
+    workerd = undefined;
+    const restored = createWorkerdRuntime({
+      root,
+      binary: WORKERD,
+      port: Number(new URL(origin).port),
+      isReady: () => workerd?.exitCode === null,
+      onReload: async (configPath) => {
+        workerd = Bun.spawn([WORKERD as string, "serve", configPath], {
+          env: {},
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        if (!(await reachable(origin))) throw new Error("restored runtime did not start");
+      },
+    });
+    expect(await restored.restore()).toContain(String(setup.targetWorkerOutputs.scriptName));
+    for (const hostname of [targetHostname, SERVICE_CALLER_HOSTNAME]) {
+      const response = await request(hostname, "/identity");
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        version: "v2",
+        marker: "environment-v2",
+        keys: ["MARKER"],
+      });
+      expect(await (await request(hostname, "/asset.txt")).text()).toBe("target asset v2");
+    }
+  },
+  90_000,
+);
+
+test.skipIf(WORKERD === null)(
+  "module-worker.service follows the target active deployment without a public endpoint",
+  async () => {
+    const setup = await bootServiceBinding();
+    const { origin, local, callerScript, targetDeploymentInput } = setup;
+    const callerManifestPath = join(root, "workers", callerScript, "takoserver-site.json");
+    const callerManifest = await Bun.file(callerManifestPath).text();
+
+    // A Version may bind a realized ModuleWorker before that Worker's mutable
+    // traffic deployment is active. Invocation, not declaration, is unavailable.
+    const inactive = await fetch(`${origin}/echo`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(inactive.status).toBe(503);
+    expect(await inactive.json()).toEqual({ name: "backend_unavailable" });
+
+    const targetDeployment = await local.apply({
+      operationId: "op_service_target_deployment_v1",
+      ...targetDeploymentInput,
+    });
+    expect(targetDeployment.phase).toBe("succeeded");
+    if (targetDeployment.phase !== "succeeded") throw new Error("the target was not activated");
+
+    const shape = await fetch(`${origin}/binding-shape`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(await shape.json()).toEqual({
+      env: ["PEER"],
+      binding: ["fetch"],
+      frozen: true,
+      rpc: "undefined",
+    });
+
+    const streamed = await streamedServiceAsk(origin);
+    expect(streamed).toMatchObject({
+      status: 207,
+      body: "v1:first|second",
+      firstResponseBeforeSecondRequest: true,
+    });
+    expect(streamed.headers["x-target-version"]).toBe("v1");
+    expect(streamed.headers["x-seen-method"]).toBe("POST");
+    expect(streamed.headers["x-seen-query"]).toBe("?token=kept");
+    expect(streamed.headers["x-seen-probe"]).toBe("streaming");
+
+    const stringInit = await fetch(`${origin}/string-init`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(stringInit.status).toBe(209);
+    expect(await stringInit.text()).toBe("string request body");
+    expect(stringInit.headers.get("x-target-version")).toBe("v1");
+    expect(stringInit.headers.get("x-seen-host")).toBe("caller-chosen.invalid");
+    expect(stringInit.headers.get("x-seen-method")).toBe("PATCH");
+    expect(stringInit.headers.get("x-seen-query")).toBe("?source=string");
+    expect(stringInit.headers.get("x-seen-probe")).toBe("string-init");
+
+    const aborted = await fetch(`${origin}/abort-in-flight`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(aborted.status).toBe(503);
+    expect(await aborted.json()).toEqual({ name: "AbortError" });
+
+    const asset = await fetch(`${origin}/asset.txt`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(asset.status).toBe(200);
+    expect(asset.headers.get("content-type")).toBe("text/plain");
+    expect(await asset.text()).toBe("target asset v1");
+
+    // The callee's uncaught exception is its runtime-generated response. It is
+    // not the Host-unavailable rejection caught and rewritten by the caller.
+    const thrown = await fetch(`${origin}/throw`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(thrown.status).toBe(500);
+
+    // The marker value is per caller Version and never reaches the target. A
+    // tenant returning the same private-looking status/header spelling is still
+    // an ordinary response, preserved rather than misclassified as absence.
+    const spoof = await fetch(`${origin}/spoof`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(spoof.status).toBe(530);
+    expect(spoof.headers.get("x-takoserver-selfhost-service-unavailable")).toBe("guessed");
+    expect(await spoof.text()).toBe("target-owned 530");
+
+    const targetV2 = await local.apply({
+      operationId: "op_service_target_v2",
+      offering: offering("WorkerVersion"),
+      identity: identity("target-v2"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "target-v2-bundle" },
+        handlers: ["fetch"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "target-v2-assets" },
+          notFoundHandling: "none",
+          runWorkerFirst: false,
+        },
+      },
+      relations: [
+        deployed(
+          "/worker",
+          "ModuleWorker",
+          "target",
+          setup.targetWorkerNativeId,
+          setup.targetWorkerOutputs,
+        ),
+        relation("/bundle", "WorkerBundle", "target-v2-bundle", {
+          manifestDigest: "sha256:target-v2-bundle",
+        }),
+        relation("/assets/bundle", "StaticAssetBundle", "target-v2-assets", {
+          manifestDigest: "sha256:target-v2-assets",
+        }),
+      ],
+    });
+    expect(targetV2.phase).toBe("succeeded");
+    const targetV2Deployment = await local.apply({
+      operationId: "op_service_target_deployment_v2",
+      offering: targetDeploymentInput.offering,
+      identity: targetDeploymentInput.identity,
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "target-v2" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "target"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "target-v2"),
+      ],
+    });
+    expect(targetV2Deployment.phase).toBe("succeeded");
+
+    const updated = await fetch(`${origin}/string-init`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(updated.status).toBe(209);
+    expect(updated.headers.get("x-target-version")).toBe("v2");
+    const updatedAsset = await fetch(`${origin}/asset.txt`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(await updatedAsset.text()).toBe("target asset v2");
+    expect(await Bun.file(callerManifestPath).text()).toBe(callerManifest);
+
+    const noFetchVersion = await local.apply({
+      operationId: "op_service_target_no_fetch",
+      offering: offering("WorkerVersion"),
+      identity: identity("target-no-fetch"),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "target-v2-bundle" },
+        handlers: ["scheduled"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        assets: {
+          bundle: { apiVersion: EDGE_API, kind: "StaticAssetBundle", name: "target-v2-assets" },
+          notFoundHandling: "none",
+          runWorkerFirst: false,
+        },
+      },
+      relations: [
+        deployed(
+          "/worker",
+          "ModuleWorker",
+          "target",
+          setup.targetWorkerNativeId,
+          setup.targetWorkerOutputs,
+        ),
+        relation("/bundle", "WorkerBundle", "target-v2-bundle", {
+          manifestDigest: "sha256:target-v2-bundle",
+        }),
+        relation("/assets/bundle", "StaticAssetBundle", "target-v2-assets", {
+          manifestDigest: "sha256:target-v2-assets",
+        }),
+      ],
+    });
+    expect(noFetchVersion.phase).toBe("succeeded");
+    expect(
+      (
+        await local.apply({
+          operationId: "op_service_target_deployment_no_fetch",
+          offering: targetDeploymentInput.offering,
+          identity: targetDeploymentInput.identity,
+          spec: {
+            worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+            versions: [
+              {
+                workerVersion: {
+                  apiVersion: EDGE_API,
+                  kind: "WorkerVersion",
+                  name: "target-no-fetch",
+                },
+                weight: 10_000,
+              },
+            ],
+          },
+          relations: [
+            relation("/worker", "ModuleWorker", "target"),
+            relation("/versions/0/workerVersion", "WorkerVersion", "target-no-fetch"),
+          ],
+        })
+      ).phase,
+    ).toBe("succeeded");
+    const noFetch = await fetch(`${origin}/asset.txt`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(noFetch.status).toBe(503);
+    expect(await noFetch.json()).toEqual({ name: "backend_unavailable" });
+
+    const restoredTarget = await local.apply({
+      operationId: "op_service_target_deployment_v2_restore",
+      offering: targetDeploymentInput.offering,
+      identity: targetDeploymentInput.identity,
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "target" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "target-v2" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "target"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "target-v2"),
+      ],
+    });
+    expect(restoredTarget.phase).toBe("succeeded");
+    if (restoredTarget.phase !== "succeeded") throw new Error("the target was not restored");
+    const restoredAsset = await fetch(`${origin}/asset.txt`, {
+      headers: { host: SERVICE_CALLER_HOSTNAME },
+    });
+    expect(await restoredAsset.text()).toBe("target asset v2");
+
+    expect(
+      (
+        await local.delete({
+          operationId: "op_service_target_deployment_delete",
+          offering: targetDeploymentInput.offering,
+          nativeId: restoredTarget.result.nativeId,
+          identity: targetDeploymentInput.identity,
+          spec: targetDeploymentInput.spec,
+          relations: targetDeploymentInput.relations,
+        })
+      ).phase,
+    ).toBe("succeeded");
+    let unavailable: Response | undefined;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      unavailable = await fetch(`${origin}/echo`, {
+        headers: { host: SERVICE_CALLER_HOSTNAME },
+      }).catch(() => undefined);
+      if (unavailable?.status === 503) break;
+      await new Promise<void>((wake) => setTimeout(wake, 50));
+    }
+    expect(unavailable?.status).toBe(503);
+    expect(await unavailable?.json()).toEqual({ name: "backend_unavailable" });
+    expect(await Bun.file(callerManifestPath).text()).toBe(callerManifest);
+  },
+  90_000,
+);
 
 const attachCron = (local: ReturnType<typeof createSelfhostProvider>, cron: string) =>
   local.apply({

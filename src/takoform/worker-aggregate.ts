@@ -103,6 +103,7 @@ export async function validateWorkerAggregate(input: {
     | "queuePathReaches"
     | "resourcesByRelation"
     | "readResource"
+    | "readResourceDeletion"
     | "readRelations"
     | "resourceClaimHolder"
     | "committedResourceClaimHolder"
@@ -169,8 +170,15 @@ export async function validateWorkerAggregate(input: {
       }
     }
     const requiredHandlers = await dependentHandlers(input, worker.targetUid, edgeApiVersion);
+    const selectedVersions = await readSelectedVersions(input, weighted);
+    if (!selectedVersions) throw new TakoformHostError("invalid_argument", 400);
     for (const handler of requiredHandlers) {
-      if (!(await selectedVersionsServe(input, weighted, handler))) {
+      if (
+        !selectedVersions.every(
+          (version) =>
+            Array.isArray(version.spec.handlers) && version.spec.handlers.includes(handler),
+        )
+      ) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
     }
@@ -489,16 +497,24 @@ async function workerDependents(
   return found;
 }
 
-async function selectedVersionsServe(
+/**
+ * Reads every selected version's current lifecycle state before a deployment
+ * mutation. The stored Resource status is the only readiness authority: a
+ * Ready condition must describe the current desired generation, and the UID
+ * must still be the incarnation pinned by the relation. The deletion
+ * attestation is the corresponding lifecycle authority; a pending attestation
+ * means an accepted delete is already removing that exact incarnation.
+ */
+async function readSelectedVersions(
   input: {
     readonly tenantId: string;
     readonly space: string;
-    readonly store: Pick<TakoformStore, "readResource">;
+    readonly store: Pick<TakoformStore, "readResource" | "readResourceDeletion">;
   },
   versions: readonly TakoformStoredRelation[],
-  handler: string,
-): Promise<boolean> {
-  if (versions.length === 0) return false;
+): Promise<readonly TakoformStoredResource[] | null> {
+  if (versions.length === 0) return null;
+  const selected: TakoformStoredResource[] = [];
   for (const relation of versions) {
     const version = await input.store.readResource({
       tenantId: input.tenantId,
@@ -507,16 +523,44 @@ async function selectedVersionsServe(
       kind: relation.targetKind,
       name: relation.targetName,
     });
-    if (
-      !version ||
-      version.metadata.uid !== relation.targetUid ||
-      !Array.isArray(version.spec.handlers) ||
-      !version.spec.handlers.includes(handler)
-    ) {
-      return false;
+    if (!version) {
+      throw crossResourcePrecondition({
+        details: { pointer: relation.pointer },
+        message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects is no longer present; restore it or select another WorkerVersion, then apply again`,
+      });
     }
+    if (version.metadata.uid !== relation.targetUid) {
+      throw crossResourcePrecondition({
+        details: { pointer: relation.pointer },
+        message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects was replaced; re-resolve it, then apply again`,
+      });
+    }
+    const deletion = await input.store.readResourceDeletion(input.tenantId, relation.targetUid);
+    if (deletion?.state === "pending") {
+      throw crossResourcePrecondition({
+        details: { pointer: relation.pointer },
+        message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects is being deleted; wait for its deletion to settle, then apply again`,
+      });
+    }
+    if (version.status.observedGeneration !== version.metadata.generation) {
+      throw crossResourcePrecondition({
+        details: { pointer: relation.pointer },
+        message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects is not Ready for generation ${version.metadata.generation}; wait until it is Ready, then apply again`,
+      });
+    }
+    if (
+      !version.status.conditions.some(
+        (condition) => condition.type === "Ready" && condition.status === "True",
+      )
+    ) {
+      throw crossResourcePrecondition({
+        details: { pointer: relation.pointer },
+        message: `the WorkerVersion ${relation.targetName} this WorkerDeployment selects is not Ready; wait until it is Ready, then apply again`,
+      });
+    }
+    selected.push(version);
   }
-  return true;
+  return selected;
 }
 
 function validateEnvironmentNamespace(spec: JsonObject): void {

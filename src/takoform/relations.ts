@@ -20,6 +20,8 @@ export interface TakoformStoredRelation {
   readonly targetKind: string;
   readonly targetName: string;
   readonly targetUid: string;
+  /** Internal lifecycle snapshot; absent only on relations persisted by an older Host. */
+  readonly targetRevision?: string;
   readonly targetFormRef: TakoformV1Alpha3FormRef;
   readonly bindingRef?: TakoformBindingRef;
 }
@@ -236,6 +238,7 @@ export async function resolveRelations(input: {
       targetKind: instance.targetKind,
       targetName: instance.targetName,
       targetUid: target.metadata.uid,
+      targetRevision: target.metadata.revision,
       targetFormRef: structuredClone(target.form.formRef),
       ...(bindingRef ? { bindingRef: structuredClone(bindingRef) } : {}),
     });

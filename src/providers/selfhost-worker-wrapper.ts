@@ -94,6 +94,12 @@ export const SELFHOST_WORKER_EDGE_SQL_BINDING_KIND = "edge.sql@1.0.0" as const;
  * Binding facade to hide.
  */
 export const SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND = "edge.objects@1.0.0" as const;
+/** The published fetch-only logical Worker binding. */
+export const SELFHOST_WORKER_SERVICE_BINDING_KIND = "worker.service@1.0.0" as const;
+/** Host-private signal used only between the service router and this wrapper. */
+export const SELFHOST_WORKER_SERVICE_UNAVAILABLE_HEADER =
+  "x-takoserver-selfhost-service-unavailable" as const;
+export const SELFHOST_WORKER_SERVICE_UNAVAILABLE_STATUS = 530 as const;
 
 /** Names reserved for this Host; a public binding may never start with it. */
 export const SELFHOST_WORKER_INTERNAL_BINDING_PREFIX = "__TAKOSERVER_" as const;
@@ -111,6 +117,12 @@ export const SELFHOST_WORKER_DATA_SERVICE_BINDING = "__TAKOSERVER_SELFHOST_DATA"
  * behind that, not the reason it is safe.
  */
 export const SELFHOST_WORKER_DATA_TOKEN_BINDING = "__TAKOSERVER_SELFHOST_DATA_TOKEN" as const;
+/** Runtime-private proof that the readiness request came from this Host. */
+const SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_BINDING =
+  "__TAKOSERVER_SELFHOST_RUNTIME_READINESS" as const;
+/** Request marker paired with the private raw binding above. */
+const SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_HEADER =
+  "x-takoserver-selfhost-runtime-readiness" as const;
 
 /** Module name the generated entrypoint is published under. */
 export const SELFHOST_WORKER_ENTRYPOINT_MODULE = "__takoserver-selfhost-entrypoint.js" as const;
@@ -278,9 +290,20 @@ export interface SelfhostWorkerDataBindingDescriptor {
   readonly publicName: string;
 }
 
+/** A native workerd service projected as the fetch-only portable facade. */
+export interface SelfhostWorkerServiceBindingDescriptor {
+  readonly kind: typeof SELFHOST_WORKER_SERVICE_BINDING_KIND;
+  readonly publicName: string;
+  /** Host-minted raw env name; tenant code only receives `publicName`. */
+  readonly internalName: string;
+  /** Per-Version marker unknown to the target and absent from active calls. */
+  readonly unavailableToken: string;
+}
+
 export type SelfhostWorkerBindingDescriptor =
   | SelfhostWorkerNativeBindingDescriptor
-  | SelfhostWorkerDataBindingDescriptor;
+  | SelfhostWorkerDataBindingDescriptor
+  | SelfhostWorkerServiceBindingDescriptor;
 
 export interface SelfhostWorkerEntrypointSourceInput {
   readonly originalMainModule: string;
@@ -325,6 +348,8 @@ const DATA_BINDING_KINDS = new Set<string>([
   SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
 ]);
+const INTERNAL_SERVICE_BINDING_NAME = /^__TAKOSERVER_SELFHOST_SERVICE_[0-9]{5}$/u;
+const UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
 const HANDLER_NAMES = new Set<string>(SELFHOST_WORKER_HANDLER_NAMES);
 
 /**
@@ -348,11 +373,11 @@ export function selfhostWorkerEntrypointSource(input: SelfhostWorkerEntrypointSo
   // not with a runtime error about a missing entrypoint.
   const handlers = [
     `  async fetch(request, rawEnv, rawContext) {
-    const answered = await safeReadiness(request);
+    const answered = await safeReadiness(request, rawEnv);
     if (answered) return answered;
 ${
   configuration.declaredHandlers.includes("fetch")
-    ? `    return await invoke("fetch", [request], rawEnv, rawContext);`
+    ? `    return await invokeFetch(request, rawEnv, rawContext);`
     : `    return statusResponse(404);`
 }
   },`,
@@ -484,6 +509,8 @@ const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
 const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)};
 const READINESS_RESULT_SCHEMA = ${JSON.stringify(SELFHOST_WORKER_READINESS_RESULT_SCHEMA)};
 const READINESS_HEADER = ${JSON.stringify(SELFHOST_WORKER_READINESS_HEADER)};
+const INTERNAL_READINESS_CAPABILITY_BINDING = ${JSON.stringify(SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_BINDING)};
+const INTERNAL_READINESS_CAPABILITY_HEADER = ${JSON.stringify(SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_HEADER)};
 const PUBLICATION = ${JSON.stringify(normalized.publication)};
 const PROBE_HOSTNAME = ${JSON.stringify(normalized.probeHostname)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
@@ -498,6 +525,9 @@ const OBJECT_REQUEST_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_REQUES
 const OBJECT_RESULT_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER)};
 const OBJECT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE)};
 const OBJECTS_KIND = ${JSON.stringify(SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND)};
+const SERVICE_KIND = ${JSON.stringify(SELFHOST_WORKER_SERVICE_BINDING_KIND)};
+const SERVICE_UNAVAILABLE_HEADER = ${JSON.stringify(SELFHOST_WORKER_SERVICE_UNAVAILABLE_HEADER)};
+const SERVICE_UNAVAILABLE_STATUS = ${SELFHOST_WORKER_SERVICE_UNAVAILABLE_STATUS};
 const MAX_OBJECT_DOCUMENT_BYTES = ${MAX_SELFHOST_OBJECT_DOCUMENT_BYTES};
 const EVENT_PATH = ${JSON.stringify(SELFHOST_WORKER_EVENT_PATH)};
 const EVENT_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_EVENT_PROTOCOL)};
@@ -571,6 +601,23 @@ async function invoke(handler, args, rawEnv, rawContext) {
   return await SafeApply(original.handlers[handler], original.target, [...args, env, context]);
 }
 
+async function invokeFetch(request, rawEnv, rawContext) {
+  const env = projectEnv(rawEnv);
+  const context = createPortableContext(rawContext);
+  // Loading and validating the tenant namespace remains outside the handler
+  // boundary. A malformed declaration must refuse publication rather than be
+  // mistaken for a valid module whose fetch happened to throw.
+  const original = await loadOriginal();
+  try {
+    return await SafeApply(original.handlers.fetch, original.target, [request, env, context]);
+  } catch {
+    // A service caller receives the callee's Host-generated 500 as a Response.
+    // Native workerd service bindings reject an isolate throw, so terminate
+    // the actual handler invocation before it crosses that binding.
+    return statusResponse(500);
+  }
+}
+
 function statusResponse(status) {
   return new SafeResponse(null, { status });
 }
@@ -594,9 +641,9 @@ function statusResponse(status) {
  * the handler — which the Host reads as "the runtime did not answer at all",
  * waits out the deadline for, and reports as retryable.
  */
-async function safeReadiness(request) {
+async function safeReadiness(request, rawEnv) {
   try {
-    return await readiness(request);
+    return await readiness(request, rawEnv);
   } catch {
     const answer = SafeObjectCreate(null);
     answer.schema = READINESS_RESULT_SCHEMA;
@@ -610,23 +657,38 @@ async function safeReadiness(request) {
   }
 }
 
-async function readiness(request) {
-  let asked = false;
+async function readiness(request, rawEnv) {
+  let headers;
+  let capability;
   try {
-    const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
-    if (SafeApply(SafeURLPathnameGet, url, []) !== READINESS_PATH) return undefined;
-    if (SafeApply(SafeRequestMethodGet, request, []) !== "POST") return undefined;
-    const headers = SafeApply(SafeRequestHeadersGet, request, []);
-    if (SafeApply(SafeHeadersGet, headers, [READINESS_HEADER]) !== READINESS_PROTOCOL) {
-      return undefined;
-    }
-    // Whether this Host asked, as opposed to the internet. Every hostname the
-    // publication claims reaches this same service, so the route answers
-    // publicly; only the probe's own address distinguishes the Host's question,
-    // and it is the one thing about a request that tenant code cannot supply.
-    asked = SafeApply(SafeURLHostnameGet, url, []) === PROBE_HOSTNAME;
+    headers = SafeApply(SafeRequestHeadersGet, request, []);
+    capability = SafeApply(SafeHeadersGet, headers, [INTERNAL_READINESS_CAPABILITY_HEADER]);
   } catch {
     return undefined;
+  }
+  // Without the Host-private marker this is an ordinary tenant request, even
+  // when its public method, path, and protocol header resemble readiness.
+  if (capability === null) return undefined;
+  try {
+    const expected = SafeApply(SafeReflectGet, SafeReflect, [
+      rawEnv,
+      INTERNAL_READINESS_CAPABILITY_BINDING,
+    ]);
+    const url = new SafeURL(SafeApply(SafeRequestUrlGet, request, []));
+    if (
+      typeof expected !== "string" ||
+      capability !== expected ||
+      SafeApply(SafeURLHostnameGet, url, []) !== PROBE_HOSTNAME ||
+      SafeApply(SafeURLPathnameGet, url, []) !== READINESS_PATH ||
+      SafeApply(SafeRequestMethodGet, request, []) !== "POST" ||
+      SafeApply(SafeHeadersGet, headers, [READINESS_HEADER]) !== READINESS_PROTOCOL
+    ) {
+      return statusResponse(404);
+    }
+  } catch {
+    // A same-named marker is Host-private. Never pass even a malformed guess
+    // through to tenant code or turn it into a detailed readiness response.
+    return statusResponse(404);
   }
   const answer = SafeObjectCreate(null);
   answer.schema = READINESS_RESULT_SCHEMA;
@@ -641,15 +703,12 @@ async function readiness(request) {
     // or a getter can throw here. A refusal this Host cannot describe is still
     // a refusal, and it must not become "the runtime did not answer", which is
     // retryable and costs the whole probe deadline on every attempt.
-    // The refusal is public; what the module said about it is not. A module
-    // specifier or a source path is the bundle's business and the operator's,
-    // not something to hand to anyone who can reach the Worker's address.
-    if (asked) {
-      try {
-        answer.failure = describeLoadFailure(error);
-      } catch {
-        answer.failure = unknownLoadFailure();
-      }
+    // Only this Host can reach this branch. A module specifier or source path
+    // remains private to its authenticated publication probe.
+    try {
+      answer.failure = describeLoadFailure(error);
+    } catch {
+      answer.failure = unknownLoadFailure();
     }
   }
   return new SafeResponse(SafeJSONStringify(answer), {
@@ -732,6 +791,10 @@ function sealGeneratedConfiguration(raw) {
     if (SafeObjectHasOwn(source, "kind")) {
       descriptor.kind = source.kind;
       descriptor.publicName = source.publicName;
+      if (source.kind === SERVICE_KIND) {
+        descriptor.internalName = source.internalName;
+        descriptor.unavailableToken = source.unavailableToken;
+      }
     } else {
       descriptor.name = source.name;
       descriptor.type = source.type;
@@ -841,6 +904,10 @@ function projectEnv(rawEnv) {
   for (let index = 0; index < CONFIGURATION.bindings.length; index += 1) {
     const descriptor = CONFIGURATION.bindings[index];
     if (SafeObjectHasOwn(descriptor, "kind")) {
+      if (descriptor.kind === SERVICE_KIND) {
+        projected[descriptor.publicName] = createServiceAdapter(rawEnv, descriptor);
+        continue;
+      }
       // The object facade streams, so it has a caller of its own: everything
       // else on this seam is one JSON envelope in and one out.
       if (descriptor.kind === OBJECTS_KIND) {
@@ -862,6 +929,42 @@ function projectEnv(rawEnv) {
     projected[descriptor.name] = rawEnv[descriptor.name];
   }
   return projected;
+}
+
+/**
+ * worker.service@1.0.0: one method and no provider-native surface.
+ *
+ * Request construction and response transport stay native to workerd, so both
+ * bodies remain streams. The private router resolves a current target response
+ * as-is. Only its unforgeable per-Version absence marker becomes the portable
+ * backend_unavailable rejection; a callee's ordinary 500 remains a resolved
+ * Response.
+ */
+function createServiceAdapter(rawEnv, descriptor) {
+  const service = rawEnv[descriptor.internalName];
+  const nativeFetch = service && service.fetch;
+  const portable = SafeObjectCreate(null);
+  portable.fetch = async function(input, init) {
+    if (!service || typeof nativeFetch !== "function") throw portableError("backend_unavailable");
+    // Native rejection is part of fetch transport: cancellation and stream
+    // aborts must reach the caller as themselves. Static undispatchability is
+    // represented only by the authenticated router response below.
+    const response = await SafeApply(nativeFetch, service, [input, init]);
+    let unavailable = false;
+    try {
+      const status = SafeApply(SafeResponseStatusGet, response, []);
+      const headers = SafeApply(SafeResponseHeadersGet, response, []);
+      unavailable =
+        status === SERVICE_UNAVAILABLE_STATUS &&
+        SafeApply(SafeHeadersGet, headers, [SERVICE_UNAVAILABLE_HEADER]) ===
+          descriptor.unavailableToken;
+    } catch {
+      throw portableError("backend_unavailable");
+    }
+    if (unavailable) throw portableError("backend_unavailable");
+    return response;
+  };
+  return SafeApply(SafeObjectFreeze, SafeObject, [portable]);
 }
 
 function createPortableContext(rawContext) {
@@ -2547,6 +2650,29 @@ function normalizeSourceInput(input: SelfhostWorkerEntrypointSourceInput): {
   for (const bindingInput of bindingInputs) {
     const binding = dataProperties(bindingInput, "bindings");
     if (Object.hasOwn(binding, "kind")) {
+      if (binding.kind === SELFHOST_WORKER_SERVICE_BINDING_KIND) {
+        exactNormalizedKeys(
+          binding,
+          ["kind", "publicName", "internalName", "unavailableToken"],
+          "bindings",
+        );
+        validatePublicName(binding.publicName, publicNames, false);
+        if (
+          typeof binding.internalName !== "string" ||
+          !INTERNAL_SERVICE_BINDING_NAME.test(binding.internalName) ||
+          typeof binding.unavailableToken !== "string" ||
+          !UNAVAILABLE_TOKEN.test(binding.unavailableToken)
+        ) {
+          invalid("bindings");
+        }
+        bindings.push({
+          kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
+          publicName: binding.publicName as string,
+          internalName: binding.internalName,
+          unavailableToken: binding.unavailableToken,
+        });
+        continue;
+      }
       exactNormalizedKeys(binding, ["kind", "publicName"], "bindings");
       if (typeof binding.kind !== "string" || !DATA_BINDING_KINDS.has(binding.kind)) {
         invalid("bindings");

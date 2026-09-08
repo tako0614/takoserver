@@ -7,6 +7,11 @@ import {
   createSelfhostScriptStateStore,
   nodeSelfhostScriptStateFileSystem,
 } from "../src/providers/selfhost-script-state.ts";
+import {
+  canonicalSelfhostWeightedVersions,
+  randomSelfhostDeploymentBasisPoint,
+  selectSelfhostWeightedVersion,
+} from "../src/selfhost-weighted-deployment.ts";
 
 let root: string;
 
@@ -19,6 +24,67 @@ afterEach(() => {
 });
 
 describe("self-host Worker script state", () => {
+  test("persists one canonical weighted deployment and selects exact basis-point boundaries", async () => {
+    const store = createSelfhostScriptStateStore({ root });
+    const written = await store.write("script-one", null, {
+      deployment: {
+        versions: [
+          { versionId: "v-b", workerVersionUid: "uid-version-b", weight: 9_999 },
+          { versionId: "v-a", workerVersionUid: "uid-version-a", weight: 1 },
+        ],
+      },
+      domains: [],
+    });
+
+    expect(written.state.deployment?.versions).toEqual([
+      { versionId: "v-a", workerVersionUid: "uid-version-a", weight: 1 },
+      { versionId: "v-b", workerVersionUid: "uid-version-b", weight: 9_999 },
+    ]);
+    const restarted = await createSelfhostScriptStateStore({ root }).read("script-one");
+    const versions = restarted.state.deployment?.versions ?? [];
+    expect(selectSelfhostWeightedVersion(versions, 0).versionId).toBe("v-a");
+    expect(selectSelfhostWeightedVersion(versions, 1).versionId).toBe("v-b");
+    expect(selectSelfhostWeightedVersion(versions, 9_999).versionId).toBe("v-b");
+  });
+
+  test("rejects duplicate identities, invalid totals, and conflicting legacy deployment shapes", async () => {
+    expect(() =>
+      canonicalSelfhostWeightedVersions([
+        { versionId: "v-a", workerVersionUid: "uid-version-a", weight: 5_000 },
+        { versionId: "v-b", workerVersionUid: "uid-version-a", weight: 5_000 },
+      ]),
+    ).toThrow();
+    expect(() =>
+      canonicalSelfhostWeightedVersions([
+        { versionId: "v-a", workerVersionUid: "uid-version-a", weight: 9_999 },
+      ]),
+    ).toThrow();
+
+    await mkdir(root, { recursive: true });
+    const path = join(root, "script-one.json");
+    await writeFile(
+      path,
+      JSON.stringify({
+        activeVersion: "v-a",
+        deployment: {
+          versions: [{ versionId: "v-a", workerVersionUid: "uid-version-a", weight: 10_000 }],
+        },
+        domains: [],
+      }),
+      "utf8",
+    );
+    await expect(createSelfhostScriptStateStore({ root }).read("script-one")).rejects.toMatchObject(
+      {
+        code: "corrupt",
+      },
+    );
+  });
+
+  test("draws an unbiased basis point by rejecting the uint32 remainder", () => {
+    const values = [4_294_960_000, 10_001];
+    expect(randomSelfhostDeploymentBasisPoint(() => values.shift() as number)).toBe(1);
+  });
+
   test("round-trips native and portable queue identities across restart", async () => {
     const firstProcess = createSelfhostScriptStateStore({ root });
     await firstProcess.write("script-one", null, {

@@ -1,11 +1,20 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
-import { existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
+import { selfhostDatabasePath } from "../src/providers/selfhost.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
@@ -804,15 +813,92 @@ test("the sweep reclaims expired rows and nothing else, in bounded batches", asy
   });
 });
 
-test("forgetting a database drops the handle rather than the file", async () => {
+test("deleting a database closes its handle and removes its file and sidecars", async () => {
   provisionFixture("CREATE TABLE t (id INTEGER)");
   await db({ op: "execute", statement: { sql: "INSERT INTO t VALUES (1)" } });
-  planes.maintenance.forgetDatabase("tsdb-alpha");
-  // Reopened on the next request, so a database deleted and declared again
-  // under the same name is never served through a handle on the old inode.
-  expect(
-    value((await db({ op: "query", statement: { sql: "SELECT count(*) AS n FROM t" } })).envelope),
-  ).toEqual({ rows: [{ n: 1 }], rowsWritten: 0 });
+  const path = join(root, "tsdb-alpha.sqlite");
+  fixture?.close();
+  fixture = undefined;
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    writeFileSync(`${path}${suffix}`, "stale-sidecar");
+  }
+  expect(existsSync(path)).toBe(true);
+  expect(["-wal", "-shm", "-journal"].every((suffix) => existsSync(`${path}${suffix}`))).toBe(true);
+  planes.maintenance.deleteDatabase("tsdb-alpha");
+  expect(existsSync(path)).toBe(false);
+  expect(["-wal", "-shm", "-journal"].every((suffix) => existsSync(`${path}${suffix}`))).toBe(
+    false,
+  );
+  // A retry after a completed deletion is an absence acknowledgement, not a
+  // second mutation and not a reason to sweep any neighboring database.
+  planes.maintenance.deleteDatabase("tsdb-alpha");
+  expect(existsSync(path)).toBe(false);
+});
+
+test("database deletion refuses malformed names and non-regular paths", () => {
+  expect(() => planes.maintenance.deleteDatabase("../outside")).toThrow();
+  const path = join(root, "tsdb-alpha.sqlite");
+  mkdirSync(path);
+  expect(() => planes.maintenance.deleteDatabase("tsdb-alpha")).toThrow();
+  expect(existsSync(path)).toBe(true);
+  rmSync(path, { recursive: true, force: true });
+});
+
+test("a relative self-host data root opens and deletes SQLite files by its absolute path", async () => {
+  const relativeRoot = mkdtempSync(join(".", ".takoserver-relative-"));
+  const localSql = createEphemeralSql();
+  const localGrant: SelfhostDataPlaneGrant = {
+    ...ALPHA,
+    sql: { DB: "tsdb-relative" },
+  };
+  const localPlanes = createSelfhostDataPlanes({
+    sql: localSql,
+    grant: async () => localGrant,
+    databasePath: (name) => selfhostDatabasePath(relativeRoot, name),
+    objectRoot: join(relativeRoot, "objects"),
+    clock: () => now,
+  });
+  try {
+    const configuredPath = selfhostDatabasePath(relativeRoot, "tsdb-relative");
+    const path = resolve(configuredPath);
+    expect(configuredPath.startsWith("/")).toBe(false);
+    mkdirSync(join(relativeRoot, "databases"), { recursive: true });
+    const seeded = new Database(path);
+    seeded.exec("CREATE TABLE relative_root (id INTEGER PRIMARY KEY)");
+    seeded.close();
+    const body = JSON.stringify({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "DB",
+      op: "execute",
+      statement: { sql: "INSERT INTO relative_root DEFAULT VALUES" },
+    });
+    const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer alpha.v1.${ALPHA.secret}`,
+        "content-type": "application/json",
+        "content-length": String(new TextEncoder().encode(body).byteLength),
+      },
+      body,
+    });
+    const response = await localPlanes.routes(request, new URL(request.url));
+    expect(response?.status).toBe(200);
+    expect((await response?.json()) as Record<string, unknown>).toMatchObject({ ok: true });
+
+    expect(existsSync(path)).toBe(true);
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      writeFileSync(`${path}${suffix}`, "stale-sidecar");
+    }
+    localPlanes.maintenance.deleteDatabase("tsdb-relative");
+    expect(path.startsWith("/")).toBe(true);
+    expect(existsSync(path)).toBe(false);
+    expect(["-wal", "-shm", "-journal"].every((suffix) => existsSync(`${path}${suffix}`))).toBe(
+      false,
+    );
+    localPlanes.maintenance.deleteDatabase("tsdb-relative");
+  } finally {
+    rmSync(relativeRoot, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

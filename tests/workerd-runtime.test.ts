@@ -1,10 +1,18 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { chmod, mkdir, readFile, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { bytesDigest } from "../src/json.ts";
-import { createWorkerdRuntime, type WorkerdBinding } from "../src/workerd-runtime.ts";
+import {
+  createWorkerdRuntime,
+  DEPLOYMENT_ROUTER_SOURCE,
+  ROUTER_SOURCE,
+  readWorkerdActiveDeployment,
+  type WorkerdBinding,
+  type WorkerdDeploymentPublication,
+} from "../src/workerd-runtime.ts";
 
 /**
  * The generated configuration is assembled by concatenating strings, and the
@@ -24,6 +32,144 @@ afterEach(() => {
 });
 
 const MODULES = new Map([["index.js", new TextEncoder().encode("export default {}")]]);
+
+const HOST_ENTRYPOINT = "__takoserver-host.js";
+
+function weightedPublication(
+  name: string,
+  generation: string,
+  weights: readonly [number, number] = [1, 9_999],
+): WorkerdDeploymentPublication {
+  const version = (suffix: "a" | "b", weight: number) => ({
+    versionId: `${name}-v-${suffix}`,
+    workerVersionUid: `uid-WorkerVersion-${name}-${suffix}`,
+    weight,
+    site: {
+      directory: name,
+      mainModule: "index.js",
+      hostEntrypoint: HOST_ENTRYPOINT,
+      hostnames: [],
+      generation,
+      workerResourceUid: `uid-ModuleWorker-${name}`,
+      fetchHandler: true,
+    },
+    modules: new Map([
+      [
+        "index.js",
+        new TextEncoder().encode(
+          `export default { fetch() { return new Response(${JSON.stringify(`${name}-${suffix}`)}); } };`,
+        ),
+      ],
+    ]),
+    hostModules: new Map([
+      [HOST_ENTRYPOINT, new TextEncoder().encode('export { default } from "./index.js";')],
+    ]),
+  });
+  return {
+    generation,
+    workerResourceUid: `uid-ModuleWorker-${name}`,
+    hostnames: [`${name}.localhost`],
+    // Declaration order is intentionally not canonical. The durable manifest
+    // and routing table must use the one shared WorkerVersion UID comparator.
+    versions: [version("b", weights[1]), version("a", weights[0])],
+  };
+}
+
+function deferred(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function configRoutes(config: string): Readonly<Record<string, string>> {
+  const literal = /\(name = "ROUTES", text = ("(?:[^"\\]|\\.)*")\)/u.exec(config)?.[1];
+  if (!literal) throw new Error("missing runtime route table");
+  return JSON.parse(JSON.parse(literal)) as Record<string, string>;
+}
+
+function configTextRecord(config: string, binding: string): Readonly<Record<string, string>> {
+  const literal = new RegExp(
+    `\\(name = ${JSON.stringify(binding)}, text = ("(?:[^"\\\\]|\\\\.)*")\\)`,
+    "u",
+  ).exec(config)?.[1];
+  if (!literal) throw new Error(`missing ${binding} binding`);
+  return JSON.parse(JSON.parse(literal)) as Record<string, string>;
+}
+
+function withoutPrivateRuntimeTokens(config: string): string {
+  return config.replace(
+    /(name = "(?:CONFIG_PROBE_TOKEN|INTERNAL_READINESS_CAPABILITY)", text = ")[0-9a-f]{64}"/gu,
+    '$1<private-runtime-token>"',
+  );
+}
+
+interface GeneratedFetchWorker {
+  fetch(request: Request, env: Record<string, unknown>): Promise<Response>;
+}
+
+async function generatedFetchWorker(source: string, name: string): Promise<GeneratedFetchWorker> {
+  const path = join(root, name);
+  await writeFile(path, source, "utf8");
+  const loaded = (await import(`${pathToFileURL(path).href}?test=${crypto.randomUUID()}`)) as {
+    readonly default: GeneratedFetchWorker;
+  };
+  return loaded.default;
+}
+
+function createConfigProbe(): {
+  readonly port: number;
+  readonly onReload: (path: string) => Promise<void>;
+  behavior: ((config: string, invocation: number) => void | Promise<void>) | undefined;
+  stop(): void;
+} {
+  let serving: { readonly identity: string; readonly token: string } | null = null;
+  let invocation = 0;
+  const result = {
+    port: 0,
+    behavior: undefined as
+      | ((config: string, invocation: number) => void | Promise<void>)
+      | undefined,
+    async onReload(path: string) {
+      const config = await readFile(path, "utf8");
+      const identity = /\(name = "CONFIG_IDENTITY", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+      const token = /\(name = "CONFIG_PROBE_TOKEN", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+      if (!identity || !token) throw new Error("invalid config probe declaration");
+      serving = { identity, token };
+      invocation += 1;
+      await result.behavior?.(config, invocation);
+    },
+    stop() {
+      server.stop(true);
+    },
+  };
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (
+        serving === null ||
+        request.method !== "POST" ||
+        request.headers.get("host") !== "runtime.selfhost-config.invalid" ||
+        url.pathname !== "/.well-known/takoserver/selfhost-runtime-config/v1" ||
+        request.headers.get("x-takoserver-selfhost-runtime-config") !== serving?.token
+      ) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "x-takoserver-selfhost-config-identity": serving.identity,
+        },
+      });
+    },
+  });
+  if (server.port === undefined) throw new Error("config probe did not bind a port");
+  result.port = server.port;
+  return result;
+}
 
 test("renders separate application and Host-private identities even under the same name", async () => {
   const sharedName = "__takoserver-selfhost-entrypoint.js";
@@ -64,6 +210,37 @@ test("renders separate application and Host-private identities even under the sa
   expect([
     ...(await readFile(join(root, "workers", "site", "host-private", "module-00000"))),
   ]).toEqual([...hostSource]);
+});
+
+test("renders retained scalar readiness as one private Host capability route", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  await runtime.write(
+    "site",
+    {
+      directory: "site",
+      mainModule: "index.js",
+      hostEntrypoint: HOST_ENTRYPOINT,
+      hostnames: ["site.localhost"],
+      generation: "scalar-generation",
+    },
+    MODULES,
+    undefined,
+    new Map([[HOST_ENTRYPOINT, new TextEncoder().encode('export { default } from "./index.js";')]]),
+  );
+  await runtime.reload();
+
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(configTextRecord(config, "INTERNAL_READINESS_ROUTES")).toEqual({
+    "site.selfhost-internal.invalid": "site",
+  });
+  const entrypointCapability =
+    /\(name = "__TAKOSERVER_SELFHOST_RUNTIME_READINESS", text = "([0-9a-f]{64})"\)/u.exec(
+      config,
+    )?.[1];
+  const routerCapability =
+    /\(name = "INTERNAL_READINESS_CAPABILITY", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+  expect(entrypointCapability).toBeDefined();
+  expect(entrypointCapability).toBe(routerCapability);
 });
 
 test("module inspection uses the selected serving binary without a package fallback", async () => {
@@ -654,7 +831,7 @@ test("renders text and json bindings the module can read", async () => {
 test("a script that declares no binding does not invent one", async () => {
   const without = await publish();
   const empty = await publish([]);
-  expect(empty).toBe(without);
+  expect(withoutPrivateRuntimeTokens(empty)).toBe(withoutPrivateRuntimeTokens(without));
   // The script's own service block, as distinct from the router's, still names
   // no bindings at all.
   expect(without).toContain(
@@ -792,35 +969,48 @@ test("tightens a scripts tree an older tree left group- or world-readable", asyn
  * and renders the configuration again for them.
  */
 test("restores the runtime from what a previous process published", async () => {
-  const published = createWorkerdRuntime({ root, isReady: () => true });
-  await published.write(
-    "site",
-    {
-      directory: "site",
-      mainModule: "index.js",
-      hostnames: ["site.localhost"],
-      generation: "gen-1",
-    },
-    MODULES,
-  );
-  await published.reload();
-  const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  const probe = createConfigProbe();
+  try {
+    const published = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    await published.write(
+      "site",
+      {
+        directory: "site",
+        mainModule: "index.js",
+        hostnames: ["site.localhost"],
+        generation: "gen-1",
+      },
+      MODULES,
+    );
+    await published.reload();
+    const before = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
 
-  // The next process: a new runtime over the same data directory, told nothing.
-  const reloaded: string[] = [];
-  const restarted = createWorkerdRuntime({
-    root,
-    isReady: () => true,
-    onReload: async (configPath) => {
-      reloaded.push(configPath);
-    },
-  });
-  expect(await restarted.restore()).toEqual(["site"]);
-  // The runtime was actually started, against the configuration this build
-  // renders rather than whichever one happened to be on disk.
-  expect(reloaded).toEqual([join(root, "workers", "workerd.capnp")]);
-  expect(await readFile(join(root, "workers", "workerd.capnp"), "utf8")).toBe(before);
-  expect(await restarted.has("site", "gen-1")).toBe(true);
+    // The next process: a new runtime over the same data directory, told nothing.
+    const reloaded: string[] = [];
+    const restarted = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: async (configPath) => {
+        reloaded.push(configPath);
+        await probe.onReload(configPath);
+      },
+    });
+    expect(await restarted.restore()).toEqual(["site"]);
+    // The runtime was actually started, against the configuration this build
+    // renders rather than whichever one happened to be on disk.
+    expect(reloaded).toEqual([join(root, "workers", "workerd.capnp")]);
+    const after = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(withoutPrivateRuntimeTokens(after)).toBe(withoutPrivateRuntimeTokens(before));
+    expect(await restarted.has("site", "gen-1")).toBe(true);
+  } finally {
+    probe.stop();
+  }
 });
 
 test("starts nothing on a machine that has published no Worker", async () => {
@@ -837,4 +1027,408 @@ test("starts nothing on a machine that has published no Worker", async () => {
   // Worker must not be given a workerd to run one in.
   expect(reloaded).toEqual([]);
   await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).rejects.toThrow();
+});
+
+test("keeps weighted readiness private from public and service-binding requests", async () => {
+  const outer = await generatedFetchWorker(ROUTER_SOURCE, "generated-router.mjs");
+  const deployment = await generatedFetchWorker(
+    DEPLOYMENT_ROUTER_SOURCE,
+    "generated-deployment-router.mjs",
+  );
+  const capabilityHeader = "x-takoserver-selfhost-runtime-readiness";
+  const capability = "f".repeat(64);
+  const tenantRequests: Request[] = [];
+  const readinessRequests: Request[] = [];
+  const tenant = (name: string) => ({
+    async fetch(request: Request) {
+      tenantRequests.push(request);
+      return new Response(`${name}:${await request.text()}`);
+    },
+  });
+  const ready = (publication: string) => ({
+    async fetch(request: Request) {
+      readinessRequests.push(request);
+      return Response.json({
+        schema: "takoserver.selfhost-worker-readiness-result@v1",
+        publication,
+      });
+    },
+  });
+  const deploymentEnv = {
+    INTERNAL_HOSTNAME: "site.selfhost-internal.invalid",
+    INTERNAL_READINESS_CAPABILITY: capability,
+    PUBLICATION: "logical-publication",
+    VERSIONS: [
+      {
+        binding: "VERSION_00000",
+        readinessBinding: "READINESS_00000",
+        versionId: "version-a",
+        weight: 1,
+      },
+      {
+        binding: "VERSION_00001",
+        readinessBinding: "READINESS_00001",
+        versionId: "version-b",
+        weight: 9_999,
+      },
+    ],
+    VERSION_00000: tenant("a"),
+    VERSION_00001: tenant("b"),
+    READINESS_00000: ready("version-a"),
+    READINESS_00001: ready("version-b"),
+  };
+  const logical = {
+    fetch: (request: Request) => deployment.fetch(request, deploymentEnv),
+  };
+  const outerEnv = {
+    CONFIG_IDENTITY: "identity",
+    CONFIG_PROBE_TOKEN: "",
+    INTERNAL_READINESS_CAPABILITY: capability,
+    INTERNAL_READINESS_ROUTES: JSON.stringify({
+      "site.selfhost-internal.invalid": "logical",
+    }),
+    ROUTES: JSON.stringify({
+      "customer.test": "logical",
+      "site.selfhost-internal.invalid": "logical",
+    }),
+    logical,
+  };
+  const magicHeaders = {
+    "x-takoserver-selfhost-readiness": "takoserver.selfhost-worker-readiness@v1",
+  };
+  const path = "/.well-known/takoserver/selfhost-worker-readiness/v1";
+
+  // A public endpoint request with the reserved method/path/header remains an
+  // ordinary tenant fetch and samples exactly one Version.
+  const publicAnswer = await outer.fetch(
+    new Request(`https://customer.test${path}`, {
+      method: "POST",
+      headers: magicHeaders,
+      body: "public",
+    }),
+    outerEnv,
+  );
+  expect(await publicAnswer.text()).toMatch(/^[ab]:public$/u);
+  expect(tenantRequests).toHaveLength(1);
+  expect(readinessRequests).toHaveLength(0);
+  expect(tenantRequests[0]?.headers.get(capabilityHeader)).toBeNull();
+
+  // A worker.service caller reaches the deployment router directly and can
+  // spoof its URL and public headers, but not this Host's private capability.
+  const serviceAnswer = await deployment.fetch(
+    new Request(`https://site.selfhost-internal.invalid${path}`, {
+      method: "POST",
+      headers: magicHeaders,
+      body: "service",
+    }),
+    deploymentEnv,
+  );
+  expect(await serviceAnswer.text()).toMatch(/^[ab]:service$/u);
+  expect(tenantRequests).toHaveLength(2);
+  expect(readinessRequests).toHaveLength(0);
+  expect(tenantRequests[1]?.headers.get(capabilityHeader)).toBeNull();
+
+  const guessedServiceAnswer = await deployment.fetch(
+    new Request(`https://site.selfhost-internal.invalid${path}`, {
+      method: "POST",
+      headers: { ...magicHeaders, [capabilityHeader]: "not-the-capability" },
+    }),
+    deploymentEnv,
+  );
+  expect(guessedServiceAnswer.status).toBe(404);
+  expect(tenantRequests).toHaveLength(2);
+  expect(readinessRequests).toHaveLength(0);
+
+  // Only the loopback runtime probe supplies the private marker on the exact
+  // Host-owned route. That one question fans out across every Version.
+  const internalAnswer = await outer.fetch(
+    new Request(`https://site.selfhost-internal.invalid${path}`, {
+      method: "POST",
+      headers: { ...magicHeaders, [capabilityHeader]: capability },
+      body: "internal",
+    }),
+    outerEnv,
+  );
+  expect(internalAnswer.status).toBe(200);
+  expect(await internalAnswer.json()).toEqual({
+    schema: "takoserver.selfhost-worker-readiness-result@v1",
+    publication: "logical-publication",
+  });
+  expect(tenantRequests).toHaveLength(2);
+  expect(readinessRequests).toHaveLength(2);
+});
+
+test("publishes one canonical immutable weighted graph and retains old generations", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+
+  const pointerPath = join(root, "workers", "site", "takoserver-site.json");
+  const firstPointer = JSON.parse(await readFile(pointerPath, "utf8")) as {
+    generation: string;
+    generationKey: string;
+  };
+  const firstRoot = join(root, "workers", ".publications", "site", firstPointer.generationKey);
+  const firstManifest = await readFile(join(firstRoot, "deployment.json"), "utf8");
+  const parsed = JSON.parse(firstManifest) as {
+    versions: Array<{ versionId: string; workerVersionUid: string; weight: number }>;
+  };
+  expect(parsed.versions.map(({ workerVersionUid }) => workerVersionUid)).toEqual([
+    "uid-WorkerVersion-site-a",
+    "uid-WorkerVersion-site-b",
+  ]);
+  expect(parsed.versions.map(({ versionId, weight }) => ({ versionId, weight }))).toEqual([
+    { versionId: "site-v-a", weight: 1 },
+    { versionId: "site-v-b", weight: 9_999 },
+  ]);
+  const firstModule = await readFile(
+    join(firstRoot, "version-00000", "application", "module-00000"),
+  );
+  const firstConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(configRoutes(firstConfig)).toMatchObject({
+    "site.localhost": "site-selfhost-deployment",
+  });
+  expect(firstConfig).toContain('(name = "VERSIONS", json =');
+  expect(configRoutes(firstConfig)["site.localhost"]).not.toStartWith("selfhost-version-");
+
+  await runtime.publish("site", weightedPublication("site", "generation-2", [10_000 - 1, 1]));
+  const secondPointer = JSON.parse(await readFile(pointerPath, "utf8")) as {
+    generation: string;
+    generationKey: string;
+  };
+  expect(secondPointer.generation).toBe("generation-2");
+  expect(secondPointer.generationKey).not.toBe(firstPointer.generationKey);
+  expect(await readFile(join(firstRoot, "deployment.json"), "utf8")).toBe(firstManifest);
+  expect(await readFile(join(firstRoot, "version-00000", "application", "module-00000"))).toEqual(
+    firstModule,
+  );
+
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["site"]);
+  expect(await restarted.has("site", "generation-2")).toBe(true);
+  await runtime.publish("site", null);
+  await expect(readFile(pointerPath, "utf8")).rejects.toThrow();
+  // Deactivation removes only the stable pointer. The immutable payload may
+  // still back an in-flight request and has no safe eager-GC process boundary.
+  expect(await readFile(join(firstRoot, "deployment.json"), "utf8")).toBe(firstManifest);
+});
+
+test("rejects a bad later weighted variant before staging any publication", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const publication = weightedPublication("site", "generation-bad");
+  const broken: WorkerdDeploymentPublication = {
+    ...publication,
+    versions: publication.versions.map((version, index) =>
+      index === 1 ? { ...version, modules: new Map() } : version,
+    ),
+  };
+  await expect(runtime.publish("site", broken)).rejects.toThrow(
+    "unusable application worker module snapshot",
+  );
+  await expect(
+    readFile(join(root, "workers", "site", "takoserver-site.json"), "utf8"),
+  ).rejects.toThrow();
+  await expect(
+    readFile(join(root, "workers", ".publications", "site", "deployment.json"), "utf8"),
+  ).rejects.toThrow();
+  await expect(readFile(join(root, "workers", "workerd.capnp"), "utf8")).rejects.toThrow();
+});
+
+test("restores and proves the prior graph when a watcher loaded a failed activation", async () => {
+  const probe = createConfigProbe();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    const pointerPath = join(root, "workers", "site", "takoserver-site.json");
+    const beforePointer = await readFile(pointerPath, "utf8");
+    const beforeConfig = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    probe.behavior = (_config, invocation) => {
+      // The emulator has already made the new graph live. A throwing hook is
+      // therefore not evidence that workerd stayed on the old graph.
+      if (invocation === 2) throw new Error("reload acknowledgement failed");
+    };
+
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-2", [9_999, 1])),
+    ).rejects.toThrow("reload acknowledgement failed");
+    expect(await readFile(pointerPath, "utf8")).toBe(beforePointer);
+    // The private probe token is stable for this runtime, so exact graph
+    // rollback restores byte-for-byte configuration as well as the pointer.
+    expect(await readFile(join(root, "workers", "workerd.capnp"), "utf8")).toBe(beforeConfig);
+    expect(await runtime.has("site", "generation-1")).toBe(true);
+    expect(await runtime.has("site", "generation-2")).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("event readback is indeterminate while a weighted graph crosses its pointer", async () => {
+  const probe = createConfigProbe();
+  const loaded = deferred();
+  const release = deferred();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    probe.behavior = async (_config, invocation) => {
+      if (invocation !== 2) return;
+      loaded.resolve();
+      await release.promise;
+    };
+
+    const publishing = runtime.publish(
+      "site",
+      weightedPublication("site", "generation-2", [9_999, 1]),
+    );
+    await loaded.promise;
+    expect(await readWorkerdActiveDeployment(root, "site")).toBeNull();
+    release.resolve();
+    await publishing;
+    expect(await readWorkerdActiveDeployment(root, "site")).toMatchObject({
+      generation: "generation-2",
+      versions: [
+        { workerVersionUid: "uid-WorkerVersion-site-a", weight: 9_999 },
+        { workerVersionUid: "uid-WorkerVersion-site-b", weight: 1 },
+      ],
+    });
+  } finally {
+    release.resolve();
+    probe.stop();
+  }
+});
+
+test("clears activation truth when neither the forward nor rollback graph is proven", async () => {
+  const probe = createConfigProbe();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    probe.behavior = (_config, invocation) => {
+      if (invocation >= 2) throw new Error("watcher state is unknown");
+    };
+
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-2", [9_999, 1])),
+    ).rejects.toThrow("worker runtime activation state is unknown");
+    expect(
+      JSON.parse(await readFile(join(root, "workers", ".takoserver-active.json"), "utf8")),
+    ).toEqual({});
+    expect(await runtime.has("site", "generation-1")).toBe(false);
+    expect(await runtime.has("site", "generation-2")).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("derives rollback markers from the exact graph proved after a stale-marker restart", async () => {
+  const probe = createConfigProbe();
+  try {
+    const published = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!published.publish) throw new Error("weighted publication is unavailable");
+    await published.publish("site", weightedPublication("site", "generation-1"));
+    await published.publish("site", weightedPublication("site", "generation-2", [9_999, 1]));
+    // Exact crash window: the stable pointer names generation 2, while the
+    // marker still contains the last generation whose receipt was durable.
+    await Bun.write(
+      join(root, "workers", ".takoserver-active.json"),
+      JSON.stringify({ site: "generation-1" }),
+    );
+    let failForward = true;
+    probe.behavior = () => {
+      if (failForward) {
+        failForward = false;
+        throw new Error("restore acknowledgement failed after load");
+      }
+    };
+
+    const restarted = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    await expect(restarted.restore()).rejects.toThrow("restore acknowledgement failed after load");
+    expect(
+      JSON.parse(await readFile(join(root, "workers", ".takoserver-active.json"), "utf8")),
+    ).toEqual({ site: "generation-2" });
+    expect(await restarted.has("site", "generation-2")).toBe(true);
+    expect(await restarted.has("site", "generation-1")).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("serializes shared config commit and rollback across two Worker publications", async () => {
+  const probe = createConfigProbe();
+  const betaLoaded = deferred();
+  const letBetaCommit = deferred();
+  let heldBeta = false;
+  probe.behavior = async (config) => {
+    const routes = configRoutes(config);
+    const alpha = Object.hasOwn(routes, "alpha.localhost");
+    const beta = Object.hasOwn(routes, "beta.localhost");
+    if (beta && !alpha && !heldBeta) {
+      heldBeta = true;
+      betaLoaded.resolve();
+      await letBetaCommit.promise;
+    }
+    if (alpha) throw new Error("alpha activation failed after load");
+  };
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    const beta = runtime.publish("beta", weightedPublication("beta", "beta-generation"));
+    await betaLoaded.promise;
+    const alpha = runtime.publish("alpha", weightedPublication("alpha", "alpha-generation"));
+    letBetaCommit.resolve();
+    await beta;
+    await expect(alpha).rejects.toThrow("alpha activation failed after load");
+
+    const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+    expect(configRoutes(config)).toMatchObject({
+      "beta.localhost": "beta-selfhost-deployment",
+    });
+    expect(configRoutes(config)).not.toHaveProperty("alpha.localhost");
+    expect(await runtime.has("beta", "beta-generation")).toBe(true);
+    expect(await runtime.has("alpha", "alpha-generation")).toBe(false);
+    expect(
+      JSON.parse(await readFile(join(root, "workers", ".takoserver-active.json"), "utf8")),
+    ).toEqual({ beta: "beta-generation" });
+    expect(await readFile(join(root, "workers", "beta", "takoserver-site.json"), "utf8")).toContain(
+      "beta-generation",
+    );
+    await expect(
+      readFile(join(root, "workers", "alpha", "takoserver-site.json"), "utf8"),
+    ).rejects.toThrow();
+  } finally {
+    letBetaCommit.resolve();
+    probe.stop();
+  }
 });
