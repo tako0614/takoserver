@@ -435,6 +435,152 @@ describe("Wrangler version publication output", () => {
     ).toThrow("100 percent");
   });
 
+  test("accepts Wrangler session and autoconfig framing around one deploy event", () => {
+    const session = {
+      type: "wrangler-session",
+      version: 1,
+      wrangler_version: "4.123.0",
+      command_line_args: ["deploy", "bundle.js", "--name", WORKER],
+      log_file_path: "/tmp/wrangler-debug.log",
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    const autoconfig = {
+      type: "autoconfig",
+      version: 1,
+      command: "deploy",
+      summary: {},
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    const deploy = {
+      type: "deploy",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      version_id: VERSION,
+      targets: [],
+      worker_name_overridden: false,
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    expect(
+      parseWranglerLifecycleDeployOutput(
+        [session, autoconfig, deploy].map((event) => JSON.stringify(event)).join("\n"),
+        WORKER,
+      ),
+    ).toEqual({ versionId: VERSION, targets: [] });
+  });
+
+  test("accepts the session framing for version upload and version deployment", () => {
+    const session = {
+      type: "wrangler-session",
+      version: 1,
+      wrangler_version: "4.123.0",
+      command_line_args: ["versions", "upload", "bundle.js", "--name", WORKER],
+      log_file_path: "/tmp/wrangler-debug.log",
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    const upload = {
+      type: "version-upload",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      version_id: VERSION,
+      preview_url: null,
+      preview_alias_url: null,
+      worker_name_overridden: false,
+      timestamp: "2026-08-30T00:00:01.000Z",
+    };
+    const versionDeploy = {
+      type: "version-deploy",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      deployment_id: DEPLOYMENT,
+      version_traffic: {},
+      timestamp: "2026-08-30T00:00:02.000Z",
+    };
+    expect(
+      parseWranglerVersionUploadOutput(
+        [session, upload].map((event) => JSON.stringify(event)).join("\n"),
+        WORKER,
+      ),
+    ).toEqual({ versionId: VERSION });
+    expect(
+      parseWranglerVersionDeployOutput(
+        [session, versionDeploy].map((event) => JSON.stringify(event)).join("\n"),
+        WORKER,
+      ),
+    ).toEqual({ deploymentId: DEPLOYMENT });
+  });
+
+  test("rejects duplicate, foreign, malformed, or unknown lifecycle output events", () => {
+    const deploy = {
+      type: "deploy",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      version_id: VERSION,
+      targets: [],
+      worker_name_overridden: false,
+    };
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        `${JSON.stringify(deploy)}\n${JSON.stringify(deploy)}`,
+        WORKER,
+      ),
+    ).toThrow("more than one");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({ ...deploy, worker_name: "foreign-worker" }),
+        WORKER,
+      ),
+    ).toThrow("lifecycle deployment");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({ ...deploy, version_id: "not-a-version" }),
+        WORKER,
+      ),
+    ).toThrow("lifecycle deployment");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({ type: "version-deploy", version: 1 }),
+        WORKER,
+      ),
+    ).toThrow("unexpected publication");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        JSON.stringify({ type: "unknown-event", version: 1 }),
+        WORKER,
+      ),
+    ).toThrow("unsupported");
+
+    const session = {
+      type: "wrangler-session",
+      version: 1,
+      wrangler_version: "4.123.0",
+      command_line_args: ["deploy", "bundle.js", "--name", WORKER],
+      log_file_path: "/tmp/wrangler-debug.log",
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        `${JSON.stringify(session)}\n${JSON.stringify(session)}\n${JSON.stringify(deploy)}`,
+        WORKER,
+      ),
+    ).toThrow("more than one session");
+    expect(() =>
+      parseWranglerLifecycleDeployOutput(
+        `${JSON.stringify({ ...session, timestamp: "not-a-timestamp" })}\n${JSON.stringify(deploy)}`,
+        WORKER,
+      ),
+    ).toThrow("timestamp");
+    expect(() =>
+      parseWranglerVersionUploadOutput(
+        `${JSON.stringify(session)}\n${JSON.stringify({ ...deploy, type: "autoconfig" })}`,
+        WORKER,
+      ),
+    ).toThrow("unexpected autoconfig");
+  });
+
   test("rejects extra, duplicate, or wrong publication events", () => {
     const upload = {
       type: "version-upload",

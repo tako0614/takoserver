@@ -1069,7 +1069,7 @@ export function parseWranglerVersionUploadOutput(
   raw: string,
   workerName: string,
 ): { readonly versionId: string } {
-  const event = parsePublicationEvent(raw, "version upload");
+  const event = parsePublicationEvent(raw, "version upload", "version-upload");
   assertExactEventKeys(event, "version upload", [
     "type",
     "version",
@@ -1104,7 +1104,7 @@ export function parseWranglerLifecycleDeployOutput(
   raw: string,
   workerName: string,
 ): WranglerLifecycleDeployment {
-  const event = parsePublicationEvent(raw, "lifecycle deployment");
+  const event = parsePublicationEvent(raw, "lifecycle deployment", "deploy");
   assertExactEventKeys(event, "lifecycle deployment", [
     "type",
     "version",
@@ -1134,12 +1134,124 @@ export function parseWranglerLifecycleDeployOutput(
   return { versionId: event.version_id, targets: event.targets };
 }
 
+/**
+ * Wrangler's output file is an event stream, not a single event. Every
+ * command writes a session event, deploy may write an autoconfig event, and
+ * the command handler writes exactly one publication event. Parse every line
+ * so an unexpected or foreign event cannot be silently discarded.
+ */
+function parsePublicationEvent(
+  raw: string,
+  operation: string,
+  expectedType: "version-upload" | "version-deploy" | "deploy",
+): Record<string, unknown> {
+  const text = raw.trim();
+  if (text.length === 0) {
+    throw preflightError(`Wrangler ${operation} returned no JSON event`);
+  }
+  const lines = text.split(/\r?\n/u).filter((line) => line.trim().length > 0);
+  let publication: Record<string, unknown> | undefined;
+  let sessionSeen = false;
+  let autoconfigSeen = false;
+  for (const [index, line] of lines.entries()) {
+    const event = parseWranglerJson(line, `Wrangler ${operation} output event ${index + 1}`);
+    if (!isRecord(event)) {
+      throw preflightError(`Wrangler ${operation} output event is not an object`);
+    }
+    switch (event.type) {
+      case "wrangler-session":
+        if (sessionSeen) {
+          throw preflightError(`Wrangler ${operation} returned more than one session event`);
+        }
+        sessionSeen = true;
+        assertWranglerSessionOutputEvent(event);
+        break;
+      case "autoconfig":
+        if (expectedType !== "deploy") {
+          throw preflightError(
+            `Wrangler ${operation} output contains an unexpected autoconfig event`,
+          );
+        }
+        if (autoconfigSeen) {
+          throw preflightError(`Wrangler ${operation} returned more than one autoconfig event`);
+        }
+        autoconfigSeen = true;
+        assertWranglerAutoconfigOutputEvent(event);
+        break;
+      case "version-upload":
+      case "version-deploy":
+      case "deploy":
+        if (event.type !== expectedType) {
+          throw preflightError(
+            `Wrangler ${operation} output contains an unexpected publication event`,
+          );
+        }
+        if (publication !== undefined) {
+          throw preflightError(
+            `Wrangler ${operation} must return exactly one expected publication event (more than one found)`,
+          );
+        }
+        publication = event;
+        break;
+      default:
+        throw preflightError(`Wrangler ${operation} output contains an unsupported event type`);
+    }
+  }
+  if (publication === undefined) {
+    throw preflightError(`Wrangler ${operation} returned no expected publication event`);
+  }
+  return publication;
+}
+
+function assertWranglerSessionOutputEvent(event: Record<string, unknown>): void {
+  assertExactEventKeys(event, "Wrangler session", [
+    "type",
+    "version",
+    "wrangler_version",
+    "command_line_args",
+    "log_file_path",
+    "timestamp",
+  ]);
+  if (
+    event.type !== "wrangler-session" ||
+    event.version !== 1 ||
+    typeof event.wrangler_version !== "string" ||
+    !Array.isArray(event.command_line_args) ||
+    event.command_line_args.some((argument) => typeof argument !== "string") ||
+    typeof event.log_file_path !== "string" ||
+    typeof event.timestamp !== "string"
+  ) {
+    throw preflightError("Wrangler session output event has an invalid shape");
+  }
+  assertOptionalTimestamp(event.timestamp);
+}
+
+function assertWranglerAutoconfigOutputEvent(event: Record<string, unknown>): void {
+  assertExactEventKeys(event, "Wrangler autoconfig", [
+    "type",
+    "version",
+    "command",
+    "summary",
+    "timestamp",
+  ]);
+  if (
+    event.type !== "autoconfig" ||
+    event.version !== 1 ||
+    event.command !== "deploy" ||
+    !isRecord(event.summary) ||
+    typeof event.timestamp !== "string"
+  ) {
+    throw preflightError("Wrangler autoconfig output event has an invalid shape");
+  }
+  assertOptionalTimestamp(event.timestamp);
+}
+
 export function parseWranglerVersionDeployOutput(
   raw: string,
   workerName: string,
   expectedVersionId?: string,
 ): { readonly deploymentId: string } {
-  const event = parsePublicationEvent(raw, "version deployment");
+  const event = parsePublicationEvent(raw, "version deployment", "version-deploy");
   assertExactEventKeys(event, "version deployment", [
     "type",
     "version",
@@ -1180,18 +1292,6 @@ export function parseWranglerVersionDeployOutput(
   assertOptionalString(event.wrangler_environment, "wrangler_environment");
   assertOptionalTimestamp(event.timestamp);
   return { deploymentId: event.deployment_id };
-}
-
-function parsePublicationEvent(raw: string, operation: string): Record<string, unknown> {
-  const text = raw.trim();
-  if (text.length === 0) throw preflightError(`Wrangler ${operation} returned no JSON event`);
-  const lines = text.split(/\r?\n/u).filter((line) => line.trim().length > 0);
-  if (lines.length !== 1) {
-    throw preflightError(`Wrangler ${operation} must return exactly one JSON event`);
-  }
-  const parsed = parseWranglerJson(lines[0] as string, `Wrangler ${operation} event`);
-  if (!isRecord(parsed)) throw preflightError(`Wrangler ${operation} event is not an object`);
-  return parsed;
 }
 
 function assertExactEventKeys(
