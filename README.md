@@ -515,8 +515,11 @@ asynchronous, incomplete or wrong-kind backend is a startup error, never an
 ordinary-Workers fallback; the deprecated ordinary endpoint suffix cannot be
 combined with that factory.
 
-The same extension exports the experimental, self-host-only
-`createDockerHttpRevisionRuntime`. It reconciles an application-selected image
+The separate `@takoserver/core/provider-extension/selfhost` entry exports the
+experimental `createDockerHttpRevisionRuntime` and `createSelfhostContainerRuntime`.
+Node/filesystem adapters stay out of the portable `provider-extension`, which
+exports the runtime-neutral `createHttpRevisionServing` coordinator.
+The Docker primitive reconciles an application-selected image
 pinned by SHA-256 on an operator-selected Docker socket and isolated network,
 with explicit memory, CPU and PID ceilings. Exact revision names and labels
 allow recovery without creating a second container; old and new revisions may

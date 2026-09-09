@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./provider-extension": "./src/provider-extension.ts",
+    "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",
     "./deploy-extension": "./scripts/deploy-extension.ts",
     "./testing": "./tests/helpers/hosted-supply-fixtures.ts",
     "./testing/cloudflare-workers": "./src/cloudflare-workers-rpc.d.ts"

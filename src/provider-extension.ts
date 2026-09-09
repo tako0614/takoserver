@@ -125,13 +125,6 @@ export type {
   CloudflareWorkersForPlatformsBackendFactoryOptions,
 } from "./providers/cloudflare-worker-backend.ts";
 export {
-  createDockerHttpRevisionRuntime,
-  type DockerHttpRevision,
-  DockerHttpRevisionError,
-  type DockerHttpRevisionObservation,
-  type DockerHttpRevisionOptions,
-} from "./providers/docker-http-revision.ts";
-export {
   createHttpRevisionServing,
   type HttpRevisionBackendObservation,
   type HttpRevisionServingBackend,
