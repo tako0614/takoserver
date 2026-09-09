@@ -515,6 +515,16 @@ asynchronous, incomplete or wrong-kind backend is a startup error, never an
 ordinary-Workers fallback; the deprecated ordinary endpoint suffix cannot be
 combined with that factory.
 
+The same extension exports the experimental, self-host-only
+`createDockerHttpRevisionRuntime`. It reconciles an application-selected image
+pinned by SHA-256 on an operator-selected Docker socket and isolated network,
+with explicit memory, CPU and PID ceilings. Exact revision names and labels
+allow recovery without creating a second container; old and new revisions may
+coexist, and deletion addresses only the selected native revision. Its caller
+must still own resource admission, desired revision, traffic cutover and
+retirement. This primitive is not wired into a public Container resource or
+Offering and does not by itself make container installation available.
+
 This is an in-process composition seam, not another Host API or serialized
 credential format. The public Worker imports only the credential-free executor
 RPC port and pure wire validation; the execution authority stays behind the

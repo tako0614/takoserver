@@ -124,6 +124,29 @@ export type {
   CloudflareWorkerDeleteInput,
   CloudflareWorkersForPlatformsBackendFactoryOptions,
 } from "./providers/cloudflare-worker-backend.ts";
+export {
+  createDockerHttpRevisionRuntime,
+  type DockerHttpRevision,
+  DockerHttpRevisionError,
+  type DockerHttpRevisionObservation,
+  type DockerHttpRevisionOptions,
+} from "./providers/docker-http-revision.ts";
+export {
+  createHttpRevisionServing,
+  type HttpRevisionBackendObservation,
+  type HttpRevisionServingBackend,
+  type HttpRevisionServingCoordinator,
+  HttpRevisionServingError,
+  type HttpRevisionServingErrorCode,
+  type HttpRevisionServingHandle,
+  type HttpRevisionServingIdentity,
+  type HttpRevisionServingObservation,
+  type HttpRevisionServingOptions,
+  type HttpRevisionServingRevision,
+  type HttpRevisionServingRevisionRecord,
+  type HttpRevisionServingSnapshot,
+  type HttpRevisionServingStatePort,
+} from "./providers/http-revision-serving.ts";
 export { ProviderMeterError } from "./providers/provider-meter.ts";
 export {
   assertSafeMigrationSql,

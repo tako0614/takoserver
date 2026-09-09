@@ -161,6 +161,8 @@ const HOST_ONLY = [
   "src/workerd-supervisor.ts",
   "src/workerd-worker-module-inspector.ts",
   "src/workerd-artifact.ts",
+  "src/providers/docker-http-revision.ts",
+  "src/providers/selfhost-container-runtime.ts",
   // The public Worker has D1 and R2 bindings. Credential-bearing HTTP
   // transports and the real Cloudflare provider belong only to the route-less
   // executor; see docs/adr/0001-provision-from-the-worker.md.
