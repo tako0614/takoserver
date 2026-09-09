@@ -12,6 +12,7 @@ import {
 } from "../scripts/deploy/worker.ts";
 import {
   acquireWranglerVersionPublicationLease,
+  deployWranglerLifecycleChange,
   inspectWranglerVersionPublicationLease,
   parseWranglerDeploymentOutput,
   parseWranglerLifecycleDeployOutput,
@@ -165,6 +166,89 @@ describe("Wrangler OAuth Worker reader", () => {
 });
 
 describe("Wrangler version publication output", () => {
+  test("keeps bounded allowlisted detail for a failed lifecycle publication", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-lifecycle-failure-${crypto.randomUUID()}`;
+    const syntheticBearer = "synthetic-bearer-value";
+    const syntheticConfig = `${root}/synthetic-config-value.jsonc`;
+    const rawDiagnostics = [
+      `Error: request failed for account ${target.accountId} worker ${target.workerName}`,
+      `Authorization: Bearer ${syntheticBearer}`,
+      `target=${target.publicOrigin} config=${syntheticConfig}`,
+      "[code: 10021] [code: 10022] [code: 10023] [code: 10024] [code: 1234567]",
+      "ECONNRESET ETIMEDOUT fetch failed ECONNRESET_SECRET raw diagnostic text",
+    ].join("\n");
+    const lease = {
+      accountId: target.accountId,
+      workerName: target.workerName,
+      release: async () => {},
+    };
+    try {
+      const failure = await deployWranglerLifecycleChange({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: syntheticConfig,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message: syntheticBearer,
+        lease,
+        assertCurrentStillExpected: async () => {},
+        run: async () => ({ exitCode: 1, stdout: rawDiagnostics, stderr: rawDiagnostics }),
+      }).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      const error = failure as DeployError;
+      expect(error.phase).toBe("mutation");
+      expect(error.message).toContain("acknowledgement is indeterminate");
+      expect(error.message).toContain("do not retry before --status");
+      expect(error.detail).toContain("exit=1");
+      expect(error.detail).toContain("10021");
+      expect(error.detail).not.toContain("10024");
+      expect(error.detail).not.toContain("1234567");
+      expect(error.detail).toContain("ECONNRESET");
+      expect(error.detail).toContain("ETIMEDOUT");
+      expect(error.detail).toContain("fetch failed");
+      expect(error.detail).not.toContain("ECONNRESET_SECRET");
+      expect(error.detail).not.toContain(syntheticBearer);
+      expect(error.detail).not.toContain(target.accountId);
+      expect(error.detail).not.toContain(target.workerName);
+      expect(error.detail).not.toContain(target.publicOrigin);
+      expect(error.detail).not.toContain(syntheticConfig);
+      expect(error.detail).not.toContain("raw diagnostic text");
+      expect((error.detail?.match(/\[code:/gu) ?? []).length).toBeLessThanOrEqual(3);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to the exit code when no allowlisted failure detail exists", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-lifecycle-failure-empty-${crypto.randomUUID()}`;
+    const lease = {
+      accountId: target.accountId,
+      workerName: target.workerName,
+      release: async () => {},
+    };
+    try {
+      const failure = await deployWranglerLifecycleChange({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: `${root}/wrangler.jsonc`,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message: "safe-message",
+        lease,
+        assertCurrentStillExpected: async () => {},
+        run: async () => ({
+          exitCode: 7,
+          stdout: "plain Wrangler failure text",
+          stderr: "nothing allowlisted here",
+        }),
+      }).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).detail).toBe("exit=7");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("rejects an active same-host kernel lease", async () => {
     const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-lease-${crypto.randomUUID()}`;
     try {

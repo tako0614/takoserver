@@ -27,6 +27,26 @@ const BOOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const PROCESS_START_TICKS = /^[1-9][0-9]*$/u;
 const LEASE_OWNER_KIND = "takoserver.worker-publication-lease-owner@v1" as const;
 const MAX_LEASE_OWNER_BYTES = 4096;
+const MAX_WRANGLER_FAILURE_CODES = 3;
+const MAX_WRANGLER_FAILURE_CODE_DIGITS = 6;
+const WRANGLER_FAILURE_CODE_PATTERN = new RegExp(
+  `\\[code:[ \\t]*([0-9]{1,${MAX_WRANGLER_FAILURE_CODE_DIGITS}})\\]`,
+  "gu",
+);
+const WRANGLER_FAILURE_NETWORK_MARKERS = [
+  {
+    label: "ECONNRESET",
+    pattern: /(?:^|[^A-Za-z0-9_])ECONNRESET(?:$|[^A-Za-z0-9_])/u,
+  },
+  {
+    label: "ETIMEDOUT",
+    pattern: /(?:^|[^A-Za-z0-9_])ETIMEDOUT(?:$|[^A-Za-z0-9_])/u,
+  },
+  {
+    label: "fetch failed",
+    pattern: /(?:^|[^A-Za-z0-9_])fetch failed(?:$|[^A-Za-z0-9_])/iu,
+  },
+] as const;
 
 export type WranglerProcess = (
   command: readonly string[],
@@ -784,7 +804,7 @@ export async function deployWranglerLifecycleChange(input: {
   if (deployed.exitCode !== 0) {
     throw mutationError(
       "Worker lifecycle deployment acknowledgement is indeterminate; do not retry before --status",
-      `exit=${deployed.exitCode}`,
+      safeWranglerFailureDetail(deployed),
     );
   }
   try {
@@ -1011,6 +1031,38 @@ async function runPublicationCommand(
   } catch {
     throw mutationError(message, "process invocation failed");
   }
+}
+
+/**
+ * Keep lifecycle publication failures useful without replaying Wrangler's
+ * account, credential, target, URL, or arbitrary diagnostic text. The only
+ * provider values retained are exact bounded `[code: N]` markers and the
+ * small fixed set of network categories that Wrangler/Node emits.
+ */
+function safeWranglerFailureDetail(result: CommandResult): string {
+  const sources = [result.stdout, result.stderr];
+  const codes: string[] = [];
+  for (const source of sources) {
+    for (const match of source.matchAll(WRANGLER_FAILURE_CODE_PATTERN)) {
+      const code = match[1];
+      if (code === undefined || codes.includes(code)) continue;
+      codes.push(code);
+      if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
+    }
+    if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
+  }
+
+  const network: string[] = [];
+  for (const marker of WRANGLER_FAILURE_NETWORK_MARKERS) {
+    if (sources.some((source) => marker.pattern.test(source))) network.push(marker.label);
+  }
+
+  const detail = [`exit=${result.exitCode}`];
+  if (codes.length > 0) {
+    detail.push(`codes=${codes.map((code) => `[code: ${code}]`).join(",")}`);
+  }
+  if (network.length > 0) detail.push(`network=${network.join(",")}`);
+  return detail.join(" ");
 }
 
 export function parseWranglerVersionUploadOutput(
