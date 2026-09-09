@@ -124,11 +124,14 @@ export interface HttpRevisionServingOptions<
   /** Validation that must complete before invoking the durable state port. */
   readonly validateSnapshot?: (snapshot: HttpRevisionServingSnapshot<Revision, NativeId>) => void;
   readonly createError?: (code: HttpRevisionServingErrorCode) => Error;
+  /** Disable process-local timer cleanup when the caller owns durable wakeups. */
+  readonly automaticTimers?: boolean;
 }
 
 export interface HttpRevisionServingHandle<Revision extends HttpRevisionServingRevision> {
   reconcile(revision: Revision): Promise<HttpRevisionServingObservation>;
   observe(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
+  sweep(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
   invoke(identity: HttpRevisionServingIdentity, request: Request): Promise<Response>;
   remove(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
   close(): Promise<void>;
@@ -352,6 +355,23 @@ export function createHttpRevisionServing<
         });
       },
 
+      sweep(identity) {
+        return run(async () => {
+          const current = await serviceFor(options, services, identity, () => stopping);
+          // Deadline cancellation must not wait behind a slow native operation
+          // already queued on the service lock.
+          abortExpired(current);
+          return locked(options, current, async () => {
+            if (closed.signal.aborted) fail(options, "closed");
+            // A call can become due while waiting for the lock. Recheck before
+            // native retirement so the deadline remains authoritative.
+            abortExpired(current);
+            await retire(options, current, createError);
+            return observation(options, current);
+          });
+        });
+      },
+
       invoke(identity, request) {
         return run(async () => {
           const current = await serviceFor(options, services, identity, () => stopping);
@@ -527,7 +547,14 @@ function schedule<Revision extends HttpRevisionServingRevision, NativeId extends
   service: Service<Revision, NativeId>,
   futureOnly = false,
 ): void {
-  if (service.isStopping() || service.failed || service.timer !== null || !service.state) return;
+  if (
+    options.automaticTimers === false ||
+    service.isStopping() ||
+    service.failed ||
+    service.timer !== null ||
+    !service.state
+  )
+    return;
   const deadlines = service.state.revisions
     .filter(
       (revision) =>
