@@ -30,6 +30,49 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("Worker Versions unwrap result.items and retain exhaustive pagination checks", async () => {
+    const versions = Array.from({ length: 101 }, (_, index) => ({ id: `version-${index}` }));
+    const pages: number[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        expect(url.pathname).toBe(
+          `/client/v4/accounts/${ACCOUNT}/workers/scripts/executor/versions`,
+        );
+        expect(url.searchParams.has("deployable")).toBe(false);
+        const page = Number(url.searchParams.get("page"));
+        expect(url.searchParams.get("per_page")).toBe("100");
+        pages.push(page);
+        const items = versions.slice((page - 1) * 100, page * 100);
+        return Response.json({
+          success: true,
+          result: { items },
+          result_info: { page, per_page: 100, count: items.length, total_count: versions.length },
+        });
+      },
+    });
+    expect(await state.workerVersions("executor")).toEqual(versions);
+    expect(pages).toEqual([1, 2]);
+  });
+
+  test("Worker Versions reject missing items, an array envelope and inconsistent totals", async () => {
+    for (const [result, resultInfo] of [
+      [{}, { page: 1, per_page: 100, count: 0, total_count: 0 }],
+      [[], { page: 1, per_page: 100, count: 0, total_count: 0 }],
+      [{ items: [] }, { page: 1, per_page: 100, count: 1, total_count: 1 }],
+      [{ items: [{ id: "version-1" }] }, { page: 1, per_page: 100, count: 1, total_count: 2 }],
+    ]) {
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        fetcher: async () => Response.json({ success: true, result, result_info: resultInfo }),
+      });
+      await expect(state.workerVersions("executor")).rejects.toBeInstanceOf(DeployError);
+    }
+  });
+
   test("reads one dispatch namespace by exact name and recognizes only error 100119 as absent", async () => {
     const requests: Request[] = [];
     const metadata = {

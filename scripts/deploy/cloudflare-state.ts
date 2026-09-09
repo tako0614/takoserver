@@ -63,7 +63,12 @@ export class CloudflareState {
     return await this.#list(this.#url(path), label);
   }
 
-  async #list(baseUrl: URL, label: string, pageSize = PAGE_SIZE): Promise<readonly unknown[]> {
+  async #list(
+    baseUrl: URL,
+    label: string,
+    pageSize = PAGE_SIZE,
+    resultShape: "array" | "version-items" = "array",
+  ): Promise<readonly unknown[]> {
     const collected: unknown[] = [];
     let expectedTotal: number | null = null;
     let totalPages: number | null = null;
@@ -73,14 +78,22 @@ export class CloudflareState {
       url.searchParams.set("page", String(page));
       url.searchParams.set("per_page", String(pageSize));
       const envelope = await this.#request(url, label);
-      if (!Array.isArray(envelope.result)) {
+      // Worker Versions nests the paginated list in result.items; other
+      // inventory endpoints return the array directly.
+      const entries =
+        resultShape === "version-items"
+          ? isRecord(envelope.result)
+            ? envelope.result.items
+            : undefined
+          : envelope.result;
+      if (!Array.isArray(entries)) {
         throw preflightError(`${label} returned a non-list result`);
       }
       const pagination = parsePagination(envelope.result_info, label);
       if (pagination.page !== page || pagination.perPage !== pageSize) {
         throw preflightError(`${label} returned inconsistent pagination coordinates`);
       }
-      if (pagination.count !== envelope.result.length) {
+      if (pagination.count !== entries.length) {
         throw preflightError(`${label} pagination count does not match the returned page`);
       }
       if (totalPages === null) {
@@ -92,7 +105,7 @@ export class CloudflareState {
       ) {
         throw preflightError(`${label} pagination totals changed during readback`);
       }
-      collected.push(...envelope.result);
+      collected.push(...entries);
     }
     if (expectedTotal === null || collected.length !== expectedTotal) {
       throw preflightError(
@@ -209,9 +222,11 @@ export class CloudflareState {
   }
 
   workerVersions(workerName: string): Promise<readonly unknown[]> {
-    return this.list(
-      `/workers/scripts/${encodeURIComponent(workerName)}/versions`,
+    return this.#list(
+      this.#url(`/workers/scripts/${encodeURIComponent(workerName)}/versions`),
       `${workerName} version history`,
+      PAGE_SIZE,
+      "version-items",
     );
   }
 
