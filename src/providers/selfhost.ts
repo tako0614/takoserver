@@ -628,6 +628,11 @@ class SelfhostFailure extends Error {
   }
 }
 
+// Shared by adapters using the same normalized data root in this process.
+// This schedules commands; durable state and its compare-and-swap remain owned
+// by the script store. It is not a cross-process lock or a recovery ledger.
+const SELFHOST_WORKER_MUTATIONS = new Map<string, Promise<void>>();
+
 export function createSelfhostProvider(options: SelfhostProviderOptions): Provider {
   const id = options.id ?? "local";
   const { runtime, artifacts, dataRoot } = options;
@@ -734,6 +739,43 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       space: resource.space,
       name: resource.name,
     });
+
+  /** Keep state preparation, commit, publication and refusal rollback together. */
+  const acquireWorkerMutation = async (
+    input: Pick<ApplyInput, "offering" | "identity" | "relations">,
+  ): Promise<() => void> => {
+    const kind = dispatchKind(input.offering);
+    let worker: { readonly space: string; readonly name: string } | undefined;
+    switch (kind) {
+      case "ModuleWorker":
+        worker = input.identity;
+        break;
+      case "WorkerVersion":
+      case "WorkerDeployment":
+      case "WorkerEndpoint":
+      case "WorkerCustomDomain":
+      case "WorkerCronTrigger":
+      case "QueueConsumer":
+        worker = relationResource(input.relations, "/worker", "ModuleWorker")?.metadata;
+        break;
+    }
+    // Invalid declarations retain the owning handler's existing refusal.
+    // Unrelated resource kinds never enter this per-Worker queue.
+    if (!worker) return () => {};
+    const script = await scriptOf(input.identity.tenantRef, worker);
+    const key = `${resolve(scriptsRoot)}\0${script}`;
+    const previous = SELFHOST_WORKER_MUTATIONS.get(key);
+    let release!: () => void;
+    const current = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    SELFHOST_WORKER_MUTATIONS.set(key, current);
+    if (previous) await previous;
+    return () => {
+      release();
+      if (SELFHOST_WORKER_MUTATIONS.get(key) === current) SELFHOST_WORKER_MUTATIONS.delete(key);
+    };
+  };
 
   const versionIdOf = (
     tenantRef: string,
@@ -1093,9 +1135,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
    * the other had just asked about, so the endpoint's probe waited out a
    * five-second guess on an answer naming somebody else's publication and
    * refused a Version that was in fact serving. Publications of one script are
-   * now serialized (`republish`), which removes the race rather than tolerating
-   * it — a probe always asks about the configuration the runtime was last given
-   * for this script.
+   * now serialized with their complete apply/delete command, including the
+   * preceding state update. A probe asks about the configuration the runtime
+   * was last given for this script.
    *
    * What is left to bound is a runtime that never gets there, and the bound is
    * derived from what the runtime is doing rather than guessed: the budget is
@@ -1193,46 +1235,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       ),
     );
     return stored.every((version) => Boolean(version?.eventToken && version.handlers));
-  };
-
-  /**
-   * One publication of a script at a time, on this machine.
-   *
-   * A publication is read-state, render, write, reload, then ask the runtime
-   * whether the configuration it is serving is this one. Nothing made those
-   * five steps exclusive, and a single `tofu apply` runs several of them at
-   * once: the `WorkerEndpoint`, the `QueueConsumer` and the `WorkerCronTrigger`
-   * all republish the same script. Interleaved, each reload replaced the
-   * configuration the other had just asked about, so the endpoint's probe
-   * waited out its budget on an answer that named somebody else's publication
-   * and refused a Version that was in fact serving — and the failed attempt
-   * then wedged the origin reservation behind it. Serializing per script is
-   * what removes the race, rather than teaching the probe to tolerate an answer
-   * that is not its own: every publication is still load-probed by the
-   * configuration that asked for it, which is the property the exact match
-   * exists for.
-   *
-   * Per script rather than globally, because two tenants' Workers have no
-   * reason to wait on each other, and the chain entry is dropped once it is the
-   * tail and settled so a long-lived Host does not accumulate one per script it
-   * ever published.
-   */
-  const publications = new Map<string, Promise<void>>();
-  const republish = (script: string): Promise<void> => {
-    const queued = publications.get(script) ?? Promise.resolve();
-    const next = queued.then(
-      () => publishScript(script),
-      () => publishScript(script),
-    );
-    const settled = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    publications.set(script, settled);
-    void settled.then(() => {
-      if (publications.get(script) === settled) publications.delete(script);
-    });
-    return next;
   };
 
   interface PreparedRuntimeVersion {
@@ -2640,7 +2642,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     await writeScriptState(script, current, next);
     try {
-      await republish(script);
+      await publishScript(script);
     } catch (error) {
       if (error instanceof SelfhostFailure) return error.ticket;
       throw error;
@@ -2684,7 +2686,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // success response.
     if (hasDeployment(current.state)) {
       try {
-        await republish(script);
+        await publishScript(script);
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
@@ -2735,7 +2737,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // a version is active, even when the desired domain list is unchanged.
     if (hasDeployment(current.state)) {
       try {
-        await republish(script);
+        await publishScript(script);
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
@@ -2795,7 +2797,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // published before this Host recorded handlers has neither a handler list
     // nor an event token, so nothing would ever be delivered to it — and
     // committing the attachment first meant that discovery happened inside
-    // `republish`, with the attachment already written and every later
+    // publication, with the attachment already written and every later
     // republish of the script failing on it.
     if (receivesEvents(next) && !next.deployment) {
       throw new SelfhostFailure(
@@ -2825,20 +2827,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       });
     }
     const moved = JSON.stringify(next) !== JSON.stringify(current.state);
-    if (moved) await writeScriptState(script, current, next);
+    const written = moved ? await writeScriptState(script, current, next) : current;
     if (!hasDeployment(next)) return;
     try {
       // Always, even when the desired state was already this: a committed
       // attachment is not proof that the runtime accepted the gate it needs,
       // and the publication is what puts that gate in front of the Worker.
-      await republish(script);
+      await publishScript(script);
     } catch (error) {
       // A definite refusal means this declaration cannot be served at all, so
       // the attachment must not stay behind refusing every later republish of
       // the script. A retryable failure is the opposite: the desired state is
       // right and the next reconcile is what makes it true, so it stays.
       if (moved && error instanceof SelfhostFailure && !retryableTicket(error.ticket)) {
-        const written = await readScriptState(script);
         await writeScriptState(script, written, current.state).catch(() => undefined);
       }
       throw error;
@@ -3385,7 +3386,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async apply(input): Promise<ProviderTicket> {
+      let release: (() => void) | undefined;
       try {
+        release = await acquireWorkerMutation(input);
         // The current ObjectBucket before the switch, because the switch
         // dispatches on kind alone and the retained v1beta1 drain answers to
         // the same one with an address-derived name it must keep.
@@ -3424,6 +3427,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
+      } finally {
+        release?.();
       }
     },
 
@@ -3707,7 +3712,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
       const done = (): ProviderTicket =>
         succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+      let release: (() => void) | undefined;
       try {
+        release = await acquireWorkerMutation(input);
         // The current ObjectBucket holds bytes, so its delete is the one on this
         // Host that can refuse. The retained v1beta1 drain falls through to the
         // default below: it never held anything here.
@@ -3780,7 +3787,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 });
                 await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
                 await bindingStoreOperation(() => versionBindings.remove(script, versionId));
-                await republish(script);
+                await publishScript(script);
               } else {
                 await rm(join(versionsRoot, script, versionId), { recursive: true, force: true });
                 await bindingStoreOperation(() => versionBindings.remove(script, versionId));
@@ -3799,7 +3806,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 ...retained
               } = current.state;
               await writeScriptState(script, current, retained);
-              await republish(script);
+              await publishScript(script);
             }
             return done();
           }
@@ -3810,7 +3817,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               const current = await readScriptState(script);
               const { endpointHostname: _endpointHostname, ...retained } = current.state;
               await writeScriptState(script, current, retained);
-              if (hasDeployment(current.state)) await republish(script);
+              if (hasDeployment(current.state)) await publishScript(script);
             }
             return done();
           }
@@ -3827,7 +3834,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                 ...current.state,
                 domains: current.state.domains.filter((entry) => entry !== hostname),
               });
-              if (hasDeployment(current.state)) await republish(script);
+              if (hasDeployment(current.state)) await publishScript(script);
             }
             return done();
           }
@@ -3916,6 +3923,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
+      } finally {
+        release?.();
       }
     },
 
