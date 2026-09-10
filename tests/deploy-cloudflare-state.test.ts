@@ -283,6 +283,64 @@ describe("strict paginated Cloudflare state", () => {
     }
   });
 
+  test("treats only the exact missing-Worker deployment response as an empty history", async () => {
+    const missing = Response.json(
+      {
+        success: false,
+        result: null,
+        errors: [{ code: 10007, message: "Worker not found" }],
+        messages: [],
+      },
+      { status: 404 },
+    );
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "token",
+      fetcher: async () => missing,
+    });
+    await expect(state.workerDeployments("takoserver-api-staging")).resolves.toEqual([]);
+
+    for (const response of [
+      Response.json(
+        {
+          success: false,
+          result: null,
+          errors: [{ code: 10007 }],
+          messages: [],
+        },
+        { status: 403 },
+      ),
+      Response.json(
+        {
+          success: false,
+          result: null,
+          errors: [{ code: 10008 }],
+          messages: [],
+        },
+        { status: 404 },
+      ),
+      new Response("not-json", { status: 404 }),
+      Response.json(
+        {
+          success: false,
+          result: { deployments: [] },
+          errors: [{ code: 10007 }],
+          messages: [],
+        },
+        { status: 404 },
+      ),
+    ]) {
+      const negative = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "token",
+        fetcher: async () => response,
+      });
+      await expect(negative.workerDeployments("takoserver-api-staging")).rejects.toBeInstanceOf(
+        DeployError,
+      );
+    }
+  });
+
   test("reads official Version module bytes only through include=modules", async () => {
     const requests: Request[] = [];
     const version = {

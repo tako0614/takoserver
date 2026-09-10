@@ -196,11 +196,13 @@ export class CloudflareState {
 
   async workerDeployments(workerName: string): Promise<readonly unknown[]> {
     const label = `${workerName} deployment history`;
-    const result = await this.read(
-      `/workers/scripts/${encodeURIComponent(workerName)}/deployments`,
+    const envelope = await this.#request(
+      this.#url(`/workers/scripts/${encodeURIComponent(workerName)}/deployments`),
       label,
+      { allowMissingWorkerDeployment: true },
     );
-    return parseDeploymentHistory(result, label);
+    if (isMissingWorkerDeploymentEnvelope(envelope)) return [];
+    return parseDeploymentHistory(envelope.result, label);
   }
 
   async workerScripts(): Promise<readonly string[]> {
@@ -388,7 +390,11 @@ export class CloudflareState {
     return new URL(`${API}/accounts/${this.#accountId}${path}`);
   }
 
-  async #request(url: URL, label: string): Promise<Envelope> {
+  async #request(
+    url: URL,
+    label: string,
+    options: { readonly allowMissingWorkerDeployment?: boolean } = {},
+  ): Promise<Envelope> {
     let response: Response;
     try {
       response = await this.#fetcher(
@@ -410,6 +416,13 @@ export class CloudflareState {
       body = JSON.parse(text);
     } catch {
       throw preflightError(`${label} returned malformed JSON (HTTP ${response.status})`);
+    }
+    if (
+      options.allowMissingWorkerDeployment &&
+      response.status === 404 &&
+      isMissingWorkerDeploymentEnvelope(body)
+    ) {
+      return body;
     }
     if (!isRecord(body) || response.ok !== true || body.success !== true) {
       throw preflightError(
@@ -500,6 +513,36 @@ function parseDeploymentHistory(value: unknown, label: string): readonly unknown
     throw preflightError(`${label} returned an invalid deployment history envelope`);
   }
   return value.deployments;
+}
+
+function isMissingWorkerDeploymentEnvelope(body: unknown): body is Envelope {
+  if (!isRecord(body) || body.success !== false || body.result !== null) {
+    return false;
+  }
+  if (!hasExactKeys(body, ["errors", "messages", "result", "success"])) return false;
+  if (!Array.isArray(body.messages) || body.messages.length !== 0) return false;
+  if (!Array.isArray(body.errors) || body.errors.length !== 1) return false;
+  const error = body.errors[0];
+  if (!isRecord(error) || error.code !== 10007) return false;
+  const errorKeys = Object.keys(error).sort();
+  if (
+    !(
+      (errorKeys.length === 1 && errorKeys[0] === "code") ||
+      (errorKeys.length === 2 && errorKeys[0] === "code" && errorKeys[1] === "message")
+    )
+  ) {
+    return false;
+  }
+  return !Object.hasOwn(error, "message") || typeof error.message === "string";
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return (
+    actual.length === sortedExpected.length &&
+    actual.every((key, index) => key === sortedExpected[index])
+  );
 }
 
 function parseSecretInventory(value: unknown, label: string): readonly unknown[] {
