@@ -264,6 +264,8 @@ export interface TakoformResourceDriver {
     readonly name: string;
     readonly space: string;
     readonly spec: JsonObject;
+    /** Host-selected incoming desired generation, not the current/precondition generation. */
+    readonly desiredGeneration?: string;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: TakoformCommercialAuthority;
     /** Private Host context. The driver resolves it before provider dispatch. */

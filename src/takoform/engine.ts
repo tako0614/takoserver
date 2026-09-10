@@ -1498,6 +1498,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               name: body.metadata.name,
               space: body.metadata.space,
               spec: structuredClone(body.spec),
+              desiredGeneration: incomingDesiredGeneration(body, current),
               relations: preparedDriverRelations,
               atomicDeploymentCommit: true,
               ...(context.commercialAuthority
@@ -2375,6 +2376,18 @@ function replayedMutation(
   return { kind: "resource", resource: replay.resource, status: replay.status };
 }
 
+function incomingDesiredGeneration(
+  input: ParsedResource,
+  current: TakoformStoredResource | null,
+): string {
+  // Generation tracks desired state, so it only moves when the spec does.
+  return current
+    ? canonicalJson(current.spec) === canonicalJson(input.spec)
+      ? current.metadata.generation
+      : increment(current.metadata.generation)
+    : "1";
+}
+
 function materializeResource(
   input: ParsedResource,
   form: InstalledTakoformForm,
@@ -2383,12 +2396,7 @@ function materializeResource(
   clock: Clock,
   resourceUid: string,
 ): TakoformStoredResource {
-  // Generation tracks desired state, so it only moves when the spec does.
-  const generation = current
-    ? canonicalJson(current.spec) === canonicalJson(input.spec)
-      ? current.metadata.generation
-      : increment(current.metadata.generation)
-    : "1";
+  const generation = incomingDesiredGeneration(input, current);
   const revision = current ? increment(current.metadata.revision) : "1";
   const projection = projectReceipt(form, receipt);
   return {

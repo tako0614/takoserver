@@ -98,6 +98,16 @@ managed runtime or receive its credentials.
 `TAKOSERVER_CF_TOKEN_FILE` may be used instead of `CLOUDFLARE_API_TOKEN`: the
 file is read at the moment of each call, so a rotation does not need a restart.
 
+### Provider desired-generation context
+
+The Host computes the incoming desired Resource generation (`"1"` for create,
+preserving canonical-equal desired specs and incrementing a changed decimal
+string) and passes it through the internal driver and Provider extension as
+optional `desiredGeneration`. It is separate from `identity.generation`, which
+remains the incumbent on update; older direct driver callers may omit it. This
+extension does not alter the Host wire, a Form, or the published catalog, and
+does not by itself provide Container execution.
+
 ## Worker storage on this machine
 
 A Worker Version that declares `kvBindings`, `bucketBindings`,

@@ -1009,6 +1009,9 @@ export function createProviderDriver(
       const providerInput = {
         operationId: input.operationId,
         operationKey: input.operationKey,
+        ...(input.desiredGeneration !== undefined
+          ? { desiredGeneration: input.desiredGeneration }
+          : {}),
         ...(input.publicApply ? { publicApply: input.publicApply } : {}),
         ...(input.operationMode ? { operationMode: input.operationMode } : {}),
         executionAuthority: input.executionAuthority,

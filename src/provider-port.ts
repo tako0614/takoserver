@@ -207,6 +207,13 @@ export interface ProviderExecutionAuthority {
 export interface ApplyInput extends ProviderMutationInput {
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
+  /**
+   * Incoming Resource generation computed by the Host for this desired spec.
+   * Unlike identity.generation (the incumbent on update), present on Host
+   * creates too. Optional for older direct callers; never infer it from the
+   * incumbent or convert the decimal string through a JavaScript number.
+   */
+  readonly desiredGeneration?: string;
   readonly spec: JsonObject;
   readonly region?: string;
   /** Present for an update; absent for a create. */
