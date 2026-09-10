@@ -25,17 +25,20 @@ export class RemoteD1 {
   readonly #configPath: string;
   readonly #environment: Readonly<Record<string, string>>;
   readonly #run: D1Process;
+  readonly #wranglerCommand: (args: readonly string[]) => readonly string[];
 
   constructor(
     configPath: string,
     options: {
       readonly environment?: Readonly<Record<string, string>>;
       readonly run?: D1Process;
+      readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
     } = {},
   ) {
     this.#configPath = configPath;
     this.#environment = options.environment ?? cloudflareChildEnvironment();
     this.#run = options.run ?? runCommand;
+    this.#wranglerCommand = options.wranglerCommand ?? wranglerCommand;
   }
 
   /**
@@ -82,7 +85,7 @@ export class RemoteD1 {
     json: boolean,
   ): Promise<string> {
     const result = await this.#run(
-      wranglerCommand([
+      this.#wranglerCommand([
         "d1",
         "execute",
         "STATE_DB",
