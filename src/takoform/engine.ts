@@ -1629,13 +1629,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (expected !== current.metadata.generation) {
         throw new TakoformHostError("generation_conflict", 412);
       }
-      const replayKey = replayKeyFor(context, current.metadata.space, "observe");
-      const fingerprint = mutationFingerprint(
-        context.request,
-        await requestBodyDigest(context.request),
-      );
-      const replay = await store.readReplay(replayKey);
-      if (replay) return replayedObservation(replay, fingerprint, current.metadata.uid);
 
       const relations = await store.readRelations(address);
       const observeId = operationId();
@@ -1684,12 +1677,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       );
       await commit(address, next, current, relations, undefined, fresh.fence);
       await recordOperationFor(context.tenantId)(observeId, "observe", next);
-      await store.putReplay(replayKey, {
-        fingerprint,
-        status: 200,
-        resource: next,
-        boundUid: next.metadata.uid,
-      });
       return { kind: "resource", resource: next, status: 200 };
     },
 
@@ -2385,18 +2372,6 @@ function replayedMutation(
   if (currentUid === undefined) return null;
   if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
   if (replay.boundUid !== currentUid) throw new TakoformHostError("resource_not_found", 404);
-  return { kind: "resource", resource: replay.resource, status: replay.status };
-}
-
-function replayedObservation(
-  replay: StoredReplay,
-  fingerprint: string,
-  currentUid: string,
-): EngineResult {
-  if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
-  if (!replay.resource || replay.boundUid !== currentUid) {
-    throw new TakoformHostError("resource_not_found", 404);
-  }
   return { kind: "resource", resource: replay.resource, status: replay.status };
 }
 
