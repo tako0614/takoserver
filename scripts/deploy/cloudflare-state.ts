@@ -515,7 +515,9 @@ function parseDeploymentHistory(value: unknown, label: string): readonly unknown
   return value.deployments;
 }
 
-function isMissingWorkerDeploymentEnvelope(body: unknown): body is Envelope {
+function isMissingWorkerDeploymentEnvelope(
+  body: unknown,
+): body is Envelope & { readonly success: false; readonly result: null } {
   if (!isRecord(body) || body.success !== false || body.result !== null) {
     return false;
   }
