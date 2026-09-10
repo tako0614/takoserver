@@ -206,6 +206,17 @@ generation the event-delivery authority: events use the proven serving
 generation. These self-host checks do not qualify managed WfP execution or
 unsupported Actor capabilities.
 
+Removing a validated legacy scalar Worker first proves the replacement runtime
+graph and persists its activation marker, then atomically moves the old module
+directory out of the published Workers tree. A failed transition restores the
+previous graph instead of reporting the Worker absent. The private
+`workers/.retired` directory retains those modules; legacy static assets remain
+at their original path for in-flight requests. Weighted immutable generations
+are retained too. Unpublishing is not garbage collection: this path does not
+erase retained code or assets, or recursively remove an unknown partial
+publication. Empty weighted-publication directories are removed so absence
+readback does not mistake them for malformed live Workers.
+
 The self-host supervisor starts workerd in watch mode and accepts it only after
 the serving readiness probe succeeds. A failed initial start rejects the
 activation; it does not leave a background startup loop. Once accepted, an

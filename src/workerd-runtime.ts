@@ -4,6 +4,7 @@ import {
   chmod,
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readdir,
   readFile,
@@ -602,7 +603,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const activate = async (
     published: readonly PublishedDeployment[],
     previous: readonly PublishedDeployment[],
-    pointer?: { readonly commit: () => Promise<void>; readonly rollback: () => Promise<void> },
+    pointer?: {
+      readonly commit: () => Promise<void>;
+      readonly rollback: () => Promise<void>;
+      readonly commitAfterActivation?: boolean;
+    },
   ): Promise<void> => {
     try {
       const before = activated(previous);
@@ -622,8 +627,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       await writeRendered(published);
       await options.onReload?.(configPath);
       await proveRendered(published);
-      await pointer?.commit();
+      if (!pointer?.commitAfterActivation) await pointer?.commit();
       await writeActivation(activationPath, activated(published));
+      // Retiring a validated scalar carrier is the final fallible operation.
+      // Its absence must not precede a marker write that could still fail.
+      if (pointer?.commitAfterActivation) await pointer.commit();
     } catch (failure) {
       try {
         await pointer?.rollback();
@@ -811,24 +819,62 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             : [...previous.filter((entry) => entry.name !== name), staged.deployment]
         ).sort((left, right) => left.name.localeCompare(right.name));
         const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
-        await activate(next, previous, {
-          commit: async () => {
-            if (pointerContents === null) {
-              await removePointer();
-            } else {
-              await privateDirectory(directory);
-              await writePrivate(pointerPath, pointerContents, "utf8");
+        const retiringScalar =
+          staged === null && previous.some((entry) => entry.name === name && !entry.weighted);
+        let retiredCarrier: string | undefined;
+        if (retiringScalar) {
+          // Only the fully validated runtime publication authorizes this move.
+          // Provider desired state may already have cleared its legacy scalar.
+          // Retain the modules for recovery; legacy assets keep their old path
+          // so an in-flight request can still read them after graph replacement.
+          const retainedRoot = join(scriptsRoot, ".retired");
+          await privateDirectory(retainedRoot);
+          retiredCarrier = join(await mkdtemp(join(retainedRoot, `${name}-`)), "publication");
+        }
+        let retirementCommitted = false;
+        try {
+          await activate(next, previous, {
+            ...(retiredCarrier === undefined ? {} : { commitAfterActivation: true }),
+            commit: async () => {
+              if (retiredCarrier !== undefined) {
+                await rename(directory, retiredCarrier);
+                retirementCommitted = true;
+                return;
+              }
+              if (pointerContents === null) {
+                await removePointer();
+              } else {
+                await privateDirectory(directory);
+                await writePrivate(pointerPath, pointerContents, "utf8");
+              }
+            },
+            rollback: async () => {
+              // A failed scalar retirement leaves its original carrier in place;
+              // no operation follows a successful rename that could need rollback.
+              if (retiredCarrier !== undefined) return;
+              if (beforePointer === null) {
+                await removePointer();
+              } else {
+                await privateDirectory(directory);
+                await writePrivate(pointerPath, beforePointer, "utf8");
+              }
+            },
+          });
+        } catch (failure) {
+          if (retiredCarrier !== undefined && !retirementCommitted) {
+            // This operation created the private staging parent. Failed
+            // attempts must not accumulate it; committed recovery bytes stay.
+            try {
+              await rm(dirname(retiredCarrier), { recursive: true, force: true });
+            } catch (cleanupFailure) {
+              throw new AggregateError(
+                [failure, cleanupFailure],
+                "worker retirement staging cleanup failed",
+              );
             }
-          },
-          rollback: async () => {
-            if (beforePointer === null) {
-              await removePointer();
-            } else {
-              await privateDirectory(directory);
-              await writePrivate(pointerPath, beforePointer, "utf8");
-            }
-          },
-        });
+          }
+          throw failure;
+        }
       });
     },
     async write(name, site, modules, assets, hostModules) {

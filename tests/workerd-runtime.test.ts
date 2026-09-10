@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -169,6 +169,62 @@ function createConfigProbe(): {
   if (server.port === undefined) throw new Error("config probe did not bind a port");
   result.port = server.port;
   return result;
+}
+
+for (const failure of ["activation-marker", "carrier-rename"] as const) {
+  test(`restores the scalar publication when ${failure} persistence fails during retirement`, async () => {
+    const probe = createConfigProbe();
+    const script = "site";
+    const directory = join(root, "workers", script);
+    const markerPath = join(root, "workers", ".takoserver-active.json");
+    try {
+      const runtime = createWorkerdRuntime({
+        root,
+        port: probe.port,
+        isReady: () => true,
+        onReload: probe.onReload,
+      });
+      if (!runtime.publish) throw new Error("publication fixture is unavailable");
+      const version = weightedPublication(script, "scalar-generation").versions[0];
+      if (!version) throw new Error("scalar fixture is unavailable");
+      await runtime.write(
+        script,
+        { ...version.site, hostnames: ["site.localhost"] },
+        version.modules,
+        undefined,
+        version.hostModules,
+      );
+      await runtime.reload();
+      const manifest = await readFile(join(directory, "takoserver-site.json"));
+      const module = await readFile(join(directory, "application", "module-00000"));
+      probe.behavior = async (_config, invocation) => {
+        if (failure === "activation-marker") {
+          if (invocation === 2) {
+            rmSync(markerPath);
+            await mkdir(markerPath);
+          }
+          if (invocation === 3) rmSync(markerPath, { recursive: true });
+        } else if (invocation === 2) {
+          const retainedRoot = join(root, "workers", ".retired");
+          const [retained] = await readdir(retainedRoot);
+          if (!retained) throw new Error("retirement fixture is unavailable");
+          const destination = join(retainedRoot, retained, "publication");
+          await mkdir(destination);
+          await writeFile(join(destination, "occupied"), "refuse replacement");
+        }
+      };
+
+      await expect(runtime.publish(script, null)).rejects.toThrow();
+      expect(await readFile(join(directory, "takoserver-site.json"))).toEqual(manifest);
+      expect(await readFile(join(directory, "application", "module-00000"))).toEqual(module);
+      expect(await runtime.has(script, "scalar-generation")).toBe(true);
+      const restarted = createWorkerdRuntime({ root, isReady: () => true });
+      expect(await restarted.restore()).toEqual([script]);
+      expect(await readdir(join(root, "workers", ".retired"))).toEqual([]);
+    } finally {
+      probe.stop();
+    }
+  });
 }
 
 test("renders separate application and Host-private identities even under the same name", async () => {

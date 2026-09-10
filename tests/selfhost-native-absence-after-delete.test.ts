@@ -114,6 +114,23 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+async function publishScalar(runtime: ReturnType<typeof createWorkerdRuntime>) {
+  const version = weightedPublication().versions[0];
+  if (!version) throw new Error("publication fixture is unavailable");
+  await runtime.write(
+    SCRIPT,
+    { ...version.site, hostnames: ["site.localhost"] },
+    version.modules,
+    undefined,
+    version.hostModules,
+  );
+  await runtime.reload();
+  return {
+    manifest: await readFile(join(root, "workers", SCRIPT, "takoserver-site.json")),
+    module: await readFile(join(root, "workers", SCRIPT, "application", "module-00000")),
+  };
+}
+
 describe("self-host native absence after runtime unpublish", () => {
   test("proves ModuleWorker, Deployment, and Endpoint absent after weighted publish deletion", async () => {
     const runtime = createWorkerdRuntime({ root, isReady: () => true });
@@ -171,6 +188,25 @@ describe("self-host native absence after runtime unpublish", () => {
         },
       ],
     });
+  });
+
+  test("unpublishes a validated retained scalar Worker without restoring it on restart", async () => {
+    const runtime = createWorkerdRuntime({ root, isReady: () => true });
+    if (!runtime.publish) throw new Error("publication fixture is unavailable");
+    const before = await publishScalar(runtime);
+    expect(await runtime.has(SCRIPT)).toBe(true);
+
+    await runtime.publish(SCRIPT, null);
+    expect(existsSync(join(root, "workers", SCRIPT))).toBe(false);
+    expect(await runtime.has(SCRIPT)).toBe(false);
+    const restarted = createWorkerdRuntime({ root, isReady: () => true });
+    expect(await restarted.restore()).toEqual([]);
+    const retainedRoot = join(root, "workers", ".retired");
+    const retained = await readdir(retainedRoot);
+    expect(retained).toHaveLength(1);
+    const carrier = join(retainedRoot, retained[0] as string, "publication");
+    expect(await readFile(join(carrier, "takoserver-site.json"))).toEqual(before.manifest);
+    expect(await readFile(join(carrier, "application", "module-00000"))).toEqual(before.module);
   });
 
   test("keeps a nonempty script carrier indeterminate instead of claiming absence", async () => {
