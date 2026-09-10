@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
+  isArtifactBlobIoQuiescedTarget,
   loadManagedWorkerDispatchNamespaceTarget,
   loadTarget,
   parseDeployTarget,
@@ -122,11 +124,15 @@ describe("environment-exact deploy target", () => {
 
   test("accepts only the explicit pre-0043 artifact I/O compatibility mode", () => {
     withTarget(descriptor({ artifactBlobIoMode: "pre-0043-quiesced" }), (path) => {
-      expect(loadTarget(path, "rehearsal").artifactBlobIoMode).toBe("pre-0043-quiesced");
+      const target = loadTarget(path, "rehearsal");
+      expect(target.artifactBlobIoMode).toBe("pre-0043-quiesced");
+      expect(isArtifactBlobIoQuiescedTarget(target)).toBe(true);
     });
     withTarget(descriptor({ artifactBlobIoMode: "quiet-ish" }), (path) => {
       expect(() => loadTarget(path, "rehearsal")).toThrow("artifactBlobIoMode");
     });
+    const ordinaryTarget: Pick<DeployTarget, "artifactBlobIoMode"> = {};
+    expect(isArtifactBlobIoQuiescedTarget(ordinaryTarget)).toBe(false);
   });
 
   test("refuses the retired cross-product runtime topology", () => {

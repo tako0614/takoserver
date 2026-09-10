@@ -185,6 +185,13 @@ export interface ManagedWorkerDispatchNamespaceTarget {
 
 export const DEPLOY_TARGET_KIND = "takoserver.deploy-target@v2";
 
+/** True only for the reviewed pre-0043 all-traffic quiescence target. */
+export function isArtifactBlobIoQuiescedTarget(
+  target: Pick<DeployTarget, "artifactBlobIoMode">,
+): boolean {
+  return target.artifactBlobIoMode === "pre-0043-quiesced";
+}
+
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;

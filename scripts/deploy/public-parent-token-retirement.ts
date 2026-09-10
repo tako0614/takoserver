@@ -28,7 +28,7 @@ import {
   type WorkerVersionAuthorityProfile,
   writeWorkerConfig,
 } from "./realized-config.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   type ProviderExecutorInspection,
@@ -124,6 +124,11 @@ export async function runPublicParentTokenRetirement(
   target: DeployTarget,
   options: PublicParentTokenRetirementOptions = {},
 ): Promise<Record<string, unknown>> {
+  if (isArtifactBlobIoQuiescedTarget(target)) {
+    throw preflightError(
+      "public parent-token retirement is unavailable for a pre-0043-quiesced target",
+    );
+  }
   validateInvocation(invocation, target);
   const run = options.run ?? runCommand;
   const credential =

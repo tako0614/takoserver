@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  artifactBlobIoCompatibilityAllowsPending,
+  artifactBlobIoSchemaAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
@@ -32,7 +32,7 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 import { assertTargetComposes } from "./worker-composition.ts";
@@ -190,12 +190,14 @@ export async function runWorker(
       : null;
   const state = options.state ?? cloudflareState;
   if (state === null) throw preflightError("Worker state is unavailable");
-  const providerExecutorQualification = providerExecutorQualificationReader({
-    target,
-    ...(options.providerExecutorQualification === undefined
-      ? {}
-      : { injected: options.providerExecutorQualification }),
-  });
+  const providerExecutorQualification = isArtifactBlobIoQuiescedTarget(target)
+    ? null
+    : providerExecutorQualificationReader({
+        target,
+        ...(options.providerExecutorQualification === undefined
+          ? {}
+          : { injected: options.providerExecutorQualification }),
+      });
   const providerExecutorBefore =
     providerExecutorQualification === null
       ? null
@@ -307,8 +309,7 @@ export async function runWorker(
             }
           : {}),
         ready:
-          (before.pending.length === 0 ||
-            artifactBlobIoCompatibilityAllowsPending(target, before.pending)) &&
+          artifactBlobIoSchemaAllowsPending(target, before.pending) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
@@ -343,10 +344,7 @@ export async function runWorker(
       commit: invocation.commit,
       run,
     });
-    if (
-      before.pending.length > 0 &&
-      !artifactBlobIoCompatibilityAllowsPending(target, before.pending)
-    ) {
+    if (!artifactBlobIoSchemaAllowsPending(target, before.pending)) {
       throw preflightError(
         "routine Worker publication refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(before.pending),
@@ -567,10 +565,7 @@ export async function runWorker(
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
-    if (
-      after.pending.length > 0 &&
-      !artifactBlobIoCompatibilityAllowsPending(target, after.pending)
-    ) {
+    if (!artifactBlobIoSchemaAllowsPending(target, after.pending)) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
     const providerExecutorAfter =

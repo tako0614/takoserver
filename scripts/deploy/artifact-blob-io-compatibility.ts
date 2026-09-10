@@ -32,7 +32,16 @@ const COMPATIBILITY_PENDING_SUFFIX = [
   "0041_selfhost_object_buckets.sql",
   "0042_worker_endpoint_origin_reservation_space_id.sql",
   "0043_artifact_blob_io_fences.sql",
+  "0044_artifact_consumer_resolution_receipts.sql",
+  "0045_cloudflare_provider_executor_operations.sql",
+  "0046_exact_artifact_recovery_receipts.sql",
+  "0047_sponsorship_cutover_consumption.sql",
+  "0048_resource_execution_evidence.sql",
+  "0049_artifact_consumer_active_resolution.sql",
 ] as const;
+const COMPATIBILITY_BOUNDARY_INDEX = COMPATIBILITY_PENDING_SUFFIX.indexOf(
+  "0043_artifact_blob_io_fences.sql",
+);
 
 export interface ArtifactBlobIoCompatibilityState {
   workerSubdomain(workerName: string): Promise<{
@@ -74,10 +83,24 @@ export function artifactBlobIoCompatibilityAllowsPending(
   pending: readonly string[],
 ): boolean {
   if (target.artifactBlobIoMode !== QUIESCED_MODE || pending.length === 0) return false;
-  return COMPATIBILITY_PENDING_SUFFIX.some(
-    (_name, index) =>
-      JSON.stringify(pending) === JSON.stringify(COMPATIBILITY_PENDING_SUFFIX.slice(index)),
-  );
+  return COMPATIBILITY_PENDING_SUFFIX.some((_name, index) => {
+    if (index > COMPATIBILITY_BOUNDARY_INDEX) return false;
+    const minimumLength = COMPATIBILITY_BOUNDARY_INDEX - index + 1;
+    return (
+      pending.length >= minimumLength &&
+      pending.every((name, offset) => COMPATIBILITY_PENDING_SUFFIX[index + offset] === name)
+    );
+  });
+}
+
+/** Normal Workers require a settled schema; quiesced Workers require this exact lineage. */
+export function artifactBlobIoSchemaAllowsPending(
+  target: DeployTarget,
+  pending: readonly string[],
+): boolean {
+  return target.artifactBlobIoMode === QUIESCED_MODE
+    ? artifactBlobIoCompatibilityAllowsPending(target, pending)
+    : pending.length === 0;
 }
 
 /** Public smoke for the maintenance Worker: every request must stop before composition. */

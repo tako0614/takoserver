@@ -12,7 +12,11 @@ import {
   parseWorkerDeploymentHistory,
   workerVersionMetadataBindingProfile,
 } from "../scripts/deploy/worker-state.ts";
-import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
+import {
+  cloudflareProviderExecutorTarget,
+  edgeSuppliesFixture,
+  objectBucketSuppliesFixture,
+} from "./helpers/hosted-supply-fixtures.ts";
 
 const RETIRED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
 
@@ -138,6 +142,49 @@ describe("immutable Worker Version binding closure", () => {
         entrypoint: "CloudflareProviderExecutor",
       },
     });
+  });
+
+  test("omits only the executor service for the exact maintenance target", () => {
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      artifactBlobIoMode: "pre-0043-quiesced" as const,
+      signing: { currentKeyId: "key-current" },
+      cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
+      edgeSupplies: edgeSuppliesFixture(),
+      objectBucketSupplies: objectBucketSuppliesFixture(),
+    } satisfies DeployTarget;
+    const closure = expectedExactBindingClosure(target);
+    expect(closure.CLOUDFLARE_PROVIDER_EXECUTOR).toBeUndefined();
+    expect(closure.TAKOSERVER_ARTIFACT_BLOB_IO_MODE).toEqual({
+      type: "plain_text",
+      fields: { text: "pre-0043-quiesced" },
+    });
+    expect(closure.TAKOSERVER_MANAGED_BASE_DOMAIN).toEqual({
+      type: "plain_text",
+      fields: { text: target.cloudflareProviderExecutor.managedBaseDomain },
+    });
+    expect(closure.TAKOSERVER_EDGE_SUPPLIES).toEqual({
+      type: "plain_text",
+      fields: { text: JSON.stringify(target.edgeSupplies) },
+    });
+    expect(closure.TAKOSERVER_OBJECT_BUCKET_SUPPLIES).toEqual({
+      type: "plain_text",
+      fields: { text: JSON.stringify(target.objectBucketSupplies) },
+    });
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "verification",
+        "version-1",
+        expectedExactVersionFromClosure(closure),
+        closure,
+      ),
+    ).not.toThrow();
   });
 
   test("JIT authority closures require an exact five-binding provenance profile", () => {

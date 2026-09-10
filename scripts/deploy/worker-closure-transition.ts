@@ -2,7 +2,7 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import {
-  artifactBlobIoCompatibilityAllowsPending,
+  artifactBlobIoSchemaAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
@@ -23,7 +23,7 @@ import {
   type WorkerVersionAuthorityProfile,
   writeWorkerConfig,
 } from "./realized-config.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   probeProduct,
@@ -168,12 +168,14 @@ export async function runWorkerClosureTransition(
         : null;
     const state = options.state ?? cloudflareState;
     if (state === null) throw preflightError("Worker state is unavailable");
-    const providerExecutorQualification = providerExecutorQualificationReader({
-      target,
-      ...(options.providerExecutorQualification === undefined
-        ? {}
-        : { injected: options.providerExecutorQualification }),
-    });
+    const providerExecutorQualification = isArtifactBlobIoQuiescedTarget(target)
+      ? null
+      : providerExecutorQualificationReader({
+          target,
+          ...(options.providerExecutorQualification === undefined
+            ? {}
+            : { injected: options.providerExecutorQualification }),
+        });
     const providerExecutorBefore =
       providerExecutorQualification === null
         ? null
@@ -240,14 +242,14 @@ export async function runWorkerClosureTransition(
           pendingMigrations: pending,
           mutationApplied: false,
           ready:
-            (pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending)) &&
+            artifactBlobIoSchemaAllowsPending(target, pending) &&
             (providerExecutorBefore === null || providerExecutorBefore.ready),
         },
         providerExecutorBefore,
       );
     }
 
-    if (pending.length > 0 && !artifactBlobIoCompatibilityAllowsPending(target, pending)) {
+    if (!artifactBlobIoSchemaAllowsPending(target, pending)) {
       throw preflightError(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
@@ -344,6 +346,21 @@ export async function runWorkerClosureTransition(
       const currentProviderExecutor = await providerExecutorQualification.read("preflight");
       assertProviderExecutorUnchanged(providerExecutorBefore, currentProviderExecutor);
     }
+    const finalMigrationState = await migrations.read();
+    const finalPending = pendingMigrations(finalMigrationState.local, finalMigrationState.applied);
+    if (!artifactBlobIoSchemaAllowsPending(target, finalPending)) {
+      throw preflightError(
+        "closure transition refuses changed pending D1 migrations before upload; apply takoserver-d1-schema first",
+        JSON.stringify(finalPending),
+      );
+    }
+    if (
+      JSON.stringify(finalMigrationState.local) !== JSON.stringify(migrationState.local) ||
+      JSON.stringify(finalMigrationState.applied) !== JSON.stringify(migrationState.applied) ||
+      JSON.stringify(finalPending) !== JSON.stringify(pending)
+    ) {
+      throw preflightError("D1 migration lineage changed before the closure transition upload");
+    }
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
     const upload = await run(
       deployWranglerCommand(options.wranglerPath, [
@@ -390,10 +407,7 @@ export async function runWorkerClosureTransition(
     }
     const afterMigrations = await migrations.read();
     const afterPending = pendingMigrations(afterMigrations.local, afterMigrations.applied);
-    if (
-      afterPending.length > 0 &&
-      !artifactBlobIoCompatibilityAllowsPending(target, afterPending)
-    ) {
+    if (!artifactBlobIoSchemaAllowsPending(target, afterPending)) {
       throw verificationError("closure transition left pending D1 migrations");
     }
     const providerExecutorAfter =
@@ -503,8 +517,7 @@ async function appliedClosureTransitionStatus(
     pendingMigrations: pending,
     mutationApplied: false,
     ready:
-      (pending.length === 0 || artifactBlobIoCompatibilityAllowsPending(target, pending)) &&
-      successor.commit === invocation.commit,
+      artifactBlobIoSchemaAllowsPending(target, pending) && successor.commit === invocation.commit,
   };
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -22,6 +22,11 @@ import {
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+
+const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema-surface-"));
+const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
+afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -225,6 +230,7 @@ describe("forward-only D1 schema surface", () => {
         target,
         {
           reader,
+          migrationDirectory: auditedMigrations,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
@@ -266,6 +272,7 @@ describe("forward-only D1 schema surface", () => {
         {
           reader,
           run: fixture.run,
+          migrationDirectory: auditedMigrations,
           outputDirectory: join(root, "work"),
           receiptPath: join(root, "receipt.json"),
           review: "reviewer@example.test",
@@ -414,7 +421,7 @@ describe("forward-only D1 schema surface", () => {
         return await fixture.run(command, options);
       };
       const pre = migrationStateThrough(36, "oauth-0043-pre");
-      const post = migrationStateThrough(49, "oauth-0049-post");
+      const post = migrationStateThrough(MIGRATIONS.length, "oauth-current-post");
       const result = await runD1Schema(
         { action: "apply", environment: "integration", commit: COMMIT },
         integration0043Target,
@@ -456,6 +463,9 @@ describe("forward-only D1 schema surface", () => {
           "0047_sponsorship_cutover_consumption.sql",
           "0048_resource_execution_evidence.sql",
           "0049_artifact_consumer_active_resolution.sql",
+          "0050_container_runtime_input_custody.sql",
+          "0051_container_runtime_input_rewrap.sql",
+          "0052_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);
@@ -496,6 +506,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: rehearsal.run,
           reader: readerSequence([pre, pre, pre, post]),
+          migrationDirectory: auditedMigrations,
           outputDirectory: join(root, "rehearsal-work"),
           receiptPath,
           review: "reviewer@example.test",
@@ -515,6 +526,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: production.run,
           reader: readerSequence([pre, pre, pre, post]),
+          migrationDirectory: auditedMigrations,
           outputDirectory: join(root, "production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
@@ -553,6 +565,7 @@ describe("forward-only D1 schema surface", () => {
           {
             run: refusedProcess.run,
             reader: readerSequence([pre, pre]),
+            migrationDirectory: auditedMigrations,
             outputDirectory: join(root, `refused-work-${index}`),
             receiptPath: badReceiptPath,
             review: "second-reviewer@example.test",

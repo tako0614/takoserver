@@ -6,7 +6,7 @@ import {
 } from "../../src/worker-production-composition.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import { deploymentVariables } from "./realized-config.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 
 /**
  * A target's binding closure can be exactly right and still not describe a
@@ -44,7 +44,7 @@ export function workerCompositionEnv(target: DeployTarget): WorkerProductionComp
     const value = vars[name];
     if (value !== undefined) env[name] = value;
   }
-  if (target.cloudflareProviderExecutor !== undefined) {
+  if (target.cloudflareProviderExecutor !== undefined && !isArtifactBlobIoQuiescedTarget(target)) {
     // Composition never invokes the binding. Its exact presence is the
     // credential-free capability fact the runtime requires before it exposes
     // any Cloudflare recovery/provider surface.
@@ -66,6 +66,7 @@ export async function assertTargetComposes(
   phase: DeployPhase,
   target: DeployTarget,
 ): Promise<void> {
+  if (isArtifactBlobIoQuiescedTarget(target)) return;
   const env = workerCompositionEnv(target);
   const current = currentTakoformCandidates();
   const retained = await buildEdgeForms();

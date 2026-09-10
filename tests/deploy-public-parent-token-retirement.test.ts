@@ -50,6 +50,49 @@ const target = {
 } satisfies DeployTarget;
 
 describe("public Cloudflare parent-token retirement", () => {
+  test("refuses the quiesced maintenance target before credentials or qualification", async () => {
+    const maintenanceTarget = {
+      ...target,
+      artifactBlobIoMode: "pre-0043-quiesced" as const,
+    } satisfies DeployTarget;
+    let processCalls = 0;
+    let qualificationReads = 0;
+    const state: PublicParentTokenRetirementState = {
+      async workerDomains() {
+        throw new Error("state must not be read");
+      },
+      async workerDeployments() {
+        throw new Error("state must not be read");
+      },
+      async workerVersion() {
+        throw new Error("state must not be read");
+      },
+      async workerSecrets() {
+        throw new Error("state must not be read");
+      },
+    };
+    await expect(
+      runPublicParentTokenRetirement(applyInvocation(), maintenanceTarget, {
+        run: async () => {
+          processCalls += 1;
+          return ok(JSON.stringify({ type: "oauth", token: "oauth-token" }));
+        },
+        state,
+        providerExecutorQualification: {
+          async read() {
+            qualificationReads += 1;
+            return executorInspection();
+          },
+        },
+      }),
+    ).rejects.toMatchObject({
+      phase: "preflight",
+      message: expect.stringContaining("quiesced"),
+    });
+    expect(processCalls).toBe(0);
+    expect(qualificationReads).toBe(0);
+  });
+
   test("status reports the exact legacy unbound Worker without mutating it", async () => {
     const fixture = stateFixture("legacy");
     const result = await runPublicParentTokenRetirement(

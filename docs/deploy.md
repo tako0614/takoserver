@@ -22,11 +22,12 @@ supply parsers retain their existing lower-case grammar for Offerings; this
 bound does not tighten price-plan or other hosted reference fields.
 
 The production-shaped D1 lane is deliberately narrower. Rehearsal and
-production require exactly one approved next-wave selector:
+production require exactly one approved next-wave selector, while integration
+may use the same selector for one bounded audited wave:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
-bun run deploy -- takoserver-d1-schema --apply --environment=<rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
+bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
+bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
@@ -38,9 +39,12 @@ the complete 0047 sponsorship authority lineage; it never rewrites 0047.
 The 0049 wave preserves every prior artifact-consumer receipt while admitting
 only active zero-consumption receipts with no manifest digest. Apply 0049
 before publishing the Worker that can emit that new receipt.
-Integration retains only the no-selector fast path for disposable cadence and
-rejects every protected selector. Its output is explicitly integration-only
-and it cannot write evidence accepted by rehearsal or production. The separate
+Integration without a selector retains the disposable fast path. When an
+integration invocation selects a boundary, it seals and applies only that
+audited wave, reports `evidenceClass: integration-protected-wave`, and never
+reads or writes the rehearsal receipt chain. Both integration modes are
+explicitly non-production evidence; a selected wave cannot be consumed by
+rehearsal or production. The separate
 `takoserver-d1-schema-rehearsal-baseline` surface is rehearsal-only, accepts no
 selector, and takes only an exact empty database through the fixed 0001–0022
 prefix without emitting a production rehearsal receipt.
@@ -489,7 +493,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049`; integration rejects every selector and accepts only its no-selector disposable path. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
+| `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-rotation` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_NEXT_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -809,6 +813,23 @@ managed customer runtime.
   migrations a second time. The lease does not claim to fence another operator
   host or a direct Cloudflare/API mutation.
 
+  Integration may select one of the same audited boundaries to exercise a
+  bounded protected wave. The selector is checked against the immutable
+  0001–0049 names and SHA-256 inventory, so a checkout with unreviewed 0050+
+  migrations is refused before any provider command. The selected integration
+  lane keeps every named data preflight, lease, compatibility fence, and
+  mutation/readback check, but it applies only the selected through-prefix and
+  emits no rehearsal receipt or predecessor link. Its
+  `integration-protected-wave` result is never accepted by rehearsal or
+  production; the no-selector integration lane remains the disposable suffix
+  path described above.
+  If the selected wave includes 0043, integration uses the staged compatibility
+  protocol below. Keep its maintenance projection while the selected 0044–0049
+  trail is pending; a Cloudflare provider executor (CPE) service is optional
+  and may be introduced only after 0045 and its dependencies are settled. The
+  normal Host closure retires the quiescence mode only after the selected schema
+  lineage is settled, with no rehearsal receipt chain created for integration.
+
 ### 0043 artifact blob-I/O compatibility protocol
 
 Migration 0043 changes the authority immediately around R2 `PUT` and `DELETE`.
@@ -818,11 +839,12 @@ not migration-first compatible. It remains blocked until this exact staged
 protocol has removed every older object-I/O invocation:
 
 1. Add `"artifactBlobIoMode": "pre-0043-quiesced"` to the operator-private
-   deploy target. Publish the selected 0043 commit through
+   deploy target. Publish the selected accepted commit through
    `takoserver-worker-authority-cutover`, using the current Version as
    `--closure-predecessor-version` and
    `--add-var=TAKOSERVER_ARTIFACT_BLOB_IO_MODE`. This exceptional target is
-   allowed only while the exact ordered 0037–0043 suffix is pending. It returns
+   allowed only while the exact ordered pending lineage through 0043 is present,
+   followed only by an optional accepted contiguous 0044–0049 tail. It returns
    the owned `503 backend_unavailable` envelope on every request before D1/R2
    composition and makes scheduled execution a no-op. The realized Worker
    configuration explicitly sets `preview_urls: false`.
@@ -847,7 +869,7 @@ protocol has removed every older object-I/O invocation:
    ```json
    {
      "kind": "takoserver.artifact-blob-io-quiescence@v1",
-     "environment": "production",
+     "environment": "<integration|rehearsal|production>",
      "accountId": "<exact account id>",
      "workerName": "<exact Worker name>",
      "databaseId": "<exact D1 id>",
@@ -867,23 +889,10 @@ protocol has removed every older object-I/O invocation:
    `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` to its absolute path.
    If the operator cannot establish the assertion, do not create the receipt;
    0043 intentionally remains unavailable.
-4. Run `takoserver-d1-schema --status --through-migration=0043`. Readiness now
-   requires the two immutable compatibility Versions, disabled public preview
-   URLs, unchanged deployment history, an exact receipt created after and bound
-   to both deployment and Version identities, and zero
-   active-root/deleting-candidate conflicts. Apply re-reads every item at
-   qualification, at the final fence, and in mutation phase immediately before
-   the first migration. A preview setting, history, receipt, target, or count
-   change prevents the Wrangler apply; redeploying even the same two Versions
-   invalidates the receipt and requires another drain proof.
-5. After the exact 0043 lineage reads back, remove `artifactBlobIoMode` from the
-   private target and publish through the authority cutover with the serving
-   compatibility Version as `--closure-predecessor-version` and
-   `--retire-var=TAKOSERVER_ARTIFACT_BLOB_IO_MODE`. The new code now admits a
-   per-digest `write_admitted` owner before each PUT and advances a blob delete
-   through `delete_claimed` then `delete_started` before its one external
-   DELETE. Its immediate rollback remains the compatibility Worker, so rollback
-   is service-denying but cannot run historical object I/O.
+4. Run `takoserver-d1-schema --status --environment=<integration|rehearsal|production> --through-migration=0043`. Readiness now requires the two immutable compatibility Versions, disabled public preview URLs, unchanged deployment history, an exact receipt created after and bound to both deployment and Version identities, and zero active-root/deleting-candidate conflicts. Apply re-reads every item at qualification, at the final fence, and in mutation phase immediately before the first migration. A preview setting, history, receipt, target, or count change prevents the Wrangler apply; redeploying even the same two Versions invalidates the receipt and requires another drain proof. When a later boundary 0044–0049 is selected, the sealed artifact retains the exact audited 0001–0043 prefix and adds only the ordered suffix through that boundary; a later selector cannot skip a still-pending boundary.
+5. After the exact 0043 lineage reads back, keep `artifactBlobIoMode` and the maintenance projection while any selected 0044–0049 suffix remains pending. Run those accepted boundaries in order, retaining the exact through-0043 prefix and applying only the requested trailing wave. The new code admits a per-digest `write_admitted` owner before each PUT and advances a blob delete through `delete_claimed` then `delete_started` before its one external DELETE. Its immediate rollback remains the compatibility Worker, so rollback is service-denying but cannot run historical object I/O.
+6. A target that declares a Cloudflare provider executor (CPE) service may add that service only after migration 0045 and all of the CPE's declared dependencies have read back as settled. CPE is optional for a generic OSS Host and is not a prerequisite for settling the available accepted schema lineage.
+7. Once the selected schema lineage is settled, publish the normal Host closure with the serving compatibility Version as `--closure-predecessor-version` and retire `TAKOSERVER_ARTIFACT_BLOB_IO_MODE`. If the target declares CPE, add its exact target-derived service binding in this same closure; a target without CPE retires the mode and exits without requiring WfP topology. Do not remove maintenance mode or add CPE before the applicable boundary and dependency proofs.
 
 Before step 4, aborting the cutover may deliberately restore an older Version,
 but doing so invalidates and requires deletion of any drain receipt. From the

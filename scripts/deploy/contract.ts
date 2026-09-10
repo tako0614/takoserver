@@ -117,15 +117,17 @@ export const DEPLOY_CONTRACT = {
           "kernel flock with exact boot, PID-start, " +
           "and lock-inode owner evidence serializes this owning publication path through authoritative " +
           "readback and public smoke. Status distinguishes active, stale-reclaimable crashed, and unsafe " +
-          "lease state. While the exact 0037-0043 suffix is pending, public smoke instead requires the " +
+          "lease state. While the exact pending lineage through 0043, followed only by an accepted " +
+          "contiguous 0044-0049 tail, is pending, public smoke instead requires the " +
           "owned all-traffic quiescence 503 before any request-time composition. Cloudflare exposes no conditional " +
           "deployment/CAS input, so authoritative post-mutation " +
           "history re-establishes the actual immediate predecessor as the rollback target.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${routineFailure} The surface refuses pending migrations except the exact 0037-0043 ` +
-          "suffix while the selected target is the all-traffic pre-0043 quiescence Worker. It refuses any configuration, secret, " +
+          `${routineFailure} The surface refuses pending migrations except the exact pending lineage through 0043, ` +
+          "followed only by an accepted contiguous 0044-0049 tail, while the selected target is the all-traffic " +
+          "pre-0043 quiescence Worker. It refuses any configuration, secret, " +
           "signing or Hosted topology drift before upload. It also composes the selected target with " +
           "the Worker's own startup path before any upload and refuses with that composition's exact " +
           "words, so a target that parses and yet cannot serve is a pre-mutation refusal rather than a " +
@@ -228,14 +230,16 @@ export const DEPLOY_CONTRACT = {
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
           "Integration JIT enablement adds exactly its environment, dedicated public JWK, fixed organization, " +
           "source commit and artifact digest plain-text bindings as one all-or-none profile. While the exact " +
-          "0037-0043 suffix is pending, public smoke instead requires the owned all-traffic quiescence 503 " +
+          "pending lineage through 0043, followed only by an accepted contiguous 0044-0049 tail, is pending, " +
+          "public smoke instead requires the owned all-traffic quiescence 503 " +
           "before any request-time composition. Every Form-authority environment separately seals " +
           "handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form " +
           "package-operation set, embeds P/capability/I, then hashes outer artifact A.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
-          `${highRiskFailure} Pending schema is refused except for the exact 0037-0043 suffix while ` +
+          `${highRiskFailure} Pending schema is refused except for the exact pending lineage through 0043, ` +
+          "followed only by an accepted contiguous 0044-0049 tail, while " +
           "the selected target blocks all request and scheduled traffic in pre-0043 quiescence mode. " +
           "Any other configuration, secret, signing or Hosted topology drift is still refused. Integration alone may bridge exact absence to the complete JIT " +
           "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
@@ -758,8 +762,9 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048 or 0049. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. Integration accepts no selector; its no-selector disposable cadence " +
-          "is explicitly integration-only. The 0022 selector is a one-time exact 0016-to-0022 " +
+          "forward-only apply. Integration may retain its no-selector disposable cadence or select " +
+          "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
+          "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
           "catch-up and never permits arbitrary migration-prefix adoption.",
         "post-conditions":
           "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +

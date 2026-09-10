@@ -68,6 +68,11 @@ const executorTarget = {
   },
 } satisfies DeployTarget;
 
+const maintenanceExecutorTarget = {
+  ...executorTarget,
+  artifactBlobIoMode: "pre-0043-quiesced",
+} satisfies DeployTarget;
+
 function fixture(
   input: {
     readonly diff?: string;
@@ -261,6 +266,58 @@ describe("split Takoserver Worker surfaces", () => {
     );
     expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
     expect(current.calls.some((call) => call.includes("--dry-run"))).toBe(false);
+  });
+
+  test("maintenance Worker status does not read the provider executor qualification", async () => {
+    const current = fixture({
+      selectedTarget: maintenanceExecutorTarget,
+      local: ARTIFACT_BLOB_IO_COMPATIBILITY_PENDING,
+      applied: [],
+    });
+    let reads = 0;
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      maintenanceExecutorTarget,
+      {
+        ...current,
+        providerExecutorQualification: {
+          async read() {
+            reads += 1;
+            throw new Error("maintenance mode must not qualify the provider executor");
+          },
+        },
+      },
+    );
+    expect(reads).toBe(0);
+    expect(status).toMatchObject({
+      ready: true,
+      cloudflareProviderExecutor: { required: false },
+      pendingMigrations: [...ARTIFACT_BLOB_IO_COMPATIBILITY_PENDING],
+    });
+  });
+
+  test("maintenance Worker status refuses a lingering mode after migrations settle", async () => {
+    const current = fixture({ selectedTarget: maintenanceExecutorTarget });
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      maintenanceExecutorTarget,
+      current,
+    );
+    expect(status).toMatchObject({
+      ready: false,
+      cloudflareProviderExecutor: { required: false },
+      pendingMigrations: [],
+    });
   });
 
   test("published product and OpenAPI stay bound to the exact target origin", async () => {

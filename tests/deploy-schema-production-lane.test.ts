@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -24,13 +24,36 @@ import {
 } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
-  runD1Schema,
-  runD1SchemaRehearsalBaseline,
+  runD1SchemaRehearsalBaseline as runBaseline,
+  runD1Schema as runSchema,
   type SchemaProcess,
   type SchemaReader,
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+
+const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema-"));
+const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
+afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
+
+// These cases exercise frozen 0001-0049 catch-up waves. Current source may
+// append later migrations without changing those waves or their receipts.
+function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
+  return runSchema(invocation, selectedTarget, {
+    migrationDirectory: auditedMigrations,
+    ...options,
+  });
+}
+
+function runD1SchemaRehearsalBaseline(
+  ...[invocation, selectedTarget, options]: Parameters<typeof runBaseline>
+) {
+  return runBaseline(invocation, selectedTarget, {
+    migrationDirectory: auditedMigrations,
+    ...options,
+  });
+}
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -387,38 +410,151 @@ async function rehearsalReceiptChainThrough0036(
 }
 
 describe("production-shaped D1 migration lane", () => {
-  test("integration rejects every protected wave selector at the runtime boundary", async () => {
+  test("integration can select one protected wave without widening its suffix or evidence", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-"));
     try {
+      const result = await runD1Schema(
+        {
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0028",
+        },
+        { ...target, environment: "integration" },
+        {
+          reader: dataReaderSequence([stateThrough(22, "i")]),
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        environment: "integration",
+        evidenceClass: "integration-protected-wave",
+        fromMigration: "0022_takoform_admission.sql",
+        throughMigration: "0028_reseller_settlement_cancellation.sql",
+        pendingMigrations: MIGRATIONS.slice(22, 28).map(({ name }) => name),
+        readyForApply: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration selected apply mutates only the audited wave and emits no receipt", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-apply-"));
+    try {
+      chmodSync(root, 0o700);
       const fixture = processFixture();
-      for (const throughMigration of [
-        "0028",
-        "0033",
-        "0036",
-        "0043",
-        "0044",
-        "0045",
-        "0046",
-        "0047",
-      ] as const) {
-        const failure = await runD1Schema(
-          {
-            action: "status",
-            environment: "integration",
-            commit: COMMIT,
-            throughMigration,
-          },
-          { ...target, environment: "integration" },
-          {
-            run: fixture.run,
-            reader: readerSequence([stateThrough(22, "i")]),
-            outputDirectory: join(root, `work-${throughMigration}`),
-            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          },
-        ).catch((error) => error);
-        expect(failure).toBeInstanceOf(DeployError);
-        expect(failure.message).toContain("integration D1 schema accepts no wave selector");
-      }
+      const pre = stateThrough(22, "i-pre");
+      const post = stateThrough(28, "i-post");
+      const receiptPath = join(root, "integration.receipt.json");
+      const result = await runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0028",
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([pre, pre, pre, post]),
+          outputDirectory: join(root, "work"),
+          receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      expect(result).toMatchObject({
+        environment: "integration",
+        evidenceClass: "integration-protected-wave",
+        pendingMigrations: MIGRATIONS.slice(22, 28).map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 28).map(({ name }) => name),
+        rehearsalReceipt:
+          "not-emitted-integration-protected-wave-evidence-is-never-production-acceptable",
+      });
+      expect(fixture.appliedFiles()).toEqual(MIGRATIONS.slice(0, 28).map(({ name }) => name));
+      expect(existsSync(receiptPath)).toBe(false);
+      expect(
+        fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration selected 0043 apply requires and preserves the external quiescence proof", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-0043-"));
+    try {
+      chmodSync(root, 0o700);
+      const fixture = processFixture();
+      const pre = stateThrough(36, "i-0043-pre");
+      const post = stateThrough(43, "i-0043-post");
+      const receiptPath = join(root, "integration-0043.receipt.json");
+      const result = await runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0043",
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([pre, pre, pre, post]),
+          outputDirectory: join(root, "work"),
+          receiptPath,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          artifactBlobIoCompatibilityReader: readyArtifactBlobIoCompatibility,
+        },
+      );
+
+      expect(result).toMatchObject({
+        environment: "integration",
+        evidenceClass: "integration-protected-wave",
+        fromMigration: "0036_provider_repair_and_managed_schedule_reconciliation.sql",
+        throughMigration: "0043_artifact_blob_io_fences.sql",
+        pendingMigrations: MIGRATIONS.slice(36, 43).map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 43).map(({ name }) => name),
+        artifactBlobIoCompatibility: await readyArtifactBlobIoCompatibility(),
+        rehearsalReceipt:
+          "not-emitted-integration-protected-wave-evidence-is-never-production-acceptable",
+      });
+      expect(fixture.appliedFiles()).toEqual(MIGRATIONS.slice(0, 43).map(({ name }) => name));
+      expect(existsSync(receiptPath)).toBe(false);
+      expect(
+        fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("integration protected selectors refuse the unreviewed current migration tail", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-drift-"));
+    try {
+      const fixture = processFixture();
+      const failure = await runD1Schema(
+        {
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0043",
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([stateThrough(36, "i")]),
+          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(String(failure)).toContain("exact audited source inventory 0001-0049");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -775,7 +911,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-drift-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
+      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
       renameSync(
         join(migrationDirectory, "0027_reseller_settlement_intents.sql"),
         join(migrationDirectory, "0027_drifted_settlement_intents.sql"),
@@ -805,7 +941,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-byte-drift-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
+      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
       const earlier = join(migrationDirectory, "0005_resource_deployments.sql");
       writeFileSync(earlier, `${readFileSync(earlier, "utf8")}\n-- edited after wave 0028\n`);
       const failure = await runD1Schema(
@@ -830,11 +966,34 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
+  test("the current integration schema cannot silently extend a protected production wave", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-current-head-"));
+    try {
+      const fixture = processFixture();
+      const failure = await runD1Schema(
+        { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0028" },
+        target,
+        {
+          run: fixture.run,
+          reader: readerSequence([stateThrough(22, "l")]),
+          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(String(failure)).toContain("exact audited source inventory 0001-0049");
+      expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("a fixed wave refuses migrations outside the exact audited 0001-0049 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(resolve(import.meta.dir, "../migrations"), migrationDirectory, { recursive: true });
+      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
       copyFileSync(
         join(migrationDirectory, "0049_artifact_consumer_active_resolution.sql"),
         join(migrationDirectory, "0050_unreviewed_extension.sql"),
@@ -914,7 +1073,7 @@ describe("production-shaped D1 migration lane", () => {
       }
 
       expect(receipted).toEqual(
-        readMigrationArtifact()
+        readMigrationArtifact(auditedMigrations)
           .files.slice(22)
           .map(({ name, digest, bytes }) => ({
             name,
@@ -1048,7 +1207,7 @@ describe("production-shaped D1 migration lane", () => {
         target,
         {
           run: process.run,
-          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          migrationDirectory: auditedMigrations,
           outputDirectory: join(root, "0043-work"),
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,

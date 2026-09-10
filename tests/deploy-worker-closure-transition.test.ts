@@ -373,6 +373,7 @@ describe("reviewed Worker closure transition", () => {
         applied: [],
         predecessor: { dropVar: "TAKOSERVER_ARTIFACT_BLOB_IO_MODE" },
       });
+      let qualificationReads = 0;
       const result = await runWorkerClosureTransition(
         {
           surface: "takoserver-worker-authority-cutover",
@@ -383,13 +384,19 @@ describe("reviewed Worker closure transition", () => {
           delta: {
             ...INTEGRATION_DELTA,
             addedVars: [...INTEGRATION_DELTA.addedVars, "TAKOSERVER_ARTIFACT_BLOB_IO_MODE"],
+            addedBindings: [],
           },
         },
         selected,
         {
           run: parts.run,
           state: parts.state,
-          providerExecutorQualification: parts.providerExecutorQualification,
+          providerExecutorQualification: {
+            async read() {
+              qualificationReads += 1;
+              throw new Error("maintenance mode must not qualify the provider executor");
+            },
+          },
           migrations: parts.migrations,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
@@ -411,12 +418,84 @@ describe("reviewed Worker closure transition", () => {
             ),
         },
       );
+      expect(qualificationReads).toBe(0);
       expect(result).toMatchObject({
         state: "closure-transition-applied",
         pendingMigrations: pending,
         probe: { status: 503, traffic: "quiesced" },
       });
       expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test("rechecks the migration lineage immediately before upload", async () => {
+    await withRoot("takoserver-closure-migration-race-", async (root) => {
+      const selected = {
+        ...target,
+        artifactBlobIoMode: "pre-0043-quiesced" as const,
+      } satisfies DeployTarget;
+      const local = [
+        "0037_worker_runtime_input_preparation_v2.sql",
+        "0038_selfhost_edge_kv.sql",
+        "0039_takoform_live_native_claim_across_tenants.sql",
+        "0040_selfhost_queues_and_schedules.sql",
+        "0041_selfhost_object_buckets.sql",
+        "0042_worker_endpoint_origin_reservation_space_id.sql",
+        "0043_artifact_blob_io_fences.sql",
+        "0044_artifact_consumer_resolution_receipts.sql",
+        "0045_cloudflare_provider_executor_operations.sql",
+      ];
+      const parts = fixture(root, {
+        selected,
+        local,
+        applied: [],
+        predecessor: { dropVar: "TAKOSERVER_ARTIFACT_BLOB_IO_MODE" },
+      });
+      let built = false;
+      let trafficMutations = 0;
+      const run: ClosureTransitionProcess = async (command, options) => {
+        if (command.includes("--dry-run")) built = true;
+        return parts.run(command, options);
+      };
+      const migrations: WorkerMigrationReader = {
+        async read() {
+          if (!built) return parts.migrations.read();
+          return { local, applied: local.slice(0, 7) };
+        },
+      };
+      const failure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            ...INTEGRATION_DELTA,
+            addedVars: [...INTEGRATION_DELTA.addedVars, "TAKOSERVER_ARTIFACT_BLOB_IO_MODE"],
+            addedBindings: [],
+          },
+        },
+        selected,
+        {
+          run,
+          state: parts.state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          migrations,
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+          fetcher: async () => {
+            trafficMutations += 1;
+            return Response.json({ error: "unexpected traffic mutation" }, { status: 500 });
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).message).toContain("changed pending D1 migrations");
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+      expect(trafficMutations).toBe(0);
     });
   });
 

@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import type { PublicFormImplementationIdentity } from "../../src/public-worker-implementation.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import type { LegacyHostServiceBinding } from "./worker-state.ts";
 
 export interface WorkerConfigOptions {
@@ -102,7 +102,7 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
       : neutralConfigWithTopology;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
   const services = [
-    ...(target.cloudflareProviderExecutor === undefined
+    ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? []
       : [
           {

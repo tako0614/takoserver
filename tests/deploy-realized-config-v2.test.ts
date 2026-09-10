@@ -73,6 +73,55 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("omits only the executor service while retaining the maintenance target inputs", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-executor-"));
+    const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
+    const supplied = {
+      ...target,
+      artifactBlobIoMode: "pre-0043-quiesced" as const,
+      edgeSupplies: edgeSuppliesFixture(),
+      objectBucketSupplies: objectBucketSuppliesFixture(),
+      cloudflareProviderExecutor,
+    } satisfies DeployTarget;
+    try {
+      const path = writeWorkerConfig(supplied, {
+        path: join(root, "wrangler.jsonc"),
+        main: "worker.js",
+        commit: "a".repeat(40),
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as {
+        services?: unknown;
+        vars: Record<string, string>;
+        d1_databases: readonly Record<string, unknown>[];
+        r2_buckets: readonly Record<string, unknown>[];
+      };
+      expect(config.services).toBeUndefined();
+      expect(config.vars).toMatchObject({
+        TAKOSERVER_ARTIFACT_BLOB_IO_MODE: "pre-0043-quiesced",
+        TAKOSERVER_MANAGED_BASE_DOMAIN: cloudflareProviderExecutor.managedBaseDomain,
+      });
+      const edgeSupplies = config.vars.TAKOSERVER_EDGE_SUPPLIES;
+      const objectBucketSupplies = config.vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES;
+      if (edgeSupplies === undefined || objectBucketSupplies === undefined) {
+        throw new Error("maintenance config omitted declared supply inputs");
+      }
+      expect(JSON.parse(edgeSupplies)).toEqual(supplied.edgeSupplies);
+      expect(JSON.parse(objectBucketSupplies)).toEqual(supplied.objectBucketSupplies);
+      expect(config.d1_databases).toEqual([
+        {
+          binding: "STATE_DB",
+          database_name: supplied.d1.databaseName,
+          database_id: supplied.d1.databaseId,
+        },
+      ]);
+      expect(config.r2_buckets).toEqual([
+        { binding: "OBJECTS", bucket_name: supplied.r2.bucketName },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("realizes the independent public Worker with no service binding", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-v2-"));
     try {

@@ -634,11 +634,6 @@ export async function runD1Schema(
   ) {
     throw preflightError("D1 schema through migration is not an approved fixed wave boundary");
   }
-  if (invocation.environment === "integration" && invocation.throughMigration !== undefined) {
-    throw preflightError(
-      "integration D1 schema accepts no wave selector; protected wave evidence is rehearsal/production only",
-    );
-  }
   if (invocation.environment !== "integration" && invocation.throughMigration === undefined) {
     throw preflightError(
       "rehearsal and production D1 schema invocations require one fixed --through-migration boundary",
@@ -726,8 +721,10 @@ export async function runD1Schema(
         environment: invocation.environment,
         selectedCommit: invocation.commit,
         evidenceClass:
-          invocation.environment === "integration" && invocation.throughMigration === undefined
-            ? "integration-only"
+          invocation.environment === "integration"
+            ? invocation.throughMigration === undefined
+              ? "integration-only"
+              : "integration-protected-wave"
             : "production-wave",
         fromMigration: wave.fromMigration,
         throughMigration: wave.throughMigration,
@@ -1250,8 +1247,10 @@ export async function runD1Schema(
       remoteRef: source.remoteRef,
       reviewer,
       evidenceClass:
-        invocation.environment === "integration" && invocation.throughMigration === undefined
-          ? "integration-only"
+        invocation.environment === "integration"
+          ? invocation.throughMigration === undefined
+            ? "integration-only"
+            : "integration-protected-wave"
           : "production-wave",
       fromMigration: wave.fromMigration,
       throughMigration: wave.throughMigration,
@@ -1282,7 +1281,9 @@ export async function runD1Schema(
             : "written-without-overwrite"
           : invocation.environment === "production"
             ? "exact-match-consumed-read-only"
-            : "not-emitted-integration-evidence-is-never-production-acceptable",
+            : invocation.throughMigration === undefined
+              ? "not-emitted-integration-evidence-is-never-production-acceptable"
+              : "not-emitted-integration-protected-wave-evidence-is-never-production-acceptable",
       rollback: "forward repair only: D1 migrations have no down path",
     };
   } finally {

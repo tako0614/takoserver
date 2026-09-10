@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   type ArtifactBlobIoCompatibilityState,
   artifactBlobIoCompatibilityAllowsPending,
+  artifactBlobIoSchemaAllowsPending,
   inspectArtifactBlobIoDeploymentCompatibility,
   probeArtifactBlobIoQuiescence,
 } from "../scripts/deploy/artifact-blob-io-compatibility.ts";
@@ -104,7 +105,7 @@ function receipt(path: string, overrides: Readonly<Record<string, unknown>> = {}
 }
 
 describe("0043 artifact blob I/O deployment compatibility", () => {
-  test("allows only the exact 0037-0043 pending suffix while all traffic is quiesced", () => {
+  test("allows only the exact 0037-0043 lineage and contiguous later pending migrations", () => {
     const suffix = [
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
@@ -117,9 +118,60 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(artifactBlobIoCompatibilityAllowsPending(target, suffix)).toBe(true);
     expect(artifactBlobIoCompatibilityAllowsPending(target, suffix.slice(5))).toBe(true);
     expect(artifactBlobIoCompatibilityAllowsPending(target, suffix.slice(0, -1))).toBe(false);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        ...suffix,
+        "0044_artifact_consumer_resolution_receipts.sql",
+        "0045_cloudflare_provider_executor_operations.sql",
+        "0046_exact_artifact_recovery_receipts.sql",
+        "0047_sponsorship_cutover_consumption.sql",
+        "0048_resource_execution_evidence.sql",
+        "0049_artifact_consumer_active_resolution.sql",
+      ]),
+    ).toBe(true);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0043_artifact_blob_io_fences.sql",
+        "0044_artifact_consumer_resolution_receipts.sql",
+      ]),
+    ).toBe(true);
+    expect(artifactBlobIoCompatibilityAllowsPending(target, [])).toBe(false);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0044_artifact_consumer_resolution_receipts.sql",
+      ]),
+    ).toBe(false);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0042_worker_endpoint_origin_reservation_space_id.sql",
+        "0043_artifact_blob_io_fences.sql",
+        "0045_cloudflare_provider_executor_operations.sql",
+      ]),
+    ).toBe(false);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0042_worker_endpoint_origin_reservation_space_id.sql",
+        "0043_artifact_blob_io_fences.sql",
+        "0044_artifact_consumer_resolution_receipts.sql",
+        "0044_artifact_consumer_resolution_receipts.sql",
+      ]),
+    ).toBe(false);
     expect(artifactBlobIoCompatibilityAllowsPending(targetWithoutCompatibilityMode(), suffix)).toBe(
       false,
     );
+  });
+
+  test("requires the quiesced schema predicate while normal Workers require no pending migrations", () => {
+    expect(artifactBlobIoSchemaAllowsPending(target, [])).toBe(false);
+    expect(artifactBlobIoSchemaAllowsPending(target, ["0043_artifact_blob_io_fences.sql"])).toBe(
+      true,
+    );
+    expect(artifactBlobIoSchemaAllowsPending(targetWithoutCompatibilityMode(), [])).toBe(true);
+    expect(
+      artifactBlobIoSchemaAllowsPending(targetWithoutCompatibilityMode(), [
+        "0043_artifact_blob_io_fences.sql",
+      ]),
+    ).toBe(false);
   });
 
   test("probes the dedicated all-traffic quiescence response instead of product health", async () => {

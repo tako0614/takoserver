@@ -6,7 +6,7 @@ import {
   expectedWorkerSecrets,
   type WorkerVersionAuthorityProfile,
 } from "./realized-config.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 
 const VERSION_ID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/u;
 const EXACT_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -182,7 +182,7 @@ export function expectedExactBindingClosure(
     AI: { type: "ai", fields: {} },
     WORKER_VERSION: { type: "version_metadata", fields: {} },
     ...expectedBindingClosureForTarget(target),
-    ...(target.cloudflareProviderExecutor === undefined
+    ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? {}
       : {
           CLOUDFLARE_PROVIDER_EXECUTOR: {

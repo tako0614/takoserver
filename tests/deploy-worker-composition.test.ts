@@ -83,4 +83,19 @@ describe("Worker composition preflight", () => {
       supplyContract: { id: "cloudflare.staging-supply" },
     });
   });
+
+  test("quiesced maintenance does not fake executor capability or compose supplies", async () => {
+    const selected = {
+      ...target({ edgeResourceClasses: EDGE_ONLY_RESOURCE_CLASSES }),
+      artifactBlobIoMode: "pre-0043-quiesced" as const,
+    } satisfies DeployTarget;
+    const env = workerCompositionEnv(selected);
+    expect(env).not.toHaveProperty("CLOUDFLARE_PROVIDER_EXECUTOR");
+    expect(Object.keys(env).sort()).toEqual([
+      "TAKOSERVER_EDGE_SUPPLIES",
+      "TAKOSERVER_MANAGED_BASE_DOMAIN",
+      "TAKOSERVER_OBJECT_BUCKET_SUPPLIES",
+    ]);
+    await expect(assertTargetComposes("preflight", selected)).resolves.toBeUndefined();
+  });
 });

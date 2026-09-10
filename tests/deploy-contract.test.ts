@@ -139,7 +139,12 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(routineWorker?.obligations["post-conditions"]).toContain("stale");
     expect(routineWorker?.obligations["post-conditions"]).toContain("all-traffic quiescence 503");
     expect(routineWorker?.obligations["failure-handling"]).toContain("traffic is indeterminate");
-    expect(routineWorker?.obligations["failure-handling"]).toContain("0037-0043");
+    expect(routineWorker?.obligations["failure-handling"]).toContain(
+      "exact pending lineage through 0043",
+    );
+    expect(routineWorker?.obligations["failure-handling"]).toContain(
+      "accepted contiguous 0044-0049 tail",
+    );
     expect(routineWorker?.obligations["failure-handling"]).toContain("all-traffic");
     expect(routineWorker?.obligations["failure-handling"]).toContain(
       "never claims that no target was touched",
@@ -153,6 +158,9 @@ describe("Takoserver split deploy entrypoint", () => {
       "cannot emit production rehearsal evidence",
     );
     expect(schema?.obligations.provenance).toContain("fixed next boundaries 0022, 0028");
+    expect(schema?.obligations.provenance).toContain("select one audited wave");
+    expect(schema?.obligations.provenance).toContain("integration-protected-wave");
+    expect(schema?.obligations.provenance).toContain("never writes rehearsal receipts");
     expect(schema?.obligations.provenance).toContain("one-time exact 0016-to-0022 catch-up");
     expect(schema?.obligations.provenance).toContain("0045");
     expect(schema?.obligations.provenance).toContain("0046");
@@ -368,7 +376,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0048",
       "0049",
     ] as const) {
-      for (const environment of ["rehearsal", "production"] as const) {
+      for (const environment of ["integration", "rehearsal", "production"] as const) {
         const accepted = await deploy([
           "takoserver-d1-schema",
           "--status",
@@ -391,32 +399,6 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationWithoutWave.exitCode).toBe(2);
     expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
     expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
-
-    for (const through of [
-      "0022",
-      "0028",
-      "0033",
-      "0036",
-      "0043",
-      "0044",
-      "0045",
-      "0046",
-      "0047",
-      "0048",
-      "0049",
-    ] as const) {
-      const refused = await deploy([
-        "takoserver-d1-schema",
-        "--status",
-        "--environment=integration",
-        `--commit=${sha}`,
-        `--through-migration=${through}`,
-      ]);
-      expect(refused.exitCode).toBe(2);
-      expect(refused.stdout).toBe("");
-      expect(refused.stderr).toContain("no target was touched");
-      expect(refused.stderr).not.toContain("deploy target descriptor");
-    }
 
     for (const args of [
       [
