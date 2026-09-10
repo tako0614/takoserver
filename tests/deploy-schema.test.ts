@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -27,6 +27,32 @@ import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema-surface-"));
 const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
 afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
+
+// The integration lane intentionally accepts a current source tail. Keep the
+// unreviewed tail synthetic and isolated so this test does not depend on
+// ambient worktree migrations that are absent from a clean historical commit.
+const INVENTED_UNAUDITED_TAIL = [
+  [
+    "0050_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0050_container_runtime_input_custody (id TEXT);\n",
+  ],
+  [
+    "0051_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0051_container_runtime_input_rewrap (id TEXT);\n",
+  ],
+  [
+    "0052_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0052_container_runtime_input_acceptance (id TEXT);\n",
+  ],
+] as const;
+
+function currentIntegrationMigrations(directory: string): string {
+  const result = copyAuditedSchemaFixture(directory);
+  for (const [name, sql] of INVENTED_UNAUDITED_TAIL) {
+    writeFileSync(join(result, name), sql, { mode: 0o600 });
+  }
+  return result;
+}
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -111,6 +137,17 @@ function integration0043Reader(states: readonly D1SchemaState[]): SchemaReader {
 function migrationStateThrough(count: number, marker: string): D1SchemaState {
   return {
     applied: MIGRATIONS.slice(0, count).map(({ name }) => name),
+    shape: `${marker}\n`,
+    shapeDigest: `sha256:${marker.repeat(64).slice(0, 64)}`,
+  };
+}
+
+function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
+  return {
+    applied: [
+      ...MIGRATIONS.slice(0, 49).map(({ name }) => name),
+      ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
+    ],
     shape: `${marker}\n`,
     shapeDigest: `sha256:${marker.repeat(64).slice(0, 64)}`,
   };
@@ -403,6 +440,7 @@ describe("forward-only D1 schema surface", () => {
   test("integration pending-0043 dispatch passes the OAuth bearer to compatibility reads only", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-0043-"));
     try {
+      const migrationDirectory = currentIntegrationMigrations(join(root, "current-migrations"));
       const oauthToken = "d1-0043-oauth-token-only-in-process";
       const calls: {
         readonly command: readonly string[];
@@ -421,14 +459,14 @@ describe("forward-only D1 schema surface", () => {
         return await fixture.run(command, options);
       };
       const pre = migrationStateThrough(36, "oauth-0043-pre");
-      const post = migrationStateThrough(MIGRATIONS.length, "oauth-current-post");
+      const post = migrationStateThroughCurrentTail("oauth-current-post");
       const result = await runD1Schema(
         { action: "apply", environment: "integration", commit: COMMIT },
         integration0043Target,
         {
           run,
           reader: integration0043Reader([pre, pre, pre, post]),
-          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          migrationDirectory,
           outputDirectory: join(root, "work"),
           review: "reviewer@example.test",
           artifactBlobIoCompatibilityReader: async (phase, context) => {

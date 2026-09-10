@@ -37,6 +37,32 @@ const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema
 const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
 afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 
+// Protected-wave tests must model the current source tail explicitly. Keep
+// these synthetic unaudited files in each test's temporary directory instead
+// of relying on untracked migrations in the ambient worktree.
+const INVENTED_UNAUDITED_TAIL = [
+  [
+    "0050_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0050_container_runtime_input_custody (id TEXT);\n",
+  ],
+  [
+    "0051_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0051_container_runtime_input_rewrap (id TEXT);\n",
+  ],
+  [
+    "0052_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0052_container_runtime_input_acceptance (id TEXT);\n",
+  ],
+] as const;
+
+function currentIntegrationMigrations(directory: string): string {
+  const result = copyAuditedSchemaFixture(directory);
+  for (const [name, sql] of INVENTED_UNAUDITED_TAIL) {
+    writeFileSync(join(result, name), sql, { mode: 0o600 });
+  }
+  return result;
+}
+
 // These cases exercise frozen 0001-0049 catch-up waves. Current source may
 // append later migrations without changing those waves or their receipts.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
@@ -536,6 +562,7 @@ describe("production-shaped D1 migration lane", () => {
   test("integration protected selectors refuse the unreviewed current migration tail", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-integration-selector-drift-"));
     try {
+      const migrationDirectory = currentIntegrationMigrations(join(root, "current-migrations"));
       const fixture = processFixture();
       const failure = await runD1Schema(
         {
@@ -548,7 +575,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: fixture.run,
           reader: dataReaderSequence([stateThrough(36, "i")]),
-          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          migrationDirectory,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
@@ -969,6 +996,7 @@ describe("production-shaped D1 migration lane", () => {
   test("the current integration schema cannot silently extend a protected production wave", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-current-head-"));
     try {
+      const migrationDirectory = currentIntegrationMigrations(join(root, "current-migrations"));
       const fixture = processFixture();
       const failure = await runD1Schema(
         { action: "status", environment: "rehearsal", commit: COMMIT, throughMigration: "0028" },
@@ -976,7 +1004,7 @@ describe("production-shaped D1 migration lane", () => {
         {
           run: fixture.run,
           reader: readerSequence([stateThrough(22, "l")]),
-          migrationDirectory: resolve(import.meta.dir, "../migrations"),
+          migrationDirectory,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },

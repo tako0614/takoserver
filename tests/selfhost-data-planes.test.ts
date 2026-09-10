@@ -8,6 +8,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1276,6 +1277,11 @@ test("the maintenance tick reclaims abandoned uploads and files no row names", a
   const storageId = String((rows[0] as Record<string, unknown>).storage_id);
   await sql.run("DELETE FROM selfhost_objects WHERE key = ?", ["orphaned"]);
   const orphan = join(root, "objects", ALPHA.objects?.MEDIA as string, "o", storageId.slice(0, 2));
+  // Filesystem timestamps use wall time, while maintenance uses this fixture's
+  // clock. Keep the orphan on that same timeline; do not let the calendar date
+  // determine whether it has crossed the native one-hour safety window.
+  utimesSync(join(orphan, storageId), now, now);
+  expect(await planes.maintenance.reconcileOrphanObjectFiles()).toBe(0);
 
   // A fresh upload survives the tick; one past its lifetime does not.
   expect(await planes.maintenance.sweepExpiredObjectUploads()).toBe(0);
