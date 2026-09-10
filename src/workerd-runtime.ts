@@ -326,6 +326,8 @@ export interface WorkerdRuntimeOptions {
   readonly configPath?: string;
   /** Port the router listens on. */
   readonly port?: number;
+  /** Current Host-owned loopback listener; persisted Versions retain their original metadata. */
+  readonly dataPlaneAddress?: string;
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -459,6 +461,10 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
+  const dataPlaneAddress =
+    options.dataPlaneAddress === undefined
+      ? undefined
+      : validDataPlaneAddress(options.dataPlaneAddress);
   const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.binary ?? null,
     temporaryRoot: join(options.root, ".workerd-inspection"),
@@ -539,6 +545,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         options.tls,
         configProbeToken,
         internalReadinessCapability,
+        dataPlaneAddress,
       ),
       "utf8",
     );
@@ -2376,6 +2383,7 @@ function renderConfig(
   tls?: WorkerdTlsKeypair,
   configProbeToken?: string,
   internalReadinessCapability = "",
+  dataPlaneAddress?: string,
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
   const graphIdentity = publishedGraphIdentity(published);
@@ -2536,9 +2544,10 @@ function renderConfig(
     })
     .join("\n");
 
-  // One pair per script rather than one shared, so the configuration stays a
-  // pure function of the manifests on disk: a script that binds no data plane
-  // contributes neither service, and removing it removes both with it.
+  // Each script contributes its own service pair. Service membership derives
+  // from manifests on disk: a script that binds no data plane contributes
+  // neither service, and removing it removes both. The origin listener comes
+  // from current Host-owned transport so restart never rewrites the manifest.
   //
   // The token is declared here and only here. The script's own service holds a
   // binding to this one and nothing else, so tenant code — by `env`, by
@@ -2567,7 +2576,7 @@ function renderConfig(
     )
   ),
   ( name = "${entry.name}-selfhost-data-origin",
-    external = ( address = ${capnpText(plane.address)}, http = () )
+    external = ( address = ${capnpText(dataPlaneAddress ?? plane.address)}, http = () )
   ),`;
     })
     .join("\n");

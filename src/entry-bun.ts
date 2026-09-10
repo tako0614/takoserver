@@ -426,6 +426,9 @@ const workerdRuntime = createWorkerdRuntime({
   root: dataRoot,
   binary: workerdBinary,
   port: workerdPort,
+  // The kernel may choose a different listener after a restart. Re-render
+  // Host transport from this process, not a Version's saved ephemeral port.
+  ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
   ...(workerdTls ? { tls: workerdTls } : {}),
   isReady: () => workerd.isReady(),
   async onReload(configPath) {

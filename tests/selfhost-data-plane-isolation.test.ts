@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -279,5 +279,54 @@ test("only a loopback address with a real port may be published", async () => {
     await expect(
       runtime.write("sw1", site(address), modules, undefined, hostModules),
     ).rejects.toThrow("unusable data plane address");
+  }
+});
+
+test("restore rebinds the Host listener without rewriting immutable publication data", async () => {
+  root = mkdtempSync(join(tmpdir(), "takoserver-plane-rebind-"));
+  const first = createWorkerdRuntime({ root, isReady: () => true });
+  await first.write(
+    "sw1",
+    {
+      directory: "sw1",
+      mainModule: "index.js",
+      hostnames: [],
+      dataPlane: {
+        address: "127.0.0.1:42101",
+        module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+        vars: [],
+      },
+    },
+    new Map([["index.js", new TextEncoder().encode("export default {};")]]),
+    undefined,
+    new Map([
+      [SELFHOST_WORKER_DATA_SERVICE_MODULE, new TextEncoder().encode(selfhostDataServiceSource())],
+    ]),
+  );
+  const manifestPath = join(root, "workers", "sw1", "takoserver-site.json");
+  const before = readFileSync(manifestPath, "utf8");
+  const second = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    dataPlaneAddress: "127.0.0.1:42102",
+  });
+  expect(await second.restore()).toEqual(["sw1"]);
+  const config = readFileSync(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain('address = "127.0.0.1:42102"');
+  expect(config).not.toContain('address = "127.0.0.1:42101"');
+  expect(readFileSync(manifestPath, "utf8")).toBe(before);
+});
+
+test("a Host listener override cannot redirect data-plane credentials off loopback", () => {
+  for (const dataPlaneAddress of [
+    "localhost:1234",
+    "0.0.0.0:1234",
+    "10.0.0.1:1234",
+    "127.0.0.1:0",
+    "127.0.0.1:65536",
+  ]) {
+    expect(() => createWorkerdRuntime({ root: "/unused", dataPlaneAddress })).toThrow(
+      "unusable data plane address",
+    );
   }
 });

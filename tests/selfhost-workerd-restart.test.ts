@@ -2,6 +2,17 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createEphemeralSql } from "../src/compat.ts";
+import {
+  SELFHOST_WORKER_DATA_SERVICE_MODULE,
+  selfhostDataServiceSource,
+} from "../src/providers/selfhost-data-service.ts";
+import {
+  SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_WORKER_DATA_TOKEN_BINDING,
+} from "../src/providers/selfhost-worker-wrapper.ts";
+import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
 
@@ -26,14 +37,19 @@ import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
 const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
 const HOSTNAME = "restart.localhost";
 const MODULE = `export default {
-  async fetch() {
-    return new Response("served after a restart");
+  async fetch(request, env) {
+    return env.__TAKOSERVER_SELFHOST_DATA.fetch("http://data.internal${SELFHOST_DATA_PLANE_SQL_PATH}", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ protocol: ${JSON.stringify(SELFHOST_DATA_PLANE_PROTOCOL)}, binding: "DB", op: "execute", statement: { sql: "SELECT 42 AS answer" } }),
+    });
   },
 };
 `;
 
 let root: string;
 let running: { kill(): void; readonly exited?: Promise<number> } | undefined;
+let plane: ReturnType<typeof serveSelfhostDataPlanes> | undefined;
+let retiredListener: ReturnType<typeof Bun.serve> | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-restart-"));
@@ -48,6 +64,10 @@ afterEach(async () => {
     await running.exited;
     running = undefined;
   }
+  plane?.stop(true);
+  plane = undefined;
+  retiredListener?.stop(true);
+  retiredListener = undefined;
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
@@ -58,7 +78,26 @@ test.skipIf(WORKERD === null)(
     const port = Number(reserved.port);
     reserved.stop(true);
 
-    const boot = async () => {
+    const sql = createEphemeralSql();
+    const startPlane = () =>
+      serveSelfhostDataPlanes({
+        sql,
+        grant: async (script, versionId) =>
+          script === "sw1" && versionId === "v1"
+            ? {
+                secret: "restart-plane-secret-0",
+                kv: {},
+                sql: { DB: "restart-db" },
+                queue: {},
+                objects: {},
+              }
+            : null,
+        databasePath: (name) => join(root, "databases", `${name}.sqlite`),
+        objectRoot: join(root, "objects"),
+      });
+    plane = startPlane();
+    const originalAddress = plane.address;
+    const boot = async (dataPlaneAddress: string) => {
       const supervisor = createWorkerdSupervisor({
         binary: WORKERD,
         spawn: (command) => {
@@ -83,6 +122,7 @@ test.skipIf(WORKERD === null)(
       const runtime = createWorkerdRuntime({
         root,
         port,
+        dataPlaneAddress,
         isReady: () => supervisor.isReady(),
         onReload: async (configPath) => {
           await supervisor.ensure(configPath);
@@ -103,7 +143,7 @@ test.skipIf(WORKERD === null)(
       }
     };
 
-    const first = await boot();
+    const first = await boot(originalAddress);
     // Nothing published yet, so a boot starts nothing at all.
     expect(await first.runtime.restore()).toEqual([]);
     expect(first.supervisor.isReady()).toBe(false);
@@ -115,23 +155,55 @@ test.skipIf(WORKERD === null)(
         mainModule: "index.js",
         hostnames: [HOSTNAME],
         generation: "gen-1",
+        dataPlane: {
+          address: originalAddress,
+          module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
+          vars: [
+            {
+              name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
+              value: "sw1.v1.restart-plane-secret-0",
+              kind: "text",
+            },
+          ],
+        },
       },
       new Map([["index.js", new TextEncoder().encode(MODULE)]]),
+      undefined,
+      new Map([
+        [
+          SELFHOST_WORKER_DATA_SERVICE_MODULE,
+          new TextEncoder().encode(selfhostDataServiceSource()),
+        ],
+      ]),
     );
     await first.runtime.reload();
-    expect(await ask()).toBe("served after a restart");
+    const expected = { ok: true, value: { rows: [{ answer: 42 }], rowsWritten: 0 } };
+    expect(JSON.parse((await ask()) ?? "null")).toEqual(expected);
 
     // The machine goes away, exactly as a `kill` or a reboot takes it away.
     first.supervisor.stop();
     await running?.exited;
     running = undefined;
     expect(await ask()).toBeNull();
+    plane.stop(true);
+    let staleCalls = 0;
+    retiredListener = Bun.serve({
+      hostname: "127.0.0.1",
+      port: Number(originalAddress.split(":")[1]),
+      fetch() {
+        staleCalls++;
+        return new Response("retired listener", { status: 503 });
+      },
+    });
+    plane = startPlane();
+    expect(plane.address).not.toBe(originalAddress);
 
     // And comes back over the same data directory, told nothing.
-    const second = await boot();
+    const second = await boot(plane.address);
     expect(await second.runtime.restore()).toEqual(["sw-restart"]);
     expect(second.supervisor.isReady()).toBe(true);
-    expect(await ask()).toBe("served after a restart");
+    expect(JSON.parse((await ask()) ?? "null")).toEqual(expected);
+    expect(staleCalls).toBe(0);
     // The Host's own observation agrees: this generation really is activated.
     expect(await second.runtime.has("sw-restart", "gen-1")).toBe(true);
   },
