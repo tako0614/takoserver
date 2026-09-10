@@ -9,6 +9,7 @@ import {
   readFile,
   rename,
   rm,
+  rmdir,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -785,6 +786,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     async publish(name, publication) {
       const directory = scriptDirectory(name);
       const pointerPath = join(directory, MANIFEST);
+      const removePointer = async (): Promise<void> => {
+        await rm(pointerPath, { force: true });
+        try {
+          // An empty carrier is not a partial publication. Remove it without
+          // touching retained generations or a nonempty, incomplete script.
+          await rmdir(directory);
+        } catch (error) {
+          const code = (error as { readonly code?: unknown }).code;
+          if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
+        }
+      };
       // Byte capture and immutable generation staging can proceed in parallel
       // for different Workers. Only the shared graph snapshot/commit is
       // serialized; otherwise two valid publishes can each render a graph
@@ -801,18 +813,18 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
         await activate(next, previous, {
           commit: async () => {
-            await privateDirectory(directory);
             if (pointerContents === null) {
-              await rm(pointerPath, { force: true });
+              await removePointer();
             } else {
+              await privateDirectory(directory);
               await writePrivate(pointerPath, pointerContents, "utf8");
             }
           },
           rollback: async () => {
-            await privateDirectory(directory);
             if (beforePointer === null) {
-              await rm(pointerPath, { force: true });
+              await removePointer();
             } else {
+              await privateDirectory(directory);
               await writePrivate(pointerPath, beforePointer, "utf8");
             }
           },
