@@ -27,6 +27,7 @@ import {
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
 import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
+import type { SelfhostStandardServiceIntegration } from "./providers/selfhost-standard-services.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
 import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
@@ -117,6 +118,8 @@ export interface SelfhostCompositionOptions {
    * and admission refuses the declaration before anything is provisioned.
    */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /** Operator-selected runtime serializers; compose a matching Host resolver separately. */
+  readonly standardServiceIntegrations?: readonly SelfhostStandardServiceIntegration[];
   /**
    * Loopback address of this machine's KV and SQL data planes. Absent means it
    * serves none, and a Worker Version that binds one is refused at apply.
@@ -231,6 +234,9 @@ export function createSelfhostComposition(
       : { workerEndpointPort: options.workerEndpointPort }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
+    ...(options.standardServiceIntegrations
+      ? { standardServiceIntegrations: options.standardServiceIntegrations }
+      : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
     ...(options.events ? { events: options.events } : {}),

@@ -92,6 +92,12 @@ import {
   SelfhostScriptStateStoreError,
 } from "./selfhost-script-state.ts";
 import {
+  createSelfhostStandardServices,
+  SelfhostStandardServiceError,
+  type SelfhostStandardServiceIntegration,
+  sameSelfhostStandardServiceDeclaration,
+} from "./selfhost-standard-services.ts";
+import {
   createSelfhostVersionBindingStore,
   normalizeSelfhostVersionBindingSet,
   SELFHOST_WORKER_HANDLER_NAMES,
@@ -309,6 +315,8 @@ export interface SelfhostProviderOptions {
    * declaration with `unsupported_capability` before any mutation happens.
    */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /** Explicit operator integrations only; none are bundled or enabled by default. */
+  readonly standardServiceIntegrations?: readonly SelfhostStandardServiceIntegration[];
   /**
    * Loopback address of this Host's KV and SQL data planes.
    *
@@ -645,6 +653,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const scriptStates = createSelfhostScriptStateStore({ root: scriptsRoot });
   const versionBindings = createSelfhostVersionBindingStore({ root: versionBindingsRoot });
   const runtimeInputs = options.runtimeInputs;
+  const standardServices = createSelfhostStandardServices(options.standardServiceIntegrations);
   const versionMaterializer = createSelfhostVersionMaterializer({
     root: versionsRoot,
     artifacts,
@@ -1054,6 +1063,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             name: binding.name,
             type: "secret_text" as const,
           })),
+          ...(bindings.externalServices ?? []).flatMap((slot) =>
+            slot.binding ? [{ name: slot.name, type: "json" as const }] : [],
+          ),
           ...(plane?.bindings ?? []).map((binding) => ({
             kind:
               binding.kind === "edge.kv"
@@ -1309,7 +1321,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       bindings.handlers,
     );
     if (verificationFailure) throw new SelfhostFailure(verificationFailure);
-    const vars = bindings ? [...bindings.vars, ...bindings.sensitiveVars] : [];
+    const vars = bindings
+      ? [
+          ...bindings.vars,
+          ...bindings.sensitiveVars,
+          ...(bindings.externalServices ?? []).flatMap((slot) =>
+            slot.binding ? [{ name: slot.name, ...slot.binding }] : [],
+          ),
+        ]
+      : [];
     const projection = wrapperProjection(
       script,
       versionId,
@@ -2191,6 +2211,22 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     }
     const verificationFailure = await verifyPreparedWorkerModule(prepared, handlers);
     if (verificationFailure) return verificationFailure;
+    let externalServices: ReturnType<typeof standardServices.materialize>;
+    try {
+      externalServices = standardServices.materialize(
+        input.spec,
+        input.standardServices ?? [],
+        new Set([
+          ...vars.map(({ name }) => name),
+          ...requiredSensitive,
+          ...dataBindings.map(({ name }) => name),
+          ...serviceBindings.map(({ name }) => name),
+        ]),
+      );
+    } catch (error) {
+      if (error instanceof SelfhostStandardServiceError) return failed("denied", error.message);
+      throw error;
+    }
     if (serviceBindings.length > 0) {
       const existing = await readVersionBindings(script, versionId);
       if (
@@ -2251,6 +2287,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         vars,
         sensitiveVars,
         serviceBindings,
+        ...(externalServices.length > 0 ? { externalServices } : {}),
         ...(dataPlane ? { dataPlane } : {}),
       });
     } catch (error) {
@@ -2314,6 +2351,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         requiredSensitive,
         dataBindings,
         serviceBindings,
+        input.spec,
       )
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
@@ -2498,6 +2536,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         requiredSensitive,
         dataBindings,
         serviceBindings,
+        input.spec,
       )
     ) {
       return failed("not_found", "the Worker Version environment was not recorded");
@@ -3142,6 +3181,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   return {
     id,
     offerings: structuredClone(options.offerings) as ProviderOffering[],
+    standardServiceProtocols: standardServices.protocols,
     ...(options.nativeReadbackAuthorities
       ? { nativeReadbackAuthorities: structuredClone(options.nativeReadbackAuthorities) }
       : {}),
@@ -3397,7 +3437,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           case "ModuleWorker":
             return await applyModuleWorker(input);
           case "WorkerVersion":
-            return await applyWorkerVersion(input);
+            return input.operationMode === "recovery"
+              ? await recoverWorkerVersionApply(input)
+              : await applyWorkerVersion(input);
           case "WorkerDeployment":
             return await applyWorkerDeployment(input);
           case "WorkerEndpoint":
@@ -3505,7 +3547,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // only the immutable ownership edge added by worker.service here;
             // apply/recovery remain responsible for the full data projection.
             const serviceBindings = await declaredServiceBindings(input, script, new Set());
-            if (!sameVersionAuthority(bindings, worker.metadata.uid, serviceBindings)) {
+            if (
+              !sameVersionAuthority(bindings, worker.metadata.uid, serviceBindings) ||
+              !sameSelfhostStandardServiceDeclaration(input.spec, bindings.externalServices)
+            ) {
               return failed(
                 "conflict",
                 "the retained Worker Version has different environment bindings",
@@ -5019,11 +5064,13 @@ function sameVersionDeclaration(
   sensitiveNames: readonly string[],
   dataBindings: readonly SelfhostVersionDataBinding[],
   serviceBindings: readonly SelfhostVersionServiceBinding[],
+  spec: JsonObject,
 ): boolean {
   if (
     !recorded?.handlers ||
     !sameStrings(recorded.handlers, handlers) ||
-    !sameVersionAuthority(recorded, workerResourceUid, serviceBindings)
+    !sameVersionAuthority(recorded, workerResourceUid, serviceBindings) ||
+    !sameSelfhostStandardServiceDeclaration(spec, recorded.externalServices)
   ) {
     return false;
   }

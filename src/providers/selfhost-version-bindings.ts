@@ -2,6 +2,9 @@ import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { isJsonObject } from "../json.ts";
+import { parseStrictJson } from "../strict-json.ts";
+import { isStableStandardServiceProtocol } from "../takoform/standard-services.ts";
 
 /**
  * Durable runtime bindings for one immutable Worker Version.
@@ -57,6 +60,12 @@ const FORMAT_V3 = "takoserver.selfhost-version-bindings@v3";
  * acquiring authority over the replacement Resource.
  */
 const FORMAT_V4 = "takoserver.selfhost-version-bindings@v4";
+/**
+ * Adds Host-owned, runtime-only material for stable external standard services.
+ * The declaration is retained beside the optional JSON binding so recovery can
+ * prove the exact slot set without resolving current operator integrations.
+ */
+const FORMAT_V5 = "takoserver.selfhost-version-bindings@v5";
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
   "edge.kv",
@@ -123,6 +132,20 @@ export interface SelfhostVersionServiceBinding {
   readonly targetResourceUid: string;
 }
 
+/** One stable external service slot and its optional runtime-only JSON value. */
+export interface SelfhostVersionExternalService {
+  readonly name: string;
+  readonly required: boolean;
+  readonly service: {
+    readonly apiVersion: "standards.takoform.com/v1";
+    readonly protocol: string;
+  };
+  readonly binding?: {
+    readonly kind: "json";
+    readonly value: string;
+  };
+}
+
 /**
  * The half of a version's environment that needs a data plane behind it.
  *
@@ -152,6 +175,8 @@ export interface SelfhostVersionBindingSet {
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
   /** Fetch-only projections to other logical ModuleWorkers. */
   readonly serviceBindings: readonly SelfhostVersionServiceBinding[];
+  /** Stable external service declarations and optional runtime JSON values. */
+  readonly externalServices?: readonly SelfhostVersionExternalService[];
   /** Absent when the version binds no namespace, queue, or database. */
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
@@ -169,6 +194,8 @@ export interface StoredSelfhostVersionBindings {
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
   /** Absent only on a retained @v1-@v3 record. */
   readonly serviceBindings?: readonly SelfhostVersionServiceBinding[];
+  /** Absent on @v1-@v4 records and on versions with no external services. */
+  readonly externalServices?: readonly SelfhostVersionExternalService[];
   readonly dataPlane?: SelfhostVersionDataPlane;
   /** Salted commitment to this exact binding set; safe to place in a generation. */
   readonly digest: `sha256:${string}`;
@@ -300,7 +327,8 @@ export function createSelfhostVersionBindingStore(options: {
         ) {
           throw new SelfhostVersionBindingStoreError("unavailable");
         }
-        const raw = canonicalRecord(FORMAT_V4, salt, normalized, planeToken, eventToken);
+        const format = normalized.externalServices ? FORMAT_V5 : FORMAT_V4;
+        const raw = canonicalRecord(format, salt, normalized, planeToken, eventToken);
         const bytes = new TextEncoder().encode(raw);
         if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
         const temporary = `${path}.tmp`;
@@ -329,7 +357,7 @@ export function createSelfhostVersionBindingStore(options: {
         }
         return {
           ...normalized,
-          digest: digestOf(FORMAT_V4, salt, normalized, planeToken, eventToken),
+          digest: digestOf(format, salt, normalized, planeToken, eventToken),
           ...(planeToken === undefined ? {} : { planeToken }),
           eventToken,
         };
@@ -409,7 +437,21 @@ async function locked<T>(key: string, operation: () => Promise<T>): Promise<T> {
 export function normalizeSelfhostVersionBindingSet(
   set: SelfhostVersionBindingSet,
 ): SelfhostVersionBindingSet {
-  return normalizeSet(set);
+  const normalized = normalizeSet(set);
+  // Check the complete envelope before materialization or a one-shot secret
+  // dispatch, not only in write(). Tokens and salt have fixed encoded lengths.
+  const placeholder = "A".repeat(43);
+  const raw = canonicalRecord(
+    normalized.externalServices ? FORMAT_V5 : FORMAT_V4,
+    placeholder,
+    normalized,
+    normalized.dataPlane ? placeholder : undefined,
+    placeholder,
+  );
+  if (new TextEncoder().encode(raw).byteLength > MAX_BYTES) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return normalized;
 }
 
 function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet {
@@ -421,12 +463,14 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
   const sensitiveVars = normalizeBindings(set.sensitiveVars);
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
   const serviceBindings = normalizeServiceBindings(set.serviceBindings);
+  const externalServices = normalizeExternalServices(set.externalServices);
   const names = new Set<string>();
   for (const name of [
     ...vars.map((binding) => binding.name),
     ...sensitiveVars.map((binding) => binding.name),
     ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
     ...serviceBindings.map((binding) => binding.name),
+    ...(externalServices ?? []).map((binding) => binding.name),
   ]) {
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
     names.add(name);
@@ -437,8 +481,106 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
     vars,
     sensitiveVars,
     serviceBindings,
+    ...(externalServices ? { externalServices } : {}),
     ...(dataPlane ? { dataPlane } : {}),
   };
+}
+
+/**
+ * Stable external services are a closed declaration list. An empty list is
+ * normalized to absence so the historical @v1-@v4 bytes remain unchanged.
+ */
+function normalizeExternalServices(
+  services: readonly SelfhostVersionExternalService[] | undefined,
+): readonly SelfhostVersionExternalService[] | undefined {
+  if (services === undefined) return undefined;
+  if (!Array.isArray(services)) throw new SelfhostVersionBindingStoreError("corrupt");
+  if (services.length === 0) return undefined;
+  if (services.length > 16) throw new SelfhostVersionBindingStoreError("corrupt");
+  const sorted = [...services].sort((left, right) => {
+    const leftName =
+      typeof left === "object" &&
+      left !== null &&
+      !Array.isArray(left) &&
+      typeof left.name === "string"
+        ? left.name
+        : "";
+    const rightName =
+      typeof right === "object" &&
+      right !== null &&
+      !Array.isArray(right) &&
+      typeof right.name === "string"
+        ? right.name
+        : "";
+    return leftName < rightName ? -1 : leftName > rightName ? 1 : 0;
+  });
+  return sorted.map((service) => {
+    if (
+      typeof service !== "object" ||
+      service === null ||
+      Array.isArray(service) ||
+      (Object.keys(service).sort().join(",") !== "name,required,service" &&
+        Object.keys(service).sort().join(",") !== "binding,name,required,service") ||
+      typeof service.name !== "string" ||
+      service.name.length === 0 ||
+      service.name.length > 64 ||
+      !/^[A-Z][A-Z0-9_]*$/u.test(service.name) ||
+      typeof service.required !== "boolean" ||
+      typeof service.service !== "object" ||
+      service.service === null ||
+      Array.isArray(service.service) ||
+      Object.keys(service.service).sort().join(",") !== "apiVersion,protocol" ||
+      service.service.apiVersion !== "standards.takoform.com/v1" ||
+      typeof service.service.protocol !== "string" ||
+      !isStableStandardServiceProtocol(service.service.protocol)
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    const hasBinding = Object.hasOwn(service, "binding");
+    if (service.required && !hasBinding) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    let binding: SelfhostVersionExternalService["binding"];
+    if (hasBinding) {
+      if (
+        typeof service.binding !== "object" ||
+        service.binding === null ||
+        Array.isArray(service.binding) ||
+        Object.keys(service.binding).sort().join(",") !== "kind,value" ||
+        service.binding.kind !== "json" ||
+        typeof service.binding.value !== "string"
+      ) {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      validateExternalServiceJsonValue(service.binding.value);
+      binding = { kind: "json", value: service.binding.value };
+    }
+    return {
+      name: service.name,
+      required: service.required,
+      service: {
+        apiVersion: "standards.takoform.com/v1" as const,
+        protocol: service.service.protocol,
+      },
+      ...(binding === undefined ? {} : { binding }),
+    };
+  });
+}
+
+function validateExternalServiceJsonValue(value: string): void {
+  let parsed: unknown;
+  try {
+    const bytes = new TextEncoder().encode(value);
+    // TextEncoder replaces lone UTF-16 surrogates; reject that lossy path so
+    // the strict parser validates the exact string retained in the sidecar.
+    if (new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes) !== value) {
+      throw new Error("external_service_json_not_unicode_scalar");
+    }
+    parsed = parseStrictJson(bytes, MAX_BYTES);
+  } catch {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (!isJsonObject(parsed)) throw new SelfhostVersionBindingStoreError("corrupt");
 }
 
 function normalizeServiceBindings(
@@ -605,12 +747,14 @@ function sameBindings(
         handlers: left.handlers,
         vars: left.vars,
         sensitiveVars: left.sensitiveVars,
+        externalServices: left.externalServices ?? null,
         dataPlane: left.dataPlane ?? null,
       }) ===
         JSON.stringify({
           handlers: right.handlers,
           vars: right.vars,
           sensitiveVars: right.sensitiveVars,
+          externalServices: right.externalServices ?? null,
           dataPlane: right.dataPlane ?? null,
         })
     );
@@ -623,6 +767,7 @@ function sameBindings(
       vars: left.vars,
       sensitiveVars: left.sensitiveVars,
       serviceBindings: left.serviceBindings,
+      ...(left.externalServices ? { externalServices: left.externalServices } : {}),
       ...(left.dataPlane ? { dataPlane: left.dataPlane } : {}),
     }) === canonicalBindings(right)
   );
@@ -635,6 +780,7 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
     vars: set.vars,
     sensitiveVars: set.sensitiveVars,
     serviceBindings: set.serviceBindings,
+    externalServices: set.externalServices ?? null,
     dataPlane: set.dataPlane ?? null,
   });
 }
@@ -646,10 +792,16 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
  * Every format this Host has ever written is reproducible here, because that
  * proof is what tells a torn or tampered file from a good one. `@v1` and `@v2`
  * are read, never written: a machine published by an earlier build keeps
- * serving, and the next Version it publishes is written at `@v4`.
+ * serving, and the next Version it publishes is written at `@v4` or `@v5`
+ * depending on whether it declares external services.
  */
 function canonicalRecord(
-  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3 | typeof FORMAT_V4,
+  format:
+    | typeof FORMAT_V1
+    | typeof FORMAT_V2
+    | typeof FORMAT_V3
+    | typeof FORMAT_V4
+    | typeof FORMAT_V5,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -703,14 +855,29 @@ function canonicalRecord(
     });
   }
   const current = set as SelfhostVersionBindingSet;
+  if (format === FORMAT_V4) {
+    return JSON.stringify({
+      format: FORMAT_V4,
+      salt,
+      workerResourceUid: current.workerResourceUid,
+      handlers: current.handlers,
+      vars: current.vars,
+      sensitiveVars: current.sensitiveVars,
+      serviceBindings: current.serviceBindings,
+      ...(plane ? { dataPlane: plane } : {}),
+      ...(planeToken === undefined ? {} : { planeToken }),
+      eventToken,
+    });
+  }
   return JSON.stringify({
-    format: FORMAT_V4,
+    format: FORMAT_V5,
     salt,
     workerResourceUid: current.workerResourceUid,
     handlers: current.handlers,
     vars: current.vars,
     sensitiveVars: current.sensitiveVars,
     serviceBindings: current.serviceBindings,
+    externalServices: current.externalServices,
     ...(plane ? { dataPlane: plane } : {}),
     ...(planeToken === undefined ? {} : { planeToken }),
     eventToken,
@@ -724,6 +891,7 @@ interface LegacySet {
   readonly vars: readonly SelfhostVersionBinding[];
   readonly sensitiveVars: readonly SelfhostVersionBinding[];
   readonly serviceBindings?: readonly SelfhostVersionServiceBinding[];
+  readonly externalServices?: readonly SelfhostVersionExternalService[];
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
@@ -734,7 +902,12 @@ interface LegacySet {
  * generation string is not a place to put one.
  */
 function digestOf(
-  format: typeof FORMAT_V1 | typeof FORMAT_V2 | typeof FORMAT_V3 | typeof FORMAT_V4,
+  format:
+    | typeof FORMAT_V1
+    | typeof FORMAT_V2
+    | typeof FORMAT_V3
+    | typeof FORMAT_V4
+    | typeof FORMAT_V5,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -766,7 +939,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
           ? FORMAT_V3
           : record.format === FORMAT_V4 && isVersion4Keys(keys)
             ? FORMAT_V4
-            : null;
+            : record.format === FORMAT_V5 && isVersion5Keys(keys)
+              ? FORMAT_V5
+              : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -776,7 +951,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   }
   const hasPlane =
     format === FORMAT_V2 ||
-    ((format === FORMAT_V3 || format === FORMAT_V4) && "dataPlane" in record);
+    ((format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5) &&
+      "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
     hasPlane &&
@@ -784,9 +960,12 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
-  const eventToken = format === FORMAT_V3 || format === FORMAT_V4 ? record.eventToken : undefined;
+  const eventToken =
+    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5
+      ? record.eventToken
+      : undefined;
   if (
-    (format === FORMAT_V3 || format === FORMAT_V4) &&
+    (format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -795,13 +974,13 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   // because a Version with no binding declares them too.
   const legacyPlane = format === FORMAT_V2 ? parsedLegacyDataPlane(record.dataPlane) : null;
   const handlers =
-    format === FORMAT_V3 || format === FORMAT_V4
+    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
         : undefined;
   const set = normalizeSetOrLegacy({
-    ...(format === FORMAT_V4
+    ...(format === FORMAT_V4 || format === FORMAT_V5
       ? {
           workerResourceUid: parsedResourceUid(record.workerResourceUid),
           serviceBindings: parsedServiceBindings(record.serviceBindings),
@@ -812,6 +991,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     sensitiveVars: parsedBindings(record.sensitiveVars),
     ...(hasPlane
       ? { dataPlane: parsedDataPlane(format === FORMAT_V2 ? legacyPlane : record.dataPlane) }
+      : {}),
+    ...(format === FORMAT_V5
+      ? { externalServices: parsedExternalServices(record.externalServices) }
       : {}),
   });
   if (
@@ -857,6 +1039,16 @@ function isVersion4Keys(keys: string): boolean {
   );
 }
 
+/** A `@v5` record always carries at least one external service declaration. */
+function isVersion5Keys(keys: string): boolean {
+  return (
+    keys ===
+      "eventToken,externalServices,format,handlers,salt,sensitiveVars,serviceBindings,vars,workerResourceUid" ||
+    keys ===
+      "dataPlane,eventToken,externalServices,format,handlers,planeToken,salt,sensitiveVars,serviceBindings,vars,workerResourceUid"
+  );
+}
+
 function parsedResourceUid(value: unknown): string {
   if (typeof value !== "string" || !RESOURCE_UID.test(value)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -879,6 +1071,11 @@ function parsedServiceBindings(value: unknown): readonly SelfhostVersionServiceB
   });
 }
 
+function parsedExternalServices(value: unknown): readonly SelfhostVersionExternalService[] {
+  if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
+  return value as readonly SelfhostVersionExternalService[];
+}
+
 function parsedHandlers(value: unknown): readonly SelfhostWorkerHandlerName[] {
   if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
   for (const entry of value) {
@@ -895,6 +1092,7 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
   const serviceBindings =
     set.serviceBindings === undefined ? undefined : normalizeServiceBindings(set.serviceBindings);
+  const externalServices = normalizeExternalServices(set.externalServices);
   if (
     set.workerResourceUid !== undefined &&
     (typeof set.workerResourceUid !== "string" || !RESOURCE_UID.test(set.workerResourceUid))
@@ -907,6 +1105,7 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
     ...sensitiveVars.map((binding) => binding.name),
     ...(dataPlane?.bindings ?? []).map((binding) => binding.name),
     ...(serviceBindings ?? []).map((binding) => binding.name),
+    ...(externalServices ?? []).map((binding) => binding.name),
   ]) {
     if (names.has(name)) throw new SelfhostVersionBindingStoreError("corrupt");
     names.add(name);
@@ -917,6 +1116,7 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
     vars,
     sensitiveVars,
     ...(serviceBindings ? { serviceBindings } : {}),
+    ...(externalServices ? { externalServices } : {}),
     ...(dataPlane ? { dataPlane } : {}),
   };
 }

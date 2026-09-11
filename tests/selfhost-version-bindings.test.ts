@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createSelfhostVersionBindingStore,
+  normalizeSelfhostVersionBindingSet,
   type SelfhostVersionBindingStore,
 } from "../src/providers/selfhost-version-bindings.ts";
 
@@ -35,6 +36,44 @@ const SET = {
   serviceBindings: [],
 };
 
+test("complete external binding envelope is bounded before a runtime write", () => {
+  const value = JSON.stringify({ value: "a".repeat(3 * 1024 * 1024) });
+  expect(() =>
+    normalizeSelfhostVersionBindingSet({
+      ...SET,
+      externalServices: ["A", "B"].map((name) => ({
+        name,
+        required: true,
+        service: { apiVersion: "standards.takoform.com/v1", protocol: "org.example.service" },
+        binding: { kind: "json", value },
+      })),
+    }),
+  ).toThrow();
+});
+
+const EXTERNAL_SERVICES = [
+  {
+    name: "ARCHIVE",
+    required: true,
+    service: {
+      apiVersion: "standards.takoform.com/v1" as const,
+      protocol: "com.example.archive",
+    },
+    binding: {
+      kind: "json" as const,
+      value: '{"endpoint":"https://archive.example.invalid","token":"secret"}',
+    },
+  },
+  {
+    name: "OPTIONAL_CACHE",
+    required: false,
+    service: {
+      apiVersion: "standards.takoform.com/v1" as const,
+      protocol: "com.example.cache",
+    },
+  },
+] as const;
+
 test("stores and returns one version's bindings", async () => {
   expect(await store.read("sw-a", "v-1")).toBeNull();
   const written = await store.write("sw-a", "v-1", SET);
@@ -42,6 +81,59 @@ test("stores and returns one version's bindings", async () => {
   expect(written.sensitiveVars).toEqual(SET.sensitiveVars);
   expect(written.digest).toMatch(/^sha256:[0-9a-f]{64}$/u);
   expect(await store.read("sw-a", "v-1")).toEqual(written);
+});
+
+test("stores v5 external declarations, optional omission, and JSON runtime values privately", async () => {
+  const written = await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: EXTERNAL_SERVICES,
+  });
+  expect(written.externalServices).toEqual(EXTERNAL_SERVICES);
+  expect(JSON.parse(EXTERNAL_SERVICES[0].binding.value)).toEqual({
+    endpoint: "https://archive.example.invalid",
+    token: "secret",
+  });
+  expect(written.externalServices?.[1]?.binding).toBeUndefined();
+  expect(JSON.parse(await readFile(join(root, "sw-a", "v-1.json"), "utf8")).format).toBe(
+    "takoserver.selfhost-version-bindings@v5",
+  );
+  expect((await stat(join(root, "sw-a", "v-1.json"))).mode & 0o777).toBe(0o600);
+  expect(await store.read("sw-a", "v-1")).toEqual(written);
+});
+
+test("replays a v5 record byte-for-byte without minting new secrets", async () => {
+  const first = await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: EXTERNAL_SERVICES,
+  });
+  const before = await readFile(join(root, "sw-a", "v-1.json"));
+  const replay = await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: [...EXTERNAL_SERVICES].reverse(),
+  });
+  const after = await readFile(join(root, "sw-a", "v-1.json"));
+  expect(replay).toEqual(first);
+  expect(after).toEqual(before);
+});
+
+test("changes the v5 digest when external declaration metadata or JSON changes", async () => {
+  const first = await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: EXTERNAL_SERVICES,
+  });
+  const changed = await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: [
+      {
+        ...EXTERNAL_SERVICES[0],
+        required: false,
+        binding: { kind: "json" as const, value: '{"endpoint":"https://changed.invalid"}' },
+      },
+      EXTERNAL_SERVICES[1],
+    ],
+  });
+  expect(changed.digest).not.toBe(first.digest);
+  expect(changed.externalServices?.[0]?.required).toBe(false);
 });
 
 test("keeps one salt for one version so a retry does not move its digest", async () => {
@@ -104,6 +196,47 @@ test("refuses a set that names the same binding twice", async () => {
   ).rejects.toMatchObject({ code: "corrupt" });
 });
 
+test("refuses invalid external declarations and any binding-name collision", async () => {
+  await expect(
+    store.write("sw-a", "v-1", {
+      ...SET,
+      externalServices: [
+        {
+          name: "LANE",
+          required: false,
+          service: { apiVersion: "standards.takoform.com/v1", protocol: "com.example.archive" },
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.write("sw-a", "v-1", {
+      ...SET,
+      externalServices: [
+        {
+          name: "bad-name",
+          required: true,
+          service: { apiVersion: "standards.takoform.com/v1", protocol: "com.example.archive" },
+          binding: { kind: "json", value: "null" },
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.write("sw-a", "v-1", {
+      ...SET,
+      externalServices: [
+        {
+          name: "ARCHIVE",
+          required: true,
+          service: { apiVersion: "standards.takoform.com/v1", protocol: "not-a-protocol" },
+          binding: { kind: "json", value: "[]" },
+        },
+      ],
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+});
+
 test("reports a tampered record as corrupt instead of serving it", async () => {
   await store.write("sw-a", "v-1", SET);
   const path = join(root, "sw-a", "v-1.json");
@@ -112,6 +245,30 @@ test("reports a tampered record as corrupt instead of serving it", async () => {
   await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
   await writeFile(path, "{not json", "utf8");
   await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("rejects unknown v5 external metadata instead of serving it", async () => {
+  await store.write("sw-a", "v-1", {
+    ...SET,
+    externalServices: EXTERNAL_SERVICES,
+  });
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    externalServices: Array<Record<string, unknown>>;
+  };
+  raw.externalServices[0] = { ...raw.externalServices[0], extra: true };
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("preserves historical v4 bytes when external services are absent or empty", async () => {
+  const first = await store.write("sw-a", "v-1", SET);
+  const before = await readFile(join(root, "sw-a", "v-1.json"));
+  expect(JSON.parse(before.toString()).format).toBe("takoserver.selfhost-version-bindings@v4");
+  const replay = await store.write("sw-a", "v-1", { ...SET, externalServices: [] });
+  const after = await readFile(join(root, "sw-a", "v-1.json"));
+  expect(replay).toEqual(first);
+  expect(after).toEqual(before);
 });
 
 test("a record an earlier build wrote is still read, and carries no handlers", async () => {

@@ -11,7 +11,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -33,6 +33,7 @@ import {
 } from "../src/providers/selfhost.ts";
 import { SELFHOST_WORKER_EVENT_PROTOCOL } from "../src/providers/selfhost-events.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
+import type { SelfhostStandardServiceIntegration } from "../src/providers/selfhost-standard-services.ts";
 import {
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_RESULT_SCHEMA,
@@ -43,8 +44,10 @@ import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "../src/takoform/limits.ts";
+import type { TakoformStandardServiceProjection } from "../src/takoform/types.ts";
 import {
   createWorkerdRuntime,
+  type WorkerdDeploymentPublication,
   type WorkerdRuntime,
   type WorkerdSite,
 } from "../src/workerd-runtime.ts";
@@ -243,6 +246,7 @@ interface ProviderCase {
   readonly missingBlobs?: boolean;
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly dataPlaneMaintenance?: SelfhostDataPlaneMaintenance;
+  readonly standardServiceIntegrations?: readonly SelfhostStandardServiceIntegration[];
 }
 
 const SECRET_VALUE = "placeholder-encryption-value";
@@ -557,6 +561,9 @@ function provider(options: ProviderCase = {}) {
     ...(options.runtimeInputs ? { runtimeInputs: options.runtimeInputs } : {}),
     ...(options.dataPlaneAddress ? { dataPlaneAddress: options.dataPlaneAddress } : {}),
     ...(options.dataPlaneMaintenance ? { dataPlaneMaintenance: options.dataPlaneMaintenance } : {}),
+    ...(options.standardServiceIntegrations
+      ? { standardServiceIntegrations: options.standardServiceIntegrations }
+      : {}),
     ...(options.events ? { events: options.events } : {}),
     artifacts: {
       async manifest(_tenant, digest) {
@@ -5635,5 +5642,249 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     });
     expect(ticket.phase).toBe("succeeded");
     expect(dropped).toEqual([QUEUE_ID]);
+  });
+});
+
+const TEST_STANDARD_SERVICE = {
+  apiVersion: "standards.takoform.com/v1",
+  protocol: "org.example.service",
+} as const;
+
+const TEST_STANDARD_SERVICE_SPEC = {
+  name: "SERVICE",
+  service: TEST_STANDARD_SERVICE,
+} as const;
+
+const TEST_STANDARD_SERVICE_PROJECTION = {
+  name: "SERVICE",
+  required: true,
+  service: TEST_STANDARD_SERVICE,
+  endpoint: { url: "https://service.invalid" },
+  credential: { key: "placeholder-service-key" },
+} as const;
+
+function publicationRuntime(): {
+  readonly runtime: WorkerdRuntime;
+  readonly publications: WorkerdDeploymentPublication[];
+} {
+  const publications: WorkerdDeploymentPublication[] = [];
+  return {
+    publications,
+    runtime: {
+      async inspectModule(input) {
+        return { outcome: "valid", exportedHandlers: [...input.declaredHandlers] };
+      },
+      async publish(_name, publication) {
+        if (publication) publications.push(publication);
+      },
+      async write() {},
+      async remove() {},
+      async reload() {},
+      async has() {
+        return true;
+      },
+    },
+  };
+}
+
+function standardServiceVersionInput(
+  standardServices?: readonly TakoformStandardServiceProjection[],
+  protocol: string = TEST_STANDARD_SERVICE.protocol,
+) {
+  return {
+    operationId: "op_standard_service_version",
+    offering: offering("WorkerVersion"),
+    identity: identity("hello-v1"),
+    spec: {
+      bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+      handlers: ["fetch"],
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+      externalServices: [
+        {
+          ...TEST_STANDARD_SERVICE_SPEC,
+          service: { ...TEST_STANDARD_SERVICE, protocol },
+        },
+      ],
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", "hello"),
+      relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+    ],
+    ...(standardServices ? { standardServices } : {}),
+  };
+}
+
+describe("self-host stable external service delivery", () => {
+  test.each([true, false])(
+    "publishes a JSON binding and recovers it without current integrations (required=%s)",
+    async (required) => {
+      const captured = publicationRuntime();
+      const seen: unknown[] = [];
+      const local = provider({
+        runtime: captured.runtime,
+        standardServiceIntegrations: [
+          {
+            service: TEST_STANDARD_SERVICE,
+            serialize(projection) {
+              seen.push(projection);
+              return {
+                endpoint: projection.endpoint.url as string,
+                key: projection.credential.key as string,
+              };
+            },
+          },
+        ],
+      });
+      const worker = await local.apply({
+        operationId: "op_standard_service_worker",
+        offering: offering("ModuleWorker"),
+        identity: identity("hello"),
+        spec: {},
+      });
+      expect(worker.phase).toBe("succeeded");
+
+      const resolvedProjection = { ...TEST_STANDARD_SERVICE_PROJECTION, required };
+      const baseInput = standardServiceVersionInput([resolvedProjection]);
+      const versionInput = {
+        ...baseInput,
+        spec: {
+          ...baseInput.spec,
+          externalServices: [{ ...TEST_STANDARD_SERVICE_SPEC, required }],
+        },
+      };
+      const version = await local.apply(versionInput);
+      expect(version.phase).toBe("succeeded");
+      if (version.phase !== "succeeded") throw new Error("the standard service version failed");
+      expect(seen).toEqual([resolvedProjection]);
+
+      const deployment = await local.apply({
+        operationId: "op_standard_service_deploy",
+        offering: offering("WorkerDeployment"),
+        identity: identity("hello-live"),
+        spec: {
+          worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+          versions: [
+            {
+              workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+              weight: 10_000,
+            },
+          ],
+        },
+        relations: [
+          relation("/worker", "ModuleWorker", "hello"),
+          relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+        ],
+      });
+      expect(deployment.phase).toBe("succeeded");
+      expect(captured.publications).toHaveLength(1);
+      const published = captured.publications[0]?.versions[0]?.site.vars ?? [];
+      expect(published).toContainEqual({
+        name: "SERVICE",
+        kind: "json",
+        value: '{"endpoint":"https://service.invalid","key":"placeholder-service-key"}',
+      });
+
+      const script = String(version.result.outputs.scriptName);
+      const versionId = String(version.result.outputs.versionId);
+      const bindingPath = join(root, "selfhost", "version-bindings", script, `${versionId}.json`);
+      const retained = await readFile(bindingPath, "utf8");
+      expect(retained).toContain("placeholder-service-key");
+
+      const restarted = publicationRuntime();
+      const recoveredProvider = provider({ runtime: restarted.runtime });
+      if (!recoveredProvider.convergeApply) {
+        throw new Error("the self-host provider is missing recovery convergence");
+      }
+      const { standardServices: _projections, ...recoveryInput } = versionInput;
+      const recovered = await recoveredProvider.convergeApply({
+        ...recoveryInput,
+        operationId: "op_standard_service_recovery",
+        operationMode: "recovery",
+      });
+      expect(recovered).toMatchObject({ phase: "succeeded" });
+      expect(await readFile(bindingPath, "utf8")).toBe(retained);
+      expect(restarted.publications).toHaveLength(0);
+
+      const mismatched = await recoveredProvider.convergeApply({
+        ...recoveryInput,
+        operationId: "op_standard_service_mismatch",
+        operationMode: "recovery",
+        spec: {
+          ...recoveryInput.spec,
+          externalServices: [
+            {
+              ...TEST_STANDARD_SERVICE_SPEC,
+              service: { ...TEST_STANDARD_SERVICE, protocol: "org.example.other" },
+            },
+          ],
+        },
+      });
+      expect(mismatched).toMatchObject({
+        phase: "failed",
+        failure: { code: "not_found", retryable: false },
+      });
+      await rm(bindingPath);
+      const absent = await recoveredProvider.convergeApply({
+        ...recoveryInput,
+        operationId: "op_standard_service_absent",
+        operationMode: "recovery",
+      });
+      expect(absent).toMatchObject({
+        phase: "failed",
+        failure: { code: "not_found", retryable: false },
+      });
+    },
+  );
+
+  test("keeps a declared optional unsupported service absent from runtime bindings", async () => {
+    const captured = publicationRuntime();
+    const local = provider({ runtime: captured.runtime });
+    const worker = await local.apply({
+      operationId: "op_optional_standard_service_worker",
+      offering: offering("ModuleWorker"),
+      identity: identity("hello"),
+      spec: {},
+    });
+    expect(worker.phase).toBe("succeeded");
+    const optionalInput = standardServiceVersionInput(undefined, "org.example.unsupported");
+    const version = await local.apply({
+      ...optionalInput,
+      operationId: "op_optional_standard_service_version",
+      spec: {
+        ...optionalInput.spec,
+        externalServices: [
+          {
+            ...TEST_STANDARD_SERVICE_SPEC,
+            required: false,
+            service: { ...TEST_STANDARD_SERVICE, protocol: "org.example.unsupported" },
+          },
+        ],
+      },
+    });
+    expect(version.phase).toBe("succeeded");
+
+    const deployment = await local.apply({
+      operationId: "op_optional_standard_service_deploy",
+      offering: offering("WorkerDeployment"),
+      identity: identity("hello-live"),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: "hello" },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: "hello-v1" },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", "hello"),
+        relation("/versions/0/workerVersion", "WorkerVersion", "hello-v1"),
+      ],
+    });
+    expect(deployment.phase).toBe("succeeded");
+    expect(captured.publications).toHaveLength(1);
+    expect(captured.publications[0]?.versions[0]?.site.vars ?? []).not.toContainEqual(
+      expect.objectContaining({ name: "SERVICE" }),
+    );
   });
 });

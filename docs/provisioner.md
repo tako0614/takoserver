@@ -108,6 +108,36 @@ remains the incumbent on update; older direct driver callers may omit it. This
 extension does not alter the Host wire, a Form, or the published catalog, and
 does not by itself provide Container execution.
 
+## Operator-composed external services
+
+The programmatic self-host composition accepts `standardServiceIntegrations`:
+an explicit list of exact `standards.takoform.com/v1` protocol identities and
+serializers. A serializer receives Host-resolved execution material and returns
+one JSON object. Its integration owns the object's keys; Takoserver does not
+define a protocol-to-environment member table. Compose the matching Host
+`standardServiceResolver` separately. No integration, protocol, AI service or
+resolver is enabled by the ordinary Bun entry by default.
+
+An initial WorkerVersion apply projects that object as one runtime JSON binding
+under the slot's declared name. Required unsatisfied slots fail; optional ones
+may project nothing. Provider selection must support the exact protocol before
+receiving its material. Endpoints, credentials and serialized values never
+become portable Resource state, Deployment output or discovery.
+
+The self-host provider retains slot declarations and their materialized JSON
+beside the immutable Version, separately from ordinary variables and one-shot
+runtime inputs. Files retain the existing 0600/0700 permissions and salted
+commitments. Versions with no external slots retain the existing sidecar format;
+new records with slots use the internal v5 format. This is not a public schema
+or Form version. Restart, recovery and observation read the retained record and
+compare the exact declaration, including optional omissions; they never invoke
+the resolver or serializer again. Missing or mismatched material does not
+authorize recreation. Destroy removes this record with the Version.
+
+This is a self-host integration mechanism, not a bundled standard-service
+offering. Concrete protocol adapters and the private WfP transport remain
+separate work; enabling a resolver alone is not complete runtime support.
+
 ## Worker storage on this machine
 
 A Worker Version that declares `kvBindings`, `bucketBindings`,

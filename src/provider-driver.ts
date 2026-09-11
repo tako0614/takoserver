@@ -29,6 +29,7 @@ import {
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
 import { receiptProjectable } from "./takoform/receipt-projection.ts";
+import { validateStandardServiceSlots } from "./takoform/standard-services.ts";
 import type { TakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
@@ -47,6 +48,42 @@ import {
   WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
+
+function selectStandardServiceProjections(
+  provider: Provider,
+  input: Parameters<TakoformResourceDriver["apply"]>[0],
+) {
+  const projections = input.standardServices ?? [];
+  if (projections.length === 0) return [];
+  const slots = validateStandardServiceSlots(input);
+  const seen = new Set<string>();
+  for (const projection of projections) {
+    const slot = slots.find((candidate) => candidate.name === projection.name);
+    if (
+      !slot ||
+      seen.has(projection.name) ||
+      slot.required !== projection.required ||
+      slot.service.apiVersion !== projection.service.apiVersion ||
+      slot.service.protocol !== projection.service.protocol
+    ) {
+      throw new TakoformHostError("invalid_argument", 400);
+    }
+    seen.add(projection.name);
+  }
+  const supported = (service: (typeof projections)[number]["service"]) =>
+    provider.standardServiceProtocols?.some(
+      (candidate) =>
+        candidate.apiVersion === service.apiVersion && candidate.protocol === service.protocol,
+    ) === true;
+  for (const slot of slots) {
+    if (slot.required && (!seen.has(slot.name) || !supported(slot.service))) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+  }
+  // Optional slots which the selected runtime cannot deliver remain absent.
+  // This field never joins Deployment.spec, provider outputs or receipt material.
+  return structuredClone(projections.filter((projection) => supported(projection.service)));
+}
 
 /**
  * The provider accepted a mutation but the driver could not observe a
@@ -830,6 +867,13 @@ export function createProviderDriver(
         ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
       });
       assertProviderRuntimeInputs(provider, input.spec);
+      // Recovery adopts the retained runtime binding, not today's integration
+      // registry. Initial delivery is fenced before placement or native work.
+      if (input.standardServices?.length && input.operationMode === undefined) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      const standardServices =
+        input.operationMode === "initial" ? selectStandardServiceProjections(provider, input) : [];
       const sold = soldSelection?.sold;
       const priceMinor = soldSelection?.priceMinor ?? 0;
       const relationTargets =
@@ -1020,6 +1064,7 @@ export function createProviderDriver(
         spec: input.spec,
         relations: relationTargets,
         ...(runtimeBindings.length > 0 ? { runtimeBindings } : {}),
+        ...(standardServices.length > 0 ? { standardServices } : {}),
         ...(endpointAssignment
           ? {
               workerEndpointOriginAssignment: {

@@ -222,7 +222,7 @@ export interface TakoformStandardServiceSlot {
   };
 }
 
-/** Sealed execution material. It is passed to a driver and never stored in a Resource. */
+/** Runtime-only material, not ciphertext. The driver owns protected custody; never Resource state. */
 export interface TakoformStandardServiceProjection extends TakoformStandardServiceSlot {
   readonly endpoint: JsonObject;
   readonly credential: JsonObject;

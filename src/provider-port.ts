@@ -5,6 +5,10 @@ import type {
   ProviderRuntimeInputCapabilities,
   ProviderRuntimeInputPublicApply,
 } from "./provider-runtime-input-port.ts";
+import type {
+  TakoformStandardServiceProjection,
+  TakoformStandardServiceSlot,
+} from "./takoform/types.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -222,6 +226,8 @@ export interface ApplyInput extends ProviderMutationInput {
   readonly relations?: readonly ProviderRelation[];
   /** Provider-pack materialized bindings. Never portable state or provider output. */
   readonly runtimeBindings?: readonly ProviderRuntimeBinding[];
+  /** Initial-dispatch-only material. Never copy to portable state, outputs or diagnostics. */
+  readonly standardServices?: readonly TakoformStandardServiceProjection[];
   /** Exact private origin authority for a reservation-backed WorkerEndpoint. */
   readonly workerEndpointOriginAssignment?: ProviderWorkerEndpointOriginAssignment;
   /**
@@ -437,6 +443,8 @@ export interface Provider {
   readonly workerEndpointOriginReservations?: ProviderWorkerEndpointOriginReservationCapability;
   /** Present only when this configured adapter can durably receive one-shot runtime inputs. */
   readonly runtimeInputCapabilities?: ProviderRuntimeInputCapabilities;
+  /** Explicitly composed runtime integrations; absence means no standard-service delivery. */
+  readonly standardServiceProtocols?: readonly TakoformStandardServiceSlot["service"][];
   apply(input: ApplyInput): Promise<ProviderTicket>;
   /**
    * Captures an opaque, versioned provider readback descriptor before the
