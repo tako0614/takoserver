@@ -61,9 +61,8 @@ describe("self-host Form admission", () => {
     } finally {
       fixture.close();
     }
-    // A clean CI checkout applies the complete migration history before it
-    // can inspect all 17 packages; the default five-second budget is not a
-    // product latency assertion and is too small on shared runners.
+    // Inspecting the complete package corpus on a shared runner is not a
+    // product latency assertion.
   }, 30_000);
 
   test("applies the admission through the released Core verifier and activates the implemented subset", async () => {
@@ -136,8 +135,8 @@ describe("self-host Form admission", () => {
     } finally {
       fixture.close();
     }
-    // Two full 17-package admissions with their durable readbacks: a shared CI
-    // disk needs far more than the default per-test budget for this volume.
+    // Two full 17-package admissions include filesystem-backed object writes
+    // and readbacks, so retain a bounded integration-test budget.
   }, 60_000);
 
   test("refuses a verifier whose live identity is not the exact released Core", async () => {
@@ -165,7 +164,10 @@ describe("self-host Form admission", () => {
 
 function dataRoot() {
   const root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-admission-"));
-  const database = new Database(join(root, "control.sqlite"));
+  // These cases receive an SQL handle and never reopen a database file. Keep
+  // the full SQLite schema and constraints without per-migration disk flushes;
+  // the assertions cover admission authority/state, not filesystem durability.
+  const database = new Database(":memory:");
   for (const migration of MIGRATIONS) database.exec(migration.sql);
   return {
     sql: createSqliteSql(database),

@@ -304,7 +304,9 @@ test("native D1 keeps a two-target dependency fence atomic through dispatch and 
   } finally {
     await runtime.dispose();
   }
-});
+  // Include cold Miniflare startup, the full migration history, D1 RPC
+  // assertions, and awaited cleanup in a bounded native integration budget.
+}, 30_000);
 
 async function applyMigrations(
   database: Awaited<ReturnType<Miniflare["getD1Database"]>>,
