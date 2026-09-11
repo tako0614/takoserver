@@ -47,11 +47,7 @@ const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAP
 const EXPECTED_REPOSITORY = "https://github.com/tako0614/takoform-forms.git";
 const EXPECTED_REPOSITORY_COMMIT = "3231633605b737ce5279d7fc020b4780568e7091";
 const EXPECTED_SET_ID = "e7f8a39311dd011b8467e97e7f300cabb9a6b06c";
-const IMPLEMENTED_KINDS = [
-  ...Object.keys(YURUCOMMU_FORM_VERSIONS),
-  "StaticAssetBundle",
-  "WorkerCustomDomain",
-].sort();
+const IMPLEMENTED_KINDS = [...Object.keys(YURUCOMMU_FORM_VERSIONS), "WorkerCustomDomain"].sort();
 /** Core attests the exact raw policy bytes; the Host pins the canonical digest. */
 const RAW_POLICY_DIGEST = await bytesDigest(
   new TextEncoder().encode(TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE.core.publisherPolicy),
@@ -155,10 +151,10 @@ describe("exact publisher-set import", () => {
       const pkg = plan.packages.find((entry) => entry.formRef.kind === kind);
       expect(pkg?.operations).toEqual([]);
     }
-    for (const kind of ["StaticAssetBundle", "WorkerCustomDomain"]) {
-      const pkg = plan.packages.find((entry) => entry.formRef.kind === kind);
-      expect(pkg?.operations).toEqual([]);
-    }
+    const staticAssets = plan.packages.find((entry) => entry.formRef.kind === "StaticAssetBundle");
+    expect(staticAssets?.operations).toEqual(["create", "read", "delete", "import", "observe"]);
+    const customDomain = plan.packages.find((entry) => entry.formRef.kind === "WorkerCustomDomain");
+    expect(customDomain?.operations).toEqual([]);
     expect(fixture.container.requests).toEqual([]);
   });
 
@@ -223,15 +219,24 @@ describe("exact publisher-set import", () => {
         });
       }
     }
-    for (const kind of ["StaticAssetBundle", "WorkerCustomDomain"]) {
-      const form = readback.forms.find((candidate) => candidate.formRef.kind === kind);
-      expect(form).toMatchObject({
-        installed: true,
-        supported: true,
-        operations: [],
-        activationHead: { present: true, active: true },
-      });
-    }
+    const staticAssets = readback.forms.find(
+      (candidate) => candidate.formRef.kind === "StaticAssetBundle",
+    );
+    expect(staticAssets).toMatchObject({
+      installed: true,
+      supported: true,
+      operations: ["create", "read", "delete", "import", "observe"],
+      activationHead: { present: true, active: true },
+    });
+    const customDomain = readback.forms.find(
+      (candidate) => candidate.formRef.kind === "WorkerCustomDomain",
+    );
+    expect(customDomain).toMatchObject({
+      installed: true,
+      supported: true,
+      operations: [],
+      activationHead: { present: true, active: true },
+    });
     // ADR 0007 moved ObjectBucket into the code-owned implementation catalog,
     // so the exact current package is now installed, supported, and active
     // with the operations its Form declares — never `update`.

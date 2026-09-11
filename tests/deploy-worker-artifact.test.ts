@@ -113,6 +113,13 @@ describe("hermetic Worker bundle identity", () => {
       expect(identity.implementationPayloadDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
       expect(identity.capabilityDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
       expect(identity.implementationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+      const payloadConfig = JSON.parse(
+        readFileSync(join(root, "base", "form-implementation-payload", "wrangler.jsonc"), "utf8"),
+      ) as Record<string, unknown>;
+      expect(payloadConfig).toMatchObject({ workers_dev: false, preview_urls: false });
+      expect(payloadConfig).not.toHaveProperty("routes");
+      expect(payloadConfig).not.toHaveProperty("custom_domains");
+      expect(payloadConfig).not.toHaveProperty("zone_id");
       const releaseConfig = JSON.parse(readFileSync(prepared.configPath, "utf8")) as {
         define: Record<string, string>;
         vars: Record<string, string>;

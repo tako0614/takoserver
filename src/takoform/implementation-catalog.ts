@@ -11,6 +11,7 @@ export const YURUCOMMU_FORM_VERSIONS = {
   SQLiteDatabase: "0.1.0",
   SQLiteMigrationApplication: "0.1.0",
   SQLiteMigrationSet: "0.1.0",
+  StaticAssetBundle: "0.1.0",
   WorkerBundle: "0.1.0",
   WorkerCronTrigger: "0.1.0",
   WorkerDeployment: "0.2.0",
@@ -158,6 +159,7 @@ export function yurucommuLifecycleCapabilityManifest(
         return supplied.has("ModuleWorker");
       case "SQLiteMigrationApplication":
       case "SQLiteMigrationSet":
+      case "StaticAssetBundle":
       case "WorkerBundle":
         return true;
     }

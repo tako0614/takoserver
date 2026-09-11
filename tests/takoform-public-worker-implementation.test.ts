@@ -24,10 +24,33 @@ describe("public Worker semantic implementation identity", () => {
     expect(kinds).toEqual(expect.arrayContaining(["StaticAssetBundle", "WorkerCustomDomain"]));
     expect(kinds).not.toEqual(expect.arrayContaining(["ActorNamespace", "DurableWorkflow"]));
     expect(
-      catalog.entries
-        .filter((entry) => ["StaticAssetBundle", "WorkerCustomDomain"].includes(entry.formRef.kind))
-        .every((entry) => entry.operations.length === 0),
-    ).toBe(true);
+      catalog.entries.find((entry) => entry.formRef.kind === "StaticAssetBundle")?.operations,
+    ).toEqual(["create", "read", "delete", "import", "observe"]);
+    expect(
+      catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
+    ).toEqual([]);
+  });
+
+  test("keeps intrinsic asset support independent of identity supply and domain configuration", async () => {
+    const capabilities = yurucommuLifecycleCapabilityManifest([]);
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities,
+    });
+    expect(capabilities.forms.StaticAssetBundle).toEqual([
+      "create",
+      "read",
+      "update",
+      "delete",
+      "import",
+      "observe",
+    ]);
+    expect(
+      catalog.entries.find((entry) => entry.formRef.kind === "StaticAssetBundle")?.operations,
+    ).toEqual(["create", "read", "delete", "import", "observe"]);
+    expect(
+      catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
+    ).toEqual([]);
   });
 
   test("ignores unrelated outer Worker bytes but changes for payload or capability bytes", async () => {

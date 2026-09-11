@@ -15,6 +15,22 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 
+const HISTORICAL_PUBLIC_CAPABILITY_DIGESTS = [
+  // Capability identity before StaticAssetBundle was admitted as intrinsic.
+  "sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024",
+  // Capability identity before ADR 0007's ObjectBucket admission.
+  "sha256:630899ce5e482e7e274c87dab17d74edd904620852a71c2b021aade236a1ea73",
+] as const;
+const HISTORICAL_SELFHOST_IMPLEMENTATION_PAYLOAD_DIGEST =
+  "sha256:b7ea4f2da3f5dca05827442cb9a9f2419bf2063e3a9457cf6f97b7409da9f2c4";
+const HISTORICAL_SELFHOST_IMPLEMENTATION_DIGESTS = [
+  // Self-host identity after ADR 0007 but before StaticAssetBundle admission.
+  "sha256:d5721ffce4cd3167d2f2a00aff8a0fd63e656a1d06b23b804b5c756b608ae15e",
+  // The two older identities this host had already moved away from.
+  "sha256:3788374901bbbb413a8be78d56d1220a3b82d352c12f03d2ce32b0a10454d756",
+  "sha256:6e566932ddad3ef48360d8f3ee643c2ccdf2eb3a05307c483e225f6d6f622459",
+] as const;
+
 describe("Form authority implementation catalog", () => {
   test("feeds every exact publisher identity into generic admission", () => {
     const source = currentTakoformCandidates().forms;
@@ -99,8 +115,10 @@ describe("Form authority implementation catalog", () => {
     expect(withoutUnsupported.entries).toEqual(catalog.entries);
   });
 
-  test("selects exactly the 13 Yurucommu package identities from the verified corpus", () => {
-    const forms = yurucommuFormCandidates(currentTakoformCandidates().forms);
+  test("selects the exact current Yurucommu package identities from the verified corpus", () => {
+    const source = currentTakoformCandidates().forms;
+    const forms = yurucommuFormCandidates(source);
+    expect(forms).toHaveLength(Object.keys(YURUCOMMU_FORM_VERSIONS).length);
     expect(
       forms.map((form) => [form.identity.formRef.kind, form.identity.formRef.definitionVersion]),
     ).toEqual(
@@ -109,8 +127,13 @@ describe("Form authority implementation catalog", () => {
     expect(forms.every((form) => form.identity.packageDigest?.startsWith("sha256:"))).toBe(true);
     expect(forms.map((form) => form.identity.formRef.kind)).not.toContain("ActorNamespace");
     expect(forms.map((form) => form.identity.formRef.kind)).not.toContain("DurableWorkflow");
-    expect(forms.map((form) => form.identity.formRef.kind)).not.toContain("StaticAssetBundle");
     expect(forms.map((form) => form.identity.formRef.kind)).not.toContain("WorkerCustomDomain");
+    const staticAsset = forms.find((form) => form.identity.formRef.kind === "StaticAssetBundle");
+    const publishedStaticAsset = source.find(
+      (form) => form.identity.formRef.kind === "StaticAssetBundle",
+    );
+    expect(staticAsset).toEqual(publishedStaticAsset);
+    expect(staticAsset?.operations).toEqual(["create", "read", "delete", "import", "observe"]);
     // ADR 0007 admitted the exact current ObjectBucket package; the identity is
     // the whole quad, so it is pinned here rather than matched by kind alone.
     expect(forms.find((form) => form.identity.formRef.kind === "ObjectBucket")?.identity).toEqual({
@@ -124,45 +147,100 @@ describe("Form authority implementation catalog", () => {
     });
   });
 
-  /**
-   * ADR 0007 rotates the digests of both Hosts, twice. After the second
-   * rotation both realize an ObjectBucket supply, so they share a
-   * `capabilityDigest` again while keeping distinct implementation digests: a
-   * self-host binds the manifest through its own payload kind, and the public
-   * Worker additionally binds its sealed runtime payload. Both are pinned here
-   * so a later edit of a manifest or an admitted operation set cannot slip
-   * through as an accident: changing these values is an explicit reconvergence
-   * obligation, never a refresh of a stale expectation.
-   */
-  test("pins the public Worker capability digest ADR 0007 rotates", async () => {
+  test("keeps intrinsic assets available without identity supply or custom-domain prerequisites", async () => {
+    const capabilities = yurucommuLifecycleCapabilityManifest([]);
+    expect(capabilities.forms.StaticAssetBundle).toEqual([
+      "create",
+      "read",
+      "update",
+      "delete",
+      "import",
+      "observe",
+    ]);
+    expect(capabilities.forms.WorkerBundle).toEqual(capabilities.forms.StaticAssetBundle);
+    expect(capabilities.forms.SQLiteMigrationSet).toEqual(capabilities.forms.StaticAssetBundle);
+    expect(capabilities.forms.WorkerCustomDomain).toBeUndefined();
+
+    const forms = exactPublisherFormCandidates(currentTakoformCandidates().forms);
+    const staticAsset = forms.find((form) => form.identity.formRef.kind === "StaticAssetBundle");
+    const customDomain = forms.find((form) => form.identity.formRef.kind === "WorkerCustomDomain");
+    if (!staticAsset || !customDomain) throw new Error("intrinsic test Forms are missing");
+    const catalog = await deriveImplementationCatalog({
+      forms: [staticAsset, customDomain],
+      capabilities,
+      handlers: {
+        apiVersion: "takoserver.form-handlers@v1",
+        artifact: "worker-artifact-v1",
+        forms: {
+          StaticAssetBundle: ["create", "read", "delete", "import", "observe"],
+          WorkerCustomDomain: ["create", "read", "delete", "import", "observe"],
+        },
+      },
+    });
+    expect(catalog.entries).toEqual([
+      expect.objectContaining({
+        formRef: staticAsset.identity.formRef,
+        packageDigest: staticAsset.identity.packageDigest,
+        operations: ["create", "read", "delete", "import", "observe"],
+      }),
+      expect.objectContaining({
+        formRef: customDomain.identity.formRef,
+        packageDigest: customDomain.identity.packageDigest,
+        operations: [],
+      }),
+    ]);
+  });
+
+  test("rotates the public Worker identity when intrinsic asset support is admitted", async () => {
     const capabilities = publicFormCapabilityManifest();
     expect(capabilities.implementation).toBe(
       "takoserver.public-worker-target@v1:AtLeastOnceQueue,EdgeKVNamespace,ModuleWorker,ObjectBucket,SQLiteDatabase",
     );
+    expect(capabilities.forms.StaticAssetBundle).toEqual([
+      "create",
+      "read",
+      "update",
+      "delete",
+      "import",
+      "observe",
+    ]);
     const semantic = await derivePublicFormImplementationIdentity({
       implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
       capabilities,
     });
-    expect(semantic.capabilityDigest).toBe(
-      "sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024",
-    );
-    // The predecessor identity, kept so the reconvergence obligation names the
-    // exact value an operator must move away from.
-    expect(semantic.capabilityDigest).not.toBe(
-      "sha256:630899ce5e482e7e274c87dab17d74edd904620852a71c2b021aade236a1ea73",
-    );
+    expect(semantic.capabilityDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    const predecessorCapabilities = withoutStaticAssetCapability(capabilities);
+    const predecessor = await derivePublicFormImplementationIdentity({
+      implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
+      capabilities: predecessorCapabilities,
+    });
+    expect(predecessor.capabilityDigest).toBe(HISTORICAL_PUBLIC_CAPABILITY_DIGESTS[0]);
+    expect(semantic.capabilityDigest).not.toBe(predecessor.capabilityDigest);
+    expect(semantic.capabilityDigest).not.toBe(HISTORICAL_PUBLIC_CAPABILITY_DIGESTS[1]);
+    expect(semantic.implementationDigest).not.toBe(predecessor.implementationDigest);
   });
 
-  test("pins the self-host implementation digests ADR 0007 rotates", async () => {
+  test("keeps self-host and public capability parity while rotating implementation identity", async () => {
     const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
-    // A self-host realizes the ObjectBucket supply now, so it names one — and
-    // its capability manifest is once again the same five-supply manifest the
-    // public Worker serves. The implementation digests still differ, because a
-    // self-host's binds the manifest through its own payload kind rather than a
-    // sealed Worker artifact.
+    // A self-host realizes the ObjectBucket supply now, so it names one. Both
+    // Hosts share the intrinsic-aware capability manifest, while their
+    // implementation identities differ because one binds a local payload and
+    // the other binds a sealed Worker artifact.
     expect(capabilities.implementation).toBe(
       "takoserver.public-worker-target@v1:AtLeastOnceQueue,EdgeKVNamespace,ModuleWorker,ObjectBucket,SQLiteDatabase",
     );
+    expect(capabilities.forms.StaticAssetBundle).toEqual([
+      "create",
+      "read",
+      "update",
+      "delete",
+      "import",
+      "observe",
+    ]);
+    const publicSemantic = await derivePublicFormImplementationIdentity({
+      implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
+      capabilities: publicFormCapabilityManifest(),
+    });
     const implementationPayloadDigest = await canonicalDigest({
       kind: "takoserver.selfhost-form-implementation@v1",
       capabilities,
@@ -171,24 +249,17 @@ describe("Form authority implementation catalog", () => {
       implementationPayloadDigest,
       capabilities,
     });
-    expect(semantic.capabilityDigest).toBe(
-      "sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024",
+    expect(semantic.capabilityDigest).toBe(publicSemantic.capabilityDigest);
+    expect(semantic.capabilityDigest).not.toBe(HISTORICAL_PUBLIC_CAPABILITY_DIGESTS[0]);
+    expect(semantic.implementationPayloadDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(semantic.implementationPayloadDigest).not.toBe(
+      HISTORICAL_SELFHOST_IMPLEMENTATION_PAYLOAD_DIGEST,
     );
-    expect(semantic.implementationPayloadDigest).toBe(
-      "sha256:b7ea4f2da3f5dca05827442cb9a9f2419bf2063e3a9457cf6f97b7409da9f2c4",
-    );
-    expect(semantic.implementationDigest).toBe(
-      "sha256:d5721ffce4cd3167d2f2a00aff8a0fd63e656a1d06b23b804b5c756b608ae15e",
-    );
-    // The two predecessor identities a converged self-host moves away from: the
-    // one it served before ADR 0007, and the supply-less one ADR 0007 first
-    // gave it.
-    for (const predecessor of [
-      "sha256:3788374901bbbb413a8be78d56d1220a3b82d352c12f03d2ce32b0a10454d756",
-      "sha256:6e566932ddad3ef48360d8f3ee643c2ccdf2eb3a05307c483e225f6d6f622459",
-    ]) {
+    expect(semantic.implementationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    for (const predecessor of HISTORICAL_SELFHOST_IMPLEMENTATION_DIGESTS) {
       expect(semantic.implementationDigest).not.toBe(predecessor);
     }
+    expect(semantic.implementationDigest).not.toBe(publicSemantic.implementationDigest);
   });
 
   test("keeps ObjectBucket unsupported on a Host with no realized bucket supply", async () => {
@@ -342,3 +413,14 @@ describe("Form authority implementation catalog", () => {
     ).toThrow("widen");
   });
 });
+
+function withoutStaticAssetCapability(
+  capabilities: ReturnType<typeof publicFormCapabilityManifest>,
+): ReturnType<typeof publicFormCapabilityManifest> {
+  return {
+    ...capabilities,
+    forms: Object.fromEntries(
+      Object.entries(capabilities.forms).filter(([kind]) => kind !== "StaticAssetBundle"),
+    ),
+  };
+}

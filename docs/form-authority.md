@@ -323,10 +323,21 @@ apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
 intersection of the package set with the code-owned implementation catalog.
-That catalog has concrete handlers for 15 of the 17 identities: its
-`StaticAssetBundle` and `WorkerCustomDomain` entries currently have an empty
-operation intersection because this target advertises no corresponding supply,
-but they remain supported and activatable as implemented Forms. `ActorNamespace`
+That catalog has concrete handlers for 15 of the 17 identities.
+`StaticAssetBundle@0.1.0` is an intrinsic artifact resource: the Host resolves
+and verifies its committed manifest and blobs in the caller's tenant, without
+requiring a provider identity supply or a custom-domain zone grant. It exposes
+the exact package's `create`, `read`, `delete`, `import`, and `observe`
+operations, never `update`. WorkerVersion owns the separate asset attachment
+and serving policy; admitting the bundle does not provision a Worker or domain.
+This is bundle lifecycle support, not qualification of every Worker backend's
+asset attachment. The current managed Workers-for-Platforms backend still
+refuses asset-bearing WorkerVersions until its upload and authoritative
+readback path is implemented and qualified.
+`WorkerCustomDomain` still has an empty operation intersection: its provider
+handler requires an exact tenant/hostname zone grant, and the code-owned
+capability manifest does not yet advertise that conditional capability. It
+remains supported and activatable with no executable operations. `ActorNamespace`
 and `DurableWorkflow` have no handlers, so they remain installed and
 discoverable only (`supported: false`) with an absent activation head. No
 operation is advertised unless it is declared by the package, present in the
@@ -346,20 +357,24 @@ self-host is its own, holding object bodies under
 `<data root>/selfhost/objects/` and their metadata under migration `0041`, with
 a Provider Pack that owns both halves of the `module-worker.object-bucket`
 materialization. So `scripts/selfhost-form-admission.ts` records the Form with
-its five operations, and the two Hosts share one capability digest again:
-`sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024`. Their
-implementation digests still differ — a self-host's binds the manifest through
-its own payload kind, the public Worker's additionally binds a sealed runtime
-payload — and both rotated, so both require explicit reconvergence in every
-advertised environment. The self-host's rotated twice: once when the Form
-entered the catalog with an empty operation set, and once when the machine grew
-the backend that fills it. ADR 0007 carries both pairs.
+its five operations. The two Hosts share the same capability manifest,
+including intrinsic StaticAssetBundle support, while their implementation
+digests differ: a self-host binds the manifest through its own payload kind,
+and the public Worker additionally binds a sealed runtime payload. These
+identities are derived from the selected code and exact publisher packages,
+not supplied by an operator. Enabling StaticAssetBundle changes the capability
+and implementation digests of both Hosts without changing any Form identity.
+ADR 0007 preserves the preceding ObjectBucket rotations and records the
+StaticAssetBundle amendment separately.
 Reconvergence is an append-only support and activation event through the
 existing admission chain — the operator surface in an environment that has one,
 `scripts/selfhost-form-admission.ts` on a self-host — never an in-place edit of
-a durable head. ADR 0007 carries the exact predecessor and successor digests
-for both Hosts, and the operator commands for the environments that have an
-ingress.
+a durable head. A code update alone does not reconverge an environment's
+durable support and activation heads or prove that its asset-serving backend
+is live. Read back the new code-derived identity and use the existing owning
+admission path before advertising the successor there. ADR 0007 carries the
+historical digest pairs and the operator commands for environments that have
+an ingress.
 
 Production currently has no operator ingress: the route-less production Worker
 can be deployed, its Container identity can be read back through the probe,
