@@ -475,6 +475,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/public-form-implementation-build.ts",
       "src/public-form-runtime.ts",
       "src/public-worker-implementation.ts",
+      "src/standard-service-port.ts",
       "src/strict-json.ts",
       "src/takoform/bindings.ts",
       "src/takoform/current-candidates.ts",
