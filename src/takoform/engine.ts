@@ -29,7 +29,7 @@ import {
   prepareSqliteMigrationApplication,
   sqliteMigrationCondition,
 } from "./sqlite-migrations.ts";
-import { resolveStandardServiceSlots } from "./standard-services.ts";
+import { resolveStandardServiceSlots, validateStandardServiceSlots } from "./standard-services.ts";
 import type {
   ProviderMutationExecution,
   ResourceAddress,
@@ -303,7 +303,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
      * the attempt rather than leaving it open for a repair that will not come.
      */
     readonly onProvablyIdle?: () => void;
-    readonly prepare?: (dependencies: ResourceDependencySet | undefined) => Promise<void>;
+    readonly prepare?: (
+      dependencies: ResourceDependencySet | undefined,
+      mode: "initial" | "recovery",
+    ) => Promise<void>;
     readonly settleDefinitiveImportConflict?: (leaseToken: string) => Promise<boolean>;
     readonly execute: (
       mode: "initial" | "recovery",
@@ -394,7 +397,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDependenciesAccepted?.(dependencySet);
       }
-      await input.prepare?.(dependencySet);
+      await input.prepare?.(dependencySet, execution.mode);
       const marked = await store.markProviderMutationDispatch({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -1053,14 +1056,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("resource_not_found", 404);
       }
       await requireArtifact(form, body.spec, context.tenantId);
-      await resolveStandardServiceSlots({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-        project: false,
-      });
+      validateStandardServiceSlots({ form, spec: body.spec });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "apply");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -1339,27 +1335,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw error;
       }
-      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
-      try {
-        if (create) await context.beforeCreate?.();
-        standardServices = await resolveStandardServiceSlots({
-          tenantId: context.tenantId,
-          space: body.metadata.space,
-          form,
-          spec: body.spec,
-          ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-          project: true,
-        });
-      } catch (error) {
-        await store.releaseResourceClaims(claimOwnerId);
-        await store.abandonProviderMutationPlan({
-          tenantId: context.tenantId,
-          operationId: opId,
-          replayKey,
-          resourceUid: uid,
-        });
-        throw error;
-      }
+      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>> | undefined;
       if (
         !(await store.reserveResourceIncarnation({
           tenantId: context.tenantId,
@@ -1437,7 +1413,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerDispatched = true;
           },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies) => {
+          prepare: async (acceptedDependencies, executionMode) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
@@ -1453,6 +1429,38 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               artifacts,
               driver,
             });
+            // Supply resolution is deliberately part of the initial
+            // pre-dispatch prepare. Completed receipts and recovered commands
+            // must not depend on a resolver being available or project new
+            // runtime material.
+            if (executionMode === "initial") {
+              if (create && context.beforeCreate) {
+                // A provision token is single-use authority. Check required
+                // service satisfiability before claiming it, then resolve the
+                // execution projection only after that authority succeeds.
+                await resolveStandardServiceSlots({
+                  tenantId: context.tenantId,
+                  space: body.metadata.space,
+                  form,
+                  spec: body.spec,
+                  ...(options.standardServiceResolver
+                    ? { resolver: options.standardServiceResolver }
+                    : {}),
+                  project: false,
+                });
+                await context.beforeCreate();
+              }
+              standardServices = await resolveStandardServiceSlots({
+                tenantId: context.tenantId,
+                space: body.metadata.space,
+                form,
+                spec: body.spec,
+                ...(options.standardServiceResolver
+                  ? { resolver: options.standardServiceResolver }
+                  : {}),
+                project: true,
+              });
+            }
             await refreshMutation(
               context,
               create ? "create" : "update",
@@ -1509,7 +1517,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                     workerEndpointOriginReservationId: context.workerEndpointOriginReservationId,
                   }
                 : {}),
-              ...(standardServices.length > 0 ? { standardServices } : {}),
+              ...(standardServices && standardServices.length > 0 ? { standardServices } : {}),
               ...(current ? { previous: structuredClone(current) } : {}),
             });
           },
@@ -1721,14 +1729,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       );
       form = authority.form;
       await requireArtifact(form, body.spec, context.tenantId);
-      await resolveStandardServiceSlots({
-        tenantId: context.tenantId,
-        space: body.metadata.space,
-        form,
-        spec: body.spec,
-        ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-        project: false,
-      });
+      validateStandardServiceSlots({ form, spec: body.spec });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "import");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -1845,26 +1846,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw error;
       }
-      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>>;
-      try {
-        standardServices = await resolveStandardServiceSlots({
-          tenantId: context.tenantId,
-          space: body.metadata.space,
-          form,
-          spec: body.spec,
-          ...(options.standardServiceResolver ? { resolver: options.standardServiceResolver } : {}),
-          project: true,
-        });
-      } catch (error) {
-        await store.releaseResourceClaims(claimOwnerId);
-        await store.abandonProviderMutationPlan({
-          tenantId: context.tenantId,
-          operationId: importId,
-          replayKey,
-          resourceUid: uid,
-        });
-        throw error;
-      }
+      let standardServices: Awaited<ReturnType<typeof resolveStandardServiceSlots>> | undefined;
       if (
         !(await store.reserveResourceIncarnation({
           tenantId: context.tenantId,
@@ -1942,7 +1924,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerDispatched = true;
           },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies) => {
+          prepare: async (acceptedDependencies, executionMode) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
@@ -1958,6 +1940,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               artifacts,
               driver,
             });
+            // Supply resolution is deliberately part of the initial
+            // pre-dispatch prepare. Completed receipts and recovered commands
+            // must not depend on a resolver being available or project new
+            // runtime material.
+            if (executionMode === "initial") {
+              standardServices = await resolveStandardServiceSlots({
+                tenantId: context.tenantId,
+                space: body.metadata.space,
+                form,
+                spec: body.spec,
+                ...(options.standardServiceResolver
+                  ? { resolver: options.standardServiceResolver }
+                  : {}),
+                project: true,
+              });
+            }
             await refreshMutation(
               context,
               "import",
@@ -2005,7 +2003,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               nativeId: body.nativeId,
               relations: preparedDriverRelations,
               atomicDeploymentCommit: true,
-              ...(standardServices.length > 0 ? { standardServices } : {}),
+              ...(standardServices && standardServices.length > 0 ? { standardServices } : {}),
               ...(current ? { previous: structuredClone(current) } : {}),
             });
           },

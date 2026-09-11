@@ -41,7 +41,20 @@ export function standardServiceDeclarations(
   return declarations;
 }
 
-/** Resolve required slots now; optionally return sealed execution material. */
+/**
+ * Validate declared slots and their runtime namespace without consulting Host
+ * supply. This structural pass is safe to run for replay and recovery paths.
+ */
+export function validateStandardServiceSlots(input: {
+  readonly form: InstalledTakoformForm;
+  readonly spec: JsonObject;
+}): readonly TakoformStandardServiceSlot[] {
+  const slots = declaredSlots(input.form, input.spec);
+  validateRuntimeNamespace(input.form, input.spec, slots);
+  return slots;
+}
+
+/** Resolve required slots now; optionally return runtime-only execution material. */
 export async function resolveStandardServiceSlots(input: {
   readonly tenantId: string;
   readonly space: string;
@@ -50,8 +63,7 @@ export async function resolveStandardServiceSlots(input: {
   readonly resolver?: TakoformStandardServiceResolver;
   readonly project: boolean;
 }): Promise<readonly TakoformStandardServiceProjection[]> {
-  const slots = declaredSlots(input.form, input.spec);
-  validateRuntimeNamespace(input.form, input.spec, slots);
+  const slots = validateStandardServiceSlots(input);
   const result: TakoformStandardServiceProjection[] = [];
   for (const slot of slots) {
     const satisfiable =

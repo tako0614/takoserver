@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
-import type { InstalledTakoformForm, TakoformResourceDriver } from "../src/takoform/types.ts";
+import type { DeferredOperationsConfiguration } from "../src/takoform/operations.ts";
+import type {
+  InstalledTakoformForm,
+  TakoformResourceDriver,
+  TakoformStandardServiceResolver,
+} from "../src/takoform/types.ts";
+import { TakoformHostError } from "../src/takoform/types.ts";
 import { createStaticStableTestTakoformHost as createTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1";
@@ -108,6 +114,56 @@ describe("stable StandardServiceRef", () => {
     expect(mutations).toBe(0);
   });
 
+  test("refuses an initially unsatisfied required slot before driver mutation", async () => {
+    let mutations = 0;
+    let available = true;
+    const resolver: TakoformStandardServiceResolver = {
+      async satisfiable({ serviceRef }) {
+        if (!available) return false;
+        return serviceRef.protocol === "com.example.archive";
+      },
+      async resolve() {
+        if (!available) throw new Error("resolver unavailable");
+        return {
+          endpoint: { endpoint: "sealed-endpoint:main" },
+          credential: { token: "sealed-credential" },
+        };
+      },
+    };
+    const host = stableHost(
+      {
+        async apply() {
+          mutations += 1;
+          return {};
+        },
+        async observe() {
+          return {};
+        },
+        async delete() {},
+      },
+      true,
+      resolver,
+    );
+    const desired = resource("com.example.archive");
+    const prepared = await host.handle(
+      request(`${lane}/resources/prepare`, { method: "POST", body: JSON.stringify(desired) }),
+    );
+    expect(prepared?.status).toBe(200);
+    if (!prepared) throw new Error("prepare was not routed");
+    const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+    available = false;
+    const refused = await host.handle(
+      request(`${lane}/resources/example.forms.invalid/StandardClient/client`, {
+        method: "PUT",
+        headers: { "idempotency-key": "stable-standard-service-reject-0001", "if-none-match": "*" },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    expect(refused?.status).toBe(422);
+    expect(await refused?.json()).toMatchObject({ error: { code: "unsupported_capability" } });
+    expect(mutations).toBe(0);
+  });
+
   test("defaults required to true, omits unsupported optional slots, and keeps material sealed", async () => {
     const projected: unknown[] = [];
     const host = stableHost({
@@ -158,6 +214,151 @@ describe("stable StandardServiceRef", () => {
     expect(portable).not.toContain("sealed-credential");
   });
 
+  test("does not resolve standard services for an exact completed replay", async () => {
+    let available = true;
+    let satisfiableCalls = 0;
+    let resolveCalls = 0;
+    let mutations = 0;
+    const resolver: TakoformStandardServiceResolver = {
+      async satisfiable({ serviceRef }) {
+        satisfiableCalls += 1;
+        if (!available) throw new Error("resolver unavailable");
+        return serviceRef.protocol === "com.example.archive";
+      },
+      async resolve() {
+        resolveCalls += 1;
+        if (!available) throw new Error("resolver unavailable");
+        return {
+          endpoint: { endpoint: "sealed-endpoint:main" },
+          credential: { token: "sealed-credential" },
+        };
+      },
+    };
+    const host = stableHost(
+      {
+        async apply() {
+          mutations += 1;
+          return { outputs: { hostname: "worker.example.invalid" } };
+        },
+        async observe() {
+          return {};
+        },
+        async delete() {},
+      },
+      true,
+      resolver,
+    );
+    const desired = resource("com.example.archive");
+    const prepared = await host.handle(
+      request(`${lane}/resources/prepare`, { method: "POST", body: JSON.stringify(desired) }),
+    );
+    expect(prepared?.status).toBe(200);
+    if (!prepared) throw new Error("prepare was not routed");
+    const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+    const apply = () =>
+      host.handle(
+        request(`${lane}/resources/example.forms.invalid/StandardClient/client`, {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "stable-standard-service-replay-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+    const created = await apply();
+    expect(created?.status).toBe(201);
+    expect(mutations).toBe(1);
+    const beforeReplay = { satisfiableCalls, resolveCalls };
+    available = false;
+    const replayed = await apply();
+    expect(replayed?.status).toBe(201);
+    expect(mutations).toBe(1);
+    expect({ satisfiableCalls, resolveCalls }).toEqual(beforeReplay);
+  });
+
+  test("recovers an in-flight mutation without resolving standard services", async () => {
+    let available = true;
+    let satisfiableCalls = 0;
+    let resolveCalls = 0;
+    let mutations = 0;
+    const modes: Array<"initial" | "recovery" | undefined> = [];
+    const projected: Array<readonly unknown[] | undefined> = [];
+    const resolver: TakoformStandardServiceResolver = {
+      async satisfiable({ serviceRef }) {
+        satisfiableCalls += 1;
+        if (!available) throw new Error("resolver unavailable");
+        return serviceRef.protocol === "com.example.archive";
+      },
+      async resolve() {
+        resolveCalls += 1;
+        if (!available) throw new Error("resolver unavailable");
+        return {
+          endpoint: { endpoint: "sealed-endpoint:main" },
+          credential: { token: "sealed-credential" },
+        };
+      },
+    };
+    const host = stableHost(
+      {
+        async apply(input) {
+          mutations += 1;
+          modes.push(input.operationMode);
+          projected.push(input.standardServices);
+          if (mutations === 1) throw new TakoformHostError("backend_unavailable", 503);
+          return { observed: structuredClone(input.spec) };
+        },
+        async observe() {
+          return {};
+        },
+        async delete() {},
+      },
+      true,
+      resolver,
+      {
+        shouldDefer: () => true,
+        pollsBeforeCommit: 1,
+        retryAfterSeconds: 0,
+        executeOnAccept: false,
+        leaseMilliseconds: 1_000,
+      },
+    );
+    const desired = resource("com.example.archive");
+    const prepared = await host.handle(
+      request(`${lane}/resources/prepare`, { method: "POST", body: JSON.stringify(desired) }),
+    );
+    expect(prepared?.status).toBe(200);
+    if (!prepared) throw new Error("prepare was not routed");
+    const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+    const apply = await host.handle(
+      request(`${lane}/resources/example.forms.invalid/StandardClient/client`, {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "stable-standard-service-recovery-0001",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    expect(apply?.status).toBe(202);
+    if (!apply) throw new Error("apply was not accepted");
+    const operationId = ((await apply.json()) as { operation: { id: string } }).operation.id;
+    const operationPath = `${lane}/operations/${operationId}`;
+    expect((await host.handle(request(operationPath)))?.status).toBe(200);
+    const failedInitial = await host.handle(request(operationPath));
+    expect(failedInitial?.status).toBe(200);
+    expect(mutations).toBe(1);
+    const beforeRecovery = { satisfiableCalls, resolveCalls };
+    available = false;
+    const recovered = await host.handle(request(operationPath));
+    expect(recovered?.status).toBe(200);
+    expect(await recovered?.json()).toMatchObject({ done: true });
+    expect(modes).toEqual(["initial", "recovery"]);
+    expect(projected[0]).toHaveLength(1);
+    expect(projected[1]).toBeUndefined();
+    expect({ satisfiableCalls, resolveCalls }).toEqual(beforeRecovery);
+  });
+
   test("rejects portable endpoint, credential, FormRef, and Resource selector fields", async () => {
     const host = stableHost({
       async apply() {
@@ -191,16 +392,22 @@ describe("stable StandardServiceRef", () => {
   });
 });
 
-function stableHost(driver: TakoformResourceDriver, withResolver = true) {
+function stableHost(
+  driver: TakoformResourceDriver,
+  withResolver = true,
+  resolver?: TakoformStandardServiceResolver,
+  deferredOperations?: DeferredOperationsConfiguration,
+) {
   return createTakoformHost({
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
     forms: [form],
     driver,
+    ...(deferredOperations ? { deferredOperations } : {}),
     ...(withResolver
       ? {
-          standardServiceResolver: {
+          standardServiceResolver: resolver ?? {
             async satisfiable({ tenantId, space, serviceRef }) {
               return (
                 tenantId === "tenant-a" &&

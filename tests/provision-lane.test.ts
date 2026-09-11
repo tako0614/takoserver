@@ -11,6 +11,7 @@ import {
 import { createLedger } from "../src/ledger.ts";
 import type { Sql } from "../src/ports.ts";
 import { createReseller } from "../src/reseller.ts";
+import type { TakoformStandardServiceResolver } from "../src/takoform/types.ts";
 import { createTokenService, type SigningKey, type TokenService } from "../src/token.ts";
 import { createStaticStableEphemeralTakoformHost as createTakoformHost } from "./helpers/historical-takoform-host.ts";
 
@@ -503,5 +504,194 @@ describe("Takoform run-token lane", () => {
       { "idempotency-key": "run-observe-1", "takoform-expected-generation": "1" },
     );
     expect(observed.status).toBe(200);
+  });
+
+  test("rejects an unsatisfied required service before claiming a run reservation", async () => {
+    const serviceApiVersion = "standards.takoform.com/v1" as const;
+    const standardFormRef = {
+      apiVersion: "example.forms.invalid",
+      kind: "StandardClient",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"2".repeat(64)}`,
+    } as const;
+    const standardForm: InstalledTakoformForm = {
+      identity: { formRef: standardFormRef },
+      requiresHostApi: "forms.takoform.com/v1",
+      role: "revision",
+      desiredSchema: {
+        type: "object",
+        properties: {
+          externalServices: {
+            type: "array",
+            "x-takoform-standard-services": serviceApiVersion,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                name: { type: "string", pattern: "^[A-Z][A-Z0-9_]*$", maxLength: 64 },
+                required: { type: "boolean", default: true },
+                service: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    apiVersion: { const: serviceApiVersion },
+                    protocol: {
+                      type: "string",
+                      pattern:
+                        "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?){2,}$",
+                      maxLength: 253,
+                    },
+                  },
+                  required: ["apiVersion", "protocol"],
+                },
+              },
+              required: ["name", "service"],
+            },
+          },
+        },
+        required: ["externalServices"],
+        additionalProperties: false,
+      },
+      operations: ["create", "read", "delete"],
+    };
+    const standardOffering: Offering = {
+      ...OFFERING,
+      id: "standard.client.standard",
+      resourceClass: "standard.client",
+      kind: "standard_client",
+      form: standardFormRef,
+    };
+    const sql = createEphemeralSql();
+    const clock = () => new Date(NOW);
+    const catalog = createCatalog([standardOffering]);
+    const ledger = createLedger(sql, clock);
+    const reseller = createReseller({ sql, ledger, catalog, clock });
+    await ledger.fund({ organizationId: ORG, fundingRef: "pay_standard", amountMinor: 10_000 });
+    const quote = await reseller.quote({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      offeringId: standardOffering.id,
+      quantity: 1,
+    });
+    const reservation = await reseller.reserve({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      quoteId: quote.id,
+    });
+    const tokens = createTokenService({
+      sql,
+      issuer: ISSUER,
+      clock,
+      keyCacheSeconds: 0,
+      signingKey: await provisionKey(sql),
+    });
+    const issued = await tokens.issueTakoformRunToken({
+      organizationId: ORG,
+      tenantRef: TENANT,
+      reservationId: reservation.id,
+      offeringId: standardOffering.id,
+      offeringDigest: await catalog.digest(standardOffering),
+      formRef: standardFormRef,
+      resourceName: "client",
+      mode: "provision",
+      ttlSeconds: 600,
+    });
+
+    let available = true;
+    let mutations = 0;
+    let resolveCalls = 0;
+    const events: string[] = [];
+    const memory = new InMemoryTakoformResourceDriver();
+    const resolver: TakoformStandardServiceResolver = {
+      async satisfiable({ serviceRef }) {
+        events.push("satisfiable");
+        return available && serviceRef.protocol === "com.example.archive";
+      },
+      async resolve() {
+        events.push("resolve");
+        resolveCalls += 1;
+        return {
+          endpoint: { endpoint: "sealed-endpoint:main" },
+          credential: { token: "sealed-credential" },
+        };
+      },
+    };
+    const host = createTakoformHost({
+      sql,
+      objects: createMemoryObjectStore(),
+      authenticate: async (authorization) => {
+        const token = authorization?.replace(/^Bearer /u, "");
+        if (!token) return null;
+        const claims = await tokens.verifyTakoformRunToken(token);
+        return {
+          tenantId: claims.organizationId,
+          principalId: `run:${claims.tokenId}`,
+          scope: {
+            space: claims.tenantRef,
+            formRef: claims.formRef,
+            resourceName: claims.resourceName,
+            mode: "provision" as const,
+            claimCreate: async () => {
+              events.push("claim");
+              await tokens.claimTakoformRunTokenForCreate(token);
+            },
+          },
+        };
+      },
+      forms: [standardForm],
+      driver: {
+        async apply(input) {
+          mutations += 1;
+          return await memory.apply(input);
+        },
+        observe: (input) => memory.observe(input),
+        delete: (input) => memory.delete(input),
+        import: (input) => memory.import(input),
+      },
+      clock,
+      standardServiceResolver: resolver,
+    });
+    const body = {
+      apiVersion: standardFormRef.apiVersion,
+      kind: standardFormRef.kind,
+      form: { formRef: standardFormRef },
+      metadata: { space: TENANT, name: "client" },
+      spec: {
+        externalServices: [
+          {
+            name: "ARCHIVE",
+            service: { apiVersion: serviceApiVersion, protocol: "com.example.archive" },
+          },
+        ],
+      },
+    };
+    const prepared = await laneRequest(
+      host,
+      "POST",
+      "/apis/forms.takoform.com/v1/resources/prepare",
+      issued.token,
+      body,
+    );
+    expect(prepared.status).toBe(200);
+    const prepareDigest = String((prepared.body.review as { prepareDigest: string }).prepareDigest);
+    events.length = 0;
+    available = false;
+
+    const refused = await laneRequest(
+      host,
+      "PUT",
+      "/apis/forms.takoform.com/v1/resources/example.forms.invalid/StandardClient/client",
+      issued.token,
+      { ...body, review: { prepareDigest } },
+      { "idempotency-key": "run-standard-service-reject-0001", "if-none-match": "*" },
+    );
+    expect(refused.status).toBe(422);
+    expect(refused.body).toMatchObject({ error: { code: "unsupported_capability" } });
+    expect(events).toEqual(["satisfiable"]);
+    expect(resolveCalls).toBe(0);
+    expect(mutations).toBe(0);
+    expect(await sql.query("SELECT COUNT(*) AS total FROM provision_token_consumptions")).toEqual([
+      { total: 0 },
+    ]);
   });
 });
