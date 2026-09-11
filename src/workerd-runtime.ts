@@ -1341,7 +1341,7 @@ function validModuleMediaTypes(
   return normalized;
 }
 
-const SAFE_ASSET_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
+const SAFE_ASSET_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
 const ASSET_MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const MAX_ASSET_MEDIA_TYPE_LENGTH = 255;
 const MAX_ASSET_ENTRIES = 16_384;
@@ -3082,11 +3082,10 @@ export default {
  * what a miss means. An application that routes on the client needs its shell
  * served for a valid path no file matches; malformed and ambiguous paths fail
  * closed before that fallback. Cloudflare's asset layer decides the former
- * from `notFoundHandling`, and the portable Worker Version path grammar decides
- * the latter.
+ * from `notFoundHandling`, and the bounded URL safety rules decide the latter;
+ * the manifest filename grammar is not an application URL allowlist.
  */
 export const ASSETS_SOURCE = `const MISS_HEADER = "x-takoserver-selfhost-asset-miss";
-const SAFE_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 
 async function file(env, entry) {
   // Logical manifest paths never become filesystem paths. The private
@@ -3125,6 +3124,18 @@ function invalidPath() {
 }
 
 function pathOf(request) {
+  const rawUrl = typeof request.url === "string" ? request.url : "";
+  const rawPath = rawUrl.split(/[?#]/u, 1)[0] ?? "";
+  // Some URL implementations normalize encoded dot segments while parsing;
+  // inspect the wire spelling first so traversal never becomes a native key.
+  const rawLower = rawPath.toLowerCase();
+  if (
+    rawPath.split("/").some((segment) =>
+      [".", "..", "%2e", "%2e%2e", "%2e.", ".%2e"].includes(segment.toLowerCase()),
+    ) ||
+    rawLower.includes("%2f") ||
+    rawLower.includes("%5c")
+  ) return null;
   let pathname;
   try {
     pathname = new URL(request.url).pathname;
@@ -3153,16 +3164,15 @@ function pathOf(request) {
     ) return null;
   }
   const path = decoded.slice(1);
-  // The root is a valid missing path and may enter SPA fallback. Everywhere
-  // else, an empty, dot, or repeated segment is invalid.
+  // The root, a single trailing slash, and repeated slashes are valid missing
+  // paths. Only literal dot or dotdot segments are rejected as traversal.
   if (path === "") return path;
   const segments = path.split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
-    return null;
-  }
-  // A decoded runtime path still has to be a path a StaticAssetBundle manifest
-  // could declare. Otherwise it is invalid, not a valid SPA miss.
-  if (path.length > 240 || !SAFE_PATH.test(path)) return null;
+  const checkedSegments = segments.at(-1) === "" ? segments.slice(0, -1) : segments;
+  if (checkedSegments.some((segment) => segment === "." || segment === "..")) return null;
+  // URL paths are not constrained by the manifest filename grammar. A valid
+  // Unicode, extensionless, or trailing-slash path can simply miss the
+  // inventory and then follow the declared none/SPA fallback policy.
   return path;
 }
 

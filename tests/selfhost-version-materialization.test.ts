@@ -324,8 +324,38 @@ describe("self-host Worker Version materialization", () => {
     expect(physical.every((entry) => entry.isFile())).toBe(true);
   });
 
-  test.each([".env", "dir/.x", ".well-known/info", "a/.hidden/main.js"])(
-    "refuses asset path %s outside the frozen manifest grammar before materialization",
+  test("materializes explicit dot-prefixed asset paths in flat storage", async () => {
+    const paths = [".env", "dir/.x", ".well-known/info", "a/.hidden/main.js"] as const;
+    const { materializer, input, assetManifestDigest } = await assetMaterializerFixture(paths);
+    await materializer.materialize({
+      ...input,
+      assets: {
+        manifestDigest: assetManifestDigest,
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+      },
+    });
+
+    const retained = await materializer.readSnapshot(input);
+    expect(retained.state).toBe("present");
+    if (retained.state !== "present") throw new Error("dot-prefixed assets were not retained");
+    expect([...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>).keys()]).toEqual(
+      paths,
+    );
+    const physical = await import("node:fs/promises").then(({ readdir }) =>
+      readdir(join(root, input.script, input.versionId, "assets"), { withFileTypes: true }),
+    );
+    expect(physical.map((entry) => entry.name).sort()).toEqual([
+      "asset-00000",
+      "asset-00001",
+      "asset-00002",
+      "asset-00003",
+    ]);
+    expect(physical.every((entry) => entry.isFile())).toBe(true);
+  });
+
+  test.each([".", "..", "dir/./x", "dir/../x"])(
+    "rejects traversal asset path %s before materialization",
     async (path) => {
       const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([path]);
       await expect(

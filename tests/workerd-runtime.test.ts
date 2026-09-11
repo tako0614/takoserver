@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { bytesDigest } from "../src/json.ts";
 import {
+  ASSET_ROUTER_SOURCE,
+  ASSETS_SOURCE,
   createWorkerdRuntime,
   DEPLOYMENT_ROUTER_SOURCE,
   ROUTER_SOURCE,
@@ -116,6 +118,10 @@ async function generatedFetchWorker(source: string, name: string): Promise<Gener
     readonly default: GeneratedFetchWorker;
   };
   return loaded.default;
+}
+
+function rawRequest(url: string, method = "GET"): Request {
+  return { method, url } as Request;
 }
 
 function createConfigProbe(): {
@@ -628,6 +634,176 @@ test("persists private asset routing order through reload and restart", async ()
   expect(await restarted.has("site", "gen-assets")).toBe(true);
 });
 
+test("materializes explicit dot-prefixed asset paths in flat storage", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  const paths = [".env", "dir/.x", ".well-known/nodeinfo", "a/.hidden/main.js"] as const;
+  const mediaTypes = Object.fromEntries(paths.map((path) => [path, "text/plain"]));
+  const bytes = new Map<string, Uint8Array>(
+    paths.map((path) => [path, new TextEncoder().encode(`asset:${path}`)] as const),
+  );
+
+  await runtime.write(
+    "dot-assets",
+    {
+      directory: "dot-assets",
+      mainModule: "index.js",
+      hostnames: ["dot-assets.localhost"],
+      assets: {
+        notFoundHandling: "none",
+        runWorkerFirst: false,
+        mediaTypes,
+      },
+    },
+    MODULES,
+    bytes,
+  );
+
+  const manifest = JSON.parse(
+    await readFile(join(root, "workers", "dot-assets", "takoserver-site.json"), "utf8"),
+  ) as {
+    assets: {
+      storageLayout: string;
+      files: Record<string, { key: string; mediaType: string; size: number; digest: string }>;
+    };
+  };
+  expect(manifest.assets.storageLayout).toBe("flat-ordinal-v1");
+  expect(Object.keys(manifest.assets.files).sort()).toEqual([...paths].sort());
+  const sortedPaths = [...paths].sort();
+  for (const [index, path] of sortedPaths.entries()) {
+    expect(manifest.assets.files[path]?.key).toBe(`asset-${index.toString().padStart(5, "0")}`);
+  }
+  const physical = await readdir(join(root, "assets", "dot-assets"), { withFileTypes: true });
+  expect(physical.map((entry) => entry.name).sort()).toEqual([
+    "asset-00000",
+    "asset-00001",
+    "asset-00002",
+    "asset-00003",
+  ]);
+  expect(physical.every((entry) => entry.isFile())).toBe(true);
+  expect(await readFile(join(root, "assets", "dot-assets", "asset-00000"), "utf8")).toBe(
+    "asset:.env",
+  );
+});
+
+test("generated asset routing treats valid URL misses separately from malformed paths", async () => {
+  const assets = await generatedFetchWorker(ASSETS_SOURCE, "generated-assets.mjs");
+  const fileRequests: string[] = [];
+  const assetFiles: Record<string, { readonly body: string; readonly mediaType: string }> = {
+    // The disk service emits octet-stream for files, including .json; the
+    // declared manifest media type is applied by the asset layer itself.
+    "asset-00000": { body: '{"links":[]}', mediaType: "application/octet-stream" },
+    "asset-00001": { body: "<html>shell</html>", mediaType: "application/octet-stream" },
+  };
+  const assetManifest = {
+    ".well-known/nodeinfo": {
+      key: "asset-00000",
+      mediaType: "application/json",
+    },
+    "index.html": {
+      key: "asset-00001",
+      mediaType: "text/html",
+    },
+  };
+  const assetEnv = {
+    ASSET_MANIFEST: assetManifest,
+    FILES: {
+      async fetch(request: Request | string) {
+        const requestUrl = typeof request === "string" ? request : request.url;
+        const key = new URL(requestUrl).pathname.slice("/".length);
+        fileRequests.push(key);
+        const file = assetFiles[key];
+        return file
+          ? new Response(file.body, { status: 200, headers: { "content-type": file.mediaType } })
+          : new Response(null, { status: 404 });
+      },
+    },
+    NOT_FOUND: "none",
+  };
+  const dotPath = await assets.fetch(
+    new Request("https://assets.test/.well-known/nodeinfo"),
+    assetEnv,
+  );
+  expect(dotPath.status).toBe(200);
+  expect(dotPath.headers.get("content-type")).toBe("application/json");
+  expect(await dotPath.text()).toBe('{"links":[]}');
+  expect(fileRequests).toEqual(["asset-00000"]);
+
+  for (const path of ["/日本語", "/missing/", "/directory", "/a//b", `/${"a".repeat(241)}`]) {
+    const miss = await assets.fetch(new Request(`https://assets.test${path}`), assetEnv);
+    expect(miss.status).toBe(404);
+    expect(miss.headers.get("x-takoserver-selfhost-asset-miss")).toBe("1");
+  }
+  expect(fileRequests).toEqual(["asset-00000"]);
+
+  for (const path of ["/bad%2Fname", "/bad%5Cname", "/%2e/secret", "/%2e%2e/secret", "/%E0%A4%A"]) {
+    const malformed = await assets.fetch(rawRequest(`https://assets.test${path}`), assetEnv);
+    expect(malformed.status).toBe(404);
+    expect(malformed.headers.get("x-takoserver-selfhost-asset-miss")).toBeNull();
+  }
+  expect(fileRequests).toEqual(["asset-00000"]);
+
+  const spa = await generatedFetchWorker(ASSETS_SOURCE, "generated-spa-assets.mjs");
+  const spaResponse = await spa.fetch(new Request("https://assets.test/日本語/"), {
+    ...assetEnv,
+    NOT_FOUND: "single-page-application",
+  });
+  expect(spaResponse.status).toBe(200);
+  expect(await spaResponse.text()).toBe("<html>shell</html>");
+  expect(fileRequests).toEqual(["asset-00000", "asset-00001"]);
+
+  const router = await generatedFetchWorker(ASSET_ROUTER_SOURCE, "generated-asset-router.mjs");
+  const routerAssetRequests: string[] = [];
+  let workerStatus = 404;
+  const workerRequests: string[] = [];
+  const routedEnv = {
+    RUN_WORKER_FIRST: "false",
+    ASSETS: {
+      async fetch(request: Request) {
+        routerAssetRequests.push(new URL(request.url).pathname);
+        return await assets.fetch(request, assetEnv);
+      },
+    },
+    WORKER: {
+      async fetch(request: Request) {
+        workerRequests.push(new URL(request.url).pathname);
+        return new Response(workerStatus === 404 ? "app-404" : "app-ok", {
+          status: workerStatus,
+          headers: { "x-app": "preserved" },
+        });
+      },
+    },
+  };
+  const assetFirst = await router.fetch(
+    new Request("https://assets.test/.well-known/nodeinfo"),
+    routedEnv,
+  );
+  expect(assetFirst.status).toBe(200);
+  expect(await assetFirst.text()).toBe('{"links":[]}');
+  expect(workerRequests).toHaveLength(0);
+  expect(routerAssetRequests).toEqual(["/.well-known/nodeinfo"]);
+
+  const appFallback = await router.fetch(new Request("https://assets.test/missing/"), routedEnv);
+  expect(appFallback.status).toBe(404);
+  expect(await appFallback.text()).toBe("app-404");
+  expect(appFallback.headers.get("x-app")).toBe("preserved");
+  expect(workerRequests).toEqual(["/missing/"]);
+
+  routedEnv.RUN_WORKER_FIRST = "true";
+  const workerFirstAsset = await router.fetch(
+    new Request("https://assets.test/.well-known/nodeinfo"),
+    routedEnv,
+  );
+  expect(workerFirstAsset.status).toBe(200);
+  expect(await workerFirstAsset.text()).toBe('{"links":[]}');
+  expect(workerRequests).toEqual(["/missing/", "/.well-known/nodeinfo"]);
+
+  workerStatus = 200;
+  const workerWins = await router.fetch(new Request("https://assets.test/missing"), routedEnv);
+  expect(workerWins.status).toBe(200);
+  expect(await workerWins.text()).toBe("app-ok");
+  expect(routerAssetRequests).toHaveLength(3);
+});
+
 test("rejects unusable asset routing before damaging the active publication", async () => {
   const runtime = createWorkerdRuntime({ root, isReady: () => true });
   await runtime.write(
@@ -696,7 +872,7 @@ test("rejects unusable asset routing before damaging the active publication", as
       },
       bytes: new Map([["../index.html", new TextEncoder().encode("new index")]]),
     },
-    ...[".env", "dir/.x"].map((path) => ({
+    ...[".", "..", "dir/./x", "dir/../x"].map((path) => ({
       assets: {
         notFoundHandling: "none" as const,
         runWorkerFirst: false,
