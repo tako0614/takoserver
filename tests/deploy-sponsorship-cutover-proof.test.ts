@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sponsorshipAuthorityBindingClosure } from "../scripts/deploy/sponsorship-authority.ts";
 import {
-  sponsorshipCutoverOperationIdentity,
   type SponsorshipCutoverConsumptionDatabase,
   type SponsorshipCutoverConsumptionRecord,
   type SponsorshipCutoverOperationCompletion,
   type SponsorshipCutoverOperationStart,
+  sponsorshipCutoverOperationIdentity,
 } from "../scripts/deploy/sponsorship-cutover-consumption.ts";
 import {
   createSponsorshipCutoverProofGate,
