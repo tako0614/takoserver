@@ -3,8 +3,8 @@ import { constants as fsConstants } from "node:fs";
 import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { isJsonObject } from "../json.ts";
+import { isStableStandardServiceProtocol } from "../standard-service-port.ts";
 import { parseStrictJson } from "../strict-json.ts";
-import { isStableStandardServiceProtocol } from "../takoform/standard-services.ts";
 
 /**
  * Durable runtime bindings for one immutable Worker Version.

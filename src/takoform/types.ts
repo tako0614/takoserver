@@ -3,6 +3,7 @@ import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.
 import type { JsonObject } from "../ports.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
+import type { StandardServiceProjection, StandardServiceSlot } from "../standard-service-port.ts";
 
 export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
 
@@ -213,20 +214,8 @@ export interface TakoformDriverRelation {
   readonly bindingRef?: TakoformBindingRef;
 }
 
-export interface TakoformStandardServiceSlot {
-  readonly name: string;
-  readonly required: boolean;
-  readonly service: {
-    readonly apiVersion: "standards.takoform.com/v1alpha1" | "standards.takoform.com/v1";
-    readonly protocol: string;
-  };
-}
-
-/** Runtime-only material, not ciphertext. The driver owns protected custody; never Resource state. */
-export interface TakoformStandardServiceProjection extends TakoformStandardServiceSlot {
-  readonly endpoint: JsonObject;
-  readonly credential: JsonObject;
-}
+export type TakoformStandardServiceSlot = StandardServiceSlot;
+export type TakoformStandardServiceProjection = StandardServiceProjection;
 
 export interface TakoformStandardServiceResolver {
   satisfiable(input: {

@@ -1,7 +1,9 @@
 import { canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
+import {
+  isStableStandardServiceProtocol,
+  type StandardServiceProjection,
+} from "../standard-service-port.ts";
 import { parseStrictJson } from "../strict-json.ts";
-import { isStableStandardServiceProtocol } from "../takoform/standard-services.ts";
-import type { TakoformStandardServiceProjection } from "../takoform/types.ts";
 import type { SelfhostVersionExternalService } from "./selfhost-version-bindings.ts";
 
 type Declaration = Omit<SelfhostVersionExternalService, "binding">;
@@ -9,7 +11,7 @@ type Declaration = Omit<SelfhostVersionExternalService, "binding">;
 /** Operator code owns the JSON object's keys; this is not a protocol registry. */
 export interface SelfhostStandardServiceIntegration {
   readonly service: Declaration["service"];
-  readonly serialize: (projection: TakoformStandardServiceProjection) => JsonObject;
+  readonly serialize: (projection: StandardServiceProjection) => JsonObject;
 }
 
 export class SelfhostStandardServiceError extends Error {
@@ -39,12 +41,12 @@ export function createSelfhostStandardServices(
     protocols: integrations.map(({ service }) => ({ ...service })),
     materialize(
       spec: JsonObject,
-      projections: readonly TakoformStandardServiceProjection[],
+      projections: readonly StandardServiceProjection[],
       reserved: ReadonlySet<string>,
     ): readonly SelfhostVersionExternalService[] {
       try {
         const slots = declarations(spec);
-        const supplied = new Map<string, TakoformStandardServiceProjection>();
+        const supplied = new Map<string, StandardServiceProjection>();
         for (const projection of projections) {
           const slot = slots.find((candidate) => candidate.name === projection.name);
           if (

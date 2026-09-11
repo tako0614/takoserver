@@ -1,5 +1,12 @@
 import type { JsonObject } from "../ports.ts";
 import {
+  isStableStandardServiceProtocol,
+  STABLE_STANDARD_SERVICE_PROTOCOL_PATTERN,
+} from "../standard-service-port.ts";
+
+export { isStableStandardServiceProtocol } from "../standard-service-port.ts";
+
+import {
   type InstalledTakoformForm,
   TakoformHostError,
   type TakoformStandardServiceProjection,
@@ -9,8 +16,6 @@ import {
 
 const LEGACY_STANDARD_SERVICES_API = "standards.takoform.com/v1alpha1";
 export const STABLE_STANDARD_SERVICES_API = "standards.takoform.com/v1";
-const STABLE_PROTOCOL =
-  /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?){2,}$/u;
 const PROJECTED_MEMBERS: Readonly<Record<string, readonly string[]>> = {
   postgresql: ["URL"],
   redis: ["URL"],
@@ -22,11 +27,6 @@ interface StandardServiceDeclaration {
   readonly pointer: `/${string}`;
   readonly apiVersion: typeof LEGACY_STANDARD_SERVICES_API | typeof STABLE_STANDARD_SERVICES_API;
   readonly protocols?: readonly string[];
-}
-
-/** Stable syntax validation is structural and never a protocol registry lookup. */
-export function isStableStandardServiceProtocol(value: string): boolean {
-  return value.length <= 253 && STABLE_PROTOCOL.test(value);
 }
 
 /** Reads the extension from the Definition schema; there is no parallel slot catalog. */
@@ -219,7 +219,7 @@ function walk(schema: unknown, pointer: string, result: StandardServiceDeclarati
       apiVersion === STABLE_STANDARD_SERVICES_API &&
       record(protocol) &&
       protocol.type === "string" &&
-      protocol.pattern === STABLE_PROTOCOL.source &&
+      protocol.pattern === STABLE_STANDARD_SERVICE_PROTOCOL_PATTERN &&
       protocol.maxLength === 253;
     const legacyProtocolSchema =
       apiVersion === LEGACY_STANDARD_SERVICES_API &&
