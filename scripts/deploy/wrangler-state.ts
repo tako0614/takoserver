@@ -1081,6 +1081,7 @@ export function parseWranglerVersionUploadOutput(
     "worker_name_overridden",
     "wrangler_environment",
     "timestamp",
+    "bundle_size",
   ]);
   if (
     event.type !== "version-upload" ||
@@ -1097,6 +1098,7 @@ export function parseWranglerVersionUploadOutput(
   assertOptionalNullableString(event.preview_alias_url, "preview_alias_url");
   assertOptionalString(event.wrangler_environment, "wrangler_environment");
   assertOptionalTimestamp(event.timestamp);
+  assertOptionalBundleSize(event.bundle_size);
   return { versionId: event.version_id };
 }
 
@@ -1115,6 +1117,7 @@ export function parseWranglerLifecycleDeployOutput(
     "worker_name_overridden",
     "wrangler_environment",
     "timestamp",
+    "bundle_size",
   ]);
   if (
     event.type !== "deploy" ||
@@ -1131,6 +1134,7 @@ export function parseWranglerLifecycleDeployOutput(
   assertOptionalNullableString(event.worker_tag, "worker_tag");
   assertOptionalString(event.wrangler_environment, "wrangler_environment");
   assertOptionalTimestamp(event.timestamp);
+  assertOptionalBundleSize(event.bundle_size);
   return { versionId: event.version_id, targets: event.targets };
 }
 
@@ -1318,6 +1322,19 @@ function assertOptionalNullableString(value: unknown, field: string): void {
 function assertOptionalString(value: unknown, field: string): void {
   if (value !== undefined && typeof value !== "string") {
     throw preflightError(`Wrangler publication event field ${field} has an invalid shape`);
+  }
+}
+
+function assertOptionalBundleSize(value: unknown): void {
+  if (value === undefined) return;
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !== "gzip_bytes,raw_bytes") {
+    throw preflightError("Wrangler publication event bundle_size has an invalid shape");
+  }
+  for (const field of ["raw_bytes", "gzip_bytes"] as const) {
+    const bytes = value[field];
+    if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0) {
+      throw preflightError("Wrangler publication event bundle_size has an invalid shape");
+    }
   }
 }
 

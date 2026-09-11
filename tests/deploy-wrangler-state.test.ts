@@ -435,6 +435,93 @@ describe("Wrangler version publication output", () => {
     ).toThrow("100 percent");
   });
 
+  test("accepts Wrangler upload bundle_size while refusing malformed size and unknown fields", () => {
+    const upload = {
+      type: "version-upload",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      version_id: VERSION,
+      preview_url: null,
+      preview_alias_url: null,
+      worker_name_overridden: false,
+      wrangler_environment: "production",
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+    const lifecycle = {
+      type: "deploy",
+      version: 1,
+      worker_name: WORKER,
+      worker_tag: null,
+      version_id: VERSION,
+      targets: [],
+      worker_name_overridden: false,
+      wrangler_environment: "production",
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+
+    for (const bundleSize of [
+      { raw_bytes: 0, gzip_bytes: 0 },
+      { raw_bytes: 1, gzip_bytes: 2 },
+      { raw_bytes: 12_345, gzip_bytes: 6_789 },
+    ]) {
+      expect(
+        parseWranglerVersionUploadOutput(
+          JSON.stringify({ ...upload, bundle_size: bundleSize }),
+          WORKER,
+        ),
+      ).toEqual({ versionId: VERSION });
+      expect(
+        parseWranglerLifecycleDeployOutput(
+          JSON.stringify({ ...lifecycle, bundle_size: bundleSize }),
+          WORKER,
+        ),
+      ).toEqual({ versionId: VERSION, targets: [] });
+    }
+
+    for (const bundleSize of [
+      null,
+      [],
+      { raw_bytes: 12_345 },
+      { raw_bytes: 12_345, gzip_bytes: 6_789, extra: 1 },
+      { raw_bytes: 12_345.5, gzip_bytes: 6_789 },
+      { raw_bytes: Number.MAX_SAFE_INTEGER + 1, gzip_bytes: 6_789 },
+      { raw_bytes: "12_345", gzip_bytes: 6_789 },
+      { raw_bytes: -1, gzip_bytes: 6_789 },
+    ]) {
+      expect(() =>
+        parseWranglerVersionUploadOutput(
+          JSON.stringify({ ...upload, bundle_size: bundleSize }),
+          WORKER,
+        ),
+      ).toThrow();
+      expect(() =>
+        parseWranglerLifecycleDeployOutput(
+          JSON.stringify({ ...lifecycle, bundle_size: bundleSize }),
+          WORKER,
+        ),
+      ).toThrow();
+    }
+    expect(() =>
+      parseWranglerVersionUploadOutput(JSON.stringify({ ...upload, unknown_field: true }), WORKER),
+    ).toThrow("unexpected");
+    expect(() =>
+      parseWranglerVersionDeployOutput(
+        JSON.stringify({
+          type: "version-deploy",
+          version: 1,
+          worker_name: WORKER,
+          worker_tag: null,
+          deployment_id: DEPLOYMENT,
+          version_traffic: {},
+          timestamp: "2026-08-30T00:00:00.000Z",
+          bundle_size: { raw_bytes: 12_345, gzip_bytes: 6_789 },
+        }),
+        WORKER,
+      ),
+    ).toThrow("unexpected");
+  });
+
   test("accepts Wrangler session and autoconfig framing around one deploy event", () => {
     const session = {
       type: "wrangler-session",
