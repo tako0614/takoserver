@@ -12,6 +12,66 @@ const VERSION_ID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 const EXACT_VERSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const MISSING_WORKER = /script_not_found|could not find|does not exist|no deployments/iu;
 
+export const LEGACY_PUBLIC_PARENT_SECRET = "CLOUDFLARE_API_TOKEN" as const;
+export const LEGACY_HOSTED_SPONSORSHIP_SECRET = [
+  "TAKOSERVER",
+  "HOSTED",
+  "SPONSORSHIP",
+  "TOKEN",
+].join("_");
+
+/**
+ * Exact legacy-secret custody words used only by the bounded 0043 transition.
+ * `base` is the target-derived Worker inventory, `full` carries both retiring
+ * credentials, and `post-parent` is the sole intermediate after the public
+ * parent credential has been deleted by its dedicated owner.
+ * Remove this profile and its transition branches once A (or accepted H) is
+ * current and the K1/K2 rollback custody Versions are no longer retained.
+ */
+export type WorkerLegacySecretCustodyProfile = "base" | "full" | "post-parent";
+
+export function workerSecretsForLegacyCustody(
+  target: DeployTarget,
+  profile: WorkerLegacySecretCustodyProfile,
+): readonly string[] {
+  const legacy = new Set([LEGACY_PUBLIC_PARENT_SECRET, LEGACY_HOSTED_SPONSORSHIP_SECRET]);
+  const base = expectedWorkerSecrets(target).filter((name) => !legacy.has(name));
+  return [
+    ...new Set([
+      ...base,
+      ...(profile === "full" ? [LEGACY_PUBLIC_PARENT_SECRET] : []),
+      ...(profile === "full" || profile === "post-parent"
+        ? [LEGACY_HOSTED_SPONSORSHIP_SECRET]
+        : []),
+    ]),
+  ].sort();
+}
+
+/**
+ * Classifies only the two fixed legacy names. The caller still proves the full
+ * Version/store inventory with the selected target-derived closure, so this
+ * helper cannot turn an unknown extra or a missing ordinary secret into an
+ * accepted transition.
+ */
+export function workerLegacySecretCustodyProfile(
+  phase: DeployPhase,
+  secretNames: readonly string[],
+  allowed: readonly WorkerLegacySecretCustodyProfile[],
+): WorkerLegacySecretCustodyProfile {
+  const parent = secretNames.includes(LEGACY_PUBLIC_PARENT_SECRET);
+  const hosted = secretNames.includes(LEGACY_HOSTED_SPONSORSHIP_SECRET);
+  const profile: WorkerLegacySecretCustodyProfile | null =
+    parent && hosted ? "full" : !parent && hosted ? "post-parent" : !parent ? "base" : null;
+  if (profile === null || !allowed.includes(profile)) {
+    throw new DeployError(
+      phase,
+      "Worker legacy secret custody drift",
+      `allowed=${JSON.stringify([...allowed].sort())} parent=${parent} hosted=${hosted}`,
+    );
+  }
+  return profile;
+}
+
 /**
  * The Worker version currently receiving production traffic, or null when the
  * Worker has never been deployed. A missing Worker is a normal first-publish

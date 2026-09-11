@@ -20,7 +20,7 @@ import {
   workerVersionIdentity,
   workerVersionScriptContentIdentity,
 } from "./worker-live.ts";
-import { parseWorkerDeploymentHistory } from "./worker-state.ts";
+import { parseWorkerDeploymentChain, parseWorkerDeploymentHistory } from "./worker-state.ts";
 
 const PROOF_KIND = "takosumi-hosted.sponsorship-authority-cutover-proof@v1";
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
@@ -48,6 +48,27 @@ export interface SponsorshipCutoverProofGate {
   ): Promise<SponsorshipCutoverStartAdmission>;
   complete(handle: SponsorshipCutoverProofHandle, versionId: string): Promise<void>;
   settle(stage: SponsorshipCutoverProofStage, versionId: string): Promise<string | undefined>;
+  /**
+   * Records an already-retired public route without publishing a Worker
+   * Version. This is intentionally limited to the exact provider-created
+   * post-parent-secret Version captured by the current proof.
+   */
+  adoptPreexistingRouteRemoval(candidate: SponsorshipCutoverCandidateIdentity): Promise<string>;
+  /** Reconciles only the current-proof P -> P preexisting-route receipt. */
+  settlePreexistingRouteRemoval(versionId: string): Promise<string | undefined>;
+  completePost0043LegacySecretRetirement(
+    handle: SponsorshipCutoverProofHandle,
+    successor: Post0043LegacySecretSuccessor,
+  ): Promise<void>;
+  settlePost0043LegacySecretRetirement(
+    successor: Post0043LegacySecretSuccessor,
+  ): Promise<string | undefined>;
+}
+
+export interface Post0043LegacySecretSuccessor {
+  readonly hostedRetiredVersionId: string;
+  readonly parentVersionId: string;
+  readonly executorVersionId: string;
 }
 
 export interface SponsorshipCutoverStartedOperation {
@@ -165,6 +186,28 @@ export function createSponsorshipCutoverProofGate(input: {
     if (stage === "public-route-removal") {
       assertProofPredecessor(proof, publicWorker);
     } else {
+      const currentProofRoute = await readConsumption("public-route-removal");
+      const completedRoute = currentProofRoute?.completion ?? null;
+      const preexistingVersion =
+        completedRoute !== null &&
+        currentProofRoute !== null &&
+        completedRoute.successorVersionId === currentProofRoute.start.predecessorVersionId;
+      const preexistingDeployment =
+        completedRoute !== null &&
+        currentProofRoute !== null &&
+        completedRoute.successorDeploymentId === currentProofRoute.start.predecessorDeploymentId;
+      if (preexistingVersion !== preexistingDeployment) {
+        throw preflightError("public route-removal receipt has an inconsistent provider effect");
+      }
+      if (completedRoute && preexistingVersion) {
+        await assertExactPreexistingRouteRemoval(
+          currentProofRoute,
+          publicWorker.versionId,
+          "preflight",
+          true,
+        );
+        return { stage, proofSha256 };
+      }
       const routeVersionId = publicWorker.previousVersionId;
       if (routeVersionId === null) {
         throw preflightError(
@@ -308,7 +351,334 @@ export function createSponsorshipCutoverProofGate(input: {
       await settleStarted(stage, versionId, "preflight");
       return proofSha256;
     },
+    async adoptPreexistingRouteRemoval(candidate) {
+      await validateCurrent();
+      const publicWorker = await inspectPublicWorker(input.target, input.state);
+      assertProofPredecessor(proof, publicWorker, "secret-created-direct-successor");
+      validateCandidate(candidate);
+      if (
+        candidate.sourceCommit !== publicWorker.commit ||
+        candidate.bundleSha256 !== publicWorker.bundleSha256
+      ) {
+        throw preflightError(
+          "preexisting route-removal candidate differs from the exact served Worker",
+        );
+      }
+      if (await readConsumption("public-route-removal")) {
+        throw preflightError(
+          "preexisting route-removal receipt already exists; reconcile with status",
+        );
+      }
+      const base = {
+        targetSha256,
+        environment: consumptionEnvironment,
+        stage: "public-route-removal" as const,
+        proofSha256,
+        predecessorDeploymentId: publicWorker.deploymentId,
+        predecessorVersionId: publicWorker.versionId,
+        predecessorTopologySha256: publicWorker.topologySha256,
+        sourceCommit: candidate.sourceCommit,
+        bundleSha256: candidate.bundleSha256,
+        configSha256: candidate.configSha256,
+      };
+      const identity = sponsorshipCutoverOperationIdentity(base);
+      const admission = await input.database.begin({
+        ...base,
+        ...identity,
+        startedAt: exactNow(clock()).toISOString(),
+      });
+      const recorded = await readConsumption("public-route-removal");
+      if (
+        admission !== "inserted" ||
+        !recorded ||
+        recorded.completion !== null ||
+        recorded.start.operationId !== identity.operationId ||
+        recorded.start.candidateIdentitySha256 !== identity.candidateIdentitySha256
+      ) {
+        throw preflightError(
+          "preexisting route-removal start acknowledgement is indeterminate; reconcile with status",
+        );
+      }
+      await settlePreexistingStarted(recorded, publicWorker.versionId, "verification");
+      return proofSha256;
+    },
+    async settlePreexistingRouteRemoval(versionId) {
+      if (!VERSION_ID.test(versionId)) {
+        throw preflightError("preexisting route-removal reconciliation Version is invalid");
+      }
+      await validateCurrent();
+      const publicWorker = await inspectPublicWorker(input.target, input.state);
+      if (publicWorker.versionId !== versionId) {
+        throw preflightError(
+          "preexisting route-removal reconciliation Version is not authoritative",
+        );
+      }
+      assertProofPredecessor(proof, publicWorker, "secret-created-direct-successor");
+      const record = await readConsumption("public-route-removal");
+      if (!record) return undefined;
+      if (record.completion) {
+        await assertExactPreexistingRouteRemoval(record, versionId, "preflight", true);
+        return proofSha256;
+      }
+      await settlePreexistingStarted(record, versionId, "preflight");
+      return proofSha256;
+    },
+    async completePost0043LegacySecretRetirement(handle, successor) {
+      exactHandle(handle, proofSha256);
+      if (handle.stage !== "legacy-secret-retirement") {
+        throw verificationError("post-0043 secret completion uses the wrong proof stage");
+      }
+      validatePost0043Successor(successor, "verification");
+      await settlePost0043Started(successor, "verification");
+    },
+    async settlePost0043LegacySecretRetirement(successor) {
+      validatePost0043Successor(successor, "preflight");
+      const record = await readConsumption("legacy-secret-retirement");
+      if (!record) return undefined;
+      if (record.completion) {
+        await assertExactPost0043SecretSuccessor(record, successor, "preflight", true);
+        return proofSha256;
+      }
+      await settlePost0043Started(successor, "preflight");
+      return proofSha256;
+    },
   };
+
+  async function settlePost0043Started(
+    successor: Post0043LegacySecretSuccessor,
+    phase: "preflight" | "verification",
+  ): Promise<void> {
+    const record = await readConsumption("legacy-secret-retirement");
+    if (!record || record.completion) {
+      throw phase === "verification"
+        ? verificationError("post-0043 legacy-secret start receipt is unavailable")
+        : preflightError("post-0043 legacy-secret start receipt is unavailable");
+    }
+    const current = await assertExactPost0043SecretSuccessor(record, successor, phase, false);
+    await input.database.complete({
+      operationId: record.start.operationId,
+      successorDeploymentId: current.deploymentId,
+      successorVersionId: current.versionId,
+      completedAt: exactNow(clock()).toISOString(),
+    });
+    const completed = await readConsumption("legacy-secret-retirement");
+    if (
+      !completed?.completion ||
+      completed.start.operationId !== record.start.operationId ||
+      completed.completion.successorDeploymentId !== current.deploymentId ||
+      completed.completion.successorVersionId !== current.versionId
+    ) {
+      throw phase === "verification"
+        ? verificationError("post-0043 legacy-secret completion receipt readback failed")
+        : preflightError("post-0043 legacy-secret completion receipt readback failed");
+    }
+    await assertExactPost0043SecretSuccessor(completed, successor, phase, true);
+  }
+
+  async function assertExactPost0043SecretSuccessor(
+    record: SponsorshipCutoverConsumptionRecord,
+    successor: Post0043LegacySecretSuccessor,
+    phase: "preflight" | "verification",
+    completed: boolean,
+  ): Promise<{ readonly deploymentId: string; readonly versionId: string }> {
+    validateProofSemantics(
+      proof,
+      input.target,
+      input.environment,
+      new Date(record.start.startedAt),
+    );
+    await verifyProofReceipt(proof, input.target);
+    const chain = parseWorkerDeploymentChain(
+      await input.state.workerDeployments(input.target.workerName),
+      phase,
+      { requireUuidVersionIds: true },
+    );
+    const hostedOffset =
+      chain[0]?.versionId === successor.hostedRetiredVersionId
+        ? 0
+        : chain[1]?.versionId === successor.hostedRetiredVersionId
+          ? 1
+          : -1;
+    const attributed = hostedOffset === 1 ? chain[0] : undefined;
+    const hostedRetired = hostedOffset < 0 ? undefined : chain[hostedOffset];
+    const parent = hostedOffset < 0 ? undefined : chain[hostedOffset + 1];
+    const executor = hostedOffset < 0 ? undefined : chain[hostedOffset + 2];
+    const route = await readConsumption("public-route-removal");
+    if (
+      record.start.targetSha256 !== targetSha256 ||
+      record.start.environment !== consumptionEnvironment ||
+      record.start.stage !== "legacy-secret-retirement" ||
+      record.start.proofSha256 !== proofSha256 ||
+      hostedRetired === undefined ||
+      parent === undefined ||
+      executor === undefined ||
+      hostedRetired.versionId !== successor.hostedRetiredVersionId ||
+      parent.versionId !== successor.parentVersionId ||
+      executor.versionId !== successor.executorVersionId ||
+      new Set(chain.slice(0, hostedOffset + 3).map(({ deploymentId }) => deploymentId)).size !==
+        hostedOffset + 3 ||
+      new Set(chain.slice(0, hostedOffset + 3).map(({ versionId }) => versionId)).size !==
+        hostedOffset + 3 ||
+      record.start.predecessorVersionId !== successor.parentVersionId ||
+      record.start.predecessorDeploymentId !== parent.deploymentId ||
+      !route?.completion ||
+      route.start.targetSha256 !== targetSha256 ||
+      route.start.environment !== consumptionEnvironment ||
+      route.start.stage !== "public-route-removal" ||
+      route.start.proofSha256 !== proofSha256 ||
+      route.start.predecessorVersionId !== successor.parentVersionId ||
+      route.start.predecessorDeploymentId !== parent.deploymentId ||
+      route.completion.operationId !== route.start.operationId ||
+      route.completion.successorVersionId !== route.start.predecessorVersionId ||
+      route.completion.successorDeploymentId !== route.start.predecessorDeploymentId ||
+      route.start.sourceCommit !== record.start.sourceCommit ||
+      route.start.bundleSha256 !== record.start.bundleSha256 ||
+      route.start.predecessorTopologySha256 !== record.start.predecessorTopologySha256 ||
+      (completed &&
+        (record.completion === null ||
+          record.completion.operationId !== record.start.operationId ||
+          record.completion.successorVersionId !== hostedRetired.versionId ||
+          record.completion.successorDeploymentId !== hostedRetired.deploymentId))
+    ) {
+      throw phase === "verification"
+        ? verificationError("post-0043 H-P-E deployment prefix changed")
+        : preflightError("post-0043 H-P-E deployment prefix changed");
+    }
+    const current = await inspectPublicWorker(input.target, input.state, hostedOffset === 0);
+    const hostedVersion = await input.state.workerVersion(
+      input.target.workerName,
+      hostedRetired.versionId,
+    );
+    const parentVersion = await input.state.workerVersion(
+      input.target.workerName,
+      parent.versionId,
+    );
+    const executorVersion = await input.state.workerVersion(
+      input.target.workerName,
+      executor.versionId,
+    );
+    const hostedScript = workerVersionScriptContentIdentity(
+      phase,
+      hostedRetired.versionId,
+      hostedVersion,
+    );
+    const executorIdentity = workerVersionIdentity(phase, executorVersion);
+    const invalidCurrent =
+      current.versionId !== (attributed?.versionId ?? hostedRetired.versionId) ||
+      current.deploymentId !== (attributed?.deploymentId ?? hostedRetired.deploymentId) ||
+      current.previousVersionId !==
+        (attributed === undefined ? parent.versionId : hostedRetired.versionId) ||
+      current.provenance !==
+        (attributed === undefined ? "secret-created-bounded-successor" : "canonical-upload") ||
+      current.cutoverOperationId !== null ||
+      current.commit !== record.start.sourceCommit ||
+      current.bundleSha256 !== record.start.bundleSha256 ||
+      current.topologySha256 !== record.start.predecessorTopologySha256 ||
+      workerVersionAnnotationProfile(hostedVersion) !== "secret-created" ||
+      workerVersionAnnotationProfile(parentVersion) !== "secret-created" ||
+      workerVersionAnnotationProfile(executorVersion) !== "canonical" ||
+      executorIdentity.commit !== record.start.sourceCommit ||
+      `sha256:${executorIdentity.bundleDigestHex}` !== record.start.bundleSha256 ||
+      workerVersionScriptContentIdentity(phase, parent.versionId, parentVersion) !== hostedScript ||
+      workerVersionScriptContentIdentity(phase, executor.versionId, executorVersion) !==
+        hostedScript ||
+      current.scriptEtagSha256 !== sha256Text(hostedScript);
+    if (invalidCurrent) {
+      throw phase === "verification"
+        ? verificationError(
+            "post-0043 H receipt is not anchored to the exact current custody prefix",
+          )
+        : preflightError("post-0043 H receipt is not anchored to the exact current custody prefix");
+    }
+    const finalChain = parseWorkerDeploymentChain(
+      await input.state.workerDeployments(input.target.workerName),
+      phase,
+      { requireUuidVersionIds: true },
+    );
+    if (JSON.stringify(finalChain) !== JSON.stringify(chain)) {
+      throw phase === "verification"
+        ? verificationError("post-0043 H receipt custody prefix changed during inspection")
+        : preflightError("post-0043 H receipt custody prefix changed during inspection");
+    }
+    return {
+      deploymentId: hostedRetired.deploymentId,
+      versionId: hostedRetired.versionId,
+    };
+  }
+
+  async function settlePreexistingStarted(
+    record: SponsorshipCutoverConsumptionRecord,
+    versionId: string,
+    phase: "preflight" | "verification",
+  ): Promise<void> {
+    if (record.completion !== null) {
+      throw phase === "verification"
+        ? verificationError("preexisting route-removal start receipt is unavailable")
+        : preflightError("preexisting route-removal start receipt is unavailable");
+    }
+    validateProofSemantics(
+      proof,
+      input.target,
+      input.environment,
+      new Date(record.start.startedAt),
+    );
+    await verifyProofReceipt(proof, input.target);
+    await assertCurrentWorkerIdentities(proof, input.target, input.state);
+    const current = await assertExactPreexistingRouteRemoval(record, versionId, phase, false);
+    await input.database.complete({
+      operationId: record.start.operationId,
+      successorDeploymentId: current.deploymentId,
+      successorVersionId: current.versionId,
+      completedAt: exactNow(clock()).toISOString(),
+    });
+    const completed = await readConsumption("public-route-removal");
+    if (
+      !completed?.completion ||
+      completed.start.operationId !== record.start.operationId ||
+      completed.completion.successorDeploymentId !== current.deploymentId ||
+      completed.completion.successorVersionId !== current.versionId
+    ) {
+      throw phase === "verification"
+        ? verificationError("preexisting route-removal completion receipt readback failed")
+        : preflightError("preexisting route-removal completion receipt readback failed");
+    }
+    await assertExactPreexistingRouteRemoval(completed, versionId, phase, true);
+  }
+
+  async function assertExactPreexistingRouteRemoval(
+    record: SponsorshipCutoverConsumptionRecord,
+    versionId: string,
+    phase: "preflight" | "verification",
+    completed: boolean,
+  ): Promise<PublicWorkerInspection> {
+    const current = await inspectPublicWorker(input.target, input.state);
+    const invalid =
+      record.start.targetSha256 !== targetSha256 ||
+      record.start.environment !== consumptionEnvironment ||
+      record.start.stage !== "public-route-removal" ||
+      record.start.proofSha256 !== proofSha256 ||
+      current.versionId !== versionId ||
+      current.versionId !== record.start.predecessorVersionId ||
+      current.deploymentId !== record.start.predecessorDeploymentId ||
+      current.commit !== record.start.sourceCommit ||
+      current.bundleSha256 !== record.start.bundleSha256 ||
+      current.topologySha256 !== record.start.predecessorTopologySha256 ||
+      current.provenance !== "secret-created-direct-successor" ||
+      current.cutoverOperationId !== null ||
+      (completed &&
+        (record.completion === null ||
+          record.completion.successorVersionId !== current.versionId ||
+          record.completion.successorDeploymentId !== current.deploymentId));
+    if (invalid) {
+      throw phase === "verification"
+        ? verificationError(
+            "preexisting route-removal receipt differs from the exact served Worker",
+          )
+        : preflightError("preexisting route-removal receipt differs from the exact served Worker");
+    }
+    assertProofPredecessor(proof, current, "secret-created-direct-successor");
+    return current;
+  }
 
   async function settleStarted(
     stage: SponsorshipCutoverProofStage,
@@ -395,8 +765,8 @@ export function createSponsorshipCutoverProofGate(input: {
         (current.provenance !== "canonical-upload" ||
           current.cutoverOperationId !== record.start.operationId)) ||
       (stage === "legacy-secret-retirement" &&
-        (current.provenance !== "secret-created-direct-successor" ||
-          current.cutoverOperationId !== null))
+        current.provenance !== "secret-created-direct-successor") ||
+      (stage === "legacy-secret-retirement" && current.cutoverOperationId !== null)
     ) {
       throw phase === "verification"
         ? verificationError("sponsorship cutover successor lacks the exact operation identity")
@@ -432,7 +802,10 @@ export interface PublicWorkerInspection {
   readonly bundleSha256: `sha256:${string}`;
   readonly scriptEtagSha256: `sha256:${string}`;
   readonly cutoverOperationId: `sha256:${string}` | null;
-  readonly provenance: "canonical-upload" | "secret-created-direct-successor";
+  readonly provenance:
+    | "canonical-upload"
+    | "secret-created-direct-successor"
+    | "secret-created-bounded-successor";
   readonly publicTopology: PublicWorkerTopology;
   readonly topologySha256: `sha256:${string}`;
 }
@@ -460,11 +833,13 @@ export async function inspectSponsorshipCutoverPublicWorker(
 async function inspectPublicWorker(
   target: DeployTarget,
   state: SponsorshipCutoverProofState,
+  allowPost0043BoundedSuccessor = false,
 ): Promise<PublicWorkerInspection> {
-  const history = parseWorkerDeploymentHistory(
-    await state.workerDeployments(target.workerName),
-    "preflight",
-  );
+  const rawDeployments = await state.workerDeployments(target.workerName);
+  const chain = parseWorkerDeploymentChain(rawDeployments, "preflight", {
+    requireUuidVersionIds: true,
+  });
+  const history = parseWorkerDeploymentHistory(rawDeployments, "preflight");
   if (history === null) throw preflightError("public Worker has no authoritative deployment");
   const version = await state.workerVersion(target.workerName, history.versionId);
   const annotation = workerVersionAnnotationProfile(version);
@@ -478,15 +853,48 @@ async function inspectPublicWorker(
     provenance = "canonical-upload";
   } else if (annotation === "secret-created" && history.previousVersionId !== null) {
     const predecessor = await state.workerVersion(target.workerName, history.previousVersionId);
-    if (
-      workerVersionAnnotationProfile(predecessor) !== "canonical" ||
-      workerVersionScriptContentIdentity("preflight", history.previousVersionId, predecessor) !==
-        scriptEtag
+    const predecessorScript = workerVersionScriptContentIdentity(
+      "preflight",
+      history.previousVersionId,
+      predecessor,
+    );
+    if (predecessorScript !== scriptEtag) {
+      throw preflightError("public Worker secret successor changed the served script content");
+    }
+    if (workerVersionAnnotationProfile(predecessor) === "canonical") {
+      identity = workerVersionIdentity("preflight", predecessor);
+      provenance = "secret-created-direct-successor";
+    } else if (
+      allowPost0043BoundedSuccessor &&
+      workerVersionAnnotationProfile(predecessor) === "secret-created"
     ) {
+      const trusted = chain[2];
+      if (
+        chain[0]?.versionId !== history.versionId ||
+        chain[1]?.versionId !== history.previousVersionId ||
+        trusted === undefined ||
+        new Set(chain.slice(0, 3).map(({ deploymentId }) => deploymentId)).size !== 3 ||
+        new Set(chain.slice(0, 3).map(({ versionId }) => versionId)).size !== 3
+      ) {
+        throw preflightError(
+          "public Worker secret successor lacks the bounded two-secret deployment lineage",
+        );
+      }
+      const trustedVersion = await state.workerVersion(target.workerName, trusted.versionId);
+      if (
+        workerVersionAnnotationProfile(trustedVersion) !== "canonical" ||
+        workerVersionScriptContentIdentity("preflight", trusted.versionId, trustedVersion) !==
+          scriptEtag
+      ) {
+        throw preflightError(
+          "public Worker secret successor lacks an exact bounded canonical predecessor",
+        );
+      }
+      identity = workerVersionIdentity("preflight", trustedVersion);
+      provenance = "secret-created-bounded-successor";
+    } else {
       throw preflightError("public Worker secret successor lacks an exact canonical predecessor");
     }
-    identity = workerVersionIdentity("preflight", predecessor);
-    provenance = "secret-created-direct-successor";
   } else {
     throw preflightError("public Worker has no exact source and bundle identity");
   }
@@ -529,10 +937,14 @@ async function inspectPublicWorker(
   };
 }
 
-function assertProofPredecessor(proof: CutoverProof, current: PublicWorkerInspection): void {
+function assertProofPredecessor(
+  proof: CutoverProof,
+  current: PublicWorkerInspection,
+  requiredProvenance: PublicWorkerInspection["provenance"] = "canonical-upload",
+): void {
   const expected = proof.publicWorkerPredecessor;
   if (
-    current.provenance !== "canonical-upload" ||
+    current.provenance !== requiredProvenance ||
     current.workerName !== expected.workerName ||
     current.deploymentId !== expected.deploymentId ||
     current.versionId !== expected.versionId ||
@@ -555,6 +967,23 @@ function validateCandidate(value: SponsorshipCutoverCandidateIdentity): void {
     !SHA256.test(value.configSha256)
   ) {
     throw preflightError("sponsorship cutover candidate identity is invalid");
+  }
+}
+
+function validatePost0043Successor(
+  value: Post0043LegacySecretSuccessor,
+  phase: "preflight" | "verification",
+): void {
+  if (
+    !VERSION_ID.test(value.hostedRetiredVersionId) ||
+    !VERSION_ID.test(value.parentVersionId) ||
+    !VERSION_ID.test(value.executorVersionId) ||
+    new Set([value.hostedRetiredVersionId, value.parentVersionId, value.executorVersionId]).size !==
+      3
+  ) {
+    throw phase === "verification"
+      ? verificationError("post-0043 legacy-secret successor identity is invalid")
+      : preflightError("post-0043 legacy-secret successor identity is invalid");
   }
 }
 

@@ -9,7 +9,11 @@ import {
 } from "../scripts/deploy/public-parent-token-retirement.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { WorkerProviderExecutorQualification } from "../scripts/deploy/worker.ts";
-import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import {
+  expectedExactBindingClosure,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  workerSecretsForLegacyCustody,
+} from "../scripts/deploy/worker-state.ts";
 import type { WranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
 import {
   cloudflareProviderExecutorTarget,
@@ -27,7 +31,10 @@ const BOUND_VERSION = "00000000-0000-4000-8000-000000000002";
 const BOUND_DEPLOYMENT = "00000000-0000-4000-8000-000000000012";
 const RETIRED_VERSION = "00000000-0000-4000-8000-000000000003";
 const RETIRED_DEPLOYMENT = "00000000-0000-4000-8000-000000000013";
+const RELEASED_VERSION = "00000000-0000-4000-8000-000000000004";
+const RELEASED_DEPLOYMENT = "00000000-0000-4000-8000-000000000014";
 const PARENT_TOKEN = "CLOUDFLARE_API_TOKEN";
+const HOSTED_TOKEN = LEGACY_HOSTED_SPONSORSHIP_SECRET;
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const PUBLIC_SECRETS = ["TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING", "TAKOSERVER_SIGNING_KEY"];
@@ -48,6 +55,9 @@ const target = {
   cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
   signing: { currentKeyId: "current-key" },
 } satisfies DeployTarget;
+
+const FULL_LEGACY_SECRETS = workerSecretsForLegacyCustody(target, "full");
+const POST_PARENT_SECRETS = workerSecretsForLegacyCustody(target, "post-parent");
 
 describe("public Cloudflare parent-token retirement", () => {
   test("refuses the quiesced maintenance target before credentials or qualification", async () => {
@@ -126,6 +136,7 @@ describe("public Cloudflare parent-token retirement", () => {
       scriptContentIdentity: "public-worker-script-etag",
       executorBindingReady: false,
       parentTokenPresent: true,
+      legacySecretCustody: "parent-only",
       cloudflareProviderExecutor: {
         required: true,
         ready: true,
@@ -146,6 +157,144 @@ describe("public Cloudflare parent-token retirement", () => {
       },
     });
     expect(fixture.mutations).toEqual([]);
+  });
+
+  test("retains full normal-target custody while the parent-token owner deletes only CF", async () => {
+    const settledMigrations = {
+      async read() {
+        return { local: [], applied: [] };
+      },
+    };
+    await withApplyingFixture(
+      { initialStage: "bound", hostedToken: true },
+      async ({ fixture, root }) => {
+        const status = await runPublicParentTokenRetirement(statusInvocation(), target, {
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          migrations: settledMigrations,
+        });
+        expect(status).toMatchObject({
+          state: "bound-parent-token",
+          ready: false,
+          canApply: true,
+          parentTokenPresent: true,
+          legacySecretCustody: "full",
+          pendingMigrations: [],
+        });
+        expect(fixture.mutations).toEqual([]);
+
+        const result = await runPublicParentTokenRetirement(applyInvocation(), target, {
+          run: fixture.run,
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          publicationLease: fixture.lease,
+          executorPublicationLease: fixture.executorLease,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-reader-token" },
+          migrations: settledMigrations,
+        });
+
+        expect(result).toMatchObject({
+          state: "complete",
+          parentTokenPresent: false,
+          secretRetirement: {
+            performed: true,
+            secretRemoved: PARENT_TOKEN,
+          },
+        });
+        expect(fixture.mutations).toHaveLength(1);
+        expect(fixture.mutations[0]).toEqual(
+          expect.arrayContaining(["secret", "delete", PARENT_TOKEN]),
+        );
+        expect(fixture.mutations[0]).not.toContain(HOSTED_TOKEN);
+        for (const retained of PUBLIC_SECRETS) expect(fixture.mutations[0]).not.toContain(retained);
+
+        const after = await runPublicParentTokenRetirement(statusInvocation(), target, {
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          migrations: settledMigrations,
+        });
+        expect(after).toMatchObject({
+          state: "retired-secret-successor",
+          parentTokenPresent: false,
+          legacySecretCustody: "post-parent",
+        });
+      },
+    );
+  });
+
+  test("releases quiesced K2/K1 into normal full custody before deleting only CF", async () => {
+    const settledMigrations = {
+      async read() {
+        return { local: [], applied: [] };
+      },
+    };
+    await withApplyingFixture(
+      { initialStage: "bound", hostedToken: true, quiescedCustody: true },
+      async ({ fixture, root }) => {
+        const maintenance = await runPublicParentTokenRetirement(statusInvocation(), target, {
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          migrations: settledMigrations,
+        });
+        expect(maintenance).toMatchObject({
+          state: "quiesced-full-custody",
+          ready: false,
+          canApply: true,
+          parentTokenPresent: true,
+          legacySecretCustody: "full",
+          previousVersionId: LEGACY_VERSION,
+          pendingMigrations: [],
+        });
+        expect(fixture.mutations).toEqual([]);
+
+        const result = await runPublicParentTokenRetirement(applyInvocation(), target, {
+          run: fixture.run,
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          publicationLease: fixture.lease,
+          executorPublicationLease: fixture.executorLease,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-reader-token" },
+          migrations: settledMigrations,
+        });
+        expect(result).toMatchObject({
+          state: "complete",
+          parentTokenPresent: false,
+          bindingRelease: {
+            performed: true,
+            previousVersionId: BOUND_VERSION,
+            versionId: RELEASED_VERSION,
+          },
+          secretRetirement: {
+            performed: true,
+            previousVersionId: RELEASED_VERSION,
+            versionId: RETIRED_VERSION,
+            secretRemoved: PARENT_TOKEN,
+          },
+        });
+        expect(fixture.mutations).toHaveLength(2);
+        expect(fixture.mutations[0]).toContain("deploy");
+        expect(fixture.mutations[0]).toContain("--no-bundle");
+        expect(fixture.mutations[1]).toEqual(
+          expect.arrayContaining(["secret", "delete", PARENT_TOKEN]),
+        );
+        expect(fixture.mutations[1]).not.toContain(HOSTED_TOKEN);
+
+        const after = await runPublicParentTokenRetirement(statusInvocation(), target, {
+          state: fixture.state,
+          providerExecutorQualification: readyExecutorQualification(),
+          migrations: settledMigrations,
+        });
+        expect(after).toMatchObject({
+          state: "retired-secret-successor",
+          parentTokenPresent: false,
+          legacySecretCustody: "post-parent",
+        });
+      },
+    );
   });
 
   test("apply releases the exact executor binding before deleting only the public parent token", async () => {
@@ -671,6 +820,8 @@ async function withApplyingFixture(
 
 interface ApplyingFixtureOptions {
   readonly initialStage?: "legacy" | "bound" | "retired";
+  readonly hostedToken?: boolean;
+  readonly quiescedCustody?: boolean;
   readonly changedPaths?: readonly string[];
   readonly gateExitCode?: number;
   readonly releaseExitCode?: number;
@@ -685,6 +836,7 @@ interface ApplyingFixtureOptions {
 
 function applyingFixture(options: ApplyingFixtureOptions = {}) {
   let stage: "legacy" | "bound" | "retired" = options.initialStage ?? "legacy";
+  let bindingReleased = false;
   const mutations: string[][] = [];
   const childEnvironments: Readonly<Record<string, string>>[] = [];
   let released = false;
@@ -724,8 +876,13 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
         service: target.cloudflareProviderExecutor?.workerName,
         entrypoint: "CloudflareProviderExecutor",
       });
-      expect(config.secrets.required.sort()).toEqual(LEGACY_SECRETS);
-      if (options.releaseApplies !== false) stage = "bound";
+      expect(config.secrets.required.sort()).toEqual(
+        options.hostedToken ? [...FULL_LEGACY_SECRETS] : LEGACY_SECRETS,
+      );
+      if (options.releaseApplies !== false) {
+        bindingReleased = options.quiescedCustody === true;
+        stage = "bound";
+      }
       return options.releaseExitCode === undefined
         ? ok("released\n")
         : { exitCode: options.releaseExitCode, stdout: "", stderr: "lost acknowledgement" };
@@ -745,21 +902,63 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
     },
     async workerDeployments(workerName) {
       expect(workerName).toBe(target.workerName);
-      return stage === "legacy"
-        ? [deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z")]
-        : stage === "bound"
-          ? [
-              deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
-              deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
-            ]
-          : [
-              deployment(RETIRED_DEPLOYMENT, RETIRED_VERSION, "2026-09-04T00:02:00.000Z"),
-              deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
-              deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
-            ];
+      if (stage === "legacy") {
+        return [deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z")];
+      }
+      if (stage === "bound") {
+        if (options.quiescedCustody && bindingReleased) {
+          return [
+            deployment(RELEASED_DEPLOYMENT, RELEASED_VERSION, "2026-09-04T00:03:00.000Z"),
+            deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
+            deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
+          ];
+        }
+        return [
+          deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
+          deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
+        ];
+      }
+      return options.quiescedCustody
+        ? [
+            deployment(RETIRED_DEPLOYMENT, RETIRED_VERSION, "2026-09-04T00:04:00.000Z"),
+            deployment(RELEASED_DEPLOYMENT, RELEASED_VERSION, "2026-09-04T00:03:00.000Z"),
+            deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
+            deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
+          ]
+        : [
+            deployment(RETIRED_DEPLOYMENT, RETIRED_VERSION, "2026-09-04T00:02:00.000Z"),
+            deployment(BOUND_DEPLOYMENT, BOUND_VERSION, "2026-09-04T00:01:00.000Z"),
+            deployment(LEGACY_DEPLOYMENT, LEGACY_VERSION, "2026-09-04T00:00:00.000Z"),
+          ];
     },
     async workerVersion(workerName, versionId) {
       expect(workerName).toBe(target.workerName);
+      if (options.quiescedCustody && stage === "bound" && !bindingReleased) {
+        expect([BOUND_VERSION, LEGACY_VERSION]).toContain(versionId);
+        return publicVersion({
+          versionId,
+          commit: COMMIT,
+          digest: BUNDLE_DIGEST,
+          executorBinding: false,
+          parentToken: true,
+          hostedToken: options.hostedToken === true,
+          quiesced: true,
+        });
+      }
+      if (
+        options.quiescedCustody &&
+        (bindingReleased || stage === "retired") &&
+        versionId === RELEASED_VERSION
+      ) {
+        return publicVersion({
+          versionId,
+          commit: COMMIT,
+          digest: BUNDLE_DIGEST,
+          executorBinding: true,
+          parentToken: true,
+          hostedToken: options.hostedToken === true,
+        });
+      }
       if (versionId === LEGACY_VERSION) {
         return publicVersion({
           versionId,
@@ -767,6 +966,7 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
           digest: DIGEST,
           executorBinding: false,
           parentToken: true,
+          hostedToken: options.hostedToken === true,
         });
       }
       if (versionId === BOUND_VERSION) {
@@ -776,6 +976,7 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
           digest: options.boundDigest ?? BUNDLE_DIGEST,
           executorBinding: true,
           parentToken: true,
+          hostedToken: options.hostedToken === true,
         });
       }
       return publicVersion({
@@ -784,6 +985,7 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
         digest: BUNDLE_DIGEST,
         executorBinding: true,
         parentToken: false,
+        hostedToken: options.hostedToken === true,
         secretCreated: true,
         ...(options.retiredScriptEtag === undefined
           ? {}
@@ -792,10 +994,14 @@ function applyingFixture(options: ApplyingFixtureOptions = {}) {
     },
     async workerSecrets(workerName) {
       expect(workerName).toBe(target.workerName);
-      return (stage === "retired" ? PUBLIC_SECRETS : LEGACY_SECRETS).map((name) => ({
-        name,
-        type: "secret_text",
-      }));
+      const names = options.hostedToken
+        ? stage === "retired"
+          ? POST_PARENT_SECRETS
+          : FULL_LEGACY_SECRETS
+        : stage === "retired"
+          ? PUBLIC_SECRETS
+          : LEGACY_SECRETS;
+      return names.map((name) => ({ name, type: "secret_text" }));
     },
   };
   const lease: WranglerVersionPublicationLease = {
@@ -962,13 +1168,24 @@ function publicVersion(input: {
   readonly digest: string;
   readonly executorBinding: boolean;
   readonly parentToken: boolean;
+  readonly hostedToken?: boolean;
+  readonly quiesced?: boolean;
   readonly secretCreated?: boolean;
   readonly wrongExecutorService?: boolean;
   readonly extraBinding?: boolean;
   readonly scriptEtag?: string;
 }): Record<string, unknown> {
-  const secrets = input.parentToken ? LEGACY_SECRETS : PUBLIC_SECRETS;
-  const closure = expectedExactBindingClosure(target, {
+  const secrets = input.hostedToken
+    ? input.parentToken
+      ? FULL_LEGACY_SECRETS
+      : POST_PARENT_SECRETS
+    : input.parentToken
+      ? LEGACY_SECRETS
+      : PUBLIC_SECRETS;
+  const selectedTarget = input.quiesced
+    ? { ...target, artifactBlobIoMode: "pre-0043-quiesced" as const }
+    : target;
+  const closure = expectedExactBindingClosure(selectedTarget, {
     expectedSecrets: secrets,
     workerArtifactDigest: `sha256:${input.digest}`,
   });

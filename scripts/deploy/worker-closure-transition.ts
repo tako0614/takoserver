@@ -18,11 +18,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import {
-  expectedWorkerSecrets,
-  type WorkerVersionAuthorityProfile,
-  writeWorkerConfig,
-} from "./realized-config.ts";
+import { type WorkerVersionAuthorityProfile, writeWorkerConfig } from "./realized-config.ts";
 import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
@@ -45,10 +41,17 @@ import {
 } from "./worker-live.ts";
 import {
   expectedExactBindingClosure,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  LEGACY_PUBLIC_PARENT_SECRET,
   parseWorkerDeploymentHistory,
+  parseWorkerSecretInventory,
+  versionSecretBindingNames,
   type WorkerClosureDelta,
   type WorkerDeploymentHistory,
+  type WorkerLegacySecretCustodyProfile,
   workerClosureDeltaIsEmpty,
+  workerLegacySecretCustodyProfile,
+  workerSecretsForLegacyCustody,
   workerTransitionSecretInventory,
 } from "./worker-state.ts";
 import {
@@ -105,6 +108,8 @@ interface ClosurePredecessor {
   readonly carriedSecrets: readonly string[];
   /** Held by the script-level store while the served Version does not declare them. */
   readonly carriedStoreSecrets: readonly string[];
+  /** Complete immutable secret closure the successor must declare. */
+  readonly expectedSecrets: readonly string[];
 }
 
 /**
@@ -292,6 +297,7 @@ export async function runWorkerClosureTransition(
           main,
           commit: source.commit,
           sourceRepositoryRoot,
+          transitionExpectedSecrets: before.expectedSecrets,
           ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
           ...(bundleDigestHex === undefined
             ? {}
@@ -338,7 +344,9 @@ export async function runWorkerClosureTransition(
       requalified.commit !== before.commit ||
       requalified.bundleDigestHex !== before.bundleDigestHex ||
       JSON.stringify(requalified.carriedSecrets) !== JSON.stringify(before.carriedSecrets) ||
-      JSON.stringify(requalified.carriedStoreSecrets) !== JSON.stringify(before.carriedStoreSecrets)
+      JSON.stringify(requalified.carriedStoreSecrets) !==
+        JSON.stringify(before.carriedStoreSecrets) ||
+      JSON.stringify(requalified.expectedSecrets) !== JSON.stringify(before.expectedSecrets)
     ) {
       throw preflightError("pinned closure predecessor identity changed before the upload");
     }
@@ -390,6 +398,7 @@ export async function runWorkerClosureTransition(
       throw verificationError("closure transition did not create the exact direct successor");
     }
     const after = await inspectLiveWorkerVersion("verification", target, state, {
+      expectedSecrets: before.expectedSecrets,
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}
         : {
@@ -493,7 +502,24 @@ async function appliedClosureTransitionStatus(
       `expected=${selector} actual=${history.versionId} actual_previous=${history.previousVersionId ?? "none"}`,
     );
   }
+  const version = await state.workerVersion(target.workerName, history.versionId);
+  const secretInventory = await state.workerSecrets(target.workerName);
+  const expectedSecrets = expectedClosureTransitionSecrets(
+    "preflight",
+    target,
+    versionSecretBindingNames("preflight", history.versionId, version),
+    parseWorkerSecretInventory(secretInventory, "preflight"),
+  );
+  if (expectedSecrets.includes(LEGACY_PUBLIC_PARENT_SECRET)) {
+    assertLegacySecretsAreCarried(
+      "preflight",
+      normalizedWorkerClosureDelta(invocation.delta),
+      "full",
+    );
+  }
   const successor = await inspectLiveWorkerVersion("preflight", target, state, {
+    expectedSecrets,
+    secretInventory,
     ...(target.integrationE2eCredentialAuthority === undefined
       ? {}
       : { authorityProfile: { kind: "provenance-bound-jit" as const } }),
@@ -526,8 +552,9 @@ async function appliedClosureTransitionStatus(
  * delta reversed. Every other binding name, type and plain-text value and the
  * routing closure stay as strict as the routine path. The secret inventory is
  * the union of what the Version declares and what the script-level store holds,
- * because a rollback leaves the store ahead of the Version and a required
- * secret the Worker already holds is carried rather than demanded again.
+ * because a rollback can leave ordinary target secrets ahead in the store. The
+ * exceptional legacy custody pair is stricter: Version and store must each
+ * independently declare either the complete pair or neither key.
  */
 async function admitClosurePredecessor(
   phase: DeployPhase,
@@ -548,15 +575,35 @@ async function admitClosurePredecessor(
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
     workerArtifactDigest,
   } as const;
-  const targetClosure = expectedExactBindingClosure(target, bindingInput);
-  const targetSecrets = expectedWorkerSecrets(target);
-  const secrets = workerTransitionSecretInventory(
+  const fullCustodySecrets = workerSecretsForLegacyCustody(target, "full");
+  const preliminarySecrets = workerTransitionSecretInventory(
     phase,
     versionId,
     version,
     await state.workerSecrets(target.workerName),
+    isArtifactBlobIoQuiescedTarget(target)
+      ? fullCustodySecrets
+      : workerSecretsForLegacyCustody(target, "base"),
+  );
+  const custody = exactTransitionLegacyCustody(
+    phase,
+    preliminarySecrets.versionSecrets,
+    preliminarySecrets.storeSecrets,
+    isArtifactBlobIoQuiescedTarget(target) ? ["base", "full"] : ["base"],
+  );
+  assertLegacySecretsAreCarried(phase, delta, custody);
+  const targetSecrets = workerSecretsForLegacyCustody(target, custody);
+  const secrets = workerTransitionSecretInventory(
+    phase,
+    versionId,
+    version,
+    preliminarySecrets.storeSecrets.map((name) => ({ name, type: "secret_text" })),
     targetSecrets,
   );
+  const targetClosure = expectedExactBindingClosure(target, {
+    ...bindingInput,
+    expectedSecrets: targetSecrets,
+  });
   // One shared admission for every Worker-publishing surface: the declaration
   // must describe this target, account for the entire difference, and leave the
   // rest of the closure exactly as strict as the routine path.
@@ -579,7 +626,64 @@ async function admitClosurePredecessor(
       "authoritative Worker deployment history changed during closure transition inspection",
     );
   }
-  return { history, ...identity, carriedSecrets, carriedStoreSecrets: secrets.carriedStoreSecrets };
+  return {
+    history,
+    ...identity,
+    carriedSecrets,
+    carriedStoreSecrets: secrets.carriedStoreSecrets,
+    expectedSecrets: targetSecrets,
+  };
+}
+
+function expectedClosureTransitionSecrets(
+  phase: DeployPhase,
+  target: DeployTarget,
+  versionSecrets: readonly string[],
+  storeSecrets: readonly string[],
+): readonly string[] {
+  const custody = exactTransitionLegacyCustody(
+    phase,
+    versionSecrets,
+    storeSecrets,
+    isArtifactBlobIoQuiescedTarget(target) ? ["base", "full"] : ["base"],
+  );
+  return workerSecretsForLegacyCustody(target, custody);
+}
+
+function exactTransitionLegacyCustody(
+  phase: DeployPhase,
+  versionSecrets: readonly string[],
+  storeSecrets: readonly string[],
+  allowed: readonly WorkerLegacySecretCustodyProfile[],
+): WorkerLegacySecretCustodyProfile {
+  const versionCustody = workerLegacySecretCustodyProfile(phase, versionSecrets, allowed);
+  const storeCustody = workerLegacySecretCustodyProfile(phase, storeSecrets, allowed);
+  if (versionCustody !== storeCustody) {
+    throw phaseError(
+      phase,
+      "Worker Version and store legacy secret custody differ",
+      `version=${versionCustody} store=${storeCustody}`,
+    );
+  }
+  return versionCustody;
+}
+
+function assertLegacySecretsAreCarried(
+  phase: DeployPhase,
+  delta: WorkerClosureDelta,
+  custody: WorkerLegacySecretCustodyProfile,
+): void {
+  if (custody !== "full") return;
+  const declared = [...delta.addedSecrets, ...delta.rotatedSecrets];
+  if (
+    declared.includes(LEGACY_PUBLIC_PARENT_SECRET) ||
+    declared.includes(LEGACY_HOSTED_SPONSORSHIP_SECRET)
+  ) {
+    throw phaseError(
+      phase,
+      "0043 compatibility transition must carry both legacy secrets unchanged",
+    );
+  }
 }
 
 /**

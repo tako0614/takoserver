@@ -4,11 +4,12 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sponsorshipAuthorityBindingClosure } from "../scripts/deploy/sponsorship-authority.ts";
-import type {
-  SponsorshipCutoverConsumptionDatabase,
-  SponsorshipCutoverConsumptionRecord,
-  SponsorshipCutoverOperationCompletion,
-  SponsorshipCutoverOperationStart,
+import {
+  sponsorshipCutoverOperationIdentity,
+  type SponsorshipCutoverConsumptionDatabase,
+  type SponsorshipCutoverConsumptionRecord,
+  type SponsorshipCutoverOperationCompletion,
+  type SponsorshipCutoverOperationStart,
 } from "../scripts/deploy/sponsorship-cutover-consumption.ts";
 import {
   createSponsorshipCutoverProofGate,
@@ -22,6 +23,15 @@ const PUBLIC_PREDECESSOR_VERSION = "33333333-3333-4333-8333-333333333333";
 const ROUTE_SUCCESSOR_VERSION = "44444444-4444-4444-8444-444444444444";
 const TOPOLOGY_SUCCESSOR_VERSION = "66666666-6666-4666-8666-666666666666";
 const SECRET_SUCCESSOR_VERSION = "55555555-5555-4555-8555-555555555555";
+const POST0043_VERSION_A = "77777777-7777-4777-8777-777777777777";
+const POST0043_VERSION_H = "88888888-8888-4888-8888-888888888888";
+const POST0043_VERSION_P = "99999999-9999-4999-8999-999999999999";
+const POST0043_VERSION_E = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const POST0043_VERSION_K2 = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const POST0043_VERSION_K1 = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const POST0043_VERSION_T = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const POST0043_VERSION_C = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const POST0043_VERSION_L = "ffffffff-ffff-4fff-8fff-ffffffffffff";
 const AUTHORITY_SOURCE = "a".repeat(40);
 const HOSTED_SOURCE = "b".repeat(40);
 const PUBLIC_SOURCE = "c".repeat(40);
@@ -330,6 +340,73 @@ describe("sponsorship cutover proof consumption", () => {
     }
   });
 
+  test("settles a post-0043 H receipt only for the exact P to P route and H-P-E prefix", async () => {
+    const fixture = await proofFixture();
+    try {
+      fixture.state.promotePost0043("hosted-retired");
+      seedPost0043Receipts(fixture);
+      const gate = fixture.gate();
+      await expect(
+        gate.settlePost0043LegacySecretRetirement({
+          hostedRetiredVersionId: POST0043_VERSION_H,
+          parentVersionId: POST0043_VERSION_P,
+          executorVersionId: POST0043_VERSION_E,
+        }),
+      ).resolves.toBe(fixture.proofSha256);
+      const secret = fixture.database.records.find(
+        ({ start }) => start.stage === "legacy-secret-retirement",
+      );
+      expect(secret?.completion).toMatchObject({
+        successorDeploymentId: "post-0043-deployment-h",
+        successorVersionId: POST0043_VERSION_H,
+      });
+      await expect(
+        gate.settlePost0043LegacySecretRetirement({
+          hostedRetiredVersionId: POST0043_VERSION_H,
+          parentVersionId: POST0043_VERSION_P,
+          executorVersionId: POST0043_VERSION_K1,
+        }),
+      ).rejects.toThrow("H-P-E deployment prefix changed");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  test("does not settle a post-0043 receipt with no matching proof or completion", async () => {
+    const missing = await proofFixture();
+    try {
+      missing.state.promotePost0043("hosted-retired");
+      await expect(
+        missing.gate().settlePost0043LegacySecretRetirement({
+          hostedRetiredVersionId: POST0043_VERSION_H,
+          parentVersionId: POST0043_VERSION_P,
+          executorVersionId: POST0043_VERSION_E,
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      missing.cleanup();
+    }
+
+    const foreign = await proofFixture();
+    try {
+      foreign.state.promotePost0043("hosted-retired");
+      seedPost0043Receipts(foreign, { proofSha256: `sha256:${"0".repeat(64)}` });
+      await expect(
+        foreign.gate().settlePost0043LegacySecretRetirement({
+          hostedRetiredVersionId: POST0043_VERSION_H,
+          parentVersionId: POST0043_VERSION_P,
+          executorVersionId: POST0043_VERSION_E,
+        }),
+      ).resolves.toBeUndefined();
+      expect(
+        foreign.database.records.find(({ start }) => start.stage === "legacy-secret-retirement")
+          ?.completion,
+      ).toBeNull();
+    } finally {
+      foreign.cleanup();
+    }
+  });
+
   test("requires exact digest and owned 0600 input", async () => {
     const fixture = await proofFixture();
     try {
@@ -522,6 +599,67 @@ async function proofFixture(
   };
 }
 
+function seedPost0043Receipts(
+  fixture: {
+    readonly target: DeployTarget;
+    readonly state: ProofState;
+    readonly database: MemoryConsumptionDatabase;
+    readonly proofSha256: string;
+  },
+  options: { readonly proofSha256?: string } = {},
+): void {
+  const proofSha256 = options.proofSha256 ?? fixture.proofSha256;
+  const targetSha256 = digestText(
+    canonicalJson({
+      accountId: fixture.target.accountId,
+      databaseId: fixture.target.d1.databaseId,
+      environment: "integration",
+      workerName: fixture.target.workerName,
+    }),
+  );
+  const predecessorTopologySha256 = digestText(
+    canonicalJson(fixture.state.expectedPublicTopology()),
+  );
+  const routeBase = {
+    targetSha256,
+    environment: "integration" as const,
+    stage: "public-route-removal" as const,
+    proofSha256,
+    predecessorDeploymentId: "post-0043-deployment-p",
+    predecessorVersionId: POST0043_VERSION_P,
+    predecessorTopologySha256,
+    sourceCommit: CANDIDATE_SOURCE,
+    bundleSha256: CANDIDATE_ARTIFACT,
+    configSha256: CANDIDATE_CONFIG,
+  };
+  const routeStart: SponsorshipCutoverOperationStart = {
+    ...routeBase,
+    ...sponsorshipCutoverOperationIdentity(routeBase),
+    startedAt: "2026-09-04T00:02:30.000Z",
+  };
+  const secretBase = {
+    ...routeBase,
+    stage: "legacy-secret-retirement" as const,
+  };
+  const secretStart: SponsorshipCutoverOperationStart = {
+    ...secretBase,
+    ...sponsorshipCutoverOperationIdentity(secretBase),
+    startedAt: "2026-09-04T00:02:30.000Z",
+  };
+  fixture.database.records.push(
+    {
+      start: routeStart,
+      completion: {
+        operationId: routeStart.operationId,
+        successorDeploymentId: routeStart.predecessorDeploymentId,
+        successorVersionId: routeStart.predecessorVersionId,
+        completedAt: "2026-09-04T00:02:45.000Z",
+      },
+    },
+    { start: secretStart, completion: null },
+  );
+}
+
 function targetWithReceipt(receiptPublicJwk: { kty: "OKP"; crv: "Ed25519"; x: string }) {
   return {
     kind: "takoserver.deploy-target@v2",
@@ -704,7 +842,14 @@ async function issuanceReceipt(
 }
 
 class ProofState implements SponsorshipCutoverProofState {
-  #mode: "predecessor" | "route" | "topology" | "secret" = "predecessor";
+  #mode:
+    | "predecessor"
+    | "route"
+    | "topology"
+    | "secret"
+    | "post-parent"
+    | "hosted-retired"
+    | "attributed" = "predecessor";
   #routeOperationId: `sha256:${string}` | null = null;
   #routeBundle: `sha256:${string}` = CANDIDATE_ARTIFACT;
 
@@ -728,6 +873,10 @@ class ProofState implements SponsorshipCutoverProofState {
 
   promoteTopology(): void {
     this.#mode = "topology";
+  }
+
+  promotePost0043(head: "post-parent" | "hosted-retired" | "attributed"): void {
+    this.#mode = head;
   }
 
   reverseToPredecessor(): void {
@@ -766,6 +915,53 @@ class ProofState implements SponsorshipCutoverProofState {
           "2026-09-04T00:00:00.000Z",
         ),
       ];
+    }
+    if (
+      workerName === PUBLIC_WORKER &&
+      (this.#mode === "post-parent" ||
+        this.#mode === "hosted-retired" ||
+        this.#mode === "attributed")
+    ) {
+      const ids =
+        this.#mode === "post-parent"
+          ? [
+              POST0043_VERSION_P,
+              POST0043_VERSION_E,
+              POST0043_VERSION_K2,
+              POST0043_VERSION_K1,
+              POST0043_VERSION_T,
+              POST0043_VERSION_C,
+              POST0043_VERSION_L,
+            ]
+          : this.#mode === "hosted-retired"
+            ? [
+                POST0043_VERSION_H,
+                POST0043_VERSION_P,
+                POST0043_VERSION_E,
+                POST0043_VERSION_K2,
+                POST0043_VERSION_K1,
+                POST0043_VERSION_T,
+                POST0043_VERSION_C,
+                POST0043_VERSION_L,
+              ]
+            : [
+                POST0043_VERSION_A,
+                POST0043_VERSION_H,
+                POST0043_VERSION_P,
+                POST0043_VERSION_E,
+                POST0043_VERSION_K2,
+                POST0043_VERSION_K1,
+                POST0043_VERSION_T,
+                POST0043_VERSION_C,
+                POST0043_VERSION_L,
+              ];
+      return ids.map((versionId, index) =>
+        deployment(
+          `post-0043-deployment-${versionId === POST0043_VERSION_H ? "h" : versionId === POST0043_VERSION_P ? "p" : versionId === POST0043_VERSION_A ? "a" : index}`,
+          versionId,
+          new Date(Date.parse("2026-09-04T00:12:00.000Z") - index * 60_000).toISOString(),
+        ),
+      );
     }
     const predecessor = deployment(
       "deployment-public-predecessor",
@@ -824,6 +1020,20 @@ class ProofState implements SponsorshipCutoverProofState {
           bindings: authorityBindings(this.target),
         },
       };
+    }
+    if (
+      workerName === PUBLIC_WORKER &&
+      (this.#mode === "post-parent" ||
+        this.#mode === "hosted-retired" ||
+        this.#mode === "attributed")
+    ) {
+      if (versionId === POST0043_VERSION_P || versionId === POST0043_VERSION_H) {
+        return {
+          annotations: { "workers/triggered_by": "secret" },
+          resources: { script: { etag: ROUTE_ETAG }, bindings: [] },
+        };
+      }
+      return canonicalPublicVersion(CANDIDATE_SOURCE, CANDIDATE_ARTIFACT, ROUTE_ETAG);
     }
     if (versionId === PUBLIC_PREDECESSOR_VERSION) {
       return canonicalPublicVersion(

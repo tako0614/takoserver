@@ -13,10 +13,15 @@ import { type DeployPhase, mutationError, preflightError, verificationError } fr
 import type { DeployTarget } from "./target.ts";
 import { workerVersionIdentity, workerVersionScriptContentIdentity } from "./worker-live.ts";
 import {
+  assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
   optionalExactPlainTextBinding,
   parseWorkerDeploymentChain,
+  parseWorkerSecretInventory,
+  versionSecretBindingNames,
+  workerLegacySecretCustodyProfile,
+  workerSecretsForLegacyCustody,
 } from "./worker-state.ts";
 
 const RECEIPT_KIND = "takoserver.artifact-blob-io-quiescence@v1";
@@ -50,6 +55,7 @@ export interface ArtifactBlobIoCompatibilityState {
   }>;
   workerDeployments(workerName: string): Promise<readonly unknown[]>;
   workerVersion(workerName: string, versionId: string): Promise<unknown>;
+  workerSecrets(workerName: string): Promise<readonly unknown[]>;
 }
 
 export interface ArtifactBlobIoDeploymentCompatibility {
@@ -145,8 +151,9 @@ export async function probeArtifactBlobIoQuiescence(
 /**
  * Proves the runtime half of the 0043 cutover.
  *
- * Two consecutive immutable Versions must contain the pre-0043-compatible
- * quiescence code and binding: one serves, one is the owned one-step rollback.
+ * Two consecutive immutable Versions and the live script secret store must
+ * contain the same exact pre-0043-compatible custody: one Version serves, one
+ * is the owned one-step rollback.
  * The private receipt is deliberately not manufactured here. It records the
  * external operator's proof that invocations of every older Version have
  * either completed or been cancelled while mutation ingress was blocked.
@@ -189,12 +196,56 @@ export async function inspectArtifactBlobIoDeploymentCompatibility(input: {
   if (!VERSION_ID.test(currentDeploymentId) || !VERSION_ID.test(rollbackDeploymentId)) {
     throw phaseError(input.phase, "0043 compatibility Worker deployment identity is invalid");
   }
-  const [current, rollback] = await Promise.all([
+  const [current, rollback, secretInventory] = await Promise.all([
     input.state.workerVersion(input.target.workerName, currentVersionId),
     input.state.workerVersion(input.target.workerName, rollbackVersionId),
+    input.state.workerSecrets(input.target.workerName),
   ]);
-  proveVersion(input.phase, input.target, input.selectedCommit, currentVersionId, current);
-  proveVersion(input.phase, input.target, input.selectedCommit, rollbackVersionId, rollback);
+  const currentCustody = workerLegacySecretCustodyProfile(
+    input.phase,
+    versionSecretBindingNames(input.phase, currentVersionId, current),
+    ["base", "full"],
+  );
+  const rollbackCustody = workerLegacySecretCustodyProfile(
+    input.phase,
+    versionSecretBindingNames(input.phase, rollbackVersionId, rollback),
+    ["base", "full"],
+  );
+  if (currentCustody !== rollbackCustody) {
+    throw phaseError(
+      input.phase,
+      "0043 compatibility current and rollback Worker Versions do not share the same legacy-secret custody",
+    );
+  }
+  const storeCustody = workerLegacySecretCustodyProfile(
+    input.phase,
+    parseWorkerSecretInventory(secretInventory, input.phase),
+    ["base", "full"],
+  );
+  if (storeCustody !== currentCustody) {
+    throw phaseError(
+      input.phase,
+      "0043 compatibility Worker Versions and live secret store do not share the same legacy-secret custody",
+    );
+  }
+  const expectedSecrets = workerSecretsForLegacyCustody(input.target, currentCustody);
+  assertExactSecretInventory(secretInventory, expectedSecrets, input.phase);
+  proveVersion(
+    input.phase,
+    input.target,
+    input.selectedCommit,
+    currentVersionId,
+    current,
+    expectedSecrets,
+  );
+  proveVersion(
+    input.phase,
+    input.target,
+    input.selectedCommit,
+    rollbackVersionId,
+    rollback,
+    expectedSecrets,
+  );
   const currentScriptContentIdentity = workerVersionScriptContentIdentity(
     input.phase,
     currentVersionId,
@@ -271,6 +322,7 @@ function proveVersion(
   selectedCommit: string,
   versionId: string,
   version: unknown,
+  expectedSecrets: readonly string[],
 ): void {
   if (
     optionalExactPlainTextBinding(phase, versionId, version, "TAKOSERVER_ARTIFACT_BLOB_IO_MODE") !==
@@ -294,6 +346,7 @@ function proveVersion(
     versionId,
     version,
     expectedExactBindingClosure(target, {
+      expectedSecrets,
       workerArtifactDigest: artifactDigest,
       ...(target.integrationE2eCredentialAuthority === undefined
         ? {}

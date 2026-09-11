@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
+import { RemoteD1 } from "./d1.ts";
 import {
   DeployError,
   type DeployPhase,
@@ -9,8 +10,10 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
+  REPOSITORY,
   requireEnvironment,
   resolveCloudflareCredential,
   runCommand,
@@ -23,7 +26,6 @@ import {
   unsealDirectory,
 } from "./qualification.ts";
 import {
-  expectedWorkerSecrets,
   type WorkerConfigOptions,
   type WorkerVersionAuthorityProfile,
   writeWorkerConfig,
@@ -34,6 +36,7 @@ import {
   type ProviderExecutorInspection,
   providerExecutorQualificationReader,
   providerExecutorStatus,
+  type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
 } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
@@ -50,19 +53,24 @@ import {
   assertExactSecretInventory,
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  LEGACY_PUBLIC_PARENT_SECRET,
+  optionalExactPlainTextBinding,
   parseWorkerDeploymentChain,
   parseWorkerSecretInventory,
   readVersionBindings,
   type WorkerDeploymentChainEntry,
   type WorkerDeploymentHistory,
+  workerSecretsForLegacyCustody,
 } from "./worker-state.ts";
 import {
   acquireWranglerVersionPublicationLease,
   type WranglerVersionPublicationLease,
 } from "./wrangler-state.ts";
 
-export const PUBLIC_PARENT_TOKEN = "CLOUDFLARE_API_TOKEN" as const;
+export const PUBLIC_PARENT_TOKEN = LEGACY_PUBLIC_PARENT_SECRET;
 const EXECUTOR_BINDING = "CLOUDFLARE_PROVIDER_EXECUTOR" as const;
+const QUIESCED_MODE = "pre-0043-quiesced" as const;
 
 export interface PublicParentTokenRetirementInvocation {
   readonly surface: "takoserver-public-parent-token-retirement";
@@ -90,10 +98,13 @@ export interface PublicParentTokenRetirementOptions {
   readonly publicationLease?: WranglerVersionPublicationLease;
   readonly executorPublicationLease?: WranglerVersionPublicationLease;
   readonly publicationLeaseRoot?: string;
+  /** Exact shared-D1 lineage seam; injectable only for portable tests. */
+  readonly migrations?: WorkerMigrationReader;
 }
 
 type PublicRetirementStateKind =
   | "legacy-unbound-parent-token"
+  | "quiesced-full-custody"
   | "bound-parent-token"
   | "retired-canonical"
   | "retired-secret-successor";
@@ -108,7 +119,14 @@ interface PublicRetirementInspection {
   readonly scriptContentIdentity: string;
   readonly executorBindingReady: boolean;
   readonly parentTokenPresent: boolean;
+  readonly custody: "base" | "parent-only" | "full" | "post-parent";
   readonly trustedPredecessorVersionId: string | null;
+}
+
+interface PublicRetirementMigrationState {
+  readonly local: readonly string[];
+  readonly applied: readonly string[];
+  readonly pending: readonly string[];
 }
 
 /**
@@ -160,9 +178,25 @@ export async function runPublicParentTokenRetirement(
   }
 
   const executorBefore = await qualification.read("preflight");
-  const publicBefore = await inspectPublicRetirementState("preflight", target, state);
+  const publicBefore = await inspectPublicRetirementState(
+    "preflight",
+    target,
+    state,
+    invocation.commit,
+  );
+  const migrations =
+    options.migrations ??
+    remoteMigrationReader(
+      target,
+      invocation.commit,
+      environment,
+      run,
+      options.sourceRepositoryRoot ?? REPOSITORY,
+      options.wranglerPath,
+    );
+  const migrationBefore = await retirementMigrationState(publicBefore, migrations);
   if (invocation.action === "status") {
-    return statusResult(invocation, executorBefore, publicBefore);
+    return statusResult(invocation, executorBefore, publicBefore, migrationBefore);
   }
   if (!executorBefore.ready || !executorBefore.routeLess) {
     throw preflightError(
@@ -177,6 +211,7 @@ export async function runPublicParentTokenRetirement(
       "public parent token is already absent without a completed exact cutover; use --status for adoption evidence",
     );
   }
+  assertSettledRetirementMigrations("preflight", migrationBefore);
 
   const source = await qualifySource({
     environment: invocation.environment,
@@ -208,7 +243,12 @@ export async function runPublicParentTokenRetirement(
       ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       run,
       environment,
-      writeConfig: publicParentConfigWriter(target, source.commit, options.sourceRepositoryRoot),
+      writeConfig: publicParentConfigWriter(
+        target,
+        source.commit,
+        parentReleaseSecrets(target, publicBefore.custody),
+        options.sourceRepositoryRoot,
+      ),
     });
     artifact = prepared.seal();
     artifact.assertUnchanged();
@@ -239,7 +279,7 @@ export async function runPublicParentTokenRetirement(
       }));
     assertLeaseTarget(publicLease, target.accountId, target.workerName);
 
-    let current = await inspectPublicRetirementState("preflight", target, state);
+    let current = await inspectPublicRetirementState("preflight", target, state, invocation.commit);
     assertSameInspection(
       "preflight",
       publicBefore,
@@ -255,6 +295,7 @@ export async function runPublicParentTokenRetirement(
     let bindingRelease: Record<string, unknown>;
     if (releaseRequired) {
       const predecessorVersionId = current.history.versionId;
+      await assertRetirementMigrationsUnchanged("preflight", migrationBefore, migrations);
       await runBindingRelease({
         sourceCommit: source.commit,
         bundleDigestHex: prepared.bundleDigestHex,
@@ -266,9 +307,15 @@ export async function runPublicParentTokenRetirement(
       });
       targetTouched = true;
       artifact.assertUnchanged();
-      current = await inspectPublicRetirementState("verification", target, state);
+      current = await inspectPublicRetirementState(
+        "verification",
+        target,
+        state,
+        invocation.commit,
+      );
       if (
         current.kind !== "bound-parent-token" ||
+        current.custody !== publicBefore.custody ||
         current.history.previousVersionId !== predecessorVersionId ||
         current.commit !== source.commit ||
         current.bundleDigestHex !== prepared.bundleDigestHex
@@ -277,6 +324,7 @@ export async function runPublicParentTokenRetirement(
           "binding release did not create the exact selected-commit direct successor",
         );
       }
+      await assertRetirementMigrationsUnchanged("verification", migrationBefore, migrations);
       assertProviderExecutorUnchanged(
         executorBefore,
         await qualification.read("verification"),
@@ -302,7 +350,12 @@ export async function runPublicParentTokenRetirement(
     }
 
     const beforeDeletePhase: DeployPhase = targetTouched ? "verification" : "preflight";
-    const beforeDelete = await inspectPublicRetirementState(beforeDeletePhase, target, state);
+    const beforeDelete = await inspectPublicRetirementState(
+      beforeDeletePhase,
+      target,
+      state,
+      invocation.commit,
+    );
     assertSameInspection(
       beforeDeletePhase,
       current,
@@ -311,6 +364,7 @@ export async function runPublicParentTokenRetirement(
     );
     if (
       beforeDelete.kind !== "bound-parent-token" ||
+      (beforeDelete.custody !== "parent-only" && beforeDelete.custody !== "full") ||
       beforeDelete.commit !== source.commit ||
       beforeDelete.bundleDigestHex !== prepared.bundleDigestHex
     ) {
@@ -324,6 +378,7 @@ export async function runPublicParentTokenRetirement(
       await qualification.read(targetTouched ? "verification" : "preflight"),
       targetTouched ? "verification" : "preflight",
     );
+    await assertRetirementMigrationsUnchanged(beforeDeletePhase, migrationBefore, migrations);
 
     await runParentTokenDeletion({
       target,
@@ -333,9 +388,15 @@ export async function runPublicParentTokenRetirement(
       ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
     });
     targetTouched = true;
-    const after = await inspectPublicRetirementState("verification", target, state);
+    const after = await inspectPublicRetirementState(
+      "verification",
+      target,
+      state,
+      invocation.commit,
+    );
     if (
       after.kind !== "retired-secret-successor" ||
+      after.custody !== (beforeDelete.custody === "full" ? "post-parent" : "base") ||
       after.history.previousVersionId !== beforeDelete.history.versionId ||
       after.trustedPredecessorVersionId !== beforeDelete.history.versionId ||
       after.commit !== source.commit ||
@@ -346,6 +407,7 @@ export async function runPublicParentTokenRetirement(
         "parent-token deletion did not create the exact token-free direct successor",
       );
     }
+    await assertRetirementMigrationsUnchanged("verification", migrationBefore, migrations);
     const executorAfter = await qualification.read("verification");
     assertProviderExecutorUnchanged(executorBefore, executorAfter, "verification");
     artifact.assertUnchanged();
@@ -410,6 +472,7 @@ async function inspectPublicRetirementState(
   phase: DeployPhase,
   target: DeployTarget,
   state: PublicParentTokenRetirementState,
+  selectedCommit: string,
 ): Promise<PublicRetirementInspection> {
   const before = await deploymentSnapshot(phase, target, state);
   const current = before.chain[0];
@@ -420,10 +483,89 @@ async function inspectPublicRetirementState(
   const inventory = await state.workerSecrets(target.workerName);
   const secretNames = parseWorkerSecretInventory(inventory, phase);
   const parentTokenPresent = secretNames.includes(PUBLIC_PARENT_TOKEN);
+  const hostedTokenPresent = secretNames.includes(LEGACY_HOSTED_SPONSORSHIP_SECRET);
+  const mode = optionalExactPlainTextBinding(
+    phase,
+    current.versionId,
+    version,
+    "TAKOSERVER_ARTIFACT_BLOB_IO_MODE",
+  );
+  if (mode !== null) {
+    if (mode !== QUIESCED_MODE) {
+      throw phaseError(phase, "public Worker has an unrecognized artifact blob I/O mode");
+    }
+    const rollback = before.chain[1];
+    if (rollback === undefined || rollback.versionId === current.versionId) {
+      throw phaseError(
+        phase,
+        "parent-token retirement requires two distinct immutable 0043 compatibility Versions",
+      );
+    }
+    const rollbackVersion = await state.workerVersion(target.workerName, rollback.versionId);
+    assertVersionIdentity(phase, rollback.versionId, rollbackVersion);
+    const expectedSecrets = workerSecretsForLegacyCustody(target, "full");
+    assertExactSecretInventory(inventory, expectedSecrets, phase);
+    const quiescedTarget = { ...target, artifactBlobIoMode: QUIESCED_MODE } satisfies DeployTarget;
+    const currentIdentity = proveQuiescedCustodyVersion(
+      phase,
+      quiescedTarget,
+      current.versionId,
+      version,
+      selectedCommit,
+      expectedSecrets,
+    );
+    const rollbackIdentity = proveQuiescedCustodyVersion(
+      phase,
+      quiescedTarget,
+      rollback.versionId,
+      rollbackVersion,
+      selectedCommit,
+      expectedSecrets,
+    );
+    const currentScript = workerVersionScriptContentIdentity(phase, current.versionId, version);
+    const rollbackScript = workerVersionScriptContentIdentity(
+      phase,
+      rollback.versionId,
+      rollbackVersion,
+    );
+    if (
+      currentIdentity.bundleDigestHex !== rollbackIdentity.bundleDigestHex ||
+      currentScript !== rollbackScript
+    ) {
+      throw phaseError(
+        phase,
+        "0043 compatibility custody Versions do not share one exact selected artifact",
+      );
+    }
+    await assertLiveWorkerRoutingClosure(phase, target, state);
+    const after = await deploymentSnapshot(phase, target, state);
+    if (!sameChain(before.chain, after.chain)) {
+      throw phaseError(phase, "public Worker changed during parent-token retirement inspection");
+    }
+    return {
+      kind: "quiesced-full-custody",
+      history: before.history,
+      chain: before.chain,
+      ...currentIdentity,
+      scriptContentIdentity: currentScript,
+      executorBindingReady: false,
+      parentTokenPresent: true,
+      custody: "full",
+      trustedPredecessorVersionId: rollback.versionId,
+    };
+  }
   const bindingEntries = readVersionBindings(phase, current.versionId, version).filter(
     (binding) => binding.name === EXECUTOR_BINDING || binding.binding === EXECUTOR_BINDING,
   );
   const executorBindingReady = bindingEntries.length > 0;
+  const custody: PublicRetirementInspection["custody"] =
+    parentTokenPresent && hostedTokenPresent
+      ? "full"
+      : parentTokenPresent
+        ? "parent-only"
+        : hostedTokenPresent
+          ? "post-parent"
+          : "base";
 
   let result: PublicRetirementInspection;
   if (workerVersionAnnotationProfile(version) === "canonical") {
@@ -435,9 +577,13 @@ async function inspectPublicRetirementState(
       version,
       identity,
     );
-    const expectedSecrets = parentTokenPresent
-      ? publicParentSecrets(target)
-      : publicSecrets(target);
+    if ((custody === "full" && !executorBindingReady) || custody === "post-parent") {
+      throw phaseError(
+        phase,
+        "canonical public Worker is not an exact parent-token retirement state",
+      );
+    }
+    const expectedSecrets = publicRetirementSecrets(target, custody);
     const closure = expectedExactBindingClosure(target, {
       expectedSecrets,
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
@@ -466,10 +612,15 @@ async function inspectPublicRetirementState(
       scriptContentIdentity: workerVersionScriptContentIdentity(phase, current.versionId, version),
       executorBindingReady,
       parentTokenPresent,
+      custody,
       trustedPredecessorVersionId: null,
     };
   } else if (workerVersionAnnotationProfile(version) === "secret-created") {
-    if (parentTokenPresent || !executorBindingReady) {
+    if (
+      parentTokenPresent ||
+      !executorBindingReady ||
+      (custody !== "base" && custody !== "post-parent")
+    ) {
       throw phaseError(
         phase,
         "secret-created public Worker is not an exact bound token-retirement successor",
@@ -492,12 +643,13 @@ async function inspectPublicRetirementState(
       predecessorVersion,
       identity,
     );
+    const predecessorCustody = custody === "post-parent" ? "full" : "parent-only";
     assertExactVersionBindingClosure(
       phase,
       predecessor.versionId,
       predecessorVersion,
       expectedExactBindingClosure(target, {
-        expectedSecrets: publicParentSecrets(target),
+        expectedSecrets: publicRetirementSecrets(target, predecessorCustody),
         ...(authorityProfile === undefined ? {} : { authorityProfile }),
         workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
       }),
@@ -507,12 +659,12 @@ async function inspectPublicRetirementState(
       current.versionId,
       version,
       expectedExactBindingClosure(target, {
-        expectedSecrets: publicSecrets(target),
+        expectedSecrets: publicRetirementSecrets(target, custody),
         ...(authorityProfile === undefined ? {} : { authorityProfile }),
         workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
       }),
     );
-    assertExactSecretInventory(inventory, publicSecrets(target), phase);
+    assertExactSecretInventory(inventory, publicRetirementSecrets(target, custody), phase);
     const predecessorScript = workerVersionScriptContentIdentity(
       phase,
       predecessor.versionId,
@@ -530,6 +682,7 @@ async function inspectPublicRetirementState(
       scriptContentIdentity: successorScript,
       executorBindingReady: true,
       parentTokenPresent: false,
+      custody,
       trustedPredecessorVersionId: predecessor.versionId,
     };
   } else {
@@ -544,20 +697,65 @@ async function inspectPublicRetirementState(
   return result;
 }
 
+function proveQuiescedCustodyVersion(
+  phase: DeployPhase,
+  target: DeployTarget,
+  versionId: string,
+  version: unknown,
+  selectedCommit: string,
+  expectedSecrets: readonly string[],
+): { readonly commit: string; readonly bundleDigestHex: string } {
+  if (workerVersionAnnotationProfile(version) !== "canonical") {
+    throw phaseError(phase, "0043 compatibility custody Version has no canonical source identity");
+  }
+  const identity = workerVersionIdentity(phase, version);
+  if (identity.commit !== selectedCommit) {
+    throw phaseError(
+      phase,
+      "0043 compatibility custody Version does not identify the selected source commit",
+    );
+  }
+  const authorityProfile = authorityProfileForCanonicalVersion(
+    phase,
+    target,
+    versionId,
+    version,
+    identity,
+  );
+  assertExactVersionBindingClosure(
+    phase,
+    versionId,
+    version,
+    expectedExactBindingClosure(target, {
+      expectedSecrets,
+      ...(authorityProfile === undefined ? {} : { authorityProfile }),
+      workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+    }),
+  );
+  return identity;
+}
+
 function statusResult(
   invocation: PublicParentTokenRetirementInvocation,
   executor: ProviderExecutorInspection,
   inspected: PublicRetirementInspection,
+  migrations: PublicRetirementMigrationState | null,
 ): Record<string, unknown> {
   const complete = isCompleted(inspected, invocation.commit);
+  const schemaReady = migrations === null || migrations.pending.length === 0;
   return {
     kind: "takoserver.public-parent-token-retirement-status@v1",
     surface: invocation.surface,
     environment: invocation.environment,
     selectedCommit: invocation.commit,
     state: inspected.kind,
-    ready: complete && executor.ready && executor.routeLess,
-    canApply: !complete && inspected.parentTokenPresent && executor.ready && executor.routeLess,
+    ready: complete && executor.ready && executor.routeLess && schemaReady,
+    canApply:
+      !complete &&
+      inspected.parentTokenPresent &&
+      executor.ready &&
+      executor.routeLess &&
+      schemaReady,
     deploymentId: inspected.history.deploymentId,
     versionId: inspected.history.versionId,
     previousVersionId: inspected.history.previousVersionId,
@@ -567,6 +765,10 @@ function statusResult(
     scriptContentIdentity: inspected.scriptContentIdentity,
     executorBindingReady: inspected.executorBindingReady,
     parentTokenPresent: inspected.parentTokenPresent,
+    legacySecretCustody: inspected.custody,
+    ...(migrations === null
+      ? {}
+      : { appliedMigrations: migrations.applied, pendingMigrations: migrations.pending }),
     ...providerExecutorStatus(executor),
   };
 }
@@ -574,6 +776,7 @@ function statusResult(
 function publicParentConfigWriter(
   target: DeployTarget,
   commit: string,
+  expectedSecrets: readonly string[],
   sourceRepositoryRoot?: string,
 ): (input: {
   readonly path: string;
@@ -588,7 +791,7 @@ function publicParentConfigWriter(
       commit,
       ...(sourceRepositoryRoot === undefined ? {} : { sourceRepositoryRoot }),
       signingKeyId: target.signing.currentKeyId,
-      transitionExpectedSecrets: publicParentSecrets(target),
+      transitionExpectedSecrets: expectedSecrets,
       ...(input.formImplementationIdentity === undefined
         ? {}
         : { formImplementationIdentity: input.formImplementationIdentity }),
@@ -794,6 +997,7 @@ function assertSameInspection(
     expected.scriptContentIdentity !== actual.scriptContentIdentity ||
     expected.executorBindingReady !== actual.executorBindingReady ||
     expected.parentTokenPresent !== actual.parentTokenPresent ||
+    expected.custody !== actual.custody ||
     !sameHistory(expected.history, actual.history) ||
     !sameChain(expected.chain, actual.chain)
   ) {
@@ -833,12 +1037,117 @@ function isCompleted(inspection: PublicRetirementInspection, selectedCommit: str
   );
 }
 
-function publicParentSecrets(target: DeployTarget): readonly string[] {
-  return [...new Set([...expectedWorkerSecrets(target), PUBLIC_PARENT_TOKEN])].sort();
+function parentReleaseSecrets(
+  target: DeployTarget,
+  custody: PublicRetirementInspection["custody"],
+): readonly string[] {
+  if (custody === "full") return workerSecretsForLegacyCustody(target, "full");
+  if (custody === "parent-only") {
+    return [
+      ...new Set([...workerSecretsForLegacyCustody(target, "base"), PUBLIC_PARENT_TOKEN]),
+    ].sort();
+  }
+  throw preflightError("public parent-token release requires an exact parent-token custody state");
 }
 
-function publicSecrets(target: DeployTarget): readonly string[] {
-  return expectedWorkerSecrets(target).filter((name) => name !== PUBLIC_PARENT_TOKEN);
+function publicRetirementSecrets(
+  target: DeployTarget,
+  custody: PublicRetirementInspection["custody"],
+): readonly string[] {
+  if (custody === "full") return workerSecretsForLegacyCustody(target, "full");
+  if (custody === "post-parent") return workerSecretsForLegacyCustody(target, "post-parent");
+  if (custody === "base") return workerSecretsForLegacyCustody(target, "base");
+  return [
+    ...new Set([...workerSecretsForLegacyCustody(target, "base"), PUBLIC_PARENT_TOKEN]),
+  ].sort();
+}
+
+async function retirementMigrationState(
+  inspection: PublicRetirementInspection,
+  migrations: WorkerMigrationReader,
+): Promise<PublicRetirementMigrationState | null> {
+  if (inspection.custody !== "full" && inspection.custody !== "post-parent") return null;
+  const state = await migrations.read();
+  const local = [...state.local];
+  const applied = [...state.applied];
+  return {
+    local,
+    applied,
+    pending: pendingMigrations(local, applied),
+  };
+}
+
+function assertSettledRetirementMigrations(
+  phase: DeployPhase,
+  state: PublicRetirementMigrationState | null,
+): void {
+  if (state !== null && state.pending.length > 0) {
+    throw phaseError(
+      phase,
+      "0043 compatibility exit requires the complete shared D1 migration lineage",
+    );
+  }
+}
+
+async function assertRetirementMigrationsUnchanged(
+  phase: DeployPhase,
+  expected: PublicRetirementMigrationState | null,
+  migrations: WorkerMigrationReader,
+): Promise<void> {
+  if (expected === null) return;
+  const actualState = await migrations.read();
+  const local = [...actualState.local];
+  const applied = [...actualState.applied];
+  const actual: PublicRetirementMigrationState = {
+    local,
+    applied,
+    pending: pendingMigrations(local, applied),
+  };
+  assertSettledRetirementMigrations(phase, actual);
+  if (
+    JSON.stringify(actual.local) !== JSON.stringify(expected.local) ||
+    JSON.stringify(actual.applied) !== JSON.stringify(expected.applied) ||
+    JSON.stringify(actual.pending) !== JSON.stringify(expected.pending)
+  ) {
+    throw phaseError(phase, "shared D1 migration lineage changed during 0043 compatibility exit");
+  }
+}
+
+function remoteMigrationReader(
+  target: DeployTarget,
+  commit: string,
+  environment: Readonly<Record<string, string>>,
+  run: PublicParentTokenRetirementProcess,
+  sourceRepositoryRoot: string,
+  wranglerPath?: string,
+): WorkerMigrationReader {
+  return {
+    async read() {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-public-parent-migrations-"));
+      try {
+        const configPath = writeWorkerConfig(target, {
+          path: join(root, "wrangler.jsonc"),
+          main: resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts"),
+          commit,
+          sourceRepositoryRoot,
+          ...(target.integrationE2eCredentialAuthority === undefined
+            ? {}
+            : { authorityProfile: { kind: "historical-pre-jit" as const } }),
+        });
+        const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
+        const remote = await readD1SchemaState(
+          new RemoteD1(configPath, {
+            environment,
+            run,
+            wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
+          }),
+        );
+        return { local: local.names, applied: remote.applied };
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  };
 }
 
 async function runOwnerGate(run: PublicParentTokenRetirementProcess): Promise<void> {

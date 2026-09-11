@@ -902,6 +902,45 @@ owning deploy output names only the safe immediate predecessor. Subsequent
 normal publications make lease-aware Versions each other's rollback; the
 compatibility Version can then age out of the immediate rollback position.
 
+#### Legacy composed Host secret custody
+
+A pre-0043 composed Host may still have both `CLOUDFLARE_API_TOKEN` and
+`TAKOSERVER_HOSTED_SPONSORSHIP_TOKEN` in addition to its target-required secrets.
+The compatibility publications may carry that exact pair unchanged. This is
+not a new secret requirement for an OSS Host: its ordinary target-derived secret
+inventory remains valid. Single legacy keys, unknown extra keys, mixed custody
+between the two compatibility Versions or between the served Version and live
+secret store, and key rotation are not accepted by this exceptional entry path.
+Ordinary target-secret recovery may still carry a store-ahead secret after a
+rollback; that does not permit a partial legacy pair.
+
+For the retained pair, use the existing retirement owners to complete the exit:
+
+1. Settle the selected schema lineage and qualify the declared CPE dependencies
+   before removing maintenance mode.
+2. With the normal target, `takoserver-public-parent-token-retirement` first
+   publishes the normal Host with its CPE binding while carrying both legacy
+   keys, then deletes only the Cloudflare key. It does not copy or rotate secret
+   values.
+3. If route and materializer removal already predate this schema transition,
+   `takoserver-sponsorship-public-route-retirement` settles that current fact in
+   D1 using a fresh cutover proof and repeated exact readback. Its predecessor
+   and successor are the same serving Version; it does not upload a Worker or
+   invent a historical receipt. Topology retirement is already complete in this
+   narrow path and does not authorize another apply or reversal.
+4. `takoserver-hosted-token-retirement` consumes that completed route operation
+   and its current proof before deleting only the Hosted key. Lost-acknowledgement
+   settlement still requires the exact recorded operation and successor.
+
+The receipt-proved Hosted-key deletion completes the exit. A later canonical
+metadata-attribution repair is optional, and must retain that same completed
+deletion as its authority; attribution alone cannot substitute for its receipt.
+
+These owners recognize only the bounded, ordered compatibility and retirement
+history with matching source, script, closure and durable identities. An
+arbitrary matching ancestor is not authority. Do not begin the maintenance entry
+until the complete exit and the required operator proof inputs are available.
+
 Artifact maintenance status exposes `permanentlyFencedBlobDeletes`: external
 DELETE owners still at `delete_started` after their lease deadline. Neither
 object absence nor elapsed time proves that a thrown DELETE will not later

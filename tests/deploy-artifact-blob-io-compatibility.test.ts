@@ -10,13 +10,19 @@ import {
   probeArtifactBlobIoQuiescence,
 } from "../scripts/deploy/artifact-blob-io-compatibility.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
+import {
+  expectedExactBindingClosure,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  LEGACY_PUBLIC_PARENT_SECRET,
+  workerSecretsForLegacyCustody,
+} from "../scripts/deploy/worker-state.ts";
 
 const COMMIT = "a".repeat(40);
 const CURRENT_DEPLOYMENT = "10000000-0000-4000-8000-000000000043";
 const ROLLBACK_DEPLOYMENT = "10000000-0000-4000-8000-000000000042";
 const CURRENT = "00000000-0000-4000-8000-000000000043";
 const ROLLBACK = "00000000-0000-4000-8000-000000000042";
+const LEGACY_SECRET_PAIR = [LEGACY_PUBLIC_PARENT_SECRET, LEGACY_HOSTED_SPONSORSHIP_SECRET] as const;
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "rehearsal",
@@ -42,8 +48,13 @@ function deployment(id: string, versionId: string, created: string) {
   return { id, created_on: created, versions: [{ version_id: versionId, percentage: 100 }] };
 }
 
-function version(versionId: string, selected: DeployTarget = target) {
+function version(
+  versionId: string,
+  selected: DeployTarget = target,
+  custody: "base" | "full" = "base",
+) {
   const digest = versionId === CURRENT ? "c".repeat(64) : "b".repeat(64);
+  const expectedSecrets = workerSecretsForLegacyCustody(selected, custody);
   return {
     id: versionId,
     annotations: {
@@ -51,7 +62,7 @@ function version(versionId: string, selected: DeployTarget = target) {
       "workers/triggered_by": "version_upload",
     },
     resources: {
-      bindings: Object.entries(expectedExactBindingClosure(selected)).flatMap(
+      bindings: Object.entries(expectedExactBindingClosure(selected, { expectedSecrets })).flatMap(
         ([name, requirement]) =>
           requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
       ),
@@ -60,7 +71,11 @@ function version(versionId: string, selected: DeployTarget = target) {
   };
 }
 
-function state(selected: DeployTarget = target): ArtifactBlobIoCompatibilityState {
+function state(
+  selected: DeployTarget = target,
+  custody: "base" | "full" = "base",
+  storeSecrets: readonly string[] = workerSecretsForLegacyCustody(selected, custody),
+): ArtifactBlobIoCompatibilityState {
   return {
     async workerSubdomain() {
       return { enabled: false, previewsEnabled: false };
@@ -72,7 +87,10 @@ function state(selected: DeployTarget = target): ArtifactBlobIoCompatibilityStat
       ];
     },
     async workerVersion(_workerName, versionId) {
-      return version(versionId, selected);
+      return version(versionId, selected, custody);
+    },
+    async workerSecrets() {
+      return storeSecrets.map((name) => ({ name, type: "secret_text" }));
     },
   };
 }
@@ -236,6 +254,55 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts one exact full legacy custody pair shared by current and rollback", async () => {
+    const withoutReceipt = await inspectArtifactBlobIoDeploymentCompatibility({
+      phase: "preflight",
+      target,
+      selectedCommit: COMMIT,
+      state: state(target, "full"),
+    });
+    expect(withoutReceipt).toMatchObject({
+      status: "drain_receipt_required",
+      currentCompatibilityVersionId: CURRENT,
+      rollbackCompatibilityVersionId: ROLLBACK,
+    });
+
+    const differingProfiles: ArtifactBlobIoCompatibilityState = {
+      ...state(target, "full"),
+      async workerVersion(_workerName, versionId) {
+        return version(versionId, target, versionId === CURRENT ? "full" : "base");
+      },
+    };
+    await expect(
+      inspectArtifactBlobIoDeploymentCompatibility({
+        phase: "preflight",
+        target,
+        selectedCommit: COMMIT,
+        state: differingProfiles,
+      }),
+    ).rejects.toThrow("do not share the same legacy-secret custody");
+  });
+
+  test("refuses full compatibility Versions when the live secret store drops one or both legacy keys", async () => {
+    const fullStore = workerSecretsForLegacyCustody(target, "full");
+    for (const missing of [
+      LEGACY_SECRET_PAIR,
+      [LEGACY_SECRET_PAIR[0]],
+      [LEGACY_SECRET_PAIR[1]],
+    ] as const) {
+      const missingNames = new Set<string>(missing);
+      const retained = fullStore.filter((name) => !missingNames.has(name));
+      await expect(
+        inspectArtifactBlobIoDeploymentCompatibility({
+          phase: "preflight",
+          target,
+          selectedCommit: COMMIT,
+          state: state(target, "full", retained),
+        }),
+      ).rejects.toMatchObject({ phase: "preflight" });
     }
   });
 

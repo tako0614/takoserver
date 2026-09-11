@@ -19,6 +19,7 @@ import {
   expectedTransitionBindingClosure,
   extractLegacyHostServiceBinding,
 } from "../scripts/deploy/worker-state.ts";
+import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
 
 const COMMIT = "a".repeat(40);
 const REPAIR_COMMIT = "d".repeat(40);
@@ -59,6 +60,16 @@ const testProofGate: SponsorshipCutoverProofGate = {
   async complete() {},
   async settle() {
     return `sha256:${"9".repeat(64)}`;
+  },
+  async adoptPreexistingRouteRemoval() {
+    return `sha256:${"9".repeat(64)}`;
+  },
+  async settlePreexistingRouteRemoval() {
+    return undefined;
+  },
+  async completePost0043LegacySecretRetirement() {},
+  async settlePost0043LegacySecretRetirement() {
+    return undefined;
   },
 };
 
@@ -106,6 +117,31 @@ const integrationE2eTarget = {
 const BASE_SECRETS = ["TAKOSERVER_SIGNING_KEY"];
 const HOSTED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
 const HOSTED_SECRETS = [...BASE_SECRETS, HOSTED_SPONSORSHIP_SECRET];
+const POST0043_FULL_SECRETS = [...BASE_SECRETS, "CLOUDFLARE_API_TOKEN", HOSTED_SPONSORSHIP_SECRET];
+const POST0043_PARENT_SECRETS = [...BASE_SECRETS, HOSTED_SPONSORSHIP_SECRET];
+const POST0043_PROOF = `sha256:${"8".repeat(64)}`;
+const POST0043_VERSION_A = "10000000-0000-4000-8000-000000000001";
+const POST0043_VERSION_H = "10000000-0000-4000-8000-000000000002";
+const POST0043_VERSION_P = "10000000-0000-4000-8000-000000000003";
+const POST0043_VERSION_E = "10000000-0000-4000-8000-000000000004";
+const POST0043_VERSION_K2 = "10000000-0000-4000-8000-000000000005";
+const POST0043_VERSION_K1 = "10000000-0000-4000-8000-000000000006";
+const POST0043_VERSION_T = "10000000-0000-4000-8000-000000000007";
+const POST0043_VERSION_C = "10000000-0000-4000-8000-000000000008";
+const POST0043_VERSION_L = "10000000-0000-4000-8000-000000000009";
+const POST0043_TARGET = {
+  ...target,
+  cloudflareProviderExecutor: cloudflareProviderExecutorTarget(),
+} satisfies DeployTarget;
+const POST0043_QUIESCED_TARGET = {
+  ...POST0043_TARGET,
+  artifactBlobIoMode: "pre-0043-quiesced",
+} satisfies DeployTarget;
+const POST0043_LEGACY_TARGET: DeployTarget = (() => {
+  const { cloudflareProviderExecutor: _ignored, ...legacy } = POST0043_TARGET;
+  void _ignored;
+  return legacy;
+})();
 type TestAuthorityProfile =
   | { readonly kind: "historical-pre-jit" }
   | {
@@ -219,6 +255,18 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         async settle() {
           return undefined;
         },
+        async adoptPreexistingRouteRemoval() {
+          throw new Error("must not adopt preexisting route removal in this test");
+        },
+        async settlePreexistingRouteRemoval() {
+          return undefined;
+        },
+        async completePost0043LegacySecretRetirement() {
+          throw new Error("must not complete post-0043 retirement in this test");
+        },
+        async settlePost0043LegacySecretRetirement() {
+          return undefined;
+        },
       };
       const result = await runRetirementOwned(
         {
@@ -269,6 +317,18 @@ describe("reviewed Hosted legacy-edge retirement", () => {
           throw new Error("must not complete without a provider successor");
         },
         async settle() {
+          return undefined;
+        },
+        async adoptPreexistingRouteRemoval() {
+          throw new Error("must not adopt preexisting route removal in this test");
+        },
+        async settlePreexistingRouteRemoval() {
+          return undefined;
+        },
+        async completePost0043LegacySecretRetirement() {
+          throw new Error("must not complete post-0043 retirement in this test");
+        },
+        async settlePost0043LegacySecretRetirement() {
           return undefined;
         },
       };
@@ -331,6 +391,150 @@ describe("reviewed Hosted legacy-edge retirement", () => {
         { run: token.run, state: token.state },
       ),
     ).rejects.toThrow("current sponsorship cutover proof");
+  });
+
+  test("post-0043 P status settles only its preexisting route receipt", async () => {
+    const fixture = post0043Fixture("post-parent");
+    const result = await runRetirementOwned(
+      {
+        surface: "takoserver-host-runtime-topology-retirement",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+      },
+      POST0043_TARGET,
+      {
+        state: fixture.state,
+        run: fixture.run,
+        proofGate: fixture.proofGate,
+      },
+    );
+    expect(result).toMatchObject({
+      state: "preexisting-topology-retired",
+      ready: true,
+      canApply: false,
+      versionId: POST0043_VERSION_P,
+      previousVersionId: POST0043_VERSION_E,
+      sponsorshipCutoverProofSha256: POST0043_PROOF,
+    });
+    expect(fixture.routeSettlements).toEqual([POST0043_VERSION_P]);
+    expect(fixture.secretSettlements).toHaveLength(0);
+    expect(fixture.mutations).toHaveLength(0);
+  });
+
+  test("post-0043 H is ready without A only after its exact durable receipt", async () => {
+    const missing = post0043Fixture("hosted-retired", "missing");
+    await expect(
+      runRetirementOwned(
+        {
+          surface: "takoserver-hosted-token-retirement",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+        },
+        POST0043_TARGET,
+        { state: missing.state, run: missing.run, proofGate: missing.proofGate },
+      ),
+    ).rejects.toThrow("exact durable receipt");
+    expect(missing.mutations).toHaveLength(0);
+
+    const complete = post0043Fixture("hosted-retired", "complete");
+    const result = await runRetirementOwned(
+      {
+        surface: "takoserver-hosted-token-retirement",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+      },
+      POST0043_TARGET,
+      { state: complete.state, run: complete.run, proofGate: complete.proofGate },
+    );
+    expect(result).toMatchObject({
+      state: "token-retired-unattributed-successor",
+      ready: true,
+      repairRequired: false,
+      attributionRepairAvailable: true,
+      versionId: POST0043_VERSION_H,
+      previousVersionId: POST0043_VERSION_P,
+      sponsorshipCutoverProofSha256: POST0043_PROOF,
+    });
+    expect(complete.secretSettlements).toEqual([
+      {
+        hostedRetiredVersionId: POST0043_VERSION_H,
+        parentVersionId: POST0043_VERSION_P,
+        executorVersionId: POST0043_VERSION_E,
+      },
+    ]);
+    expect(complete.mutations).toHaveLength(0);
+  });
+
+  test("post-0043 A attribution remains optional but requires H completion", async () => {
+    const missing = post0043Fixture("attributed", "missing");
+    await expect(
+      runRetirementOwned(
+        {
+          surface: "takoserver-worker-retirement-attribution-repair",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+          unattributedSuccessorVersionId: POST0043_VERSION_H,
+        },
+        POST0043_TARGET,
+        {
+          state: missing.state,
+          run: missing.run,
+          proofGate: missing.proofGate,
+          fetcher: probeFetcher,
+        },
+      ),
+    ).rejects.toThrow("exact durable receipt");
+    expect(missing.secretSettlements).toHaveLength(1);
+    expect(missing.mutations).toHaveLength(0);
+
+    const complete = post0043Fixture("attributed", "complete");
+    const result = await runRetirementOwned(
+      {
+        surface: "takoserver-worker-retirement-attribution-repair",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+        legacyHostRuntimePredecessorVersionId: POST0043_VERSION_L,
+        unattributedSuccessorVersionId: POST0043_VERSION_H,
+      },
+      POST0043_TARGET,
+      {
+        state: complete.state,
+        run: complete.run,
+        proofGate: complete.proofGate,
+        fetcher: probeFetcher,
+      },
+    );
+    expect(result).toMatchObject({
+      state: "token-retirement-attribution-repaired",
+      ready: true,
+      repairRequired: false,
+      attributionRepairAvailable: false,
+      versionId: POST0043_VERSION_A,
+      previousVersionId: POST0043_VERSION_H,
+      sponsorshipCutoverProofSha256: POST0043_PROOF,
+    });
+    expect(complete.secretSettlements).toEqual([
+      {
+        hostedRetiredVersionId: POST0043_VERSION_H,
+        parentVersionId: POST0043_VERSION_P,
+        executorVersionId: POST0043_VERSION_E,
+      },
+      {
+        hostedRetiredVersionId: POST0043_VERSION_H,
+        parentVersionId: POST0043_VERSION_P,
+        executorVersionId: POST0043_VERSION_E,
+      },
+    ]);
+    expect(complete.mutations).toHaveLength(0);
   });
 
   test("authority transition classifies historical L as pre-JIT and requires provenance-bound JIT C", async () => {
@@ -1928,6 +2132,149 @@ describe("reviewed Hosted legacy-edge retirement", () => {
   });
 });
 
+function post0043Fixture(
+  head: "post-parent" | "hosted-retired" | "attributed",
+  receipt: "missing" | "complete" = "complete",
+) {
+  const chain =
+    head === "post-parent"
+      ? [
+          POST0043_VERSION_P,
+          POST0043_VERSION_E,
+          POST0043_VERSION_K2,
+          POST0043_VERSION_K1,
+          POST0043_VERSION_T,
+          POST0043_VERSION_C,
+          POST0043_VERSION_L,
+        ]
+      : head === "hosted-retired"
+        ? [
+            POST0043_VERSION_H,
+            POST0043_VERSION_P,
+            POST0043_VERSION_E,
+            POST0043_VERSION_K2,
+            POST0043_VERSION_K1,
+            POST0043_VERSION_T,
+            POST0043_VERSION_C,
+            POST0043_VERSION_L,
+          ]
+        : [
+            POST0043_VERSION_A,
+            POST0043_VERSION_H,
+            POST0043_VERSION_P,
+            POST0043_VERSION_E,
+            POST0043_VERSION_K2,
+            POST0043_VERSION_K1,
+            POST0043_VERSION_T,
+            POST0043_VERSION_C,
+            POST0043_VERSION_L,
+          ];
+  const roleByVersion = new Map<string, string>([
+    [POST0043_VERSION_A, "A"],
+    [POST0043_VERSION_H, "H"],
+    [POST0043_VERSION_P, "P"],
+    [POST0043_VERSION_E, "E"],
+    [POST0043_VERSION_K2, "K2"],
+    [POST0043_VERSION_K1, "K1"],
+    [POST0043_VERSION_T, "T"],
+    [POST0043_VERSION_C, "C"],
+    [POST0043_VERSION_L, "L"],
+  ]);
+  const mutations: { command: string[]; input?: string }[] = [];
+  const routeSettlements: string[] = [];
+  const secretSettlements: {
+    hostedRetiredVersionId: string;
+    parentVersionId: string;
+    executorVersionId: string;
+  }[] = [];
+  const run: RetirementProcess = async (command, options) => {
+    mutations.push({
+      command: [...command],
+      ...(options?.input === undefined ? {} : { input: options.input }),
+    });
+    throw new Error(`unexpected command: ${command.join(" ")}`);
+  };
+  const proofGate: SponsorshipCutoverProofGate = {
+    async authorize(stage) {
+      return { stage, proofSha256: POST0043_PROOF };
+    },
+    async begin() {
+      return {
+        operationId: `sha256:${"7".repeat(64)}`,
+        candidateIdentitySha256: `sha256:${"6".repeat(64)}`,
+        fresh: true,
+        executionClaim: {
+          async execute(mutation) {
+            return await mutation();
+          },
+        },
+      };
+    },
+    async complete() {},
+    async settle() {
+      return undefined;
+    },
+    async adoptPreexistingRouteRemoval() {
+      return POST0043_PROOF;
+    },
+    async settlePreexistingRouteRemoval(versionId) {
+      routeSettlements.push(versionId);
+      return versionId === POST0043_VERSION_P ? POST0043_PROOF : undefined;
+    },
+    async completePost0043LegacySecretRetirement(_handle, successor) {
+      secretSettlements.push({ ...successor });
+    },
+    async settlePost0043LegacySecretRetirement(successor) {
+      secretSettlements.push({ ...successor });
+      return receipt === "complete" ? POST0043_PROOF : undefined;
+    },
+  };
+  const state: RetirementState = {
+    async workerDomains() {
+      return [{ hostname: "api.integration.example.test", service: POST0043_TARGET.workerName }];
+    },
+    async workerDeployments() {
+      return chain.map((versionId, index) =>
+        deployment(
+          `post-0043-deployment-${index + 1}`,
+          versionId,
+          new Date(Date.parse("2026-09-01T12:00:00Z") - index * 60_000).toISOString(),
+        ),
+      );
+    },
+    async workerVersion(_worker, versionId) {
+      const role = roleByVersion.get(versionId);
+      if (role === undefined) throw new Error(`unexpected Version ${versionId}`);
+      const selectedTarget =
+        role === "K1" || role === "K2"
+          ? POST0043_QUIESCED_TARGET
+          : role === "L" || role === "C" || role === "T"
+            ? POST0043_LEGACY_TARGET
+            : POST0043_TARGET;
+      const expectedSecrets =
+        role === "P"
+          ? POST0043_PARENT_SECRETS
+          : role === "H" || role === "A"
+            ? BASE_SECRETS
+            : POST0043_FULL_SECRETS;
+      const serviceBinding =
+        role === "L" || role === "C" ? { service: SERVICE, entrypoint: ENTRYPOINT } : undefined;
+      const secretCreated = role === "P" || role === "H";
+      return versionShape({
+        selectedTarget,
+        expectedSecrets,
+        ...(serviceBinding === undefined ? {} : { serviceBinding }),
+        ...(secretCreated ? { annotations: { "workers/triggered_by": "secret" } } : {}),
+      });
+    },
+    async workerSecrets() {
+      const expected = head === "post-parent" ? POST0043_PARENT_SECRETS : BASE_SECRETS;
+      return expected.map((name) => ({ name, type: "secret_text" }));
+    },
+  };
+  return { state, run, proofGate, mutations, routeSettlements, secretSettlements };
+}
+
 function stateFixture(
   stage: "legacy" | "candidate" | "topology" | "token" | "tokenRestored" | "repaired",
   failure?:
@@ -2096,6 +2443,7 @@ function initialHistory(
 function versionShape(input: {
   readonly serviceBinding?: { readonly service: string; readonly entrypoint: string };
   readonly includeHostedSecret?: boolean;
+  readonly expectedSecrets?: readonly string[];
   readonly includeVersionMetadata?: boolean;
   readonly message?: string | null;
   readonly annotations?: Readonly<Record<string, string>> | null;
@@ -2130,7 +2478,9 @@ function versionShape(input: {
   const expected = expectedTransitionBindingClosure(selectedTarget, {
     serviceBinding: input.serviceBinding ?? null,
     metadataProfile: input.includeVersionMetadata === false ? "pre-version-metadata" : "current",
-    expectedSecrets: input.includeHostedSecret === false ? BASE_SECRETS : HOSTED_SECRETS,
+    expectedSecrets:
+      input.expectedSecrets ??
+      (input.includeHostedSecret === false ? BASE_SECRETS : HOSTED_SECRETS),
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
   });
   const bindings = Object.entries(expected).flatMap(([name, requirement]) =>

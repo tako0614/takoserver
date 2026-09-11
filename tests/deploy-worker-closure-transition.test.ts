@@ -18,6 +18,8 @@ import {
 } from "../scripts/deploy/worker-closure-transition.ts";
 import {
   expectedExactBindingClosure,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  LEGACY_PUBLIC_PARENT_SECRET,
   type WorkerClosureDelta,
 } from "../scripts/deploy/worker-state.ts";
 import {
@@ -42,6 +44,9 @@ const ADDED_BINDING = "CLOUDFLARE_PROVIDER_EXECUTOR";
 const ADDED_SECRET = "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING";
 const ROTATED_SECRET = "TAKOSERVER_SIGNING_KEY";
 const CARRIED_STORE_SECRET = "STRIPE_SECRET_KEY";
+const ARTIFACT_MODE_VAR = "TAKOSERVER_ARTIFACT_BLOB_IO_MODE";
+const UNKNOWN_SECRET = "TAKOSERVER_UNKNOWN_SECRET";
+const LEGACY_SECRET_PAIR = [LEGACY_PUBLIC_PARENT_SECRET, LEGACY_HOSTED_SPONSORSHIP_SECRET] as const;
 const SEAL_KEYRING_VALUE = "seal-keyring-input-value";
 const PROVISIONER_TOKEN_VALUE = "replacement-provisioner-token";
 
@@ -76,6 +81,17 @@ const rollbackTarget = {
   stripeCheckout: true,
 } satisfies DeployTarget;
 
+/** The reviewed 0043 compatibility lane is the only target allowed full custody. */
+const compatibilityTarget = {
+  ...target,
+  artifactBlobIoMode: "pre-0043-quiesced" as const,
+} satisfies DeployTarget;
+
+const compatibilityRollbackTarget = {
+  ...rollbackTarget,
+  artifactBlobIoMode: "pre-0043-quiesced" as const,
+} satisfies DeployTarget;
+
 const INTEGRATION_DELTA: WorkerClosureDelta = {
   retiredVars: [RETIRED_VAR],
   addedVars: [ADDED_VAR],
@@ -83,6 +99,12 @@ const INTEGRATION_DELTA: WorkerClosureDelta = {
   addedBindings: [ADDED_BINDING],
   addedSecrets: [ADDED_SECRET],
   rotatedSecrets: [ROTATED_SECRET],
+};
+
+const COMPATIBILITY_DELTA: WorkerClosureDelta = {
+  ...INTEGRATION_DELTA,
+  addedVars: [...INTEGRATION_DELTA.addedVars, ARTIFACT_MODE_VAR],
+  addedBindings: [],
 };
 
 function targetBindings(
@@ -102,6 +124,8 @@ function predecessorVersion(
     readonly selected?: DeployTarget;
     /** Target secrets this Version does not declare, as a rollback can leave them. */
     readonly dropSecrets?: readonly string[];
+    /** Additional secret bindings carried by the immutable predecessor Version. */
+    readonly versionExtraSecrets?: readonly string[];
     /** Values this Version binds that differ from the ones the target derives. */
     readonly staleVars?: Readonly<Record<string, string>>;
   } = {},
@@ -142,6 +166,10 @@ function predecessorVersion(
         ...(overrides.extraVar === undefined
           ? []
           : [{ name: overrides.extraVar, type: "plain_text", text: "left-over" }]),
+        ...(overrides.versionExtraSecrets ?? []).map((name) => ({
+          name,
+          type: "secret_text",
+        })),
       ],
     },
   };
@@ -551,6 +579,174 @@ describe("reviewed Worker closure transition", () => {
       expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
       expect(parts.calls.some((call) => call.includes("--dry-run"))).toBe(false);
     });
+  });
+
+  test("keeps the 0043 legacy custody pair exact and target-derived", async () => {
+    const accepted = [
+      {
+        name: "ordinary base-only target",
+        selected: target,
+        delta: INTEGRATION_DELTA,
+        fixture: {},
+        carried: [ROTATED_SECRET],
+      },
+      {
+        name: "quiesced target with the CF+Hosted pair",
+        selected: compatibilityTarget,
+        delta: COMPATIBILITY_DELTA,
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: LEGACY_SECRET_PAIR,
+          },
+          storeSecrets: [...expectedWorkerSecrets(compatibilityTarget), ...LEGACY_SECRET_PAIR],
+        },
+        carried: [ROTATED_SECRET, ...LEGACY_SECRET_PAIR].sort(),
+      },
+      {
+        name: "quiesced Stripe target with the CF+Hosted pair",
+        selected: compatibilityRollbackTarget,
+        delta: COMPATIBILITY_DELTA,
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: LEGACY_SECRET_PAIR,
+          },
+          storeSecrets: [
+            ...expectedWorkerSecrets(compatibilityRollbackTarget),
+            ...LEGACY_SECRET_PAIR,
+          ],
+        },
+        carried: [CARRIED_STORE_SECRET, ROTATED_SECRET, ...LEGACY_SECRET_PAIR].sort(),
+      },
+    ] as const;
+
+    for (const [index, scenario] of accepted.entries()) {
+      await withRoot(`takoserver-closure-custody-accepted-${index}-`, async (root) => {
+        const parts = fixture(root, { selected: scenario.selected, ...scenario.fixture });
+        const status = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: scenario.delta,
+          },
+          scenario.selected,
+          {
+            run: parts.run,
+            state: parts.state,
+            providerExecutorQualification: parts.providerExecutorQualification,
+            migrations: parts.migrations,
+            outputDirectory: join(root, "work"),
+          },
+        );
+
+        expect(status.state, scenario.name).toBe("closure-predecessor-current");
+        expect(status.carriedSecrets, scenario.name).toEqual(scenario.carried);
+        expect(
+          parts.calls.some((call) => call.includes("--no-bundle")),
+          scenario.name,
+        ).toBe(false);
+      });
+    }
+  });
+
+  test("rejects partial, unknown, mismatched, and delta-mutated legacy custody", async () => {
+    const base = expectedWorkerSecrets(compatibilityTarget);
+    const refusalCases = [
+      {
+        name: "parent key without Hosted key",
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: [LEGACY_PUBLIC_PARENT_SECRET],
+          },
+          storeSecrets: [...base, LEGACY_PUBLIC_PARENT_SECRET],
+        },
+        delta: COMPATIBILITY_DELTA,
+      },
+      {
+        name: "Hosted key without parent key",
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: [LEGACY_HOSTED_SPONSORSHIP_SECRET],
+          },
+          storeSecrets: [...base, LEGACY_HOSTED_SPONSORSHIP_SECRET],
+        },
+        delta: COMPATIBILITY_DELTA,
+      },
+      {
+        name: "unknown Version secret",
+        fixture: {
+          predecessor: { dropVar: ARTIFACT_MODE_VAR, versionExtraSecrets: [UNKNOWN_SECRET] },
+          storeSecrets: base,
+        },
+        delta: COMPATIBILITY_DELTA,
+      },
+      {
+        name: "unknown store secret",
+        fixture: {
+          predecessor: { dropVar: ARTIFACT_MODE_VAR },
+          storeSecrets: [...base, UNKNOWN_SECRET],
+        },
+        delta: COMPATIBILITY_DELTA,
+      },
+      {
+        name: "Version and store hold different legacy keys",
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: LEGACY_SECRET_PAIR,
+          },
+          storeSecrets: [...base, LEGACY_PUBLIC_PARENT_SECRET],
+        },
+        delta: COMPATIBILITY_DELTA,
+      },
+      {
+        name: "delta attempts to rotate a carried legacy key",
+        fixture: {
+          predecessor: {
+            dropVar: ARTIFACT_MODE_VAR,
+            versionExtraSecrets: LEGACY_SECRET_PAIR,
+          },
+          storeSecrets: [...base, ...LEGACY_SECRET_PAIR],
+        },
+        delta: {
+          ...COMPATIBILITY_DELTA,
+          addedSecrets: [...COMPATIBILITY_DELTA.addedSecrets, LEGACY_PUBLIC_PARENT_SECRET],
+        },
+      },
+    ] as const;
+
+    for (const [index, scenario] of refusalCases.entries()) {
+      await withRoot(`takoserver-closure-custody-refusal-${index}-`, async (root) => {
+        const parts = fixture(root, { selected: compatibilityTarget, ...scenario.fixture });
+        const refusal = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: scenario.delta,
+          },
+          compatibilityTarget,
+          {
+            run: parts.run,
+            state: parts.state,
+            providerExecutorQualification: parts.providerExecutorQualification,
+            migrations: parts.migrations,
+            outputDirectory: join(root, "work"),
+          },
+        ).catch((error: unknown) => error);
+
+        expect(refusal, scenario.name).toBeInstanceOf(DeployError);
+        expect((refusal as DeployError).phase, scenario.name).toBe("preflight");
+      });
+    }
   });
 
   test("refuses an unqualified provider executor before reading or publishing the public Worker", async () => {

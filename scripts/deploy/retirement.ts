@@ -19,11 +19,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import {
-  expectedWorkerSecrets,
-  type WorkerConfigOptions,
-  writeWorkerConfig,
-} from "./realized-config.ts";
+import { type WorkerConfigOptions, writeWorkerConfig } from "./realized-config.ts";
 import {
   createRemoteSponsorshipCutoverConsumptionDatabase,
   type SponsorshipCutoverConsumptionDatabase,
@@ -55,12 +51,18 @@ import {
   assertExactVersionBindingClosure,
   expectedTransitionBindingClosure,
   extractLegacyHostServiceBinding,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET,
   type LegacyHostServiceBinding,
   parseWorkerDeploymentHistory,
+  versionSecretBindingNames,
   type WorkerDeploymentHistory,
+  workerLegacySecretCustodyProfile,
+  workerSecretsForLegacyCustody,
 } from "./worker-state.ts";
 
-export const HOSTED_SPONSORSHIP_SECRET = ["TAKOSERVER", "HOSTED", "SPONSORSHIP", "TOKEN"].join("_");
+export const HOSTED_SPONSORSHIP_SECRET = LEGACY_HOSTED_SPONSORSHIP_SECRET;
+const QUIESCED_ARTIFACT_MODE = "pre-0043-quiesced" as const;
+const PROVIDER_EXECUTOR_BINDING = "CLOUDFLARE_PROVIDER_EXECUTOR" as const;
 
 /**
  * Retirement only follows the known provider-history suffix. Older history is
@@ -177,6 +179,26 @@ export async function runAuthorityTransition(
   const temporary = options.outputDirectory === undefined;
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    if (invocation.surface === "takoserver-sponsorship-public-route-retirement") {
+      const post0043 = await inspectPost0043RetirementLineage(
+        "preflight",
+        target,
+        state,
+        selector,
+        invocation.commit,
+      );
+      if (post0043 !== null) {
+        return await runPost0043RouteSettlement(
+          invocation,
+          target,
+          state,
+          run,
+          options,
+          root,
+          post0043,
+        );
+      }
+    }
     const current = await currentHistory("preflight", target, state);
     const predecessor = await readVersionAt("preflight", target, state, current.versionId);
     const service = extractLegacyHostServiceBinding("preflight", current.versionId, predecessor);
@@ -436,6 +458,147 @@ export async function runAuthorityTransition(
   }
 }
 
+async function runPost0043RouteSettlement(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  run: RetirementProcess,
+  options: RetirementOptions,
+  root: string,
+  before: Post0043RetirementLineage,
+): Promise<Record<string, unknown>> {
+  if (before.head !== "post-parent") {
+    throw preflightError(
+      "preexisting route-removal settlement requires the exact post-parent P Version",
+    );
+  }
+  if (invocation.reverse) {
+    throw preflightError(
+      "preexisting route removal has no provider effect to reverse after the 0043 compatibility exit",
+    );
+  }
+  const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+  if (invocation.action === "status") {
+    const proofSha256 = await proofGate.settlePreexistingRouteRemoval(before.parentVersionId);
+    return {
+      kind: "takoserver.worker-authority-transition-status@v1",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      selectedCommit: invocation.commit,
+      state:
+        proofSha256 === undefined
+          ? "preexisting-route-removal-unsettled"
+          : "preexisting-route-removal-settled",
+      ready: proofSha256 !== undefined,
+      canApply: proofSha256 === undefined,
+      versionId: before.history.versionId,
+      previousVersionId: before.history.previousVersionId,
+      deployedCommit: before.selectedIdentity.commit,
+      artifactDigest: digestValue(before.selectedIdentity.bundleDigestHex),
+      service: before.service.service,
+      entrypoint: before.service.entrypoint,
+      providerMutationRequired: false,
+      observedPreexistingRouteRemoval: true,
+      ...(proofSha256 === undefined ? {} : { sponsorshipCutoverProofSha256: proofSha256 }),
+    };
+  }
+
+  const reviewer = exactReviewer(
+    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+  );
+  const source = await qualifySource({
+    environment: invocation.environment === "integration" ? "integration" : "production",
+    commit: invocation.commit,
+    run,
+  });
+  if (source.commit !== before.selectedIdentity.commit) {
+    throw preflightError("preexisting route-removal source differs from the exact E Version");
+  }
+  const gate = await run(["bun", "run", "check"]);
+  if (gate.exitCode !== 0) {
+    throw preflightError(
+      `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
+      `${gate.stdout}${gate.stderr}`.trim(),
+    );
+  }
+  const prepared = await prepareWorkerArtifact({
+    root,
+    target,
+    commit: source.commit,
+    signingKeyId: target.signing.currentKeyId,
+    run,
+    environment: options.cloudflareEnvironment,
+    writeConfig: transitionConfigWriter(
+      target,
+      source.commit,
+      undefined,
+      hostedVersionSecrets(target),
+    ),
+  });
+  if (prepared.bundleDigestHex !== before.selectedIdentity.bundleDigestHex) {
+    throw preflightError(
+      "preexisting route-removal settlement source differs from the served E artifact",
+    );
+  }
+  const artifact = prepared.seal();
+  artifact.assertUnchanged();
+  const fresh = await inspectPost0043RetirementLineage(
+    "preflight",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    fresh === null ||
+    fresh.head !== "post-parent" ||
+    fresh.fingerprint !== before.fingerprint ||
+    !sameDeploymentHistory(fresh.history, before.history)
+  ) {
+    throw preflightError("post-0043 custody prefix changed before route settlement");
+  }
+  const proofSha256 = await proofGate.adoptPreexistingRouteRemoval({
+    sourceCommit: source.commit,
+    bundleSha256: `sha256:${prepared.bundleDigestHex}`,
+    configSha256: digestFile(prepared.configPath),
+  });
+  artifact.assertUnchanged();
+  const after = await inspectPost0043RetirementLineage(
+    "verification",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    after === null ||
+    after.head !== "post-parent" ||
+    after.fingerprint !== before.fingerprint ||
+    !sameDeploymentHistory(after.history, before.history)
+  ) {
+    throw verificationError("preexisting route-removal settlement changed the served Worker state");
+  }
+  return {
+    kind: "takoserver.worker-authority-transition-apply@v1",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    state: "preexisting-route-removal-settled",
+    commit: source.commit,
+    reviewer,
+    previousVersionId: before.history.previousVersionId,
+    versionId: before.history.versionId,
+    service: before.service.service,
+    entrypoint: before.service.entrypoint,
+    artifactDigest: artifact.digest,
+    artifactBytes: artifact.bytes,
+    bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+    sponsorshipCutoverProofSha256: proofSha256,
+    providerMutationApplied: false,
+    receiptMutationApplied: true,
+    observedPreexistingRouteRemoval: true,
+  };
+}
+
 async function authorityCandidateStatus(
   invocation: RetirementInvocation,
   target: DeployTarget,
@@ -615,6 +778,54 @@ async function runTopologyRetirement(
   try {
     const beforeHistory = await currentHistory("preflight", target, state);
     const beforeVersion = await readVersionAt("preflight", target, state, beforeHistory.versionId);
+    const post0043 = await inspectPost0043RetirementLineage(
+      "preflight",
+      target,
+      state,
+      selector,
+      invocation.commit,
+    );
+    if (post0043 !== null) {
+      if (post0043.head !== "post-parent") {
+        throw preflightError(
+          "post-0043 topology status is only defined at the exact post-parent P Version",
+        );
+      }
+      if (invocation.action === "apply") {
+        throw preflightError(
+          "post-0043 topology is already retired; no provider apply or reverse is permitted",
+        );
+      }
+      const proofSha256 = await requiredProofGate(
+        invocation,
+        target,
+        state,
+        options,
+        root,
+        run,
+      ).settlePreexistingRouteRemoval(post0043.parentVersionId);
+      return {
+        kind: "takoserver.host-runtime-topology-retirement-status@v1",
+        surface: invocation.surface,
+        environment: invocation.environment,
+        selectedCommit: invocation.commit,
+        state:
+          proofSha256 === undefined
+            ? "preexisting-topology-retired-unsettled"
+            : "preexisting-topology-retired",
+        ready: proofSha256 !== undefined,
+        canApply: false,
+        versionId: post0043.history.versionId,
+        previousVersionId: post0043.history.previousVersionId,
+        deployedCommit: post0043.selectedIdentity.commit,
+        artifactDigest: digestValue(post0043.selectedIdentity.bundleDigestHex),
+        serviceRemoved: legacyServiceBindingName(),
+        secretRetained: HOSTED_SPONSORSHIP_SECRET,
+        providerMutationRequired: false,
+        observedPreexistingTopologyRetirement: true,
+        ...(proofSha256 === undefined ? {} : { sponsorshipCutoverProofSha256: proofSha256 }),
+      };
+    }
     const topologyPresent = hasMaterializerBinding(beforeVersion);
     if (!topologyPresent) {
       const beforeInventory = await state.workerSecrets(target.workerName);
@@ -1135,6 +1346,25 @@ async function runAttributionRepair(
   const temporary = options.outputDirectory === undefined;
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    const post0043 = await inspectPost0043RetirementLineage(
+      "preflight",
+      target,
+      state,
+      selector,
+      invocation.commit,
+    );
+    if (post0043 !== null) {
+      return await runPost0043AttributionRepair(
+        invocation,
+        target,
+        state,
+        run,
+        options,
+        root,
+        unattributedSelector,
+        post0043,
+      );
+    }
     const beforeHistory = await currentHistory("preflight", target, state);
     const before = await inspectAttributionRepairLineage(
       "preflight",
@@ -1337,6 +1567,254 @@ async function runAttributionRepair(
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+async function runPost0043AttributionRepair(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  run: RetirementProcess,
+  options: RetirementOptions,
+  root: string,
+  unattributedSelector: string,
+  before: Post0043RetirementLineage,
+): Promise<Record<string, unknown>> {
+  if (before.head === "post-parent") {
+    throw preflightError("post-0043 attribution repair requires Hosted secret retirement first");
+  }
+  const expectedUnattributedVersionId =
+    before.head === "hosted-retired" ? before.history.versionId : before.hostedRetiredVersionId;
+  if (
+    expectedUnattributedVersionId === null ||
+    expectedUnattributedVersionId !== unattributedSelector
+  ) {
+    throw preflightError("post-0043 attribution repair selector is not the exact H Version");
+  }
+  const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+  const receiptProofSha256 = await requirePost0043LegacySecretReceipt(
+    "preflight",
+    proofGate,
+    before,
+  );
+  if (invocation.action === "status") {
+    const probe = await probeRetirementProduct(
+      target.publicOrigin,
+      options.fetcher ?? ((input, init) => fetch(input, init)),
+    );
+    const final = await inspectPost0043RetirementLineage(
+      "verification",
+      target,
+      state,
+      before.legacyVersionId,
+      invocation.commit,
+    );
+    if (
+      final === null ||
+      final.head !== before.head ||
+      final.fingerprint !== before.fingerprint ||
+      !sameDeploymentHistory(final.history, before.history)
+    ) {
+      throw verificationError("post-0043 attribution status changed during final inspection");
+    }
+    const finalReceiptProofSha256 = await requirePost0043LegacySecretReceipt(
+      "verification",
+      proofGate,
+      final,
+    );
+    if (finalReceiptProofSha256 !== receiptProofSha256) {
+      throw verificationError("post-0043 attribution status changed proof authority");
+    }
+    return post0043AttributionStatus(invocation, final, probe, finalReceiptProofSha256);
+  }
+  if (before.head === "attributed") {
+    throw preflightError(
+      "post-0043 attribution repair has already created the exact A successor; run --status",
+    );
+  }
+  const source = await qualifySource({
+    environment: invocation.environment === "integration" ? "integration" : "production",
+    commit: invocation.commit,
+    run,
+  });
+  if (source.commit !== before.selectedIdentity.commit) {
+    throw preflightError("attribution repair source differs from the exact compatibility exit");
+  }
+  const gate = await run(["bun", "run", "check"]);
+  if (gate.exitCode !== 0) {
+    throw preflightError(
+      `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
+      `${gate.stdout}${gate.stderr}`.trim(),
+    );
+  }
+  const prepared = await prepareWorkerArtifact({
+    root,
+    target,
+    commit: source.commit,
+    signingKeyId: target.signing.currentKeyId,
+    run,
+    environment: options.cloudflareEnvironment,
+    writeConfig: transitionConfigWriter(
+      target,
+      source.commit,
+      undefined,
+      baseWorkerSecrets(target),
+    ),
+  });
+  if (prepared.bundleDigestHex !== before.selectedIdentity.bundleDigestHex) {
+    throw preflightError(
+      "post-0043 attribution repair refuses bytes different from the exact E Version",
+    );
+  }
+  const artifact = prepared.seal();
+  artifact.assertUnchanged();
+  const fresh = await inspectPost0043RetirementLineage(
+    "preflight",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    fresh === null ||
+    fresh.head !== "hosted-retired" ||
+    fresh.fingerprint !== before.fingerprint ||
+    !sameDeploymentHistory(fresh.history, before.history)
+  ) {
+    throw preflightError("post-0043 H custody prefix changed before attribution repair");
+  }
+  const freshReceiptProofSha256 = await requirePost0043LegacySecretReceipt(
+    "preflight",
+    proofGate,
+    fresh,
+  );
+  if (freshReceiptProofSha256 !== receiptProofSha256) {
+    throw preflightError("post-0043 attribution repair proof authority changed before upload");
+  }
+  const upload = await run(
+    wranglerCommand([
+      "deploy",
+      prepared.bundlePath,
+      "--no-bundle",
+      "--config",
+      prepared.configPath,
+      "--strict",
+      "--message",
+      `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
+    ]),
+    providerOptions(options.cloudflareEnvironment),
+  );
+  if (upload.exitCode !== 0) {
+    throw mutationError(
+      "attribution repair upload acknowledgement is indeterminate; run --status before repair",
+      `${upload.stdout}${upload.stderr}`.trim(),
+    );
+  }
+  const after = await inspectPost0043RetirementLineage(
+    "verification",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    after === null ||
+    after.head !== "attributed" ||
+    after.history.previousVersionId !== unattributedSelector ||
+    after.hostedRetiredVersionId !== unattributedSelector ||
+    after.currentCommit !== source.commit ||
+    after.currentBundleDigestHex !== prepared.bundleDigestHex ||
+    !samePost0043Anchors(before, after)
+  ) {
+    throw verificationError(
+      "post-0043 attribution repair did not create the exact A successor of H",
+    );
+  }
+  const afterReceiptProofSha256 = await requirePost0043LegacySecretReceipt(
+    "verification",
+    proofGate,
+    after,
+  );
+  if (afterReceiptProofSha256 !== receiptProofSha256) {
+    throw verificationError("post-0043 attribution repair changed proof authority");
+  }
+  artifact.assertUnchanged();
+  const probe = await probeRetirementProduct(
+    target.publicOrigin,
+    options.fetcher ?? ((input, init) => fetch(input, init)),
+  );
+  const final = await inspectPost0043RetirementLineage(
+    "verification",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    final === null ||
+    final.head !== "attributed" ||
+    final.fingerprint !== after.fingerprint ||
+    !sameDeploymentHistory(final.history, after.history)
+  ) {
+    throw verificationError("post-0043 attribution repair final inspection no longer proves A");
+  }
+  const finalReceiptProofSha256 = await requirePost0043LegacySecretReceipt(
+    "verification",
+    proofGate,
+    final,
+  );
+  if (finalReceiptProofSha256 !== receiptProofSha256) {
+    throw verificationError("post-0043 attribution repair final proof authority changed");
+  }
+  return {
+    kind: "takoserver.worker-retirement-attribution-repair-apply@v1",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    state: "token-retirement-attribution-repaired",
+    commit: source.commit,
+    previousVersionId: unattributedSelector,
+    versionId: final.history.versionId,
+    artifactDigest: artifact.digest,
+    artifactBytes: artifact.bytes,
+    artifactFiles: artifact.files,
+    bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+    scriptContentIdentity: final.currentScriptEtag,
+    sponsorshipCutoverProofSha256: finalReceiptProofSha256,
+    probe,
+  };
+}
+
+function post0043AttributionStatus(
+  invocation: RetirementInvocation,
+  lineage: Post0043RetirementLineage,
+  probe: Awaited<ReturnType<typeof probeRetirementProduct>>,
+  proofSha256: string,
+): Record<string, unknown> {
+  return {
+    kind: "takoserver.worker-retirement-attribution-repair-status@v1",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    selectedCommit: invocation.commit,
+    state:
+      lineage.head === "attributed"
+        ? "token-retirement-attribution-repaired"
+        : "token-retired-unattributed-successor",
+    ready: true,
+    repairRequired: false,
+    attributionRepairAvailable: lineage.head !== "attributed",
+    versionId: lineage.history.versionId,
+    previousVersionId: lineage.history.previousVersionId,
+    unattributedVersionId: lineage.hostedRetiredVersionId ?? lineage.history.versionId,
+    trustedCompatibilityExitVersionId: lineage.executorVersionId,
+    trustedCommit: lineage.selectedIdentity.commit,
+    trustedArtifactDigest: `sha256:${lineage.selectedIdentity.bundleDigestHex}`,
+    deployedCommit: lineage.currentCommit,
+    artifactDigest: digestValue(lineage.currentBundleDigestHex),
+    scriptContentIdentity: lineage.currentScriptEtag,
+    serviceRetired: true,
+    secretRetired: true,
+    sponsorshipCutoverProofSha256: proofSha256,
+    probe,
+  };
 }
 
 function attributionRepairStatus(
@@ -1607,6 +2085,24 @@ async function runTokenRetirement(
   const temporary = options.outputDirectory === undefined;
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
+    const post0043 = await inspectPost0043RetirementLineage(
+      "preflight",
+      target,
+      state,
+      selector,
+      invocation.commit,
+    );
+    if (post0043 !== null) {
+      return await runPost0043TokenRetirement(
+        invocation,
+        target,
+        state,
+        run,
+        options,
+        root,
+        post0043,
+      );
+    }
     const beforeHistory = await currentHistory("preflight", target, state);
     const beforeVersion = await readVersionAt("preflight", target, state, beforeHistory.versionId);
     if (hasMaterializerBinding(beforeVersion)) {
@@ -1897,6 +2393,176 @@ async function runTokenRetirement(
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
+}
+
+async function runPost0043TokenRetirement(
+  invocation: RetirementInvocation,
+  target: DeployTarget,
+  state: RetirementState,
+  run: RetirementProcess,
+  options: RetirementOptions,
+  root: string,
+  before: Post0043RetirementLineage,
+): Promise<Record<string, unknown>> {
+  if (invocation.action === "status") {
+    let proofSha256: string | undefined;
+    if (before.head === "post-parent") {
+      proofSha256 = await requiredProofGate(
+        invocation,
+        target,
+        state,
+        options,
+        root,
+        run,
+      ).settlePreexistingRouteRemoval(before.parentVersionId);
+    } else {
+      proofSha256 = await requirePost0043LegacySecretReceipt(
+        "preflight",
+        requiredProofGate(invocation, target, state, options, root, run),
+        before,
+      );
+    }
+    return {
+      kind: "takoserver.hosted-token-retirement-status@v1",
+      surface: invocation.surface,
+      environment: invocation.environment,
+      selectedCommit: invocation.commit,
+      state:
+        before.head === "post-parent"
+          ? proofSha256 === undefined
+            ? "preexisting-topology-retired-unsettled"
+            : "preexisting-topology-retired"
+          : before.head === "hosted-retired"
+            ? "token-retired-unattributed-successor"
+            : "token-retirement-attribution-repaired",
+      ready: before.head !== "post-parent" && proofSha256 !== undefined,
+      canApply: before.head === "post-parent" && proofSha256 !== undefined,
+      repairRequired: false,
+      attributionRepairAvailable: before.head === "hosted-retired",
+      versionId: before.history.versionId,
+      previousVersionId: before.history.previousVersionId,
+      deployedCommit: before.currentCommit,
+      trustedCommit: before.selectedIdentity.commit,
+      artifactDigest: digestValue(before.selectedIdentity.bundleDigestHex),
+      secretPresent: before.head === "post-parent",
+      serviceRetired: true,
+      predecessorService: before.service.service,
+      predecessorEntrypoint: before.service.entrypoint,
+      observedPreexistingTopologyRetirement: true,
+      ...(proofSha256 === undefined ? {} : { sponsorshipCutoverProofSha256: proofSha256 }),
+    };
+  }
+  if (before.head !== "post-parent") {
+    throw preflightError("post-0043 Hosted sponsorship secret is already absent; run --status");
+  }
+
+  const reviewer = exactReviewer(
+    options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+  );
+  const proofGate = requiredProofGate(invocation, target, state, options, root, run);
+  const routeProof = await proofGate.settlePreexistingRouteRemoval(before.parentVersionId);
+  if (routeProof === undefined) {
+    throw preflightError(
+      "Hosted token retirement requires the current proof's preexisting route-removal settlement",
+    );
+  }
+  const proof = await proofGate.authorize("legacy-secret-retirement");
+  const authorityProfile = provenanceBoundAuthorityProfile(
+    "preflight",
+    target,
+    before.selectedIdentity.commit,
+    before.selectedIdentity.bundleDigestHex,
+  );
+  const configPath = writeWorkerConfig(target, {
+    path: join(root, "post-0043-token-retirement-wrangler.jsonc"),
+    main: resolve(REPOSITORY, "src/entry-cloudflare-worker.ts"),
+    commit: invocation.commit,
+    signingKeyId: target.signing.currentKeyId,
+    transitionExpectedSecrets: hostedVersionSecrets(target),
+    ...(authorityProfile === undefined ? {} : { authorityProfile }),
+  });
+  const fresh = await inspectPost0043RetirementLineage(
+    "preflight",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    fresh === null ||
+    fresh.head !== "post-parent" ||
+    fresh.fingerprint !== before.fingerprint ||
+    !sameDeploymentHistory(fresh.history, before.history)
+  ) {
+    throw preflightError("post-0043 custody prefix changed before Hosted secret retirement");
+  }
+  const started = await proofGate.begin(proof, {
+    sourceCommit: before.selectedIdentity.commit,
+    bundleSha256: `sha256:${before.selectedIdentity.bundleDigestHex}`,
+    configSha256: digestFile(configPath),
+  });
+  if (!started.fresh) {
+    throw preflightError(
+      "sponsorship cutover start already exists; apply is forbidden and only status reconciliation is allowed",
+    );
+  }
+  const mutation = await started.executionClaim.execute(
+    async () =>
+      await run(
+        wranglerCommand([
+          "secret",
+          "delete",
+          HOSTED_SPONSORSHIP_SECRET,
+          "--name",
+          target.workerName,
+          "--config",
+          configPath,
+        ]),
+        providerOptions(options.cloudflareEnvironment),
+      ),
+  );
+  if (mutation.exitCode !== 0) {
+    throw mutationError(
+      "Hosted token retirement acknowledgement is indeterminate; run --status before repair",
+      `${mutation.stdout}${mutation.stderr}`.trim(),
+    );
+  }
+  const after = await inspectPost0043RetirementLineage(
+    "verification",
+    target,
+    state,
+    before.legacyVersionId,
+    invocation.commit,
+  );
+  if (
+    after === null ||
+    after.head !== "hosted-retired" ||
+    after.hostedRetiredVersionId !== after.history.versionId ||
+    after.parentVersionId !== before.parentVersionId ||
+    after.history.previousVersionId !== before.parentVersionId ||
+    !samePost0043Anchors(before, after)
+  ) {
+    throw verificationError("Hosted token retirement did not create the exact H successor of P");
+  }
+  await proofGate.completePost0043LegacySecretRetirement(proof, {
+    hostedRetiredVersionId: after.history.versionId,
+    parentVersionId: after.parentVersionId,
+    executorVersionId: after.executorVersionId,
+  });
+  return {
+    kind: "takoserver.hosted-token-retirement-apply@v1",
+    surface: invocation.surface,
+    environment: invocation.environment,
+    state: "token-retired-unattributed-successor",
+    reviewer,
+    versionId: after.history.versionId,
+    previousVersionId: before.history.versionId,
+    commit: null,
+    secretRemoved: HOSTED_SPONSORSHIP_SECRET,
+    repairRequired: false,
+    attributionRepairAvailable: true,
+    sponsorshipCutoverProofSha256: proof.proofSha256,
+  };
 }
 
 function requiredProofGate(
@@ -2349,11 +3015,535 @@ async function currentHistory(
 }
 
 function hostedVersionSecrets(target: DeployTarget): readonly string[] {
-  return [...new Set([...expectedWorkerSecrets(target), HOSTED_SPONSORSHIP_SECRET])].sort();
+  return workerSecretsForLegacyCustody(target, "post-parent");
 }
 
 function baseWorkerSecrets(target: DeployTarget): readonly string[] {
-  return expectedWorkerSecrets(target).filter((name) => name !== HOSTED_SPONSORSHIP_SECRET);
+  return workerSecretsForLegacyCustody(target, "base");
+}
+
+function fullLegacyCustodySecrets(target: DeployTarget): readonly string[] {
+  return workerSecretsForLegacyCustody(target, "full");
+}
+
+type Post0043RetirementHead = "post-parent" | "hosted-retired" | "attributed";
+
+interface Post0043RetirementLineage {
+  readonly head: Post0043RetirementHead;
+  readonly history: WorkerDeploymentHistory;
+  readonly currentCommit: string | null;
+  readonly currentBundleDigestHex: string | null;
+  readonly selectedIdentity: { readonly commit: string; readonly bundleDigestHex: string };
+  readonly currentScriptEtag: string;
+  readonly service: LegacyHostServiceBinding;
+  readonly parentVersionId: string;
+  readonly hostedRetiredVersionId: string | null;
+  readonly executorVersionId: string;
+  readonly quiescedCurrentVersionId: string;
+  readonly quiescedRollbackVersionId: string;
+  readonly topologyVersionId: string;
+  readonly candidateVersionId: string;
+  readonly legacyVersionId: string;
+  readonly fingerprint: string;
+}
+
+async function requirePost0043LegacySecretReceipt(
+  phase: DeployPhase,
+  proofGate: SponsorshipCutoverProofGate,
+  lineage: Post0043RetirementLineage,
+): Promise<string> {
+  const hostedRetiredVersionId =
+    lineage.head === "hosted-retired" ? lineage.history.versionId : lineage.hostedRetiredVersionId;
+  if (hostedRetiredVersionId === null) {
+    throw phaseError(phase, "post-0043 Hosted retirement has no exact H Version");
+  }
+  const proofSha256 = await proofGate.settlePost0043LegacySecretRetirement({
+    hostedRetiredVersionId,
+    parentVersionId: lineage.parentVersionId,
+    executorVersionId: lineage.executorVersionId,
+  });
+  if (proofSha256 === undefined) {
+    throw phaseError(
+      phase,
+      "terminal post-0043 secret retirement requires its exact durable receipt",
+    );
+  }
+  return proofSha256;
+}
+
+/**
+ * Recognizes only the fixed compatibility-exit word:
+ *
+ *   [A <-] [H <-] P <- E <- K2 <- K1 <- T <- C <- L
+ *
+ * K1/K2/E are one selected source and script, P/H are the two provider-created
+ * secret successors, and the older T/C/L word remains independently exact.
+ * This is deliberately separate from the legacy ancestry walkers: new and old
+ * source bytes are not compared, and no unbounded history search is allowed.
+ */
+async function inspectPost0043RetirementLineage(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: RetirementState,
+  legacySelector: string,
+  selectedCommit: string,
+): Promise<Post0043RetirementLineage | null> {
+  if (target.artifactBlobIoMode !== undefined) {
+    throw phaseError(phase, "post-0043 retirement requires the normal Worker target");
+  }
+  // The compatibility exit exists only for a target that selects the provider
+  // executor. Preserve the established legacy retirement read sequence for
+  // ordinary targets instead of speculatively walking their deployment history.
+  if (target.cloudflareProviderExecutor === undefined) return null;
+  const chain = await deploymentChain(phase, target, state);
+  const currentEntry = chain[0];
+  if (currentEntry === undefined) return null;
+  const currentVersion = await readVersionAt(phase, target, state, currentEntry.versionId);
+  if (!hasNamedBinding(currentVersion, PROVIDER_EXECUTOR_BINDING)) return null;
+
+  const currentCustody = workerLegacySecretCustodyProfile(
+    phase,
+    versionSecretBindingNames(phase, currentEntry.versionId, currentVersion),
+    ["base", "post-parent"],
+  );
+  const currentAnnotation = workerVersionAnnotationProfile(currentVersion);
+  let head: Post0043RetirementHead;
+  let parentIndex: 0 | 1 | 2;
+  if (currentCustody === "post-parent" && currentAnnotation === "secret-created") {
+    head = "post-parent";
+    parentIndex = 0;
+  } else if (currentCustody === "base" && currentAnnotation === "secret-created") {
+    head = "hosted-retired";
+    parentIndex = 1;
+  } else if (currentCustody === "base" && currentAnnotation === "canonical") {
+    head = "attributed";
+    parentIndex = 2;
+  } else {
+    throw phaseError(phase, "post-0043 retirement head has an invalid custody provenance");
+  }
+
+  const parentEntry = chain[parentIndex];
+  const hostedRetiredEntry = head === "post-parent" ? undefined : chain[parentIndex - 1];
+  const executorEntry = chain[parentIndex + 1];
+  const quiescedCurrentEntry = chain[parentIndex + 2];
+  const quiescedRollbackEntry = chain[parentIndex + 3];
+  const topologyEntry = chain[parentIndex + 4];
+  const candidateEntry = chain[parentIndex + 5];
+  const legacyEntry = chain[parentIndex + 6];
+  if (
+    parentEntry === undefined ||
+    executorEntry === undefined ||
+    quiescedCurrentEntry === undefined ||
+    quiescedRollbackEntry === undefined ||
+    topologyEntry === undefined ||
+    candidateEntry === undefined ||
+    legacyEntry === undefined ||
+    legacyEntry.versionId !== legacySelector
+  ) {
+    throw phaseError(
+      phase,
+      "post-0043 retirement requires the exact P-E-K2-K1-T-C-L custody prefix",
+    );
+  }
+  const throughLegacy = chain.slice(0, parentIndex + 7);
+  if (
+    new Set(throughLegacy.map(({ deploymentId }) => deploymentId)).size !== throughLegacy.length ||
+    new Set(throughLegacy.map(({ versionId }) => versionId)).size !== throughLegacy.length
+  ) {
+    throw phaseError(phase, "post-0043 retirement custody prefix contains a lineage cycle");
+  }
+  const history = await currentHistory(phase, target, state);
+  if (
+    history.deploymentId !== currentEntry.deploymentId ||
+    history.versionId !== currentEntry.versionId ||
+    history.previousVersionId !== chain[1]?.versionId
+  ) {
+    throw phaseError(phase, "post-0043 retirement history changed during prefix inspection");
+  }
+
+  const entries = [
+    parentEntry,
+    ...(hostedRetiredEntry === undefined ? [] : [hostedRetiredEntry]),
+    executorEntry,
+    quiescedCurrentEntry,
+    quiescedRollbackEntry,
+    topologyEntry,
+    candidateEntry,
+    legacyEntry,
+  ];
+  const versions = new Map<string, unknown>();
+  for (const entry of entries) {
+    versions.set(entry.versionId, await readVersionAt(phase, target, state, entry.versionId));
+  }
+  versions.set(currentEntry.versionId, currentVersion);
+  const versionAt = (entry: DeploymentChainEntry): unknown => {
+    const version = versions.get(entry.versionId);
+    if (version === undefined) {
+      throw phaseError(phase, "post-0043 retirement Version readback is incomplete");
+    }
+    return version;
+  };
+
+  const parentVersion = versionAt(parentEntry);
+  const executorVersion = versionAt(executorEntry);
+  const quiescedCurrentVersion = versionAt(quiescedCurrentEntry);
+  const quiescedRollbackVersion = versionAt(quiescedRollbackEntry);
+  const topologyVersion = versionAt(topologyEntry);
+  const candidateVersion = versionAt(candidateEntry);
+  const legacyVersion = versionAt(legacyEntry);
+  const hostedRetiredVersion =
+    hostedRetiredEntry === undefined ? undefined : versionAt(hostedRetiredEntry);
+
+  assertAnnotationProfile(phase, parentEntry.versionId, parentVersion, "secret-created");
+  workerLegacySecretCustodyProfile(
+    phase,
+    versionSecretBindingNames(phase, parentEntry.versionId, parentVersion),
+    ["post-parent"],
+  );
+  if (hostedRetiredEntry !== undefined && hostedRetiredVersion !== undefined) {
+    assertAnnotationProfile(
+      phase,
+      hostedRetiredEntry.versionId,
+      hostedRetiredVersion,
+      "secret-created",
+    );
+    workerLegacySecretCustodyProfile(
+      phase,
+      versionSecretBindingNames(phase, hostedRetiredEntry.versionId, hostedRetiredVersion),
+      ["base"],
+    );
+  }
+  assertAnnotationProfile(phase, executorEntry.versionId, executorVersion, "canonical");
+  assertAnnotationProfile(
+    phase,
+    quiescedCurrentEntry.versionId,
+    quiescedCurrentVersion,
+    "canonical",
+  );
+  assertAnnotationProfile(
+    phase,
+    quiescedRollbackEntry.versionId,
+    quiescedRollbackVersion,
+    "canonical",
+  );
+  assertAnnotationProfile(phase, topologyEntry.versionId, topologyVersion, "canonical");
+  assertAnnotationProfile(phase, candidateEntry.versionId, candidateVersion, "canonical");
+  assertAnnotationProfile(phase, legacyEntry.versionId, legacyVersion, "canonical");
+
+  const executorIdentity = requiredVersionIdentity(phase, executorEntry.versionId, executorVersion);
+  const quiescedCurrentIdentity = requiredVersionIdentity(
+    phase,
+    quiescedCurrentEntry.versionId,
+    quiescedCurrentVersion,
+  );
+  const quiescedRollbackIdentity = requiredVersionIdentity(
+    phase,
+    quiescedRollbackEntry.versionId,
+    quiescedRollbackVersion,
+  );
+  if (
+    executorIdentity.commit !== selectedCommit ||
+    quiescedCurrentIdentity.commit !== selectedCommit ||
+    quiescedRollbackIdentity.commit !== selectedCommit ||
+    executorIdentity.bundleDigestHex !== quiescedCurrentIdentity.bundleDigestHex ||
+    executorIdentity.bundleDigestHex !== quiescedRollbackIdentity.bundleDigestHex
+  ) {
+    throw phaseError(
+      phase,
+      "post-0043 K1/K2/E Versions do not identify one exact selected artifact",
+    );
+  }
+
+  const executorAuthority = requireCurrentAuthorityProfile(
+    phase,
+    target,
+    executorEntry.versionId,
+    executorVersion,
+  );
+  const quiescedTarget = { ...target, artifactBlobIoMode: QUIESCED_ARTIFACT_MODE };
+  const legacyTarget = withoutProviderExecutor(target);
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    executorEntry.versionId,
+    executorVersion,
+    null,
+    fullLegacyCustodySecrets(target),
+    executorAuthority,
+  );
+  assertRetirementVersionShape(
+    phase,
+    quiescedTarget,
+    state,
+    quiescedCurrentEntry.versionId,
+    quiescedCurrentVersion,
+    null,
+    fullLegacyCustodySecrets(target),
+    requireCurrentAuthorityProfile(
+      phase,
+      quiescedTarget,
+      quiescedCurrentEntry.versionId,
+      quiescedCurrentVersion,
+    ),
+  );
+  assertRetirementVersionShape(
+    phase,
+    quiescedTarget,
+    state,
+    quiescedRollbackEntry.versionId,
+    quiescedRollbackVersion,
+    null,
+    fullLegacyCustodySecrets(target),
+    requireCurrentAuthorityProfile(
+      phase,
+      quiescedTarget,
+      quiescedRollbackEntry.versionId,
+      quiescedRollbackVersion,
+    ),
+  );
+  assertRetirementVersionShape(
+    phase,
+    target,
+    state,
+    parentEntry.versionId,
+    parentVersion,
+    null,
+    hostedVersionSecrets(target),
+    executorAuthority,
+  );
+  if (hostedRetiredEntry !== undefined && hostedRetiredVersion !== undefined) {
+    assertRetirementVersionShape(
+      phase,
+      target,
+      state,
+      hostedRetiredEntry.versionId,
+      hostedRetiredVersion,
+      null,
+      baseWorkerSecrets(target),
+      executorAuthority,
+    );
+  }
+  if (head === "attributed") {
+    const currentIdentity = requiredVersionIdentity(phase, currentEntry.versionId, currentVersion);
+    if (
+      currentIdentity.commit !== selectedCommit ||
+      currentIdentity.bundleDigestHex !== executorIdentity.bundleDigestHex
+    ) {
+      throw phaseError(phase, "post-0043 attribution Version has an unexpected identity");
+    }
+    assertRetirementVersionShape(
+      phase,
+      target,
+      state,
+      currentEntry.versionId,
+      currentVersion,
+      null,
+      baseWorkerSecrets(target),
+      requireCurrentAuthorityProfile(phase, target, currentEntry.versionId, currentVersion),
+    );
+  }
+
+  const service = extractLegacyHostServiceBinding(phase, legacyEntry.versionId, legacyVersion);
+  const candidateService = extractLegacyHostServiceBinding(
+    phase,
+    candidateEntry.versionId,
+    candidateVersion,
+  );
+  if (
+    service.service !== candidateService.service ||
+    service.entrypoint !== candidateService.entrypoint
+  ) {
+    throw phaseError(phase, "post-0043 legacy service identity changed across L and C");
+  }
+  const candidateAuthority = requireCurrentAuthorityProfile(
+    phase,
+    legacyTarget,
+    candidateEntry.versionId,
+    candidateVersion,
+  );
+  const topologyAuthority = requireCurrentAuthorityProfile(
+    phase,
+    legacyTarget,
+    topologyEntry.versionId,
+    topologyVersion,
+  );
+  assertRetirementVersionShape(
+    phase,
+    legacyTarget,
+    state,
+    legacyEntry.versionId,
+    legacyVersion,
+    service,
+    fullLegacyCustodySecrets(target),
+    historicalAuthorityProfile(legacyTarget),
+  );
+  assertRetirementVersionShape(
+    phase,
+    legacyTarget,
+    state,
+    candidateEntry.versionId,
+    candidateVersion,
+    service,
+    fullLegacyCustodySecrets(target),
+    candidateAuthority,
+  );
+  assertRetirementVersionShape(
+    phase,
+    legacyTarget,
+    state,
+    topologyEntry.versionId,
+    topologyVersion,
+    null,
+    fullLegacyCustodySecrets(target),
+    topologyAuthority,
+  );
+  const candidateIdentity = requiredVersionIdentity(
+    phase,
+    candidateEntry.versionId,
+    candidateVersion,
+  );
+  const topologyIdentity = requiredVersionIdentity(phase, topologyEntry.versionId, topologyVersion);
+  if (
+    candidateIdentity.commit !== topologyIdentity.commit ||
+    candidateIdentity.bundleDigestHex !== topologyIdentity.bundleDigestHex ||
+    workerVersionScriptContentIdentity(phase, candidateEntry.versionId, candidateVersion) !==
+      workerVersionScriptContentIdentity(phase, topologyEntry.versionId, topologyVersion)
+  ) {
+    throw phaseError(phase, "post-0043 C/T legacy code identity changed");
+  }
+
+  const selectedScriptEtag = workerVersionScriptContentIdentity(
+    phase,
+    executorEntry.versionId,
+    executorVersion,
+  );
+  const selectedScriptVersions: Array<{
+    readonly entry: DeploymentChainEntry;
+    readonly version: unknown;
+  }> = [
+    { entry: quiescedCurrentEntry, version: quiescedCurrentVersion },
+    { entry: quiescedRollbackEntry, version: quiescedRollbackVersion },
+    { entry: parentEntry, version: parentVersion },
+    ...(hostedRetiredEntry === undefined || hostedRetiredVersion === undefined
+      ? []
+      : [{ entry: hostedRetiredEntry, version: hostedRetiredVersion }]),
+    ...(head === "attributed" ? [{ entry: currentEntry, version: currentVersion }] : []),
+  ];
+  for (const { entry, version } of selectedScriptVersions) {
+    if (
+      workerVersionScriptContentIdentity(phase, entry.versionId, version) !== selectedScriptEtag
+    ) {
+      throw phaseError(phase, "post-0043 custody transition changed served script content");
+    }
+  }
+
+  assertExactSecretInventory(
+    await state.workerSecrets(target.workerName),
+    head === "post-parent" ? hostedVersionSecrets(target) : baseWorkerSecrets(target),
+    phase,
+  );
+  await assertLiveWorkerRoutingClosure(phase, target, state);
+  const afterChain = await deploymentChain(phase, target, state);
+  if (JSON.stringify(chain) !== JSON.stringify(afterChain)) {
+    throw phaseError(phase, "post-0043 retirement history changed during closure inspection");
+  }
+  const currentIdentity = versionIdentity(currentVersion);
+  return {
+    head,
+    history,
+    currentCommit: currentIdentity?.commit ?? null,
+    currentBundleDigestHex: currentIdentity?.bundleDigestHex ?? null,
+    selectedIdentity: executorIdentity,
+    currentScriptEtag: workerVersionScriptContentIdentity(
+      phase,
+      currentEntry.versionId,
+      currentVersion,
+    ),
+    service,
+    parentVersionId: parentEntry.versionId,
+    hostedRetiredVersionId: hostedRetiredEntry?.versionId ?? null,
+    executorVersionId: executorEntry.versionId,
+    quiescedCurrentVersionId: quiescedCurrentEntry.versionId,
+    quiescedRollbackVersionId: quiescedRollbackEntry.versionId,
+    topologyVersionId: topologyEntry.versionId,
+    candidateVersionId: candidateEntry.versionId,
+    legacyVersionId: legacyEntry.versionId,
+    fingerprint: JSON.stringify({
+      head,
+      chain: throughLegacy,
+      selectedIdentity: executorIdentity,
+      selectedScriptEtag,
+      service,
+    }),
+  };
+}
+
+function samePost0043Anchors(
+  left: Post0043RetirementLineage,
+  right: Post0043RetirementLineage,
+): boolean {
+  return (
+    left.selectedIdentity.commit === right.selectedIdentity.commit &&
+    left.selectedIdentity.bundleDigestHex === right.selectedIdentity.bundleDigestHex &&
+    left.currentScriptEtag === right.currentScriptEtag &&
+    left.parentVersionId === right.parentVersionId &&
+    left.executorVersionId === right.executorVersionId &&
+    left.quiescedCurrentVersionId === right.quiescedCurrentVersionId &&
+    left.quiescedRollbackVersionId === right.quiescedRollbackVersionId &&
+    left.topologyVersionId === right.topologyVersionId &&
+    left.candidateVersionId === right.candidateVersionId &&
+    left.legacyVersionId === right.legacyVersionId &&
+    left.service.service === right.service.service &&
+    left.service.entrypoint === right.service.entrypoint
+  );
+}
+
+function assertAnnotationProfile(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  expected: "canonical" | "secret-created",
+): void {
+  if (workerVersionAnnotationProfile(version) !== expected) {
+    throw phaseError(phase, `post-0043 Version ${versionId} does not have ${expected} provenance`);
+  }
+}
+
+function requiredVersionIdentity(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+): { readonly commit: string; readonly bundleDigestHex: string } {
+  const identity = versionIdentity(version);
+  if (identity === null) {
+    throw phaseError(phase, `post-0043 Version ${versionId} has no canonical identity`);
+  }
+  return identity;
+}
+
+function withoutProviderExecutor(target: DeployTarget): DeployTarget {
+  const {
+    artifactBlobIoMode: ignoredMode,
+    cloudflareProviderExecutor: ignoredExecutor,
+    ...legacy
+  } = target;
+  void ignoredMode;
+  void ignoredExecutor;
+  return legacy;
+}
+
+function hasNamedBinding(version: unknown, name: string): boolean {
+  if (
+    !isRecord(version) ||
+    !isRecord(version.resources) ||
+    !Array.isArray(version.resources.bindings)
+  ) {
+    return false;
+  }
+  return version.resources.bindings.some(
+    (entry) => isRecord(entry) && (entry.name === name || entry.binding === name),
+  );
 }
 
 function hasSecretBinding(version: unknown, name: string): boolean {

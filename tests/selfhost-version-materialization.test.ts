@@ -339,9 +339,9 @@ describe("self-host Worker Version materialization", () => {
     const retained = await materializer.readSnapshot(input);
     expect(retained.state).toBe("present");
     if (retained.state !== "present") throw new Error("dot-prefixed assets were not retained");
-    expect([...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>).keys()]).toEqual(
-      paths,
-    );
+    expect([...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>).keys()]).toEqual([
+      ...paths,
+    ]);
     const physical = await import("node:fs/promises").then(({ readdir }) =>
       readdir(join(root, input.script, input.versionId, "assets"), { withFileTypes: true }),
     );
