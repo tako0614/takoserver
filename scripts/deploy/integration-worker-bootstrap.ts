@@ -1439,7 +1439,12 @@ async function checkedGate(run: WorkerProcess): Promise<void> {
   } catch {
     throw preflightError("scoped owner gate `bun run check` could not be started");
   }
-  if (result.exitCode !== 0) throw preflightError("scoped owner gate `bun run check` failed");
+  if (result.exitCode !== 0) {
+    throw preflightError(
+      `scoped owner gate \`bun run check\` failed (exit ${result.exitCode})`,
+      `${result.stdout}${result.stderr}`.trim(),
+    );
+  }
 }
 
 function exactReviewer(value: string): string {

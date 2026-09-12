@@ -255,6 +255,26 @@ describe("Takoserver integration Worker bootstrap", () => {
     rmSync(wrongKeyringDirectory, { recursive: true, force: true });
   });
 
+  test("owner gate failure preserves exit status and diagnostics before publication", async () => {
+    const fixture = bootstrapFixture({
+      target,
+      gateFailure: {
+        exitCode: 17,
+        stdout: "gate stdout\n",
+        stderr: "gate stderr\n",
+      },
+    });
+    const error = await rejectedError(apply(fixture));
+    expect(error).toBeInstanceOf(DeployError);
+    expect(error).toMatchObject({
+      phase: "preflight",
+      message: "scoped owner gate `bun run check` failed (exit 17)",
+      detail: "gate stdout\ngate stderr",
+    });
+    expect(fixture.lifecycleCalls).toHaveLength(0);
+    expect(fixture.uploaded).toBe(false);
+  });
+
   test("publishes one genuine first Version with Ed25519 proof and exact temporary secret closure", async () => {
     const fixture = bootstrapFixture({ target });
     const secretDirectory = writeSecretDirectory(target);
@@ -386,6 +406,7 @@ interface FixtureOptions {
   readonly schemaMode?: "complete" | "wrong";
   readonly signingMode?: "valid" | "revoked" | "malformed";
   readonly provider?: WorkerProviderExecutorQualification;
+  readonly gateFailure?: CommandResult;
   readonly postAckDrift?: "schema" | "signing" | "schedule";
   readonly finalNativeRace?: boolean;
   readonly lostAcknowledgement?: boolean;
@@ -444,7 +465,9 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     if (command.join(" ") === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (command.join(" ") === "git branch --show-current") return ok("integration-worker\n");
     if (command.join(" ") === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-    if (command.join(" ") === "bun run check") return ok("green\n");
+    if (command.join(" ") === "bun run check") {
+      return options.gateFailure ?? ok("green\n");
+    }
     if (command.includes("--dry-run")) {
       const index = command.indexOf("--outdir");
       const out = index < 0 ? undefined : command[index + 1];

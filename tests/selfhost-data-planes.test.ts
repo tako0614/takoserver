@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import type { Sql } from "../src/ports.ts";
 import { selfhostDatabasePath } from "../src/providers/selfhost.ts";
@@ -846,7 +846,9 @@ test("database deletion refuses malformed names and non-regular paths", () => {
 });
 
 test("a relative self-host data root opens and deletes SQLite files by its absolute path", async () => {
-  const relativeRoot = mkdtempSync(join(".", ".takoserver-relative-"));
+  // Exercise a relative configured path without placing SQLite fsync traffic
+  // on the source checkout's filesystem. Keep the process cwd unchanged.
+  const relativeRoot = relative(process.cwd(), mkdtempSync(join(tmpdir(), "takoserver-relative-")));
   const localSql = createEphemeralSql();
   const localGrant: SelfhostDataPlaneGrant = {
     ...ALPHA,
