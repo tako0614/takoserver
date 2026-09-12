@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import worker from "../src/entry-worker.ts";
+import worker, { resolvePublicWorkerImplementationIdentity } from "../src/entry-worker.ts";
+import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
 import {
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
@@ -38,6 +39,60 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("a JIT-enabled Host without Form authority serves discovery and OpenAPI", async () => {
+    const signing = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const jit = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const publicJwk = await crypto.subtle.exportKey("jwk", jit.publicKey);
+    const env = workerEnv({
+      TAKOSERVER_SIGNING_KEY_ID: "startup-signing",
+      TAKOSERVER_SIGNING_KEY: JSON.stringify(
+        await crypto.subtle.exportKey("jwk", signing.privateKey),
+      ),
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK: JSON.stringify({
+        kty: "OKP",
+        crv: "Ed25519",
+        x: publicJwk.x,
+      }),
+      TAKOSERVER_INTEGRATION_E2E_ORGANIZATION_ID: INTEGRATION_E2E_ORGANIZATION_ID,
+      TAKOSERVER_SOURCE_COMMIT: "e".repeat(40),
+      TAKOSERVER_WORKER_ARTIFACT_DIGEST: `sha256:${"f".repeat(64)}`,
+    });
+    const discovery = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
+    expect(discovery.status).toBe(200);
+    expect(await discovery.json()).toMatchObject({
+      product: "takoserver",
+      apiVersion: "v1",
+      endpoints: { api: ORIGIN, openapi: `${ORIGIN}/openapi.json` },
+    });
+    const openapi = await worker.fetch(new Request(`${ORIGIN}/openapi.json`), env);
+    expect(openapi.status).toBe(200);
+    expect(await openapi.json()).toMatchObject({ servers: [{ url: ORIGIN }] });
+    expect(resolvePublicWorkerImplementationIdentity(env)).toBeUndefined();
+
+    let storageReads = 0;
+    const incomplete = {
+      ...env,
+      TAKOSERVER_SOURCE_COMMIT: undefined,
+      get STATE_DB(): never {
+        storageReads += 1;
+        throw new Error("invalid JIT must refuse before storage");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    const refused = await worker.fetch(new Request(`${ORIGIN}/openapi.json`), incomplete);
+    expect(refused.status).toBe(503);
+    expect((await envelope(refused)).error.message).toBe(
+      "integration E2E credential authority configuration is incomplete",
+    );
+    expect(storageReads).toBe(0);
+  });
+
   test("the pre-0043 compatibility mode blocks all traffic before storage composition", async () => {
     const env = {
       PUBLIC_ORIGIN: ORIGIN,

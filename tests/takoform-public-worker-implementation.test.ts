@@ -111,12 +111,21 @@ describe("public Worker semantic implementation identity", () => {
     expect(() => resolvePublicWorkerImplementationIdentity({}, embedded)).toThrow(
       "implementation identity is incomplete",
     );
-    expect(() =>
+    // An ordinary Worker/JIT artifact digest is not a Form declaration.
+    expect(
       resolvePublicWorkerImplementationIdentity(
         { TAKOSERVER_WORKER_ARTIFACT_DIGEST: artifact("1") },
         undefined,
       ),
-    ).toThrow("implementation identity is incomplete");
+    ).toBeUndefined();
+    for (const identity of [undefined, embedded]) {
+      expect(() =>
+        resolvePublicWorkerImplementationIdentity(
+          { TAKOSERVER_WORKER_ARTIFACT_DIGEST: "malformed" },
+          identity,
+        ),
+      ).toThrow("implementation identity is incomplete");
+    }
     expect(
       resolvePublicWorkerImplementationIdentity(
         { TAKOSERVER_WORKER_ARTIFACT_DIGEST: artifact("1") },

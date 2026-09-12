@@ -186,25 +186,35 @@ function workerState(input: {
 }
 
 describe("split signing authority surfaces", () => {
-  test("canonical upload classification requires the exact version_upload profile", () => {
+  test("canonical upload classification accepts either exact upload profile", () => {
     const message = `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`;
-    expect(
-      workerVersionAnnotationProfile({
-        annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
-      }),
-    ).toBe("canonical");
+    for (const triggeredBy of ["upload", "version_upload"] as const) {
+      expect(
+        workerVersionAnnotationProfile({
+          annotations: { "workers/message": message, "workers/triggered_by": triggeredBy },
+        }),
+      ).toBe("canonical");
+
+      for (const annotations of [
+        { "workers/triggered_by": triggeredBy },
+        { "workers/message": "unexpected", "workers/triggered_by": triggeredBy },
+        { "workers/message": 42, "workers/triggered_by": triggeredBy },
+        {
+          "workers/message": message,
+          "workers/triggered_by": triggeredBy,
+          "workers/extra": "unexpected",
+        },
+      ]) {
+        expect(workerVersionAnnotationProfile({ annotations })).toBe("other");
+      }
+    }
 
     for (const annotations of [
       { "workers/message": message },
       {},
-      { "workers/triggered_by": "version_upload" },
-      { "workers/message": "unexpected", "workers/triggered_by": "version_upload" },
+      { "workers/message": message, "workers/triggered_by": "unknown" },
       { "workers/message": message, "workers/triggered_by": "secret" },
-      {
-        "workers/message": message,
-        "workers/triggered_by": "version_upload",
-        "workers/extra": "unexpected",
-      },
+      { "workers/message": message, "workers/triggered_by": 42 },
     ]) {
       expect(workerVersionAnnotationProfile({ annotations })).toBe("other");
     }
@@ -1587,7 +1597,7 @@ function workerVersion(
         }),
   });
   return {
-    annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
+    annotations: { "workers/message": message, "workers/triggered_by": "upload" },
     resources: {
       script: { etag: scriptEtag },
       bindings: Object.entries(expected).flatMap(([name, requirement]) =>
@@ -1628,7 +1638,7 @@ function signingVersion(
         }),
   });
   return {
-    annotations: { "workers/message": message, "workers/triggered_by": "version_upload" },
+    annotations: { "workers/message": message, "workers/triggered_by": "upload" },
     resources: {
       script: { etag: "script-etag" },
       bindings: Object.entries(closure).flatMap(([name, requirement]) =>

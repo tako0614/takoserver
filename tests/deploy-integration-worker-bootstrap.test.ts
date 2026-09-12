@@ -772,7 +772,7 @@ function versionForTarget(selectedTarget: DeployTarget, message: string): Record
     id: VERSION_ID,
     annotations: {
       "workers/message": message,
-      "workers/triggered_by": "version_upload",
+      "workers/triggered_by": "upload",
     },
     compatibility_date: "2026-08-17",
     compatibility_flags: ["nodejs_compat"],

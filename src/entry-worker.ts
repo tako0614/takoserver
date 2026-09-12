@@ -295,11 +295,13 @@ export function resolvePublicWorkerImplementationIdentity(
     | undefined = embeddedPublicFormImplementationIdentity(),
 ): PublicWorkerImplementationIdentity | undefined {
   const artifact = env.TAKOSERVER_WORKER_ARTIFACT_DIGEST;
-  if (artifact === undefined && embedded === undefined) return undefined;
-  if (artifact === undefined || embedded === undefined) {
+  if (artifact !== undefined && !/^sha256:[0-9a-f]{64}$/u.test(artifact)) {
     throw new TypeError("public Worker Form implementation identity is incomplete");
   }
-  if (!/^sha256:[0-9a-f]{64}$/u.test(artifact)) {
+  // The artifact digest also binds JIT credential provenance. Only embedded
+  // Form implementation metadata declares this independent Form identity.
+  if (embedded === undefined) return undefined;
+  if (artifact === undefined) {
     throw new TypeError("public Worker Form implementation identity is incomplete");
   }
   return { workerArtifactDigest: artifact as `sha256:${string}`, ...embedded };

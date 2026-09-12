@@ -714,7 +714,12 @@ export function workerVersionCutoverOperationIdentity(
 
 export type WorkerVersionAnnotationProfile = "canonical" | "secret-created" | "other";
 
-/** Exact annotation inventory classifier for authority-sensitive transitions. */
+/**
+ * Exact annotation inventory classifier for authority-sensitive transitions.
+ * Cloudflare direct publication reports `upload`; the Versions upload path
+ * reports `version_upload`. Both still require our exact source/bundle message.
+ * Secret-created versions remain a separate, single-key profile.
+ */
 export function workerVersionAnnotationProfile(value: unknown): WorkerVersionAnnotationProfile {
   if (!isRecord(value) || !isRecord(value.annotations)) return "other";
   if (
@@ -728,7 +733,8 @@ export function workerVersionAnnotationProfile(value: unknown): WorkerVersionAnn
     exactKeys(value.annotations, ["workers/message", "workers/triggered_by"]) &&
     typeof message === "string" &&
     WORKER_MESSAGE.test(message) &&
-    value.annotations["workers/triggered_by"] === "version_upload"
+    (value.annotations["workers/triggered_by"] === "version_upload" ||
+      value.annotations["workers/triggered_by"] === "upload")
   ) {
     return "canonical";
   }
