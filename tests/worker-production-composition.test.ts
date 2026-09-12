@@ -310,6 +310,59 @@ describe("Worker production composition", () => {
     ]);
   });
 
+  test(
+    "derives deterministic managed WorkerEndpoint subdomains from tenant, Space, and Worker",
+    async () => {
+      const catalog = stableProductionTakoformCatalog();
+      const composed = createWorkerProductionComposition({
+        env: {
+          TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(edgeSupplies),
+          ...executorEnv,
+        },
+        forms: catalog.forms,
+        now,
+      });
+      const provider = composed.providers[0];
+      if (!(provider instanceof CloudflareProviderProxy)) {
+        throw new Error("Cloudflare provider proxy is unavailable");
+      }
+      const reservations = provider.workerEndpointOriginReservations;
+      if (!reservations.hostMintedSubdomain) {
+        throw new Error("managed Cloudflare provider does not mint WorkerEndpoint subdomains");
+      }
+
+      const target = {
+        tenantRef: "tenant_default",
+        space: "default",
+        workerName: "hello",
+      };
+      const first = await reservations.hostMintedSubdomain(target);
+      const repeat = await reservations.hostMintedSubdomain(target);
+      const otherTenant = await reservations.hostMintedSubdomain({
+        ...target,
+        tenantRef: "tenant_other",
+      });
+      const otherSpace = await reservations.hostMintedSubdomain({ ...target, space: "preview" });
+      const otherWorker = await reservations.hostMintedSubdomain({
+        ...target,
+        workerName: "goodbye",
+      });
+
+      expect(first).toMatch(/^tsw-[0-9a-f]{40}$/u);
+      expect(repeat).toBe(first);
+      expect(new Set([first, otherTenant, otherSpace, otherWorker]).size).toBe(4);
+      if (typeof first !== "string") {
+        throw new Error("managed WorkerEndpoint subdomain is missing");
+      }
+      expect(
+        await reservations.derive({
+          tenantRef: target.tenantRef,
+          requestedSubdomain: first,
+        }),
+      ).toEqual({ canonicalPublicOrigin: `https://${first}.workers.example.test` });
+    },
+  );
+
   test("keeps managed ObjectBucket and every edge Offering sellable without public credentials", () => {
     const catalog = stableProductionTakoformCatalog();
     const composed = createWorkerProductionComposition({

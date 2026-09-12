@@ -13,7 +13,10 @@ import type {
   ProviderTicket,
 } from "../provider-port.ts";
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
-import { canonicalWorkerEndpointOrigin } from "../provider-worker-endpoint-origin.ts";
+import {
+  canonicalWorkerEndpointOrigin,
+  derivedProviderResourceName,
+} from "../provider-worker-endpoint-origin.ts";
 import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
@@ -79,10 +82,16 @@ export class CloudflareProviderProxy implements Provider {
         );
         return canonicalPublicOrigin ? { canonicalPublicOrigin } : null;
       },
-      // A WfP installation sells names beneath the managed base domain. The
-      // Host must therefore hold a caller-requested reservation; it may not
-      // invent an address from a Worker name.
-      hostMintedSubdomain: async () => null,
+      // A WfP installation serves managed Workers beneath the managed base
+      // domain. Host-minted reservations therefore use a stable opaque label
+      // from the logical Worker identity; caller-supplied reservations still
+      // take priority in the Host reservation lifecycle.
+      hostMintedSubdomain: async ({ tenantRef, space, workerName }) =>
+        await derivedProviderResourceName("tsw", {
+          tenantRef,
+          space,
+          name: workerName,
+        }),
     };
   }
 

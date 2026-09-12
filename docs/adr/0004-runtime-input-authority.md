@@ -3,7 +3,9 @@
 **Status:** accepted, 2026-08-31. The runtime-input wire contract and the
 composition consequence below are superseded by
 [ADR 0006](0006-runtime-input-wire-contract-v2.md); the reservation authority
-stands.
+stands. The chosen-name-only restriction for managed Workers-for-Platforms in
+the first September 2 amendment is superseded by the September 12 amendment
+below.
 
 ## Decision
 
@@ -367,3 +369,38 @@ row that was still `bound`, declined it for not being `expired`, and watched
 `prepare` sweep it one statement later and refuse to replay a terminal row: the
 state the repair exists for was unreachable from the only caller that has it.
 The mint therefore sweeps its own row before asking whether to take it back.
+
+## Amendment — 2026-09-12: managed Workers receive a default endpoint
+
+The chosen-name-only managed policy left ordinary organization keys unable to
+create a WorkerEndpoint. Such a key can prepare a reservation through the
+Takoserver control API, but the stable Resource request has no reservation
+input; only an admitted tenant-run credential carries that context. The
+Cloudflare public Host does not compose the self-host credential issuer.
+Consequently a normal portable WorkerEndpoint declaration reached
+`unsupported_capability` even though the managed provider could serve it.
+
+Managed supply now offers a derived default as well as the existing
+chosen-name path. Its credential-free Provider projection uses
+`derivedProviderResourceName("tsw", { tenantRef, space, name: workerName })` to
+derive an opaque DNS label beneath the configured managed base domain. The
+same identity derives the same label; organization, Space and Worker names
+are separately scoped inputs, not raw hostname text. The private executor
+continues to validate and consume the Host's exact canonical-origin assignment
+rather than deriving another address.
+
+This is a Takoserver-owned Provider policy change, not a change to the frozen
+Host API or WorkerEndpoint Form. It uses the existing mint, bind, assign and
+activation authorities, including placement checks, uniqueness constraints,
+incarnation custody and deletion witnesses. A supplied reservation still wins
+before default minting, and a live conflicting hold is refused, not adopted or
+released. No new header, desired-state field, route, signing authority or
+database schema is added.
+
+An optional reservation header on the stable Host API was rejected: naming it
+after Takoserver would not make an undeclared behavioral extension compatible
+with frozen v1. A new control-plane credential handoff would be a separate,
+larger authority design, unnecessary for a default URL. Direct organization
+keys still cannot attach a chosen-name reservation to ordinary Resource
+requests. That remaining capability gap is explicit; the default allocation
+does not claim to solve it.

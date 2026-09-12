@@ -396,13 +396,23 @@ and records the same exact sold ModuleWorker Offering and provider placement as
 ordinary Host mutation; an omitted Offering is accepted only when that
 selection has exactly one eligible result. The reservation is value-free and
 does not create a Takoform Resource or call the provider. A key that reserves
-nothing still gets a `WorkerEndpoint`: where the selected installation derives
-its own endpoint address — a self-host suffix, the ordinary-workers
-`workers.dev` or zone suffix — the Host reserves that derived origin on the
-caller's behalf, in an id namespace the public routes refuse every write to,
-and lets go of an endpoint or a moved Worker revision under the same fences. An installation that sells its base
-domain instead of deriving one mints nothing and still requires a supplied
-reservation.
+nothing still gets a `WorkerEndpoint` where the selected installation derives
+its own endpoint address. The managed Workers-for-Platforms provider derives
+an opaque default label from the organization, Space and Worker name beneath
+its configured managed base domain. Self-host and the ordinary-workers
+adapter use their own endpoint suffixes. The Host reserves that derived origin
+on the caller's behalf, in an id namespace the public routes refuse every
+write to, and releases an old endpoint or advances a moved Worker revision
+only under the existing ownership and absence fences.
+
+A supplied chosen-name reservation still takes precedence; default-name
+allocation never takes over a caller's live reservation. No extra Form field,
+Host API header or provider configuration is needed to obtain a default URL.
+Choosing a custom label is a separate control-plane flow: the current
+Cloudflare public Host accepts that reservation through an admitted tenant-run
+credential, not an ordinary organization key's Resource request. Preparing a
+chosen-name reservation with an organization key alone does not attach it to
+that key's subsequent WorkerEndpoint create.
 
 The sensitive half of a Worker Version travels separately, over
 `PUT|GET /v1/takoform/worker-runtime-input-preparations/{operationKey}` speaking

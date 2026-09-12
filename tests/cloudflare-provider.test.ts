@@ -4119,8 +4119,8 @@ describe("released edge Form placement", () => {
    * `#applyWorkerEndpoint` publishes `<derived script name>.<suffix>` and takes
    * nothing from the caller, so the reservation the Host mints has to name the
    * same hostname the apply will publish rather than a second one beside it.
-   * The managed backend sells its base domain instead of deriving one, so it
-   * mints nothing and keeps requiring a supplied reservation.
+   * The managed backend consumes a Host-assigned origin instead; its public
+   * Provider projection owns default-name derivation, not this native adapter.
    */
   test("derives the Host-minted endpoint subdomain as the script the endpoint publishes", async () => {
     const endpointOffering = technical("WorkerEndpoint");
