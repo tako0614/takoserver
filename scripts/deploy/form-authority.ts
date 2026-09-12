@@ -637,6 +637,7 @@ export async function runFormAuthority(
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-form-authority-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let mutationPhase: DeployPhase = "preflight";
   try {
     const publicProof = await prepareWorkerArtifact({
       root: join(root, "public-worker-proof"),
@@ -710,25 +711,28 @@ export async function runFormAuthority(
       );
       assertSameBootstrapProbePredecessor(bootstrapProbeBefore, bootstrapProbeLast);
     }
-    const upload = await run(
-      wranglerCommand([
-        "deploy",
-        prepared.bundlePath,
-        "--no-bundle",
-        "--config",
-        prepared.configPath,
-        "--strict",
-        "--message",
-        message(invocation.surface, source.commit, authorityArtifactDigest),
-      ]),
-      { env: environment },
-    );
+    // Build the command before marking the target as touched. A command
+    // construction failure is still preflight; once the child process starts,
+    // a thrown result leaves upload acknowledgement indeterminate.
+    const uploadCommand = wranglerCommand([
+      "deploy",
+      prepared.bundlePath,
+      "--no-bundle",
+      "--config",
+      prepared.configPath,
+      "--strict",
+      "--message",
+      message(invocation.surface, source.commit, authorityArtifactDigest),
+    ]);
+    mutationPhase = "mutation";
+    const upload = await run(uploadCommand, { env: environment });
     if (upload.exitCode !== 0) {
       throw mutationError(
         "Form authority Worker upload acknowledgement is indeterminate; do not retry before --status",
         `${upload.stdout}${upload.stderr}`.trim(),
       );
     }
+    mutationPhase = "verification";
 
     const publicAfter = await inspectPublicWorker("verification", target, state);
     assertSamePublicWorker("verification", publicBefore, publicAfter);
@@ -895,6 +899,20 @@ export async function runFormAuthority(
             `surface deletes a Worker. Finish the lane: ${verifierBridgeRemedy(invocation, target)}`
           : "forward repair only: no previous Form authority Worker version exists",
     };
+  } catch (error) {
+    if (mutationPhase === "preflight") throw error;
+    if (
+      error instanceof DeployError &&
+      (error.phase === "mutation" || error.phase === "verification")
+    ) {
+      throw error;
+    }
+    if (mutationPhase === "mutation") {
+      throw mutationError(
+        "Form authority Worker upload acknowledgement is indeterminate; do not retry before --status",
+      );
+    }
+    throw verificationError("Form authority post-mutation authoritative inspection failed");
   } finally {
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });

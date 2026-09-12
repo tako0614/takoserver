@@ -2612,6 +2612,140 @@ describe("Form authority forward transition and descriptor drift", () => {
       rmSync(outside, { recursive: true, force: true });
     }
   });
+
+  test("classifies a post-acknowledgement Version read failure as verification without retry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-post-ack-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const base = stateSequence({ isUploaded: () => uploaded });
+      const state: FormAuthorityDeployState = {
+        ...base,
+        async workerVersion(workerName, versionId) {
+          if (uploaded && workerName === target.formAuthority.integrationWorkerName) {
+            throw new DeployError(
+              "preflight",
+              "sentinel Cloudflare Version transport detail",
+              "sentinel Cloudflare Version detail",
+            );
+          }
+          return await base.workerVersion(workerName, versionId);
+        },
+      };
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("verification");
+      expect((failure as DeployError).message).toContain(
+        "post-mutation authoritative inspection failed",
+      );
+      expect((failure as DeployError).message).not.toContain(
+        "sentinel Cloudflare Version transport detail",
+      );
+      expect((failure as DeployError).message).not.toContain("sentinel Cloudflare Version detail");
+      expect((failure as DeployError).detail).toBeUndefined();
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the same Version read failure in preflight when upload has not started", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-pre-upload-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({
+        onUpload() {
+          uploaded = true;
+        },
+      });
+      const base = stateSequence({ isUploaded: () => uploaded });
+      const state: FormAuthorityDeployState = {
+        ...base,
+        async workerVersion() {
+          throw new DeployError("preflight", "Cloudflare Version GET returned 404");
+        },
+      };
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+      expect(uploaded).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("classifies a thrown upload transport as mutation with no retry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-upload-transport-"));
+    let uploadAttempts = 0;
+    try {
+      const process = fakeProcess();
+      const run: FormAuthorityProcess = async (command, options) => {
+        if (command.includes("--no-bundle")) {
+          uploadAttempts += 1;
+          throw new Error("transport detail must not escape");
+        }
+        return await process.run(command, options);
+      };
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run,
+          state: stateSequence(),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("mutation");
+      expect((failure as DeployError).message).toContain("acknowledgement is indeterminate");
+      expect((failure as DeployError).message).not.toContain("transport detail");
+      expect(uploadAttempts).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 /**
