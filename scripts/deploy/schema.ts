@@ -20,6 +20,7 @@ import {
 } from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
+import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
   DeployError,
   type DeployPhase,
@@ -813,9 +814,25 @@ export async function runD1Schema(
     ) {
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
+    const migrationImport =
+      wave.selector === "0047"
+        ? buildD1MigrationImport(
+            sealedMigrationArtifact.files.slice(
+              wave.fromPrefixNames.length,
+              wave.throughPrefixNames.length,
+            ),
+            { freshLedger: false },
+          )
+        : null;
+    const migrationImportPath =
+      migrationImport === null ? null : join(release, "migration-import.sql");
+    if (migrationImport !== null && migrationImportPath !== null) {
+      writeFileSync(migrationImportPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
+    }
     const configPath = writeD1Config(join(release, "wrangler.jsonc"), target, "migrations");
     const artifact = sealDirectory(release, [
       "wrangler.jsonc",
+      ...(migrationImportPath === null ? [] : ["migration-import.sql"]),
       ...wave.throughPrefixNames.map((name) => `migrations/${name}`),
     ]);
 
@@ -1087,15 +1104,29 @@ export async function runD1Schema(
         injected: options.reader,
       });
       const apply = await run(
-        wranglerCommand([
-          "d1",
-          "migrations",
-          "apply",
-          target.d1.databaseName,
-          "--remote",
-          "--config",
-          configPath,
-        ]),
+        wranglerCommand(
+          migrationImportPath === null
+            ? [
+                "d1",
+                "migrations",
+                "apply",
+                target.d1.databaseName,
+                "--remote",
+                "--config",
+                configPath,
+              ]
+            : [
+                "d1",
+                "execute",
+                target.d1.databaseName,
+                "--remote",
+                "--yes",
+                "--config",
+                configPath,
+                "--file",
+                migrationImportPath,
+              ],
+        ),
         { env: environment },
       );
       providerAcknowledgement = "acknowledged";
@@ -1256,6 +1287,12 @@ export async function runD1Schema(
       throughMigration: wave.throughMigration,
       migrationDigest: wave.migrationDigest,
       migrationBytes: wave.migrationBytes,
+      ...(migrationImport === null
+        ? {}
+        : {
+            migrationImportDigest: migrationImport.digest,
+            migrationImportBytes: migrationImport.bytes,
+          }),
       throughPrefixDigest: wave.throughPrefixDigest,
       pendingMigrations: wave.pending,
       dataPreflights: fencedDataPreflights,

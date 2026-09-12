@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { RemoteD1 } from "./d1.ts";
+import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
   DeployError,
   type DeployPhase,
@@ -48,6 +49,24 @@ const MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024;
 const MAX_D1_LIST_PAGES = 100;
 const MAX_R2_LIST_PAGES = 100;
 const R2_LIST_PAGE_SIZE = 100;
+const MAX_MIGRATION_DIAGNOSTIC_NAMES = 128;
+
+interface BoundedMigrationFailureEvidence {
+  readonly exitCode: number | null;
+  readonly appliedMigrations: readonly string[] | null;
+  readonly expectedMigrations: readonly string[];
+}
+
+// Keep migration evidence in a private typed error so normalization never has
+// to trust or forward arbitrary error detail text.
+class MigrationApplyError extends DeployError {
+  constructor(
+    message: string,
+    readonly evidence: BoundedMigrationFailureEvidence,
+  ) {
+    super("mutation", message);
+  }
+}
 
 export interface IntegrationStorageGenerationInvocation {
   readonly action: "status" | "apply";
@@ -270,7 +289,8 @@ async function applyStorageGeneration(
   if (existsSync(release)) {
     throw preflightError("integration storage generation output directory is already in use");
   }
-  const migrationOutput = join(release, "migrations");
+  const payload = join(release, "payload");
+  const migrationOutput = join(payload, "migrations");
   mkdirSync(migrationOutput, { recursive: true, mode: 0o700 });
   let sealed: ReturnType<typeof sealDirectory> | null = null;
   let migrationSeal: ReturnType<typeof sealDirectory> | null = null;
@@ -292,7 +312,16 @@ async function applyStorageGeneration(
         "sealed integration migration lineage differs from the qualified source",
       );
     }
-    migrationSeal = sealDirectory(migrationOutput, sourceArtifact.names);
+    // D1's /query parser truncates the nested CASE in the frozen 0047 trigger.
+    // Its /import transport accepts those exact bytes; do not rewrite history
+    // or change the canonical schema to work around a transport parser.
+    const migrationImport = buildD1MigrationImport(sealedArtifact.files, { freshLedger: true });
+    const importPath = join(payload, "migration-import.sql");
+    writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
+    migrationSeal = sealDirectory(payload, [
+      "migration-import.sql",
+      ...sourceArtifact.names.map((name) => `migrations/${name}`),
+    ]);
     const configPath = join(release, "wrangler.jsonc");
 
     const provider = await resolveProvider(target, options);
@@ -337,7 +366,8 @@ async function applyStorageGeneration(
     );
     sealed = sealDirectory(release, [
       "wrangler.jsonc",
-      ...sourceArtifact.names.map((name) => `migrations/${name}`),
+      "payload/migration-import.sql",
+      ...sourceArtifact.names.map((name) => `payload/migrations/${name}`),
     ]);
     sealed.assertUnchanged();
 
@@ -362,6 +392,7 @@ async function applyStorageGeneration(
     const migration = await applySealedMigrations(
       configPath,
       names.databaseName,
+      importPath,
       generatedTarget,
       provider.environment,
       run,
@@ -428,6 +459,8 @@ async function applyStorageGeneration(
       r2: { bucketName: names.bucketName },
       migrationDigest: sourceArtifact.digest,
       migrationBytes: sourceArtifact.bytes,
+      migrationImportDigest: migrationImport.digest,
+      migrationImportBytes: migrationImport.bytes,
       appliedMigrations: postMigration.applied,
       schemaShapeDigest: postMigration.shapeDigest,
       rollback: "old active target remains unchanged; repair forward from this exact generation",
@@ -507,6 +540,7 @@ interface GeneratedD1Target {
 async function applySealedMigrations(
   configPath: string,
   databaseName: string,
+  importPath: string,
   target: GeneratedD1Target,
   environment: Readonly<Record<string, string>>,
   run: IntegrationStorageGenerationProcess,
@@ -520,20 +554,24 @@ async function applySealedMigrations(
     result = await run(
       (options.wranglerCommand ?? wranglerCommand)([
         "d1",
-        "migrations",
-        "apply",
+        "execute",
         databaseName,
         "--remote",
+        "--yes",
         "--config",
         configPath,
+        "--file",
+        importPath,
       ]),
       { env: environment },
     );
   } catch {
-    throw mutationError(
+    throw migrationFailureError(
       "D1 migration apply acknowledgement is indeterminate; inspect this exact generation " +
         "and do not retry",
-      `databaseId=${target.databaseId}`,
+      null,
+      null,
+      expectedMigrations,
     );
   }
   if (result.exitCode !== 0) {
@@ -551,13 +589,11 @@ async function applySealedMigrations(
       // A failed readback is itself indeterminate. Do not turn it into a
       // second migration attempt or infer a new database from the name.
     }
-    throw mutationError(
+    throw migrationFailureError(
       "D1 migration apply failed; partial or lost acknowledgement is not retried or adopted",
-      JSON.stringify({
-        databaseId: target.databaseId,
-        appliedMigrations: aftermath?.applied ?? null,
-        expectedMigrations,
-      }),
+      result.exitCode,
+      aftermath?.applied ?? null,
+      expectedMigrations,
     );
   }
   const state = await readGeneratedState(
@@ -752,7 +788,7 @@ function writeGenerationConfig(
             binding: "STATE_DB",
             database_name: databaseName,
             database_id: databaseId,
-            migrations_dir: "migrations",
+            migrations_dir: "payload/migrations",
           },
         ],
       },
@@ -783,14 +819,60 @@ async function providerCall<T>(
   }
 }
 
+function migrationFailureError(
+  message: string,
+  exitCode: number | null,
+  appliedMigrations: readonly string[] | null,
+  expectedMigrations: readonly string[],
+): MigrationApplyError {
+  return new MigrationApplyError(message, {
+    exitCode: safeExitCode(exitCode),
+    appliedMigrations: safeAppliedMigrations(appliedMigrations, expectedMigrations),
+    expectedMigrations: expectedMigrations.slice(0, MAX_MIGRATION_DIAGNOSTIC_NAMES),
+  });
+}
+
+function safeExitCode(value: number | null): number | null {
+  return value !== null && Number.isSafeInteger(value) && value >= -128 && value <= 255
+    ? value
+    : null;
+}
+
+function safeAppliedMigrations(
+  appliedMigrations: readonly string[] | null,
+  expectedMigrations: readonly string[],
+): readonly string[] | null {
+  if (
+    appliedMigrations === null ||
+    !Array.isArray(appliedMigrations) ||
+    appliedMigrations.length > expectedMigrations.length ||
+    appliedMigrations.length > MAX_MIGRATION_DIAGNOSTIC_NAMES ||
+    appliedMigrations.some((name) => typeof name !== "string")
+  ) {
+    return null;
+  }
+  for (let index = 0; index < appliedMigrations.length; index += 1) {
+    if (appliedMigrations[index] !== expectedMigrations[index]) return null;
+  }
+  return appliedMigrations.slice();
+}
+
 function normalizeAfterD1Create(error: unknown, databaseId: string | null): DeployError {
-  const detail = `databaseId=${databaseId ?? "unknown"}`;
+  const phase: DeployPhase =
+    error instanceof DeployError && error.phase === "verification" ? "verification" : "mutation";
+  const evidence = error instanceof MigrationApplyError ? error.evidence : undefined;
+  const detail =
+    evidence === undefined
+      ? `databaseId=${databaseId ?? "unknown"}`
+      : [
+          `databaseId=${databaseId ?? "unknown"}`,
+          `phase=${phase}`,
+          `exitCode=${evidence.exitCode ?? "unknown"}`,
+          `appliedMigrations=${JSON.stringify(evidence.appliedMigrations)}`,
+          `expectedMigrations=${JSON.stringify(evidence.expectedMigrations)}`,
+        ].join(" ");
   if (error instanceof DeployError) {
-    return new DeployError(
-      error.phase === "verification" ? "verification" : "mutation",
-      error.message,
-      detail,
-    );
+    return new DeployError(phase, error.message, detail);
   }
   return new DeployError(
     "mutation",

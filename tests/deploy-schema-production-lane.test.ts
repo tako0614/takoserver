@@ -218,6 +218,7 @@ function processFixture(
 ) {
   const calls: string[][] = [];
   let appliedFiles: readonly string[] = [];
+  let appliedImportSql: string | null = null;
   const run: SchemaProcess = async (command): Promise<CommandResult> => {
     calls.push([...command]);
     const key = command.join(" ");
@@ -231,6 +232,20 @@ function processFixture(
     if (key === "git fetch --quiet --all --prune") return ok("");
     if (key === `git branch -r --contains ${COMMIT}`) return ok("  origin/release-schema\n");
     if (key === "bun run check:migrations") return ok("green\n");
+    if (command.includes("execute") && command.includes("--file")) {
+      const configPath = command.at(command.indexOf("--config") + 1);
+      const importPath = command.at(command.indexOf("--file") + 1);
+      if (!configPath || !importPath) throw new Error("D1 file import omitted its sealed paths");
+      const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+        d1_databases: { migrations_dir: string }[];
+      };
+      const [database] = config.d1_databases;
+      if (!database) throw new Error("sealed config omitted its D1 database");
+      const migrationDirectory = resolve(dirname(configPath), database.migrations_dir);
+      appliedImportSql = readFileSync(importPath, "utf8");
+      appliedFiles = readdirSync(migrationDirectory).sort();
+      return migrationApplyResult;
+    }
     if (command.includes("migrations") && command.includes("apply")) {
       const configPath = command.at(command.indexOf("--config") + 1);
       if (!configPath) throw new Error("migration apply did not name its sealed config");
@@ -245,7 +260,12 @@ function processFixture(
     }
     throw new Error(`unexpected command: ${key}`);
   };
-  return { run, calls, appliedFiles: () => appliedFiles };
+  return {
+    run,
+    calls,
+    appliedFiles: () => appliedFiles,
+    appliedImportSql: () => appliedImportSql,
+  };
 }
 
 function databaseThrough(count: number): Database {
@@ -554,6 +574,95 @@ describe("production-shaped D1 migration lane", () => {
       expect(
         fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
       ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("selected 0047 imports the unchanged SQL through one sealed file and later waves stay regular", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0047-import-"));
+    try {
+      chmodSync(root, 0o700);
+      const fixture = processFixture();
+      const pre = stateThrough(46, "i-0047-pre");
+      const post = stateThrough(47, "i-0047-post");
+      const result = await runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0047",
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([pre, pre, pre, post]),
+          outputDirectory: join(root, "work"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+
+      const importCalls = fixture.calls.filter(
+        (call) => call.includes("execute") && call.includes("--file"),
+      );
+      expect(importCalls).toHaveLength(1);
+      expect(importCalls[0]).not.toContain("--command");
+      expect(
+        fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+      ).toHaveLength(0);
+      const migration0047 = readMigrationArtifact(auditedMigrations).files[46];
+      if (!migration0047) throw new Error("audited fixture omitted migration 0047");
+      const sourceSql = readFileSync(migration0047.path, "utf8");
+      const expectedImport = `${sourceSql}\nINSERT INTO "d1_migrations" (name)\nvalues ('${migration0047.name}');`;
+      expect(fixture.appliedImportSql()).toBe(expectedImport);
+      expect(result).toMatchObject({
+        migrationBytes: migration0047.bytes,
+        migrationImportDigest: `sha256:${createHash("sha256")
+          .update(Buffer.from(expectedImport, "utf8"))
+          .digest("hex")}`,
+        migrationImportBytes: Buffer.byteLength(expectedImport, "utf8"),
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed 0047 file import is not retried", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0047-import-failure-"));
+    try {
+      chmodSync(root, 0o700);
+      const fixture = processFixture("rehearsal", {
+        exitCode: 1,
+        stdout: "",
+        stderr: "transport failed",
+      });
+      const pre = stateThrough(46, "i-0047-failure");
+      const failure = await runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0047",
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([pre, pre, pre, pre]),
+          outputDirectory: join(root, "work"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(String(failure)).toContain("partially applied");
+      expect(
+        fixture.calls.filter((call) => call.includes("execute") && call.includes("--file")),
+      ).toHaveLength(1);
+      expect(
+        fixture.calls.filter((call) => call.includes("migrations") && call.includes("apply")),
+      ).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1096,6 +1205,19 @@ describe("production-shaped D1 migration lane", () => {
         expect(fixture.appliedFiles()).toEqual(
           MIGRATIONS.slice(0, through).map(({ name }) => name),
         );
+        const fileImports = fixture.calls.filter(
+          (call) => call.includes("execute") && call.includes("--file"),
+        );
+        const migrationApplies = fixture.calls.filter(
+          (call) => call.includes("migrations") && call.includes("apply"),
+        );
+        if (throughMigration === "0047") {
+          expect(fileImports).toHaveLength(1);
+          expect(migrationApplies).toHaveLength(0);
+        } else {
+          expect(fileImports).toHaveLength(0);
+          expect(migrationApplies).toHaveLength(1);
+        }
         predecessorReceiptPath = receiptPath;
         previousPost = post;
       }

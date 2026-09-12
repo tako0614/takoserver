@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   CloudflareIntegrationStorageProvider,
   type IntegrationStorageD1Database,
@@ -109,8 +110,10 @@ function ok(stdout = ""): CommandResult {
 function processFixture(migrationResult: CommandResult = ok("applied\n")): {
   readonly run: IntegrationStorageGenerationProcess;
   readonly commands: string[][];
+  readonly importDigests: string[];
 } {
   const commands: string[][] = [];
+  const importDigests: string[] = [];
   const run: IntegrationStorageGenerationProcess = async (command) => {
     commands.push([...command]);
     const key = command.join(" ");
@@ -118,10 +121,15 @@ function processFixture(migrationResult: CommandResult = ok("applied\n")): {
     if (key === "git branch --show-current") return ok("integration-storage\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (key === "bun run check:migrations") return ok("green\n");
-    if (command.includes("migrations") && command.includes("apply")) return migrationResult;
+    if (command.includes("execute") && command.includes("--file")) {
+      const path = command[command.indexOf("--file") + 1];
+      if (path === undefined) throw new Error("migration import file was not supplied");
+      importDigests.push(`sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`);
+      return migrationResult;
+    }
     throw new Error(`unexpected command ${key}`);
   };
-  return { run, commands };
+  return { run, commands, importDigests };
 }
 
 interface ProviderOptions {
@@ -409,9 +417,13 @@ describe("integration storage generation bootstrap", () => {
     ]);
     expect(
       process.commands.filter(
-        (command) => command.includes("migrations") && command.includes("apply"),
+        (command) => command.includes("execute") && command.includes("--file"),
       ),
     ).toHaveLength(1);
+    expect(process.commands.some((command) => command.includes("--command"))).toBe(false);
+    expect(process.commands.some((command) => command.includes("apply"))).toBe(false);
+    expect(process.importDigests).toHaveLength(1);
+    expect(result.migrationImportDigest).toBe(process.importDigests[0]);
   });
 
   test("refuses malformed create identity and nonempty new D1 without R2", async () => {
@@ -481,6 +493,35 @@ describe("integration storage generation bootstrap", () => {
       runIntegrationStorageGeneration(invocation, target, options(raced.provider)),
     ).rejects.toThrow("do not adopt");
     expect(raced.calls.filter((call) => call.startsWith("createR2:")).length).toBe(0);
+  });
+
+  test("preserves bounded migration failure evidence after D1 creation without raw CLI output", async () => {
+    const partialApplied = completeState.applied.slice(0, 1);
+    const failedProcess = processFixture({
+      exitCode: 7,
+      stdout: "secret migration output must stay private",
+      stderr: "raw provider response must stay private",
+    });
+    const failed = providerFixture();
+    const error = await rejectedError(
+      runIntegrationStorageGeneration(
+        invocation,
+        target,
+        options(failed.provider, [emptyState, state(partialApplied, [])], failedProcess),
+      ),
+    );
+    expect(error).toBeInstanceOf(DeployError);
+    if (!(error instanceof DeployError)) throw error;
+    expect(error.phase).toBe("mutation");
+    expect(error.detail).toContain(`databaseId=${DATABASE_ID}`);
+    expect(error.detail).toContain("exitCode=7");
+    expect(error.detail).toContain(JSON.stringify(partialApplied));
+    expect(error.detail).not.toContain("secret migration output");
+    expect(error.detail).not.toContain("raw provider response");
+    expect(error.stack).not.toContain("secret migration output");
+    expect(error.stack).not.toContain("raw provider response");
+    expect(failed.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(failed.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
   });
 
   test("does not leak provider diagnostics and rejects an unreviewed migration tail", async () => {

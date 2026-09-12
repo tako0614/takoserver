@@ -72,6 +72,25 @@ audited 0001–0049 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
+The fresh empty database uses one sealed `wrangler d1 execute --file` import,
+not the remote `migrations apply` query path. The import retains every audited
+SQL byte and adds only Wrangler's migration-ledger DDL and an ordered ledger
+insert after each migration. Output records both the source-lineage digest and
+the derived import-file digest. The exact empty-state fence and complete
+canonical-schema readback remain mandatory.
+
+This transport distinction matters for the frozen 0047 trigger: D1's query
+parser rejects an unparenthesized `CASE … END` inside a trigger body. A native
+read-only `EXPLAIN` probe of that construct failed through the query path and
+succeeded through import without changing schema or lineage; this matches
+[Cloudflare workers-sdk #4727](https://github.com/cloudflare/workers-sdk/issues/4727).
+Do not edit 0047, change its audited hash, or normalize away schema differences.
+An existing database must use the explicit `--through-migration=0047` wave after
+0046; that wave imports only the original 0047 SQL and its ledger insert, under
+the existing selector, lease, receipt and readback rules. Later waves retain
+their ordinary transport. The no-selector integration path spanning 0047 is
+not covered by this workaround; use the explicit ordered waves instead.
+
 Apply requires an independent reviewer and runs the migration gate once.
 Status is read-only. Any existing name, even an empty resource, prevents apply.
 A partial or unacknowledged creation is never retried, adopted or automatically

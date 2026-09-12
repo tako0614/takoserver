@@ -776,6 +776,7 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy.ts",
         "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/schema.ts",
         "scripts/deploy/migrations.ts",
         "scripts/deploy/d1.ts",
@@ -789,10 +790,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0049 names and bytes are sealed before creation.",
+          "the fixed audited 0001-0049 names and bytes are sealed before creation. A separately " +
+          "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0049 lineage and canonical schema, then creates and reads back one new R2 bucket. " +
+          "0001-0049 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -845,6 +847,7 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
+        "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
       ],
@@ -866,7 +869,9 @@ export const DEPLOY_CONTRACT = {
           "forward-only apply. Integration may retain its no-selector disposable cadence or select " +
           "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
-          "catch-up and never permits arbitrary migration-prefix adoption.",
+          "catch-up and never permits arbitrary migration-prefix adoption. The selected 0047 wave " +
+          "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
+          "its migration-ledger insert; other selected waves keep their existing transport.",
         "post-conditions":
           "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
           "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
