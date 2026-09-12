@@ -209,10 +209,46 @@ export function createProviderDriver(
     await Promise.all(
       relations.map(async (relation) => {
         const deployment = await deployments.active(tenantId, relation.targetUid);
+        // Stored resources and deployments include Host-owned state. Project
+        // the closed Provider port explicitly; a structural type annotation
+        // alone would still transmit status, provenance and native claims.
         return {
-          ...structuredClone(relation),
-          ...(deployment ? { deployment } : {}),
-        };
+          pointer: relation.pointer,
+          relation: relation.relation,
+          targetUid: relation.targetUid,
+          resource: {
+            apiVersion: relation.resource.apiVersion,
+            kind: relation.resource.kind,
+            form: { formRef: structuredClone(relation.resource.form.formRef) },
+            metadata: {
+              name: relation.resource.metadata.name,
+              space: relation.resource.metadata.space,
+              uid: relation.resource.metadata.uid,
+              generation: relation.resource.metadata.generation,
+              revision: relation.resource.metadata.revision,
+            },
+            spec: structuredClone(relation.resource.spec),
+          },
+          ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+          ...(deployment
+            ? {
+                deployment: {
+                  tenantId: deployment.tenantId,
+                  id: deployment.id,
+                  resourceUid: deployment.resourceUid,
+                  offeringId: deployment.offeringId,
+                  providerPackRef: deployment.providerPackRef,
+                  providerInstallationRef: deployment.providerInstallationRef,
+                  nativeId: deployment.nativeId,
+                  state: deployment.state,
+                  observed: structuredClone(deployment.observed),
+                  outputs: structuredClone(deployment.outputs),
+                  createdAt: deployment.createdAt,
+                  updatedAt: deployment.updatedAt,
+                },
+              }
+            : {}),
+        } satisfies ProviderRelation;
       }),
     );
 

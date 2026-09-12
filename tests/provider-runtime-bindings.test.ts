@@ -664,7 +664,7 @@ describe("provider-private runtime Binding materialization", () => {
    * else. There is nothing to materialize here: the adapter resolves the
    * namespace from the relation. The driver must therefore call it.
    */
-  test("the Provider driver calls the adapter for a same-pack data binding", async () => {
+  test("the Provider driver projects closed relations for a same-pack data binding", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-09-01T00:00:00.000Z");
     const deployments = createResourceDeploymentStore(sql, clock);
@@ -674,13 +674,16 @@ describe("provider-private runtime Binding materialization", () => {
     const namespace = forms.find((form) => form.identity.formRef.kind === "EdgeKVNamespace");
     if (!worker || !version || !namespace) throw new Error("stable Binding fixtures missing");
     let remoteCalls = 0;
+    const remoteRelations: ProviderRelation[] = [];
     const remote = createRemoteProvider({
       id: "remote",
       origin: "https://provisioner.test",
       offerings: [edgeProviderOffering(version, { id: "remote.worker-version" })],
       authorize: () => "Bearer provider-private",
-      async fetch() {
+      async fetch(request) {
         remoteCalls += 1;
+        const payload = (await request.json()) as { input: { relations: ProviderRelation[] } };
+        remoteRelations.push(...payload.input.relations);
         return Response.json({ ticket: { phase: "failed", failure: { code: "invalid_spec" } } });
       },
     });
@@ -714,7 +717,11 @@ describe("provider-private runtime Binding materialization", () => {
     const resource = (form: typeof worker, name: string, uid: string) => ({
       apiVersion: form.identity.formRef.apiVersion,
       kind: form.identity.formRef.kind,
-      form: form.identity,
+      form: {
+        ...form.identity,
+        packageDigest: `sha256:${"a".repeat(64)}` as const,
+        implementationDigest: `sha256:${"b".repeat(64)}` as const,
+      },
       metadata: { name, space: "default", uid, generation: "1", revision: "1" },
       spec: {},
       status: { observedGeneration: "1", conditions: [] },
@@ -778,6 +785,41 @@ describe("provider-private runtime Binding materialization", () => {
       }),
     ).rejects.toMatchObject({ code: "invalid_argument" });
     expect(remoteCalls).toBe(1);
+    expect(remoteRelations).toHaveLength(2);
+    for (const [index, [form, name, uid, deploymentId, offeringId]] of (
+      [
+        [worker, "worker", "uid-worker", "dep-worker", "remote.module-worker"],
+        [namespace, "store", "uid-kv", "dep-kv", "remote.edge-kv"],
+      ] as const
+    ).entries()) {
+      const projected = remoteRelations[index];
+      expect(projected?.resource).toEqual({
+        apiVersion: form.identity.formRef.apiVersion,
+        kind: form.identity.formRef.kind,
+        form: { formRef: form.identity.formRef },
+        metadata: { name, space: "default", uid, generation: "1", revision: "1" },
+        spec: {},
+      });
+      expect(projected?.deployment).toEqual({
+        tenantId: "org-remote",
+        id: deploymentId,
+        resourceUid: uid,
+        offeringId,
+        providerPackRef: "remote",
+        providerInstallationRef: "remote.primary",
+        nativeId: `native:${uid}`,
+        state: "active",
+        observed: {},
+        outputs: {},
+        createdAt: clock().toISOString(),
+        updatedAt: clock().toISOString(),
+      });
+    }
+    expect(remoteRelations[0]).not.toHaveProperty("bindingRef");
+    expect(remoteRelations[1]?.bindingRef).toEqual({
+      apiVersion: "bindings.takoform.com/v1alpha2",
+      ...EDGE_KV_BINDING_REF,
+    });
   });
 
   /**
