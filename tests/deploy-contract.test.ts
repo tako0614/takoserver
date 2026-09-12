@@ -24,6 +24,7 @@ async function deploy(args: readonly string[]): Promise<{
 
 const SURFACES = [
   ["takoserver-worker", []],
+  ["takoserver-integration-worker-bootstrap", ["irreversible", "authority"]],
   ["takoserver-sponsorship-authority-worker", ["irreversible", "authority", "published-identity"]],
   ["takoserver-worker-authority-cutover", ["authority"]],
   ["takoserver-sponsorship-public-route-retirement", ["irreversible", "authority"]],
@@ -36,6 +37,7 @@ const SURFACES = [
   ["takoserver-integration-e2e-credentials", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
+  ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
@@ -348,6 +350,99 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
+    }
+  });
+
+  test("first Host bootstrap accepts only integration status/apply without transition operands", async () => {
+    const surface = "takoserver-integration-worker-bootstrap";
+    const commit = `--commit=${"a".repeat(40)}`;
+    for (const action of ["--status", "--apply"]) {
+      const accepted = await deploy([surface, action, "--environment=integration", commit]);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+    for (const args of [
+      ...["rehearsal", "production"].map((environment) => [
+        surface,
+        "--apply",
+        `--environment=${environment}`,
+        commit,
+      ]),
+      ...[
+        "--reverse",
+        "--through-migration=0049",
+        `--generation=${"b".repeat(32)}`,
+        "--add-secret=FOO",
+      ].map((flag) => [surface, "--apply", "--environment=integration", commit, flag]),
+      [surface, "--issue", "--environment=integration", commit],
+    ]) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("accepts storage generation only with an exact integration-only selector", async () => {
+    const surface = "takoserver-integration-storage-generation";
+    const commit = `--commit=${"a".repeat(40)}`;
+    const generation = `--generation=${"b".repeat(32)}`;
+    const base = [surface, "--status", "--environment=integration", commit];
+    for (const action of ["--status", "--apply"]) {
+      const accepted = await deploy([
+        surface,
+        action,
+        "--environment=integration",
+        commit,
+        generation,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+    const malformed = [
+      "",
+      "b".repeat(31),
+      "b".repeat(33),
+      "B".repeat(32),
+      "g".repeat(32),
+      "../old",
+    ];
+    const extras = [
+      "--through-migration=0049",
+      "--reverse",
+      "--organization=org_test",
+      "--add-var=FOO",
+    ];
+    for (const args of [
+      base,
+      ...malformed.map((value) => [...base, `--generation=${value}`]),
+      [...base, generation, generation],
+      ...["rehearsal", "production"].map((environment) => [
+        surface,
+        "--apply",
+        `--environment=${environment}`,
+        commit,
+        generation,
+      ]),
+      ...extras.map((extra) => [...base, generation, extra]),
+      ["takoserver-worker", "--status", "--environment=integration", commit, generation],
+      [
+        "takoserver-org-api-key",
+        "--status",
+        "--environment=integration",
+        commit,
+        "--organization=org_test",
+        "--api-key=key_test",
+        generation,
+      ],
+      [surface, "--issue", "--environment=integration", commit, generation],
+    ]) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
     }
   });
 

@@ -55,6 +55,66 @@ rehearses the exact 0017–0022 bytes against an independently populated
 immutable receipt. Production must present that exact receipt and the same
 pre-shape and data digest before the first migration can run.
 
+### Fresh integration storage
+
+A disposable staging rebuild uses a separate integration-only surface. It does
+not reset an existing database or relax its migration requirements:
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex>
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex>
+```
+
+Both new resource names are `takoserver-i-<generation>`. The selected private
+target supplies the integration account; its existing database and bucket are
+never changed. Apply creates one new D1, proves it empty, applies the fixed
+audited 0001–0049 lineage and verifies its canonical schema, then creates the
+new R2 bucket. Creating the bucket last means older object operations cannot
+reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
+
+Apply requires an independent reviewer and runs the migration gate once.
+Status is read-only. Any existing name, even an empty resource, prevents apply.
+A partial or unacknowledged creation is never retried, adopted or automatically
+deleted: inspect that generation with status and keep the current target.
+Successful output is only a candidate storage projection. It does not publish
+a Host or WfP Worker, register signing keys, change a route or switch the
+current target. Those steps retain their separate owning deploy surfaces.
+
+### First integration Host publication
+
+Once storage is ready, register the signing public key through
+`takoserver-signing-key-register`. A genuinely absent public Host then uses:
+
+```sh
+bun run deploy -- takoserver-integration-worker-bootstrap --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-worker-bootstrap --apply --environment=integration --commit=<40-hex-sha>
+```
+
+Use a new Worker name and its exact account-owned workers.dev origin, with no
+aliases. This is the public Takoserver API component; customer ModuleWorkers
+still belong to WfP and use the managed app domain. Bootstrap never adopts a
+zone route or custom domain. It uses the normal Host settings with workers.dev
+enabled and preview URLs disabled so subsequent routine updates need no
+special topology transition.
+
+For apply, `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` supplies exactly the
+target-derived required secret files, including `TAKOSERVER_SIGNING_KEY`.
+The private signing JWK must match the already registered active D1 key. The
+temporary sealed JSON is passed once through `--secrets-file` and removed on
+exit; no secret bytes reach the build or result. Apply also requires the
+independent reviewer, complete schema, target composition and ready provider
+dependencies. WfP targets use the private composition's wrapper to qualify its
+executor; this public surface never implements that private backend.
+
+Status does not read initial secrets. Apply refuses every existing or partial
+Worker, including a previously successful bootstrap. After an uncertain
+acknowledgement, inspect status instead of replaying creation. Success requires
+the exact first Version, no predecessor, complete configuration/module
+readback, the normal source-declared cron schedule and a successful public
+product probe. Cleanup failures are reported explicitly; a failed cleanup must
+not be treated as proof that temporary secret material was removed. Later updates and secret
+changes use their existing lifecycle surfaces.
+
 The integration JIT credential authority instead accepts exactly one of
 `--issue`, `--status`, or `--revoke` through that same entrypoint, and the
 durable organization API key surface accepts exactly one of `--mint`,

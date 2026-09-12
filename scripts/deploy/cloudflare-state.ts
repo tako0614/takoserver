@@ -262,6 +262,33 @@ export class CloudflareState {
     );
   }
 
+  /** Cron triggers are Worker-local mutable state, not immutable Version metadata. */
+  async workerSchedules(workerName: string): Promise<readonly string[]> {
+    const label = `${workerName} schedules`;
+    const result = await this.read(
+      `/workers/scripts/${encodeURIComponent(workerName)}/schedules`,
+      label,
+    );
+    if (!isRecord(result) || !Array.isArray(result.schedules)) {
+      throw preflightError(`${label} returned a malformed result`);
+    }
+    const crons = result.schedules.map((schedule: unknown) => {
+      if (
+        !isRecord(schedule) ||
+        typeof schedule.cron !== "string" ||
+        schedule.cron.length === 0 ||
+        schedule.cron.trim() !== schedule.cron
+      ) {
+        throw preflightError(`${label} returned a malformed cron`);
+      }
+      return schedule.cron;
+    });
+    if (new Set(crons).size !== crons.length) {
+      throw preflightError(`${label} contains duplicate crons`);
+    }
+    return crons.sort();
+  }
+
   async workerSubdomain(workerName: string): Promise<{
     readonly enabled: boolean;
     readonly previewsEnabled: boolean;

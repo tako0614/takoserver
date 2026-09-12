@@ -9,6 +9,8 @@ import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
+import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import { runRetirement } from "./deploy/retirement.ts";
@@ -37,6 +39,10 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-operator-identity --<status|apply> --environment=integration --commit=<sha>
     --organization=org_... (legacy spelling; integration only)
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
+  bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
+    --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
+  bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
+    (first public Host publication only; existing Workers use their normal lifecycle)
   bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
   bun run deploy -- takoserver-sponsorship-public-route-retirement --<status|apply> --environment=<integration|production> --commit=<sha>
     --legacy-host-runtime-predecessor-version=<uuid> [--reverse]
@@ -81,7 +87,11 @@ deploy-plan flag, ledger, target override or mixed mutation controller.
 type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
 type CredentialSurface = "takoserver-integration-e2e-credentials";
 type OrgApiKeySurface = "takoserver-org-api-key";
-type StandardSurface = Exclude<Surface, CredentialSurface | OrgApiKeySurface>;
+type StorageGenerationSurface = "takoserver-integration-storage-generation";
+type StandardSurface = Exclude<
+  Surface,
+  CredentialSurface | OrgApiKeySurface | StorageGenerationSurface
+>;
 
 interface InvocationBase {
   readonly environment: DeployEnvironment;
@@ -101,6 +111,11 @@ interface InvocationBase {
 }
 
 type Invocation =
+  | (InvocationBase & {
+      readonly surface: StorageGenerationSurface;
+      readonly action: "status" | "apply";
+      readonly generation: string;
+    })
   | (InvocationBase & {
       readonly surface: StandardSurface;
       readonly action: "status" | "apply";
@@ -187,6 +202,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let action: ParsedInvocation["action"] | null = null;
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
+  let generation: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
   let closurePredecessorVersionId: string | null = null;
@@ -270,6 +286,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       const value = flag.slice("--commit=".length);
       if (!/^[0-9a-f]{40}$/u.test(value)) return null;
       commit = value;
+      continue;
+    }
+    if (flag.startsWith("--generation=")) {
+      if (generation !== null) return null;
+      const value = flag.slice("--generation=".length);
+      if (!/^[0-9a-f]{32}$/u.test(value)) return null;
+      generation = value;
       continue;
     }
     if (flag.startsWith("--legacy-predecessor-version=")) {
@@ -377,6 +400,23 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  if (
+    surfaceValue === "takoserver-integration-worker-bootstrap" &&
+    (environment !== "integration" ||
+      args.length !== 4 ||
+      (action !== "status" && action !== "apply"))
+  )
+    return null;
+  const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
+  if ((generation !== null) !== storageGeneration) return null;
+  if (
+    storageGeneration &&
+    (environment !== "integration" ||
+      args.length !== 5 ||
+      (action !== "status" && action !== "apply"))
+  ) {
+    return null;
+  }
   const closureDeltaNames = [
     ...retireVars,
     ...addVars,
@@ -644,6 +684,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(throughMigration === null ? {} : { throughMigration }),
+    ...(generation === null ? {} : { generation }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -729,6 +770,13 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runConsole(invocation, target);
     case "takoserver-d1-schema-rehearsal-baseline":
       return await runD1SchemaRehearsalBaseline(invocation, target);
+    case "takoserver-integration-storage-generation":
+      return await runIntegrationStorageGeneration(invocation, target);
+    case "takoserver-integration-worker-bootstrap":
+      return await runIntegrationWorkerBootstrap(
+        { ...invocation, surface: "takoserver-integration-worker-bootstrap" },
+        target,
+      );
     case "takoserver-d1-schema":
       return await runD1Schema(
         {

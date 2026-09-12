@@ -30,6 +30,49 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("reads Worker-local cron triggers without inventing pagination or Version metadata", async () => {
+    const requests: Request[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        requests.push(request);
+        return Response.json({
+          success: true,
+          result: { schedules: [{ cron: "*/5 * * * *", created_on: "2026-09-12T00:00:00Z" }] },
+        });
+      },
+    });
+    expect(await state.workerSchedules("takoserver-api-integration")).toEqual(["*/5 * * * *"]);
+    expect(requests).toHaveLength(1);
+    const url = new URL(requests[0]?.url ?? "");
+    expect(url.pathname).toBe(
+      `/client/v4/accounts/${ACCOUNT}/workers/scripts/takoserver-api-integration/schedules`,
+    );
+    expect(url.search).toBe("");
+  });
+
+  test("schedule inventory distinguishes empty from malformed or duplicate results", async () => {
+    const stateFor = (result: unknown) =>
+      new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        fetcher: async () => Response.json({ success: true, result }),
+      });
+    expect(await stateFor({ schedules: [] }).workerSchedules("host")).toEqual([]);
+    for (const result of [
+      {},
+      { schedules: null },
+      { schedules: [null] },
+      { schedules: [{ cron: 1 }] },
+      { schedules: [{ cron: "" }] },
+      { schedules: [{ cron: " */5 * * * *" }] },
+      { schedules: [{ cron: "*/5 * * * *" }, { cron: "*/5 * * * *" }] },
+    ]) {
+      await expect(stateFor(result).workerSchedules("host")).rejects.toBeInstanceOf(DeployError);
+    }
+  });
+
   test("Worker Versions unwrap result.items and retain exhaustive pagination checks", async () => {
     const versions = Array.from({ length: 101 }, (_, index) => ({ id: `version-${index}` }));
     const pages: number[] = [];

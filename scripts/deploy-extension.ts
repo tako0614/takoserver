@@ -31,6 +31,7 @@ export {
   planExactArtifactRecoveryDeployment,
   runExactArtifactRecoveryDeployment,
 } from "./deploy/exact-artifact-recovery.ts";
+export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type {
   CloudflareCredential,
   CloudflareDeployEnvironment,

@@ -1396,6 +1396,26 @@ function assertAuditedMigrationHashes(
   }
 }
 
+/**
+ * Reads the frozen 0001-0049 migration corpus without changing the ordinary
+ * integration or protected schema lanes.  Callers that need the historical
+ * lineage (for example, a fresh disposable integration database) use this
+ * helper instead of copying the audit constants or weakening the wave checks.
+ */
+export function readAuditedMigrationArtifact(
+  directory: string = resolve(REPOSITORY, "migrations"),
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "audited migration lineage must contain exactly 0001-0049",
+      `actual=${JSON.stringify(artifact.names)}`,
+    );
+  }
+  assertAuditedMigrationHashes(artifact.files);
+  return artifact;
+}
+
 function digestMigrationFiles(files: readonly MigrationArtifactFile[]): string {
   const hash = createHash("sha256");
   for (const file of files) {

@@ -147,6 +147,65 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-worker-bootstrap",
+      target: "cloudflare-worker:new-integration-public-host",
+      covers: [
+        "src",
+        "wrangler.jsonc",
+        "scripts/build-worker.ts",
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-worker-bootstrap.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/migrations.ts",
+        "scripts/deploy/schema.ts",
+        "scripts/deploy/worker-artifact.ts",
+        "scripts/deploy/worker-closure-transition.ts",
+        "scripts/deploy/worker-live.ts",
+        "scripts/deploy/realized-config.ts",
+        "scripts/deploy/signing.ts",
+        "scripts/deploy/wrangler-state.ts",
+      ],
+      requiresScripts: ["check", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration-only first publication. Qualify the source once, then seal the ` +
+          "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy.",
+        "post-conditions":
+          "Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
+          "module, bindings, settings, source-declared cron schedule and secret inventory must exactly match " +
+          "the selected target and artifact. " +
+          "The public product probe must succeed at its exact account-owned workers.dev origin. No zone route " +
+          "or custom domain is adopted. This is a public Host component, not a customer ModuleWorker.",
+        reversal:
+          "There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
+          "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap.",
+        "failure-handling":
+          "Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
+          "Acknowledgement loss is indeterminate; status is read-only and never reads initial secret bytes. " +
+          "The command never retries, rotates secrets or changes storage/signing registration. The temporary " +
+          "secret file cleanup is attempted on every exit; failure reports potentially retained material. " +
+          "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY supplies only " +
+          "the exact target-derived initial secrets for apply; it is never passed to the build." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
+          "Worker absent before and after qualification and at the final fence. The target must have a " +
+          "complete schema, exact R2 identity, valid runtime composition, active registered signing public " +
+          "key matching the owned private input, and ready provider qualification. Signing and provider " +
+          "state are rechecked before mutation. Only the account-owned workers.dev origin with no aliases " +
+          "is accepted; preview URLs remain disabled.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-sponsorship-authority-worker",
       target: "cloudflare-worker:environment-selected-route-less-sponsorship-authority",
       covers: [
@@ -711,6 +770,48 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-storage-generation",
+      target: "cloudflare-d1-and-r2:new-integration-generation-only",
+      covers: [
+        "migrations",
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/schema.ts",
+        "scripts/deploy/migrations.ts",
+        "scripts/deploy/d1.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: ["check:migrations", "deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
+          "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
+          "the fixed audited 0001-0049 names and bytes are sealed before creation.",
+        "post-conditions":
+          "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
+          "0001-0049 lineage and canonical schema, then creates and reads back one new R2 bucket. " +
+          "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
+          "route, namespace, secret or current target is changed.",
+        reversal:
+          "Before cutover, retain the existing target and do not adopt the candidate. Partial resources " +
+          "are not automatically deleted. There is no down migration or retry/adoption of an existing generation.",
+        "failure-handling":
+          "Pre-existing resources, even empty ones, are refused. After any creation attempt the command " +
+          "stops on failure, reports only bounded identity/state diagnostics and never retries. Lost " +
+          "acknowledgements are indeterminate; --status is read-only and cannot adopt or repair them." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "Both derived names must be absent at inspection and at the creation fence. The new D1 " +
+          "UUID/name and exact empty state are checked before migration. The R2 bucket must remain " +
+          "absent until the complete schema is verified, so no older object operation can target it " +
+          "during 0043. Existing database migration and rehearsal controls remain unchanged.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-d1-schema-rehearsal-baseline",
       target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
@@ -1166,4 +1267,5 @@ function declaredSurface<Name extends DeployContractSurfaceName>(
 export const GENERIC_WORKER_DEPLOY_CONTRACT_SURFACES = [
   declaredSurface("takoserver-worker"),
   declaredSurface("takoserver-worker-authority-cutover"),
+  declaredSurface("takoserver-integration-worker-bootstrap"),
 ] as const;
