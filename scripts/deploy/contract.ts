@@ -416,7 +416,9 @@ export const DEPLOY_CONTRACT = {
           "one route-less Form-authority service binding and one target Host id are sealed before one upload. " +
           "When integration starts with both the probe and released-Core authority Workers absent, " +
           "the existing surface internally selects the named `integration-host-only` profile: its " +
-          "sealed closure contains only the Host id and public identity binding, with no FORM_AUTHORITY.",
+          "sealed closure contains only the Host id and public identity binding, with no FORM_AUTHORITY. " +
+          "An exact existing Host-only predecessor can receive a profile-preserving code update " +
+          "while Core remains absent; adding FORM_AUTHORITY still requires the explicit transition.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the upload. Its permanent " +
           "workers.dev endpoint must actively return the exact PublicHostIdentity@v2 value read through " +
@@ -429,8 +431,9 @@ export const DEPLOY_CONTRACT = {
         "failure-handling":
           `${highRiskFailure} A missing, thrown, malformed or identity-inconsistent public RPC response ` +
           "is unavailable and prevents Form-authority readiness. The integration-host-only profile " +
-          "is selected only for complete integration formAuthority topology with both native Workers " +
-          "absent; probe or authority appearance at the final fence is a zero-upload refusal, and " +
+          "requires complete integration formAuthority topology. Initial publication requires both " +
+          "native Workers to remain absent; an existing-profile update requires the exact predecessor " +
+          "to remain unchanged and Core to remain absent at the final fence. Drift is refused before upload; " +
           "production and rehearsal retain the absence refusal." +
           inputContract(applyReviewInput),
         "independent-review": review,

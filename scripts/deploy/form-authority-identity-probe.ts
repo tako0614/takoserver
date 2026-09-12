@@ -194,7 +194,25 @@ export async function runFormAuthorityIdentityProbe(
         before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE))
       ? INTEGRATION_HOST_ONLY_PROBE_PROFILE
       : null;
-  if (invocation.action === "apply" && !authorityWorkerPresent && !initialHostOnlyProfile) {
+  /**
+   * Once the first Host-only Version exists, ordinary integration code updates
+   * may keep serving that exact closure while Core is still absent. This path
+   * is deliberately narrower than bootstrap selection: it requires the
+   * complete operator topology, an exact recognized predecessor, no declared
+   * closure transition, and the independently read absence of Core.
+   */
+  const hostOnlyProfilePreservingUpdate =
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    !authorityWorkerPresent &&
+    completeIntegrationHostOnlyTopology &&
+    before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE;
+  if (
+    invocation.action === "apply" &&
+    !authorityWorkerPresent &&
+    !initialHostOnlyProfile &&
+    !hostOnlyProfilePreservingUpdate
+  ) {
     throw preflightError(
       `Worker ${selected.authorityWorkerName} named by the probe's FORM_AUTHORITY binding does not ` +
         `exist on account ${target.accountId}; deploy it first with \`bun run deploy -- ` +
@@ -207,7 +225,8 @@ export async function runFormAuthorityIdentityProbe(
     invocation.transition === undefined &&
     (probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE ||
       before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE) &&
-    !initialHostOnlyProfile
+    !initialHostOnlyProfile &&
+    !hostOnlyProfilePreservingUpdate
   ) {
     throw preflightError(
       "integration Host-only identity probe already exists; its Core binding may be added only " +
@@ -269,7 +288,7 @@ export async function runFormAuthorityIdentityProbe(
       }),
       formAuthorityWorkerName: selected.authorityWorkerName,
       formAuthorityWorkerPresent: authorityWorkerPresent,
-      ...(authorityWorkerPresent || initialHostOnlyProfile
+      ...(authorityWorkerPresent || initialHostOnlyProfile || hostOnlyProfilePreservingUpdate
         ? {}
         : {
             formAuthorityWorkerRemedy:
@@ -390,14 +409,20 @@ export async function runFormAuthorityIdentityProbe(
     );
     assertSameProbe("preflight", before, last);
     const authorityWorkerPresentLast = await isBoundAuthorityWorkerPresent(target, state);
-    if (
-      probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE &&
-      (last !== null || authorityWorkerPresentLast)
-    ) {
-      throw preflightError(
-        "integration Host-only identity probe requires both the probe and released-Core authority " +
-          "Workers to remain absent at the final mutation fence",
-      );
+    if (probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE) {
+      const hostOnlyProfileStableAtFinalFence = initialHostOnlyProfile
+        ? last === null
+        : hostOnlyProfilePreservingUpdate &&
+          last?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE;
+      if (!hostOnlyProfileStableAtFinalFence || authorityWorkerPresentLast) {
+        throw preflightError(
+          initialHostOnlyProfile
+            ? "integration Host-only identity probe requires both the probe and released-Core authority " +
+                "Workers to remain absent at the final mutation fence"
+            : "integration Host-only identity probe requires its existing profile and released-Core " +
+                "authority absence to remain stable at the final mutation fence",
+        );
+      }
     }
     if (probeProfile !== INTEGRATION_HOST_ONLY_PROBE_PROFILE && !authorityWorkerPresentLast) {
       throw preflightError(

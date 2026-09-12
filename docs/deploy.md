@@ -731,8 +731,12 @@ managed customer runtime.
   integration target with both native Workers absent, the existing surface
   internally selects `integration-host-only` and realizes only the Host id and
   public identity binding; it does not configure `FORM_AUTHORITY` or claim Core
-  readiness. Status recognizes that exact closure, while the explicit
-  `--add-binding=FORM_AUTHORITY` transition remains the sole Core-binding owner.
+  readiness. While Core remains absent, an existing exact Host-only probe may
+  receive a profile-preserving code update under the normal source, predecessor
+  and live-readback fences. Status recognizes that closure without requiring a
+  Core deployment. Partial topology or binding drift is not an update path;
+  the explicit `--add-binding=FORM_AUTHORITY` transition remains the sole
+  Core-binding owner, including when Core has appeared since bootstrap.
   Status is ready only after actively calling that RPC bridge and matching Host
   id, served Version, outer artifact `A`, payload `P`, capability, and semantic
   `I`.
