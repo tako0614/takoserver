@@ -51,16 +51,22 @@ Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned
 `identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
 with only `GET /v1/public-host-identity` and `GET /v1/core-verifier-identity`.
-The probe has two read-only service bindings — the public Worker's
+The steady-state probe has two read-only service bindings — the public Worker's
 `PublicHostIdentityEntrypoint` and the route-less authority's
 `FormAuthorityEntrypoint.verifierIdentity` — one expected Host-id variable, and
-no D1, R2, secret, mutation RPC, route, preview, or custom domain. Deploy status
-actively calls the first endpoint and validates the RPC result against the
-authoritative served public Version and artifact. For a released-Core target it
-also calls the second endpoint, which starts the Container under the served
-authority Worker Version and returns its live identity; status and apply
-readback require that identity to name the exact authority Worker Version and
-image artifact digest. An absent, thrown, malformed, stale, or semantically
+no D1, R2, secret, mutation RPC, route, preview, or custom domain. When a fresh
+integration target has both native Workers absent, the same surface internally
+selects `integration-host-only`: its first Version binds only the public
+identity RPC and omits `FORM_AUTHORITY`. The runtime still serves the public
+identity route, while `GET /v1/core-verifier-identity` returns the fixed
+`503 verifier_unavailable` response until the existing explicit
+`--add-binding=FORM_AUTHORITY` transition. Deploy status reports the profile,
+`publicIdentityRpcReady: true`, and Core unavailable rather than claiming
+authority readiness. In every profile, status actively calls the public
+endpoint and validates the RPC result against the authoritative served public
+Version and artifact. For a released-Core target it calls the second endpoint,
+which starts the Container under the served authority Worker Version and
+returns its live identity; an absent, thrown, malformed, stale, or semantically
 inconsistent response makes readiness false.
 
 The only network ingress is a third, separately deployed integration Worker,
@@ -432,16 +438,27 @@ for the route-less authority. After that Worker is dynamic, run the same
 status/apply/status sequence for the operator gateway. No live request is
 signed until the probe and both authority status results are ready.
 
-For a fresh released-Core target whose route-less authority Worker is absent,
-the authority lane has a deliberate bootstrap exception. The public Worker
-must already be serving its identity through the probe's public RPC; the
-probe's current Version may still lack its `FORM_AUTHORITY` binding. Then use
-this order:
+For a fresh integration target whose route-less authority and identity-probe
+Workers are both absent, the existing identity-probe surface internally
+selects the named `integration-host-only` profile. No new CLI flag or deploy
+surface exists. Selection requires the complete integration `formAuthority`
+topology and the exact current public Host Version, artifact, source commit,
+and build-derived Form identity. The first probe upload realizes only
+`TAKOSERVER_FORM_AUTHORITY_HOST_ID` and the `PUBLIC_HOST_IDENTITY` service
+binding (`workers_dev: true`, `preview_urls: false`); it has no
+`FORM_AUTHORITY`, D1, R2, secret, route, or custom-domain ownership. Its
+post-readback must return HTTP 200 for the exact public identity and reports
+`probeProfile: integration-host-only`, `publicIdentityRpcReady: true`,
+`coreVerifierConfigured: false`, `coreVerifierRpcReady: false`, and
+`profileReady: true`/`ready: true`. A later status recognizes that exact Host-only closure without
+claiming Core readiness. Normal apply never broadens it; only the existing
+explicit `--add-binding=FORM_AUTHORITY` transition owns the Core binding.
+Production and rehearsal keep refusing an absent bound authority Worker.
 
-1. Run identity-probe status and capture its exact current `versionId`. It must
-   be the predecessor whose target closure differs only by missing
-   `FORM_AUTHORITY`; do not substitute a later Version after starting the lane.
-2. Confirm the route-less authority status reports `versionId: null`, and
+After the Host-only probe upload, use this order for the fresh released-Core
+target:
+
+1. Confirm the route-less authority status reports `versionId: null`, and
    publish its first Version with `takoserver-form-authority-worker --apply`,
    `--bootstrap-verifier-bridge`, and
    `--bootstrap-probe-predecessor-version=<probe-version>`. Before qualification
@@ -451,12 +468,13 @@ this order:
    closure delta is missing `FORM_AUTHORITY`. Any extra or intervening drift
    leaves the authority upload count at zero. This first upload defers only the
    Core-verifier readback because the probe cannot bind an absent Worker.
-3. Transition the identity probe's `FORM_AUTHORITY` binding with the same declared
-   predecessor (`--closure-predecessor-version=<probe-version>` and
-   `--add-binding=FORM_AUTHORITY`), then run its status/apply/status sequence.
-   The binding names the Worker published in step 2; the probe refuses a
+2. Run identity-probe status and capture the exact Host-only `versionId`, then
+   transition its `FORM_AUTHORITY` binding with that declared predecessor
+   (`--closure-predecessor-version=<probe-version>` and
+   `--add-binding=FORM_AUTHORITY`) and verify the transition with status.
+   The binding names the Worker published in step 1; the probe refuses a
    dangling service binding.
-4. Run route-less authority status again. It must report
+3. Run route-less authority status again. It must report
    `coreVerifierRpcReady: true`,
    `coreVerifierAuthorityWorkerVersionId` equal to the exact bootstrapped
    Version id, and `ready: true`.

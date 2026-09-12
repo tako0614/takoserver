@@ -59,6 +59,64 @@ token variant, or unrelated secret to the child.
 | `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` | Existing absolute, link-free `0700` directory outside every Git repository. |
 | `TAKOSERVER_INDEPENDENT_REVIEW` | Independent reviewer required by `--issue` and `--revoke`; status is read-only. |
 
+## Fixed integration Organization bootstrap
+
+The credential pair requires one pre-existing exact Organization owner tuple.
+On a newly generated integration Host, create that tuple through Takoserver's
+separate owner surface before issuing a pair:
+
+```sh
+bun run deploy -- takoserver-integration-organization-bootstrap --status --environment=integration --commit=<current-live-40-hex-sha>
+bun run deploy -- takoserver-integration-organization-bootstrap --apply --environment=integration --commit=<current-live-40-hex-sha>
+```
+
+This surface reuses the existing identity-only operator key and identity input;
+it introduces no new key, Worker, route-less service, schema, ledger, Form, or
+Takoform API:
+
+| Variable | Meaning |
+| --- | --- |
+| `TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` | Owned, link-free `0600` Ed25519 private JWK matching the integration target's existing `operatorIdentity.publicJwk`. |
+| `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` | Owned, link-free `0600` exact operator identity descriptor containing provider, subject, email, and display name. |
+| `CLOUDFLARE_API_TOKEN` | Read access used only to prove the immutable current Worker Version, commit, and artifact before calling the Host. |
+| `TAKOSERVER_INDEPENDENT_REVIEW` | Independent reviewer required by `--apply`; status is read-only. |
+
+The existing Host composes
+`POST /v1/operator/integration-e2e/organization-bootstrap/status` and
+`POST /v1/operator/integration-e2e/organization-bootstrap/apply` only when its
+environment is exactly `integration` and its canonical origin, identity-only
+operator public key, complete fixed-Organization JIT credential-authority
+profile, source commit, artifact digest, and current Worker Version form one
+valid closure. Rehearsal and production never compose the route. An
+incomplete optional bootstrap closure does not stop the Host's ordinary routes
+or the JIT credential route from starting.
+
+Each request carries a purpose-specific assertion lasting at most 60 seconds.
+It binds the action, method, exact path, canonical request-body digest,
+integration environment, addressed canonical Host origin, current commit,
+artifact and Worker Version, fixed Organization id and name, and the exact
+provider/subject/email/display-name identity. Status queries an existing
+principal using all four asserted identity fields and returns only its opaque
+`ownerPrincipalId` plus sanitized tuple state. It never signs in, creates or
+updates a principal, issues a bearer, or echoes the asserted identity. Apply
+must return that exact current `ownerPrincipalId` in a newly signed body.
+
+Only these fixed rows may be created:
+
+- Organization id `org_takosumi_hosted_staging`, name
+  `Takosumi Hosted staging`, and the status-resolved owner principal;
+- its exact `owner` membership for that same principal.
+
+Both rows are inserted in one atomic D1 batch. An exact existing pair is a
+read/no-op. A missing or mismatched principal, foreign owner, name drift,
+Organization-only row, membership-only row, or any other partial owner tuple is
+a refusal; the operation never repairs, overwrites, impersonates, or deletes
+such state. A lost apply acknowledgement is not retried. After an acknowledged
+batch, a failed or drifted immediate readback is an unknown `503`, never a
+rolled-back `409`; run signed `--status` to settle whether the exact pair is
+present. There is deliberately no destroy or automatic reversal action,
+because removing these authentication rows is a separate operator authority decision.
+
 ## Pair contract and custody
 
 Every product E2E run gets a fresh pair for exactly

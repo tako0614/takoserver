@@ -1,5 +1,5 @@
 import { bytesDigest } from "./json.ts";
-import type { Clock, Sql } from "./ports.ts";
+import { type Clock, type Row, type Sql, SqlError } from "./ports.ts";
 
 /**
  * Who is calling, and what they are allowed to ask for.
@@ -179,6 +179,244 @@ export class AuthError extends Error {
     super(code);
     this.name = "AuthError";
   }
+}
+
+/** Identity asserted by the integration-only organization bootstrap authority. */
+export interface IntegrationOrganizationBootstrapOwnerIdentity {
+  readonly provider: "google" | "github";
+  readonly subject: string;
+  readonly email: string;
+  readonly displayName: string;
+}
+
+export const INTEGRATION_ORGANIZATION_ID = "org_takosumi_hosted_staging";
+export const INTEGRATION_ORGANIZATION_NAME = "Takosumi Hosted staging";
+
+/** Sanitized durable projection returned by the bootstrap store. */
+export interface IntegrationOrganizationBootstrapStatus {
+  readonly state: "eligible" | "present";
+  readonly organizationId: string;
+  readonly organizationName: string;
+  readonly ownerPrincipalId: string;
+  readonly createdAt: string | null;
+}
+
+export class IntegrationOrganizationBootstrapStoreError extends Error {
+  constructor(
+    readonly code:
+      | "principal_unavailable"
+      | "organization_state_conflict"
+      | "post_commit_state_unknown",
+  ) {
+    super(code);
+    this.name = "IntegrationOrganizationBootstrapStoreError";
+  }
+}
+
+/**
+ * The one auth-row operation used by the integration bootstrap route.
+ *
+ * It can only bind an already-existing exact principal. It never signs in,
+ * creates or updates a principal, repairs a partial tuple, or removes another
+ * membership. The two inserts are one D1-compatible atomic batch; existing
+ * schema constraints deliberately turn a losing race into a full rollback.
+ */
+export interface IntegrationOrganizationBootstrapStore {
+  status(input: {
+    readonly organizationId: string;
+    readonly organizationName: string;
+    readonly owner: IntegrationOrganizationBootstrapOwnerIdentity;
+  }): Promise<IntegrationOrganizationBootstrapStatus>;
+  apply(input: {
+    readonly organizationId: string;
+    readonly organizationName: string;
+    readonly owner: IntegrationOrganizationBootstrapOwnerIdentity;
+    readonly ownerPrincipalId: string;
+  }): Promise<{
+    readonly status: IntegrationOrganizationBootstrapStatus;
+    readonly created: boolean;
+  }>;
+}
+
+export function createIntegrationOrganizationBootstrapStore(options: {
+  readonly sql: Sql;
+  readonly clock?: Clock;
+}): IntegrationOrganizationBootstrapStore {
+  const clock = options.clock ?? (() => new Date());
+
+  const stateRows = async (input: {
+    readonly organizationId: string;
+    readonly owner: IntegrationOrganizationBootstrapOwnerIdentity;
+  }): Promise<readonly Row[]> =>
+    await options.sql.query(
+      `SELECT 'principal' AS row_kind, NULL AS org_id, NULL AS name,
+              NULL AS owner_principal_id, id AS principal_id, NULL AS role, NULL AS created_at
+       FROM principals
+       WHERE provider = ? AND provider_subject = ? AND email = ? AND display_name = ?
+       UNION ALL
+       SELECT 'organization' AS row_kind, id AS org_id, name,
+              owner_principal_id, NULL AS principal_id, NULL AS role, created_at
+       FROM orgs WHERE id = ?
+       UNION ALL
+       SELECT 'membership' AS row_kind, org_id, NULL AS name,
+              NULL AS owner_principal_id, principal_id, role, created_at
+       FROM org_memberships WHERE org_id = ?
+       ORDER BY row_kind, principal_id`,
+      [
+        input.owner.provider,
+        input.owner.subject,
+        input.owner.email,
+        input.owner.displayName,
+        input.organizationId,
+        input.organizationId,
+      ],
+    );
+
+  const status = async (input: {
+    readonly organizationId: string;
+    readonly organizationName: string;
+    readonly owner: IntegrationOrganizationBootstrapOwnerIdentity;
+  }): Promise<IntegrationOrganizationBootstrapStatus> => {
+    if (
+      input.organizationId !== INTEGRATION_ORGANIZATION_ID ||
+      input.organizationName !== INTEGRATION_ORGANIZATION_NAME
+    ) {
+      throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+    }
+    // Principal and tuple are read in one statement, so status never combines
+    // an identity from one database snapshot with owner rows from another.
+    const rows = await stateRows(input);
+    const principalRows = rows.filter((row) => row.row_kind === "principal");
+    const ownerPrincipalId =
+      principalRows.length === 1 ? principalRows[0]?.principal_id : undefined;
+    if (typeof ownerPrincipalId !== "string" || ownerPrincipalId.length === 0) {
+      throw new IntegrationOrganizationBootstrapStoreError("principal_unavailable");
+    }
+    const organizationRows = rows.filter((row) => row.row_kind === "organization");
+    const membershipRows = rows.filter((row) => row.row_kind === "membership");
+    if (organizationRows.length === 0 && membershipRows.length === 0) {
+      return {
+        state: "eligible",
+        organizationId: input.organizationId,
+        organizationName: input.organizationName,
+        ownerPrincipalId,
+        createdAt: null,
+      };
+    }
+    const organization = organizationRows.length === 1 ? organizationRows[0] : undefined;
+    const exactOwnerMemberships = membershipRows.filter(
+      (row) => row.principal_id === ownerPrincipalId && row.role === "owner",
+    );
+    const foreignOwnerMemberships = membershipRows.filter(
+      (row) => row.role === "owner" && row.principal_id !== ownerPrincipalId,
+    );
+    if (
+      !organization ||
+      organization.name !== input.organizationName ||
+      organization.owner_principal_id !== ownerPrincipalId ||
+      exactOwnerMemberships.length !== 1 ||
+      foreignOwnerMemberships.length !== 0 ||
+      typeof organization.created_at !== "string"
+    ) {
+      throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+    }
+    return {
+      state: "present",
+      organizationId: input.organizationId,
+      organizationName: input.organizationName,
+      ownerPrincipalId,
+      createdAt: organization.created_at,
+    };
+  };
+
+  return {
+    status,
+
+    async apply(input) {
+      const before = await status(input);
+      if (before.ownerPrincipalId !== input.ownerPrincipalId) {
+        throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+      }
+      if (before.state === "present") return { status: before, created: false };
+
+      const createdAt = clock().toISOString();
+      try {
+        await options.sql.batch([
+          {
+            sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                  VALUES (
+                    ?,
+                    CASE WHEN EXISTS (
+                      SELECT 1 FROM principals
+                      WHERE id = ? AND provider = ? AND provider_subject = ?
+                        AND email = ? AND display_name = ?
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM org_memberships WHERE org_id = ?
+                    ) THEN ? ELSE '' END,
+                    ?, ?
+                  )`,
+            params: [
+              input.organizationId,
+              input.ownerPrincipalId,
+              input.owner.provider,
+              input.owner.subject,
+              input.owner.email,
+              input.owner.displayName,
+              input.organizationId,
+              input.organizationName,
+              input.ownerPrincipalId,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO org_memberships (org_id, principal_id, role, created_at)
+                  VALUES (
+                    CASE WHEN EXISTS (
+                      SELECT 1 FROM principals
+                      WHERE id = ? AND provider = ? AND provider_subject = ?
+                        AND email = ? AND display_name = ?
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM org_memberships WHERE org_id = ?
+                    ) THEN ? ELSE NULL END,
+                    ?, 'owner', ?
+                  )`,
+            params: [
+              input.ownerPrincipalId,
+              input.owner.provider,
+              input.owner.subject,
+              input.owner.email,
+              input.owner.displayName,
+              input.organizationId,
+              input.organizationId,
+              input.ownerPrincipalId,
+              createdAt,
+            ],
+          },
+        ]);
+      } catch (error) {
+        if (error instanceof SqlError && error.code === "constraint") {
+          const raced = await status(input).catch(() => null);
+          if (raced?.state === "present") return { status: raced, created: false };
+          throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+        }
+        // An unavailable acknowledgement is never retried here. The signed
+        // status action is the only operation that settles whether it landed.
+        throw error;
+      }
+      try {
+        const readback = await status(input);
+        if (readback.state !== "present" || readback.createdAt !== createdAt) {
+          throw new IntegrationOrganizationBootstrapStoreError("post_commit_state_unknown");
+        }
+        return { status: readback, created: true };
+      } catch {
+        // The atomic write has acknowledged success. A failed or drifted
+        // readback is now indeterminate, never evidence that the rows rolled
+        // back; only a later signed status request may settle it.
+        throw new IntegrationOrganizationBootstrapStoreError("post_commit_state_unknown");
+      }
+    },
+  };
 }
 
 export interface Accounts {

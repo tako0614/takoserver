@@ -52,6 +52,35 @@ describe("Form authority identity probe", () => {
     expect(await response.json()).toEqual({ error: { code: "identity_unavailable" } });
   });
 
+  test("keeps the public identity route live when Core authority is not configured", async () => {
+    const request = new Request("https://probe.example.test/v1/core-verifier-identity");
+    const response = await handleFormAuthorityIdentityProbe(request, {
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: IDENTITY.hostId,
+      PUBLIC_HOST_IDENTITY: {
+        async identity() {
+          return IDENTITY;
+        },
+      },
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: { code: "verifier_unavailable" } });
+
+    const publicResponse = await handleFormAuthorityIdentityProbe(
+      new Request("https://probe.example.test/v1/public-host-identity"),
+      {
+        TAKOSERVER_FORM_AUTHORITY_HOST_ID: IDENTITY.hostId,
+        PUBLIC_HOST_IDENTITY: {
+          async identity() {
+            return IDENTITY;
+          },
+        },
+      },
+    );
+    expect(publicResponse.status).toBe(200);
+    expect(await publicResponse.json()).toEqual(IDENTITY);
+  });
+
   test("does not expose another path or method", async () => {
     let called = false;
     const env = {

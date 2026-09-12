@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import worker, { resolvePublicWorkerImplementationIdentity } from "../src/entry-worker.ts";
-import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import worker, {
+  resolvePublicWorkerImplementationIdentity,
+  workerIntegrationOrganizationBootstrap,
+} from "../src/entry-worker.ts";
+import {
+  INTEGRATION_E2E_ORGANIZATION_ID,
+  type IntegrationE2eCredentialAuthorityConfig,
+} from "../src/integration-e2e-credential-authority.ts";
 import {
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
@@ -39,6 +45,75 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("composes organization bootstrap only from exact integration identity and JIT closures", () => {
+    const exact = {
+      OPERATOR_IDENTITY_PUBLIC_JWK: JSON.stringify({
+        kty: "OKP",
+        crv: "Ed25519",
+        x: "A".repeat(43),
+      }),
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_SOURCE_COMMIT: "e".repeat(40),
+      TAKOSERVER_WORKER_ARTIFACT_DIGEST: `sha256:${"f".repeat(64)}`,
+      WORKER_VERSION: { id: "00000000-0000-4000-8000-0000000000a1" },
+    } as const;
+    const credentialAuthority: IntegrationE2eCredentialAuthorityConfig = {
+      environment: "integration" as const,
+      publicJwk: {
+        kty: "OKP" as const,
+        crv: "Ed25519" as const,
+        x: "E".repeat(43),
+      },
+      organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+      sourceCommit: exact.TAKOSERVER_SOURCE_COMMIT,
+      artifactDigest: exact.TAKOSERVER_WORKER_ARTIFACT_DIGEST as `sha256:${string}`,
+      publicWorkerVersionId: exact.WORKER_VERSION.id,
+    };
+    expect(workerIntegrationOrganizationBootstrap(exact, ORIGIN, credentialAuthority)).toEqual({
+      environment: "integration",
+      hostId: ORIGIN,
+      publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      sourceCommit: "e".repeat(40),
+      artifactDigest: `sha256:${"f".repeat(64)}`,
+      publicWorkerVersionId: "00000000-0000-4000-8000-0000000000a1",
+    });
+
+    for (const incomplete of [
+      { ...exact, OPERATOR_IDENTITY_PUBLIC_JWK: undefined },
+      { ...exact, TAKOSERVER_SOURCE_COMMIT: undefined },
+      { ...exact, TAKOSERVER_WORKER_ARTIFACT_DIGEST: "wrong" },
+      { ...exact, WORKER_VERSION: { id: "wrong" } },
+      { ...exact, TAKOSERVER_ENVIRONMENT: "production" },
+      { ...exact, TAKOSERVER_ENVIRONMENT: "rehearsal" },
+    ]) {
+      expect(
+        workerIntegrationOrganizationBootstrap(
+          incomplete as Parameters<typeof workerIntegrationOrganizationBootstrap>[0],
+          ORIGIN,
+          credentialAuthority,
+        ),
+      ).toBeUndefined();
+    }
+    for (const unavailable of [
+      undefined,
+      { ...credentialAuthority, organizationId: "org_other" },
+      { ...credentialAuthority, sourceCommit: "d".repeat(40) },
+      { ...credentialAuthority, publicJwk: undefined },
+      {
+        ...credentialAuthority,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      },
+    ]) {
+      expect(
+        workerIntegrationOrganizationBootstrap(
+          exact,
+          ORIGIN,
+          unavailable as Parameters<typeof workerIntegrationOrganizationBootstrap>[2],
+        ),
+      ).toBeUndefined();
+    }
+  });
+
   test("a JIT-enabled Host without Form authority serves discovery and OpenAPI", async () => {
     const signing = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
       "sign",

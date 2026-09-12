@@ -412,17 +412,26 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} The minimal probe bundle, one public identity service binding, one ` +
-          "route-less Form-authority service binding and one target Host id are sealed before one upload.",
+          `${exactSource} The steady-state minimal probe bundle, one public identity service binding, ` +
+          "one route-less Form-authority service binding and one target Host id are sealed before one upload. " +
+          "When integration starts with both the probe and released-Core authority Workers absent, " +
+          "the existing surface internally selects the named `integration-host-only` profile: its " +
+          "sealed closure contains only the Host id and public identity binding, with no FORM_AUTHORITY.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the upload. Its permanent " +
           "workers.dev endpoint must actively return the exact PublicHostIdentity@v2 value read through " +
-          "the named public Worker RPC; no storage, secret, mutation RPC, route or custom domain exists.",
+          "the named public Worker RPC; no storage, secret, mutation RPC, route or custom domain exists. " +
+          "The integration-host-only result reports publicIdentityRpcReady: true, " +
+          "coreVerifierConfigured: false, coreVerifierRpcReady: false, and profileReady: true; " +
+          "the released-Core binding is added only by the existing explicit transition.",
         reversal:
           "The immediately previous identity probe Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} A missing, thrown, malformed or identity-inconsistent public RPC response ` +
-          "is unavailable and prevents Form-authority readiness." +
+          "is unavailable and prevents Form-authority readiness. The integration-host-only profile " +
+          "is selected only for complete integration formAuthority topology with both native Workers " +
+          "absent; probe or authority appearance at the final fence is a zero-upload refusal, and " +
+          "production and rehearsal retain the absence refusal." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -662,6 +671,55 @@ export const DEPLOY_CONTRACT = {
           "public closure, reverse, activation, and any third scope are refused before signing; refusal " +
           "output never includes raw binding JSON or an actual, predecessor, or foreign scope." +
           inputContract(applyReviewInput, formAuthorityPrivateJwkInput),
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-organization-bootstrap",
+      target: "https:integration-exact-host-fixed-organization-owner",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-organization-bootstrap.ts",
+        "src/integration-organization-bootstrap.ts",
+        "src/auth.ts",
+        "src/app.ts",
+        "src/entry-worker.ts",
+        "src/route-table.ts",
+        "src/openapi.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
+        "TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. Native current Host Version and exact configuration ` +
+          "prove the existing operator identity key and source/artifact before its private half is read. " +
+          "The request proof binds that identity, the fixed organization tuple, action, method, path and canonical body.",
+        "pre-mutation-proof":
+          "A signed status must resolve an already-existing exact operator principal and prove both organization " +
+          "and membership absent. Exact existing state is a no-op; partial state, another owner and identity drift " +
+          "are refused. Native Host provenance is reread immediately before apply.",
+        "post-conditions":
+          "Only org_takosumi_hosted_staging and its exact owner membership are created, atomically. A separately " +
+          "signed status and native Host readback must agree with the acknowledged tuple. No principal, session, " +
+          "API key, schema, Worker, route or secret is created or changed.",
+        reversal:
+          "No automatic reversal or row deletion exists. Inspect status after an uncertain acknowledgement; " +
+          "forward repair or disposal of the isolated generation requires a separate explicit decision.",
+        "failure-handling":
+          `${highRiskFailure} Accepted apply responses are acknowledged before decoding. Status never creates ` +
+          "a session or durable row. Credentials, assertion, operator identity fields and raw HTTP bodies are not printed." +
+          inputContract(
+            applyReviewInput,
+            "`TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH` and `TAKOSERVER_ORG_API_KEY_OPERATOR_IDENTITY_PATH` " +
+              "are required for both `--status` and `--apply`; no JIT, Form or customer private key is read.",
+          ),
         "independent-review": review,
       },
     },

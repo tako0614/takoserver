@@ -139,6 +139,35 @@ The integration JIT credential authority instead accepts exactly one of
 durable organization API key surface accepts exactly one of `--mint`,
 `--status`, or `--revoke`.
 
+### Fixed integration organization bootstrap
+
+Fresh integration storage can lack the fixed organization required by the JIT
+credential lane. Once the operator has signed in normally, the existing Host
+offers an integration-only bootstrap for that already-stored principal:
+
+```sh
+bun run deploy -- takoserver-integration-organization-bootstrap --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-organization-bootstrap --apply --environment=integration --commit=<40-hex-sha>
+```
+
+Both actions use the existing identity-only operator private key and exact
+operator sign-in identity file, under the same custody as the organization-key
+surface. Apply additionally requires independent review. The native current
+Host Version must match the selected source, artifact and configured operator
+key before the caller opens its private half. Each HTTPS request carries a
+separate proof valid for at most sixty seconds; no session is created.
+
+Status resolves the exact existing principal. Apply creates only
+`org_takosumi_hosted_staging` named `Takosumi Hosted staging` and that principal's
+owner membership, in one atomic batch. Exact existing state is a no-op. Partial
+state, a different owner/name or identity mismatch are refused, not repaired.
+There is no arbitrary organization selector, principal creation, schema change,
+new key, Worker, or production/rehearsal mode. An acknowledged apply requires a
+separately signed status readback. Never replay an uncertain apply: run status
+first. The surface has no delete or automatic reversal; generation disposal is
+a separate explicit operation. Ordinary organization creation and read-only
+owner proof keep their existing semantics.
+
 The canonical `takoserver-operator-identity` surface accepts `--status` or
 `--apply` in integration, rehearsal, and production. Every invocation names
 one exact `--organization=org_...` so status and owner proof are tied to the
@@ -698,9 +727,15 @@ managed customer runtime.
   Worker upload in every Form-authority environment. Its permanent target-owned
   workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
   named service binding to the public Worker's identity RPC. It has no storage,
-  secret, mutation RPC, custom domain, preview, or zone route. Status is ready
-  only after actively calling that RPC bridge and matching Host id, served
-  Version, outer artifact `A`, payload `P`, capability, and semantic `I`.
+  secret, mutation RPC, custom domain, preview, or zone route. For an initial
+  integration target with both native Workers absent, the existing surface
+  internally selects `integration-host-only` and realizes only the Host id and
+  public identity binding; it does not configure `FORM_AUTHORITY` or claim Core
+  readiness. Status recognizes that exact closure, while the explicit
+  `--add-binding=FORM_AUTHORITY` transition remains the sole Core-binding owner.
+  Status is ready only after actively calling that RPC bridge and matching Host
+  id, served Version, outer artifact `A`, payload `P`, capability, and semantic
+  `I`.
 - `takoserver-form-authority-worker`: one reviewed route-less service-binding
   RPC Worker upload. Its Core-verifier post-condition reads the identity probe's
   `FORM_AUTHORITY` bridge, which cannot exist before this Worker does, so a
@@ -726,7 +761,7 @@ managed customer runtime.
   facts only; Takoserver Host retains admission policy and private handle
   issuance. Deploying the shell does not grant Form mutation authority.
 - `takoserver-integration-form-authority-worker`: integration only. It packages
-  the exact generated 13-Form unsigned fixture corpus, hard-refuses any other
+  the exact generated 17-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.
   Its default export has a non-operational `fetch` handler that always returns
   `404` only to satisfy Cloudflare’s module registration requirement; its named

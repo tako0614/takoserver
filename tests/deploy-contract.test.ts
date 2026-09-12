@@ -34,6 +34,7 @@ const SURFACES = [
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],
   ["takoserver-integration-form-authority", ["authority"]],
   ["takoserver-integration-form-authority-deactivation", ["authority"]],
+  ["takoserver-integration-organization-bootstrap", ["irreversible", "authority"]],
   ["takoserver-integration-e2e-credentials", ["authority"]],
   ["takoserver-site", []],
   ["takoserver-console", []],
@@ -103,6 +104,9 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-sponsorship-authority-worker",
     );
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
+    const identityProbe = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-form-authority-identity-probe",
+    );
     const schemaBaseline = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
     );
@@ -155,6 +159,15 @@ describe("Takoserver split deploy entrypoint", () => {
       "uploaded Version is inactive",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("credential resolver");
+    expect(identityProbe?.obligations.provenance).toContain("integration-host-only");
+    expect(identityProbe?.obligations.provenance).toContain("no FORM_AUTHORITY");
+    expect(identityProbe?.obligations["post-conditions"]).toContain("publicIdentityRpcReady: true");
+    expect(identityProbe?.obligations["post-conditions"]).toContain(
+      "coreVerifierConfigured: false",
+    );
+    expect(identityProbe?.obligations["failure-handling"]).toContain(
+      "production and rehearsal retain the absence refusal",
+    );
     expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(
       "cannot emit production rehearsal evidence",
@@ -374,6 +387,36 @@ describe("Takoserver split deploy entrypoint", () => {
         `--generation=${"b".repeat(32)}`,
         "--add-secret=FOO",
       ].map((flag) => [surface, "--apply", "--environment=integration", commit, flag]),
+      [surface, "--issue", "--environment=integration", commit],
+    ]) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("organization bootstrap accepts only integration status/apply without arbitrary org or transition selectors", async () => {
+    const surface = "takoserver-integration-organization-bootstrap";
+    const commit = `--commit=${"a".repeat(40)}`;
+    for (const action of ["--status", "--apply"]) {
+      const accepted = await deploy([surface, action, "--environment=integration", commit]);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+    }
+    for (const args of [
+      ...["rehearsal", "production"].map((environment) => [
+        surface,
+        "--apply",
+        `--environment=${environment}`,
+        commit,
+      ]),
+      ...["--organization=org_other", "--reverse", "--add-binding=FORM_AUTHORITY"].map((flag) => [
+        surface,
+        "--apply",
+        "--environment=integration",
+        commit,
+        flag,
+      ]),
       [surface, "--issue", "--environment=integration", commit],
     ]) {
       const refused = await deploy(args);

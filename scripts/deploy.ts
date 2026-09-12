@@ -9,6 +9,7 @@ import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
@@ -39,6 +40,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-operator-identity --<status|apply> --environment=integration --commit=<sha>
     --organization=org_... (legacy spelling; integration only)
   bun run deploy -- takoserver-integration-e2e-credentials --<issue|status|revoke> --environment=integration --commit=<sha>
+  bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
   bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
@@ -401,7 +403,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (!action || !environment || !commit) return null;
   if (
-    surfaceValue === "takoserver-integration-worker-bootstrap" &&
+    (surfaceValue === "takoserver-integration-worker-bootstrap" ||
+      surfaceValue === "takoserver-integration-organization-bootstrap") &&
     (environment !== "integration" ||
       args.length !== 4 ||
       (action !== "status" && action !== "apply"))
@@ -964,6 +967,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       );
     case "takoserver-integration-e2e-credentials":
       return await runIntegrationE2eCredentials(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+        },
+        target,
+      );
+    case "takoserver-integration-organization-bootstrap":
+      return await runIntegrationOrganizationBootstrap(
         {
           surface: invocation.surface,
           action: invocation.action,

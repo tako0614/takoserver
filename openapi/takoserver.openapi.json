@@ -20,7 +20,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "A session secret, an organization API key, a tenant-run Space-scoped token, or a resource-scoped token, depending on the route."
+        "description": "A session secret, an organization API key, a tenant-run Space-scoped token, a resource-scoped token, or a purpose-specific operator assertion, depending on the route."
       }
     },
     "schemas": {
@@ -70,6 +70,141 @@
                 "description": "Lane-specific, value-free detail. Never derived from a secret."
               }
             }
+          }
+        }
+      },
+      "IntegrationOrganizationBootstrapOwner": {
+        "type": "object",
+        "description": "Exact already-stored operator identity. This value is authenticated and used only to resolve a principal; it is never returned by the bootstrap route.",
+        "required": [
+          "provider",
+          "subject",
+          "email",
+          "displayName"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "type": "string",
+            "enum": [
+              "google",
+              "github"
+            ]
+          },
+          "subject": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "email": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "displayName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "IntegrationOrganizationBootstrapStatusRequest": {
+        "type": "object",
+        "required": [
+          "organizationId",
+          "organizationName",
+          "owner"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "organizationName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "owner": {
+            "$ref": "#/components/schemas/IntegrationOrganizationBootstrapOwner"
+          }
+        }
+      },
+      "IntegrationOrganizationBootstrapApplyRequest": {
+        "type": "object",
+        "required": [
+          "organizationId",
+          "organizationName",
+          "owner",
+          "ownerPrincipalId"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "organizationName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "owner": {
+            "$ref": "#/components/schemas/IntegrationOrganizationBootstrapOwner"
+          },
+          "ownerPrincipalId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "IntegrationOrganizationBootstrapStatus": {
+        "type": "object",
+        "required": [
+          "kind",
+          "state",
+          "organizationId",
+          "organizationName",
+          "ownerPrincipalId",
+          "createdAt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "takoserver.integration-organization-bootstrap-status@v1"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "eligible",
+              "present"
+            ]
+          },
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "organizationName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "ownerPrincipalId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "createdAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
           }
         }
       },
@@ -962,6 +1097,182 @@
           }
         },
         "security": []
+      }
+    },
+    "/v1/operator/integration-e2e/organization-bootstrap/status": {
+      "post": {
+        "summary": "Inspect the fixed integration Organization bootstrap",
+        "description": "Integration-only operator authority. A sixty-second assertion signed by the configured identity-only operator key binds this exact request and the current Host provenance. It resolves only an already-stored exact principal and never creates a principal or session.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IntegrationOrganizationBootstrapStatusRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exact tuple is eligible for creation or is already present",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationOrganizationBootstrapStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or open request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Exact short-lived operator assertion required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Request differs from the fixed integration policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Principal or Organization tuple is unavailable or conflicting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Integration bootstrap authority is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/operator/integration-e2e/organization-bootstrap/apply": {
+      "post": {
+        "summary": "Create the fixed integration Organization owner tuple",
+        "description": "Integration-only operator authority. The ownerPrincipalId must be copied from a current signed status response. Creation inserts only the Organization and its owner membership in one atomic batch; an exact existing tuple is a no-op. There is no automatic reversal or destroy operation.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IntegrationOrganizationBootstrapApplyRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exact tuple was already present",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationOrganizationBootstrapStatus"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Exact tuple was atomically created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationOrganizationBootstrapStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or open request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Exact short-lived operator assertion required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Request differs from the fixed integration policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Principal or Organization tuple is unavailable or conflicting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Integration bootstrap authority is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/v1/sessions": {

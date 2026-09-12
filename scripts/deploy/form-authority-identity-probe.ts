@@ -19,7 +19,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
-import { type DeployTarget, targetPath } from "./target.ts";
+import { type DeployTarget, parseDeployTarget, targetPath } from "./target.ts";
 import {
   type DescriptorBindingMap,
   planTargetAdoption,
@@ -50,6 +50,10 @@ export const IDENTITY_PROBE_DESCRIPTOR_BINDINGS: DescriptorBindingMap = {
 
 const PROBE_PATH = "/v1/public-host-identity";
 const MAX_PROBE_RESPONSE_BYTES = 16 * 1_024;
+
+/** Internal profile for the first integration probe while Core is absent. */
+export const INTEGRATION_HOST_ONLY_PROBE_PROFILE = "integration-host-only" as const;
+export type FormAuthorityIdentityProbeProfile = typeof INTEGRATION_HOST_ONLY_PROBE_PROFILE;
 
 export interface FormAuthorityIdentityProbeInvocation {
   readonly surface: "takoserver-form-authority-identity-probe";
@@ -110,6 +114,8 @@ interface ProbeInspection {
   /** Whether the live Version is admissible only because a difference was declared. */
   readonly bindingTransitionProfile: "none" | "declared-delta-predecessor";
   readonly drift: readonly BindingDifference[];
+  /** Exact profile recognized from the served binding closure, if any. */
+  readonly probeProfile: FormAuthorityIdentityProbeProfile | null;
 }
 
 export interface PublicIdentityProbeExpectation {
@@ -153,19 +159,61 @@ export async function runFormAuthorityIdentityProbe(
     });
   const fetcher = options.fetcher ?? fetch;
   const publicBefore = await inspectPublic("preflight", target, state);
-  const authorityWorkerPresent = await assertBoundAuthorityWorkerExists(
-    "preflight",
-    invocation,
-    target,
-    state,
-  );
+  const authorityWorkerPresent = await isBoundAuthorityWorkerPresent(target, state);
+  const completeIntegrationHostOnlyTopology = hasCompleteIntegrationHostOnlyTopology(target);
   const before = await inspectProbe(
     "preflight",
     target,
     state,
     invocation.action,
     invocation.transition,
+    undefined,
+    completeIntegrationHostOnlyTopology,
   );
+  if (
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    !authorityWorkerPresent &&
+    before === null &&
+    !completeIntegrationHostOnlyTopology
+  ) {
+    throw preflightError(
+      "integration Host-only identity probe requires the complete Form authority topology",
+    );
+  }
+  const initialHostOnlyProfile =
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    !authorityWorkerPresent &&
+    before === null &&
+    completeIntegrationHostOnlyTopology;
+  const probeProfile =
+    invocation.transition === undefined &&
+    (initialHostOnlyProfile ||
+      (completeIntegrationHostOnlyTopology &&
+        before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE))
+      ? INTEGRATION_HOST_ONLY_PROBE_PROFILE
+      : null;
+  if (invocation.action === "apply" && !authorityWorkerPresent && !initialHostOnlyProfile) {
+    throw preflightError(
+      `Worker ${selected.authorityWorkerName} named by the probe's FORM_AUTHORITY binding does not ` +
+        `exist on account ${target.accountId}; deploy it first with \`bun run deploy -- ` +
+        `takoserver-form-authority-worker --apply --environment=${invocation.environment} ` +
+        `--commit=${invocation.commit}\``,
+    );
+  }
+  if (
+    invocation.action === "apply" &&
+    invocation.transition === undefined &&
+    (probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE ||
+      before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE) &&
+    !initialHostOnlyProfile
+  ) {
+    throw preflightError(
+      "integration Host-only identity probe already exists; its Core binding may be added only " +
+        "through the explicit --add-binding=FORM_AUTHORITY transition",
+    );
+  }
   const readbackBefore =
     before === null
       ? { ready: false, identity: null }
@@ -200,25 +248,42 @@ export async function runFormAuthorityIdentityProbe(
         publicWorker: publicBefore,
         probe: before,
         readback: readbackBefore,
+        probeProfile,
+        formAuthorityWorkerPresent: authorityWorkerPresent,
         ready: invocation.transition
           ? authorityWorkerPresent &&
             before?.bindingTransitionProfile === "declared-delta-predecessor" &&
             publicBefore.commit === invocation.commit
-          : authorityWorkerPresent &&
-            before?.commit === invocation.commit &&
-            before.bindingTransitionProfile === "none" &&
-            before.drift.length === 0 &&
-            publicBefore.commit === invocation.commit &&
-            readbackBefore.ready,
+          : probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+            ? authorityWorkerPresent === false &&
+              before?.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE &&
+              before.commit === invocation.commit &&
+              publicBefore.commit === invocation.commit &&
+              readbackBefore.ready
+            : authorityWorkerPresent &&
+              before?.commit === invocation.commit &&
+              before.bindingTransitionProfile === "none" &&
+              before.drift.length === 0 &&
+              publicBefore.commit === invocation.commit &&
+              readbackBefore.ready,
       }),
       formAuthorityWorkerName: selected.authorityWorkerName,
       formAuthorityWorkerPresent: authorityWorkerPresent,
-      ...(authorityWorkerPresent
+      ...(authorityWorkerPresent || initialHostOnlyProfile
         ? {}
         : {
             formAuthorityWorkerRemedy:
-              `deploy takoserver-form-authority-worker --apply --environment=` +
-              `${invocation.environment} --commit=${invocation.commit} first`,
+              probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+                ? `bun run deploy -- takoserver-form-authority-worker --apply --environment=` +
+                  `${invocation.environment} --commit=${invocation.commit} ` +
+                  `--bootstrap-verifier-bridge --bootstrap-probe-predecessor-version=` +
+                  `${before?.history.versionId ?? "<host-only-version>"} first, then transition ` +
+                  `the Host-only probe with \`bun run deploy -- ` +
+                  `takoserver-form-authority-identity-probe --apply --environment=${invocation.environment} ` +
+                  `--commit=${invocation.commit} --closure-predecessor-version=` +
+                  `${before?.history.versionId ?? "<host-only-version>"} --add-binding=FORM_AUTHORITY\``
+                : `deploy takoserver-form-authority-worker --apply --environment=` +
+                  `${invocation.environment} --commit=${invocation.commit} first`,
           }),
       bindingTransitionProfile: before?.bindingTransitionProfile ?? null,
       ...(invocation.transition
@@ -298,7 +363,15 @@ export async function runFormAuthorityIdentityProbe(
       run,
       environment,
       main: resolve(REPOSITORY, "src/entry-form-authority-identity-probe.ts"),
-      writeConfig: ({ path, main }) => writeProbeConfig({ path, main, target }),
+      writeConfig: ({ path, main }) =>
+        writeProbeConfigInternal({
+          path,
+          main,
+          target,
+          ...(probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+            ? { probeProfile: INTEGRATION_HOST_ONLY_PROBE_PROFILE }
+            : {}),
+        }),
     });
     const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
     const artifact = prepared.seal();
@@ -312,9 +385,28 @@ export async function runFormAuthorityIdentityProbe(
       state,
       invocation.action,
       invocation.transition,
+      undefined,
+      completeIntegrationHostOnlyTopology,
     );
     assertSameProbe("preflight", before, last);
-    await assertBoundAuthorityWorkerExists("preflight", invocation, target, state);
+    const authorityWorkerPresentLast = await isBoundAuthorityWorkerPresent(target, state);
+    if (
+      probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE &&
+      (last !== null || authorityWorkerPresentLast)
+    ) {
+      throw preflightError(
+        "integration Host-only identity probe requires both the probe and released-Core authority " +
+          "Workers to remain absent at the final mutation fence",
+      );
+    }
+    if (probeProfile !== INTEGRATION_HOST_ONLY_PROBE_PROFILE && !authorityWorkerPresentLast) {
+      throw preflightError(
+        `Worker ${selected.authorityWorkerName} named by the probe's FORM_AUTHORITY binding does ` +
+          `not exist on account ${target.accountId}; deploy it first with \`bun run deploy -- ` +
+          `takoserver-form-authority-worker --apply --environment=${invocation.environment} ` +
+          `--commit=${invocation.commit}\``,
+      );
+    }
     const upload = await run(
       wranglerCommand([
         "deploy",
@@ -337,9 +429,18 @@ export async function runFormAuthorityIdentityProbe(
 
     const publicAfter = await inspectPublic("verification", target, state);
     assertSamePublic("verification", publicBefore, publicAfter);
-    const after = await inspectProbe("verification", target, state, "apply");
+    const after = await inspectProbe(
+      "verification",
+      target,
+      state,
+      "apply",
+      undefined,
+      probeProfile,
+      completeIntegrationHostOnlyTopology,
+    );
     if (
       after === null ||
+      (probeProfile !== null && after.probeProfile !== probeProfile) ||
       after.bindingTransitionProfile !== "none" ||
       after.drift.length !== 0 ||
       after.history.versionId === before?.history.versionId ||
@@ -363,6 +464,8 @@ export async function runFormAuthorityIdentityProbe(
         publicWorker: publicAfter,
         probe: after,
         readback,
+        probeProfile: probeProfile ?? after.probeProfile,
+        formAuthorityWorkerPresent: authorityWorkerPresentLast,
         ready: true,
       }),
       dirty: source.dirty,
@@ -394,6 +497,15 @@ export function writeProbeConfig(input: {
   readonly main: string;
   readonly target: DeployTarget;
 }): string {
+  return writeProbeConfigInternal(input);
+}
+
+function writeProbeConfigInternal(input: {
+  readonly path: string;
+  readonly main: string;
+  readonly target: DeployTarget;
+  readonly probeProfile?: FormAuthorityIdentityProbeProfile;
+}): string {
   const selected = requireProbeTarget(input.target);
   const configuration = {
     account_id: input.target.accountId,
@@ -411,11 +523,15 @@ export function writeProbeConfig(input: {
         service: input.target.workerName,
         entrypoint: "PublicHostIdentityEntrypoint",
       },
-      {
-        binding: "FORM_AUTHORITY",
-        service: selected.authorityWorkerName,
-        entrypoint: "FormAuthorityEntrypoint",
-      },
+      ...(input.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+        ? []
+        : [
+            {
+              binding: "FORM_AUTHORITY",
+              service: selected.authorityWorkerName,
+              entrypoint: "FormAuthorityEntrypoint",
+            },
+          ]),
     ],
   };
   writeFileSync(input.path, `${JSON.stringify(configuration, null, 2)}\n`, { mode: 0o600 });
@@ -443,6 +559,8 @@ async function inspectProbe(
   state: FormAuthorityIdentityProbeState,
   action: "status" | "apply",
   transition?: WorkerSurfaceTransition,
+  expectedProfile?: FormAuthorityIdentityProbeProfile | null,
+  hostOnlyProfileEligible = false,
 ): Promise<ProbeInspection | null> {
   const selected = requireProbeTarget(target);
   const scripts = await state.workerScripts();
@@ -465,8 +583,24 @@ async function inspectProbe(
   if (history === null) throw phaseError(phase, "identity probe has no served deployment");
   const version = await state.workerVersion(selected.workerName, history.versionId);
   const identity = probeVersionIdentity(phase, version);
-  const expected = probeBindingClosure(target);
-  const drift = describeBindingDrift(phase, history.versionId, version, expected);
+  const fullExpected = probeBindingClosure(target);
+  const hostOnlyExpected = probeBindingClosure(target, INTEGRATION_HOST_ONLY_PROBE_PROFILE);
+  const fullDrift = describeBindingDrift(phase, history.versionId, version, fullExpected);
+  const hostOnlyDrift =
+    target.environment === "integration"
+      ? describeBindingDrift(phase, history.versionId, version, hostOnlyExpected)
+      : [];
+  const recognizedProfile =
+    hostOnlyProfileEligible && expectedProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+      ? hostOnlyDrift.length === 0
+        ? INTEGRATION_HOST_ONLY_PROBE_PROFILE
+        : null
+      : hostOnlyProfileEligible && fullDrift.length !== 0 && hostOnlyDrift.length === 0
+        ? INTEGRATION_HOST_ONLY_PROBE_PROFILE
+        : null;
+  const expected =
+    expectedProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE ? hostOnlyExpected : fullExpected;
+  const drift = expectedProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE ? hostOnlyDrift : fullDrift;
   let bindingTransitionProfile: ProbeInspection["bindingTransitionProfile"] = "none";
   if (drift.length === 0) {
     assertExactVersionBindingClosure(phase, history.versionId, version, expected);
@@ -479,7 +613,7 @@ async function inspectProbe(
     })
   ) {
     bindingTransitionProfile = "declared-delta-predecessor";
-  } else if (action === "apply") {
+  } else if (action === "apply" && recognizedProfile === null) {
     // Apply must still fence exactly; this raises the surface's own refusal.
     assertExactVersionBindingClosure(phase, history.versionId, version, expected);
   }
@@ -488,11 +622,20 @@ async function inspectProbe(
   if (!subdomain.enabled || subdomain.previewsEnabled) {
     throw phaseError(phase, "identity probe workers.dev topology is not exact");
   }
-  return { history, ...identity, bindingTransitionProfile, drift };
+  return {
+    history,
+    ...identity,
+    bindingTransitionProfile,
+    drift,
+    probeProfile: recognizedProfile,
+  };
 }
 
 /** The exact closure one probe Version must serve for the selected target. */
-function probeBindingClosure(target: DeployTarget): ExpectedBindingClosure {
+function probeBindingClosure(
+  target: DeployTarget,
+  profile?: FormAuthorityIdentityProbeProfile,
+): ExpectedBindingClosure {
   const selected = requireProbeTarget(target);
   return {
     TAKOSERVER_FORM_AUTHORITY_HOST_ID: {
@@ -503,13 +646,17 @@ function probeBindingClosure(target: DeployTarget): ExpectedBindingClosure {
       type: "service",
       fields: { service: target.workerName, entrypoint: "PublicHostIdentityEntrypoint" },
     },
-    FORM_AUTHORITY: {
-      type: "service",
-      fields: {
-        service: selected.authorityWorkerName,
-        entrypoint: "FormAuthorityEntrypoint",
-      },
-    },
+    ...(profile === INTEGRATION_HOST_ONLY_PROBE_PROFILE
+      ? {}
+      : {
+          FORM_AUTHORITY: {
+            type: "service",
+            fields: {
+              service: selected.authorityWorkerName,
+              entrypoint: "FormAuthorityEntrypoint",
+            },
+          },
+        }),
   };
 }
 
@@ -522,23 +669,14 @@ function probeBindingClosure(target: DeployTarget): ExpectedBindingClosure {
  * first deploy is not this surface's to perform. So the absence is named, with
  * the surface that owns the remedy, rather than published around.
  */
-async function assertBoundAuthorityWorkerExists(
-  phase: DeployPhase,
-  invocation: FormAuthorityIdentityProbeInvocation,
+async function isBoundAuthorityWorkerPresent(
   target: DeployTarget,
   state: FormAuthorityIdentityProbeState,
 ): Promise<boolean> {
   const selected = requireProbeTarget(target);
   const scripts = await state.workerScripts();
   if (scripts.includes(selected.authorityWorkerName)) return true;
-  if (invocation.action === "status") return false;
-  throw phaseError(
-    phase,
-    `Worker ${selected.authorityWorkerName} named by the probe's FORM_AUTHORITY binding does not ` +
-      `exist on account ${target.accountId}; deploy it first with \`bun run deploy -- ` +
-      `takoserver-form-authority-worker --apply --environment=${invocation.environment} ` +
-      `--commit=${invocation.commit}\``,
-  );
+  return false;
 }
 
 export async function readPublicHostIdentityProbe(
@@ -623,8 +761,12 @@ function probeResult(input: {
   readonly publicWorker: PublicIdentityProbeExpectation;
   readonly probe: ProbeInspection | null;
   readonly readback: PublicIdentityProbeReadback;
+  readonly probeProfile: FormAuthorityIdentityProbeProfile | null;
+  readonly formAuthorityWorkerPresent: boolean;
   readonly ready: boolean;
 }): Record<string, unknown> {
+  const coreVerifierConfigured =
+    input.probeProfile === INTEGRATION_HOST_ONLY_PROBE_PROFILE ? false : null;
   return {
     kind: input.kind,
     surface: input.invocation.surface,
@@ -645,6 +787,11 @@ function probeResult(input: {
     implementationPayloadDigest: input.readback.identity?.implementationPayloadDigest ?? null,
     capabilityDigest: input.readback.identity?.capabilityDigest ?? null,
     implementationDigest: input.readback.identity?.implementationDigest ?? null,
+    formAuthorityWorkerPresent: input.formAuthorityWorkerPresent,
+    probeProfile: input.probeProfile,
+    coreVerifierConfigured,
+    coreVerifierRpcReady: coreVerifierConfigured,
+    profileReady: input.ready,
     ready: input.ready,
   };
 }
@@ -656,13 +803,105 @@ function requireProbeTarget(target: DeployTarget): {
   readonly authorityWorkerName: string;
 } {
   const authority = target.formAuthority;
-  if (!authority) throw preflightError("deploy target has no Form authority identity probe");
+  if (
+    authority === undefined ||
+    typeof authority.workerName !== "string" ||
+    authority.workerName.length === 0 ||
+    typeof authority.identityProbeWorkerName !== "string" ||
+    authority.identityProbeWorkerName.length === 0 ||
+    typeof authority.identityProbeOrigin !== "string" ||
+    authority.identityProbeOrigin.length === 0 ||
+    typeof authority.hostId !== "string" ||
+    authority.hostId.length === 0
+  ) {
+    throw preflightError("deploy target has incomplete Form authority identity probe topology");
+  }
+  try {
+    const origin = new URL(authority.identityProbeOrigin);
+    if (
+      origin.protocol !== "https:" ||
+      origin.username ||
+      origin.password ||
+      origin.search ||
+      origin.hash
+    ) {
+      throw new TypeError("identity probe origin is not an https origin");
+    }
+  } catch {
+    throw preflightError("deploy target has incomplete Form authority identity probe topology");
+  }
   return {
     workerName: authority.identityProbeWorkerName,
     origin: authority.identityProbeOrigin,
     hostId: authority.hostId,
     authorityWorkerName: authority.workerName,
   };
+}
+
+/**
+ * Host-only bootstrap is an integration-only escape hatch, so its selection
+ * must be gated by the complete operator topology it is intended to precede.
+ * Runtime target loading normally proves these fields; this guard remains
+ * explicit at the deploy surface because tests and private callers may supply
+ * an already-typed descriptor without going through that parser.
+ */
+function hasCompleteIntegrationHostOnlyTopology(target: DeployTarget): boolean {
+  if (target.environment !== "integration") return false;
+  let validated: DeployTarget;
+  try {
+    // Reuse target.ts's pure parser for host/origin/name/scope/JWK invariants.
+    // Optional supply data is deliberately omitted from this validation
+    // projection: capability supply admission already ran above, and this
+    // predicate owns only the Form-authority topology needed for profile
+    // selection.
+    validated = parseDeployTarget(
+      {
+        kind: target.kind,
+        environment: target.environment,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        d1: target.d1,
+        r2: target.r2,
+        publicOrigin: target.publicOrigin,
+        signing: target.signing,
+        ...(target.aliases === undefined ? {} : { aliases: target.aliases }),
+        formAuthority: target.formAuthority,
+      },
+      "<identity-probe-host-only-topology>",
+      "integration",
+    );
+  } catch {
+    return false;
+  }
+  const authority = validated.formAuthority;
+  const scope = authority?.integrationOperatorScope;
+  const operatorJwk = authority?.operatorPublicJwk;
+  if (
+    authority === undefined ||
+    authority.integrationWorkerName === undefined ||
+    authority.integrationOperatorWorkerName === undefined ||
+    authority.integrationOperatorOrigin === undefined ||
+    scope === undefined ||
+    operatorJwk === undefined
+  ) {
+    return false;
+  }
+  try {
+    const publicOrigin = new URL(target.publicOrigin).origin;
+    const origin = new URL(authority.integrationOperatorOrigin);
+    return (
+      origin.protocol === "https:" &&
+      origin.username === "" &&
+      origin.password === "" &&
+      origin.search === "" &&
+      origin.hash === "" &&
+      !origin.hostname.endsWith(".workers.dev") &&
+      origin.origin !== publicOrigin &&
+      !(validated.aliases ?? []).includes(origin.hostname)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function probeVersionIdentity(

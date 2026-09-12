@@ -211,6 +211,56 @@ const RUNTIME_INPUT_PREPARATION_OPERATIONS = {
   },
 } as const;
 
+const INTEGRATION_ORGANIZATION_BOOTSTRAP_OPERATIONS = {
+  status: {
+    summary: "Inspect the fixed integration Organization bootstrap",
+    description:
+      "Integration-only operator authority. A sixty-second assertion signed by the configured identity-only operator key binds this exact request and the current Host provenance. It resolves only an already-stored exact principal and never creates a principal or session.",
+    security: [{ bearerAuth: [] }],
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/IntegrationOrganizationBootstrapStatusRequest" },
+        },
+      },
+    },
+    responses: {
+      "200": integrationOrganizationBootstrapResponse(
+        "Exact tuple is eligible for creation or is already present",
+      ),
+      "400": errorResponse("Malformed or open request"),
+      "401": errorResponse("Exact short-lived operator assertion required"),
+      "403": errorResponse("Request differs from the fixed integration policy"),
+      "409": errorResponse("Principal or Organization tuple is unavailable or conflicting"),
+      "503": errorResponse("Integration bootstrap authority is unavailable"),
+    },
+  },
+  apply: {
+    summary: "Create the fixed integration Organization owner tuple",
+    description:
+      "Integration-only operator authority. The ownerPrincipalId must be copied from a current signed status response. Creation inserts only the Organization and its owner membership in one atomic batch; an exact existing tuple is a no-op. There is no automatic reversal or destroy operation.",
+    security: [{ bearerAuth: [] }],
+    requestBody: {
+      required: true,
+      content: {
+        "application/json": {
+          schema: { $ref: "#/components/schemas/IntegrationOrganizationBootstrapApplyRequest" },
+        },
+      },
+    },
+    responses: {
+      "200": integrationOrganizationBootstrapResponse("Exact tuple was already present"),
+      "201": integrationOrganizationBootstrapResponse("Exact tuple was atomically created"),
+      "400": errorResponse("Malformed or open request"),
+      "401": errorResponse("Exact short-lived operator assertion required"),
+      "403": errorResponse("Request differs from the fixed integration policy"),
+      "409": errorResponse("Principal or Organization tuple is unavailable or conflicting"),
+      "503": errorResponse("Integration bootstrap authority is unavailable"),
+    },
+  },
+} as const;
+
 const ARTIFACT_CONSUMER_REPAIR_PARAMETERS = [
   {
     name: "organizationId",
@@ -313,6 +363,8 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "Prove an operator assertion names an existing exact Organization owner without creating durable state",
     { security: [] },
   ),
+  readIntegrationOrganizationBootstrap: INTEGRATION_ORGANIZATION_BOOTSTRAP_OPERATIONS.status,
+  applyIntegrationOrganizationBootstrap: INTEGRATION_ORGANIZATION_BOOTSTRAP_OPERATIONS.apply,
   createSession: described("Exchange an external assertion for a session", {
     security: [],
   }),
@@ -512,6 +564,17 @@ function currentReservationResponse(description: string) {
   } as const;
 }
 
+function integrationOrganizationBootstrapResponse(description: string) {
+  return {
+    description,
+    content: {
+      "application/json": {
+        schema: { $ref: "#/components/schemas/IntegrationOrganizationBootstrapStatus" },
+      },
+    },
+  } as const;
+}
+
 function reservationActivationOperation(summary: string) {
   return {
     summary,
@@ -697,7 +760,7 @@ export const openApiDocument = {
         type: "http",
         scheme: "bearer",
         description:
-          "A session secret, an organization API key, a tenant-run Space-scoped token, or a resource-scoped token, " +
+          "A session secret, an organization API key, a tenant-run Space-scoped token, a resource-scoped token, or a purpose-specific operator assertion, " +
           "depending on the route.",
       },
     },
@@ -730,6 +793,60 @@ export const openApiDocument = {
               },
             },
           },
+        },
+      },
+      IntegrationOrganizationBootstrapOwner: {
+        type: "object",
+        description:
+          "Exact already-stored operator identity. This value is authenticated and used only to resolve a principal; it is never returned by the bootstrap route.",
+        required: ["provider", "subject", "email", "displayName"],
+        additionalProperties: false,
+        properties: {
+          provider: { type: "string", enum: ["google", "github"] },
+          subject: { type: "string", minLength: 1, maxLength: 256 },
+          email: { type: "string", minLength: 1, maxLength: 256 },
+          displayName: { type: "string", minLength: 1, maxLength: 256 },
+        },
+      },
+      IntegrationOrganizationBootstrapStatusRequest: {
+        type: "object",
+        required: ["organizationId", "organizationName", "owner"],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          organizationName: { type: "string", minLength: 1, maxLength: 128 },
+          owner: { $ref: "#/components/schemas/IntegrationOrganizationBootstrapOwner" },
+        },
+      },
+      IntegrationOrganizationBootstrapApplyRequest: {
+        type: "object",
+        required: ["organizationId", "organizationName", "owner", "ownerPrincipalId"],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          organizationName: { type: "string", minLength: 1, maxLength: 128 },
+          owner: { $ref: "#/components/schemas/IntegrationOrganizationBootstrapOwner" },
+          ownerPrincipalId: IDENTIFIER_SCHEMA,
+        },
+      },
+      IntegrationOrganizationBootstrapStatus: {
+        type: "object",
+        required: [
+          "kind",
+          "state",
+          "organizationId",
+          "organizationName",
+          "ownerPrincipalId",
+          "createdAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          kind: { const: "takoserver.integration-organization-bootstrap-status@v1" },
+          state: { type: "string", enum: ["eligible", "present"] },
+          organizationId: IDENTIFIER_SCHEMA,
+          organizationName: { type: "string", minLength: 1, maxLength: 128 },
+          ownerPrincipalId: IDENTIFIER_SCHEMA,
+          createdAt: { type: ["string", "null"], format: "date-time" },
         },
       },
       ArtifactConsumerRepairApply: {

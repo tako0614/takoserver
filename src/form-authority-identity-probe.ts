@@ -24,7 +24,8 @@ export interface FormAuthorityCoreVerifierIdentity {
 export interface FormAuthorityIdentityProbeEnv {
   readonly TAKOSERVER_FORM_AUTHORITY_HOST_ID: string;
   readonly PUBLIC_HOST_IDENTITY: PublicHostIdentityRpc;
-  readonly FORM_AUTHORITY: FormAuthorityCoreVerifierIdentityRpc;
+  /** Absent only while the integration Host-only bootstrap profile is live. */
+  readonly FORM_AUTHORITY?: FormAuthorityCoreVerifierIdentityRpc;
 }
 
 /**
@@ -41,6 +42,9 @@ export async function handleFormAuthorityIdentityProbe(
     return jsonError(404, "not_found");
   }
   if (url.pathname === FORM_AUTHORITY_CORE_VERIFIER_IDENTITY_PATH) {
+    if (env.FORM_AUTHORITY === undefined) {
+      return jsonError(503, "verifier_unavailable");
+    }
     try {
       const identity = await env.FORM_AUTHORITY.verifierIdentity();
       if (!isFormAuthorityCoreVerifierIdentity(identity)) {

@@ -90,12 +90,22 @@ function reservationStub(): WorkerEndpointOriginReservations {
 
 /** The whole surface composed, so no route is missing merely for want of a port. */
 function completeHandler() {
+  const publicWorkerVersionId = "00000000-0000-4000-8000-000000000001";
   return buildApp({
     sql: createEphemeralSql(),
     objects: createMemoryObjectStore(),
     identity,
     settlement,
     publicOrigin: "https://api.takoserver.com",
+    publicWorkerVersionId,
+    integrationOrganizationBootstrap: {
+      environment: "integration",
+      hostId: "https://api.takoserver.com",
+      publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+      sourceCommit: "a".repeat(40),
+      artifactDigest: `sha256:${"b".repeat(64)}`,
+      publicWorkerVersionId,
+    },
     forms: [],
     hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
@@ -427,11 +437,46 @@ describe("published API description", () => {
     expect(JSON.stringify(schemas.WorkerRuntimeInputPreparation)).not.toContain("bindings");
   });
 
-  test("mentions no other product and leaks no upstream identity vocabulary", () => {
+  test("documents the integration-only bootstrap without putting asserted identity in responses", () => {
+    type JsonReference = { content: { "application/json": { schema: { $ref: string } } } };
+    type BootstrapOperation<Status extends string> = {
+      post: { requestBody: JsonReference; responses: Record<Status, JsonReference> };
+    };
+    const statusPath = openApiDocument.paths[
+      "/v1/operator/integration-e2e/organization-bootstrap/status"
+    ] as BootstrapOperation<"200">;
+    const applyPath = openApiDocument.paths[
+      "/v1/operator/integration-e2e/organization-bootstrap/apply"
+    ] as BootstrapOperation<"201">;
+    expect(statusPath.post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/IntegrationOrganizationBootstrapStatusRequest",
+    );
+    expect(applyPath.post.requestBody.content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/IntegrationOrganizationBootstrapApplyRequest",
+    );
+    expect(statusPath.post.responses["200"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/IntegrationOrganizationBootstrapStatus",
+    );
+    expect(applyPath.post.responses["201"].content["application/json"].schema.$ref).toBe(
+      "#/components/schemas/IntegrationOrganizationBootstrapStatus",
+    );
+    const statusSchema = openApiDocument.components.schemas.IntegrationOrganizationBootstrapStatus;
+    expect(statusSchema.additionalProperties).toBe(false);
+    expect(JSON.stringify(statusSchema)).not.toMatch(
+      /assertion|bodyDigest|displayName|email|provider|subject|private/u,
+    );
+  });
+
+  test("mentions no other product and keeps upstream identity vocabulary off customer routes", () => {
     const serialized = JSON.stringify(openApiDocument);
     expect(serialized).not.toMatch(/takosumi/i);
     // The reseller lane speaks only in opaque tenant references.
-    expect(serialized).not.toMatch(/workspace|userId|principalId/);
+    const customerPaths = Object.fromEntries(
+      Object.entries(openApiDocument.paths).filter(
+        ([path]) => !path.startsWith("/v1/operator/integration-e2e/organization-bootstrap/"),
+      ),
+    );
+    expect(JSON.stringify(customerPaths)).not.toMatch(/workspace|userId|principalId/);
   });
 
   test("serves the document it describes", async () => {

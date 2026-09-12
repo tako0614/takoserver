@@ -43,6 +43,16 @@ export const ROUTES: readonly RouteDeclaration[] = [
     pattern: "/v1/operator-owner-proof",
     operation: "proveOperatorOrganizationOwner",
   },
+  {
+    method: "post",
+    pattern: "/v1/operator/integration-e2e/organization-bootstrap/status",
+    operation: "readIntegrationOrganizationBootstrap",
+  },
+  {
+    method: "post",
+    pattern: "/v1/operator/integration-e2e/organization-bootstrap/apply",
+    operation: "applyIntegrationOrganizationBootstrap",
+  },
   { method: "post", pattern: "/v1/sessions", operation: "createSession" },
   { method: "delete", pattern: "/v1/session", operation: "endSession" },
   { method: "get", pattern: "/v1/me", operation: "readPrincipal" },

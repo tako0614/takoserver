@@ -53,6 +53,33 @@ const target = {
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
 
+const integrationHostOnlyTarget = {
+  ...target,
+  environment: "integration",
+  workerName: "takoserver-api-integration",
+  publicOrigin: "https://api.integration.example.test",
+  formAuthority: {
+    ...target.formAuthority,
+    workerName: "takoserver-form-authority-integration",
+    identityProbeWorkerName: "takoserver-form-identity-integration",
+    identityProbeOrigin:
+      "https://takoserver-form-identity-integration.integration.example.workers.dev",
+    integrationWorkerName: "takoserver-form-fixture-integration",
+    integrationOperatorWorkerName: "takoserver-form-operator-integration",
+    integrationOperatorOrigin: "https://form-authority.integration.takoserver.com",
+    integrationOperatorScope: {
+      tenantId: "tenant-yurucommu-integration",
+      space: "space-yurucommu-integration",
+    },
+    operatorPublicJwk: {
+      kty: "OKP" as const,
+      crv: "Ed25519" as const,
+      x: "A".repeat(43),
+    },
+    hostId: "https://api.integration.example.test",
+  },
+} satisfies DeployTarget;
+
 describe("Form authority identity probe deploy surface", () => {
   test("realizes only the two read-only identity RPC bindings and Host id", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-identity-config-"));
@@ -151,6 +178,699 @@ describe("Form authority identity probe deploy surface", () => {
       ready: true,
     });
   });
+});
+
+describe("integration Host-only identity probe bootstrap profile", () => {
+  const PUBLIC_BUNDLE =
+    "export default { async fetch() { return new Response('public-host-only'); } };\n";
+  const PROBE_BUNDLE =
+    "export default { async fetch() { return new Response('probe-host-only'); } };\n";
+  const PUBLIC_DIGEST = `sha256:${createHash("sha256")
+    .update(PUBLIC_BUNDLE)
+    .digest("hex")}` as const;
+  const PROBE_DIGEST = `sha256:${createHash("sha256").update(PROBE_BUNDLE).digest("hex")}` as const;
+  const PROFILE_COMMIT = "c".repeat(40);
+  const PUBLIC_VERSION = "77777777-7777-4777-8777-777777777777";
+  const PROBE_VERSION = "88888888-8888-4888-8888-888888888888";
+
+  test("publishes the exact Host-only closure when both native Workers are absent", async () => {
+    const uploaded = { value: false };
+    const uploads: string[][] = [];
+    const uploadedConfigs: Record<string, unknown>[] = [];
+    const state = hostOnlyState(uploaded);
+    const result = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      integrationHostOnlyTarget,
+      {
+        state,
+        fetcher: hostOnlyFetcher(),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          uploads.push([...command]);
+          const key = command.join(" ");
+          if (key === "git rev-parse HEAD") return ok(`${PROFILE_COMMIT}\n`);
+          if (key === "git branch --show-current") return ok("fix/integration-host-only\n");
+          if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+          if (key === "bun run check") return ok("green\n");
+          if (command.includes("--dry-run")) {
+            const out = command[command.indexOf("--outdir") + 1];
+            if (!out) throw new Error("dry-run outdir missing");
+            mkdirSync(out, { recursive: true });
+            writeFileSync(
+              join(out, "worker.js"),
+              out.includes("public-worker-proof") ? PUBLIC_BUNDLE : PROBE_BUNDLE,
+            );
+            writeFileSync(join(out, "worker.js.map"), "{}\n");
+            return ok("built\n");
+          }
+          if (command.includes("--no-bundle")) {
+            const configPath = command[command.indexOf("--config") + 1];
+            if (!configPath) throw new Error("upload config missing");
+            uploadedConfigs.push(JSON.parse(readFileSync(configPath, "utf8")));
+            uploaded.value = true;
+            return ok("uploaded\n");
+          }
+          throw new Error(`unexpected command: ${key}`);
+        },
+      },
+    );
+
+    expect(result).toMatchObject({
+      probeProfile: "integration-host-only",
+      formAuthorityWorkerPresent: false,
+      publicIdentityRpcReady: true,
+      coreVerifierConfigured: false,
+      coreVerifierRpcReady: false,
+      ready: true,
+    });
+    expect(uploads.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+    expect(uploadedConfigs).toEqual([
+      {
+        account_id: integrationHostOnlyTarget.accountId,
+        name: integrationHostOnlyTarget.formAuthority.identityProbeWorkerName,
+        main: "worker.js",
+        compatibility_date: "2026-08-17",
+        compatibility_flags: ["nodejs_compat"],
+        workers_dev: true,
+        preview_urls: false,
+        observability: { enabled: true },
+        vars: { TAKOSERVER_FORM_AUTHORITY_HOST_ID: integrationHostOnlyTarget.formAuthority.hostId },
+        services: [
+          {
+            binding: "PUBLIC_HOST_IDENTITY",
+            service: integrationHostOnlyTarget.workerName,
+            entrypoint: "PublicHostIdentityEntrypoint",
+          },
+        ],
+      },
+    ]);
+    expect(state.observedProbeBindings).toEqual([
+      "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+      "PUBLIC_HOST_IDENTITY",
+    ]);
+  });
+
+  test("status recognizes the emitted Host-only profile without inventing Core readiness", async () => {
+    const uploaded = { value: true };
+    const result = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      integrationHostOnlyTarget,
+      { state: hostOnlyState(uploaded), fetcher: hostOnlyFetcher() },
+    );
+
+    expect(result).toMatchObject({
+      probeProfile: "integration-host-only",
+      formAuthorityWorkerPresent: false,
+      publicIdentityRpcReady: true,
+      coreVerifierConfigured: false,
+      coreVerifierRpcReady: false,
+      ready: true,
+    });
+    expect(result.formAuthorityWorkerRemedy).toContain("--bootstrap-verifier-bridge");
+    expect(result.formAuthorityWorkerRemedy).toContain(
+      `--bootstrap-probe-predecessor-version=${PROBE_VERSION}`,
+    );
+  });
+
+  test("does not recognize Host-only status when integration operator topology is incomplete", async () => {
+    const { integrationOperatorScope: _integrationOperatorScope, ...incompleteAuthority } =
+      integrationHostOnlyTarget.formAuthority;
+    const incomplete = {
+      ...integrationHostOnlyTarget,
+      formAuthority: incompleteAuthority,
+    } as DeployTarget;
+    const result = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "status",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      incomplete,
+      { state: hostOnlyState({ value: true }), fetcher: hostOnlyFetcher() },
+    );
+
+    expect(result).toMatchObject({
+      probeProfile: null,
+      publicIdentityRpcReady: true,
+      ready: false,
+    });
+    expect(result.formAuthorityWorkerRemedy).toContain("takoserver-form-authority-worker");
+  });
+
+  test("refuses routine Host-only apply from an incomplete integration topology", async () => {
+    const { integrationOperatorScope: _integrationOperatorScope, ...incompleteAuthority } =
+      integrationHostOnlyTarget.formAuthority;
+    const incomplete = {
+      ...integrationHostOnlyTarget,
+      formAuthority: incompleteAuthority,
+    } as DeployTarget;
+    const base = hostOnlyState({ value: true });
+    const state: FormAuthorityIdentityProbeState = {
+      ...base,
+      async workerScripts() {
+        return [
+          ...(await base.workerScripts()),
+          integrationHostOnlyTarget.formAuthority.workerName,
+        ];
+      },
+    };
+    const calls: string[][] = [];
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      incomplete,
+      {
+        state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          throw new Error(`unexpected command: ${command.join(" ")}`);
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("FORM_AUTHORITY");
+    expect(calls).toEqual([]);
+  });
+
+  test("keeps the existing production absence refusal", async () => {
+    const calls: string[][] = [];
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state: hostOnlyState({ value: false }, target),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          return ok("");
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("does not exist on account");
+    expect(calls).toEqual([]);
+  });
+
+  test("does not classify a non-integration missing Core binding as Host-only", async () => {
+    const base = probeState(true);
+    const state: FormAuthorityIdentityProbeState = {
+      ...base,
+      async workerVersion(workerName, versionId) {
+        const value = await base.workerVersion(workerName, versionId);
+        if (workerName !== target.formAuthority.identityProbeWorkerName) return value;
+        const version = value as {
+          readonly resources: { readonly bindings: readonly { readonly name: string }[] };
+        };
+        return {
+          ...version,
+          resources: {
+            ...version.resources,
+            bindings: version.resources.bindings.filter(({ name }) => name !== "FORM_AUTHORITY"),
+          },
+        };
+      },
+    };
+    const calls: string[][] = [];
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          throw new Error(`unexpected command: ${command.join(" ")}`);
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("FORM_AUTHORITY");
+    expect(calls).toEqual([]);
+  });
+
+  test("rechecks full-Core authority presence at the final fence before uploading", async () => {
+    const uploaded = { value: false };
+    let ownerGate = false;
+    const calls: string[][] = [];
+    const publicExpected = expectedExactBindingClosure(target, {
+      workerArtifactDigest: PUBLIC_DIGEST,
+    });
+    const base = probeState(true);
+    const state: FormAuthorityIdentityProbeState = {
+      ...base,
+      async workerScripts() {
+        const scripts = await base.workerScripts();
+        return ownerGate
+          ? scripts.filter((name) => name !== target.formAuthority.workerName)
+          : scripts;
+      },
+      async workerDeployments(workerName) {
+        if (workerName === target.workerName) {
+          return [
+            {
+              id: `${workerName}-deployment`,
+              created_on: "2026-08-30T00:00:00Z",
+              versions: [{ version_id: PUBLIC_VERSION, percentage: 100 }],
+            },
+          ];
+        }
+        return base.workerDeployments(workerName);
+      },
+      async workerVersion(workerName, versionId) {
+        if (workerName !== target.workerName) return base.workerVersion(workerName, versionId);
+        return {
+          annotations: {
+            "workers/message": `takoserver-worker:${COMMIT}:${PUBLIC_DIGEST.slice("sha256:".length)}`,
+            "workers/triggered_by": "version_upload",
+          },
+          resources: {
+            bindings: Object.entries(publicExpected).flatMap(([name, requirement]) =>
+              requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+            ),
+          },
+        };
+      },
+    };
+    const semantic = await derivePublicFormImplementationIdentity({
+      implementationPayloadDigest: PAYLOAD_DIGEST,
+      capabilities: publicFormCapabilityManifest(),
+    });
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+      },
+      target,
+      {
+        state,
+        fetcher: async () =>
+          Response.json({
+            kind: "takoserver.public-host-identity@v2",
+            hostId: target.formAuthority.hostId,
+            workerVersionId: PUBLIC_VERSION,
+            workerArtifactDigest: PUBLIC_DIGEST,
+            ...semantic,
+          }),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          const key = command.join(" ");
+          if (key === "git rev-parse HEAD") return ok(`${"a".repeat(40)}\n`);
+          if (key === "git branch --show-current") return ok("fix/full-core-fence\n");
+          if (key === "git fetch --quiet --all --prune") return ok("");
+          if (key === `git branch -r --contains ${"a".repeat(40)}`) {
+            return ok("  origin/fix/full-core-fence\n");
+          }
+          if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+          if (key === "bun run check") {
+            ownerGate = true;
+            return ok("green\n");
+          }
+          if (command.includes("--dry-run")) {
+            const out = command[command.indexOf("--outdir") + 1];
+            if (!out) throw new Error("dry-run outdir missing");
+            mkdirSync(out, { recursive: true });
+            writeFileSync(
+              join(out, "worker.js"),
+              out.includes("public-worker-proof") ? PUBLIC_BUNDLE : PROBE_BUNDLE,
+            );
+            writeFileSync(join(out, "worker.js.map"), "{}\n");
+            return ok("built\n");
+          }
+          if (command.includes("--no-bundle")) {
+            uploaded.value = true;
+            return ok("uploaded\n");
+          }
+          throw new Error(`unexpected command: ${key}`);
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("does not exist on account");
+    expect(ownerGate).toBe(true);
+    expect(uploaded.value).toBe(false);
+    expect(calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(0);
+  });
+
+  test("refuses an incomplete integration topology before reading or uploading", async () => {
+    const calls: string[][] = [];
+    const { identityProbeOrigin: _identityProbeOrigin, ...incompleteAuthority } =
+      integrationHostOnlyTarget.formAuthority;
+    const incomplete = {
+      ...integrationHostOnlyTarget,
+      formAuthority: incompleteAuthority,
+    } as DeployTarget;
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      incomplete,
+      {
+        state: hostOnlyState({ value: false }),
+        run: async (command) => {
+          calls.push([...command]);
+          return ok("");
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("identity probe");
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a public identity drift and never uploads", async () => {
+    const uploaded = { value: false };
+    const calls: string[][] = [];
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      integrationHostOnlyTarget,
+      {
+        state: hostOnlyState(uploaded, integrationHostOnlyTarget, {
+          publicCommit: "d".repeat(40),
+        }),
+        fetcher: hostOnlyFetcher(),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          const key = command.join(" ");
+          if (key === "git rev-parse HEAD") return ok(`${PROFILE_COMMIT}\n`);
+          if (key === "git branch --show-current") return ok("fix/integration-host-only\n");
+          if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+          if (key === "bun run check") return ok("green\n");
+          if (command.includes("--no-bundle")) {
+            uploaded.value = true;
+            return ok("uploaded\n");
+          }
+          throw new Error(`unexpected command: ${key}`);
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("public");
+    expect(uploaded.value).toBe(false);
+    expect(calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(0);
+  });
+
+  test("does not retry an acknowledged upload when the public post-readback drifts", async () => {
+    const uploaded = { value: false };
+    const calls: string[][] = [];
+    let fetchCalls = 0;
+    const refusal = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: PROFILE_COMMIT,
+      },
+      integrationHostOnlyTarget,
+      {
+        state: hostOnlyState(uploaded),
+        fetcher: async () => {
+          fetchCalls += 1;
+          const semantic = await derivePublicFormImplementationIdentity({
+            implementationPayloadDigest: PAYLOAD_DIGEST,
+            capabilities: publicFormCapabilityManifest(),
+          });
+          return Response.json({
+            kind: "takoserver.public-host-identity@v2",
+            hostId: "https://drifted.example.test",
+            workerVersionId: PUBLIC_VERSION,
+            workerArtifactDigest: PUBLIC_DIGEST,
+            ...semantic,
+          });
+        },
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        run: async (command) => {
+          calls.push([...command]);
+          const key = command.join(" ");
+          if (key === "git rev-parse HEAD") return ok(`${PROFILE_COMMIT}\n`);
+          if (key === "git branch --show-current") return ok("fix/integration-host-only\n");
+          if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+          if (key === "bun run check") return ok("green\n");
+          if (command.includes("--dry-run")) {
+            const out = command[command.indexOf("--outdir") + 1];
+            if (!out) throw new Error("dry-run outdir missing");
+            mkdirSync(out, { recursive: true });
+            writeFileSync(
+              join(out, "worker.js"),
+              out.includes("public-worker-proof") ? PUBLIC_BUNDLE : PROBE_BUNDLE,
+            );
+            writeFileSync(join(out, "worker.js.map"), "{}\n");
+            return ok("built\n");
+          }
+          if (command.includes("--no-bundle")) {
+            uploaded.value = true;
+            return ok("uploaded\n");
+          }
+          throw new Error(`unexpected command: ${key}`);
+        },
+      },
+    ).catch((error: unknown) => error);
+
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toContain("identity");
+    expect(uploaded.value).toBe(true);
+    expect(fetchCalls).toBe(1);
+    expect(calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+  });
+
+  test("refuses probe or authority appearance at the final absence fence", async () => {
+    for (const appeared of ["probe", "authority"] as const) {
+      const uploaded = { value: false };
+      let ownerGate = false;
+      const calls: string[][] = [];
+      const base = hostOnlyState(uploaded);
+      const state: FormAuthorityIdentityProbeState = {
+        ...base,
+        async workerScripts() {
+          const scripts = await base.workerScripts();
+          if (!ownerGate) return scripts;
+          return appeared === "probe"
+            ? [...scripts, integrationHostOnlyTarget.formAuthority.identityProbeWorkerName]
+            : [...scripts, integrationHostOnlyTarget.formAuthority.workerName];
+        },
+      };
+      const refusal = await runFormAuthorityIdentityProbe(
+        {
+          surface: "takoserver-form-authority-identity-probe",
+          action: "apply",
+          environment: "integration",
+          commit: PROFILE_COMMIT,
+        },
+        integrationHostOnlyTarget,
+        {
+          state,
+          fetcher: hostOnlyFetcher(),
+          review: "independent-reviewer",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          run: async (command) => {
+            calls.push([...command]);
+            const key = command.join(" ");
+            if (key === "git rev-parse HEAD") return ok(`${PROFILE_COMMIT}\n`);
+            if (key === "git branch --show-current") return ok("fix/integration-host-only\n");
+            if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+            if (key === "bun run check") {
+              ownerGate = true;
+              return ok("green\n");
+            }
+            if (command.includes("--dry-run")) {
+              const out = command[command.indexOf("--outdir") + 1];
+              if (!out) throw new Error("dry-run outdir missing");
+              mkdirSync(out, { recursive: true });
+              writeFileSync(
+                join(out, "worker.js"),
+                out.includes("public-worker-proof") ? PUBLIC_BUNDLE : PROBE_BUNDLE,
+              );
+              writeFileSync(join(out, "worker.js.map"), "{}\n");
+              return ok("built\n");
+            }
+            if (command.includes("--no-bundle")) {
+              uploaded.value = true;
+              return ok("uploaded\n");
+            }
+            throw new Error(`unexpected command: ${key}`);
+          },
+        },
+      ).catch((error: unknown) => error);
+
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toMatch(/(probe|authority)/u);
+      expect(uploaded.value).toBe(false);
+      expect(calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(0);
+    }
+  });
+
+  function hostOnlyState(
+    uploaded: { value: boolean },
+    selectedTarget: DeployTarget = integrationHostOnlyTarget,
+    input: { readonly publicCommit?: string } = {},
+  ): FormAuthorityIdentityProbeState & {
+    readonly observedProbeBindings: string[];
+  } {
+    const observedProbeBindings: string[] = [];
+    const selectedAuthority = selectedTarget.formAuthority;
+    if (!selectedAuthority) throw new Error("fixture Form authority topology missing");
+    const publicExpected = expectedExactBindingClosure(selectedTarget, {
+      workerArtifactDigest: PUBLIC_DIGEST,
+    });
+    return {
+      observedProbeBindings,
+      async workerScripts() {
+        return uploaded.value
+          ? [selectedTarget.workerName, selectedAuthority.identityProbeWorkerName]
+          : [selectedTarget.workerName];
+      },
+      async workerDeployments(workerName) {
+        if (workerName === selectedTarget.workerName) {
+          return [
+            {
+              id: "public-deployment",
+              created_on: "2026-09-01T00:00:00Z",
+              versions: [{ version_id: PUBLIC_VERSION, percentage: 100 }],
+            },
+          ];
+        }
+        return uploaded.value
+          ? [
+              {
+                id: "probe-deployment",
+                created_on: "2026-09-01T01:00:00Z",
+                versions: [{ version_id: PROBE_VERSION, percentage: 100 }],
+              },
+            ]
+          : [];
+      },
+      async workerVersion(workerName) {
+        if (workerName === selectedTarget.workerName) {
+          return {
+            annotations: {
+              "workers/message": `takoserver-worker:${input.publicCommit ?? PROFILE_COMMIT}:${PUBLIC_DIGEST.slice("sha256:".length)}`,
+              "workers/triggered_by": "version_upload",
+            },
+            resources: {
+              bindings: Object.entries(publicExpected).flatMap(([name, requirement]) =>
+                requirement === null
+                  ? []
+                  : [{ name, type: requirement.type, ...requirement.fields }],
+              ),
+            },
+          };
+        }
+        const bindings = [
+          {
+            name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+            type: "plain_text",
+            text: selectedAuthority.hostId,
+          },
+          {
+            name: "PUBLIC_HOST_IDENTITY",
+            type: "service",
+            service: selectedTarget.workerName,
+            entrypoint: "PublicHostIdentityEntrypoint",
+          },
+        ];
+        observedProbeBindings.splice(
+          0,
+          observedProbeBindings.length,
+          ...bindings.map(({ name }) => name),
+        );
+        return {
+          annotations: {
+            "workers/message": `form-authority-identity-probe:${PROFILE_COMMIT}:${PROBE_DIGEST}`,
+          },
+          resources: { bindings },
+        };
+      },
+      async workerSecrets(workerName) {
+        return workerName === selectedTarget.workerName
+          ? expectedWorkerSecrets(selectedTarget).map((name) => ({ name, type: "secret_text" }))
+          : [];
+      },
+      async workerDomains() {
+        return [
+          {
+            hostname: new URL(selectedTarget.publicOrigin).hostname,
+            service: selectedTarget.workerName,
+          },
+        ];
+      },
+      async workerSubdomain(workerName) {
+        return {
+          enabled: workerName === selectedAuthority.identityProbeWorkerName,
+          previewsEnabled: false,
+        };
+      },
+      async workerRoutes() {
+        return [];
+      },
+    };
+  }
+
+  function hostOnlyFetcher(): (input: string, init?: RequestInit) => Promise<Response> {
+    return async () => {
+      const semantic = await derivePublicFormImplementationIdentity({
+        implementationPayloadDigest: PAYLOAD_DIGEST,
+        capabilities: publicFormCapabilityManifest(),
+      });
+      return Response.json({
+        kind: "takoserver.public-host-identity@v2",
+        hostId: integrationHostOnlyTarget.formAuthority.hostId,
+        workerVersionId: PUBLIC_VERSION,
+        workerArtifactDigest: PUBLIC_DIGEST,
+        ...semantic,
+      });
+    };
+  }
+
+  function ok(stdout: string) {
+    return { exitCode: 0, stdout, stderr: "" };
+  }
 });
 
 function probeState(present: boolean): FormAuthorityIdentityProbeState {

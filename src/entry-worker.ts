@@ -8,6 +8,10 @@ import {
   type IntegrationE2eCredentialAuthorityConfig,
   resolveIntegrationE2eCredentialAuthorityConfig,
 } from "./integration-e2e-credential-authority.ts";
+import {
+  type IntegrationOrganizationBootstrapConfig,
+  resolveIntegrationOrganizationBootstrapConfig,
+} from "./integration-organization-bootstrap.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import { createOperatorSettlement } from "./operator-credentials.ts";
 import { resolvePayment } from "./payment-setup.ts";
@@ -49,7 +53,7 @@ export interface WorkerEnv {
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
-  /** Exact deploy lane. The JIT credential route refuses every value but integration. */
+  /** Exact deploy lane. Integration-only operator routes refuse every other value. */
   readonly TAKOSERVER_ENVIRONMENT?: string;
   /** Public half of the dedicated operator proof key for the JIT pair lifecycle. */
   readonly TAKOSERVER_INTEGRATION_E2E_API_KEY_PUBLIC_JWK?: string;
@@ -374,6 +378,70 @@ export function workerIntegrationE2eCredentialAuthority(
   return resolved;
 }
 
+/**
+ * Mount the fixed bootstrap only on an exact integration Host which already
+ * has the ordinary identity-only operator verifier and the separately keyed,
+ * fixed-Organization JIT authority with identical deploy provenance.
+ *
+ * This is deliberately optional: a Host without that complete closure keeps
+ * serving its existing routes instead of acquiring a new all-or-nothing
+ * startup dependency. Invalid non-integration values therefore mean route
+ * absence; the route/config constructors themselves still reject such a
+ * configuration when called directly.
+ */
+export function workerIntegrationOrganizationBootstrap(
+  env: Pick<
+    WorkerEnv,
+    | "OPERATOR_IDENTITY_PUBLIC_JWK"
+    | "TAKOSERVER_ENVIRONMENT"
+    | "TAKOSERVER_SOURCE_COMMIT"
+    | "TAKOSERVER_WORKER_ARTIFACT_DIGEST"
+    | "WORKER_VERSION"
+  >,
+  hostId: string,
+  credentialAuthority: IntegrationE2eCredentialAuthorityConfig | undefined,
+): IntegrationOrganizationBootstrapConfig | undefined {
+  if (env.TAKOSERVER_ENVIRONMENT !== "integration") return undefined;
+  let authority: ReturnType<typeof resolveIntegrationE2eCredentialAuthorityConfig>;
+  try {
+    authority = resolveIntegrationE2eCredentialAuthorityConfig(credentialAuthority);
+  } catch {
+    return undefined;
+  }
+  const values = [
+    env.OPERATOR_IDENTITY_PUBLIC_JWK,
+    env.TAKOSERVER_SOURCE_COMMIT,
+    env.TAKOSERVER_WORKER_ARTIFACT_DIGEST,
+    env.WORKER_VERSION?.id,
+  ];
+  if (values.some((value) => typeof value !== "string" || value.length === 0)) {
+    return undefined;
+  }
+  if (
+    !authority ||
+    authority.organizationId !== INTEGRATION_E2E_ORGANIZATION_ID ||
+    authority.sourceCommit !== env.TAKOSERVER_SOURCE_COMMIT ||
+    authority.artifactDigest !== env.TAKOSERVER_WORKER_ARTIFACT_DIGEST ||
+    authority.publicWorkerVersionId !== env.WORKER_VERSION.id
+  ) {
+    return undefined;
+  }
+  try {
+    const configuration = resolveIntegrationOrganizationBootstrapConfig({
+      environment: "integration",
+      hostId,
+      publicJwk: env.OPERATOR_IDENTITY_PUBLIC_JWK as string,
+      sourceCommit: authority.sourceCommit,
+      artifactDigest: authority.artifactDigest,
+      publicWorkerVersionId: authority.publicWorkerVersionId,
+    });
+    if (!configuration || configuration.publicJwk.x === authority.publicJwk.x) return undefined;
+    return configuration;
+  } catch {
+    return undefined;
+  }
+}
+
 function configuredSigningPublicJwk(
   keyId: string | undefined,
   privateJwk: string | undefined,
@@ -432,6 +500,11 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     env.TAKOSERVER_SIGNING_KEY,
   );
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
+  const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
+    env,
+    origin,
+    integrationE2eCredentialAuthority,
+  );
   if (integrationE2eCredentialAuthority) {
     if (!signingKey || !env.TAKOSERVER_SIGNING_KEY) {
       throw new TypeError(
@@ -491,6 +564,7 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
         }
       : {}),
     ...(integrationE2eCredentialAuthority ? { integrationE2eCredentialAuthority } : {}),
+    ...(integrationOrganizationBootstrap ? { integrationOrganizationBootstrap } : {}),
     ...(runtimeInputs ? { runtimeInputs } : {}),
     originReservations,
     artifacts,

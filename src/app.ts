@@ -19,6 +19,11 @@ import {
   type IntegrationE2eCredentialAuthorityConfig,
   resolveIntegrationE2eCredentialAuthorityConfig,
 } from "./integration-e2e-credential-authority.ts";
+import {
+  createIntegrationOrganizationBootstrap,
+  type IntegrationOrganizationBootstrapConfig,
+  resolveIntegrationOrganizationBootstrapConfig,
+} from "./integration-organization-bootstrap.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
@@ -102,6 +107,8 @@ export interface AppPorts {
   readonly formImplementationDigest?: `sha256:${string}`;
   /** Complete integration-only JIT key authority configuration, or no route. */
   readonly integrationE2eCredentialAuthority?: IntegrationE2eCredentialAuthorityConfig;
+  /** Existing-key, integration-only fixed organization bootstrap, or no route. */
+  readonly integrationOrganizationBootstrap?: IntegrationOrganizationBootstrapConfig;
   /** One Host-owned service shared by control, provider, and scheduled lifecycle cleanup. */
   readonly runtimeInputs?: RuntimeInputAuthority;
   /** Optional precomposed authority used to close the runtime-input/provider assembly cycle. */
@@ -207,6 +214,16 @@ export function buildApp(ports: AppPorts): App {
       "integration E2E credential authority does not match the active Worker Version",
     );
   }
+  const integrationOrganizationBootstrap = resolveIntegrationOrganizationBootstrapConfig(
+    ports.integrationOrganizationBootstrap,
+  );
+  if (
+    integrationOrganizationBootstrap &&
+    (ports.publicOrigin !== integrationOrganizationBootstrap.hostId ||
+      ports.publicWorkerVersionId !== integrationOrganizationBootstrap.publicWorkerVersionId)
+  ) {
+    throw new TypeError("integration organization bootstrap does not match this Host identity");
+  }
   // The runtime-input `canonicalPublicOrigin` is an anti-misdirection fence:
   // it is the origin a caller must have addressed for its values to be sealed
   // here. An authority configured against any other origin fences nothing, so
@@ -241,6 +258,13 @@ export function buildApp(ports: AppPorts): App {
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
         configuration: integrationE2eCredentialAuthority,
+        sql: ports.sql,
+        clock,
+      })
+    : null;
+  const integrationOrganizationBootstrapRoute = integrationOrganizationBootstrap
+    ? createIntegrationOrganizationBootstrap({
+        configuration: integrationOrganizationBootstrap,
         sql: ports.sql,
         clock,
       })
@@ -625,9 +649,13 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
   });
   return {
-    fetch: integrationE2eCredentialRoute
-      ? async (request) => (await integrationE2eCredentialRoute(request)) ?? (await router(request))
-      : router,
+    fetch:
+      integrationOrganizationBootstrapRoute || integrationE2eCredentialRoute
+        ? async (request) =>
+            (await integrationOrganizationBootstrapRoute?.(request)) ??
+            (await integrationE2eCredentialRoute?.(request)) ??
+            (await router(request))
+        : router,
     maintenance: { artifacts: artifactReconciler },
     async tick(): Promise<TickReport> {
       const providerRepairs = (await takoformHost.maintenance?.drainProviderRepairs(64)) ?? {
