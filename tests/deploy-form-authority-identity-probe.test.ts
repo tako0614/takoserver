@@ -358,8 +358,7 @@ describe("integration Host-only identity probe bootstrap profile", () => {
           ...version,
           annotations: {
             ...version.annotations,
-            "workers/message":
-              `form-authority-identity-probe:${UPDATED_PROFILE_COMMIT}:${UPDATED_PROBE_DIGEST}`,
+            "workers/message": `form-authority-identity-probe:${UPDATED_PROFILE_COMMIT}:${UPDATED_PROBE_DIGEST}`,
           },
         };
       },
@@ -415,11 +414,13 @@ describe("integration Host-only identity probe bootstrap profile", () => {
     });
     expect(uploads.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
     expect(uploadedConfigs).toHaveLength(1);
-    expect(
-      (uploadedConfigs[0]?.services as { readonly binding: string }[]).map(
-        ({ binding }) => binding,
-      ),
-    ).toEqual(["PUBLIC_HOST_IDENTITY"]);
+    expect(uploadedConfigs[0]?.services).toEqual([
+      {
+        binding: "PUBLIC_HOST_IDENTITY",
+        service: integrationHostOnlyTarget.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+    ]);
   });
 
   test("refuses an existing Host-only update after Core appears instead of auto-transitioning", async () => {
