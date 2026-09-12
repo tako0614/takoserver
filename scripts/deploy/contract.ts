@@ -121,7 +121,14 @@ export const DEPLOY_CONTRACT = {
           "contiguous 0044-0049 tail, is pending, public smoke instead requires the " +
           "owned all-traffic quiescence 503 before any request-time composition. Cloudflare exposes no conditional " +
           "deployment/CAS input, so authoritative post-mutation " +
-          "history re-establishes the actual immediate predecessor as the rollback target.",
+          "history re-establishes the actual immediate predecessor as the rollback target. The Worker's `ready` " +
+          "result and discovery/OpenAPI HTTP 200 smoke establish runtime-ready Host state only; they do not establish " +
+          "that Form admission is ready or that an application is installed and serving HTTP. When live semantic " +
+          "implementation digest `I` differs from its predecessor, the existing owner admission workflow for that environment " +
+          "is the prerequisite for reconciling current support/activation heads; Host publication alone leaves those " +
+          "durable heads unchanged. A Host code publication with unchanged `I` does not itself require reconvergence; " +
+          "other existing drift follows its owning workflow. `I` follows the canonicalized actual emitted Worker " +
+          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -293,7 +300,14 @@ export const DEPLOY_CONTRACT = {
           "public smoke instead requires the owned all-traffic quiescence 503 " +
           "before any request-time composition. Every Form-authority environment separately seals " +
           "handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form " +
-          "package-operation set, embeds P/capability/I, then hashes outer artifact A.",
+          "package-operation set, embeds P/capability/I, then hashes outer artifact A. The Worker's `ready` " +
+          "result and discovery/OpenAPI HTTP 200 smoke establish runtime-ready Host state only; they do not establish " +
+          "that Form admission is ready or that an application is installed and serving HTTP. When live semantic " +
+          "implementation digest `I` differs from its predecessor, the existing owner admission workflow for that environment " +
+          "is the prerequisite for reconciling current support/activation heads; Host publication alone leaves those " +
+          "durable heads unchanged. A Host code publication with unchanged `I` does not itself require reconvergence; " +
+          "other existing drift follows its owning workflow. `I` follows the canonicalized actual emitted Worker " +
+          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -522,7 +536,7 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} Integration only. The generated exact 13-package unsigned fixture corpus, ` +
+          `${exactSource} Integration only. The generated exact 17-package unsigned fixture corpus, ` +
           "route-less bundle, target D1/R2 bindings, public identity RPC, and canonical capability manifest are sealed before one upload.",
         "post-conditions":
           "Authoritative Worker history and exact binding closure identify the uploaded integration fixture; " +
@@ -615,8 +629,17 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
           "must identify that commit before the owned 0600 Ed25519 key signs any request.",
         "post-conditions":
-          "Status performs one signed authoritative readback. Apply obtains one signed canonical plan, " +
-          "passes that exact plan digest once to apply, and finishes with a separately signed readback of the exact 13 Space-scoped non-production fixtures.",
+          "Before this lane, when live semantic implementation digest `I` differs from its predecessor, reconcile the " +
+          "existing integration fixture Worker (`takoserver-integration-form-authority-worker`) then operator gateway " +
+          "(`takoserver-integration-form-authority-operator-worker`) to the selected public commit. Status performs " +
+          "one signed authoritative readback. Apply obtains one signed canonical plan, passes that exact plan digest " +
+          "once to apply, and finishes with a separately signed status/catalog readback of all exact 17 Space-scoped " +
+          "non-production fixture identities. Form admission ready prerequisites are all 17 package identities " +
+          "installed and implemented catalog entries supported with active activation heads matching `I`; unsupported " +
+          "identities may retain package/support heads but must have no active activation head. A successful/converged " +
+          "apply returns a zero-command next plan; these prerequisites do not by themselves prove " +
+          "application installation or HTTP serving. A dynamic host-only probe result with `publicIdentityRpcReady=true` " +
+          "can be reused in this sequence; probe code changes continue through its existing probe surface and checks.",
         reversal:
           "Authority events are repaired forward: an acknowledged partial apply preserves every sanitized " +
           "action receipt and its next-plan digest for an explicit later readback/replan.",
@@ -659,7 +682,7 @@ export const DEPLOY_CONTRACT = {
         "post-conditions":
           "Status performs one signed authoritative readback. Apply obtains one signed canonical " +
           "deactivation plan, passes that exact plan digest once to apply, and finishes with a " +
-          "separately signed readback proving every exact 13 Space-scoped fixture is absent or inactive. " +
+          "separately signed readback proving every exact 17 Space-scoped fixture identity is absent or inactive; support and activation remain limited to the implemented catalog subset. " +
           "With a transition descriptor, both gateway and route-less authority must have a verified dynamic or legacy exact identity profile and " +
           "exact-transition-predecessor and only predecessor desiredActive:false is signed. Success projects " +
           "only the transition digest, binding profile, and scope-redacted boolean/digest readback summary.",
