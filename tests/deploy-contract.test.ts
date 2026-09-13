@@ -32,7 +32,7 @@ const SURFACES = [
   ["takoserver-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-worker", ["authority"]],
   ["takoserver-integration-form-authority-operator-worker", ["authority"]],
-  ["takoserver-integration-form-authority", ["authority"]],
+  ["takoserver-integration-form-authority", ["authority", "irreversible"]],
   ["takoserver-integration-form-authority-deactivation", ["authority"]],
   ["takoserver-integration-organization-bootstrap", ["irreversible", "authority"]],
   ["takoserver-integration-e2e-credentials", ["authority"]],
@@ -226,6 +226,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(invocation?.obligations["failure-handling"]).toContain(
       "never accepts the scope-transition selector",
+    );
+    expect(invocation?.obligations["pre-mutation-proof"]).toContain(
+      "signed canonical plan bound to the current durable heads",
     );
     expect(deactivation?.obligations["post-conditions"]).toContain(
       "only predecessor desiredActive:false is signed",

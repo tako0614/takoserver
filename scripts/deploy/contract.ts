@@ -623,7 +623,7 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH",
         "TAKOSERVER_INDEPENDENT_REVIEW",
       ],
-      triggers: ["authority"],
+      triggers: ["authority", "irreversible"],
       obligations: {
         provenance:
           `${exactSource} Integration only. Exhaustive gateway/authority/public-Worker readback ` +
@@ -640,6 +640,12 @@ export const DEPLOY_CONTRACT = {
           "apply returns a zero-command next plan; these prerequisites do not by themselves prove " +
           "application installation or HTTP serving. A dynamic host-only probe result with `publicIdentityRpcReady=true` " +
           "can be reused in this sequence; probe code changes continue through its existing probe surface and checks.",
+        "pre-mutation-proof":
+          "Before mutation, the existing current-target identity readback must match the gateway/public Worker. " +
+          "Apply obtains one fresh signed canonical plan bound to the current durable heads; the authority rechecks " +
+          "its plan digest and request identity, re-derives operations from current heads, rereads heads after " +
+          "verification, and fences the live target immediately before every durable command. A mismatch at that " +
+          "fence fails closed before the command's package, support, or activation event is appended.",
         reversal:
           "Authority events are repaired forward: an acknowledged partial apply preserves every sanitized " +
           "action receipt and its next-plan digest for an explicit later readback/replan.",
