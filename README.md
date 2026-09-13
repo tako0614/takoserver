@@ -525,6 +525,23 @@ asynchronous, incomplete or wrong-kind backend is a startup error, never an
 ordinary-Workers fallback; the deprecated ordinary endpoint suffix cannot be
 combined with that factory.
 
+Mutation failure codes do not prove that nothing changed. A Provider may return
+`failedWithoutProviderMutation(operationId, code, message)` from this extension
+entry only when its exact initial call accepted no native mutation. The proof
+is bound to that returned ticket object and operation id; cloning, serialization
+and later polling do not carry it. Other failures retain the operation for
+reconciliation, including non-retryable failures and exceptions after entry.
+An earlier runtime-binding callback or SQLite migration also prevents a later
+provider-only refusal from proving the whole attempt idle. When the attempt is
+provably idle, its wallet hold and failed-operation cleanup commit together;
+otherwise the hold stays with the recoverable operation.
+
+An embedding that implements `TakoformResourceDriver` directly can use
+`ProviderMutationDefinitiveRefusalError` from `@takoserver/core` for its own
+initial pre-effect rejection. Provider Pack methods use the returned-ticket
+helper instead; throwing that class from a Provider method is not proof.
+Neither helper adds a field or version to the public Takoform API.
+
 The separate `@takoserver/core/provider-extension/selfhost` entry exports the
 experimental `createDockerHttpRevisionRuntime` and `createSelfhostContainerRuntime`.
 Node/filesystem adapters stay out of the portable `provider-extension`, which

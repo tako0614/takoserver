@@ -7,20 +7,22 @@ import { sanitizedMessage } from "./error-envelope.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
-import type { Ledger } from "./ledger.ts";
+import type { Ledger, LedgerHeldCharge } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
-import type {
-  Provider,
-  ProviderExecutionAuthority,
-  ProviderNativeAbsence,
-  ProviderNativeReadbackDescriptor,
-  ProviderOffering,
-  ProviderRelation,
-  ProviderResult,
-  ProviderTicket,
-  ProviderValue,
+import {
+  providerFailureProvesNoMutation,
+  type Provider,
+  type ProviderExecutionAuthority,
+  type ProviderNativeAbsence,
+  type ProviderNativeReadbackDescriptor,
+  type ProviderOffering,
+  type ProviderRelation,
+  type ProviderResult,
+  type ProviderRuntimeBinding,
+  type ProviderTicket,
+  type ProviderValue,
 } from "./provider-port.ts";
 import {
   canMaterializeAcrossProviderPacks,
@@ -101,6 +103,74 @@ export class ProviderMutationRecoveryError extends TakoformHostError {
     super(code, status, undefined, sanitizedMessage(message));
     this.name = "ProviderMutationRecoveryError";
   }
+}
+
+/**
+ * The current initial mutation was refused with driver-owned proof that no
+ * provider mutation was accepted. The engine may settle its already-written
+ * dispatch marker; the same evidence observed during recovery is deliberately
+ * degraded to indeterminate because it says nothing about an older invocation.
+ */
+export class ProviderMutationDefinitiveRefusalError extends TakoformHostError {
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    options?: {
+      readonly heldCharge?: LedgerHeldCharge;
+      readonly hostCode?: string;
+      readonly details?: unknown;
+    },
+  ) {
+    super(code, status, options?.details, sanitizedMessage(message), options?.hostCode);
+    this.name = "ProviderMutationDefinitiveRefusalError";
+    if (options?.heldCharge) this.heldCharge = options.heldCharge;
+  }
+
+  readonly heldCharge?: LedgerHeldCharge;
+}
+
+/**
+ * Promotes only a driver-owned preflight rejection into no-provider-mutation
+ * evidence. Callers deliberately bound each use to validation and read-only
+ * ports; reservation writes and Provider methods never run inside this helper.
+ */
+async function definitiveProviderPreflight<T>(work: () => T | Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if (
+      error instanceof ProviderMutationRecoveryError ||
+      error instanceof ProviderMutationDefinitiveRefusalError
+    ) {
+      throw error;
+    }
+    if (error instanceof TakoformHostError) {
+      throw new ProviderMutationDefinitiveRefusalError(
+        error.code,
+        error.status,
+        error.publicMessage,
+        {
+          ...(error.details !== undefined ? { details: error.details } : {}),
+          ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+        },
+      );
+    }
+    throw error;
+  }
+}
+
+/** An extension callback cannot manufacture whole-attempt no-effect proof. */
+function withoutDefinitiveProviderProof(error: unknown): unknown {
+  return error instanceof ProviderMutationDefinitiveRefusalError
+    ? new TakoformHostError(
+        error.code,
+        error.status,
+        error.details,
+        error.publicMessage,
+        error.hostCode,
+      )
+    : error;
 }
 
 /**
@@ -363,6 +433,23 @@ export function createProviderDriver(
     },
   };
 
+  /** A current-call proof cannot cross into a later poll invocation. */
+  const detachPolledFailureProof = (ticket: ProviderTicket): ProviderTicket =>
+    ticket.phase === "failed" ? { ...ticket, failure: { ...ticket.failure } } : ticket;
+
+  const retainPolledRecoveryAuthority = (
+    ticket: ProviderTicket,
+    handle: string,
+  ): ProviderTicket => {
+    const detached = detachPolledFailureProof(ticket);
+    // A terminal answer from `poll` describes that poll invocation, not the
+    // mutation which first returned this handle. Retain the provider's durable
+    // recovery identity even for a non-retryable ambiguous failure; otherwise
+    // recording the outcome would erase the only authority a later executor
+    // has to inspect the accepted mutation.
+    return detached.phase === "failed" && !detached.handle ? { ...detached, handle } : detached;
+  };
+
   /** Drives a ticket to a terminal state within the inline budget. */
   const settle = async (
     provider: Provider,
@@ -384,8 +471,12 @@ export function createProviderDriver(
     for (let attempt = 0; ticket.phase === "running" && attempt < pollBudget; attempt += 1) {
       if (!provider.poll) break;
       try {
+        const polledHandle = ticket.handle;
         await sleep(ticket.pollAfterMs);
-        ticket = await provider.poll({ operationId, handle: ticket.handle, executionAuthority });
+        ticket = retainPolledRecoveryAuthority(
+          await provider.poll({ operationId, handle: polledHandle, executionAuthority }),
+          polledHandle,
+        );
       } catch {
         // The opaque handle was durable before entering this loop. Preserve it
         // when a transport or scheduler failure leaves the outcome unknown.
@@ -393,10 +484,6 @@ export function createProviderDriver(
       }
       if (ticket.phase === "running") {
         handle = ticket.handle;
-      } else if (ticket.phase === "failed" && ticket.failure.retryable && handle) {
-        // Keep the handle beside a retryable poll fault. The next executor
-        // must retry the same operation, never dispatch a fresh mutation.
-        ticket = { ...ticket, handle };
       }
     }
     return ticket;
@@ -420,16 +507,22 @@ export function createProviderDriver(
       };
     }
     try {
-      const ticket = await provider.poll({ operationId, handle, executionAuthority });
-      return ticket.phase === "failed" && ticket.failure.retryable && !ticket.handle
-        ? { ...ticket, handle }
-        : ticket;
+      return retainPolledRecoveryAuthority(
+        await provider.poll({ operationId, handle, executionAuthority }),
+        handle,
+      );
     } catch {
       throw new ProviderMutationRecoveryError("indeterminate", handle);
     }
   };
 
-  const resultOf = (ticket: ProviderTicket): ProviderResult => {
+  const resultOf = (
+    ticket: ProviderTicket,
+    mutation?: {
+      readonly operationId: string;
+      readonly mode: "initial" | "recovery";
+    },
+  ): ProviderResult => {
     if (ticket.phase === "succeeded") {
       return ticket.result;
     }
@@ -456,26 +549,84 @@ export function createProviderDriver(
     // with `invalid_argument` and a repair line telling them to "correct the
     // desired state the message names" against a message that named nothing.
     const [code, status] = failureToWire(ticket.failure.code);
-    throw new TakoformHostError(code, status, undefined, sanitizedMessage(ticket.failure.message));
+    if (mutation && providerFailureProvesNoMutation(ticket, mutation.operationId)) {
+      if (mutation.mode === "initial") {
+        throw new ProviderMutationDefinitiveRefusalError(code, status, ticket.failure.message);
+      }
+      // This ticket proves only that the recovery invocation did not write.
+      // An older invocation already owns the durable dispatch marker and may
+      // have mutated before losing its acknowledgement, so retain its plan.
+      throw new ProviderMutationRecoveryError(
+        "indeterminate",
+        ticket.handle,
+        code,
+        status,
+        ticket.failure.message,
+      );
+    }
+    const refusal = new TakoformHostError(
+      code,
+      status,
+      undefined,
+      sanitizedMessage(ticket.failure.message),
+    );
+    if (mutation) {
+      // A provider failure code controls its public diagnosis and automatic
+      // retry policy, not mutation certainty. Even a 4xx-looking ticket may be
+      // a post-write refusal; without identity-bound no-effect proof, retain the
+      // exact operation for reconciliation.
+      throw new ProviderMutationRecoveryError(
+        "indeterminate",
+        ticket.handle,
+        code,
+        status,
+        ticket.failure.message,
+      );
+    }
+    throw refusal;
   };
 
-  /**
-   * Holds the price, runs the work, then captures or releases. A crash between
-   * hold and settlement leaves an earmark the reservation sweep returns.
-   */
+  /** Direct Provider throws never carry the operation-bound ticket proof. */
+  const enteredProviderMutation = async (
+    work: () => Promise<ProviderTicket>,
+  ): Promise<ProviderTicket> => {
+    try {
+      return await work();
+    } catch (error) {
+      if (error instanceof ProviderMutationRecoveryError) throw error;
+      throw new ProviderMutationRecoveryError("indeterminate");
+    }
+  };
+
+  /** Holds the price, runs the work, then captures or durably retains it. */
   const charged = async (
     organizationId: string,
-    operationId: string,
     priceMinor: number,
+    mutation: {
+      readonly operationId: string;
+      readonly mode: "initial" | "recovery";
+    },
     work: () => Promise<ProviderTicket>,
   ): Promise<ProviderResult> => {
-    if (priceMinor === 0) return resultOf(await work());
+    if (priceMinor === 0) return resultOf(await work(), mutation);
     const held = await ledger.hold({
       organizationId,
-      reference: operationId,
+      reference: mutation.operationId,
       amountMinor: priceMinor,
     });
-    if (!held) throw new TakoformHostError("insufficient_funds", 402);
+    if (!held) {
+      if (mutation.mode === "initial") {
+        throw new ProviderMutationDefinitiveRefusalError("insufficient_funds", 402);
+      }
+      // Failing to obtain funds for this recovery call does not prove that the
+      // earlier dispatched provider call was idle.
+      throw new ProviderMutationRecoveryError(
+        "indeterminate",
+        undefined,
+        "insufficient_funds",
+        402,
+      );
+    }
     // A provider recovery error means dispatch was accepted but the driver did
     // not observe a terminal result. The durable hold is the only authority
     // keeping this operation's price earmarked while a restarted executor
@@ -485,7 +636,7 @@ export function createProviderDriver(
     if (ticket.phase === "succeeded") {
       await ledger.capture({
         organizationId,
-        reference: operationId,
+        reference: mutation.operationId,
         amountMinor: priceMinor,
       });
       return ticket.result;
@@ -494,12 +645,27 @@ export function createProviderDriver(
       // `running` and retryable `failed` tickets are recovery outcomes. Call
       // resultOf before releasing so both retain the hold for the next poll or
       // same-operation retry.
-      return resultOf(ticket);
+      return resultOf(ticket, mutation);
     } catch (error) {
       if (error instanceof ProviderMutationRecoveryError) throw error;
+      if (error instanceof ProviderMutationDefinitiveRefusalError) {
+        // Releasing here would put money back before the engine's provider-plan
+        // lease fence commits. Carry the exact hold to the lifecycle owner so
+        // refusal, cleanup, and release become one atomic SQL decision.
+        throw new ProviderMutationDefinitiveRefusalError(
+          error.code,
+          error.status,
+          error.publicMessage,
+          {
+            heldCharge: { reference: mutation.operationId, amountMinor: priceMinor },
+            ...(error.details !== undefined ? { details: error.details } : {}),
+            ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+          },
+        );
+      }
       await ledger.release({
         organizationId,
-        reference: operationId,
+        reference: mutation.operationId,
         amountMinor: priceMinor,
       });
       throw error;
@@ -891,79 +1057,184 @@ export function createProviderDriver(
       },
     },
     async apply(input): Promise<TakoformDriverReceipt> {
-      const current = await deployments.active(input.tenantId, input.resourceUid);
+      const current = await definitiveProviderPreflight(() =>
+        deployments.active(input.tenantId, input.resourceUid),
+      );
       if (intrinsicForm(input.form)) {
-        if (current) throw new TakoformHostError("backend_unavailable", 503);
+        if (current) {
+          throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
+        }
         return { observed: structuredClone(input.spec) };
       }
-      const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
-        tenantId: input.tenantId,
-        form: input.form,
-        relations: input.relations,
-        ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
-      });
-      assertProviderRuntimeInputs(provider, input.spec);
-      // Recovery adopts the retained runtime binding, not today's integration
-      // registry. Initial delivery is fenced before placement or native work.
-      if (input.standardServices?.length && input.operationMode === undefined) {
-        throw new TakoformHostError("unsupported_capability", 422);
-      }
-      const standardServices =
-        input.operationMode === "initial" ? selectStandardServiceProjections(provider, input) : [];
-      const sold = soldSelection?.sold;
-      const priceMinor = soldSelection?.priceMinor ?? 0;
-      const relationTargets =
-        inheritedSelection?.relations ?? (await providerRelations(input.tenantId, input.relations));
-      if (
-        sold &&
-        input.commercialAuthority &&
-        (input.commercialAuthority.offeringId !== sold.id ||
-          (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
-      ) {
-        throw new TakoformHostError("unsupported_capability", 422);
-      }
-      if (
-        current &&
-        (current.offeringId !== offering.id ||
-          current.providerPackRef !== provider.id ||
-          current.providerInstallationRef !==
-            (sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef))
-      ) {
-        // Moving supply is a Migration, never an ordinary Resource update.
-        throw new TakoformHostError("unsupported_capability", 422);
-      }
-      const previous = current
-        ? {
-            nativeId: current.nativeId,
-            spec: input.previous?.spec ?? input.spec,
-          }
-        : undefined;
-      const providerInstallationRef =
-        sold?.providerInstallationRef ??
-        inheritedSelection?.providerInstallationRef ??
-        (() => {
-          throw new TakoformHostError("backend_unavailable", 503);
-        })();
-      const providerIdentity = {
-        tenantRef: input.tenantId,
-        space: input.space,
-        name: input.name,
-        uid: input.resourceUid,
-        ...(current && input.previous
+      const preflight = await definitiveProviderPreflight(async () => {
+        const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
+          tenantId: input.tenantId,
+          form: input.form,
+          relations: input.relations,
+          ...(input.commercialAuthority
+            ? { offeringId: input.commercialAuthority.offeringId }
+            : {}),
+        });
+        assertProviderRuntimeInputs(provider, input.spec);
+        // Recovery adopts the retained runtime binding, not today's integration
+        // registry. Initial delivery is fenced before placement or native work.
+        if (input.standardServices?.length && input.operationMode === undefined) {
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+        const standardServices =
+          input.operationMode === "initial"
+            ? selectStandardServiceProjections(provider, input)
+            : [];
+        const sold = soldSelection?.sold;
+        const priceMinor = soldSelection?.priceMinor ?? 0;
+        const relationTargets =
+          inheritedSelection?.relations ??
+          (await providerRelations(input.tenantId, input.relations));
+        if (
+          sold &&
+          input.commercialAuthority &&
+          (input.commercialAuthority.offeringId !== sold.id ||
+            (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
+        ) {
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+        if (
+          current &&
+          (current.offeringId !== offering.id ||
+            current.providerPackRef !== provider.id ||
+            current.providerInstallationRef !==
+              (sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef))
+        ) {
+          // Moving supply is a Migration, never an ordinary Resource update.
+          throw new TakoformHostError("unsupported_capability", 422);
+        }
+        const previous = current
           ? {
-              incarnationId: current.id,
-              generation: input.previous.metadata.generation,
+              nativeId: current.nativeId,
+              spec: input.previous?.spec ?? input.spec,
             }
-          : {}),
-      } as const;
-      const runtimeBindings = await materializeProviderRuntimeBindings({
-        tenantId: input.tenantId,
-        source: providerIdentity,
-        sourceSpec: input.spec,
-        consumerPack: packsById.get(provider.id),
-        packs: packsById,
-        relations: relationTargets,
+          : undefined;
+        const providerInstallationRef =
+          sold?.providerInstallationRef ??
+          inheritedSelection?.providerInstallationRef ??
+          (() => {
+            throw new TakoformHostError("backend_unavailable", 503);
+          })();
+        const providerIdentity = {
+          tenantRef: input.tenantId,
+          space: input.space,
+          name: input.name,
+          uid: input.resourceUid,
+          ...(current && input.previous
+            ? {
+                incarnationId: current.id,
+                generation: input.previous.metadata.generation,
+              }
+            : {}),
+        } as const;
+        return {
+          provider,
+          offering,
+          priceMinor,
+          relationTargets,
+          previous,
+          providerInstallationRef,
+          providerIdentity,
+          standardServices,
+        };
       });
+      const {
+        provider,
+        offering,
+        priceMinor,
+        relationTargets,
+        previous,
+        providerInstallationRef,
+        providerIdentity,
+        standardServices,
+      } = preflight;
+      let endpointAssignment: WorkerEndpointOriginAssignment | undefined;
+      let endpointPreflight:
+        | {
+            readonly reservations: NonNullable<typeof originReservations>;
+            readonly worker: TakoformStoredResource;
+          }
+        | undefined;
+      if (input.form.identity.formRef.kind === "WorkerEndpoint") {
+        endpointPreflight = await definitiveProviderPreflight(() => {
+          if (!originReservations) {
+            throw new TakoformHostError("unsupported_capability", 422);
+          }
+          const workerRelations = input.relations.filter(
+            (relation) =>
+              relation.pointer === "/worker" &&
+              relation.relation === "/worker" &&
+              relation.resource.kind === "ModuleWorker",
+          );
+          const worker = workerRelations.length === 1 ? workerRelations[0]?.resource : undefined;
+          if (!worker || worker.metadata.space !== input.space) {
+            throw new TakoformHostError("invalid_argument", 400);
+          }
+          return { reservations: originReservations, worker };
+        });
+        const { reservations, worker } = endpointPreflight;
+        if (current) {
+          endpointAssignment = await definitiveProviderPreflight(async () => {
+            let assignment: WorkerEndpointOriginAssignment | null;
+            try {
+              assignment = await reservations.endpointAssignment(input.tenantId, input.resourceUid);
+            } catch (error) {
+              throw endpointReservationHostError(error);
+            }
+            if (
+              !assignment ||
+              (input.workerEndpointOriginReservationId !== undefined &&
+                input.workerEndpointOriginReservationId !== assignment.reservationId) ||
+              assignment.endpoint.space !== input.space ||
+              assignment.endpoint.name !== input.name ||
+              assignment.endpoint.uid !== input.resourceUid ||
+              assignment.worker.name !== worker.metadata.name ||
+              assignment.worker.uid !== worker.metadata.uid ||
+              assignment.worker.revision !== worker.metadata.revision ||
+              assignment.placement.providerPackRef !== provider.id ||
+              assignment.placement.providerInstallationRef !== providerInstallationRef
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
+            return assignment;
+          });
+        }
+      }
+      // Runtime Binding import/export calls are extension callbacks, not a
+      // provider-mutation certainty boundary. Even though this projection is
+      // intended to be read-only, an adapter throw cannot prove it had no
+      // effects, and no later validation may upgrade it into an idle attempt.
+      const consumerPack = packsById.get(provider.id);
+      // When materialization returns, every exact route counted here necessarily
+      // crossed both extension callback sites. No route means the helper either
+      // performed local validation only or skipped a same-pack relation.
+      const runtimeBindingCallbacksEntered = relationTargets.some((relation) =>
+        canMaterializeAcrossProviderPacks({
+          bindingRef: relation.bindingRef,
+          consumerPack,
+          targetPack: relation.deployment
+            ? packsById.get(relation.deployment.providerPackRef)
+            : undefined,
+        }),
+      );
+      let runtimeBindings: readonly ProviderRuntimeBinding[];
+      try {
+        runtimeBindings = await materializeProviderRuntimeBindings({
+          tenantId: input.tenantId,
+          source: providerIdentity,
+          sourceSpec: input.spec,
+          consumerPack,
+          packs: packsById,
+          relations: relationTargets,
+        });
+      } catch (error) {
+        throw withoutDefinitiveProviderProof(error);
+      }
       for (const relation of relationTargets) {
         if (
           relation.deployment &&
@@ -980,110 +1251,73 @@ export function createProviderDriver(
           throw new TakoformHostError("unsupported_capability", 422);
         }
       }
-      let endpointAssignment: WorkerEndpointOriginAssignment | undefined;
-      if (input.form.identity.formRef.kind === "WorkerEndpoint") {
-        if (!originReservations) {
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
-        const workerRelations = input.relations.filter(
-          (relation) =>
-            relation.pointer === "/worker" &&
-            relation.relation === "/worker" &&
-            relation.resource.kind === "ModuleWorker",
-        );
-        const worker = workerRelations.length === 1 ? workerRelations[0]?.resource : undefined;
-        if (!worker || worker.metadata.space !== input.space) {
-          throw new TakoformHostError("invalid_argument", 400);
-        }
-        if (current) {
+      if (endpointPreflight && !current) {
+        const { reservations, worker } = endpointPreflight;
+        // A reservation supplied by the caller is the reseller lane's
+        // authority: it sold a name and held it before the Resource graph
+        // existed. An ordinary organization API key has no such input — the
+        // released provider's `takoform_worker_endpoint` accepts only `name`
+        // and `worker` — so on an installation whose endpoint address is
+        // derived from the Worker anyway, the Host reserves on the caller's
+        // behalf. Without that, no ordinary key could ever create a
+        // WorkerEndpoint at all, and the 14th resource of a Worker graph was
+        // unreachable.
+        let reservationId = input.workerEndpointOriginReservationId;
+        if (reservationId === undefined) {
+          let minted: Awaited<ReturnType<typeof reservations.mintForWorker>>;
           try {
-            endpointAssignment =
-              (await originReservations.endpointAssignment(input.tenantId, input.resourceUid)) ??
-              undefined;
-          } catch (error) {
-            throw endpointReservationHostError(error);
-          }
-          if (
-            !endpointAssignment ||
-            (input.workerEndpointOriginReservationId !== undefined &&
-              input.workerEndpointOriginReservationId !== endpointAssignment.reservationId) ||
-            endpointAssignment.endpoint.space !== input.space ||
-            endpointAssignment.endpoint.name !== input.name ||
-            endpointAssignment.endpoint.uid !== input.resourceUid ||
-            endpointAssignment.worker.name !== worker.metadata.name ||
-            endpointAssignment.worker.uid !== worker.metadata.uid ||
-            endpointAssignment.worker.revision !== worker.metadata.revision ||
-            endpointAssignment.placement.providerPackRef !== provider.id ||
-            endpointAssignment.placement.providerInstallationRef !== providerInstallationRef
-          ) {
-            throw new TakoformHostError("resource_busy", 409);
-          }
-        } else {
-          // A reservation supplied by the caller is the reseller lane's
-          // authority: it sold a name and held it before the Resource graph
-          // existed. An ordinary organization API key has no such input — the
-          // released provider's `takoform_worker_endpoint` accepts only `name`
-          // and `worker` — so on an installation whose endpoint address is
-          // derived from the Worker anyway, the Host reserves on the caller's
-          // behalf. Without that, no ordinary key could ever create a
-          // WorkerEndpoint at all, and the 14th resource of a Worker graph was
-          // unreachable.
-          let reservationId = input.workerEndpointOriginReservationId;
-          if (reservationId === undefined) {
-            let minted: Awaited<ReturnType<typeof originReservations.mintForWorker>>;
-            try {
-              // No Offering is named here on purpose. `offering` in this branch
-              // is always the WorkerEndpoint's, and a reservation is placed on
-              // the ModuleWorker's — the authority reads that off the Worker's
-              // own active Deployment, which is the placement everything
-              // downstream compares against.
-              minted = await originReservations.mintForWorker({
-                organizationId: input.tenantId,
-                space: input.space,
-                workerName: worker.metadata.name,
-                workerResourceUid: worker.metadata.uid,
-              });
-            } catch (error) {
-              throw endpointReservationHostError(error);
-            }
-            // No derived address on this installation: the reservation really
-            // is the caller's to supply, and there is nothing to mint.
-            if (!minted) throw new TakoformHostError("unsupported_capability", 422);
-            reservationId = minted.reservationId;
-          } else {
-            try {
-              // A supplied reservation is only prepared until this exact
-              // WorkerEndpoint create. Bind it to the resolved Ready Worker
-              // before assigning the endpoint witness or crossing into the
-              // Provider. Host-minted reservations are already bound by
-              // `mintForWorker`, so they intentionally skip this transition.
-              await originReservations.bind({
-                organizationId: input.tenantId,
-                reservationId,
-                space: input.space,
-                workerName: worker.metadata.name,
-                workerResourceUid: worker.metadata.uid,
-              });
-            } catch (error) {
-              throw endpointReservationHostError(error);
-            }
-          }
-          try {
-            endpointAssignment = await originReservations.assignEndpoint({
+            // No Offering is named here on purpose. `offering` in this branch
+            // is always the WorkerEndpoint's, and a reservation is placed on
+            // the ModuleWorker's — the authority reads that off the Worker's
+            // own active Deployment, which is the placement everything
+            // downstream compares against.
+            minted = await reservations.mintForWorker({
               organizationId: input.tenantId,
-              reservationId,
               space: input.space,
-              endpointName: input.name,
-              endpointResourceUid: input.resourceUid,
-              endpointResourceRevision: "1",
               workerName: worker.metadata.name,
               workerResourceUid: worker.metadata.uid,
-              providerPackRef: provider.id,
-              providerInstallationRef,
             });
           } catch (error) {
             throw endpointReservationHostError(error);
           }
+          // No derived address on this installation: the reservation really
+          // is the caller's to supply, and there is nothing to mint. Runtime
+          // Binding callbacks already ran, so this is intentionally unbranded.
+          if (!minted) throw new TakoformHostError("unsupported_capability", 422);
+          reservationId = minted.reservationId;
+        } else {
+          try {
+            // A supplied reservation is only prepared until this exact
+            // WorkerEndpoint create. Bind it to the resolved Ready Worker
+            // before assigning the endpoint witness or crossing into the
+            // Provider. Host-minted reservations are already bound by
+            // `mintForWorker`, so they intentionally skip this transition.
+            await reservations.bind({
+              organizationId: input.tenantId,
+              reservationId,
+              space: input.space,
+              workerName: worker.metadata.name,
+              workerResourceUid: worker.metadata.uid,
+            });
+          } catch (error) {
+            throw endpointReservationHostError(error);
+          }
+        }
+        try {
+          endpointAssignment = await reservations.assignEndpoint({
+            organizationId: input.tenantId,
+            reservationId,
+            space: input.space,
+            endpointName: input.name,
+            endpointResourceUid: input.resourceUid,
+            endpointResourceRevision: "1",
+            workerName: worker.metadata.name,
+            workerResourceUid: worker.metadata.uid,
+            providerPackRef: provider.id,
+            providerInstallationRef,
+          });
+        } catch (error) {
+          throw endpointReservationHostError(error);
         }
       }
       const providerInput = {
@@ -1115,64 +1349,76 @@ export function createProviderDriver(
       let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
       const work = async () => {
         providerBoundaryEntered = true;
-        const ticket = await settle(
-          provider,
-          input.operationId,
-          input.providerHandle
-            ? await pollHandle(
-                provider,
-                input.operationId,
-                input.providerHandle,
-                input.executionAuthority,
-              )
-            : input.operationMode === "recovery"
-              ? provider.convergeApply
-                ? await provider.convergeApply(providerInput)
-                : (() => {
-                    // A Host recovery lease may resume a mutation only through
-                    // an explicitly operation-keyed convergence seam. The
-                    // read-only `recoverApply` capability is never promoted
-                    // into mutation authority here.
-                    throw new ProviderMutationRecoveryError("indeterminate");
-                  })()
-              : await provider.apply(providerInput),
-          input.executionAuthority,
-          Boolean(input.providerHandle),
-        );
-        if (endpointAssignment && ticket.phase === "succeeded") {
-          // Asked here, before anything is activated, because this is the last
-          // moment at which the answer is free. The engine holds every receipt
-          // to its Form before it materializes a Resource; when that check ran
-          // there and failed, the reservation had already been activated and
-          // the endpoint's deletion attestation opened, the wire still said
-          // "the host mutated nothing", and the space could never create that
-          // endpoint again. One rule, asked at the point where refusing it
-          // costs nothing.
-          if (!receiptProjectable(input.form, receiptOf(ticket.result))) {
-            throw new TakoformHostError();
+        try {
+          const ticket = await settle(
+            provider,
+            input.operationId,
+            input.providerHandle
+              ? await pollHandle(
+                  provider,
+                  input.operationId,
+                  input.providerHandle,
+                  input.executionAuthority,
+                )
+              : input.operationMode === "recovery"
+                ? provider.convergeApply
+                  ? await provider.convergeApply(providerInput)
+                  : (() => {
+                      // A Host recovery lease may resume a mutation only through
+                      // an explicitly operation-keyed convergence seam. The
+                      // read-only `recoverApply` capability is never promoted
+                      // into mutation authority here.
+                      throw new ProviderMutationRecoveryError("indeterminate");
+                    })()
+                : await provider.apply(providerInput),
+            input.executionAuthority,
+            Boolean(input.providerHandle),
+          );
+          if (endpointAssignment && ticket.phase === "succeeded") {
+            // Asked here, before anything is activated, because this is the last
+            // moment at which the answer is free. The engine holds every receipt
+            // to its Form before it materializes a Resource; when that check ran
+            // there and failed, the reservation had already been activated and
+            // the endpoint's deletion attestation opened, the wire still said
+            // "the host mutated nothing", and the space could never create that
+            // endpoint again. One rule, asked at the point where refusing it
+            // costs nothing.
+            if (!receiptProjectable(input.form, receiptOf(ticket.result))) {
+              throw new TakoformHostError();
+            }
+            try {
+              activatedAssignment =
+                (await originReservations?.activateEndpointAssignment({
+                  assignment: endpointAssignment,
+                  providerOutputs: ticket.result.outputs,
+                })) ?? null;
+            } catch (error) {
+              throw endpointReservationHostError(error);
+            }
           }
-          try {
-            activatedAssignment =
-              (await originReservations?.activateEndpointAssignment({
-                assignment: endpointAssignment,
-                providerOutputs: ticket.result.outputs,
-              })) ?? null;
-          } catch (error) {
-            throw endpointReservationHostError(error);
-          }
+          return ticket;
+        } catch (error) {
+          if (error instanceof ProviderMutationRecoveryError) throw error;
+          // A thrown value has no producer-owned no-effect proof. This remains
+          // ambiguous even when it happens to use a normally precondition-like
+          // Host status: the provider boundary was already entered.
+          throw new ProviderMutationRecoveryError("indeterminate");
         }
-        return ticket;
       };
       // A reseller reservation already holds this exact Offering's price.
       // Charging the organization wallet again here would double-settle the
       // same Resource. Direct organization credentials have no such authority
       // and retain the ordinary hold/capture path.
+      const mutation = {
+        operationId: input.operationId,
+        mode: input.operationMode === "recovery" ? "recovery" : "initial",
+      } as const;
       let result: ProviderResult;
       try {
         result =
           input.commercialAuthority || priceMinor === 0
-            ? resultOf(await work())
-            : await charged(input.tenantId, input.operationId, priceMinor, work);
+            ? resultOf(await work(), mutation)
+            : await charged(input.tenantId, priceMinor, mutation, work);
       } catch (error) {
         // An assignment that was never activated is let go of, whether or not
         // the provider was entered. Keeping it after a failed create is what
@@ -1211,7 +1457,10 @@ export function createProviderDriver(
             if (!providerBoundaryEntered) throw endpointReservationHostError(cancelError);
           }
         }
-        throw error;
+        // A later wallet/provider refusal speaks only for that boundary. Once
+        // Binding extension callbacks ran, it cannot prove the whole Host
+        // attempt idle even when it carries producer-owned provider evidence.
+        throw runtimeBindingCallbacksEntered ? withoutDefinitiveProviderProof(error) : error;
       }
       if (input.atomicDeploymentCommit) {
         return {
@@ -1310,88 +1559,111 @@ export function createProviderDriver(
     // biome-ignore lint/suspicious/noConfusingVoidType: the driver contract intentionally allows no receipt for intrinsic resources
     async delete(input): Promise<TakoformDriverReceipt | void> {
       if (intrinsicFormRef(input.resource.form.formRef)) return;
-      const deployment = await active(input.tenantId, input.resourceUid);
-      const { provider, offering } = installed(deployment, input.resource.form.formRef);
-      let endpointAssignment: WorkerEndpointOriginAssignment | null = null;
-      if (input.resource.form.formRef.kind === "WorkerEndpoint") {
-        if (!originReservations) {
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
-        try {
-          endpointAssignment = await originReservations.endpointAssignment(
-            input.tenantId,
-            input.resourceUid,
+      const { deployment, provider, offering, endpointAssignment } =
+        await definitiveProviderPreflight(async () => {
+          const deployment = await active(input.tenantId, input.resourceUid);
+          const { provider, offering } = installed(deployment, input.resource.form.formRef);
+          let endpointAssignment: WorkerEndpointOriginAssignment | null = null;
+          if (input.resource.form.formRef.kind === "WorkerEndpoint") {
+            if (!originReservations) {
+              throw new TakoformHostError("unsupported_capability", 422);
+            }
+            try {
+              endpointAssignment = await originReservations.endpointAssignment(
+                input.tenantId,
+                input.resourceUid,
+              );
+            } catch (error) {
+              throw endpointReservationHostError(error);
+            }
+            if (
+              !endpointAssignment ||
+              endpointAssignment.endpoint.space !== input.resource.metadata.space ||
+              endpointAssignment.endpoint.name !== input.resource.metadata.name ||
+              endpointAssignment.endpoint.uid !== input.resourceUid ||
+              endpointAssignment.placement.providerPackRef !== deployment.providerPackRef ||
+              endpointAssignment.placement.providerInstallationRef !==
+                deployment.providerInstallationRef
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
+          }
+          return { deployment, provider, offering, endpointAssignment };
+        });
+      const resolvedProviderRelations = () =>
+        definitiveProviderPreflight(() => providerRelations(input.tenantId, input.relations));
+      let firstTicket: ProviderTicket;
+      if (input.providerHandle) {
+        firstTicket = await pollHandle(
+          provider,
+          input.operationId,
+          input.providerHandle,
+          input.executionAuthority,
+        );
+      } else {
+        if (input.operationMode === "recovery") {
+          const recoverDelete = provider.recoverDelete?.bind(provider);
+          if (!recoverDelete) {
+            // A lost DELETE acknowledgement has no safe replay. Only a
+            // provider-owned deterministic readback may settle it.
+            throw new ProviderMutationRecoveryError("indeterminate");
+          }
+          // Relation projection is a read-only driver preflight. Keep it outside
+          // the entered Provider call so its explicit refusal remains terminal.
+          const relations = await resolvedProviderRelations();
+          firstTicket = await enteredProviderMutation(() =>
+            recoverDelete({
+              operationId: input.operationId,
+              operationMode: "recovery",
+              executionAuthority: input.executionAuthority,
+              offering,
+              nativeId: deployment.nativeId,
+              identity: {
+                tenantRef: input.tenantId,
+                space: input.resource.metadata.space,
+                name: input.resource.metadata.name,
+                uid: input.resourceUid,
+                incarnationId: deployment.id,
+                generation: input.resource.metadata.generation,
+              },
+              spec: input.resource.spec,
+              relations,
+            }),
           );
-        } catch (error) {
-          throw endpointReservationHostError(error);
-        }
-        if (
-          !endpointAssignment ||
-          endpointAssignment.endpoint.space !== input.resource.metadata.space ||
-          endpointAssignment.endpoint.name !== input.resource.metadata.name ||
-          endpointAssignment.endpoint.uid !== input.resourceUid ||
-          endpointAssignment.placement.providerPackRef !== deployment.providerPackRef ||
-          endpointAssignment.placement.providerInstallationRef !==
-            deployment.providerInstallationRef
-        ) {
-          throw new TakoformHostError("resource_busy", 409);
+        } else {
+          const relations = await resolvedProviderRelations();
+          firstTicket = await enteredProviderMutation(() =>
+            provider.delete({
+              operationId: input.operationId,
+              ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+              executionAuthority: input.executionAuthority,
+              offering,
+              nativeId: deployment.nativeId,
+              identity: {
+                tenantRef: input.tenantId,
+                space: input.resource.metadata.space,
+                name: input.resource.metadata.name,
+                uid: input.resourceUid,
+                incarnationId: deployment.id,
+                generation: input.resource.metadata.generation,
+              },
+              spec: input.resource.spec,
+              relations,
+            }),
+          );
         }
       }
       const ticket = await settle(
         provider,
         input.operationId,
-        input.providerHandle
-          ? await pollHandle(
-              provider,
-              input.operationId,
-              input.providerHandle,
-              input.executionAuthority,
-            )
-          : input.operationMode === "recovery"
-            ? provider.recoverDelete
-              ? await provider.recoverDelete({
-                  operationId: input.operationId,
-                  operationMode: "recovery",
-                  executionAuthority: input.executionAuthority,
-                  offering,
-                  nativeId: deployment.nativeId,
-                  identity: {
-                    tenantRef: input.tenantId,
-                    space: input.resource.metadata.space,
-                    name: input.resource.metadata.name,
-                    uid: input.resourceUid,
-                    incarnationId: deployment.id,
-                    generation: input.resource.metadata.generation,
-                  },
-                  spec: input.resource.spec,
-                  relations: await providerRelations(input.tenantId, input.relations),
-                })
-              : (() => {
-                  // A lost DELETE acknowledgement has no safe replay. Only a
-                  // provider-owned deterministic readback may settle it.
-                  throw new ProviderMutationRecoveryError("indeterminate");
-                })()
-            : await provider.delete({
-                operationId: input.operationId,
-                ...(input.operationMode ? { operationMode: input.operationMode } : {}),
-                executionAuthority: input.executionAuthority,
-                offering,
-                nativeId: deployment.nativeId,
-                identity: {
-                  tenantRef: input.tenantId,
-                  space: input.resource.metadata.space,
-                  name: input.resource.metadata.name,
-                  uid: input.resourceUid,
-                  incarnationId: deployment.id,
-                  generation: input.resource.metadata.generation,
-                },
-                spec: input.resource.spec,
-                relations: await providerRelations(input.tenantId, input.relations),
-              }),
+        firstTicket,
         input.executionAuthority,
         Boolean(input.providerHandle),
       );
-      const result = resultOf(ticket);
+      const result = resultOf(ticket, {
+        operationId: input.operationId,
+        mode: input.operationMode === "recovery" ? "recovery" : "initial",
+      });
       if (result.nativeId !== deployment.nativeId) {
         throw new TakoformHostError("resource_busy", 409);
       }
@@ -1773,43 +2045,122 @@ export function createProviderDriver(
 
     async import(input): Promise<TakoformDriverReceipt> {
       if (intrinsicForm(input.form)) return { observed: structuredClone(input.spec) };
-      const soldSelection =
-        input.form.role === "identity" ||
-        catalog.offeringsFor(input.form.identity.formRef).length > 0
-          ? selectSold(input.form)
-          : undefined;
-      const inheritedSelection = soldSelection
-        ? undefined
-        : await inherited(input.tenantId, input.form, input.relations);
-      const provider = soldSelection?.provider ?? inheritedSelection?.provider;
-      const offering = soldSelection?.offering ?? inheritedSelection?.offering;
-      const sold = soldSelection?.sold;
-      const providerInstallationRef =
-        sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef;
-      if (!provider || !offering || !providerInstallationRef) {
-        throw new TakoformHostError("unsupported_capability", 422);
-      }
-      if (!provider.adopt) throw new TakoformHostError("unsupported_capability", 422);
-      const claim = await deployments.findByNative(
-        input.tenantId,
-        providerInstallationRef,
-        input.nativeId,
-      );
-      const current = await deployments.active(input.tenantId, input.resourceUid);
-      // A claim is immutable from the moment it is made, but a native id this
-      // host MINTED is not a claim: the ordinary import onto an address a
-      // configuration already manages names the object for the first time, and
-      // a host that refused it could never be imported into at all. So the
-      // refusal is a claim that already exists and names another object, never
-      // the mere presence of a minted one.
-      if (
-        (claim && claim.resourceUid !== input.resourceUid) ||
-        (current &&
-          ((current.nativeClaimed && current.nativeId !== input.nativeId) ||
-            current.offeringId !== offering.id ||
-            current.providerInstallationRef !== providerInstallationRef))
-      ) {
-        throw new TakoformHostError("import_conflict", 409);
+      const { provider, offering, providerInstallationRef, current, adopt } =
+        await definitiveProviderPreflight(async () => {
+          const soldSelection =
+            input.form.role === "identity" ||
+            catalog.offeringsFor(input.form.identity.formRef).length > 0
+              ? selectSold(input.form)
+              : undefined;
+          const inheritedSelection = soldSelection
+            ? undefined
+            : await inherited(input.tenantId, input.form, input.relations);
+          const provider = soldSelection?.provider ?? inheritedSelection?.provider;
+          const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+          const sold = soldSelection?.sold;
+          const providerInstallationRef =
+            sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef;
+          if (!provider || !offering || !providerInstallationRef) {
+            throw new TakoformHostError("unsupported_capability", 422);
+          }
+          const adopt = provider.adopt?.bind(provider);
+          if (!adopt) throw new TakoformHostError("unsupported_capability", 422);
+          const claim = await deployments.findByNative(
+            input.tenantId,
+            providerInstallationRef,
+            input.nativeId,
+          );
+          const current = await deployments.active(input.tenantId, input.resourceUid);
+          // A claim is immutable from the moment it is made, but a native id this
+          // host MINTED is not a claim: the ordinary import onto an address a
+          // configuration already manages names the object for the first time, and
+          // a host that refused it could never be imported into at all. So the
+          // refusal is a claim that already exists and names another object, never
+          // the mere presence of a minted one.
+          if (
+            (claim && claim.resourceUid !== input.resourceUid) ||
+            (current &&
+              ((current.nativeClaimed && current.nativeId !== input.nativeId) ||
+                current.offeringId !== offering.id ||
+                current.providerInstallationRef !== providerInstallationRef))
+          ) {
+            throw new TakoformHostError("import_conflict", 409);
+          }
+          return { provider, offering, providerInstallationRef, current, adopt };
+        });
+      const resolvedProviderRelations = () =>
+        definitiveProviderPreflight(() => providerRelations(input.tenantId, input.relations));
+      let firstTicket: ProviderTicket;
+      if (input.providerHandle) {
+        firstTicket = await pollHandle(
+          provider,
+          input.operationId,
+          input.providerHandle,
+          input.executionAuthority,
+        );
+      } else {
+        if (input.operationMode === "recovery") {
+          const recoverAdopt = provider.recoverAdopt?.bind(provider);
+          if (!recoverAdopt) {
+            // Adoption recovery must observe/adopt an existing object;
+            // calling `adopt` again could claim it twice.
+            throw new ProviderMutationRecoveryError("indeterminate");
+          }
+          // Relation projection is a read-only driver preflight. Keep it outside
+          // the entered Provider call so its explicit refusal remains terminal.
+          const relations = await resolvedProviderRelations();
+          firstTicket = await enteredProviderMutation(() =>
+            recoverAdopt({
+              operationId: input.operationId,
+              operationMode: "recovery",
+              executionAuthority: input.executionAuthority,
+              offering,
+              nativeId: input.nativeId,
+              identity: {
+                tenantRef: input.tenantId,
+                space: input.space,
+                name: input.name,
+                uid: input.resourceUid,
+                ...(current && input.previous
+                  ? {
+                      incarnationId: current.id,
+                      generation: input.previous.metadata.generation,
+                    }
+                  : {}),
+              },
+              spec: input.spec,
+              relations,
+            }),
+          );
+        } else {
+          const relations = await resolvedProviderRelations();
+          firstTicket = await enteredProviderMutation(() =>
+            adopt({
+              operationId: input.operationId,
+              ...(input.operationMode ? { operationMode: input.operationMode } : {}),
+              executionAuthority: input.executionAuthority,
+              offering,
+              nativeId: input.nativeId,
+              // The adopting provider needs the Resource UID: a bucket's
+              // native name is derived from the incarnation, and adoption is
+              // fenced to that exact derivation.
+              identity: {
+                tenantRef: input.tenantId,
+                space: input.space,
+                name: input.name,
+                uid: input.resourceUid,
+                ...(current && input.previous
+                  ? {
+                      incarnationId: current.id,
+                      generation: input.previous.metadata.generation,
+                    }
+                  : {}),
+              },
+              spec: input.spec,
+              relations,
+            }),
+          );
+        }
       }
       // Adoption bills nothing: the resource already exists and was paid for
       // wherever it came from.
@@ -1817,68 +2168,14 @@ export function createProviderDriver(
         await settle(
           provider,
           input.operationId,
-          input.providerHandle
-            ? await pollHandle(
-                provider,
-                input.operationId,
-                input.providerHandle,
-                input.executionAuthority,
-              )
-            : input.operationMode === "recovery"
-              ? provider.recoverAdopt
-                ? await provider.recoverAdopt({
-                    operationId: input.operationId,
-                    operationMode: "recovery",
-                    executionAuthority: input.executionAuthority,
-                    offering,
-                    nativeId: input.nativeId,
-                    identity: {
-                      tenantRef: input.tenantId,
-                      space: input.space,
-                      name: input.name,
-                      uid: input.resourceUid,
-                      ...(current && input.previous
-                        ? {
-                            incarnationId: current.id,
-                            generation: input.previous.metadata.generation,
-                          }
-                        : {}),
-                    },
-                    spec: input.spec,
-                    relations: await providerRelations(input.tenantId, input.relations),
-                  })
-                : (() => {
-                    // Adoption recovery must observe/adopt an existing object;
-                    // calling `adopt` again could claim it twice.
-                    throw new ProviderMutationRecoveryError("indeterminate");
-                  })()
-              : await provider.adopt({
-                  operationId: input.operationId,
-                  ...(input.operationMode ? { operationMode: input.operationMode } : {}),
-                  executionAuthority: input.executionAuthority,
-                  offering,
-                  nativeId: input.nativeId,
-                  // The adopting provider needs the Resource UID: a bucket's
-                  // native name is derived from the incarnation, and adoption is
-                  // fenced to that exact derivation.
-                  identity: {
-                    tenantRef: input.tenantId,
-                    space: input.space,
-                    name: input.name,
-                    uid: input.resourceUid,
-                    ...(current && input.previous
-                      ? {
-                          incarnationId: current.id,
-                          generation: input.previous.metadata.generation,
-                        }
-                      : {}),
-                  },
-                  spec: input.spec,
-                  relations: await providerRelations(input.tenantId, input.relations),
-                }),
+          firstTicket,
           input.executionAuthority,
           Boolean(input.providerHandle),
         ),
+        {
+          operationId: input.operationId,
+          mode: input.operationMode === "recovery" ? "recovery" : "initial",
+        },
       );
       if (result.nativeId !== input.nativeId) {
         throw new TakoformHostError("import_conflict", 409);

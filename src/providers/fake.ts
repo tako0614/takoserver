@@ -2,6 +2,7 @@ import type { JsonObject } from "../ports.ts";
 import {
   type ApplyInput,
   failed,
+  failedWithoutProviderMutation,
   type Provider,
   type ProviderNativeReadbackDescriptor,
   type ProviderOffering,
@@ -87,7 +88,15 @@ export class FakeProvider implements Provider {
     if (this.#failOn.has(input.identity.name)) {
       return this.#settle(
         input.operationId,
-        failed("provider_error", "the fake provider was told to fail", false),
+        // The exact operation has no retained completion/pending state and this
+        // branch precedes the first resource write. The non-wire proof lets the
+        // Host settle this invocation without teaching ordinary failed tickets
+        // (including remote post-write failures) the same certainty.
+        failedWithoutProviderMutation(
+          input.operationId,
+          "provider_error",
+          "the fake provider was told to fail",
+        ),
       );
     }
     const nativeId = input.previous?.nativeId ?? `${this.id}:${address}`;

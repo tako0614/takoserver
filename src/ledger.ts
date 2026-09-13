@@ -1,4 +1,4 @@
-import type { Clock, Sql } from "./ports.ts";
+import type { Clock, Sql, SqlParam, SqlStatement } from "./ports.ts";
 
 /**
  * The prepaid wallet.
@@ -108,6 +108,81 @@ export interface Ledger {
     readonly reference: string;
     readonly amountMinor: number;
   }): Promise<boolean>;
+}
+
+/** Exact priced hold carried across an internal atomic lifecycle settlement. */
+export interface LedgerHeldCharge {
+  readonly reference: string;
+  readonly amountMinor: number;
+}
+
+/**
+ * Data-only participant for a larger SQL batch which definitively releases a
+ * hold. The caller owns the surrounding lifecycle fence and transaction; this
+ * participant owns only wallet conservation and exact release readback.
+ */
+export interface LedgerHoldReleaseParticipant {
+  readonly statements: readonly SqlStatement[];
+  readonly committedFence: {
+    readonly sql: string;
+    readonly params: readonly SqlParam[];
+  };
+}
+
+export function ledgerHoldReleaseCommittedFence(
+  input: { readonly organizationId: string } & LedgerHeldCharge,
+): LedgerHoldReleaseParticipant["committedFence"] {
+  positiveAmount(input.amountMinor);
+  return {
+    sql: `EXISTS (
+            SELECT 1 FROM ledger
+            WHERE org_id = ? AND type = 'hold' AND ref = ?
+              AND settled_delta = 0 AND held_delta = ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM ledger
+            WHERE org_id = ? AND type = 'release' AND ref = ?
+              AND settled_delta = 0 AND held_delta = ?
+          )
+          AND (SELECT COALESCE(SUM(held_delta), 0) FROM ledger
+               WHERE org_id = ? AND ref = ?) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM wallet_credit_allocations
+            WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ?
+          )`,
+    params: [
+      input.organizationId,
+      input.reference,
+      input.amountMinor,
+      input.organizationId,
+      input.reference,
+      -input.amountMinor,
+      input.organizationId,
+      input.reference,
+      input.organizationId,
+      input.reference,
+    ],
+  };
+}
+
+export async function prepareLedgerHoldRelease(
+  sql: Sql,
+  clock: Clock,
+  input: { readonly organizationId: string } & LedgerHeldCharge,
+): Promise<LedgerHoldReleaseParticipant> {
+  positiveAmount(input.amountMinor);
+  const planned = await planHoldSettlement(
+    sql,
+    clock,
+    input.organizationId,
+    "release",
+    input.reference,
+    input.amountMinor,
+  );
+  return {
+    statements: planned,
+    committedFence: ledgerHoldReleaseCommittedFence(input),
+  };
 }
 
 export function createLedger(sql: Sql, clock: Clock): Ledger {
@@ -428,122 +503,9 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
     reference: string,
     amountMinor: number,
   ): Promise<void> {
-    const now = clock().toISOString();
-    const balanceRows = await sql.query(
-      `SELECT COALESCE(SUM(held_delta), 0) AS remaining
-       FROM ledger WHERE org_id = ? AND ref = ?`,
-      [organizationId, reference],
+    await sql.batch(
+      await planHoldSettlement(sql, clock, organizationId, type, reference, amountMinor),
     );
-    const heldRows = await sql.query(
-      `SELECT a.lot_ref, a.amount_minor
-       FROM wallet_credit_allocations a
-       JOIN wallet_credit_lots l ON l.org_id = a.org_id AND l.ref = a.lot_ref
-       WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?
-       ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END,
-                l.expires_at, l.created_at, l.ref`,
-      [organizationId, reference],
-    );
-    const captureRows = await sql.query(
-      `SELECT COALESCE(SUM(amount_minor), 0) AS captured
-       FROM wallet_credit_allocations
-       WHERE org_id = ? AND debit_type = 'capture' AND debit_ref = ?`,
-      [organizationId, reference],
-    );
-    const remainingHold = Number(balanceRows[0]?.remaining ?? 0);
-    const allocatedHold = heldRows.reduce((sum, row) => sum + Number(row.amount_minor), 0);
-    const capturedBefore = Number(captureRows[0]?.captured ?? 0);
-    if (remainingHold < amountMinor) throw new LedgerError("conservation_violated");
-    if (allocatedHold !== remainingHold) throw new LedgerError("conservation_violated");
-    if (type === "release" && remainingHold !== amountMinor) {
-      throw new LedgerError("conservation_violated");
-    }
-
-    let remaining = amountMinor;
-    const selected: Array<{
-      readonly lotRef: string;
-      readonly amount: number;
-      readonly previous: number;
-    }> = [];
-    for (const row of heldRows) {
-      const previous = Number(row.amount_minor);
-      const amount = Math.min(remaining, previous);
-      if (amount > 0) selected.push({ lotRef: String(row.lot_ref), amount, previous });
-      remaining -= amount;
-      if (remaining === 0) break;
-    }
-    if (remaining !== 0) throw new LedgerError("conservation_violated");
-
-    const guardId = `guard_${crypto.randomUUID()}`;
-    const moveStatements = selected.flatMap((allocation) => {
-      const shrink =
-        allocation.amount === allocation.previous
-          ? {
-              sql: `DELETE FROM wallet_credit_allocations
-                    WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ? AND lot_ref = ?
-                      AND amount_minor = ?`,
-              params: [organizationId, reference, allocation.lotRef, allocation.previous],
-            }
-          : {
-              sql: `UPDATE wallet_credit_allocations SET amount_minor = ?
-                    WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ? AND lot_ref = ?
-                      AND amount_minor = ?`,
-              params: [
-                allocation.previous - allocation.amount,
-                organizationId,
-                reference,
-                allocation.lotRef,
-                allocation.previous,
-              ],
-            };
-      if (type === "release") return [shrink];
-      return [
-        shrink,
-        {
-          sql: `INSERT INTO wallet_credit_allocations
-                  (org_id, debit_type, debit_ref, lot_ref, amount_minor, created_at)
-                VALUES (?, 'capture', ?, ?, ?, ?)`,
-          params: [organizationId, reference, allocation.lotRef, allocation.amount, now],
-        },
-      ];
-    });
-    await sql.batch([
-      ...moveStatements,
-      {
-        sql: `INSERT INTO wallet_allocation_guards (id, valid)
-              VALUES (?, CASE WHEN
-                (SELECT COALESCE(SUM(amount_minor), 0)
-                 FROM wallet_credit_allocations
-                 WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ?) = ?
-                AND (SELECT COALESCE(SUM(amount_minor), 0)
-                     FROM wallet_credit_allocations
-                     WHERE org_id = ? AND debit_type = 'capture' AND debit_ref = ?) = ?
-                THEN 1 ELSE 0 END)`,
-        params: [
-          guardId,
-          organizationId,
-          reference,
-          remainingHold - amountMinor,
-          organizationId,
-          reference,
-          capturedBefore + (type === "capture" ? amountMinor : 0),
-        ],
-      },
-      {
-        sql: `INSERT INTO ledger
-                (id, org_id, type, ref, settled_delta, held_delta, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        params: [
-          `led_${crypto.randomUUID()}`,
-          organizationId,
-          type,
-          reference,
-          type === "capture" ? -amountMinor : 0,
-          -amountMinor,
-          now,
-        ],
-      },
-      { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
-    ]);
   }
 
   async function availableAt(organizationId: string, now: string): Promise<number> {
@@ -558,6 +520,132 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
     );
     return Number(rows[0]?.available ?? 0);
   }
+}
+
+async function planHoldSettlement(
+  sql: Sql,
+  clock: Clock,
+  organizationId: string,
+  type: "capture" | "release",
+  reference: string,
+  amountMinor: number,
+): Promise<readonly SqlStatement[]> {
+  const now = clock().toISOString();
+  const balanceRows = await sql.query(
+    `SELECT COALESCE(SUM(held_delta), 0) AS remaining
+     FROM ledger WHERE org_id = ? AND ref = ?`,
+    [organizationId, reference],
+  );
+  const heldRows = await sql.query(
+    `SELECT a.lot_ref, a.amount_minor
+       FROM wallet_credit_allocations a
+       JOIN wallet_credit_lots l ON l.org_id = a.org_id AND l.ref = a.lot_ref
+       WHERE a.org_id = ? AND a.debit_type = 'hold' AND a.debit_ref = ?
+       ORDER BY CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END,
+                l.expires_at, l.created_at, l.ref`,
+    [organizationId, reference],
+  );
+  const captureRows = await sql.query(
+    `SELECT COALESCE(SUM(amount_minor), 0) AS captured
+       FROM wallet_credit_allocations
+       WHERE org_id = ? AND debit_type = 'capture' AND debit_ref = ?`,
+    [organizationId, reference],
+  );
+  const remainingHold = Number(balanceRows[0]?.remaining ?? 0);
+  const allocatedHold = heldRows.reduce((sum, row) => sum + Number(row.amount_minor), 0);
+  const capturedBefore = Number(captureRows[0]?.captured ?? 0);
+  if (remainingHold < amountMinor) throw new LedgerError("conservation_violated");
+  if (allocatedHold !== remainingHold) throw new LedgerError("conservation_violated");
+  if (type === "release" && remainingHold !== amountMinor) {
+    throw new LedgerError("conservation_violated");
+  }
+
+  let remaining = amountMinor;
+  const selected: Array<{
+    readonly lotRef: string;
+    readonly amount: number;
+    readonly previous: number;
+  }> = [];
+  for (const row of heldRows) {
+    const previous = Number(row.amount_minor);
+    const amount = Math.min(remaining, previous);
+    if (amount > 0) selected.push({ lotRef: String(row.lot_ref), amount, previous });
+    remaining -= amount;
+    if (remaining === 0) break;
+  }
+  if (remaining !== 0) throw new LedgerError("conservation_violated");
+
+  const guardId = `guard_${crypto.randomUUID()}`;
+  const moveStatements: SqlStatement[] = selected.flatMap((allocation) => {
+    const shrink: SqlStatement =
+      allocation.amount === allocation.previous
+        ? {
+            sql: `DELETE FROM wallet_credit_allocations
+                    WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ? AND lot_ref = ?
+                      AND amount_minor = ?`,
+            params: [organizationId, reference, allocation.lotRef, allocation.previous],
+          }
+        : {
+            sql: `UPDATE wallet_credit_allocations SET amount_minor = ?
+                    WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ? AND lot_ref = ?
+                      AND amount_minor = ?`,
+            params: [
+              allocation.previous - allocation.amount,
+              organizationId,
+              reference,
+              allocation.lotRef,
+              allocation.previous,
+            ],
+          };
+    if (type === "release") return [shrink];
+    return [
+      shrink,
+      {
+        sql: `INSERT INTO wallet_credit_allocations
+                  (org_id, debit_type, debit_ref, lot_ref, amount_minor, created_at)
+                VALUES (?, 'capture', ?, ?, ?, ?)`,
+        params: [organizationId, reference, allocation.lotRef, allocation.amount, now],
+      },
+    ];
+  });
+  return [
+    ...moveStatements,
+    {
+      sql: `INSERT INTO wallet_allocation_guards (id, valid)
+              VALUES (?, CASE WHEN
+                (SELECT COALESCE(SUM(amount_minor), 0)
+                 FROM wallet_credit_allocations
+                 WHERE org_id = ? AND debit_type = 'hold' AND debit_ref = ?) = ?
+                AND (SELECT COALESCE(SUM(amount_minor), 0)
+                     FROM wallet_credit_allocations
+                     WHERE org_id = ? AND debit_type = 'capture' AND debit_ref = ?) = ?
+                THEN 1 ELSE 0 END)`,
+      params: [
+        guardId,
+        organizationId,
+        reference,
+        remainingHold - amountMinor,
+        organizationId,
+        reference,
+        capturedBefore + (type === "capture" ? amountMinor : 0),
+      ],
+    },
+    {
+      sql: `INSERT INTO ledger
+                (id, org_id, type, ref, settled_delta, held_delta, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      params: [
+        `led_${crypto.randomUUID()}`,
+        organizationId,
+        type,
+        reference,
+        type === "capture" ? -amountMinor : 0,
+        -amountMinor,
+        now,
+      ],
+    },
+    { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
+  ];
 }
 
 function positiveAmount(value: number): number {

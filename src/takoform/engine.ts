@@ -1,7 +1,11 @@
 import { canonicalDigest, canonicalJson } from "../json.ts";
+import type { LedgerHeldCharge } from "../ledger.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import { SqlError } from "../ports.ts";
-import { ProviderMutationRecoveryError } from "../provider-driver.ts";
+import {
+  ProviderMutationDefinitiveRefusalError,
+  ProviderMutationRecoveryError,
+} from "../provider-driver.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import { createResourceDependencySet, type ResourceDependencySet } from "./dependency-fence.ts";
@@ -32,6 +36,7 @@ import {
 import { resolveStandardServiceSlots, validateStandardServiceSlots } from "./standard-services.ts";
 import type {
   ProviderMutationExecution,
+  ProviderMutationSaga,
   ResourceAddress,
   ResourceEffectKind,
   StoredReplay,
@@ -113,6 +118,21 @@ export interface EngineContext {
     /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
     readonly claimOwnerId: string;
     readonly commit: (mutation: EngineMutationCommit) => Promise<void>;
+    readonly commitDefinitiveProviderFailure: (
+      failure: EngineDefinitiveProviderFailureCommit,
+    ) => Promise<boolean>;
+  };
+}
+
+export interface EngineDefinitiveProviderFailureCommit {
+  readonly saga: ProviderMutationSaga;
+  readonly providerLeaseToken: string;
+  readonly operation: "create" | "update";
+  readonly charge: LedgerHeldCharge;
+  readonly error: {
+    readonly code: string;
+    readonly publicMessage?: string;
+    readonly hostCode?: string;
   };
 }
 
@@ -293,6 +313,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly onContention?: () => void;
     readonly onDispatch?: () => void | Promise<void>;
     readonly onReceiptReady?: () => void;
+    /** The wallet hold and Host lifecycle settle through one store-owned batch. */
+    readonly commitDefinitiveFailure?: (
+      leaseToken: string,
+      error: ProviderMutationDefinitiveRefusalError,
+    ) => Promise<boolean>;
+    /** Provider-only refusal proof cannot erase an earlier mutation step. */
+    readonly providerRefusalProvesWholeAttemptIdle?: () => boolean;
+    readonly onDefinitiveFailureSettled?: () => void;
     /**
      * The attempt ended having provably mutated nothing.
      *
@@ -433,8 +461,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       return receipt;
     } catch (error) {
+      const providerRefusalProvesWholeAttemptIdle =
+        input.providerRefusalProvesWholeAttemptIdle?.() ?? true;
       if (
         executeEntered &&
+        execution.mode === "initial" &&
+        providerRefusalProvesWholeAttemptIdle &&
         input.settleDefinitiveImportConflict &&
         error instanceof TakoformHostError &&
         error.code === "import_conflict"
@@ -458,10 +490,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         input.onContention?.();
       }
       let settledPrecondition = false;
+      let settledDefinitiveFailureAtomically = false;
+      const definitiveInitialRefusal =
+        execution.mode === "initial" &&
+        providerRefusalProvesWholeAttemptIdle &&
+        error instanceof ProviderMutationDefinitiveRefusalError;
       const recoveryError =
         error instanceof ProviderMutationRecoveryError
           ? error
-          : executeEntered && !preconditionFailure(error)
+          : executeEntered && !definitiveInitialRefusal
             ? new ProviderMutationRecoveryError("indeterminate")
             : undefined;
       if (recoveryError) {
@@ -474,9 +511,28 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           ...(recoveryError.providerHandle ? { providerHandle: recoveryError.providerHandle } : {}),
         });
         if (!recorded) input.onContention?.();
+      } else if (definitiveInitialRefusal && error.heldCharge) {
+        if (input.commitDefinitiveFailure) {
+          try {
+            settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
+          } catch (settlementError) {
+            input.onContention?.();
+            throw settlementError;
+          }
+          if (settledPrecondition) {
+            settledDefinitiveFailureAtomically = true;
+            input.onDefinitiveFailureSettled?.();
+          } else {
+            input.onContention?.();
+          }
+        } else {
+          // A held refusal cannot fall back to saga-only retirement: doing so
+          // would strand the money without the plan that owns its recovery.
+          input.onContention?.();
+        }
       } else if (
         (execution.mode === "initial" && providerDispatchMarked && !executeEntered) ||
-        (executeEntered && preconditionFailure(error))
+        (executeEntered && definitiveInitialRefusal)
       ) {
         settledPrecondition = await store.settleProviderMutationPreconditionFailure({
           tenantId: input.tenantId,
@@ -502,7 +558,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           resourceUid: input.resourceUid,
           ownerId: leaseToken,
         });
-      } else if (settledPrecondition) {
+      } else if (settledPrecondition && !settledDefinitiveFailureAtomically) {
         await store.releaseResourceDependencies({
           tenantId: input.tenantId,
           resourceUid: input.resourceUid,
@@ -1394,9 +1450,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           onReceiptReady: () => {
             releaseClaimsOnFailure = false;
           },
+          onDefinitiveFailureSettled: () => {
+            providerSettled = true;
+          },
           onProvablyIdle: () => {
             providerProvablyIdle = true;
           },
+          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
           onDispatch: async () => {
             if (
               !(await store.recordResourceEffect({
@@ -1468,6 +1528,31 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form.identity.formRef,
               authority,
             );
+          },
+          commitDefinitiveFailure: async (providerLeaseToken, error) => {
+            const charge = error.heldCharge;
+            if (!charge) return false;
+            const failure = {
+              saga,
+              providerLeaseToken,
+              operation: create ? ("create" as const) : ("update" as const),
+              charge,
+            };
+            if (context.durableOperation) {
+              return await context.durableOperation.commitDefinitiveProviderFailure({
+                ...failure,
+                error: {
+                  code: error.code,
+                  ...(error.publicMessage ? { publicMessage: error.publicMessage } : {}),
+                  ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+                },
+              });
+            }
+            return await store.commitDefinitiveProviderMutationFailure({
+              ...failure,
+              claimOwnerId,
+              hostOperation: { kind: "immediate", createdAt: clock().toISOString() },
+            });
           },
           execute: async (operationMode, execution, leaseToken) => {
             const executionAuthority = {
@@ -1908,6 +1993,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           onProvablyIdle: () => {
             providerProvablyIdle = true;
           },
+          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
           onDispatch: async () => {
             if (
               !(await store.recordResourceEffect({
@@ -2565,30 +2651,4 @@ function validConditions(conditions: TakoformStoredResource["status"]["condition
     return false;
   }
   return condition.message === undefined || condition.message.length > 0;
-}
-
-function preconditionFailure(error: unknown): boolean {
-  if (!(error instanceof TakoformHostError)) return false;
-  // These failures are emitted before a provider write (validation, missing
-  // capability, or a missing local deployment). It is safe to terminalize the
-  // planned saga; ambiguous 409/5xx outcomes remain recoverable instead.
-  //
-  // `dependency_in_use` is the one 409 in the list, and it is here because it
-  // is definitive rather than ambiguous: a refusal that names what must be
-  // removed first is one nothing was removed by. A provider that answers it
-  // (a bucket that still holds objects) has proven it mutated nothing, and
-  // treating that as indeterminate sent every retry into delete recovery,
-  // which answered `backend_unavailable` "re-run the same apply" forever.
-  return (
-    error.status === 400 ||
-    error.status === 403 ||
-    error.status === 404 ||
-    error.status === 422 ||
-    error.code === "invalid_argument" ||
-    error.code === "unsupported_capability" ||
-    error.code === "resource_not_found" ||
-    error.code === "form_unknown" ||
-    error.code === "policy_denied" ||
-    error.code === "dependency_in_use"
-  );
 }

@@ -592,6 +592,42 @@ export function failed(
   return { phase: "failed", failure: { code, message, retryable } };
 }
 
+/**
+ * Non-wire proof that this provider invocation returned before accepting any
+ * mutation for the named operation.
+ *
+ * The proof is deliberately tied to the ticket object's identity and exact
+ * operation id. It therefore cannot survive cloning or an RPC boundary: a
+ * remote executor that only returns the ordinary ProviderTicket stays
+ * indeterminate. Producers may use this only after checking their own durable
+ * operation state and before their first side effect. It proves the current
+ * invocation idle, not that an older invocation under the same operation id
+ * was idle.
+ */
+const mutationFreeProviderRefusals = new WeakMap<object, string>();
+
+export function failedWithoutProviderMutation(
+  operationId: string,
+  code: ProviderFailure["code"],
+  message: string,
+): ProviderTicket {
+  const ticket = failed(code, message, false);
+  mutationFreeProviderRefusals.set(ticket, operationId);
+  return ticket;
+}
+
+/** Host-internal consumer for the identity-bound proof above. */
+export function providerFailureProvesNoMutation(
+  ticket: ProviderTicket,
+  operationId: string,
+): boolean {
+  return (
+    ticket.phase === "failed" &&
+    !ticket.failure.retryable &&
+    mutationFreeProviderRefusals.get(ticket) === operationId
+  );
+}
+
 export function running(handle: string, pollAfterMs = 2_000): ProviderTicket {
   return { phase: "running", handle, pollAfterMs };
 }

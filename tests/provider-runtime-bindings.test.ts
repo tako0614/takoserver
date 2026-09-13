@@ -6,10 +6,12 @@ import {
   createEphemeralSql,
   createLedger,
   createResourceDeploymentStore,
+  ProviderMutationDefinitiveRefusalError,
 } from "../src/index.ts";
+import { failed, failedWithoutProviderMutation } from "../src/provider-extension.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import { createProviderPack, type RuntimeBindingMaterializer } from "../src/provider-pack.ts";
-import type { ProviderRelation } from "../src/provider-port.ts";
+import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import {
   canMaterializeAcrossProviderPacks,
   materializeProviderRuntimeBindings,
@@ -479,6 +481,98 @@ describe("provider-private runtime Binding materialization", () => {
         }),
       ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
     }
+  });
+
+  test("does not promote callback success into definitive provider no-effect proof", async () => {
+    const sql = createEphemeralSql();
+    const clock = () => new Date("2026-09-01T00:00:00.000Z");
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const version = stableProductionTakoformCatalog().forms.find(
+      (form) => form.identity.formRef.kind === "WorkerVersion",
+    );
+    if (!version) throw new Error("stable WorkerVersion fixture missing");
+
+    const operationId = "op-runtime-binding-refusal";
+    const events: string[] = [];
+    const providerCalls: Array<{
+      readonly operationId: string;
+      readonly operationMode: "initial" | "recovery" | undefined;
+    }> = [];
+    const provider: Provider = {
+      id: "consumer",
+      offerings: [edgeProviderOffering(version, { id: "consumer.worker-version" })],
+      async apply(input) {
+        providerCalls.push({ operationId: input.operationId, operationMode: input.operationMode });
+        events.push("provider.apply");
+        return failedWithoutProviderMutation(
+          operationId,
+          "provider_error",
+          "provider refused after runtime callbacks",
+        );
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const runtimePack = pack("consumer", completeMaterializer("consumer", events));
+    const targetRelation = relation("consumer");
+    const targetDeployment = targetRelation.deployment;
+    if (!targetDeployment) throw new Error("runtime Binding target deployment fixture missing");
+    await deployments.create({
+      tenantId: targetDeployment.tenantId,
+      id: targetDeployment.id,
+      resourceUid: targetDeployment.resourceUid,
+      offeringId: targetDeployment.offeringId,
+      providerPackRef: targetDeployment.providerPackRef,
+      providerInstallationRef: targetDeployment.providerInstallationRef,
+      nativeId: targetDeployment.nativeId,
+      state: targetDeployment.state,
+      observed: targetDeployment.observed,
+      outputs: targetDeployment.outputs,
+    });
+
+    const driver = createProviderDriver({
+      providers: [provider],
+      providerPacks: [runtimePack],
+      catalog: createCatalog([]),
+      ledger: createLedger(sql, clock),
+      deployments,
+    });
+
+    let rejection: unknown;
+    try {
+      await driver.apply({
+        operationId,
+        operationKey: "key-runtime-binding-refusal",
+        operationMode: "initial",
+        tenantId: "org-test",
+        resourceUid: "uid-version",
+        executionAuthority: testExecutionAuthority("org-test", "uid-version", operationId),
+        form: version,
+        name: "version",
+        space: "default",
+        spec: sourceSpec,
+        relations: [
+          {
+            ...targetRelation,
+            resource: {
+              ...targetRelation.resource,
+              status: { observedGeneration: "1", conditions: [] },
+            },
+          },
+        ],
+      });
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(events).toEqual(["consumer.export", "consumer.import", "provider.apply"]);
+    expect(providerCalls).toEqual([{ operationId, operationMode: "initial" }]);
+    expect(rejection).not.toBeInstanceOf(ProviderMutationDefinitiveRefusalError);
+    expect(rejection).toMatchObject({ code: "backend_unavailable", status: 503 });
   });
 
   /**

@@ -399,6 +399,26 @@ export function createDeferredOperations(input: {
             ),
           });
         },
+        commitDefinitiveProviderFailure: async (failure) => {
+          return await input.store.commitDefinitiveProviderMutationFailure({
+            saga: failure.saga,
+            providerLeaseToken: failure.providerLeaseToken,
+            claimOwnerId: leaseToken,
+            operation: failure.operation,
+            charge: failure.charge,
+            hostOperation: {
+              kind: "deferred",
+              operation,
+              leaseToken,
+              terminalJson: failureTerminal(
+                operation.id,
+                failure.error.code,
+                failure.error.publicMessage ?? diagnosticMessage(failure.error.code),
+                failure.error.hostCode,
+              ),
+            },
+          });
+        },
       },
     };
     const path: ResourcePath = {

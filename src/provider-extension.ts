@@ -35,6 +35,7 @@ export { createProviderPack, type ProviderPackDefinition } from "./provider-pack
 export {
   type ApplyInput,
   failed,
+  failedWithoutProviderMutation,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderArtifactConsumption,

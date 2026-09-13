@@ -104,7 +104,11 @@ export type {
   SqlAccess,
   SqlWrite,
 } from "./ports.ts";
-export { createProviderDriver, ProviderMutationRecoveryError } from "./provider-driver.ts";
+export {
+  createProviderDriver,
+  ProviderMutationDefinitiveRefusalError,
+  ProviderMutationRecoveryError,
+} from "./provider-driver.ts";
 export {
   createProviderMetering,
   type ProviderMeteringReport,

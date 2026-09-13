@@ -1,4 +1,9 @@
 import { canonicalDigest, canonicalJson } from "../json.ts";
+import {
+  ledgerHoldReleaseCommittedFence,
+  type LedgerHeldCharge,
+  prepareLedgerHoldRelease,
+} from "../ledger.ts";
 import type { Clock, JsonObject, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import {
@@ -202,6 +207,23 @@ export interface ProviderMutationSaga {
   readonly acceptedGeneration?: string;
   readonly acceptedRevision?: string;
   readonly receipt?: TakoformDriverReceipt;
+}
+
+/** One no-effect provider refusal committed with its exact priced hold. */
+export interface DefinitiveProviderMutationFailureCommit {
+  readonly saga: ProviderMutationSaga;
+  readonly providerLeaseToken: string;
+  readonly claimOwnerId: string;
+  readonly operation: "create" | "update";
+  readonly charge: LedgerHeldCharge;
+  readonly hostOperation:
+    | { readonly kind: "immediate"; readonly createdAt: string }
+    | {
+        readonly kind: "deferred";
+        readonly operation: DeferredOperationRecord;
+        readonly leaseToken: string;
+        readonly terminalJson: string;
+      };
 }
 
 export type ProviderMutationExecution =
@@ -438,6 +460,13 @@ export interface TakoformStore {
     readonly resourceUid: string;
     readonly leaseToken: string;
   }): Promise<boolean>;
+  /**
+   * Atomically terminalizes a proven no-effect provider attempt and releases
+   * its exact wallet hold. A lost fence returns false with both still durable.
+   */
+  commitDefinitiveProviderMutationFailure(
+    input: DefinitiveProviderMutationFailureCommit,
+  ): Promise<boolean>;
   releaseProviderMutationExecution(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -1258,54 +1287,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async releaseUncommittedResourceIncarnation(input): Promise<boolean> {
-      const producedNothing = `
-        NOT EXISTS (
-          SELECT 1 FROM tf_resources
-          WHERE tenant_id = ? AND uid = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_deployments
-          WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
-        )
-        AND EXISTS (
-          SELECT 1 FROM tf_resource_deletion_attestations
-          WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_provider_effects
-          WHERE tenant_id = ? AND resource_uid = ?
-            AND (effect_id <> ? OR phase = 'succeeded')
-        )`;
-      const fence = (uid: string, effectId: string): readonly SqlParam[] => [
-        input.tenantId,
-        uid,
-        input.tenantId,
-        uid,
-        input.tenantId,
-        uid,
-        input.tenantId,
-        uid,
-        effectId,
-      ];
-      const [, dropped] = await sql.batch([
-        {
-          sql: `DELETE FROM tf_resource_provider_effects
-                WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
-                  AND ${producedNothing}`,
-          params: [
-            input.tenantId,
-            input.resourceUid,
-            input.effectId,
-            ...fence(input.resourceUid, input.effectId),
-          ],
-        },
-        {
-          sql: `DELETE FROM tf_resource_deletion_attestations
-                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
-                  AND ${producedNothing}`,
-          params: [input.tenantId, input.resourceUid, ...fence(input.resourceUid, input.effectId)],
-        },
-      ]);
+      const release = uncommittedResourceIncarnationRelease(input);
+      const [, dropped] = await sql.batch(release.statements);
       return (dropped?.changes ?? 0) === 1;
     },
 
@@ -2051,6 +2034,186 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, now()],
       );
       return settled.changes === 1;
+    },
+
+    async commitDefinitiveProviderMutationFailure(input) {
+      assertDefinitiveProviderMutationFailure(input);
+      const timestamp = now();
+      const releaseIdentity = {
+        organizationId: input.saga.tenantId,
+        reference: input.charge.reference,
+        amountMinor: input.charge.amountMinor,
+      };
+      const releaseFence = ledgerHoldReleaseCommittedFence(releaseIdentity);
+      const committedFence = definitiveProviderFailureCommittedFence(input, releaseFence);
+      const committed = async (): Promise<boolean> => {
+        const rows = await sql.query(
+          `SELECT CASE WHEN ${committedFence.sql} THEN 1 ELSE 0 END AS committed`,
+          committedFence.params,
+        );
+        return Number(rows[0]?.committed ?? 0) === 1;
+      };
+
+      // A release without the rest of this exact lifecycle is not replay
+      // evidence. Check the whole terminal shape before asking the ledger to
+      // plan from the still-held allocation, otherwise an acknowledgement lost
+      // after commit would look like a conservation failure on retry.
+      if (await committed()) return true;
+
+      const release = await prepareLedgerHoldRelease(sql, clock, releaseIdentity);
+      const initialFence = definitiveProviderFailureInitialFence(input, timestamp);
+      const initialGuard = boundedGuard(
+        `definitive_failure_start_${input.saga.operationId}_${input.providerLeaseToken}`,
+      );
+      const committedGuard = boundedGuard(
+        `definitive_failure_result_${input.saga.operationId}_${input.providerLeaseToken}`,
+      );
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const cancelledEvent = canonicalJson({
+        eventId: `${input.saga.operationId}:cancelled`,
+        operationId: input.saga.operationId,
+        kind: "apply",
+        phase: "cancelled",
+        operationMode: "initial",
+      });
+      const incarnationRelease =
+        input.operation === "create"
+          ? uncommittedResourceIncarnationRelease({
+              tenantId: input.saga.tenantId,
+              resourceUid: input.saga.resourceUid,
+              effectId: input.saga.operationId,
+            })
+          : undefined;
+      const hostOperation = input.hostOperation;
+      const operationCreatedAt =
+        hostOperation.kind === "deferred"
+          ? hostOperation.operation.createdAt
+          : hostOperation.createdAt;
+      const storedOperation =
+        hostOperation.kind === "deferred" ? hostOperation.operation.operation : input.operation;
+      const statements: SqlStatement[] = [
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN ${initialFence.sql} THEN 1 ELSE 0 END`,
+          params: [initialGuard, ...initialFence.params],
+        },
+        ...release.statements,
+        {
+          sql: `INSERT INTO tf_resource_provider_effects
+                  (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+                   operation_mode, provider_pack_ref, provider_installation_ref,
+                   native_id, target_json, created_at)
+                VALUES (?, ?, ?, ?, 'apply', 'cancelled', 'initial', NULL, NULL, NULL, NULL, ?)`,
+          params: [
+            input.saga.tenantId,
+            input.saga.resourceUid,
+            `${input.saga.operationId}:cancelled`,
+            input.saga.operationId,
+            timestamp,
+          ],
+        },
+        {
+          sql: `UPDATE tf_resource_deletion_attestations
+                SET closure_fence = closure_fence + 1,
+                    effects_json = json_insert(effects_json, '$[#]', json(?)),
+                    evidence_json = NULL, evidence_ref = NULL,
+                    evidence_effect_digest = NULL, evidence_checked_at = NULL,
+                    evidence_status = NULL, updated_at = ?
+                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'`,
+          params: [cancelledEvent, timestamp, input.saga.tenantId, input.saga.resourceUid],
+        },
+        {
+          sql: `DELETE FROM tf_resource_claims
+                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                  AND state = 'reserved'
+                  AND NOT (claim_key >= ? AND claim_key < ?)`,
+          params: [
+            input.claimOwnerId,
+            input.saga.tenantId,
+            input.saga.resourceUid,
+            dependencyStart,
+            dependencyEnd,
+          ],
+        },
+        {
+          sql: `DELETE FROM tf_resource_claims
+                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                  AND state = 'reserved' AND claim_key >= ? AND claim_key < ?`,
+          params: [
+            input.saga.operationId,
+            input.saga.tenantId,
+            input.saga.resourceUid,
+            dependencyStart,
+            dependencyEnd,
+          ],
+        },
+        ...(incarnationRelease?.statements ?? []),
+        ...(hostOperation.kind === "deferred"
+          ? [
+              {
+                sql: `UPDATE tf_deferred_operations
+                      SET phase = 'failed', terminal_json = ?, committed_uid = NULL,
+                          lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
+                      WHERE id = ? AND tenant_id = ? AND principal_id = ?
+                        AND phase = 'committing' AND lease_token = ? AND lease_until > ?`,
+                params: [
+                  hostOperation.terminalJson,
+                  timestamp,
+                  timestamp + OPERATION_TTL_MILLISECONDS,
+                  hostOperation.operation.id,
+                  hostOperation.operation.tenantId,
+                  hostOperation.operation.principalId,
+                  hostOperation.leaseToken,
+                  timestamp,
+                ],
+              },
+            ]
+          : []),
+        {
+          sql: `INSERT INTO tf_operations
+                  (id, tenant_id, operation, state, resource_json, created_at, expires_at)
+                VALUES (?, ?, ?, 'failed', NULL, ?, ?)`,
+          params: [
+            input.saga.operationId,
+            input.saga.tenantId,
+            storedOperation,
+            operationCreatedAt,
+            timestamp + OPERATION_TTL_MILLISECONDS,
+          ],
+        },
+        {
+          sql: `DELETE FROM tf_provider_mutation_sagas
+                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND phase = 'planned' AND receipt_json IS NULL
+                  AND provider_handle IS NULL AND provider_outcome = 'running'
+                  AND execution_started_at IS NOT NULL
+                  AND execution_lease_token = ? AND execution_lease_until > ?`,
+          params: [
+            input.saga.tenantId,
+            input.saga.operationId,
+            input.saga.resourceUid,
+            input.providerLeaseToken,
+            timestamp,
+          ],
+        },
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, CASE WHEN ${committedFence.sql} THEN 1 ELSE 0 END`,
+          params: [committedGuard, ...committedFence.params],
+        },
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token IN (?, ?)",
+          params: [committedGuard, initialGuard],
+        },
+      ];
+      try {
+        await sql.batch(statements);
+        return true;
+      } catch (error) {
+        if (await committed()) return true;
+        if (error instanceof SqlError && error.code === "constraint") return false;
+        throw error;
+      }
     },
 
     async releaseProviderMutationExecution(input) {
@@ -3533,6 +3696,410 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   };
 }
 
+interface StoreSqlFence {
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+}
+
+function assertDefinitiveProviderMutationFailure(
+  input: DefinitiveProviderMutationFailureCommit,
+): void {
+  const { saga } = input;
+  if (input.charge.reference !== saga.operationId) {
+    throw new TypeError("provider failure charge has the wrong operation identity");
+  }
+  if ((input.operation === "create") !== (saga.acceptedUid === undefined)) {
+    throw new TypeError("provider failure has the wrong lifecycle operation");
+  }
+  if (
+    saga.acceptedUid !== undefined &&
+    (saga.acceptedGeneration === undefined || saga.acceptedRevision === undefined)
+  ) {
+    throw new TypeError("provider failure has an incomplete incumbent fence");
+  }
+  const hostOperation = input.hostOperation;
+  if (hostOperation.kind === "immediate") {
+    if (input.claimOwnerId !== saga.operationId) {
+      throw new TypeError("immediate provider failure has the wrong claim owner");
+    }
+    return;
+  }
+  const operation = hostOperation.operation;
+  if (
+    operation.id !== saga.operationId ||
+    operation.tenantId !== saga.tenantId ||
+    operation.operation !== "apply" ||
+    operation.fingerprint !== saga.fingerprint ||
+    operation.resourceUid !== saga.resourceUid ||
+    operation.target.space !== saga.target.space ||
+    operation.target.apiVersion !== saga.target.apiVersion ||
+    operation.target.kind !== saga.target.kind ||
+    operation.target.name !== saga.target.name ||
+    operation.acceptedUid !== saga.acceptedUid ||
+    operation.acceptedGeneration !== saga.acceptedGeneration ||
+    operation.acceptedRevision !== saga.acceptedRevision ||
+    input.claimOwnerId !== hostOperation.leaseToken
+  ) {
+    throw new TypeError("deferred provider failure does not match its accepted operation");
+  }
+}
+
+function definitiveProviderFailureInitialFence(
+  input: DefinitiveProviderMutationFailureCommit,
+  timestamp: number,
+): StoreSqlFence {
+  const { saga } = input;
+  const sagaFence = `EXISTS (
+    SELECT 1 FROM tf_provider_mutation_sagas
+    WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
+      AND fingerprint = ? AND resource_uid = ? AND authority_head_digest IS ?
+      AND target_space = ? AND target_api_version = ? AND target_kind = ? AND target_name = ?
+      AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
+      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+      AND provider_handle IS NULL AND provider_outcome = 'running'
+      AND execution_started_at IS NOT NULL
+      AND execution_lease_token = ? AND execution_lease_until > ?
+  )`;
+  const sagaParams: readonly SqlParam[] = [
+    saga.operationId,
+    saga.replayKey,
+    saga.tenantId,
+    saga.fingerprint,
+    saga.resourceUid,
+    saga.authorityHeadDigest ?? null,
+    saga.target.space,
+    saga.target.apiVersion,
+    saga.target.kind,
+    saga.target.name,
+    saga.acceptedUid ?? null,
+    saga.acceptedGeneration ?? null,
+    saga.acceptedRevision ?? null,
+    timestamp,
+    input.providerLeaseToken,
+    timestamp,
+  ];
+  const hostOperation = input.hostOperation;
+  const hostFence =
+    hostOperation.kind === "deferred"
+      ? `EXISTS (
+          SELECT 1 FROM tf_deferred_operations
+          WHERE id = ? AND tenant_id = ? AND principal_id = ?
+            AND operation = 'apply' AND phase = 'committing'
+            AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
+            AND target_space = ? AND target_api_version = ?
+            AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
+            AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
+            AND terminal_json IS NULL AND committed_uid IS NULL
+            AND lease_token = ? AND lease_until > ? AND expires_at > ?
+        )`
+      : `NOT EXISTS (
+          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+        )`;
+  const hostParams: readonly SqlParam[] =
+    hostOperation.kind === "deferred"
+      ? [
+          hostOperation.operation.id,
+          hostOperation.operation.tenantId,
+          hostOperation.operation.principalId,
+          hostOperation.operation.fingerprint,
+          hostOperation.operation.replayKey,
+          hostOperation.operation.resourceUid,
+          hostOperation.operation.target.space,
+          hostOperation.operation.target.apiVersion,
+          hostOperation.operation.target.kind,
+          hostOperation.operation.target.name,
+          JSON.stringify(hostOperation.operation.target.formRef),
+          hostOperation.operation.acceptedUid ?? null,
+          hostOperation.operation.acceptedGeneration ?? null,
+          hostOperation.operation.acceptedRevision ?? null,
+          hostOperation.leaseToken,
+          timestamp,
+          timestamp,
+        ]
+      : [saga.operationId];
+  const target = [
+    saga.tenantId,
+    saga.target.space,
+    saga.target.apiVersion,
+    saga.target.kind,
+    saga.target.name,
+  ] as const;
+  const incarnationRelease =
+    input.operation === "create"
+      ? uncommittedResourceIncarnationRelease({
+          tenantId: saga.tenantId,
+          resourceUid: saga.resourceUid,
+          effectId: saga.operationId,
+        })
+      : undefined;
+  const resourceFence =
+    input.operation === "create"
+      ? `NOT EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+        ) AND (${incarnationRelease?.fence ?? "0 = 1"})`
+      : `EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+            AND uid = ? AND generation = ? AND revision = ?
+        )`;
+  const resourceParams: readonly SqlParam[] =
+    input.operation === "create"
+      ? [...target, ...(incarnationRelease?.fenceParams ?? [])]
+      : [
+          ...target,
+          saga.acceptedUid ?? "",
+          saga.acceptedGeneration ?? "",
+          saga.acceptedRevision ?? "",
+        ];
+  const formFence = hostOperation.kind === "deferred" ? "AND form_ref_json = ?" : "";
+  const formParams: readonly SqlParam[] =
+    hostOperation.kind === "deferred"
+      ? [canonicalJson(hostOperation.operation.target.formRef)]
+      : [];
+  const attemptFence = `EXISTS (
+      SELECT 1 FROM tf_resource_deletion_attestations
+      WHERE tenant_id = ? AND resource_uid = ? AND space = ? AND api_version = ?
+        AND kind = ? AND name = ? AND state = 'live' ${formFence}
+    )
+    AND EXISTS (
+      SELECT 1 FROM tf_resource_provider_effects
+      WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+        AND effect_kind = 'apply' AND phase = 'planned' AND operation_mode = 'initial'
+    )
+    AND EXISTS (
+      SELECT 1 FROM tf_resource_provider_effects
+      WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+        AND effect_kind = 'apply' AND phase = 'dispatched' AND operation_mode = 'initial'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM tf_resource_provider_effects
+      WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+        AND phase IN ('succeeded', 'cancelled')
+    )`;
+  const attemptParams: readonly SqlParam[] = [
+    saga.tenantId,
+    saga.resourceUid,
+    saga.target.space,
+    saga.target.apiVersion,
+    saga.target.kind,
+    saga.target.name,
+    ...formParams,
+    saga.tenantId,
+    saga.resourceUid,
+    saga.operationId,
+    saga.tenantId,
+    saga.resourceUid,
+    saga.operationId,
+    saga.tenantId,
+    saga.resourceUid,
+    saga.operationId,
+  ];
+  return {
+    sql: `${sagaFence}
+      AND NOT EXISTS (SELECT 1 FROM tf_operations WHERE id = ?)
+      AND ${hostFence}
+      AND ${resourceFence}
+      AND ${attemptFence}`,
+    params: [...sagaParams, saga.operationId, ...hostParams, ...resourceParams, ...attemptParams],
+  };
+}
+
+function definitiveProviderFailureCommittedFence(
+  input: DefinitiveProviderMutationFailureCommit,
+  releaseFence: StoreSqlFence,
+): StoreSqlFence {
+  const { saga } = input;
+  const operationCreatedAt =
+    input.hostOperation.kind === "deferred"
+      ? input.hostOperation.operation.createdAt
+      : input.hostOperation.createdAt;
+  const storedOperation =
+    input.hostOperation.kind === "deferred"
+      ? input.hostOperation.operation.operation
+      : input.operation;
+  const hostFence =
+    input.hostOperation.kind === "deferred"
+      ? `EXISTS (
+          SELECT 1 FROM tf_deferred_operations
+          WHERE id = ? AND tenant_id = ? AND principal_id = ?
+            AND operation = 'apply' AND phase = 'failed'
+            AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
+            AND target_space = ? AND target_api_version = ?
+            AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
+            AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
+            AND terminal_json = ? AND committed_uid IS NULL
+            AND lease_token IS NULL AND lease_until IS NULL
+        )`
+      : `NOT EXISTS (
+          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+        )`;
+  const hostParams: readonly SqlParam[] =
+    input.hostOperation.kind === "deferred"
+      ? [
+          input.hostOperation.operation.id,
+          input.hostOperation.operation.tenantId,
+          input.hostOperation.operation.principalId,
+          input.hostOperation.operation.fingerprint,
+          input.hostOperation.operation.replayKey,
+          input.hostOperation.operation.resourceUid,
+          input.hostOperation.operation.target.space,
+          input.hostOperation.operation.target.apiVersion,
+          input.hostOperation.operation.target.kind,
+          input.hostOperation.operation.target.name,
+          JSON.stringify(input.hostOperation.operation.target.formRef),
+          input.hostOperation.operation.acceptedUid ?? null,
+          input.hostOperation.operation.acceptedGeneration ?? null,
+          input.hostOperation.operation.acceptedRevision ?? null,
+          input.hostOperation.terminalJson,
+        ]
+      : [saga.operationId];
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+  const claimFence =
+    input.operation === "create"
+      ? `NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims
+          WHERE tenant_id = ? AND holder_uid = ?
+        )`
+      : `NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims
+          WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+            AND state = 'reserved' AND NOT (claim_key >= ? AND claim_key < ?)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims
+          WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+            AND state = 'reserved' AND claim_key >= ? AND claim_key < ?
+        )`;
+  const claimParams: readonly SqlParam[] =
+    input.operation === "create"
+      ? [saga.tenantId, saga.resourceUid]
+      : [
+          input.claimOwnerId,
+          saga.tenantId,
+          saga.resourceUid,
+          dependencyStart,
+          dependencyEnd,
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          dependencyStart,
+          dependencyEnd,
+        ];
+  const target = [
+    saga.tenantId,
+    saga.target.space,
+    saga.target.apiVersion,
+    saga.target.kind,
+    saga.target.name,
+  ] as const;
+  const attemptFence =
+    input.operation === "create"
+      ? `NOT EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_deployments
+          WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_provider_effects
+          WHERE tenant_id = ? AND resource_uid = ?
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM tf_resource_deletion_attestations
+          WHERE tenant_id = ? AND resource_uid = ?
+        )`
+      : `EXISTS (
+          SELECT 1 FROM tf_resources
+          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+            AND uid = ? AND generation = ? AND revision = ?
+        )
+        AND EXISTS (
+          SELECT 1 FROM tf_resource_provider_effects
+          WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+            AND effect_kind = 'apply' AND phase = 'cancelled' AND operation_mode = 'initial'
+            AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+            AND native_id IS NULL AND target_json IS NULL
+        )
+        AND EXISTS (
+          SELECT 1
+          FROM tf_resource_deletion_attestations AS attestation,
+               json_each(attestation.effects_json) AS event
+          WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+            AND attestation.space = ? AND attestation.api_version = ?
+            AND attestation.kind = ? AND attestation.name = ? AND attestation.state = 'live'
+            AND attestation.evidence_json IS NULL AND attestation.evidence_ref IS NULL
+            AND attestation.evidence_effect_digest IS NULL
+            AND attestation.evidence_checked_at IS NULL AND attestation.evidence_status IS NULL
+            AND json_extract(event.value, '$.eventId') = ?
+            AND json_extract(event.value, '$.operationId') = ?
+            AND json_extract(event.value, '$.kind') = 'apply'
+            AND json_extract(event.value, '$.phase') = 'cancelled'
+            AND json_extract(event.value, '$.operationMode') = 'initial'
+        )`;
+  const attemptParams: readonly SqlParam[] =
+    input.operation === "create"
+      ? [
+          ...target,
+          saga.tenantId,
+          saga.resourceUid,
+          saga.tenantId,
+          saga.resourceUid,
+          saga.tenantId,
+          saga.resourceUid,
+          saga.tenantId,
+          saga.resourceUid,
+        ]
+      : [
+          ...target,
+          saga.acceptedUid ?? "",
+          saga.acceptedGeneration ?? "",
+          saga.acceptedRevision ?? "",
+          saga.tenantId,
+          saga.resourceUid,
+          `${saga.operationId}:cancelled`,
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          saga.target.space,
+          saga.target.apiVersion,
+          saga.target.kind,
+          saga.target.name,
+          `${saga.operationId}:cancelled`,
+          saga.operationId,
+        ];
+  return {
+    sql: `(${releaseFence.sql})
+      AND EXISTS (
+        SELECT 1 FROM tf_operations
+        WHERE id = ? AND tenant_id = ? AND operation = ? AND state = 'failed'
+          AND resource_json IS NULL AND created_at = ?
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM tf_provider_mutation_sagas WHERE operation_id = ?
+      )
+      AND ${hostFence}
+      AND ${claimFence}
+      AND ${attemptFence}`,
+    params: [
+      ...releaseFence.params,
+      saga.operationId,
+      saga.tenantId,
+      storedOperation,
+      operationCreatedAt,
+      saga.operationId,
+      ...hostParams,
+      ...claimParams,
+      ...attemptParams,
+    ],
+  };
+}
+
 function storedRelations(value: string): readonly TakoformStoredRelation[] {
   const parsed: unknown = JSON.parse(value);
   if (!Array.isArray(parsed)) throw new TypeError("invalid stored Takoform relations");
@@ -4857,6 +5424,64 @@ function digestText(value: unknown): `sha256:${string}` {
 
 function isDigest(value: unknown): value is `sha256:${string}` {
   return typeof value === "string" && /^sha256:[0-9a-f]{64}$/u.test(value);
+}
+
+function uncommittedResourceIncarnationRelease(input: {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly effectId: string;
+}): {
+  readonly fence: string;
+  readonly fenceParams: readonly SqlParam[];
+  readonly statements: readonly SqlStatement[];
+} {
+  const fence = `
+    NOT EXISTS (
+      SELECT 1 FROM tf_resources
+      WHERE tenant_id = ? AND uid = ?
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM tf_resource_deployments
+      WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
+    )
+    AND EXISTS (
+      SELECT 1 FROM tf_resource_deletion_attestations
+      WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM tf_resource_provider_effects
+      WHERE tenant_id = ? AND resource_uid = ?
+        AND (effect_id <> ? OR phase = 'succeeded')
+    )`;
+  const fenceParams = [
+    input.tenantId,
+    input.resourceUid,
+    input.tenantId,
+    input.resourceUid,
+    input.tenantId,
+    input.resourceUid,
+    input.tenantId,
+    input.resourceUid,
+    input.effectId,
+  ] as const;
+  return {
+    fence,
+    fenceParams,
+    statements: [
+      {
+        sql: `DELETE FROM tf_resource_provider_effects
+              WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+                AND ${fence}`,
+        params: [input.tenantId, input.resourceUid, input.effectId, ...fenceParams],
+      },
+      {
+        sql: `DELETE FROM tf_resource_deletion_attestations
+              WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
+                AND ${fence}`,
+        params: [input.tenantId, input.resourceUid, ...fenceParams],
+      },
+    ],
+  };
 }
 
 function boundedGuard(value: string): string {

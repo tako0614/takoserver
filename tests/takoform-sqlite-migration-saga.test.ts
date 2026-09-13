@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { ProviderMutationDefinitiveRefusalError } from "../src/index.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject } from "../src/ports.ts";
@@ -25,6 +26,7 @@ import {
 const LANE = "/apis/forms.takoform.com/v1";
 const TENANT_ID = "tenant-sqlite-saga";
 const PRINCIPAL_ID = "principal-sqlite-saga";
+type MigrationSuffix = NonNullable<TakoformResourceDriver["sqliteMigrations"]>["applySuffix"];
 const SQL = new TextEncoder().encode("CREATE TABLE saga_probe (id TEXT PRIMARY KEY);");
 const SQL_DIGEST = `sha256:${createHash("sha256").update(SQL).digest("hex")}` as const;
 const MANIFEST_DIGEST = `sha256:${"a".repeat(64)}` as const;
@@ -229,6 +231,96 @@ describe("SQLiteMigrationApplication provider saga", () => {
     });
   });
 
+  test("retains a zero-price migration repair when provider apply refuses after suffix completion", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const suffixInputs: Array<Parameters<MigrationSuffix>[0]> = [];
+    const executionTrace: string[] = [];
+    let observedDatabase: TakoformStoredResource | undefined;
+    let applicationCalls = 0;
+    const driver = migrationDriver(memory, {
+      async applySuffix(input) {
+        observedDatabase = input.database;
+        suffixInputs.push(input);
+        executionTrace.push("applySuffix:start");
+        await memory.sqliteMigrations.applySuffix(input);
+        executionTrace.push("applySuffix:complete");
+      },
+      async apply(input) {
+        if (input.form.identity.formRef.kind === "SQLiteMigrationApplication") {
+          applicationCalls += 1;
+          executionTrace.push("application:refuse");
+          throw new ProviderMutationDefinitiveRefusalError("unsupported_capability", 422);
+        }
+        return await memory.apply(input);
+      },
+    });
+    const { host, database } = harness(driver);
+    await seedDatabaseAndSet(host);
+    const desired = applicationDesired("definitive-migration-refusal");
+    const review = await prepare(host, desired, "admin");
+
+    const refused = await apply(
+      host,
+      desired,
+      review,
+      "definitive-migration-refusal-0001",
+      "admin",
+    );
+    expect(refused?.status).toBe(422);
+    expect(await refused?.json()).toMatchObject({
+      error: { code: "unsupported_capability", retryable: false },
+    });
+    expect(executionTrace).toEqual([
+      "applySuffix:start",
+      "applySuffix:complete",
+      "application:refuse",
+    ]);
+    expect(suffixInputs).toHaveLength(1);
+    expect(suffixInputs[0]).toMatchObject({ operationMode: "initial", expectedPrefix: [] });
+    expect(suffixInputs[0]?.desired.map(({ path, digest }) => ({ path, digest }))).toEqual([
+      { path: "0001_saga_probe.sql", digest: SQL_DIGEST },
+    ]);
+    expect(suffixInputs[0]?.migrations).toEqual([
+      { path: "0001_saga_probe.sql", digest: SQL_DIGEST, sql: SQL },
+    ]);
+    expect(applicationCalls).toBe(1);
+    if (!observedDatabase) throw new Error("migration database was not observed");
+    expect(
+      await memory.sqliteMigrations.readLedger({ tenantId: TENANT_ID, database: observedDatabase }),
+    ).toEqual([{ path: "0001_saga_probe.sql", digest: SQL_DIGEST }]);
+
+    const saga = dispatchedSaga(database);
+    expect(saga).toMatchObject({
+      phase: "planned",
+      provider_outcome: "indeterminate",
+      receipt_json: null,
+    });
+    if (!saga) throw new Error("migration refusal saga was not retained");
+    if (typeof saga.resource_uid !== "string" || typeof saga.operation_id !== "string") {
+      throw new Error("migration refusal saga identity was invalid");
+    }
+    expect(
+      database
+        .query(
+          `SELECT phase FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+           ORDER BY phase`,
+        )
+        .all(TENANT_ID, saga.resource_uid, saga.operation_id),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+    expect(
+      database
+        .query(
+          `SELECT state FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ?`,
+        )
+        .get(TENANT_ID, saga.resource_uid),
+    ).toEqual({ state: "live" });
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM tf_operations WHERE id = ?").get(saga.operation_id),
+    ).toEqual({ n: 0 });
+  });
+
   test("one live saga lease fences a concurrent suffix dispatch", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     let releaseSuffix!: () => void;
@@ -404,7 +496,7 @@ function migrationDriver(
   memory: InMemoryTakoformResourceDriver,
   overrides: {
     readonly readLedger?: typeof memory.sqliteMigrations.readLedger;
-    readonly applySuffix?: typeof memory.sqliteMigrations.applySuffix;
+    readonly applySuffix?: MigrationSuffix;
     readonly apply?: TakoformResourceDriver["apply"];
     readonly import?: NonNullable<TakoformResourceDriver["import"]>;
   },

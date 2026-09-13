@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { ProviderMutationDefinitiveRefusalError } from "../src/index.ts";
 import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
@@ -852,7 +853,7 @@ describe("durable deferred Takoform operations", () => {
       observe: (input) => memory.observe(input),
       delete: async (input) => {
         if (refusing) {
-          throw new TakoformHostError("dependency_in_use", 409, undefined, occupied);
+          throw new ProviderMutationDefinitiveRefusalError("dependency_in_use", 409, occupied);
         }
         return await memory.delete(input);
       },
@@ -1760,7 +1761,9 @@ describe("durable deferred Takoform operations", () => {
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
-        if (refusing) throw new TakoformHostError("dependency_in_use", 409, undefined, occupied);
+        if (refusing) {
+          throw new ProviderMutationDefinitiveRefusalError("dependency_in_use", 409, occupied);
+        }
         return await memory.delete(input);
       },
     };
@@ -1856,7 +1859,9 @@ describe("durable deferred Takoform operations", () => {
       ...memory,
       apply: async (input) => {
         applies.push(input.name);
-        if (!capable) throw new TakoformHostError("unsupported_capability", 422);
+        if (!capable) {
+          throw new ProviderMutationDefinitiveRefusalError("unsupported_capability", 422);
+        }
         return await memory.apply(input);
       },
       observe: (input) => memory.observe(input),
@@ -2080,7 +2085,9 @@ describe("durable deferred Takoform operations", () => {
         // The shape a self-host's endpoint mint refuses with: a statement about
         // this Host, raised after the Host marked its own dispatch and before
         // anything native was touched.
-        if (refuse) throw new TakoformHostError("unsupported_capability", 422);
+        if (refuse) {
+          throw new ProviderMutationDefinitiveRefusalError("unsupported_capability", 422);
+        }
         return await memory.apply(input);
       },
       observe: (input) => memory.observe(input),
@@ -2115,6 +2122,100 @@ describe("durable deferred Takoform operations", () => {
     refuse = false;
     expect((await apply())?.status).toBe(201);
     expect(ledger()).toEqual({ attestations: { rows: 1 }, effects: { rows: 3 } });
+    opened.close();
+  });
+
+  test("retains a pending repair when an entered driver throws an unbranded refusal", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const writes: string[] = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        writes.push(input.operationId);
+        await memory.apply(input);
+        throw new TakoformHostError("unsupported_capability", 422);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = desiredResource("unbranded-refusal", "entered-and-wrote");
+    const review = await prepareReview(opened.host, desired);
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/unbranded-refusal`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "unbranded-refusal-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("unbranded refusal returned no response");
+    const acceptedBody = (await accepted.json()) as { operation: { id: string; done: boolean } };
+    expect(acceptedBody.operation).toMatchObject({ done: false });
+    const operationId = acceptedBody.operation.id;
+
+    expect(writes).toEqual([operationId]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, terminal_json FROM tf_deferred_operations
+           WHERE id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ phase: "committing", terminal_json: null });
+
+    const saga = opened.database
+      .query(
+        `SELECT operation_id, resource_uid, phase, provider_outcome, receipt_json
+         FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+      )
+      .get(operationId) as {
+      operation_id: string;
+      resource_uid: string;
+      phase: string;
+      provider_outcome: string;
+      receipt_json: string | null;
+    } | null;
+    expect(saga).toEqual({
+      operation_id: operationId,
+      resource_uid: expect.any(String),
+      phase: "planned",
+      provider_outcome: "indeterminate",
+      receipt_json: null,
+    });
+    if (!saga) throw new Error("entered refusal saga was not retained");
+    expect(
+      opened.database
+        .query(
+          `SELECT phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY phase`,
+        )
+        .all(operationId),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+    expect(
+      opened.database
+        .query(
+          `SELECT state FROM tf_resource_deletion_attestations
+           WHERE resource_uid = ?`,
+        )
+        .get(saga.resource_uid),
+    ).toEqual({ state: "live" });
+    expect(
+      opened.database
+        .query("SELECT COUNT(*) AS rows FROM tf_operations WHERE id = ?")
+        .get(operationId),
+    ).toEqual({ rows: 0 });
     opened.close();
   });
 });
