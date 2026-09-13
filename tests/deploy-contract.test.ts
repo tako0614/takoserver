@@ -149,7 +149,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "exact pending lineage through 0043",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain(
-      "accepted contiguous 0044-0050 tail",
+      "accepted contiguous 0044-0051 tail",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("all-traffic");
     expect(routineWorker?.obligations["failure-handling"]).toContain(
@@ -181,6 +181,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schema?.obligations.provenance).toContain("0046");
     expect(schema?.obligations.provenance).toContain("0047");
     expect(schema?.obligations.provenance).toContain("0050");
+    expect(schema?.obligations.provenance).toContain("0051");
     expect(schema?.obligations["post-conditions"]).toContain(
       "exact artifact-recovery singleton and its receipt constraints",
     );
@@ -189,6 +190,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(schema?.obligations["post-conditions"]).toContain(
       "dormant workflow instance and event tables",
+    );
+    expect(schema?.obligations["post-conditions"]).toContain(
+      "internal workflow execution ownership and step state",
     );
     expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
@@ -521,6 +525,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0048",
       "0049",
       "0050",
+      "0051",
     ] as const) {
       for (const environment of ["integration", "rehearsal", "production"] as const) {
         const accepted = await deploy([

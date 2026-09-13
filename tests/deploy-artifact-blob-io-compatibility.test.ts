@@ -146,6 +146,7 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
         "0048_resource_execution_evidence.sql",
         "0049_artifact_consumer_active_resolution.sql",
         "0050_workflow_instances.sql",
+        "0051_workflow_execution.sql",
       ]),
     ).toBe(true);
     expect(

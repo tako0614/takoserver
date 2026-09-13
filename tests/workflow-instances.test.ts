@@ -13,10 +13,9 @@ import {
   type WorkflowScope,
 } from "../src/workflow-instances.ts";
 
-const MIGRATION = readFileSync(
-  new URL("../migrations/0050_workflow_instances.sql", import.meta.url),
-  "utf8",
-);
+const MIGRATION = ["0050_workflow_instances.sql", "0051_workflow_execution.sql"]
+  .map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"))
+  .join("\n");
 
 const SCOPE: WorkflowScope = {
   tenantId: "tenant_a",
@@ -186,6 +185,124 @@ describe("Durable workflow instance identity", () => {
 });
 
 describe("Durable workflow events and terminal transitions", () => {
+  async function waitingStep(f: Fixture, id: string): Promise<void> {
+    await f.sql.run(
+      `INSERT INTO tf_workflow_steps
+         (tenant_id, workflow_resource_uid, instance_id, execution_id, execution_created_at,
+          name, kind, state, wait_type, wake_at, timeout_at, created_at, updated_at, revision)
+       SELECT tenant_id, workflow_resource_uid, instance_id, execution_id, created_at,
+              'approval-step', 'wait', 'waiting', 'approval', ?, ?, created_at, created_at, 1
+       FROM tf_workflow_instances
+       WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?`,
+      [START + 10_000, START + 10_000, SCOPE.tenantId, SCOPE.workflowResourceUid, id],
+    );
+    await f.sql.run(
+      `UPDATE tf_workflow_instances
+       SET status = 'waiting', wake_at = ?, pending_step_name = 'approval-step'
+       WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?`,
+      [START + 10_000, SCOPE.tenantId, SCOPE.workflowResourceUid, id],
+    );
+  }
+
+  test("event delivery advances only its matching pending wait atomically", async () => {
+    const f = fixture();
+    await f.store.create(SCOPE, { id: "waiting" });
+    await waitingStep(f, "waiting");
+    f.setNow(START + 1);
+    await f.store.sendEvent(SCOPE, "waiting", { type: "different" });
+    expect(await row(f, "SELECT wake_at FROM tf_workflow_instances")).toEqual({
+      wake_at: START + 10_000,
+    });
+    await f.store.sendEvent(SCOPE, "waiting", { type: "approval", payload: { approved: true } });
+    expect(await row(f, "SELECT wake_at FROM tf_workflow_instances")).toEqual({
+      wake_at: START + 1,
+    });
+    expect(await row(f, "SELECT COUNT(*) AS count FROM tf_workflow_events")).toEqual({ count: 2 });
+  });
+
+  test("event insertion rolls back when its wake update fails", async () => {
+    const f = fixture();
+    await f.store.create(SCOPE, { id: "wake-failure" });
+    await waitingStep(f, "wake-failure");
+    const faultedSql: Sql = {
+      query: (sql, params) => f.sql.query(sql, params),
+      run: (sql, params) => f.sql.run(sql, params),
+      batch: (statements) =>
+        f.sql.batch(
+          statements.some((statement) => statement.sql.includes("SET wake_at = CASE"))
+            ? [...statements, { sql: "THIS IS NOT VALID SQL" }]
+            : statements,
+        ),
+    };
+    const store = createWorkflowInstances({
+      sql: faultedSql,
+      clock: f.clock,
+      randomId: () => "unused",
+    });
+    await expect(
+      store.sendEvent(SCOPE, "wake-failure", { type: "approval" }),
+    ).rejects.toMatchObject({ code: "backend_unavailable" });
+    expect(await row(f, "SELECT COUNT(*) AS count FROM tf_workflow_events")).toEqual({ count: 0 });
+    expect(await row(f, "SELECT wake_at FROM tf_workflow_instances")).toEqual({
+      wake_at: START + 10_000,
+    });
+  });
+
+  test("termination removes the journal but preserves an owner for stop acknowledgement", async () => {
+    const f = fixture();
+    await f.store.create(SCOPE, { id: "owned" });
+    await waitingStep(f, "owned");
+    f.database.exec("PRAGMA foreign_keys = OFF");
+    await f.sql.run(
+      "UPDATE tf_workflow_instances SET run_epoch = 1, run_owner = 'owner', run_lease_until = ?",
+      [START + 1_000],
+    );
+    await f.store.terminate(SCOPE, "owned");
+    expect(await row(f, "SELECT COUNT(*) AS count FROM tf_workflow_steps")).toEqual({ count: 0 });
+    expect(
+      await row(
+        f,
+        "SELECT status, run_epoch, run_owner, run_lease_until, wake_at, pending_step_name FROM tf_workflow_instances",
+      ),
+    ).toEqual({
+      status: "terminated",
+      run_epoch: 1,
+      run_owner: "owner",
+      run_lease_until: START + 1_000,
+      wake_at: null,
+      pending_step_name: null,
+    });
+  });
+
+  test("lifetime, retention reuse and sweeping explicitly clean journals without foreign keys", async () => {
+    for (const operation of ["lifetime", "reuse", "sweep"] as const) {
+      const f = fixture();
+      await f.store.create(SCOPE, { id: operation });
+      await waitingStep(f, operation);
+      f.database.exec("PRAGMA foreign_keys = OFF");
+      const lifetime = START + WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000;
+      f.setNow(
+        operation === "lifetime"
+          ? lifetime
+          : lifetime + WORKFLOW_MAX_TERMINAL_RETENTION_SECONDS * 1_000,
+      );
+      if (operation === "lifetime") {
+        expect(await f.store.status(SCOPE, operation)).toEqual({
+          status: "errored",
+          error: { reason: "lifetime_exceeded" },
+        });
+      } else if (operation === "reuse") {
+        expect(await f.store.create(SCOPE, { id: operation })).toEqual({
+          id: operation,
+          status: "queued",
+        });
+      } else {
+        expect(await f.store.sweepExpired()).toBe(1);
+      }
+      expect(await row(f, "SELECT COUNT(*) AS count FROM tf_workflow_steps")).toEqual({ count: 0 });
+    }
+  });
+
   test("retains an event before a wait and refuses events after termination", async () => {
     const f = fixture(["execution_events"]);
     await f.store.create(SCOPE, { id: "eventful" });

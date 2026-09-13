@@ -78,7 +78,7 @@ writeFileSync(
   { mode: 0o600 },
 );
 
-const APPLIED = MIGRATIONS.slice(0, 50).map(({ name }) => name);
+const APPLIED = MIGRATIONS.slice(0, 51).map(({ name }) => name);
 const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"));
 const COMPLETE_SCHEMA = schemaState(APPLIED, EXPECTED_SHAPE);
 const WRONG_SCHEMA = schemaState(APPLIED, "[]\n");

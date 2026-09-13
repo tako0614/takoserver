@@ -44,6 +44,7 @@ const COMPATIBILITY_PENDING_SUFFIX = [
   "0048_resource_execution_evidence.sql",
   "0049_artifact_consumer_active_resolution.sql",
   "0050_workflow_instances.sql",
+  "0051_workflow_execution.sql",
 ] as const;
 const COMPATIBILITY_BOUNDARY_INDEX = COMPATIBILITY_PENDING_SUFFIX.indexOf(
   "0043_artifact_blob_io_fences.sql",

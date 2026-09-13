@@ -46,16 +46,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0051_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0051_container_runtime_input_custody (id TEXT);\n",
+    "0052_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0052_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0052_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0052_container_runtime_input_rewrap (id TEXT);\n",
+    "0053_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0053_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0053_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0053_container_runtime_input_acceptance (id TEXT);\n",
+    "0054_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0054_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -68,7 +68,7 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0050 source. Historical 0001-0049 fixtures are passed explicitly by
+// 0001-0051 source. Historical 0001-0049 fixtures are passed explicitly by
 // tests that exercise frozen import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
   return runSchema(invocation, selectedTarget, {
@@ -695,7 +695,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0050");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0051");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1124,21 +1124,21 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0050");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0051");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0050 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0051 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(currentMigrations, migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0050_workflow_instances.sql"),
-        join(migrationDirectory, "0051_unreviewed_extension.sql"),
+        join(migrationDirectory, "0051_workflow_execution.sql"),
+        join(migrationDirectory, "0052_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -1161,7 +1161,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the eleven no-overwrite wave receipts cover the exact 28-file production suffix once", async () => {
+  test("the twelve no-overwrite wave receipts cover the exact 29-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -1177,6 +1177,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0048", 47, 48],
         ["0049", 48, 49],
         ["0050", 49, 50],
+        ["0051", 50, 51],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -1237,7 +1238,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(28);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(29);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

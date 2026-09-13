@@ -118,7 +118,7 @@ export const DEPLOY_CONTRACT = {
           "and lock-inode owner evidence serializes this owning publication path through authoritative " +
           "readback and public smoke. Status distinguishes active, stale-reclaimable crashed, and unsafe " +
           "lease state. While the exact pending lineage through 0043, followed only by an accepted " +
-          "contiguous 0044-0050 tail, is pending, public smoke instead requires the " +
+          "contiguous 0044-0051 tail, is pending, public smoke instead requires the " +
           "owned all-traffic quiescence 503 before any request-time composition. Cloudflare exposes no conditional " +
           "deployment/CAS input, so authoritative post-mutation " +
           "history re-establishes the actual immediate predecessor as the rollback target. The Worker's `ready` " +
@@ -133,7 +133,7 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${routineFailure} The surface refuses pending migrations except the exact pending lineage through 0043, ` +
-          "followed only by an accepted contiguous 0044-0050 tail, while the selected target is the all-traffic " +
+          "followed only by an accepted contiguous 0044-0051 tail, while the selected target is the all-traffic " +
           "pre-0043 quiescence Worker. It refuses any configuration, secret, " +
           "signing or Hosted topology drift before upload. It also composes the selected target with " +
           "the Worker's own startup path before any upload and refuses with that composition's exact " +
@@ -296,7 +296,7 @@ export const DEPLOY_CONTRACT = {
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
           "Integration JIT enablement adds exactly its environment, dedicated public JWK, fixed organization, " +
           "source commit and artifact digest plain-text bindings as one all-or-none profile. While the exact " +
-          "pending lineage through 0043, followed only by an accepted contiguous 0044-0050 tail, is pending, " +
+          "pending lineage through 0043, followed only by an accepted contiguous 0044-0051 tail, is pending, " +
           "public smoke instead requires the owned all-traffic quiescence 503 " +
           "before any request-time composition. Every Form-authority environment separately seals " +
           "handler/provider payload P, derives semantic I from P plus the adapter/capability and exact Form " +
@@ -312,7 +312,7 @@ export const DEPLOY_CONTRACT = {
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
           `${highRiskFailure} Pending schema is refused except for the exact pending lineage through 0043, ` +
-          "followed only by an accepted contiguous 0044-0050 tail, while " +
+          "followed only by an accepted contiguous 0044-0051 tail, while " +
           "the selected target blocks all request and scheduled traffic in pre-0043 quiescence mode. " +
           "Any other configuration, secret, signing or Hosted topology drift is still refused. Integration alone may bridge exact absence to the complete JIT " +
           "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
@@ -880,11 +880,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0050 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0051 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0050 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0051 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -954,9 +954,9 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
-          "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049 or 0050. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050 or 0051. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0050; unreviewed 0051+ tails are refused before any provider command. " +
+          "forward-only apply. The current source inventory is exactly 0001-0051; unreviewed 0052+ tails are refused before any provider command. " +
           "Integration may retain its no-selector disposable cadence or select " +
           "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -974,7 +974,8 @@ export const DEPLOY_CONTRACT = {
           "the 0047 boundary adds the sponsorship issuance admission and cutover-consumption receipts only after 0046; " +
           "the 0048 boundary adds value-free Resource execution evidence only after 0047; " +
           "the 0049 boundary preserves prior artifact-consumer receipts and admits active zero-consumption resolution only after 0048; " +
-          "the 0050 boundary adds dormant workflow instance and event tables after 0049 without enabling workflow execution. " +
+          "the 0050 boundary adds dormant workflow instance and event tables after 0049 without enabling workflow execution; " +
+          "the 0051 boundary adds internal workflow execution ownership and step state after 0050 without changing the public workflow declaration or enabling an executor by itself. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
