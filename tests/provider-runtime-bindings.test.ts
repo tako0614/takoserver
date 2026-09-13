@@ -8,8 +8,8 @@ import {
   createResourceDeploymentStore,
   ProviderMutationDefinitiveRefusalError,
 } from "../src/index.ts";
-import { failed, failedWithoutProviderMutation } from "../src/provider-extension.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
+import { failed, failedWithoutProviderMutation } from "../src/provider-extension.ts";
 import { createProviderPack, type RuntimeBindingMaterializer } from "../src/provider-pack.ts";
 import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import {

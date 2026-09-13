@@ -12,7 +12,6 @@ import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import {
-  providerFailureProvesNoMutation,
   type Provider,
   type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
@@ -23,6 +22,7 @@ import {
   type ProviderRuntimeBinding,
   type ProviderTicket,
   type ProviderValue,
+  providerFailureProvesNoMutation,
 } from "./provider-port.ts";
 import {
   canMaterializeAcrossProviderPacks,
