@@ -342,16 +342,11 @@ export function createDeferredOperations(input: {
       );
     }
     if (!advanced.acquired) return acceptedResponse(record.id, retryAfterSeconds);
-    const outcome = await execute(advanced.operation, leaseToken);
-    if (outcome.kind === "repair") {
-      return failure(
-        outcome.error.code,
-        outcome.error.status,
-        undefined,
-        outcome.error.publicMessage,
-        outcome.error.hostCode,
-      );
-    }
+    // A provider plan or receipt can leave the command nonterminal while the
+    // executor reports a repair-needed error. The durable record is the public
+    // authority in that case: reread it before answering so a pending repair
+    // is tracked by its Operation handle rather than leaking the stale error.
+    await execute(advanced.operation, leaseToken);
     const settled = await input.store.readDeferredOperation(
       record.tenantId,
       record.principalId,

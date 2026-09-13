@@ -35,6 +35,17 @@ const form: InstalledTakoformForm = {
   },
   operations: ["create", "read", "update", "delete"],
 };
+const importForm: InstalledTakoformForm = {
+  ...form,
+  identity: {
+    formRef: {
+      ...form.identity.formRef,
+      kind: "DeferredImportThing",
+      schemaDigest: `sha256:${"f".repeat(64)}`,
+    },
+  },
+  operations: [...form.operations, "import"],
+};
 const claimedForm: InstalledTakoformForm = {
   ...form,
   identity: {
@@ -582,6 +593,365 @@ describe("durable deferred Takoform operations", () => {
         .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
         .all(operationId),
     ).toEqual([]);
+    opened.close();
+  });
+
+  test("returns a 202 Operation handle when inline execution holds a provider-plan conflict", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async () => {
+        providerCalls += 1;
+        throw new TakoformHostError("resource_busy", 409);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = desiredResource("inline-plan-conflict", "held-provider-plan");
+    const review = await prepareReview(opened.host, desired);
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/inline-plan-conflict`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "inline-plan-conflict-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    expect(accepted?.headers.get("retry-after")).toBe("0");
+    if (!accepted) throw new Error("inline plan conflict returned no response");
+    const body: unknown = await accepted.json();
+    expect(body).toEqual({
+      operation: {
+        apiVersion: "operations.takoform.com/v1alpha1",
+        kind: "Operation",
+        id: expect.any(String),
+        done: false,
+      },
+    });
+    expect(providerCalls).toBe(1);
+    expect(
+      opened.database.query("SELECT phase, terminal_json FROM tf_deferred_operations").all(),
+    ).toEqual([{ phase: "committing", terminal_json: null }]);
+    opened.close();
+  });
+
+  test("returns a 202 Operation handle when an inline receipt commit loses its resource fence", async () => {
+    const providerEntered = deferred();
+    const releaseProvider = deferred();
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        if (input.previous) {
+          providerCalls += 1;
+          providerEntered.resolve();
+          await releaseProvider.promise;
+        }
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "inline-receipt-conflict");
+    const desired = desiredResource("inline-receipt-conflict", "inline-provider-update");
+    const review = await prepareReview(opened.host, desired, {
+      "takoform-expected-generation": current.metadata.generation,
+    });
+    const settling = opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/inline-receipt-conflict`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "inline-receipt-conflict-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-conformance-probe": "async",
+            "takoform-expected-generation": current.metadata.generation,
+          },
+          body: JSON.stringify({
+            ...desired,
+            expectedUid: current.metadata.uid,
+            expectedGeneration: current.metadata.generation,
+            review,
+          }),
+        },
+      ),
+    );
+    await providerEntered.promise;
+
+    const concurrent = storedResource("inline-receipt-conflict", current.metadata.uid);
+    concurrent.metadata.generation = current.metadata.generation;
+    concurrent.metadata.revision = "99";
+    concurrent.spec = { value: "concurrent-writer" };
+    opened.database
+      .query(
+        `UPDATE tf_resources SET revision = '99', resource_json = ?
+         WHERE tenant_id = 'tenant-a' AND space = 'main'
+           AND api_version = 'example.forms.invalid' AND kind = 'DeferredThing'
+           AND name = 'inline-receipt-conflict'`,
+      )
+      .run(JSON.stringify(concurrent));
+    releaseProvider.resolve();
+
+    const accepted = await settling;
+    expect(accepted?.status).toBe(202);
+    expect(accepted?.headers.get("retry-after")).toBe("0");
+    if (!accepted) throw new Error("inline receipt conflict returned no response");
+    const body: unknown = await accepted.json();
+    expect(body).toEqual({
+      operation: {
+        apiVersion: "operations.takoform.com/v1alpha1",
+        kind: "Operation",
+        id: expect.any(String),
+        done: false,
+      },
+    });
+    expect(providerCalls).toBe(1);
+    expect(
+      opened.database.query("SELECT phase, receipt_json FROM tf_provider_mutation_sagas").all(),
+    ).toEqual([{ phase: "executed", receipt_json: expect.any(String) }]);
+    opened.close();
+  });
+
+  test("tracks an inline import provider repair with a 202 Operation handle", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: (input) => memory.apply(input),
+      import: async () => {
+        providerCalls += 1;
+        throw new ProviderMutationRecoveryError("indeterminate", "import-provider-handle");
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [importForm], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = {
+      apiVersion: importForm.identity.formRef.apiVersion,
+      kind: importForm.identity.formRef.kind,
+      form: { formRef: importForm.identity.formRef },
+      metadata: { name: "inline-import-repair", space: "main" },
+      spec: { value: "imported" },
+      nativeId: "native-inline-import",
+    };
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredImportThing/inline-import-repair/import`,
+        "primary",
+        {
+          method: "POST",
+          headers: {
+            "idempotency-key": "inline-import-repair-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify(desired),
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    expect(accepted?.headers.get("retry-after")).toBe("0");
+    if (!accepted) throw new Error("inline import repair returned no response");
+    const body: unknown = await accepted.json();
+    expect(body).toEqual({
+      operation: {
+        apiVersion: "operations.takoform.com/v1alpha1",
+        kind: "Operation",
+        id: expect.any(String),
+        done: false,
+      },
+    });
+    expect(providerCalls).toBe(1);
+    opened.close();
+  });
+
+  test("tracks an inline delete provider repair with a 202 Operation handle", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async () => {
+        providerCalls += 1;
+        throw new ProviderMutationRecoveryError("indeterminate", "delete-provider-handle");
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "inline-delete-repair");
+    const query = new URLSearchParams({
+      space: "main",
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/inline-delete-repair?${query}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "inline-delete-repair-0001",
+            "takoform-conformance-probe": "async",
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    expect(accepted?.headers.get("retry-after")).toBe("0");
+    if (!accepted) throw new Error("inline delete repair returned no response");
+    const body: unknown = await accepted.json();
+    expect(body).toEqual({
+      operation: {
+        apiVersion: "operations.takoform.com/v1alpha1",
+        kind: "Operation",
+        id: expect.any(String),
+        done: false,
+      },
+    });
+    expect(providerCalls).toBe(1);
+    opened.close();
+  });
+
+  test("keeps an inline terminal dependency failure as a 409 response", async () => {
+    const occupied = "the provider still has dependent objects";
+    const memory = new InMemoryTakoformResourceDriver();
+    let refusing = false;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        if (refusing) {
+          throw new TakoformHostError("dependency_in_use", 409, undefined, occupied);
+        }
+        return await memory.delete(input);
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "inline-terminal-failure");
+    refusing = true;
+    const query = new URLSearchParams({
+      space: "main",
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const failed = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/inline-terminal-failure?${query}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "inline-terminal-failure-0001",
+            "takoform-conformance-probe": "async",
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        },
+      ),
+    );
+    expect(failed?.status).toBe(409);
+    expect(await failed?.json()).toMatchObject({
+      error: { code: "dependency_in_use", message: occupied, retryable: false },
+    });
+    opened.close();
+  });
+
+  test("rereads a terminal operation completed during a repair hold instead of returning its stale error", async () => {
+    let database: Database | undefined;
+    const memory = new InMemoryTakoformResourceDriver();
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        if (!database) throw new Error("test database is unavailable");
+        const terminalJson = JSON.stringify({
+          apiVersion: "operations.takoform.com/v1alpha1",
+          kind: "Operation",
+          id: input.operationId,
+          done: true,
+          error: {
+            code: "dependency_in_use",
+            message: "another worker terminalized this operation",
+            requestId: `req_${input.operationId}`,
+            retryable: false,
+          },
+        });
+        database
+          .query(
+            `UPDATE tf_deferred_operations
+             SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL
+             WHERE id = ? AND phase = 'committing'`,
+          )
+          .run(terminalJson, input.operationId);
+        throw new ProviderMutationRecoveryError("indeterminate", "stale-provider-handle");
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    database = opened.database;
+    const desired = desiredResource("inline-terminal-reread", "terminalized-elsewhere");
+    const review = await prepareReview(opened.host, desired);
+    const response = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/inline-terminal-reread`,
+        "primary",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "inline-terminal-reread-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        },
+      ),
+    );
+    expect(response?.status).toBe(409);
+    expect(await response?.json()).toMatchObject({
+      error: {
+        code: "dependency_in_use",
+        message: "another worker terminalized this operation",
+        retryable: false,
+      },
+    });
     opened.close();
   });
 

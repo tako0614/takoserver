@@ -504,7 +504,7 @@ test("a dispatched dependency set survives ordinary TTL and deferred recovery co
     idempotencyKey: "deferred-deployment-recovery",
     deferred: true,
   });
-  expect(initial.status).toBe(503);
+  expect(initial.status).toBe(202);
   const operationRow = onlyRow(
     await sql.query(
       `SELECT id, resource_uid FROM tf_deferred_operations
@@ -513,6 +513,7 @@ test("a dispatched dependency set survives ordinary TTL and deferred recovery co
   );
   const operationId = String(operationRow.id);
   const resourceUid = String(operationRow.resource_uid);
+  expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
   const heldRows = await sql.query(
     `SELECT claim_key, owner_operation_id, state, expires_at
      FROM tf_resource_claims WHERE owner_operation_id = ? ORDER BY claim_key`,
@@ -646,14 +647,11 @@ test("receipted recovery commits the accepted dependency set after target revisi
   const acceptedVersionRevision = String(beforeDrift.revision);
 
   failDeploymentCommit = true;
-  expect(
-    (
-      await apply(host, WORKER_DEPLOYMENT, "deployment", deploymentSpec(), {
-        idempotencyKey: "deferred-receipted-deployment-recovery",
-        deferred: true,
-      })
-    ).status,
-  ).toBe(500);
+  const initial = await apply(host, WORKER_DEPLOYMENT, "deployment", deploymentSpec(), {
+    idempotencyKey: "deferred-receipted-deployment-recovery",
+    deferred: true,
+  });
+  expect(initial.status).toBe(202);
   expect(providerCalls).toBe(1);
   const operationRow = onlyRow(
     await sql.query(
@@ -663,6 +661,7 @@ test("receipted recovery commits the accepted dependency set after target revisi
   );
   const operationId = String(operationRow.id);
   const resourceUid = String(operationRow.resource_uid);
+  expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
   const accepted = await createTakoformStore(
     sql,
     () => new Date(now),
@@ -736,14 +735,11 @@ test("post-dispatch recovery never rebinds the accepted dependency to a recreate
     },
   );
   await seedWorkerAndVersion(host);
-  expect(
-    (
-      await apply(host, WORKER_DEPLOYMENT, "deployment", deploymentSpec(), {
-        idempotencyKey: "deferred-deployment-aba",
-        deferred: true,
-      })
-    ).status,
-  ).toBe(503);
+  const initial = await apply(host, WORKER_DEPLOYMENT, "deployment", deploymentSpec(), {
+    idempotencyKey: "deferred-deployment-aba",
+    deferred: true,
+  });
+  expect(initial.status).toBe(202);
   const operationRow = onlyRow(
     await sql.query(
       `SELECT id, resource_uid FROM tf_deferred_operations
@@ -752,6 +748,7 @@ test("post-dispatch recovery never rebinds the accepted dependency to a recreate
   );
   const operationId = String(operationRow.id);
   const resourceUid = String(operationRow.resource_uid);
+  expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
   const originalVersion = onlyRow(
     await sql.query(
       `SELECT uid FROM tf_resources
