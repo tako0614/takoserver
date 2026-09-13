@@ -8,6 +8,7 @@ import type { JsonObject, JsonValue } from "../ports.ts";
 import {
   type ApplyInput,
   failed,
+  failedWithoutProviderMutation,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderExecutionAuthority,
@@ -1695,6 +1696,24 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       .sort((left, right) => (left.name < right.name ? -1 : 1));
   };
 
+  /** Workflow bindings are publisher-valid but this self-host provider has no runtime for them. */
+  const assertSupportedWorkflowBindings = (spec: JsonObject, operationId?: string): void => {
+    const declared = spec.workflowBindings;
+    if (declared === undefined) return;
+    if (Array.isArray(declared) && declared.length === 0) return;
+    const code = Array.isArray(declared) ? "denied" : "invalid_spec";
+    const message = Array.isArray(declared)
+      ? "the Worker Version workflow bindings are not supported by this provider"
+      : "the Worker Version workflow bindings are invalid";
+    // Only this invocation is known to be mutation-free. The driver retains
+    // an older indeterminate operation when this refusal is returned in recovery.
+    throw new SelfhostFailure(
+      operationId === undefined
+        ? failed(code, message)
+        : failedWithoutProviderMutation(operationId, code, message),
+    );
+  };
+
   type WorkerVersionDeclarationInput = Pick<ApplyInput, "identity" | "spec" | "relations">;
 
   /**
@@ -2143,6 +2162,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
+    assertSupportedWorkflowBindings(input.spec, input.operationId);
     const runtimeInputTarget = sensitiveTarget(input);
     if (requiredSensitive.length > 0 && !claimAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
@@ -2408,6 +2428,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!requiredSensitive) {
       return failed("invalid_spec", "the sensitive Worker binding declaration is invalid");
     }
+    assertSupportedWorkflowBindings(input.spec, input.operationId);
     const runtimeInputTarget = sensitiveTarget(input);
     if (requiredSensitive.length > 0 && !leasesAvailable(input, runtimeInputTarget)) {
       return failed("denied", "required sensitive Worker runtime inputs are unavailable");
@@ -3489,6 +3510,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             });
           }
           case "WorkerVersion": {
+            assertSupportedWorkflowBindings(input.spec);
             const workerRelation = input.relations?.find(
               (candidate) => candidate.pointer === "/worker",
             );

@@ -16,11 +16,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import { canonicalDigest } from "../src/json.ts";
-import type {
-  ProviderOffering,
-  ProviderRelation,
-  ProviderRuntimeBinding,
-  ProviderTicket,
+import {
+  type ProviderOffering,
+  type ProviderRelation,
+  type ProviderRuntimeBinding,
+  type ProviderTicket,
+  providerFailureProvesNoMutation,
 } from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
@@ -1799,6 +1800,208 @@ describe("publishing a Worker through the Edge Family", () => {
       relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
     ],
     ...extra,
+  });
+
+  test("refuses non-empty workflow bindings before lease or materialization", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: {
+        ...base.spec,
+        workflowBindings: [
+          {
+            name: "ORDERS",
+            resource: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "DurableWorkflow",
+              name: "orders",
+            },
+          },
+        ],
+      },
+      relations: [
+        ...base.relations,
+        relation("/workflowBindings/0/resource", "DurableWorkflow", "orders"),
+      ],
+    });
+
+    const ticket = await local.apply(request);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, request.operationId)).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, "another-operation")).toBe(false);
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
+  test("keeps omitted and empty workflow bindings supported for apply and recovery", async () => {
+    for (const [suffix, workflowBindings] of [
+      ["omitted", undefined],
+      ["empty", []],
+    ] as const) {
+      const local = provider();
+      const base = sensitiveApply();
+      const request = {
+        ...base,
+        operationId: `op_workflow_${suffix}`,
+        identity: { ...base.identity, name: `hello-workflow-${suffix}` },
+        spec: {
+          ...base.spec,
+          requiredSensitiveVars: [],
+          ...(workflowBindings === undefined ? {} : { workflowBindings }),
+        },
+      };
+      expect(await local.apply(request)).toMatchObject({ phase: "succeeded" });
+      if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+      expect(await local.recoverApply({ ...request, operationMode: "recovery" })).toMatchObject({
+        phase: "succeeded",
+      });
+    }
+  });
+
+  test("rejects malformed workflow bindings before lease or materialization", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: { ...base.spec, workflowBindings: {} },
+      relations: base.relations,
+    });
+
+    const ticket = await local.apply(request);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        retryable: false,
+        message: "the Worker Version workflow bindings are invalid",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, request.operationId)).toBe(true);
+    expect(log.events).toEqual([]);
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    expect(await local.recoverApply({ ...request, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        retryable: false,
+        message: "the Worker Version workflow bindings are invalid",
+      },
+    });
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
+  test("refuses non-empty workflow bindings during recovery before lease access", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: {
+        ...base.spec,
+        workflowBindings: [
+          {
+            name: "ORDERS",
+            resource: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "DurableWorkflow",
+              name: "orders",
+            },
+          },
+        ],
+      },
+      relations: [
+        ...base.relations,
+        relation("/workflowBindings/0/resource", "DurableWorkflow", "orders"),
+      ],
+    });
+
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    const ticket = await local.recoverApply({ ...request, operationMode: "recovery" });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, request.operationId)).toBe(true);
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
+  test("observe and import refuse workflow bindings without changing retained files", async () => {
+    const local = provider();
+    const base = sensitiveApply();
+    const request = {
+      ...base,
+      operationId: "op_observe_workflow",
+      spec: { ...base.spec, requiredSensitiveVars: [] },
+    };
+    const applied = await local.apply(request);
+    if (applied.phase !== "succeeded") throw new Error("the fixture version did not apply");
+    const { scriptName, versionId } = applied.result.outputs;
+    if (typeof scriptName !== "string" || typeof versionId !== "string") {
+      throw new Error("missing version identity");
+    }
+    const record = join(root, "selfhost", "version-bindings", scriptName, `${versionId}.json`);
+    const versionRoot = join(root, "selfhost", "versions", scriptName, versionId);
+    const beforeRecord = readFileSync(record, "utf8");
+    const beforeMeta = readFileSync(join(versionRoot, "meta.json"), "utf8");
+    const beforeModule = readFileSync(join(versionRoot, "modules", "index.js"), "utf8");
+    const workflowRequest = {
+      ...request,
+      nativeId: applied.result.nativeId,
+      spec: {
+        ...request.spec,
+        workflowBindings: [
+          {
+            name: "ORDERS",
+            resource: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "DurableWorkflow",
+              name: "orders",
+            },
+          },
+        ],
+      },
+      relations: [
+        ...request.relations,
+        relation("/workflowBindings/0/resource", "DurableWorkflow", "orders"),
+      ],
+    };
+
+    expect(await local.observe(workflowRequest)).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+    });
+    if (!local.adopt) throw new Error("the selfhost provider is missing import");
+    expect(await local.adopt(workflowRequest)).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+    });
+    expect(readFileSync(record, "utf8")).toBe(beforeRecord);
+    expect(readFileSync(join(versionRoot, "meta.json"), "utf8")).toBe(beforeMeta);
+    expect(readFileSync(join(versionRoot, "modules", "index.js"), "utf8")).toBe(beforeModule);
   });
 
   test("semantic module refusal precedes sensitive lease acquisition and materialization", async () => {

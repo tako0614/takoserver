@@ -220,6 +220,17 @@ workerd evidence does not qualify a managed runtime.
 Class-backed Actor/Workflow capabilities without an executable provider
 implementation remain unsupported on both discovery and mutation paths.
 
+The self-host provider does not project `workflowBindings` into a Worker
+Version. A nonempty declaration is refused with a non-retryable provider
+`denied` result before artifact materialization or sensitive-input dispatch,
+including apply recovery. Observation and import also refuse it rather than
+claiming that a retained Version satisfies the declaration. Omitted or empty
+lists keep the existing behavior; a non-array value is `invalid_spec`. This
+does not enable Workflow execution or change the published Form contract.
+An apply-side refusal carries operation-bound no-mutation proof so the driver
+can close an initial refusal. During recovery the same proof covers only the
+current invocation, never an older operation's uncertain side effects.
+
 The self-host adapter executes a `WorkerDeployment` containing one to eight
 exact Versions with positive integer weights totaling `10000`. It retains each
 Version's immutable materialization, orders the set by Resource UID, and
