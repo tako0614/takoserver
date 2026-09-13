@@ -31,10 +31,14 @@ import {
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  copyAuditedSchemaFixture,
+  copyCurrentSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 
 const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema-"));
 const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
+const currentMigrations = copyCurrentSchemaFixture(join(auditedFixtureRoot, "current-migrations"));
 afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 
 // Protected-wave tests must model the current source tail explicitly. Keep
@@ -42,32 +46,33 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0050_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0050_container_runtime_input_custody (id TEXT);\n",
+    "0051_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0051_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0051_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0051_container_runtime_input_rewrap (id TEXT);\n",
+    "0052_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0052_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0052_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0052_container_runtime_input_acceptance (id TEXT);\n",
+    "0053_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0053_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
 function currentIntegrationMigrations(directory: string): string {
-  const result = copyAuditedSchemaFixture(directory);
+  const result = copyCurrentSchemaFixture(directory);
   for (const [name, sql] of INVENTED_UNAUDITED_TAIL) {
     writeFileSync(join(result, name), sql, { mode: 0o600 });
   }
   return result;
 }
 
-// These cases exercise frozen 0001-0049 catch-up waves. Current source may
-// append later migrations without changing those waves or their receipts.
+// These cases exercise fixed next-wave boundaries from the current audited
+// 0001-0050 source. Historical 0001-0049 fixtures are passed explicitly by
+// tests that exercise frozen import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
   return runSchema(invocation, selectedTarget, {
-    migrationDirectory: auditedMigrations,
+    migrationDirectory: currentMigrations,
     ...options,
   });
 }
@@ -76,7 +81,7 @@ function runD1SchemaRehearsalBaseline(
   ...[invocation, selectedTarget, options]: Parameters<typeof runBaseline>
 ) {
   return runBaseline(invocation, selectedTarget, {
-    migrationDirectory: auditedMigrations,
+    migrationDirectory: currentMigrations,
     ...options,
   });
 }
@@ -690,7 +695,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0049");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0050");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1047,7 +1052,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-drift-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
+      cpSync(currentMigrations, migrationDirectory, { recursive: true });
       renameSync(
         join(migrationDirectory, "0027_reseller_settlement_intents.sql"),
         join(migrationDirectory, "0027_drifted_settlement_intents.sql"),
@@ -1077,7 +1082,7 @@ describe("production-shaped D1 migration lane", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-byte-drift-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
+      cpSync(currentMigrations, migrationDirectory, { recursive: true });
       const earlier = join(migrationDirectory, "0005_resource_deployments.sql");
       writeFileSync(earlier, `${readFileSync(earlier, "utf8")}\n-- edited after wave 0028\n`);
       const failure = await runD1Schema(
@@ -1119,21 +1124,21 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0049");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0050");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0049 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0050 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
-      cpSync(auditedMigrations, migrationDirectory, { recursive: true });
+      cpSync(currentMigrations, migrationDirectory, { recursive: true });
       copyFileSync(
-        join(migrationDirectory, "0049_artifact_consumer_active_resolution.sql"),
-        join(migrationDirectory, "0050_unreviewed_extension.sql"),
+        join(migrationDirectory, "0050_workflow_instances.sql"),
+        join(migrationDirectory, "0051_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -1156,7 +1161,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("the ten no-overwrite wave receipts cover the exact 27-file production suffix once", async () => {
+  test("the eleven no-overwrite wave receipts cover the exact 28-file production suffix once", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-all-waves-"));
     try {
       chmodSync(root, 0o700);
@@ -1171,6 +1176,7 @@ describe("production-shaped D1 migration lane", () => {
         ["0047", 46, 47],
         ["0048", 47, 48],
         ["0049", 48, 49],
+        ["0050", 49, 50],
       ] as const;
       const receipted: {
         readonly name: string;
@@ -1223,7 +1229,7 @@ describe("production-shaped D1 migration lane", () => {
       }
 
       expect(receipted).toEqual(
-        readMigrationArtifact(auditedMigrations)
+        readMigrationArtifact(currentMigrations)
           .files.slice(22)
           .map(({ name, digest, bytes }) => ({
             name,
@@ -1231,7 +1237,7 @@ describe("production-shaped D1 migration lane", () => {
             bytes,
           })),
       );
-      expect(new Set(receipted.map(({ name }) => name)).size).toBe(27);
+      expect(new Set(receipted.map(({ name }) => name)).size).toBe(28);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1357,7 +1363,7 @@ describe("production-shaped D1 migration lane", () => {
         target,
         {
           run: process.run,
-          migrationDirectory: auditedMigrations,
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "0043-work"),
           receiptPath,
           predecessorReceiptPath: predecessor.receiptPath,

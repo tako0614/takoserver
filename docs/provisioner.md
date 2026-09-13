@@ -230,6 +230,8 @@ does not enable Workflow execution or change the published Form contract.
 An apply-side refusal carries operation-bound no-mutation proof so the driver
 can close an initial refusal. During recovery the same proof covers only the
 current invocation, never an older operation's uncertain side effects.
+The [Workflow implementation note](workflow-runtime.md) separates the internal
+instance store from the execution and binding work still required for support.
 
 The self-host adapter executes a `WorkerDeployment` containing one to eight
 exact Versions with positive integer weights totaling `10000`. It retains each

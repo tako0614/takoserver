@@ -16,3 +16,15 @@ export function copyAuditedSchemaFixture(directory: string): string {
   }
   return directory;
 }
+
+/** Current audited source, including the additive 0050 workflow tables. */
+export function copyCurrentSchemaFixture(directory: string): string {
+  if (MIGRATIONS.length !== 50 || MIGRATIONS.at(-1)?.name !== "0050_workflow_instances.sql") {
+    throw new Error("current schema fixture requires the audited 0001-0050 lineage");
+  }
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const { name } of MIGRATIONS) {
+    copyFileSync(resolve(import.meta.dir, "../../migrations", name), join(directory, name));
+  }
+  return directory;
+}

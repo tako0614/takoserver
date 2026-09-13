@@ -22,32 +22,32 @@ import {
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
-const auditedFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-audited-schema-surface-"));
-const auditedMigrations = copyAuditedSchemaFixture(join(auditedFixtureRoot, "migrations"));
-afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
+const currentFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-current-schema-surface-"));
+const currentMigrations = copyCurrentSchemaFixture(join(currentFixtureRoot, "migrations"));
+afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 
 // The integration lane intentionally accepts a current source tail. Keep the
 // unreviewed tail synthetic and isolated so this test does not depend on
 // ambient worktree migrations that are absent from a clean historical commit.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0050_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0050_container_runtime_input_custody (id TEXT);\n",
+    "0051_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0051_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0051_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0051_container_runtime_input_rewrap (id TEXT);\n",
+    "0052_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0052_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0052_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0052_container_runtime_input_acceptance (id TEXT);\n",
+    "0053_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0053_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
 function currentIntegrationMigrations(directory: string): string {
-  const result = copyAuditedSchemaFixture(directory);
+  const result = copyCurrentSchemaFixture(directory);
   for (const [name, sql] of INVENTED_UNAUDITED_TAIL) {
     writeFileSync(join(result, name), sql, { mode: 0o600 });
   }
@@ -145,7 +145,7 @@ function migrationStateThrough(count: number, marker: string): D1SchemaState {
 function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
   return {
     applied: [
-      ...MIGRATIONS.slice(0, 49).map(({ name }) => name),
+      ...MIGRATIONS.slice(0, 50).map(({ name }) => name),
       ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
     ],
     shape: `${marker}\n`,
@@ -267,7 +267,7 @@ describe("forward-only D1 schema surface", () => {
         target,
         {
           reader,
-          migrationDirectory: auditedMigrations,
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
@@ -309,7 +309,7 @@ describe("forward-only D1 schema surface", () => {
         {
           reader,
           run: fixture.run,
-          migrationDirectory: auditedMigrations,
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "work"),
           receiptPath: join(root, "receipt.json"),
           review: "reviewer@example.test",
@@ -501,9 +501,10 @@ describe("forward-only D1 schema surface", () => {
           "0047_sponsorship_cutover_consumption.sql",
           "0048_resource_execution_evidence.sql",
           "0049_artifact_consumer_active_resolution.sql",
-          "0050_container_runtime_input_custody.sql",
-          "0051_container_runtime_input_rewrap.sql",
-          "0052_container_runtime_input_acceptance.sql",
+          "0050_workflow_instances.sql",
+          "0051_container_runtime_input_custody.sql",
+          "0052_container_runtime_input_rewrap.sql",
+          "0053_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);
@@ -544,7 +545,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: rehearsal.run,
           reader: readerSequence([pre, pre, pre, post]),
-          migrationDirectory: auditedMigrations,
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "rehearsal-work"),
           receiptPath,
           review: "reviewer@example.test",
@@ -564,7 +565,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: production.run,
           reader: readerSequence([pre, pre, pre, post]),
-          migrationDirectory: auditedMigrations,
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "production-work"),
           receiptPath,
           review: "second-reviewer@example.test",
@@ -603,7 +604,7 @@ describe("forward-only D1 schema surface", () => {
           {
             run: refusedProcess.run,
             reader: readerSequence([pre, pre]),
-            migrationDirectory: auditedMigrations,
+            migrationDirectory: currentMigrations,
             outputDirectory: join(root, `refused-work-${index}`),
             receiptPath: badReceiptPath,
             review: "second-reviewer@example.test",

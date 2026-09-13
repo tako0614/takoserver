@@ -19,14 +19,18 @@ import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migr
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  copyAuditedSchemaFixture,
+  copyCurrentSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-storage-tests-"));
 const auditedMigrations = copyAuditedSchemaFixture(join(fixtureRoot, "migrations"));
-const expectedApplicationShape = applicationShape(auditedMigrations);
+const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations"));
+const expectedApplicationShape = applicationShape(currentMigrations);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
-const DATABASE_ID = "00000000-0000-4000-8000-000000000049";
+const DATABASE_ID = "00000000-0000-4000-8000-000000000050";
 const TARGET_DATABASE = "takoserver-runtime-integration";
 const TARGET_BUCKET = "takoserver-objects-integration";
 const GENERATED_NAME = `takoserver-i-${GENERATION}`;
@@ -51,7 +55,7 @@ const invocation = {
 
 const emptyState = state([], []);
 const completeState = stateWithShape(
-  MIGRATIONS.slice(0, 49).map(({ name }) => name),
+  MIGRATIONS.slice(0, 50).map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -199,7 +203,7 @@ function options(
     provider,
     run: process.run,
     review: "independent-reviewer",
-    migrationDirectory: auditedMigrations,
+    migrationDirectory: currentMigrations,
     reader: {
       async read() {
         return states[Math.min(reads++, states.length - 1)] as D1SchemaState;
@@ -399,7 +403,7 @@ describe("integration storage generation bootstrap", () => {
     expect(result).toMatchObject({
       d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
       r2: { bucketName: GENERATED_NAME },
-      appliedMigrations: MIGRATIONS.slice(0, 49).map(({ name }) => name),
+      appliedMigrations: MIGRATIONS.slice(0, 50).map(({ name }) => name),
       generation: GENERATION,
       commit: COMMIT,
     });
@@ -469,7 +473,7 @@ describe("integration storage generation bootstrap", () => {
         target,
         options(wrong.provider, [emptyState, state(["0001_runtime_storage.sql"], [])]),
       ),
-    ).rejects.toThrow("exact audited 0001-0049 lineage");
+    ).rejects.toThrow("exact audited 0001-0050 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
@@ -480,7 +484,7 @@ describe("integration storage generation bootstrap", () => {
         options(wrongShape.provider, [
           emptyState,
           stateWithShape(
-            MIGRATIONS.slice(0, 49).map(({ name }) => name),
+            MIGRATIONS.slice(0, 50).map(({ name }) => name),
             "[]\n",
           ),
         ]),
@@ -524,7 +528,7 @@ describe("integration storage generation bootstrap", () => {
     expect(failed.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
   });
 
-  test("does not leak provider diagnostics and rejects an unreviewed migration tail", async () => {
+  test("does not leak provider diagnostics and rejects obsolete or unreviewed source inventories", async () => {
     const leaked = providerFixture({ failCreateD1: true });
     const process = processFixture();
     const error = await rejectedError(
@@ -536,15 +540,17 @@ describe("integration storage generation bootstrap", () => {
     );
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
-    copyAuditedSchemaFixture(tail);
-    writeFileSync(join(tail, "0050_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
-    const tailProvider = providerFixture();
-    await expect(
-      runIntegrationStorageGeneration(invocation, target, {
-        ...options(tailProvider.provider),
-        migrationDirectory: tail,
-      }),
-    ).rejects.toThrow("exactly 0001-0049");
-    expect(tailProvider.calls).toEqual([]);
+    copyCurrentSchemaFixture(tail);
+    writeFileSync(join(tail, "0051_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    for (const migrationDirectory of [auditedMigrations, tail]) {
+      const refusedProvider = providerFixture();
+      await expect(
+        runIntegrationStorageGeneration(invocation, target, {
+          ...options(refusedProvider.provider),
+          migrationDirectory,
+        }),
+      ).rejects.toThrow("exactly 0001-0050");
+      expect(refusedProvider.calls).toEqual([]);
+    }
   });
 });

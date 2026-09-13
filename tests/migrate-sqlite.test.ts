@@ -26,6 +26,7 @@ const EXACT_ARTIFACT_RECOVERY_RECEIPTS = "0046_exact_artifact_recovery_receipts.
 const SPONSORSHIP_CUTOVER_CONSUMPTION = "0047_sponsorship_cutover_consumption.sql";
 const RESOURCE_EXECUTION_EVIDENCE = "0048_resource_execution_evidence.sql";
 const ARTIFACT_CONSUMER_ACTIVE_RESOLUTION = "0049_artifact_consumer_active_resolution.sql";
+const WORKFLOW_INSTANCES = "0050_workflow_instances.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -44,6 +45,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   SPONSORSHIP_CUTOVER_CONSUMPTION,
   RESOURCE_EXECUTION_EVIDENCE,
   ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
+  WORKFLOW_INSTANCES,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -372,6 +374,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 3]?.name).toBe(SPONSORSHIP_CUTOVER_CONSUMPTION);
     expect(MIGRATIONS[receiptMigrationIndex + 4]?.name).toBe(RESOURCE_EXECUTION_EVIDENCE);
     expect(MIGRATIONS[receiptMigrationIndex + 5]?.name).toBe(ARTIFACT_CONSUMER_ACTIVE_RESOLUTION);
+    expect(MIGRATIONS[receiptMigrationIndex + 6]?.name).toBe(WORKFLOW_INSTANCES);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -391,6 +394,7 @@ describe("bringing a local database up to date", () => {
       SPONSORSHIP_CUTOVER_CONSUMPTION,
       RESOURCE_EXECUTION_EVIDENCE,
       ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
+      WORKFLOW_INSTANCES,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -455,7 +459,7 @@ describe("bringing a local database up to date", () => {
     const migrationIndex = MIGRATIONS.findIndex(
       ({ name }) => name === ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
     );
-    expect(migrationIndex).toBe(MIGRATIONS.length - 1);
+    expect(migrationIndex).toBe(48);
     const database = new Database(":memory:");
     for (const migration of MIGRATIONS.slice(0, migrationIndex)) database.exec(migration.sql);
 
@@ -651,6 +655,7 @@ describe("bringing a local database up to date", () => {
         SPONSORSHIP_CUTOVER_CONSUMPTION,
         RESOURCE_EXECUTION_EVIDENCE,
         ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
+        WORKFLOW_INSTANCES,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1204,6 +1209,7 @@ describe("bringing a local database up to date", () => {
       "0047_sponsorship_cutover_consumption.sql",
       "0048_resource_execution_evidence.sql",
       "0049_artifact_consumer_active_resolution.sql",
+      WORKFLOW_INSTANCES,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1334,6 +1340,7 @@ describe("bringing a local database up to date", () => {
       "0047_sponsorship_cutover_consumption.sql",
       "0048_resource_execution_evidence.sql",
       "0049_artifact_consumer_active_resolution.sql",
+      WORKFLOW_INSTANCES,
     ]);
     expect(
       database
@@ -2271,6 +2278,7 @@ describe("bringing a local database up to date", () => {
       SPONSORSHIP_CUTOVER_CONSUMPTION,
       RESOURCE_EXECUTION_EVIDENCE,
       ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
+      WORKFLOW_INSTANCES,
     ]);
     expect(
       database

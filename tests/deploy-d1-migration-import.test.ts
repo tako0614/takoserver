@@ -6,7 +6,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
-import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  copyAuditedSchemaFixture,
+  copyCurrentSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-d1-migration-import-tests-"));
 const migrationsDirectory = copyAuditedSchemaFixture(join(fixtureRoot, "migrations"));
@@ -75,20 +78,23 @@ describe("D1 migration SQL import builder", () => {
     expect(artifact.sql.match(/INSERT INTO "d1_migrations" \(name\)/gu)).toHaveLength(1);
   });
 
-  test("executes the fresh import into SQLite with exact application schema and lineage", () => {
-    const artifact = buildD1MigrationImport(sourceArtifact.files, { freshLedger: true });
+  test("executes the current 0050 fresh import into SQLite with exact application schema and lineage", () => {
+    const currentSource = readMigrationArtifact(
+      copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations")),
+    );
+    const artifact = buildD1MigrationImport(currentSource.files, { freshLedger: true });
     const imported = new Database(":memory:");
     const expected = new Database(":memory:");
     try {
       imported.exec(artifact.sql);
-      for (const file of sourceArtifact.files) {
+      for (const file of currentSource.files) {
         expected.exec(readFileSync(file.path, "utf8"));
       }
 
       const applied = imported.query("SELECT name FROM d1_migrations ORDER BY id").all() as Array<{
         name: string;
       }>;
-      expect(applied.map(({ name }) => name)).toEqual([...sourceArtifact.names]);
+      expect(applied.map(({ name }) => name)).toEqual([...currentSource.names]);
 
       const rows = (database: Database) =>
         database

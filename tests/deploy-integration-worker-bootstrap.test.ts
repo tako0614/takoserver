@@ -35,7 +35,7 @@ import type {
   WranglerVersionPublicationLease,
 } from "../scripts/deploy/wrangler-state.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyAuditedSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
@@ -56,7 +56,7 @@ const SCHEDULES = ["*/5 * * * *"] as const;
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-worker-bootstrap-tests-"));
 const sourceRoot = join(fixtureRoot, "source");
 mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
-copyAuditedSchemaFixture(join(sourceRoot, "migrations"));
+copyCurrentSchemaFixture(join(sourceRoot, "migrations"));
 writeFileSync(
   join(sourceRoot, "wrangler.jsonc"),
   `${JSON.stringify(
@@ -78,7 +78,7 @@ writeFileSync(
   { mode: 0o600 },
 );
 
-const APPLIED = MIGRATIONS.slice(0, 49).map(({ name }) => name);
+const APPLIED = MIGRATIONS.slice(0, 50).map(({ name }) => name);
 const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"));
 const COMPLETE_SCHEMA = schemaState(APPLIED, EXPECTED_SHAPE);
 const WRONG_SCHEMA = schemaState(APPLIED, "[]\n");

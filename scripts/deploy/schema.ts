@@ -109,6 +109,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0047_sponsorship_cutover_consumption.sql",
   "0048_resource_execution_evidence.sql",
   "0049_artifact_consumer_active_resolution.sql",
+  "0050_workflow_instances.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -210,6 +211,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:64293c3efa4ffd07bde36bf440862fb9fcb6e57290c172b771b09d955c3d2740",
   "0049_artifact_consumer_active_resolution.sql":
     "sha256:260605201a3a932fd5702aa1fdd2a449b74945a9dcd86f205cb54fcbcd757b29",
+  "0050_workflow_instances.sql":
+    "sha256:df882d84764e23fb439261c9454485f23dbeed53fe922020da238b104ff5c3de",
 };
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
@@ -223,6 +226,7 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0047",
   "0048",
   "0049",
+  "0050",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -301,6 +305,12 @@ const SCHEMA_WAVES: Readonly<
     fromMigration: "0048_resource_execution_evidence.sql",
     throughCount: 49,
     throughMigration: "0049_artifact_consumer_active_resolution.sql",
+  },
+  "0050": {
+    fromCount: 49,
+    fromMigration: "0049_artifact_consumer_active_resolution.sql",
+    throughCount: 50,
+    throughMigration: "0050_workflow_instances.sql",
   },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
@@ -1381,7 +1391,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0049",
+      "selected D1 wave requires the exact audited source inventory 0001-0050",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1426,7 +1436,9 @@ function assertAuditedMigrationHashes(
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
-        "selected D1 wave requires the exact audited migration SHA-256 for every 0001-0049 file",
+        `selected D1 wave requires the exact audited migration SHA-256 for every 0001-${String(
+          count,
+        ).padStart(4, "0")} file`,
         `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
       );
     }
@@ -1434,10 +1446,10 @@ function assertAuditedMigrationHashes(
 }
 
 /**
- * Reads the frozen 0001-0049 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0050 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
- * lineage (for example, a fresh disposable integration database) use this
- * helper instead of copying the audit constants or weakening the wave checks.
+ * lineage (for example, a frozen 0049 import fixture) use an explicit
+ * historical fixture instead of weakening the current source checks.
  */
 export function readAuditedMigrationArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
@@ -1445,7 +1457,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0049",
+      "audited migration lineage must contain exactly 0001-0050",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
