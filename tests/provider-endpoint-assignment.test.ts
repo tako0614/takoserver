@@ -509,7 +509,11 @@ test("releases an assignment the provider never got activated, and gates the rec
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
-  ).rejects.toMatchObject({ code: "resource_busy", status: 409 });
+  ).rejects.toMatchObject({
+    code: "resource_busy",
+    status: 409,
+    providerOutcome: "indeterminate",
+  });
   expect(context.events).toEqual([
     "reservation.bind",
     "reservation.assign",
@@ -559,7 +563,11 @@ test("refuses a receipt its Form cannot publish before the assignment is activat
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
-  ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  ).rejects.toMatchObject({
+    code: "invalid_argument",
+    status: 400,
+    providerOutcome: "indeterminate",
+  });
   expect(context.events).toEqual([
     "reservation.bind",
     "reservation.assign",

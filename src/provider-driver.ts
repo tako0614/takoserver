@@ -586,6 +586,19 @@ export function createProviderDriver(
     throw refusal;
   };
 
+  const indeterminateProviderMutationFailure = (error: unknown): ProviderMutationRecoveryError => {
+    if (error instanceof ProviderMutationRecoveryError) return error;
+    return error instanceof TakoformHostError
+      ? new ProviderMutationRecoveryError(
+          "indeterminate",
+          undefined,
+          error.code,
+          error.status,
+          error.publicMessage,
+        )
+      : new ProviderMutationRecoveryError("indeterminate");
+  };
+
   /** Direct Provider throws never carry the operation-bound ticket proof. */
   const enteredProviderMutation = async (
     work: () => Promise<ProviderTicket>,
@@ -593,8 +606,7 @@ export function createProviderDriver(
     try {
       return await work();
     } catch (error) {
-      if (error instanceof ProviderMutationRecoveryError) throw error;
-      throw new ProviderMutationRecoveryError("indeterminate");
+      throw indeterminateProviderMutationFailure(error);
     }
   };
 
@@ -1398,11 +1410,11 @@ export function createProviderDriver(
           }
           return ticket;
         } catch (error) {
-          if (error instanceof ProviderMutationRecoveryError) throw error;
           // A thrown value has no producer-owned no-effect proof. This remains
           // ambiguous even when it happens to use a normally precondition-like
-          // Host status: the provider boundary was already entered.
-          throw new ProviderMutationRecoveryError("indeterminate");
+          // Host status: the provider boundary was already entered. Preserve a
+          // known public diagnosis without promoting it into mutation certainty.
+          throw indeterminateProviderMutationFailure(error);
         }
       };
       // A reseller reservation already holds this exact Offering's price.
