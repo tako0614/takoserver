@@ -670,6 +670,14 @@ The routine surfaces are:
   mechanism, or any executable dependency in the build-derived public Form
   payload/identity closure. The latter closure is derived from the real P/I
   build roots rather than maintained as a provider/handler filename regex.
+  The Worker's `ready` result and discovery/OpenAPI HTTP 200 smoke establish
+  runtime-ready Host state only; they do not establish that Form admission is
+  ready or that an application is installed and serving HTTP. When live semantic
+  implementation digest `I` differs from its predecessor, the existing owner
+  admission workflow for that environment is the prerequisite for reconciling
+  current support/activation heads; Host publication alone leaves those durable
+  heads unchanged. See [Form authority plan and apply](form-authority.md#plan-and-apply)
+  for the canonical workflow.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
 - `takoserver-console`: one Console Worker upload. Exhaustive domain state must
@@ -816,13 +824,29 @@ managed customer runtime.
   retries an HTTP mutation; a lost apply acknowledgement is indeterminate. An
   acknowledged partial apply still performs the separate readback, preserves
   only sanitized action receipts and next-plan diagnostics, and exits nonzero
-  as a verification failure.
+  as a verification failure. Before this lane, when live semantic implementation
+  digest `I` differs from its predecessor, reconcile the existing integration
+  fixture Worker then operator gateway to the selected public commit:
+  `takoserver-integration-form-authority-worker` →
+  `takoserver-integration-form-authority-operator-worker`. Its signed status,
+  one apply, and status/catalog readback are the existing sequence described in
+  [the integration cutover order](form-authority.md#integration-cutover-order)
+  and [plan and apply](form-authority.md#plan-and-apply). The existing Form
+  admission prerequisites here include all 17 current package identities
+  installed and implemented catalog entries supported with active activation
+  heads matching `I`; unsupported identities may retain package/support heads
+  but must have no active activation head. A successful/converged apply returns
+  a zero-command next plan; these prerequisites do not by themselves prove
+  application installation or HTTP serving. A dynamic host-only probe result with `publicIdentityRpcReady: true`
+  can be reused in this sequence; probe code changes continue through its
+  existing probe surface and checks.
 - `takoserver-integration-form-authority-deactivation`: integration only and
   separately owned from normal activation. It always signs
   `activation.desiredActive: false`, emits only inactive activation successors,
   never loads Form packages or invokes package verification, and has no free
-  mode, repair, or reverse flag. Status/apply/status proves all exact 13
-  durable activation heads are absent or inactive. It uses the same v2 signed
+  mode, repair, or reverse flag. Status/apply/status proves all exact 17
+  durable activation heads are absent or inactive; support and activation remain
+  limited to the implemented catalog subset. It uses the same v2 signed
   request/plan/apply/readback protocol and the same no-retry/credential
   redaction rules. With the named transition descriptor it requires both live
   Workers to have a verified dynamic or legacy exact identity profile and
@@ -1373,7 +1397,11 @@ only then hashes final artifact `A`. Unrelated outer bytes may rotate `A`
 without rotating `I`; handler/provider, capability, Form package, or admitted
 operation changes rotate `I`. `P` and `I` have no operator override or runtime
 source scan, and all three supported environments realize `A` plus the embedded
-semantic identity.
+semantic identity. A Host code publication with unchanged `I` does not itself
+require reconvergence; other existing drift still follows its owning workflow.
+A digest change therefore follows the canonicalized actual
+emitted Worker bundle/import closure and those derived inputs, not every
+docs/test/deploy-only or otherwise unrelated source-commit diff.
 
 Credential actions are pinned more tightly than routine status: the selected
 commit must equal the current immutable Worker annotation, whose artifact
@@ -1628,7 +1656,7 @@ Its proof session is always revoked and its death proved by replay; a replay
 that does not return `401` is a verification failure, never a retry.
 
 For a Form deactivation acknowledgement failure, do not retry apply. Run the
-deactivation surface with `--status` and require its exact 13-head
+deactivation surface with `--status` and require its exact 17-head
 absent-or-inactive proof before any fresh decision. A Worker rollback cannot
 reverse the append-only activation event; use the normal activation surface
 for explicit reactivation. When a transition descriptor selected the
