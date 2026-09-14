@@ -90,7 +90,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -162,6 +162,7 @@ const HOST_ONLY = [
   "src/workerd-worker-module-inspector.ts",
   "src/workerd-artifact.ts",
   "src/workerd-execution-guard.ts",
+  "src/selfhost-workflow-execution-host.ts",
   "src/providers/docker-http-revision.ts",
   "src/providers/selfhost-container-runtime.ts",
   // The public Worker has D1 and R2 bindings. Credential-bearing HTTP

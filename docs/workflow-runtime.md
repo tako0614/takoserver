@@ -202,7 +202,7 @@ acknowledged first, but completed stop may overtake an in-flight start/renew
 and cancels those unresolved requests. No execution is automatically restarted
 by the guard.
 
-This is a private process primitive, not yet a complete
+This is a private process primitive, not by itself a complete
 `WorkflowExecutionHost`. The class loader, verified module/env projection,
 weighted deployment selection, step callback transport and genuine-error
 provenance still have to be composed with it. In particular, starting a
@@ -219,14 +219,50 @@ controller EOF, guard loss and an independently running HTTP sibling. This
 is distinct from the failed same-process facet probe, which remains unchanged.
 Portable protocol tests do not substitute for this native qualification.
 
+### Private self-host lifecycle composition
+
+`selfhost-workflow-execution-host` connects the coordinator's private port to
+this guard. Registration reserves the complete claim identity before any
+asynchronous work. It does not prepare or evaluate application code. `run`
+asks a host-owned preparation port to select the then-current deployment and
+snapshot verified modules/env, then starts only that registration's process.
+The preparation port must never import tenant modules into the controller.
+
+Stop is irreversible for a registered session. It aborts preparation and
+requests guard stop without waiting for preparation, START acknowledgement or
+an application result. After reap, the prepared transport must seal all prior
+application frames before artifacts are removed and stop is acknowledged.
+An unresolved parked step must not block that transport barrier. Failure to
+prove reap or seal is an infrastructure failure, not successful termination;
+the registry retains identity and artifacts for recovery. Cleanup and seal can
+be retried without restarting the process. A never-started guard's observed
+exit is enough to release a failed registration, but guard exit after START
+is not child/message proof.
+
+The coordinator calls `openPaused` once per exact current SQL claim. A valid
+successor claim changes epoch/owner; the private port is not an authorization
+endpoint for replaying arbitrary stale identities. The bounded registry keeps
+stopped tombstones through the largest requested lease, including renewals
+whose acknowledgement was lost. It never prunes an unproved stop merely
+because the controller clock advanced. Capacity exhaustion refuses admission.
+
+This composition is dormant and not a qualified serving host. Its tests use
+fake process and preparation ports. A real closed-graph class loader, ordered
+step transport with genuine-error correlation, and native stop/message-barrier
+qualification still remain. Raw workerd is not a hardened multi-tenant sandbox;
+this lifecycle code does not add or claim that security property. No WfP or
+public Workflow activation is enabled by this module.
+
 ## Schema and rollout
 
 Migration `0050_workflow_instances.sql` adds the instance and event tables.
 `0051_workflow_execution.sql` adds run ownership, wake state and the step
-journal without replacing the existing tables. Earlier migration bytes are
+journal without replacing the existing tables. `0052_workflow_termination_intent.sql`
+adds the private `termination_requested` bit, defaulting to zero, so controller
+loss cannot lose a pending consumer termination. Earlier migration bytes are
 unchanged. The generated schema must come from the owning `schema:write`
-command. The owning deployment inventory, exact migration hash, 0050-to-0051
-wave and schema tests move with this migration; adding a file alone is not a
+command. The owning deployment inventory, exact migration hashes, 0050-to-0051
+and 0051-to-0052 waves and schema tests move with these migrations; adding a file alone is not a
 deployable schema change.
 
 No live database is changed by adding this implementation. Shared, unknown and
@@ -235,7 +271,7 @@ schema transition, its predecessor evidence and exact readback. Old deployment
 evidence remains tied to its old source and cannot stand in for the new schema.
 Self-host startup applies known forward migrations and refuses a database from
 a newer build: after migration, downgrading to a binary that does not know
-0051 is not a rollback plan. Preserve the data and repair forward.
+0052 is not a rollback plan. Preserve the data and repair forward.
 
 ## Remaining runtime integration
 
@@ -247,9 +283,16 @@ until the workflow becomes due. A future due-row scheduler remains a thin
 caller of this same authority.
 
 One exact claim predicate protects step writes and a single terminalization
-path owns outcomes, retention and cleanup. The consumer instance facade waits
-for stop acknowledgement even when an earlier controller has already written
-a terminal status. Application outcomes and host/storage failures are separate:
+path owns outcomes, retention and cleanup. The consumer instance facade first
+saves termination intent without changing the public status or dropping the
+current owner. That intent prevents new claims, steps, heartbeats and ordinary
+completion/park writes. After exact stop proof, one fenced transaction publishes
+termination and removes the journal/events. `runOne` recovers saved intent
+without evaluating application code. Failed stop preserves intent and ownership
+for retry. A concurrent lifetime expiry or an existing exact terminal winner
+remains authoritative; a delayed finalizer cannot terminate a replacement
+incarnation. The raw instance store is not this runtime-owned consumer facade.
+Application outcomes and host/storage failures are separate:
 a failed SQL commit or lost host session does not become `run_threw`.
 Only the coordinator decides step-count, lifetime and step-definition failures. An adapter's
 `step_failed` outcome must correlate to an exhausted-step error emitted by that

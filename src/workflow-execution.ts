@@ -31,6 +31,11 @@ import {
  * No self-host or WfP adapter currently qualifies this protocol.
  */
 export interface WorkflowExecutionHost {
+  /**
+   * The controller calls this once for the exact current SQL claim identity.
+   * After that lease expires, a successor must use a new run epoch and owner;
+   * an old stopped registration cannot be reopened under its stale fence.
+   */
   openPaused(
     identity: WorkflowRunIdentity,
     input: JsonObject | undefined,
@@ -173,7 +178,7 @@ const MAX_STEPS = 1_024;
 const MAX_SECONDS = 31_536_000;
 const CLAIM_ID =
   "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? AND run_epoch = ? AND run_owner = ?";
-const RUNNABLE = `${CLAIM_ID} AND status = 'running' AND run_lease_until > ? AND deadline_at > ? AND retention_until > ?`;
+const RUNNABLE = `${CLAIM_ID} AND termination_requested = 0 AND status = 'running' AND run_lease_until > ? AND deadline_at > ? AND retention_until > ?`;
 const STEP_ID = "execution_id = ? AND execution_created_at = ? AND name = ?";
 const RUN_EXISTS = `EXISTS (SELECT 1 FROM tf_workflow_instances WHERE ${RUNNABLE})`;
 
@@ -278,20 +283,254 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     await clearOwner(identity);
   }
 
+  /**
+   * Set the private termination bit without changing the public instance
+   * status.  Ownership and the execution fence are part of this CAS so a
+   * delayed request can never target a replacement incarnation.
+   */
+  async function requestTermination(current: InstanceRow, timestamp: number): Promise<boolean> {
+    const ownerClause =
+      current.owner === null
+        ? " AND run_owner IS NULL AND run_lease_until IS NULL"
+        : " AND run_owner = ?";
+    const result = await sql.run(
+      "UPDATE tf_workflow_instances SET termination_requested = 1, updated_at = ?, revision = revision + 1 WHERE " +
+        "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? AND run_epoch = ? " +
+        "AND termination_requested = 0 AND status IN (" +
+        ACTIVE +
+        ") AND retention_until > ?" +
+        ownerClause,
+      [
+        timestamp,
+        ...incarnationParams(current),
+        current.epoch,
+        timestamp,
+        ...(current.owner === null ? [] : [current.owner]),
+      ],
+    );
+    return result.changes === 1;
+  }
+
+  /**
+   * Clear a termination bit left on a row that another path already made
+   * terminal (most commonly lazy lifetime expiry).  This does not alter that
+   * terminal winner; it only releases an old owner after the usual stop proof.
+   */
+  async function clearTerminalTermination(current: InstanceRow): Promise<void> {
+    const ownerClause = current.owner === null ? " AND run_owner IS NULL" : " AND run_owner = ?";
+    const timestamp = now();
+    await sql.run(
+      "UPDATE tf_workflow_instances SET run_owner = NULL, run_lease_until = NULL, termination_requested = 0, revision = revision + 1 WHERE " +
+        "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? AND run_epoch = ? " +
+        "AND status IN (" +
+        TERMINAL +
+        ") AND termination_requested = 1 AND retention_until > ?" +
+        ownerClause,
+      [
+        ...incarnationParams(current),
+        current.epoch,
+        timestamp,
+        ...(current.owner === null ? [] : [current.owner]),
+      ],
+    );
+  }
+
+  /**
+   * After a termination intent is durable, no application code may run.  A
+   * live owner must be stopped; an expired lease or hard deadline is already a
+   * proof that this exact context cannot continue.  The final CAS then chooses
+   * `terminated`, unless the absolute lifetime elapsed first.
+   */
+  async function recoverTermination(
+    current: InstanceRow,
+    expected: Pick<InstanceRow, "executionId" | "createdAt"> = current,
+  ): Promise<WorkflowRunOutcome> {
+    if (!sameIncarnation(current, expected)) return { kind: "stale" };
+    let candidate = current;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const retentionNow = now();
+      if (candidate.retentionUntil <= retentionNow) {
+        // A retained-id incarnation is no longer visible to callers.  Do not
+        // revive it by writing a late termination result; stop a still-live
+        // owner only when the exact lease/deadline proof requires it.
+        if (
+          candidate.owner !== null &&
+          candidate.leaseUntil !== null &&
+          candidate.leaseUntil > retentionNow &&
+          candidate.deadlineAt > retentionNow
+        ) {
+          await stop(identityOf(candidate), "termination");
+        }
+        return { kind: "stale" };
+      }
+      if (!candidate.terminationRequested) {
+        if (isTerminal(candidate.status)) return { kind: "terminal", status: candidate.status };
+        return { kind: "stale" };
+      }
+      if (isTerminal(candidate.status)) {
+        if (candidate.owner !== null) {
+          const timestamp = now();
+          if (
+            candidate.leaseUntil !== null &&
+            candidate.leaseUntil > timestamp &&
+            candidate.deadlineAt > timestamp
+          ) {
+            await stop(identityOf(candidate), "termination");
+          }
+        }
+        await clearTerminalTermination(candidate);
+        return { kind: "terminal", status: candidate.status };
+      }
+
+      const timestamp = now();
+      if (
+        candidate.owner !== null &&
+        candidate.leaseUntil !== null &&
+        candidate.leaseUntil > timestamp &&
+        candidate.deadlineAt > timestamp
+      ) {
+        await stop(identityOf(candidate), "termination");
+      }
+
+      const afterStop = await read(candidate.scope, candidate.instanceId);
+      if (!afterStop) return { kind: "stale" };
+      if (!sameIncarnation(afterStop, expected) || afterStop.epoch !== candidate.epoch)
+        return { kind: "stale" };
+      if (!afterStop.terminationRequested || isTerminal(afterStop.status)) {
+        candidate = afterStop;
+        continue;
+      }
+
+      const settled = await finalizeTermination(afterStop);
+      if (settled !== null) return settled;
+      const latest = await read(candidate.scope, candidate.instanceId);
+      if (!latest) return { kind: "stale" };
+      if (!sameIncarnation(latest, expected)) return { kind: "stale" };
+      candidate = latest;
+    }
+    throw new WorkflowRuntimeError("stale_claim");
+  }
+
+  /** Final CAS for a durable termination intent, including journal cleanup. */
+  async function finalizeTermination(current: InstanceRow): Promise<WorkflowRunOutcome | null> {
+    const timestamp = now();
+    const expired = timestamp >= current.deadlineAt;
+    const status: WorkflowInstanceStatus = expired ? "errored" : "terminated";
+    const endedAt = expired ? current.deadlineAt : timestamp;
+    const errorJson = expired ? '{"reason":"lifetime_exceeded"}' : null;
+    const ownerClause = current.owner === null ? " AND run_owner IS NULL" : " AND run_owner = ?";
+    const parentWhere =
+      "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? AND run_epoch = ? " +
+      "AND termination_requested = 1 AND status IN (" +
+      ACTIVE +
+      ") AND retention_until > ?" +
+      ownerClause;
+    const parentParams = [
+      ...incarnationParams(current),
+      current.epoch,
+      timestamp,
+      ...(current.owner === null ? [] : [current.owner]),
+    ];
+    const cleanupGuard =
+      "EXISTS (SELECT 1 FROM tf_workflow_instances WHERE " +
+      "tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ? AND execution_id = ? AND created_at = ? " +
+      "AND status = ?)";
+    const results = await sql.batch([
+      {
+        sql:
+          "UPDATE tf_workflow_instances SET status = ?, output_json = NULL, error_json = ?, " +
+          "retention_until = ?, wake_at = NULL, pending_step_name = NULL, run_owner = NULL, " +
+          "run_lease_until = NULL, termination_requested = 0, updated_at = ?, revision = revision + 1 WHERE " +
+          parentWhere,
+        params: [
+          status,
+          errorJson,
+          addDuration(endedAt, RETENTION_MS, "terminal retention"),
+          endedAt,
+          ...parentParams,
+        ],
+      },
+      {
+        sql:
+          "DELETE FROM tf_workflow_steps WHERE execution_id = ? AND execution_created_at = ? AND " +
+          cleanupGuard,
+        params: [
+          current.executionId,
+          current.createdAt,
+          ...instanceParams(current),
+          current.executionId,
+          current.createdAt,
+          status,
+        ],
+      },
+      {
+        sql: "DELETE FROM tf_workflow_events WHERE execution_id = ? AND " + cleanupGuard,
+        params: [
+          current.executionId,
+          ...instanceParams(current),
+          current.executionId,
+          current.createdAt,
+          status,
+        ],
+      },
+    ]);
+    if (results.length !== 3) throw new WorkflowRuntimeError("backend_unavailable");
+    if (results[0]?.changes !== 1) return null;
+    return { kind: "terminal", status };
+  }
+
   const instances: WorkflowInstances = {
     ...store,
     async terminate(scope, id) {
       const normalizedScope = normalizeScope(scope);
       const normalizedId = inputIdentifier(id, "instance id");
-      await store.terminate(normalizedScope, normalizedId);
       try {
-        const current = await read(normalizedScope, normalizedId);
-        if (current && isTerminal(current.status) && current.owner !== null) {
-          // Repeated terminal requests still finish a stop abandoned by another
-          // controller. A terminal SQL row by itself is not the acknowledgement.
-          await stopAndClear(identityOf(current), "termination");
+        // Resolve lazy lifetime expiry before sampling the execution fence.  A
+        // terminal row remains authoritative; a retained owner still needs
+        // the exact host stop proof before this operation can resolve.
+        const target = await read(normalizedScope, normalizedId);
+        if (!target) throw new WorkflowInstanceError("unknown_instance");
+        const targetIncarnation = {
+          executionId: target.executionId,
+          createdAt: target.createdAt,
+        };
+        await store.get(normalizedScope, normalizedId);
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const current = await read(normalizedScope, normalizedId);
+          if (!current) throw new WorkflowInstanceError("unknown_instance");
+          if (!sameIncarnation(current, targetIncarnation))
+            throw new WorkflowRuntimeError("stale_claim");
+          if (current.terminationRequested) {
+            const recovered = await recoverTermination(current, targetIncarnation);
+            if (recovered.kind === "terminal") return;
+            continue;
+          }
+          if (isTerminal(current.status)) {
+            if (current.owner !== null) {
+              // Repeated terminal requests still finish a stop abandoned by
+              // another controller. A terminal SQL status is not itself an
+              // acknowledgement that application code stopped.
+              await stopAndClear(identityOf(current), "termination");
+            }
+            return;
+          }
+
+          const timestamp = now();
+          if (await requestTermination(current, timestamp)) {
+            const marked = await read(normalizedScope, normalizedId);
+            if (!marked) throw new WorkflowInstanceError("unknown_instance");
+            if (!sameIncarnation(marked, targetIncarnation))
+              throw new WorkflowRuntimeError("stale_claim");
+            const recovered = await recoverTermination(marked, targetIncarnation);
+            if (recovered.kind === "terminal") return;
+          }
+          // A concurrent claim/expiry/termination won the CAS.  Re-read the
+          // exact public id; never call the old store.terminate after waiting,
+          // because that could target a retained-id replacement.
         }
-      } catch {
+        throw new WorkflowRuntimeError("stale_claim");
+      } catch (error) {
+        if (error instanceof WorkflowInstanceError) throw error;
         throw new WorkflowInstanceError("backend_unavailable");
       }
     },
@@ -302,8 +541,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     const normalizedId = inputIdentifier(id, "instance id");
     // Reuse the instance store's lifetime/retention authority.
     await store.get(normalizedScope, normalizedId);
-    const current = await read(normalizedScope, normalizedId);
+    let current = await read(normalizedScope, normalizedId);
     if (!current) throw new WorkflowRuntimeError("stale_claim");
+    if (current.terminationRequested) return recoverTermination(current);
     if (isTerminal(current.status)) {
       if (current.owner !== null) await stopAndClear(identityOf(current), "termination");
       return { kind: "terminal", status: current.status };
@@ -324,6 +564,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         "AND status IN (" +
         ACTIVE +
         ") AND deadline_at > ? AND retention_until > ? " +
+        "AND termination_requested = 0 " +
         "AND (run_owner IS NULL OR run_lease_until <= ?) AND (wake_at IS NULL OR wake_at <= ?)",
       [
         owner,
@@ -342,6 +583,21 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
       ...identityOf({ ...current, owner }),
       epoch: current.epoch + 1,
     };
+    // A termination intent can win immediately after the claim.  Fence that
+    // race before opening the host so no new application context is started.
+    if (!(await runnable(identity))) {
+      await clearOwner(identity);
+      current = await read(normalizedScope, normalizedId);
+      if (current?.terminationRequested)
+        return recoverTermination(current, {
+          executionId: identity.executionId,
+          createdAt: identity.createdAt,
+        });
+      if (current && isTerminal(current.status)) {
+        return { kind: "terminal", status: current.status };
+      }
+      return { kind: "stale" };
+    }
     return execute(identity, current.paramsJson, leaseUntil);
   }
 
@@ -365,6 +621,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         : null;
     const terminalGuard =
       CLAIM_ID +
+      " AND termination_requested = 0" +
       " AND status IN (" +
       ACTIVE +
       ")" +
@@ -894,6 +1151,23 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     }
 
     try {
+      // Re-check immediately before opening the host.  A termination intent
+      // may have raced the claim/pre-open read; clearing only this exact claim
+      // leaves the durable intent for the recovery path and does not start
+      // application code under a cancelled execution.
+      if (!(await runnable(identity))) {
+        await clearOwner(identity);
+        const current = await read(identity.scope, identity.instanceId);
+        if (current?.terminationRequested)
+          return recoverTermination(current, {
+            executionId: identity.executionId,
+            createdAt: identity.createdAt,
+          });
+        if (current && isTerminal(current.status)) {
+          return { kind: "terminal", status: current.status };
+        }
+        return { kind: "stale" };
+      }
       const session = await hostCall(() =>
         options.host.openPaused(
           identity,
@@ -1010,9 +1284,11 @@ interface InstanceRow {
   readonly owner: string | null;
   readonly leaseUntil: number | null;
   readonly deadlineAt: number;
+  readonly retentionUntil: number;
   readonly wakeAt: number | null;
   readonly status: WorkflowInstanceStatus;
   readonly paramsJson: string | null;
+  readonly terminationRequested: boolean;
 }
 type StepKind = "do" | "sleep" | "wait";
 interface StepRow {
@@ -1061,6 +1337,12 @@ function sameClaim(row: InstanceRow, identity: WorkflowRunIdentity): boolean {
     row.owner === identity.owner
   );
 }
+function sameIncarnation(
+  row: Pick<InstanceRow, "executionId" | "createdAt">,
+  expected: Pick<InstanceRow, "executionId" | "createdAt">,
+): boolean {
+  return row.executionId === expected.executionId && row.createdAt === expected.createdAt;
+}
 function isTerminal(status: WorkflowInstanceStatus): boolean {
   return status === "complete" || status === "errored" || status === "terminated";
 }
@@ -1089,6 +1371,9 @@ function parseInstance(row: Row, scope: WorkflowScope, instanceId: string): Inst
   const leaseUntil = numberOrNull(row, "run_lease_until");
   if ((owner === null) !== (leaseUntil === null))
     throw new WorkflowRuntimeError("backend_unavailable");
+  const terminationRequested = rowValue(row, "termination_requested");
+  if (terminationRequested !== 0 && terminationRequested !== 1)
+    throw new WorkflowRuntimeError("backend_unavailable");
   return {
     scope,
     instanceId,
@@ -1099,8 +1384,10 @@ function parseInstance(row: Row, scope: WorkflowScope, instanceId: string): Inst
     owner,
     leaseUntil,
     deadlineAt: integer(rowValue(row, "deadline_at")),
+    retentionUntil: integer(rowValue(row, "retention_until")),
     wakeAt: numberOrNull(row, "wake_at"),
     paramsJson: nullableString(row, "params_json"),
+    terminationRequested: terminationRequested === 1,
   };
 }
 function parseStep(row: Row): StepRow {

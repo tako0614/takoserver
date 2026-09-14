@@ -19,7 +19,11 @@ import {
 
 const START = Date.UTC(2026, 0, 1);
 const SCOPE = { tenantId: "tenant", workflowResourceUid: "workflow" };
-const MIGRATIONS = ["0050_workflow_instances.sql", "0051_workflow_execution.sql"]
+const MIGRATIONS = [
+  "0050_workflow_instances.sql",
+  "0051_workflow_execution.sql",
+  "0052_workflow_termination_intent.sql",
+]
   .map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"))
   .join("\n");
 const databases: Database[] = [];
@@ -1264,6 +1268,143 @@ describe("internal Workflow execution coordinator", () => {
     expect(effects).toBe(2);
   });
 
+  test("an ownerless termination intent finalizes without opening or stopping a host", async () => {
+    const f = fixture();
+    await f.create();
+    await f.runtime.instances.sendEvent(SCOPE, "instance", { type: "before-terminate" });
+    expect(await f.runtime.instances.terminate(SCOPE, "instance")).toBeUndefined();
+    expect(f.calls.opened).toBe(0);
+    expect(f.calls.stopped).toBe(0);
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+      run_lease_until: null,
+      wake_at: null,
+      pending_step_name: null,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test("a termination request crossing the hard deadline records lifetime expiry", async () => {
+    let crossDeadline = false;
+    let f!: ReturnType<typeof fixture>;
+    f = fixture((sql) => ({
+      ...sql,
+      async query(statement, params) {
+        const result = await sql.query(statement, params);
+        if (crossDeadline && statement.startsWith("SELECT * FROM tf_workflow_instances")) {
+          crossDeadline = false;
+          await f.advance(WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000);
+        }
+        return result;
+      },
+    }));
+    await f.create();
+    crossDeadline = true;
+    await f.runtime.instances.terminate(SCOPE, "instance");
+    expect(f.row()).toMatchObject({
+      status: "errored",
+      termination_requested: 0,
+      run_owner: null,
+      error_json: '{"reason":"lifetime_exceeded"}',
+      retention_until:
+        START +
+        (WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS + WORKFLOW_MAX_TERMINAL_RETENTION_SECONDS) * 1_000,
+    });
+  });
+
+  test("a termination intent wins a queued-to-running claim race without opening the app", async () => {
+    const claimSeen = latch<void>();
+    const releaseClaim = latch<void>();
+    let paused = true;
+    const f = fixture((sql) => ({
+      ...sql,
+      async run(statement, params) {
+        if (paused && statement.includes("SET status = 'running'")) {
+          paused = false;
+          claimSeen.resolve();
+          await releaseClaim.promise;
+        }
+        return sql.run(statement, params);
+      },
+    }));
+    await f.create();
+    f.hooks.application = async () => {
+      throw new Error("the losing claim must not open the app");
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    await claimSeen.promise;
+    const termination = f.runtime.instances.terminate(SCOPE, "instance");
+    await termination;
+    releaseClaim.resolve();
+    expect(await run).toEqual({ kind: "stale" });
+    expect(f.calls.started).toBe(0);
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+    });
+  });
+
+  test("a late old termination finalizer cannot target a retained-id replacement", async () => {
+    const stopSeen = latch<void>();
+    const f = fixture();
+    f.hooks.beforeStop = async () => {
+      stopSeen.resolve();
+    };
+    await f.create();
+    await f.sql.run(
+      "UPDATE tf_workflow_instances SET status = 'running', run_epoch = 1, run_owner = ?, run_lease_until = ?, retention_until = ?",
+      ["old-owner", START + 1_000, START + 100],
+    );
+    const termination = f.runtime.instances.terminate(SCOPE, "instance");
+    void termination.catch(() => undefined);
+    await stopSeen.promise;
+
+    // The old stop is still waiting on its lease proof.  Once retention has
+    // elapsed, the public id may be reused by a distinct execution fence.
+    await f.advance(101);
+    expect(await f.runtime.instances.create(SCOPE, { id: "instance" })).toEqual({
+      id: "instance",
+      status: "queued",
+    });
+    await f.advance(1_000);
+    await expect(termination).rejects.toMatchObject({ code: "backend_unavailable" });
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toEqual({ status: "queued" });
+    expect(f.row()).toMatchObject({ status: "queued", termination_requested: 0 });
+  });
+
+  test("runOne recovers an expired-owned termination intent without evaluating the app", async () => {
+    const f = fixture();
+    await f.create();
+    await f.runtime.instances.sendEvent(SCOPE, "instance", { type: "queued-before-stop" });
+    await f.sql.run(
+      "UPDATE tf_workflow_instances SET status = 'running', run_epoch = 1, run_owner = ?, run_lease_until = ?, termination_requested = 1",
+      ["orphan-owner", START],
+    );
+    f.hooks.application = async () => {
+      throw new Error("termination recovery must not evaluate the app");
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "terminated",
+    });
+    expect(f.calls.opened).toBe(0);
+    expect(f.calls.stopped).toBe(0);
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+      run_lease_until: null,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
+      count: 0,
+    });
+  });
+
   test("terminate waits for stop acknowledgement and retains its owner until then", async () => {
     const f = fixture();
     await f.create();
@@ -1294,12 +1435,67 @@ describe("internal Workflow execution coordinator", () => {
     });
     await stopping.promise;
     expect(terminated).toBe(false);
-    expect(f.row()).toMatchObject({ status: "terminated", run_owner: expect.any(String) });
+    expect(f.row()).toMatchObject({
+      status: "running",
+      termination_requested: 1,
+      run_owner: expect.any(String),
+    });
     acknowledge.resolve();
     await termination;
     await run.catch(() => undefined);
-    expect(f.row()).toMatchObject({ status: "terminated", run_owner: null });
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
     await f.runtime.instances.terminate(SCOPE, "instance");
+  });
+
+  test("a failed termination stop preserves its intent, owner and journal for retry", async () => {
+    const f = fixture();
+    await f.create();
+    const entered = latch<void>();
+    f.hooks.application = (step) =>
+      step.do(
+        () => "held-for-termination",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: async () => {
+            entered.resolve();
+            return new Promise<JsonObject>(() => undefined);
+          },
+        }),
+      );
+    const run = f.runtime.runOne(SCOPE, "instance");
+    void run.catch(() => undefined);
+    await entered.promise;
+    f.hooks.beforeStop = async () => {
+      throw new Error("stop acknowledgement unavailable");
+    };
+    await expect(f.runtime.instances.terminate(SCOPE, "instance")).rejects.toMatchObject({
+      code: "backend_unavailable",
+    });
+    expect(f.row()).toMatchObject({
+      status: "running",
+      termination_requested: 1,
+      run_owner: expect.any(String),
+    });
+    expect(f.db.query("SELECT state FROM tf_workflow_steps").get()).toEqual({ state: "pending" });
+
+    f.hooks.beforeStop = async () => undefined;
+    await f.runtime.instances.terminate(SCOPE, "instance");
+    await run.catch(() => undefined);
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
   });
 
   test("terminate cannot mistake a delayed open for a stopped run", async () => {
@@ -1468,9 +1664,17 @@ describe("internal Workflow execution coordinator", () => {
       name: "backend_unavailable",
       code: "backend_unavailable",
     });
-    expect(f.row()).toMatchObject({ status: "terminated", run_owner: expect.any(String) });
+    expect(f.row()).toMatchObject({
+      status: "running",
+      termination_requested: 1,
+      run_owner: expect.any(String),
+    });
     f.hooks.beforeStop = async () => undefined;
     await f.runtime.instances.terminate(SCOPE, "instance");
-    expect(f.row()).toMatchObject({ status: "terminated", run_owner: null });
+    expect(f.row()).toMatchObject({
+      status: "terminated",
+      termination_requested: 0,
+      run_owner: null,
+    });
   });
 });

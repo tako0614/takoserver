@@ -13,7 +13,11 @@ import {
   type WorkflowScope,
 } from "../src/workflow-instances.ts";
 
-const MIGRATION = ["0050_workflow_instances.sql", "0051_workflow_execution.sql"]
+const MIGRATION = [
+  "0050_workflow_instances.sql",
+  "0051_workflow_execution.sql",
+  "0052_workflow_termination_intent.sql",
+]
   .map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"))
   .join("\n");
 

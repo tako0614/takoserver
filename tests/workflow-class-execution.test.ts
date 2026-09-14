@@ -8,7 +8,11 @@ import { createWorkflowRuntime, type WorkflowDriver } from "../src/workflow-exec
 
 const START = Date.UTC(2026, 0, 1);
 const SCOPE = { tenantId: "tenant", workflowResourceUid: "workflow" };
-const migrations = ["0050_workflow_instances.sql", "0051_workflow_execution.sql"]
+const migrations = [
+  "0050_workflow_instances.sql",
+  "0051_workflow_execution.sql",
+  "0052_workflow_termination_intent.sql",
+]
   .map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8"))
   .join("\n");
 const databases: Database[] = [];

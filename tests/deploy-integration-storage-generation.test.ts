@@ -55,7 +55,7 @@ const invocation = {
 
 const emptyState = state([], []);
 const completeState = stateWithShape(
-  MIGRATIONS.slice(0, 51).map(({ name }) => name),
+  MIGRATIONS.slice(0, 52).map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -403,7 +403,7 @@ describe("integration storage generation bootstrap", () => {
     expect(result).toMatchObject({
       d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
       r2: { bucketName: GENERATED_NAME },
-      appliedMigrations: MIGRATIONS.slice(0, 51).map(({ name }) => name),
+      appliedMigrations: MIGRATIONS.map(({ name }) => name),
       generation: GENERATION,
       commit: COMMIT,
     });
@@ -473,7 +473,7 @@ describe("integration storage generation bootstrap", () => {
         target,
         options(wrong.provider, [emptyState, state(["0001_runtime_storage.sql"], [])]),
       ),
-    ).rejects.toThrow("exact audited 0001-0051 lineage");
+    ).rejects.toThrow("exact audited 0001-0052 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
@@ -484,7 +484,7 @@ describe("integration storage generation bootstrap", () => {
         options(wrongShape.provider, [
           emptyState,
           stateWithShape(
-            MIGRATIONS.slice(0, 51).map(({ name }) => name),
+            MIGRATIONS.slice(0, 52).map(({ name }) => name),
             "[]\n",
           ),
         ]),
@@ -541,7 +541,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0052_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0053_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -549,7 +549,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0051");
+      ).rejects.toThrow("exactly 0001-0052");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

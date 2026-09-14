@@ -28,6 +28,7 @@ const RESOURCE_EXECUTION_EVIDENCE = "0048_resource_execution_evidence.sql";
 const ARTIFACT_CONSUMER_ACTIVE_RESOLUTION = "0049_artifact_consumer_active_resolution.sql";
 const WORKFLOW_INSTANCES = "0050_workflow_instances.sql";
 const WORKFLOW_EXECUTION = "0051_workflow_execution.sql";
+const WORKFLOW_TERMINATION_INTENT = "0052_workflow_termination_intent.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -48,6 +49,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
   WORKFLOW_INSTANCES,
   WORKFLOW_EXECUTION,
+  WORKFLOW_TERMINATION_INTENT,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -378,6 +380,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 5]?.name).toBe(ARTIFACT_CONSUMER_ACTIVE_RESOLUTION);
     expect(MIGRATIONS[receiptMigrationIndex + 6]?.name).toBe(WORKFLOW_INSTANCES);
     expect(MIGRATIONS[receiptMigrationIndex + 7]?.name).toBe(WORKFLOW_EXECUTION);
+    expect(MIGRATIONS[receiptMigrationIndex + 8]?.name).toBe(WORKFLOW_TERMINATION_INTENT);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -399,6 +402,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
+      WORKFLOW_TERMINATION_INTENT,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -661,6 +665,7 @@ describe("bringing a local database up to date", () => {
         ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
         WORKFLOW_INSTANCES,
         WORKFLOW_EXECUTION,
+        WORKFLOW_TERMINATION_INTENT,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1216,6 +1221,7 @@ describe("bringing a local database up to date", () => {
       "0049_artifact_consumer_active_resolution.sql",
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
+      WORKFLOW_TERMINATION_INTENT,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1348,6 +1354,7 @@ describe("bringing a local database up to date", () => {
       "0049_artifact_consumer_active_resolution.sql",
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
+      WORKFLOW_TERMINATION_INTENT,
     ]);
     expect(
       database
@@ -2287,6 +2294,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_CONSUMER_ACTIVE_RESOLUTION,
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
+      WORKFLOW_TERMINATION_INTENT,
     ]);
     expect(
       database

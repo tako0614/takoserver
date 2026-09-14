@@ -17,10 +17,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
   return directory;
 }
 
-/** Current audited source, including the additive 0050/0051 workflow tables. */
+/** Current audited source, including the additive 0050/0051 workflow tables
+ * and 0052 termination intent. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 51 || MIGRATIONS.at(-1)?.name !== "0051_workflow_execution.sql") {
-    throw new Error("current schema fixture requires the audited 0001-0051 lineage");
+  if (
+    MIGRATIONS.length !== 52 ||
+    MIGRATIONS.at(-1)?.name !== "0052_workflow_termination_intent.sql"
+  ) {
+    throw new Error("current schema fixture requires the audited 0001-0052 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {
