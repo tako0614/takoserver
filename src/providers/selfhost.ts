@@ -66,17 +66,9 @@ import {
   type WorkerdRuntime,
   type WorkerdSite,
 } from "../workerd-runtime.ts";
+import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
 import { parseSelfhostCron } from "./selfhost-cron.ts";
-import {
-  SELFHOST_WORKER_DATA_SERVICE_MODULE,
-  selfhostDataServiceSource,
-} from "./selfhost-data-service.ts";
-import {
-  SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND,
-  SELFHOST_WORKER_EVENT_SERVICE_MODULE,
-  SELFHOST_WORKER_EVENT_TOKEN_BINDING,
-  selfhostEventServiceSource,
-} from "./selfhost-events.ts";
+import { SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND } from "./selfhost-events.ts";
 import {
   SELFHOST_EDGE_OBJECTS_BINDING_REF,
   SELFHOST_OBJECT_BUCKET_ID,
@@ -120,23 +112,15 @@ import {
   sameSelfhostVersionSnapshot,
 } from "./selfhost-version-materialization.ts";
 import {
-  selfhostWorkerPreludeModuleName,
-  selfhostWorkerPreludeSource,
-} from "./selfhost-worker-prelude.ts";
-import {
-  SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
-  SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_INTERNAL_BINDING_PREFIX,
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_PROTOCOL,
-  SELFHOST_WORKER_SERVICE_BINDING_KIND,
   selfhostReadinessAnswer,
   selfhostReadinessFailureMessage,
-  selfhostWorkerEntrypointSource,
 } from "./selfhost-worker-wrapper.ts";
 import { assertSafeMigrationSql } from "./sqlite-migration-policy.ts";
 
@@ -949,180 +933,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     scriptStateOperation(() => scriptStates.remove(script));
 
   /**
-   * The generated entrypoint one publication needs, or null when it cannot have
-   * one.
-   *
-   * Every publication this Host can wrap is wrapped, because the entrypoint is
-   * also the load probe: it imports the tenant module and answers whether it
-   * loaded. A Worker with no bindings and no events used to be published as-is,
-   * which meant it was never asked — an unloadable module deployed, reported
-   * `Ready=True`, and failed with a 500 on the first real request instead.
-   *
-   * The one publication that still cannot be wrapped is a Version recorded
-   * before this Host kept a handler list: the wrapper has to re-export exactly
-   * what the Version declared, and that declaration is not recoverable from the
-   * materialized bundle. Where nothing else needs a wrapper such a Version is
-   * published as it always was; where something does, it is refused.
-   */
-  const wrapperProjection = (
-    script: string,
-    versionId: string,
-    mainModule: string,
-    bindings: StoredSelfhostVersionBindings | null,
-    events: boolean,
-    generation: string,
-    readinessPublication?: string,
-  ): {
-    source: Uint8Array;
-    facade: Uint8Array | null;
-    gate: Uint8Array | null;
-    preludeModule: string;
-    publication: string;
-    token: SelfhostVersionBinding | null;
-    eventToken: SelfhostVersionBinding | null;
-    services: readonly {
-      readonly name: string;
-      readonly target: string;
-      readonly targetResourceUid: string;
-      readonly unavailableToken: string;
-    }[];
-  } | null => {
-    const plane = bindings?.dataPlane;
-    if (!bindings) return null;
-    if (!bindings.handlers && !plane && !events) return null;
-    if (plane && (!options.dataPlaneAddress || !bindings.planeToken)) {
-      throw new SelfhostFailure(
-        failed(
-          "provider_error",
-          "the Worker Version binds a data plane this deployment does not serve",
-        ),
-      );
-    }
-    // A Version published before this Host recorded handlers has no way to be
-    // wrapped: the wrapper must re-export exactly what the Version declared,
-    // and that declaration is not recoverable from the materialized bundle.
-    // Refusing beats publishing an entrypoint that drops the event.
-    if (!bindings.handlers || (events && !bindings.eventToken)) {
-      throw new SelfhostFailure(
-        failed(
-          "invalid_spec",
-          "the active Worker Version predates event delivery on this Host; publish a new Version",
-        ),
-      );
-    }
-    const serviceBindings = bindings.serviceBindings ?? [];
-    if (serviceBindings.length > 0 && !bindings.eventToken) {
-      throw new SelfhostFailure(
-        failed(
-          "invalid_spec",
-          "the active Worker Version predates service bindings on this Host; publish a new Version",
-        ),
-      );
-    }
-    const services = serviceBindings.map((binding, index) => ({
-      name: `${SELFHOST_WORKER_INTERNAL_BINDING_PREFIX}SELFHOST_SERVICE_${index
-        .toString(10)
-        .padStart(5, "0")}`,
-      target: binding.target,
-      targetResourceUid: binding.targetResourceUid,
-      // Domain-separated from the event gate token. It is compiled only into
-      // the Host-private wrapper and declared only on the Host-private router;
-      // the target receives neither and therefore cannot spoof unavailability.
-      unavailableToken: createHash("sha256")
-        .update("takoserver.selfhost-service-unavailable@v1\u0000", "utf8")
-        .update(bindings.eventToken as string, "utf8")
-        .update("\u0000", "utf8")
-        .update(binding.name, "utf8")
-        .update("\u0000", "utf8")
-        .update(binding.targetResourceUid, "utf8")
-        .digest("hex"),
-    }));
-    // The generation, not the version: two publications of one Version differ
-    // when its routes do, and a readiness answer has to be attributable to the
-    // exact configuration that asked for it or a stale one passes for it.
-    // Hashed because the generation carries customer hostnames and this string
-    // is compiled into a module the tenant's own isolate loads.
-    const publication =
-      readinessPublication ?? createHash("sha256").update(generation, "utf8").digest("hex");
-    const preludeModule = selfhostWorkerPreludeModuleName(mainModule);
-    let source: string;
-    try {
-      source = selfhostWorkerEntrypointSource({
-        publication,
-        // Where this Host's own probe reaches this script, so the failure
-        // detail is answered to the probe and not to the internet.
-        probeHostname: internalHostname(script),
-        originalMainModule: mainModule,
-        declaredHandlers: bindings.handlers,
-        ...(events ? { events: true } : {}),
-        bindings: [
-          ...bindings.vars.map((binding) => ({
-            name: binding.name,
-            type: binding.kind === "json" ? ("json" as const) : ("plain_text" as const),
-          })),
-          ...bindings.sensitiveVars.map((binding) => ({
-            name: binding.name,
-            type: "secret_text" as const,
-          })),
-          ...(bindings.externalServices ?? []).flatMap((slot) =>
-            slot.binding ? [{ name: slot.name, type: "json" as const }] : [],
-          ),
-          ...(plane?.bindings ?? []).map((binding) => ({
-            kind:
-              binding.kind === "edge.kv"
-                ? SELFHOST_WORKER_EDGE_KV_BINDING_KIND
-                : binding.kind === "edge.objects"
-                  ? SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND
-                  : binding.kind === "edge.queue"
-                    ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
-                    : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
-            publicName: binding.name,
-          })),
-          ...serviceBindings.map((binding, index) => ({
-            kind: SELFHOST_WORKER_SERVICE_BINDING_KIND,
-            publicName: binding.name,
-            internalName: services[index]?.name as string,
-            unavailableToken: services[index]?.unavailableToken as string,
-          })),
-        ],
-      });
-    } catch {
-      throw new SelfhostFailure(
-        failed("invalid_spec", "the Worker Version environment cannot be projected"),
-      );
-    }
-    return {
-      source: new TextEncoder().encode(source),
-      facade: plane ? new TextEncoder().encode(selfhostDataServiceSource()) : null,
-      gate: events ? new TextEncoder().encode(selfhostEventServiceSource()) : null,
-      preludeModule,
-      publication,
-      // The token names the version it was minted for, so the plane resolves
-      // one record rather than searching every version for a matching secret.
-      // It is declared on the facade service and nowhere else.
-      token:
-        plane && bindings.planeToken
-          ? {
-              name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
-              value: `${script}.${versionId}.${bindings.planeToken}`,
-              kind: "text",
-            }
-          : null,
-      // The event token names nothing: the gate compares it whole, and the
-      // script it protects is the one it is declared beside.
-      eventToken:
-        events && bindings.eventToken
-          ? {
-              name: SELFHOST_WORKER_EVENT_TOKEN_BINDING,
-              value: bindings.eventToken,
-              kind: "text",
-            }
-          : null,
-      services,
-    };
-  };
-
-  /**
    * Whether the pair this Host just published actually loads what it declared.
    *
    * The wrapper validates the declared handlers when it first imports the
@@ -1301,6 +1111,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       moduleMediaTypes[entry.path] = mediaType;
     }
     const assets = inspected.prepared.assets;
+    if ((meta.assets === undefined) !== (assets === undefined)) {
+      throw new SelfhostFailure(
+        failed("provider_error", "the Worker asset snapshot is incomplete"),
+      );
+    }
     const assetMediaTypes: Record<string, string> = Object.create(null);
     for (const entry of meta.assets?.files ?? []) {
       // `assetContractFailure` above makes this narrowing authoritative. A
@@ -1322,111 +1137,132 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       bindings.handlers,
     );
     if (verificationFailure) throw new SelfhostFailure(verificationFailure);
-    const vars = bindings
-      ? [
-          ...bindings.vars,
-          ...bindings.sensitiveVars,
-          ...(bindings.externalServices ?? []).flatMap((slot) =>
-            slot.binding ? [{ name: slot.name, ...slot.binding }] : [],
-          ),
-        ]
-      : [];
-    const projection = wrapperProjection(
-      script,
-      versionId,
-      meta.mainModule,
-      bindings,
-      receivesEvents(state),
-      generation,
-      weighted ? versionId : undefined,
-    );
-    const hostModules = new Map<string, Uint8Array>();
-    if (projection) {
-      // Written into the workerd script directory, never into the version
-      // directory: `materializationDigest` means "the bytes the tenant
-      // committed", and a module this Host generated is not one of them.
-      //
-      // Host modules and tenant modules are different runtime namespaces and
-      // different physical trees. Equal logical names are therefore valid and
-      // cannot overwrite or shadow one another.
-      hostModules.set(SELFHOST_WORKER_ENTRYPOINT_MODULE, projection.source);
-      hostModules.set(
-        projection.preludeModule,
-        new TextEncoder().encode(selfhostWorkerPreludeSource()),
+    const plane = bindings.dataPlane;
+    if (plane && (!options.dataPlaneAddress || !bindings.planeToken)) {
+      throw new SelfhostFailure(
+        failed(
+          "provider_error",
+          "the Worker Version binds a data plane this deployment does not serve",
+        ),
       );
-      if (projection.facade) {
-        hostModules.set(SELFHOST_WORKER_DATA_SERVICE_MODULE, projection.facade);
-      }
-      if (projection.gate) {
-        hostModules.set(SELFHOST_WORKER_EVENT_SERVICE_MODULE, projection.gate);
-      }
     }
-    return {
-      site: {
+    const events = receivesEvents(state);
+    if (events && !bindings.eventToken) {
+      throw new SelfhostFailure(
+        failed(
+          "invalid_spec",
+          "the active Worker Version predates event delivery on this Host; publish a new Version",
+        ),
+      );
+    }
+    const serviceBindings = bindings.serviceBindings ?? [];
+    if (serviceBindings.length > 0 && !bindings.eventToken) {
+      throw new SelfhostFailure(
+        failed(
+          "invalid_spec",
+          "the active Worker Version predates service bindings on this Host; publish a new Version",
+        ),
+      );
+    }
+    // Publication identity and secret derivation belong to this Host, not to
+    // the compiler. Preserve the existing scalar generation commitment and
+    // weighted Version identity without asking other Hosts to invent either.
+    const readinessPublication = weighted
+      ? versionId
+      : createHash("sha256").update(generation, "utf8").digest("hex");
+    const resolvedServices = serviceBindings.map((binding) => ({
+      publicName: binding.name,
+      target: binding.target,
+      targetResourceUid: binding.targetResourceUid,
+      // Domain-separated from the event token; the target sees neither this
+      // private marker nor the caller's event secret.
+      unavailableToken: createHash("sha256")
+        .update("takoserver.selfhost-service-unavailable@v1\u0000", "utf8")
+        .update(bindings.eventToken as string, "utf8")
+        .update("\u0000", "utf8")
+        .update(binding.name, "utf8")
+        .update("\u0000", "utf8")
+        .update(binding.targetResourceUid, "utf8")
+        .digest("hex"),
+    }));
+    try {
+      const graph = compileWorkerdVersionGraph({
         directory: script,
         mainModule: meta.mainModule,
-        ...(projection ? { hostEntrypoint: SELFHOST_WORKER_ENTRYPOINT_MODULE } : {}),
-        ...(projection ? { hostModules: [projection.preludeModule] } : {}),
-        modules: Object.keys(moduleMediaTypes).filter((name) => name !== meta.mainModule),
+        modules,
         moduleMediaTypes,
         hostnames: weighted
           ? []
           : [...(state.endpointHostname ? [state.endpointHostname] : []), ...state.domains],
         generation,
-        ...(bindings.workerResourceUid
-          ? {
-              workerResourceUid: bindings.workerResourceUid,
-              fetchHandler: bindings.handlers?.includes("fetch") === true,
-            }
-          : {}),
-        ...(projection && projection.services.length > 0
-          ? { serviceBindings: projection.services }
-          : {}),
-        ...(meta.assets
+        ...(bindings.workerResourceUid === undefined
+          ? {}
+          : { workerResourceUid: bindings.workerResourceUid }),
+        declaredHandlers: bindings.handlers,
+        readiness: { publication: readinessPublication, probeHostname: internalHostname(script) },
+        serviceBindings: resolvedServices,
+        ...(meta.assets && assets
           ? {
               assets: {
+                files: assets,
                 notFoundHandling: meta.assets.notFoundHandling,
                 runWorkerFirst: meta.assets.runWorkerFirst as boolean,
                 mediaTypes: assetMediaTypes,
               },
             }
           : {}),
-        ...(vars.length > 0 ? { vars } : {}),
-        ...(projection
+        environment: [
+          ...bindings.vars.map((binding) => ({
+            name: binding.name,
+            value: binding.value,
+            type: binding.kind === "json" ? ("json" as const) : ("plain_text" as const),
+          })),
+          ...bindings.sensitiveVars.map((binding) => ({
+            name: binding.name,
+            value: binding.value,
+            type: "secret_text" as const,
+          })),
+          ...(bindings.externalServices ?? []).flatMap((slot) =>
+            slot.binding
+              ? [{ name: slot.name, value: slot.binding.value, type: "json" as const }]
+              : [],
+          ),
+        ],
+        ...(plane
           ? {
-              // The token rides on the facade service's own binding list, so
-              // it is never a binding of the service that runs tenant code.
-              ...(projection.facade && projection.token
-                ? {
-                    dataPlane: {
-                      address: options.dataPlaneAddress as string,
-                      module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
-                      vars: [projection.token],
-                    },
-                  }
-                : {}),
-              // Same discipline for the event token, and one more thing: the
-              // gate is the only service holding a binding that names this
-              // Version's event entrypoint.
-              ...(projection.gate && projection.eventToken
-                ? {
-                    events: {
-                      module: SELFHOST_WORKER_EVENT_SERVICE_MODULE,
-                      vars: [projection.eventToken],
-                    },
-                  }
-                : {}),
+              dataPlane: {
+                address: options.dataPlaneAddress as string,
+                // Names the exact durable Version record; the compiler only
+                // puts this opaque value on the Host-private facade service.
+                token: `${script}.${versionId}.${bindings.planeToken}`,
+                bindings: plane.bindings.map((binding) => ({
+                  kind:
+                    binding.kind === "edge.kv"
+                      ? SELFHOST_WORKER_EDGE_KV_BINDING_KIND
+                      : binding.kind === "edge.objects"
+                        ? SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND
+                        : binding.kind === "edge.queue"
+                          ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
+                          : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+                  publicName: binding.name,
+                })),
+              },
             }
           : {}),
-      },
-      modules,
-      ...(assets === undefined ? {} : { assets }),
-      hostModules,
-      ...(bindings.workerResourceUid === undefined
-        ? {}
-        : { workerResourceUid: bindings.workerResourceUid }),
-      ...(projection ? { readinessPublication: projection.publication } : {}),
-    };
+        ...(events ? { eventToken: bindings.eventToken as string } : {}),
+      });
+      return {
+        ...graph,
+        ...(bindings.workerResourceUid === undefined
+          ? {}
+          : { workerResourceUid: bindings.workerResourceUid }),
+        readinessPublication,
+      };
+    } catch {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version environment cannot be projected"),
+      );
+    }
   };
 
   /** Rewrites what workerd serves for one script from durable state alone. */

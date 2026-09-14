@@ -4,25 +4,11 @@ import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createWorkflowRuntime } from "@takoserver/core/workflow-runtime";
-import { createWorkerdWorkflowExecutionHost } from "@takoserver/core/workflow-runtime/workerd";
+import {
+  compileWorkerdVersionGraph,
+  createWorkerdWorkflowExecutionHost,
+} from "@takoserver/core/workflow-runtime/workerd";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import {
-  SELFHOST_WORKER_DATA_SERVICE_MODULE,
-  selfhostDataServiceSource,
-} from "../src/providers/selfhost-data-service.ts";
-import { SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND } from "../src/providers/selfhost-events.ts";
-import {
-  selfhostWorkerPreludeModuleName,
-  selfhostWorkerPreludeSource,
-} from "../src/providers/selfhost-worker-prelude.ts";
-import {
-  SELFHOST_WORKER_DATA_TOKEN_BINDING,
-  SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
-  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
-  SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
-  SELFHOST_WORKER_ENTRYPOINT_MODULE,
-  selfhostWorkerEntrypointSource,
-} from "../src/providers/selfhost-worker-wrapper.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -119,8 +105,32 @@ export default { fetch() { return new Response("ordinary workflow handler"); } }
 `;
 
 function publication(dataPlaneAddress: string): WorkerdDeploymentPublication {
-  const prelude = selfhostWorkerPreludeModuleName("app.js");
-  const wrapper = SELFHOST_WORKER_ENTRYPOINT_MODULE;
+  const graph = compileWorkerdVersionGraph({
+    directory: SCRIPT,
+    mainModule: "app.js",
+    modules: new Map([["app.js", new TextEncoder().encode(applicationSource)]]),
+    moduleMediaTypes: { "app.js": "application/javascript+module" },
+    hostnames: [],
+    generation: `${SCRIPT}.${VERSION}`,
+    workerResourceUid: WORKER_UID,
+    declaredHandlers: ["fetch"],
+    readiness: {
+      publication: `${SCRIPT}.${VERSION}`,
+      probeHostname: "workflow.internal.invalid",
+    },
+    environment: [],
+    serviceBindings: [],
+    dataPlane: {
+      address: dataPlaneAddress,
+      token: DATA_TOKEN,
+      bindings: [
+        { kind: "edge.kv@1.0.0", publicName: "KV" },
+        { kind: "edge.sql@1.0.0", publicName: "DB" },
+        { kind: "edge.objects@1.0.0", publicName: "MEDIA" },
+        { kind: "edge.queue@1.0.0", publicName: "QUEUE" },
+      ],
+    },
+  });
   return {
     generation: `${SCRIPT}.${VERSION}`,
     workerResourceUid: WORKER_UID,
@@ -130,52 +140,7 @@ function publication(dataPlaneAddress: string): WorkerdDeploymentPublication {
         versionId: VERSION,
         workerVersionUid: "uid-WorkerVersion-workflow-version",
         weight: 10_000,
-        site: {
-          directory: SCRIPT,
-          mainModule: "app.js",
-          hostEntrypoint: wrapper,
-          hostModules: [prelude],
-          hostnames: [],
-          generation: `${SCRIPT}.${VERSION}`,
-          workerResourceUid: WORKER_UID,
-          fetchHandler: true,
-          dataPlane: {
-            address: dataPlaneAddress,
-            module: SELFHOST_WORKER_DATA_SERVICE_MODULE,
-            vars: [
-              {
-                name: SELFHOST_WORKER_DATA_TOKEN_BINDING,
-                value: DATA_TOKEN,
-                kind: "text",
-              },
-            ],
-          },
-        },
-        modules: new Map([["app.js", new TextEncoder().encode(applicationSource)]]),
-        hostModules: new Map([
-          [prelude, new TextEncoder().encode(selfhostWorkerPreludeSource())],
-          [
-            wrapper,
-            new TextEncoder().encode(
-              selfhostWorkerEntrypointSource({
-                originalMainModule: "app.js",
-                publication: `${SCRIPT}.${VERSION}`,
-                probeHostname: "workflow.internal.invalid",
-                declaredHandlers: ["fetch"],
-                bindings: [
-                  { kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "KV" },
-                  { kind: SELFHOST_WORKER_EDGE_SQL_BINDING_KIND, publicName: "DB" },
-                  { kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "MEDIA" },
-                  { kind: SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND, publicName: "QUEUE" },
-                ],
-              }),
-            ),
-          ],
-          [
-            SELFHOST_WORKER_DATA_SERVICE_MODULE,
-            new TextEncoder().encode(selfhostDataServiceSource()),
-          ],
-        ]),
+        ...graph,
       },
     ],
   };

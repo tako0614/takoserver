@@ -573,8 +573,9 @@ separation alone is not proof of a deployed managed installation.
 Workflow Host embedders have two separate source-library entries:
 `@takoserver/core/workflow-runtime` exposes the platform-neutral coordinator and
 ports; `@takoserver/core/workflow-runtime/workerd` exposes trusted Bun/Linux
-guarded execution and selected-Version preparation. Neither is a provider
-extension or an app-facing Binding. See [Workflow runtime](docs/workflow-runtime.md#host-runtime-library-entrypoints)
+guarded execution, resolved-Version graph compilation and selected-Version
+preparation. Neither is a provider extension or an app-facing Binding.
+See [Workflow runtime](docs/workflow-runtime.md#host-runtime-library-entrypoints)
 for selection and lifecycle responsibilities. These entries do not ship a
 managed companion image, enable Workflow support, or change any API/Form version.
 

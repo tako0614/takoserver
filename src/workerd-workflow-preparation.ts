@@ -138,8 +138,7 @@ export async function prepareWorkerdWorkflowExecution(
     ].some(
       (value) => typeof value !== "string" || value.length === 0 || value.includes("\u0000"),
     ) ||
-    (selected.site.workerResourceUid !== undefined &&
-      selected.site.workerResourceUid !== selected.workerResourceUid)
+    selected.site.workerResourceUid !== selected.workerResourceUid
   ) {
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }

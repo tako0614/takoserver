@@ -7,6 +7,11 @@ export type {
   WorkerdSite,
 } from "./workerd-runtime.ts";
 export {
+  compileWorkerdVersionGraph,
+  type WorkerdVersionGraph,
+  type WorkerdVersionGraphInput,
+} from "./workerd-version-graph.ts";
+export {
   prepareWorkerdWorkflowExecution,
   type WorkerdWorkflowPreparationOptions,
   type WorkerdWorkflowSelection,

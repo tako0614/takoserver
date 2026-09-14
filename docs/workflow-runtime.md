@@ -571,7 +571,7 @@ Takoform API, Form, Interface or Binding version:
   machinery, JSON codec and transport/controller internals are not exported.
 - `@takoserver/core/workflow-runtime/workerd` is trusted Bun/Linux composition,
   not a module to import into a Cloudflare Worker or tenant application. It
-  exports `createWorkerdWorkflowExecutionHost` and
+  exports `compileWorkerdVersionGraph`, `createWorkerdWorkflowExecutionHost` and
   `prepareWorkerdWorkflowExecution`, with their input/result types. The public
   factory always uses the retained guard executable and does not forward the
   internal test-only guard factory.
@@ -590,6 +590,62 @@ Its input does not require the self-host publication's `generationKey`.
 The self-host adapter retains its committed weighted selection reader; another
 Host must supply its own exact, receipt-qualified reader rather than inventing
 self-host filesystem metadata. Selection does not occur in `openPaused()`.
+
+### Compiling an already-resolved Version
+
+`compileWorkerdVersionGraph(input: WorkerdVersionGraphInput)` returns a
+`WorkerdVersionGraph`: the `site` declaration and separate application, asset
+and Host-module byte maps consumed by the preparer. It synchronously generates
+the shared wrapper, prelude, data facade and event gate without reading storage
+or evaluating application code. The self-host Provider uses this same compiler.
+
+The input contains exact module bytes and media types, optional asset bytes and
+their settings, declared handlers, resolved environment values, route/readiness
+facts and optional resolved capabilities. A data-plane capability supplies its
+address, opaque token and named Bindings; a service capability supplies its
+public name, target identity and private unavailability marker. The compiler
+allocates private service names but never derives credentials. An `eventToken`
+adds the private event gate. Omit optional capabilities when they do not exist.
+For example, an already-authorized Host can compile a captured plain Version:
+
+```ts
+import { compileWorkerdVersionGraph } from "@takoserver/core/workflow-runtime/workerd";
+
+const graph = compileWorkerdVersionGraph({
+  directory: "worker",
+  mainModule: "app.js",
+  modules: new Map([
+    ["app.js", new TextEncoder().encode(
+      'export default { fetch() { return new Response("hello"); } };',
+    )],
+  ]),
+  moduleMediaTypes: { "app.js": "application/javascript+module" },
+  workerResourceUid: "worker-resource-uid",
+  declaredHandlers: ["fetch"],
+  hostnames: [],
+  readiness: { publication: "version-receipt", probeHostname: "private.invalid" },
+  environment: [],
+  serviceBindings: [],
+});
+```
+
+The caller must obtain and verify those values before compilation. Compilation
+does not check artifact digests, resolve Resource relations, acquire secret or
+service leases, admit a Workflow class, choose an active Version or activate
+anything. Its returned maps, bytes and nested declarations are owned copies;
+invalid module/media correspondence or colliding Binding names fail without
+producing a partial graph. Application and Host modules remain separate
+namespaces even when their logical names match.
+
+`generation` is optional; a different Host need not invent a self-host
+generation. Omitting `workerResourceUid` preserves retained scalar self-host
+sites and also omits `fetchHandler`; it is not permission to execute a Workflow
+or publish a weighted deployment. Service bindings require an identified
+Worker, and the Workflow preparer independently requires the graph's Worker UID
+to equal its exact selection. Supplying a UID makes `fetchHandler` follow the
+declared handlers, never an independent caller assertion.
+
+### Preparing and disposing an execution
 
 The shared preparer snapshots nested declarations and module bytes before its
 first asynchronous operation. It owns bootstrap injection, namespace-safe

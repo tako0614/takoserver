@@ -141,16 +141,57 @@ async function preparedSources(rootPath: string, directory: string): Promise<str
   return sources.join("\n");
 }
 
-test("workerd package surface exports only concrete factory and preparation", () => {
+test("workerd package surface exports only graph compilation, preparation, and concrete factory", () => {
   expect(Object.keys(workerdRuntime).sort()).toEqual([
+    "compileWorkerdVersionGraph",
     "createWorkerdWorkflowExecutionHost",
     "prepareWorkerdWorkflowExecution",
   ]);
-  for (const name of ["createWorkerdWorkflowExecutionHost", "prepareWorkerdWorkflowExecution"]) {
+  for (const name of [
+    "compileWorkerdVersionGraph",
+    "createWorkerdWorkflowExecutionHost",
+    "prepareWorkerdWorkflowExecution",
+  ]) {
     expect(name in neutralRuntime).toBe(false);
     expect(name in root).toBe(false);
     expect(name in providerExtension).toBe(false);
   }
+});
+
+test("package compiler feeds preparation without provider stores or tenant evaluation", async () => {
+  const compiled = workerdRuntime.compileWorkerdVersionGraph({
+    directory: "site",
+    mainModule: "main.js",
+    modules: new Map([["main.js", encoder.encode('throw new Error("application-evaluated");')]]),
+    moduleMediaTypes: { "main.js": "application/javascript+module" },
+    hostnames: [],
+    workerResourceUid: "worker-1",
+    declaredHandlers: ["fetch"],
+    readiness: { publication: "receipt-qualified-version", probeHostname: "private.invalid" },
+    environment: [{ name: "APP_VALUE", value: "compiler-original", type: "plain_text" }],
+    serviceBindings: [],
+    dataPlane: {
+      address: PERSISTED_DATA_PLANE,
+      token: "opaque-host-resolved-capability",
+      bindings: [{ publicName: "KV", kind: "edge.kv@1.0.0" }],
+    },
+  });
+  const prepared = await workerdRuntime.prepareWorkerdWorkflowExecution(
+    preparationOptions({ selection: selection(compiled) }),
+  );
+  try {
+    const rootPath = dirname(prepared.configPath);
+    const config = await readFile(prepared.configPath, "utf8");
+    expect(await preparedSources(rootPath, "application")).toContain("application-evaluated");
+    expect(config).toContain('APP_VALUE", text = "compiler-original"');
+    expect(config).toContain("opaque-host-resolved-capability");
+    expect(config).toContain(`address = "${CURRENT_DATA_PLANE}"`);
+    expect(config).not.toContain(PERSISTED_DATA_PLANE);
+    expect(compiled.site.generation).toBeUndefined();
+  } finally {
+    await disposePrepared(prepared);
+  }
+  expect(await readdir(temporaryRoot)).toEqual([]);
 });
 
 test("package preparation materializes a selected graph privately without app evaluation", async () => {
@@ -234,9 +275,14 @@ test("preparation snapshots maps, nested site vars, and input before caller muta
 });
 
 test("scope and Worker identity mismatches refuse before creating a temporary execution", async () => {
+  const { workerResourceUid: _workerResourceUid, ...unidentifiedSite } = site();
+  const { fetchHandler: _fetchHandler, ...retainedScalarSite } = unidentifiedSite;
   const mismatches: readonly WorkerdWorkflowSelection[] = [
     selection({ tenantId: "tenant-other" }),
     selection({ site: site({ workerResourceUid: "worker-other" }) }),
+    selection({ site: unidentifiedSite }),
+    selection({ site: retainedScalarSite }),
+    selection({ site: site({ workerResourceUid: "" }) }),
   ];
   for (const selected of mismatches) {
     await expect(
