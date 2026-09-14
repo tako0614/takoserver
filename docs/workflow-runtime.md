@@ -35,6 +35,38 @@ never invokes getters. A successful result is committed before a decoded copy
 is returned. SQL failures stay infrastructure failures: they do not consume an
 application retry or manufacture `step_failed`.
 
+## Durable target data is not execution authority
+
+The private `createWorkflowResourceGraphReader` reads the persisted Workflow
+declaration and its UID-pinned Worker relation. It returns nested identity,
+address, generation/revision, exact FormRef and class-name facts. It has no
+script name, execution permission, preparation method or package-root export,
+and its result is not a `SelfhostWorkflowTarget`. A published v1 declaration
+can be described without treating it as the unpublished forward execution ABI.
+The installed Form supplied to this reader is schema vocabulary, not evidence
+of support, activation, or permission to execute.
+
+The store reads both Resources, the single requested relation and both live
+deletion attestations in one SQL snapshot. Missing/non-live lifecycle records,
+ambiguous UIDs or relations, tenant/space drift, and target address/UID/FormRef
+mismatches refuse the snapshot. A relation's historical `targetRevision` is
+not a lock on the Worker's current revision: ordinary status and deployment
+changes may advance it without replacing that Worker. Generation and revision
+retain their existing string representation.
+
+This is a point-in-time read, not a reservation, lease or proof that the target
+will remain live after the read. It does not infer class-export readiness from
+the cached Resource status or reuse the HTTP-service predicate that requires
+`fetch`; a class-only Worker may have a valid factual graph. Query failures
+remain failures rather than becoming an empty successful result.
+
+Execution still requires the existing durable Form support/activation authority
+to select a registered, qualified exact executable contract and implementation.
+Only that later composition may derive the self-host script and construct the
+trusted preparation target. A caller-provided boolean or callback is not an
+alternative authority. No serving entrypoint connects the factual reader to
+execution, and Workflow/Actor support remain false.
+
 ## One persistence module
 
 [`src/workflow-instances.ts`](../src/workflow-instances.ts) owns instance

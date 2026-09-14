@@ -269,6 +269,13 @@ export interface ResourceWithRelations {
   readonly relations: readonly TakoformStoredRelation[];
 }
 
+/** One same-space, lifecycle-attested Resource relation snapshot. */
+export interface ResourceRelationTargetSnapshot {
+  readonly source: ResourceListing;
+  readonly relation: TakoformStoredRelation;
+  readonly target: ResourceListing;
+}
+
 export interface OperationListing {
   readonly id: string;
   readonly operation: string;
@@ -661,6 +668,13 @@ export interface TakoformStore {
 
   /** One UID-scoped snapshot used by authorities that must bind Resource and relations together. */
   resourceWithRelationsByUid(tenantId: string, uid: string): Promise<ResourceWithRelations | null>;
+
+  /** One atomic source/relation/target snapshot with both live lifecycle attestations. */
+  resourceWithRelationTargetByUid(
+    tenantId: string,
+    sourceUid: string,
+    pointer: string,
+  ): Promise<ResourceRelationTargetSnapshot | null>;
 
   /** The most recent settled operations for a tenant, newest first. */
   listOperations(tenantId: string, limit: number): Promise<readonly OperationListing[]>;
@@ -3630,6 +3644,132 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       };
     },
 
+    async resourceWithRelationTargetByUid(tenantId, sourceUid, pointer) {
+      // The source CTE is deliberately bounded before expanding its JSON. A
+      // legacy database may contain duplicate UIDs, and retaining two rows is
+      // what lets the caller refuse an ambiguous identity instead of filtering
+      // down to whichever row SQLite happened to visit first. The same LIMIT
+      // on the outer statement retains duplicate relations or target UIDs.
+      const rows = await sql.query(
+        `WITH source_rows AS (
+           SELECT tenant_id AS source_tenant_id,
+                  space AS source_space,
+                  api_version AS source_api_version,
+                  kind AS source_kind,
+                  name AS source_name,
+                  uid AS source_uid,
+                  generation AS source_generation,
+                  revision AS source_revision,
+                  updated_at AS source_updated_at,
+                  resource_json AS source_resource_json,
+                  relations_json AS source_relations_json
+           FROM tf_resources
+           WHERE tenant_id = ? AND uid = ?
+           LIMIT 2
+         ), source_relation_rows AS (
+           SELECT source_rows.*, relation.value AS relation_json
+           FROM source_rows
+           LEFT JOIN json_each(
+             CASE
+               WHEN json_valid(source_rows.source_relations_json) = 1 THEN
+                 CASE
+                   WHEN json_type(source_rows.source_relations_json) = 'array'
+                     THEN source_rows.source_relations_json
+                   ELSE '[]'
+                 END
+               ELSE '[]'
+             END
+         ) AS relation
+             ON CASE
+                  WHEN relation.type = 'object'
+                    THEN json_extract(relation.value, '$.pointer')
+                  ELSE NULL
+                END = ?
+         )
+         SELECT source.source_tenant_id,
+                source.source_space,
+                source.source_api_version,
+                source.source_kind,
+                source.source_name,
+                source.source_uid,
+                source.source_generation,
+                source.source_revision,
+                source.source_updated_at,
+                source.source_resource_json,
+                source.source_relations_json,
+                source.relation_json,
+                target.tenant_id AS target_tenant_id,
+                target.space AS target_space,
+                target.api_version AS target_api_version,
+                target.kind AS target_kind,
+                target.name AS target_name,
+                target.uid AS target_uid,
+                target.generation AS target_generation,
+                target.revision AS target_revision,
+                target.updated_at AS target_updated_at,
+                target.resource_json AS target_resource_json,
+                source_attestation.tenant_id AS source_attestation_tenant_id,
+                source_attestation.resource_uid AS source_attestation_resource_uid,
+                source_attestation.space AS source_attestation_space,
+                source_attestation.api_version AS source_attestation_api_version,
+                source_attestation.kind AS source_attestation_kind,
+                source_attestation.name AS source_attestation_name,
+                source_attestation.form_ref_json AS source_attestation_form_ref_json,
+                source_attestation.state AS source_attestation_state,
+                target_attestation.tenant_id AS target_attestation_tenant_id,
+                target_attestation.resource_uid AS target_attestation_resource_uid,
+                target_attestation.space AS target_attestation_space,
+                target_attestation.api_version AS target_attestation_api_version,
+                target_attestation.kind AS target_attestation_kind,
+                target_attestation.name AS target_attestation_name,
+                target_attestation.form_ref_json AS target_attestation_form_ref_json,
+                target_attestation.state AS target_attestation_state
+         FROM source_relation_rows AS source
+         LEFT JOIN tf_resources AS target
+           ON target.tenant_id = source.source_tenant_id
+          AND target.uid = json_extract(source.relation_json, '$.targetUid')
+         LEFT JOIN tf_resource_deletion_attestations AS source_attestation
+           ON source_attestation.tenant_id = source.source_tenant_id
+          AND source_attestation.resource_uid = source.source_uid
+         LEFT JOIN tf_resource_deletion_attestations AS target_attestation
+           ON target_attestation.tenant_id = target.tenant_id
+          AND target_attestation.resource_uid = target.uid
+         LIMIT 2`,
+        [tenantId, sourceUid, pointer],
+      );
+      if (rows.length !== 1 || !rows[0]) return null;
+      const row = rows[0];
+      const source = snapshotResourceListing(row, "source");
+      const target = snapshotResourceListing(row, "target");
+      if (!source || !target || source.uid !== sourceUid || source.space !== target.space) {
+        return null;
+      }
+      if (
+        !liveSnapshotAttestation(row, "source", tenantId, source) ||
+        !liveSnapshotAttestation(row, "target", tenantId, target)
+      ) {
+        return null;
+      }
+
+      const relations = snapshotRelations(row.source_relations_json);
+      if (!relations) return null;
+      const matching = relations.filter((relation) => relation.pointer === pointer);
+      if (matching.length !== 1) return null;
+      const relation = matching[0];
+      if (
+        !relation ||
+        relation.relation !== pointer ||
+        relation.targetApiVersion !== target.apiVersion ||
+        relation.targetKind !== target.kind ||
+        relation.targetName !== target.name ||
+        relation.targetUid !== target.uid ||
+        !sameSnapshotFormRef(relation.targetFormRef, target.resource.form.formRef)
+      ) {
+        return null;
+      }
+      return { source, relation, target };
+    },
+
     async listOperations(tenantId, limit) {
       const rows = await sql.query(
         `SELECT id, operation, state, created_at FROM tf_operations
@@ -5739,6 +5879,182 @@ function resourceListing(row: Row): ResourceListing {
     updatedAt: new Date(Number(row.updated_at)).toISOString(),
     resource: JSON.parse(text(row.resource_json)) as TakoformStoredResource,
   };
+}
+
+function snapshotResourceListing(row: Row, prefix: "source" | "target"): ResourceListing | null {
+  const value = (column: string): unknown => row[`${prefix}_${column}`];
+  const space = value("space");
+  const apiVersion = value("api_version");
+  const kind = value("kind");
+  const name = value("name");
+  const uid = value("uid");
+  const generation = value("generation");
+  const revision = value("revision");
+  const updatedAt = value("updated_at");
+  const resourceJson = value("resource_json");
+  if (
+    typeof space !== "string" ||
+    typeof apiVersion !== "string" ||
+    typeof kind !== "string" ||
+    typeof name !== "string" ||
+    typeof uid !== "string" ||
+    typeof generation !== "string" ||
+    typeof revision !== "string" ||
+    typeof updatedAt !== "number" ||
+    !Number.isSafeInteger(updatedAt) ||
+    updatedAt < 0 ||
+    typeof resourceJson !== "string"
+  ) {
+    return null;
+  }
+  const timestamp = new Date(updatedAt);
+  if (!Number.isFinite(timestamp.getTime())) return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(resourceJson) as unknown;
+  } catch {
+    return null;
+  }
+  if (!recordValue(parsed)) return null;
+  if (parsed.apiVersion !== apiVersion || parsed.kind !== kind) return null;
+  const metadata = parsed.metadata;
+  if (
+    !recordValue(metadata) ||
+    metadata.name !== name ||
+    metadata.space !== space ||
+    metadata.uid !== uid ||
+    metadata.generation !== generation ||
+    metadata.revision !== revision
+  ) {
+    return null;
+  }
+  const form = parsed.form;
+  const formRef = recordValue(form) ? snapshotFormRef(form.formRef) : null;
+  if (!formRef || formRef.apiVersion !== apiVersion || formRef.kind !== kind) return null;
+  const resource = parsed as unknown as TakoformStoredResource;
+  return {
+    space,
+    apiVersion,
+    kind,
+    name,
+    uid,
+    generation,
+    revision,
+    updatedAt: timestamp.toISOString(),
+    resource,
+  };
+}
+
+function liveSnapshotAttestation(
+  row: Row,
+  prefix: "source" | "target",
+  tenantId: string,
+  listing: ResourceListing,
+): boolean {
+  const value = (column: string): unknown => row[`${prefix}_attestation_${column}`];
+  if (
+    value("state") !== "live" ||
+    value("tenant_id") !== tenantId ||
+    value("resource_uid") !== listing.uid ||
+    value("space") !== listing.space ||
+    value("api_version") !== listing.apiVersion ||
+    value("kind") !== listing.kind ||
+    value("name") !== listing.name
+  ) {
+    return false;
+  }
+  const formRef = snapshotFormRefFromJson(value("form_ref_json"));
+  return formRef !== null && sameSnapshotFormRef(formRef, listing.resource.form.formRef);
+}
+
+function snapshotRelations(value: unknown): readonly TakoformStoredRelation[] | null {
+  if (typeof value !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed)) return null;
+  const relations: TakoformStoredRelation[] = [];
+  for (const candidate of parsed) {
+    if (!recordValue(candidate)) return null;
+    if (
+      typeof candidate.pointer !== "string" ||
+      typeof candidate.relation !== "string" ||
+      typeof candidate.targetApiVersion !== "string" ||
+      typeof candidate.targetKind !== "string" ||
+      typeof candidate.targetName !== "string" ||
+      typeof candidate.targetUid !== "string" ||
+      !snapshotFormRef(candidate.targetFormRef) ||
+      ("targetRevision" in candidate && typeof candidate.targetRevision !== "string") ||
+      ("bindingRef" in candidate && !snapshotBindingRef(candidate.bindingRef))
+    ) {
+      return null;
+    }
+    relations.push(candidate as unknown as TakoformStoredRelation);
+  }
+  return relations;
+}
+
+function snapshotFormRefFromJson(value: unknown): TakoformV1Alpha3FormRef | null {
+  if (typeof value !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+  return snapshotFormRef(parsed);
+}
+
+function snapshotFormRef(value: unknown): TakoformV1Alpha3FormRef | null {
+  if (
+    !recordValue(value) ||
+    Object.keys(value).sort().join("|") !== "apiVersion|definitionVersion|kind|schemaDigest" ||
+    typeof value.apiVersion !== "string" ||
+    value.apiVersion.length < 1 ||
+    value.apiVersion.length > 320 ||
+    typeof value.kind !== "string" ||
+    value.kind.length < 1 ||
+    value.kind.length > 128 ||
+    typeof value.definitionVersion !== "string" ||
+    value.definitionVersion.length < 1 ||
+    value.definitionVersion.length > 128 ||
+    !isDigest(value.schemaDigest)
+  ) {
+    return null;
+  }
+  return {
+    apiVersion: value.apiVersion,
+    kind: value.kind,
+    definitionVersion: value.definitionVersion,
+    schemaDigest: value.schemaDigest,
+  };
+}
+
+function snapshotBindingRef(value: unknown): boolean {
+  if (!recordValue(value)) return false;
+  return (
+    (value.apiVersion === "bindings.takoform.com/v1alpha1" ||
+      value.apiVersion === "bindings.takoform.com/v1alpha2") &&
+    typeof value.name === "string" &&
+    typeof value.version === "string" &&
+    isDigest(value.schemaDigest)
+  );
+}
+
+function sameSnapshotFormRef(
+  left: TakoformV1Alpha3FormRef,
+  right: TakoformV1Alpha3FormRef,
+): boolean {
+  return (
+    left.apiVersion === right.apiVersion &&
+    left.kind === right.kind &&
+    left.definitionVersion === right.definitionVersion &&
+    left.schemaDigest === right.schemaDigest
+  );
 }
 
 function resourceDeletionTombstone(row: Row): ResourceDeletionTombstone {
