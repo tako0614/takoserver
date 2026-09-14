@@ -40,6 +40,11 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+type WorkflowTransportChannel = {
+  readonly journalToken: string;
+  readonly recordPayload: (sequence: number, payload: string) => void;
+};
+
 /** Lifecycle proof only: no process or transport isolation is claimed here. */
 function fixture(
   options: {
@@ -54,7 +59,9 @@ function fixture(
       id: WorkflowRunIdentity,
       input: JsonObject | undefined,
       signal: AbortSignal,
+      channel: WorkflowTransportChannel,
     ) => Promise<PreparedWorkerdWorkflow>;
+    acceptFrame?: (sequence: number, payload: string) => void;
     run?: () => Promise<WorkflowApplicationOutcome>;
     drain?: () => Promise<void>;
     dispose?: () => Promise<void>;
@@ -63,11 +70,16 @@ function fixture(
   let time = 20;
   const events: string[] = [];
   const registrations: WorkerdExecutionRegistration[] = [];
+  const journalMarkers: Array<(sequence: number) => void> = [];
+  const channels: WorkflowTransportChannel[] = [];
   const preparedStarted = deferred<void>();
   const guardStarted = deferred<void>();
   const guardStopped = deferred<void>();
   const prepared: PreparedWorkerdWorkflow = {
     configPath: "/retained/execution.capnp",
+    acceptFrame(sequence, payload) {
+      options.acceptFrame?.(sequence, payload);
+    },
     async run(actualDriver) {
       expect(actualDriver).toBe(driver);
       events.push("run");
@@ -87,10 +99,11 @@ function fixture(
     workerdBinary: "/retained/workerd",
     maximumRegistrations: options.capacity ?? 4,
     clock: () => time,
-    spawnGuard(registration): WorkerdExecutionGuard {
+    spawnGuard(registration, onJournalMarker): WorkerdExecutionGuard {
       options.spawn?.();
       events.push("register");
       registrations.push(registration);
+      journalMarkers.push(onJournalMarker);
       return {
         registered: options.registered ?? Promise.resolve(),
         exited: options.exited ?? new Promise<number>(() => {}),
@@ -111,16 +124,19 @@ function fixture(
         },
       };
     },
-    async prepare(id, input, signal) {
+    async prepare(id, input, signal, channel) {
       events.push("prepare");
+      channels.push(channel);
       preparedStarted.resolve();
-      return options.prepare ? options.prepare(id, input, signal) : prepared;
+      return options.prepare ? options.prepare(id, input, signal, channel) : prepared;
     },
   });
   return {
     host,
     events,
     registrations,
+    journalMarkers,
+    channels,
     prepared,
     preparedStarted: preparedStarted.promise,
     guardStarted: guardStarted.promise,
@@ -145,6 +161,73 @@ describe("private guarded Workflow lifecycle", () => {
     await expect(session.extendDeadline(200)).rejects.toThrow("stopped");
     expect(await f.host.stop(identity, "complete")).toBe("stopped");
     expect(f.events.filter((event) => event === "stop")).toHaveLength(1);
+  });
+
+  test("binds one private token and accepts readiness frames before run", async () => {
+    const start = deferred<void>();
+    const accepted: Array<{ sequence: number; payload: string }> = [];
+    const f = fixture({
+      start: () => start.promise,
+      acceptFrame: (sequence, payload) => accepted.push({ sequence, payload }),
+    });
+    const session = await f.host.openPaused(identity, undefined, 100);
+    const running = session.run(driver);
+    await f.guardStarted;
+    const registration = f.registrations[0];
+    const channel = f.channels[0];
+    expect(registration?.journalToken).toMatch(/^[a-f0-9]{64}$/u);
+    expect(channel?.journalToken).toBe(registration?.journalToken);
+    f.journalMarkers[0]?.(1);
+    channel?.recordPayload(1, "ready");
+    expect(accepted).toEqual([{ sequence: 1, payload: "ready" }]);
+    expect(f.events).not.toContain("run");
+    start.resolve();
+    await running;
+    await expect(f.host.stop(identity, "complete")).resolves.toBe("stopped");
+  });
+
+  test("a marker without its companion rejects stop and prevents dispose", async () => {
+    const f = fixture();
+    const session = await f.host.openPaused(identity, undefined, 100);
+    await session.run(driver);
+    f.journalMarkers[0]?.(1);
+    await expect(f.host.stop(identity, "complete")).rejects.toThrow("unpaired_frame");
+    expect(f.events).not.toContain("dispose");
+    expect(() => f.channels[0]?.recordPayload(1, "late")).toThrow("unpaired_frame");
+  });
+
+  test("a payload without its marker rejects stop and prevents dispose", async () => {
+    const f = fixture();
+    const session = await f.host.openPaused(identity, undefined, 100);
+    await session.run(driver);
+    f.channels[0]?.recordPayload(1, "orphan");
+    await expect(f.host.stop(identity, "complete")).rejects.toThrow("unpaired_frame");
+    expect(f.events).not.toContain("dispose");
+    expect(() => f.journalMarkers[0]?.(1)).toThrow("unpaired_frame");
+  });
+
+  test("pre-start stop with no frames seals successfully without preparation", async () => {
+    const f = fixture();
+    await f.host.openPaused(identity, undefined, 100);
+    await expect(f.host.stop(identity, "termination")).resolves.toBe("stopped");
+    expect(f.events).toEqual(["register", "stop"]);
+    expect(() => f.journalMarkers[0]?.(1)).toThrow("sealed");
+  });
+
+  test("preparation-time frame input fails closed before START", async () => {
+    let observedChannel: WorkflowTransportChannel | undefined;
+    const f = fixture({
+      prepare: async (_id, _input, _signal, channel) => {
+        observedChannel = channel;
+        expect(() => channel.recordPayload(1, "too-early")).toThrow("invalid_frame");
+        return f.prepared;
+      },
+    });
+    const session = await f.host.openPaused(identity, undefined, 100);
+    await expect(session.run(driver)).rejects.toThrow("invalid_frame");
+    expect(observedChannel?.journalToken).toBe(f.registrations[0]?.journalToken);
+    expect(f.events).not.toContain("start");
+    expect(f.events).not.toContain("dispose");
   });
 
   test("stop observes opening registration and prevents application preparation", async () => {

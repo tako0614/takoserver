@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { JsonObject } from "./ports.ts";
 import {
@@ -19,6 +19,11 @@ import type {
   WorkflowExecutionHost,
   WorkflowRunIdentity,
 } from "./workflow-execution.ts";
+import {
+  createWorkflowTransportJournal,
+  type WorkflowTransportJournal,
+  WorkflowTransportJournalError,
+} from "./workflow-transport-journal.ts";
 
 /**
  * Host-private prepared execution, not a public Binding. Preparation selects
@@ -28,15 +33,17 @@ import type {
  */
 export interface PreparedWorkerdWorkflow {
   readonly configPath: string;
+  /** Bounded synchronous control latch for one already-correlated frame. */
+  acceptFrame(sequence: number, payload: string): void;
   /** Called once, only after the exact guard acknowledges start. */
   run(driver: WorkflowDriver): Promise<WorkflowApplicationOutcome>;
   /**
-   * After physical stop, seal the transport and dispatch/latch every earlier
-   * application frame. No late frame may reach the driver after resolution.
-   * If frames cannot be accounted for, reject: merely rejecting run() does
-   * not prove this barrier or permit a stop ACK. This must not await parked
-   * step results. Socket EOF alone is insufficient. Must support retry after
-   * a failed seal.
+   * After physical stop, close and join the physical payload ingress. The host
+   * seals its journal only after this resolves, so no late frame may reach the
+   * driver after the stop barrier. If ingress cannot be accounted for, reject:
+   * merely rejecting run() does not prove this barrier or permit a stop ACK.
+   * This must not await parked step results. Socket EOF alone is insufficient.
+   * Must support retry after a failed drain.
    */
   drainAfterStop(): Promise<void>;
   /** Idempotent artifact cleanup, called only after reap and transport seal. */
@@ -53,6 +60,8 @@ export class SelfhostWorkflowHostError extends Error {
 interface Registration {
   readonly identity: WorkflowRunIdentity;
   readonly input: JsonObject | undefined;
+  readonly journalToken: string;
+  readonly journal: WorkflowTransportJournal;
   readonly guard: Promise<WorkerdExecutionGuard>;
   readonly abort: AbortController;
   liveUntil: number;
@@ -64,14 +73,18 @@ interface Registration {
   stopped: boolean;
   reaped: boolean;
   drained: boolean;
+  journalSealed: boolean;
+  transportFailure?: WorkflowTransportJournalError;
   prepared?: Promise<PreparedWorkerdWorkflow>;
+  preparedValue?: PreparedWorkerdWorkflow;
   stopAttempt?: Promise<void>;
 }
 
 /**
  * Dormant self-host composition. The registry owns process lifecycle and the
- * prepare port owns loader/transport construction. No serving entry selects
- * this module, and a fake prepared transport does not qualify a Workflow host.
+ * prepare port owns loader construction while this host owns the private
+ * journal composition. No serving entry selects this module, and a fake
+ * prepared transport does not qualify a Workflow host.
  * Each registration owns one guarded process, never the shared HTTP workerd.
  */
 export function createWorkerdWorkflowExecutionHost(options: {
@@ -82,6 +95,10 @@ export function createWorkerdWorkflowExecutionHost(options: {
     identity: WorkflowRunIdentity,
     input: JsonObject | undefined,
     signal: AbortSignal,
+    channel: {
+      readonly journalToken: string;
+      readonly recordPayload: (sequence: number, payload: string) => void;
+    },
   ) => Promise<PreparedWorkerdWorkflow>;
   readonly clock?: () => number;
   /**
@@ -89,7 +106,10 @@ export function createWorkerdWorkflowExecutionHost(options: {
    * A throwing factory owns cleanup of any partial construction; it must not
    * strand a process without returning its handle. No factory may send START.
    */
-  readonly spawnGuard?: (registration: WorkerdExecutionRegistration) => WorkerdExecutionGuard;
+  readonly spawnGuard?: (
+    registration: WorkerdExecutionRegistration,
+    onJournalMarker: (sequence: number) => void,
+  ) => WorkerdExecutionGuard;
 }): WorkflowExecutionHost & { close(): Promise<void> } {
   const { guardBinary, workerdBinary, maximumRegistrations, prepare } = options;
   if (
@@ -104,8 +124,13 @@ export function createWorkerdWorkflowExecutionHost(options: {
   const readClock = options.clock ?? Date.now;
   const spawn =
     options.spawnGuard ??
-    ((registration: WorkerdExecutionRegistration) =>
-      spawnWorkerdExecutionGuard({ guardBinary, workerdBinary, registration }));
+    ((registration: WorkerdExecutionRegistration, onJournalMarker: (sequence: number) => void) =>
+      spawnWorkerdExecutionGuard({
+        guardBinary,
+        workerdBinary,
+        registration,
+        onJournalMarker,
+      }));
   const registrations = new Map<string, Registration>();
   let closed = false;
 
@@ -152,11 +177,16 @@ export function createWorkerdWorkflowExecutionHost(options: {
         entry.reaped = true;
       }
       const prepared = await entry.prepared?.catch(() => undefined);
+      if (!entry.drained) {
+        if (prepared) await prepared.drainAfterStop();
+        entry.drained = true;
+      }
+      if (!entry.journalSealed) {
+        entry.journal.seal();
+        entry.journalSealed = true;
+      }
+      if (entry.transportFailure) throw entry.transportFailure;
       if (prepared) {
-        if (!entry.drained) {
-          await prepared.drainAfterStop();
-          entry.drained = true;
-        }
         await prepared.dispose();
       }
       entry.stopped = true;
@@ -193,13 +223,57 @@ export function createWorkerdWorkflowExecutionHost(options: {
         throw new SelfhostWorkflowHostError("capacity");
       }
       const inputSnapshot = input === undefined ? undefined : parseDocument(encodeDocument(input));
-      const entry: Registration = {
+      const journalToken = randomBytes(32).toString("hex");
+      let entry!: Registration;
+      const journal = createWorkflowTransportJournal({
+        dispatch(sequence, payload) {
+          const prepared = entry.preparedValue;
+          if (!prepared) {
+            const error = new WorkflowTransportJournalError("invalid_frame");
+            entry.transportFailure ??= error;
+            throw error;
+          }
+          prepared.acceptFrame(sequence, payload);
+        },
+      });
+      const recordPayload = (sequence: number, payload: string): void => {
+        if (entry.transportFailure) throw entry.transportFailure;
+        if (entry.journalSealed) {
+          journal.recordPayload(sequence, payload);
+          return;
+        }
+        if (!entry.preparedValue) {
+          const error = new WorkflowTransportJournalError("invalid_frame");
+          entry.transportFailure ??= error;
+          throw error;
+        }
+        journal.recordPayload(sequence, payload);
+      };
+      const onJournalMarker = (sequence: number): void => {
+        if (entry.transportFailure) throw entry.transportFailure;
+        if (entry.journalSealed) {
+          journal.recordMarker(sequence);
+          return;
+        }
+        if (!entry.preparedValue) {
+          const error = new WorkflowTransportJournalError("invalid_frame");
+          entry.transportFailure ??= error;
+          throw error;
+        }
+        journal.recordMarker(sequence);
+      };
+      entry = {
         identity,
         input: inputSnapshot,
+        journalToken,
+        journal,
         // Schedule spawn after reserving the identity. stop(opening) must not
         // report not_registered while a guard is being constructed/registered.
         guard: Promise.resolve().then(() =>
-          spawn({ identity: key, deadlineAt: identity.deadlineAt, until: hardDeadline }),
+          spawn(
+            { identity: key, deadlineAt: identity.deadlineAt, until: hardDeadline, journalToken },
+            onJournalMarker,
+          ),
         ),
         abort: new AbortController(),
         liveUntil: hardDeadline,
@@ -210,6 +284,7 @@ export function createWorkerdWorkflowExecutionHost(options: {
         stopped: false,
         reaped: false,
         drained: false,
+        journalSealed: false,
       };
       registrations.set(key, entry);
       try {
@@ -223,20 +298,26 @@ export function createWorkerdWorkflowExecutionHost(options: {
             entry.running = true;
             entry.prepared = Promise.resolve().then(() => {
               requireLive(entry);
-              return prepare(entry.identity, entry.input, entry.abort.signal);
+              return prepare(entry.identity, entry.input, entry.abort.signal, {
+                journalToken: entry.journalToken,
+                recordPayload,
+              });
             });
             try {
               const prepared = await entry.prepared;
               requireLive(entry);
+              if (entry.transportFailure) throw entry.transportFailure;
               if (
                 typeof prepared?.configPath !== "string" ||
                 !isAbsolute(prepared.configPath) ||
+                typeof prepared.acceptFrame !== "function" ||
                 typeof prepared.run !== "function" ||
                 typeof prepared.drainAfterStop !== "function" ||
                 typeof prepared.dispose !== "function"
               ) {
                 throw new SelfhostWorkflowHostError("invalid_input");
               }
+              entry.preparedValue = prepared;
               entry.startRequested = true;
               await guard.start(prepared.configPath);
               requireLive(entry);

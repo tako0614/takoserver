@@ -10,6 +10,15 @@ import {
   rowValue,
 } from "./workflow-data.ts";
 import {
+  isWorkflowCallInputError,
+  isWorkflowRuntimeError,
+  isWorkflowStepError,
+  type WorkflowApplicationOutcome,
+  type WorkflowDriver,
+  WorkflowRuntimeError,
+  WorkflowStepError,
+} from "./workflow-driver.ts";
+import {
   createWorkflowInstances,
   WORKFLOW_MAX_TERMINAL_RETENTION_SECONDS,
   type WorkflowErrorReason,
@@ -18,6 +27,14 @@ import {
   type WorkflowInstances,
   type WorkflowScope,
 } from "./workflow-instances.ts";
+
+export {
+  type WorkflowApplicationOutcome,
+  WorkflowCallInputError,
+  type WorkflowDriver,
+  WorkflowRuntimeError,
+  WorkflowStepError,
+} from "./workflow-driver.ts";
 
 /**
  * Private isolation protocol, NOT the JavaScript Binding/callee API.
@@ -61,13 +78,6 @@ export interface WorkflowPausedSession {
   extendDeadline(until: number): Promise<void>;
 }
 
-export type WorkflowApplicationOutcome =
-  | { readonly kind: "complete"; readonly output?: JsonObject }
-  | { readonly kind: "failed"; readonly reason: "run_threw" }
-  // An isolated adapter must correlate an uncaught driver error back to the
-  // original host-side object. A serialized/reconstructed Error is not proof.
-  | { readonly kind: "failed"; readonly reason: "step_failed"; readonly error: WorkflowStepError };
-
 type TerminalOutcome =
   | { readonly kind: "complete"; readonly output?: JsonObject }
   | { readonly kind: "failed"; readonly reason: WorkflowErrorReason };
@@ -83,33 +93,6 @@ export interface WorkflowRunIdentity {
   readonly owner: string;
   /** Absolute lifetime ceiling, not the renewable run lease. */
   readonly deadlineAt: number;
-}
-
-export interface WorkflowDriver {
-  do(
-    prepareName: () => string | Promise<string>,
-    preparePending: () =>
-      | {
-          readonly retryDelaysSeconds: readonly number[];
-          readonly effect: () => Promise<JsonObject | undefined> | JsonObject | undefined;
-        }
-      | Promise<{
-          readonly retryDelaysSeconds: readonly number[];
-          readonly effect: () => Promise<JsonObject | undefined> | JsonObject | undefined;
-        }>,
-  ): Promise<JsonObject | undefined>;
-  sleep(
-    prepareName: () => string | Promise<string>,
-    preparePending: () => number | Promise<number>,
-  ): Promise<void>;
-  waitForEvent(
-    prepareName: () => string | Promise<string>,
-    preparePending: () =>
-      | { readonly type: string; readonly timeoutSeconds: number }
-      | Promise<{ readonly type: string; readonly timeoutSeconds: number }>,
-  ): Promise<JsonObject | undefined>;
-  /** Private host control used when the application settles around a step. */
-  definitionMismatch(): Promise<never>;
 }
 
 export interface WorkflowRuntimeOptions {
@@ -132,43 +115,6 @@ export type WorkflowRunOutcome =
 export interface WorkflowRuntime {
   readonly instances: WorkflowInstances;
   runOne(scope: WorkflowScope, id: string): Promise<WorkflowRunOutcome>;
-}
-
-/** Infrastructure/private-protocol failures never become application run_threw. */
-export class WorkflowRuntimeError extends Error {
-  constructor(
-    readonly code:
-      | "backend_unavailable"
-      | "host_unavailable"
-      | "stale_claim"
-      | "invalid_runtime_input",
-  ) {
-    super(code);
-    this.name = "WorkflowRuntimeError";
-  }
-}
-
-/**
- * Private bridge for application argument validators.  The class lets the
- * core distinguish a TypeError deliberately raised by the facade from a
- * TypeError raised by storage/host code, without making the application
- * validator itself part of this private coordinator's API.
- */
-export class WorkflowCallInputError extends Error {
-  constructor(readonly error: TypeError) {
-    super("workflow call input");
-    this.name = "WorkflowCallInputError";
-  }
-}
-
-/** Internal driver result; its app-facing JavaScript projection is not selected. */
-export class WorkflowStepError extends Error {
-  constructor(
-    readonly code: "step_failed" | "wait_timeout" | "invalid_duration" | "document_too_large",
-  ) {
-    super(code);
-    this.name = "WorkflowStepError";
-  }
 }
 
 const ACTIVE = "'queued', 'running', 'sleeping', 'waiting'";
@@ -821,8 +767,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         return result;
       } catch (error) {
         if (finishing) return never();
-        if (error instanceof WorkflowCallInputError) throw error.error;
-        if (error instanceof WorkflowStepError) {
+        if (isWorkflowCallInputError(error)) throw error.error;
+        if (isWorkflowStepError(error)) {
           // Capture the classification before JavaScript receives the object.
           if (error.code === "step_failed") exhaustedStepErrors.add(error);
           throw error;
@@ -973,7 +919,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
             if (finishing) return never();
             resultJson = value === undefined ? null : encodeDocument(value);
           } catch (error) {
-            if (error instanceof WorkflowRuntimeError) throw error;
+            if (isWorkflowRuntimeError(error)) throw error;
             const delay = delays[attempts];
             if (delay === undefined) {
               await changeStep(key, current, "state = 'errored', error_json = ?", [

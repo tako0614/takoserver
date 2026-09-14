@@ -282,12 +282,81 @@ stopped tombstones through the largest requested lease, including renewals
 whose acknowledgement was lost. It never prunes an unproved stop merely
 because the controller clock advanced. Capacity exhaustion refuses admission.
 
-This composition is dormant and not a qualified serving host. Its tests use
-fake process and preparation ports. A real closed-graph class loader, ordered
-step transport with genuine-error correlation, and native stop/message-barrier
-qualification still remain. Raw workerd is not a hardened multi-tenant sandbox;
+This composition is dormant and not a qualified serving host. Its focused
+lifecycle tests use fake process and preparation ports. The separate native
+HTTP fixture composes real guarded workerd, the canonical env projector and
+the durable coordinator; it is not the production deployment selector. Raw
+workerd is not a hardened multi-tenant sandbox;
 this lifecycle code does not add or claim that security property. No WfP or
 public Workflow activation is enabled by this module.
+
+### Private HTTP class transport
+
+`workflow-http-worker` is a host-private bootstrap: canonical data/class
+helpers are statically initialized before a dynamic application import on
+RUN. The generated self-host wrapper exposes its existing `projectEnv` under
+a fixed private export, so the class receives the same declared environment
+as ordinary handlers. The wrapper is imported before retrieving the tenant
+namespace. Neither controller nor preparation evaluates tenant code. The
+closed-graph module policy and `disallow_importable_env` remain required; the
+companion binding and journal nonce are not application env.
+
+`workflow-http-controller` implements one concrete request/response turn
+protocol. A call first lets the durable driver request its name, then requests
+pending arguments only when the driver needs them, and invokes an effect only
+when instructed by that authority. Completed-name replay therefore skips
+unused arguments and effects. Canonical application JSON is embedded as a raw
+value in the private envelope rather than double-encoded. A transport failure
+during a pending argument or effect is infrastructure failure; only an actual
+application effect failure consumes an attempt. Error-origin tokens are
+private and retained per failed step name, not per invocation.
+
+`selfhost-workflow-http-transport` owns the bounded loopback companion ingress.
+It reserves each response before recording its payload in the outer journal;
+only marker/payload pairing dispatches a frame. After physical stop, it closes
+ingress and joins body readers without waiting for parked driver results. The
+outer lifecycle then seals the journal before disposal. A failed RUN response
+or an already-recorded frame's response failure rejects the run, not that
+physical stop proof; incomplete ingress still refuses the barrier. Its
+configuration callback is abort-aware and owns cleanup of partial artifacts. It is not a
+general RPC framework or a published Binding.
+
+The opt-in `tests/workerd-native-workflow-http.test.ts` exercises the pinned
+runtime, dynamic class load, generated env, durable completed-name replay and
+genuine/forged error paths. Captured native Response accessors are located
+through the trusted prototype chain during bootstrap: workerd inherits its
+`body` accessor from `Body`, rather than placing it on `Response.prototype`.
+The captured logger is also called once before application evaluation, using
+an empty ordinary log line that the guard discards. The pinned runtime lazily
+initializes its native console formatter on first use; capturing the entry
+function alone did not initialize that dependency. Subsequent private markers
+must still pair with their payloads and pass the stop/seal barrier.
+
+The selected runtime still has unresolved startup and in-run compatibility
+gaps when an application replaces Promise methods. Separate raw dynamic-import
+and raw private service-fetch probes reproduce the failures without any
+Workflow helper imports. The native corpus retains both as expected
+infrastructure refusals, with zero durable steps and physical stop, journal
+seal, owner release and artifact disposal; these are **not** successful loader
+qualification. A separate positive case replaces non-Promise intrinsics
+inside `run`. Captured helper intrinsics do not make the native module
+evaluator or native service-fetch machinery immune to application mutation.
+The implementation does not restore tenant globals, exclude these cases from
+the forward contract or claim full runtime qualification.
+
+A callable `Object.prototype.then` exposes a related native Response-fulfillment
+gap. A helper-free private fetch reproduces thenable assimilation before the
+helper can box the native response. The memo-replay refusal case retains
+exactly its first completed durable step, creates no further step, and requires
+the same nonterminal result, owner release and stop/seal/disposal boundary.
+Ordinary completed-name replay and the helper's own final Response protection
+remain separate positive cases. These native gaps require a different qualified
+transport/runtime boundary, not an observable rewrite of tenant prototypes.
+
+The fixture supplies its own closed module graph;
+production selection, full binding/resource routing, scheduler integration,
+complete native failure corpus and the managed WfP backend remain separate
+unfinished work. No serving entrypoint selects this transport yet.
 
 ## Schema and rollout
 
@@ -365,8 +434,8 @@ controller's Driver call. Overlap or run settlement with an unresolved app
 step invokes a private mismatch control; the coordinator still owns stop and
 terminal writes. Genuine step Errors have immutable own names and per-context
 WeakMap provenance. Exact rethrow retains the original controller error;
-name copies and wrappers do not. A future cross-process transport must retain
-that provenance without exposing its correlation material to the application.
+name copies and wrappers do not. The private HTTP transport correlates that
+provenance without exposing correlation material to the application.
 
 The complete private Host stop acknowledgement also needs a transport barrier:
 app-to-Host driver/control messages emitted or enqueued before physical stop
@@ -383,17 +452,15 @@ are unchanged; no migration or new serving path is implied by that extension.
 
 The coordinator and class projection are not wired to production entrypoints
 or exported from the package root. Their execution-host protocol is not a
-selected app-facing Binding. They still need a real isolated class loader with
-then-current weighted deployment selection, guarded process composition,
-private step transport and complete native qualification. Publication and exact contract
+selected app-facing Binding. The private class/transport composition still
+needs the real then-current weighted deployment selector, complete resource
+bindings and native qualification. Publication and exact contract
 selection remain separate from this private implementation. These are runtime
 responsibilities, not tasks for Takosumi or an application-specific adapter.
 
-Consumer-requested termination remains a separate ordering gap: the existing
-instance store writes `terminated` before the runtime facade waits for stop.
-Waiting before returning the terminate operation is not the same as stopping
-before another reader can see that terminal status. The forward candidate
-requires the latter; fixing run settlement alone does not qualify this path.
+Consumer-requested termination uses the durable intent and stop-before-publish
+path described above. The raw instance store alone is not that runtime facade;
+serving composition must use the facade rather than bypass its stop barrier.
 
 Self-host and managed implementations must ultimately project the same exact
 consumer Binding, authorize each declared target, and connect it to this

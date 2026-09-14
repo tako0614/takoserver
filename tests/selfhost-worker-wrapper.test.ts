@@ -24,6 +24,7 @@ import {
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
+  SELFHOST_WORKER_PROJECT_ENV_EXPORT,
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
   SELFHOST_WORKER_READINESS_PROTOCOL,
@@ -821,6 +822,18 @@ test("a version with no facade still generates the entrypoint that probes it", (
   expect(source).toContain(`from "./${SELFHOST_WORKER_PRELUDE_MODULE}"`);
   expect(source).toContain(SELFHOST_WORKER_READINESS_PATH);
   expect(source).toContain('"LANE"');
+});
+
+test("event and non-event wrappers expose the same private env projection", () => {
+  const alias = `export { projectEnv as ${SELFHOST_WORKER_PROJECT_ENV_EXPORT} };`;
+  for (const input of [KV_ONLY, { ...KV_ONLY, events: true }]) {
+    const source = selfhostWorkerEntrypointSource(input);
+    expect(source).toContain(alias);
+    expect(source.split(alias).length - 1).toBe(1);
+    // The class loader consumes the ordinary factory; no second raw-env
+    // constructor may diverge in binding shape or adapter behavior.
+    expect(source.match(/function\s+\w*Env\(rawEnv\)/gu)).toEqual(["function projectEnv(rawEnv)"]);
+  }
 });
 
 test("a tenant main may use the Host entrypoint's logical spelling", () => {

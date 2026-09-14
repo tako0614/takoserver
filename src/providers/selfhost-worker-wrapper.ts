@@ -126,6 +126,8 @@ const SELFHOST_WORKER_INTERNAL_READINESS_CAPABILITY_HEADER =
 
 /** Module name the generated entrypoint is published under. */
 export const SELFHOST_WORKER_ENTRYPOINT_MODULE = "__takoserver-selfhost-entrypoint.js" as const;
+/** Host-private named export used by the isolated Workflow class loader. */
+export const SELFHOST_WORKER_PROJECT_ENV_EXPORT = "__takoserverSelfhostProjectEnv" as const;
 
 /**
  * Where this Host asks a published pair whether the tenant module really loads.
@@ -593,6 +595,7 @@ export default SafeApply(SafeObjectFreeze, SafeObject, [{
 ${handlers}
 }]);
 ${eventEntrypoint}
+export { projectEnv as ${SELFHOST_WORKER_PROJECT_ENV_EXPORT} };
 
 async function invoke(handler, args, rawEnv, rawContext) {
   const env = projectEnv(rawEnv);
