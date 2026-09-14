@@ -15,6 +15,10 @@ const (
 	MaxFrameBytes = 16 * 1024
 	// MaxLifetimeMilliseconds is the one-year absolute execution ceiling.
 	MaxLifetimeMilliseconds int64 = 31_536_000_000
+	// MaxServiceGateways matches the private Worker Version service-binding bound.
+	MaxServiceGateways = 64
+	// MaxUnixSocketPathBytes leaves headroom below Linux sockaddr_un.sun_path.
+	MaxUnixSocketPathBytes = 100
 )
 
 // Options configures one guard process. In and Out are the private JSONL
@@ -38,6 +42,7 @@ const (
 	CodeInvalidDeadline      Code = "invalid_deadline"
 	CodeInvalidLease         Code = "invalid_lease"
 	CodeInvalidConfigPath    Code = "invalid_config_path"
+	CodeInvalidGateway       Code = "invalid_gateway"
 	CodeNotRegistered        Code = "not_registered"
 	CodeAlreadyRegistered    Code = "already_registered"
 	CodeAlreadyStarted       Code = "already_started"
@@ -47,6 +52,7 @@ const (
 	CodeClockChanged         Code = "clock_changed"
 	CodeChildStartFailed     Code = "child_start_failed"
 	CodeChildExited          Code = "child_exited"
+	CodeServiceGateway       Code = "service_gateway"
 	CodeStopFailed           Code = "stop_failed"
 	CodeProtocolOutput       Code = "protocol_output"
 	CodeProtocolBackpressure Code = "protocol_backpressure"

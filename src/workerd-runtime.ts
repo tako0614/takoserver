@@ -8,13 +8,15 @@ import {
   open,
   readdir,
   readFile,
+  realpath,
   rename,
   rm,
   rmdir,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { bytesDigest } from "./json.ts";
 import {
   canonicalSelfhostWeightedVersions,
@@ -301,13 +303,31 @@ export interface WorkerdRuntime {
   ): Promise<{ readonly status: number; readonly body: string } | null>;
 }
 
+/** Exact private selection, not provider desired state or caller-supplied bindings. */
+export interface WorkerdSelectedVersionIdentity {
+  readonly script: string;
+  readonly generation: string;
+  readonly generationKey: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionUid: string;
+}
+
+/** Secret-bearing execution capability; never log, persist or expose through a provider. */
+export interface WorkerdPrivateServiceLease {
+  readonly services: readonly {
+    readonly name: string;
+    readonly upstreamSocket: string;
+    readonly unavailableToken: string;
+  }[];
+  /** Release only after child reap, ingress drain and temporary config removal. */
+  release(): Promise<void>;
+}
+
 /**
- * The runtime as its own process holds it, which is one capability more.
- *
- * `WorkerdRuntime` is the seam a *provider* publishes through, and a provider
- * never restarts a machine. A composition root does, and it is the only thing
- * that knows this process has just started with a data directory that may
- * already hold published Workers.
+ * Composition-owned lifecycle and private execution, not provider authority.
+ * The composition restores the process and retains bindings for its children;
+ * a provider only publishes through WorkerdRuntime.
  */
 export interface HostedWorkerdRuntime extends WorkerdRuntime {
   /**
@@ -320,6 +340,10 @@ export interface HostedWorkerdRuntime extends WorkerdRuntime {
    * build comes back on this one's router.
    */
   restore(): Promise<readonly string[]>;
+  /** Pin a captured caller's binding routers while their targets follow the current graph. */
+  acquirePrivateServiceBindings(
+    identity: WorkerdSelectedVersionIdentity,
+  ): Promise<WorkerdPrivateServiceLease>;
 }
 
 /**
@@ -353,6 +377,14 @@ export interface WorkerdRuntimeOptions {
   readonly port?: number;
   /** Current Host-owned loopback listener; persisted Versions retain their original metadata. */
   readonly dataPlaneAddress?: string;
+  /**
+   * Opt-in, existing operator-owned 0700 directory for private service sockets.
+   * Must be canonical, non-symlinked and short enough for a 64-hex `.sock` name
+   * within 100 bytes, outside root. It must be fresh and empty for this runtime
+   * incarnation; its lifecycle follows the shared supervisor, not a run.
+   * Requires immutable weighted publish(); legacy write()/remove() are refused.
+   */
+  readonly serviceBindingSocketDirectory?: string;
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -486,6 +518,17 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
+  const serviceSocketDirectory = options.serviceBindingSocketDirectory;
+  if (serviceSocketDirectory !== undefined) {
+    validPrivateSocketDirectory(serviceSocketDirectory);
+    const withinRoot = relative(resolve(options.root), serviceSocketDirectory);
+    if (
+      withinRoot === "" ||
+      (!isAbsolute(withinRoot) && withinRoot !== ".." && !withinRoot.startsWith(`..${sep}`))
+    ) {
+      throw new Error("private service socket directory must be outside the runtime root");
+    }
+  }
   const dataPlaneAddress =
     options.dataPlaneAddress === undefined
       ? undefined
@@ -506,6 +549,115 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   // Host-originated readiness path and is never bound into tenant code.
   const internalReadinessCapability = privateRuntimeToken();
   let activationTail: Promise<void> = Promise.resolve();
+  const servicePins = new Map<string, { readonly binding: WorkerdServiceBinding; count: number }>();
+  let renderedPrivateRouters = new Set<string>();
+  let privateSocketRoot: PrivateSocketIdentity | undefined;
+  const ownedPrivateSockets = new Map<string, PrivateSocketIdentity>();
+  let pendingPrivateSockets: readonly string[] | undefined;
+  let privateSocketTransition = 0;
+  let privateSocketUncertain = false;
+
+  const privateServiceGraph = (published: readonly PublishedDeployment[]) =>
+    serviceSocketDirectory === undefined
+      ? undefined
+      : {
+          socketDirectory: serviceSocketDirectory,
+          bindings: collectServiceBindings(
+            published,
+            [...servicePins.values()].map((pin) => pin.binding),
+          ),
+        };
+  const retainRenderedRouters = (published: readonly PublishedDeployment[]) => {
+    renderedPrivateRouters = new Set(privateServiceGraph(published)?.bindings.keys());
+  };
+
+  const requireCertainRuntime = (): void => {
+    if (privateSocketUncertain) {
+      throw new Error("private service runtime requires a fresh supervised incarnation");
+    }
+  };
+
+  const clearFailedActivation = async (failure: unknown): Promise<void> => {
+    renderedPrivateRouters.clear();
+    try {
+      await writeActivation(activationPath, {});
+    } catch (clearFailure) {
+      if (serviceSocketDirectory !== undefined) privateSocketUncertain = true;
+      throw new AggregateError(
+        [failure, clearFailure],
+        "worker runtime activation could not be cleared",
+      );
+    }
+  };
+
+  const requireSocketRoot = async (): Promise<void> => {
+    if (serviceSocketDirectory === undefined) return;
+    requireCertainRuntime();
+    const metadata = await requirePrivateSocketDirectory(serviceSocketDirectory);
+    if (privateSocketRoot === undefined) {
+      if ((await readdir(serviceSocketDirectory)).length !== 0) {
+        throw new Error("private service socket directory must be fresh and empty");
+      }
+      privateSocketRoot = metadata;
+    } else if (!samePrivateSocketIdentity(privateSocketRoot, metadata)) {
+      throw new Error("private service socket directory was replaced");
+    }
+  };
+
+  // Capture only the graph being proved. An unproved reload may still create
+  // listeners later: its paths must never be swept by an automatic rollback.
+  const capturePrivateSockets = async (): Promise<boolean> => {
+    if (pendingPrivateSockets === undefined) return true;
+    await requireSocketRoot();
+    let complete = true;
+    for (const path of pendingPrivateSockets) {
+      const metadata = await privateSocketMetadata(path);
+      if (metadata === undefined) {
+        if (ownedPrivateSockets.has(path)) throw new Error("private service socket disappeared");
+        complete = false;
+        continue;
+      }
+      const owned = ownedPrivateSockets.get(path);
+      if (owned && !samePrivateSocketIdentity(owned, metadata)) {
+        throw new Error("private service socket was replaced");
+      }
+      ownedPrivateSockets.set(path, metadata);
+    }
+    if (complete) pendingPrivateSockets = undefined;
+    return complete;
+  };
+
+  const transitionPrivateSockets = async (published: readonly PublishedDeployment[]) => {
+    if (serviceSocketDirectory === undefined) return;
+    await requireSocketRoot();
+    const next = [...(privateServiceGraph(published)?.bindings.keys() ?? [])].map((router) =>
+      privateServiceSocket(serviceSocketDirectory, router),
+    );
+    // Validate the whole set before disrupting a single old listener. Never
+    // adopt a pre-existing path merely because it has the right filename.
+    for (const [path, owned] of ownedPrivateSockets) {
+      const metadata = await privateSocketMetadata(path);
+      if (metadata === undefined || !samePrivateSocketIdentity(owned, metadata)) {
+        throw new Error("private service socket was replaced");
+      }
+    }
+    for (const path of next) {
+      if (!ownedPrivateSockets.has(path) && (await privateSocketMetadata(path)) !== undefined) {
+        throw new Error("private service socket path is already occupied");
+      }
+    }
+    privateSocketTransition += 1;
+    for (const [path, owned] of ownedPrivateSockets) {
+      // Recheck immediately before unlink; the directory excludes other UIDs.
+      const metadata = await privateSocketMetadata(path);
+      if (metadata === undefined || !samePrivateSocketIdentity(owned, metadata)) {
+        throw new Error("private service socket was replaced");
+      }
+      await unlink(path);
+      ownedPrivateSockets.delete(path);
+    }
+    pendingPrivateSockets = next;
+  };
 
   /** Shared config and activation truth have one commit order across scripts. */
   const exclusiveActivation = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -539,6 +691,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    * asset shim and the socket are decided.
    */
   const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+    if (serviceSocketDirectory !== undefined) {
+      await requireSocketRoot();
+    }
     await privateDirectory(scriptsRoot);
     for (const entry of published) await privateDirectory(join(scriptsRoot, entry.name));
     const assetPublications = published
@@ -549,15 +704,32 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       await privateDirectory(assetsRoot);
       for (const entry of assetPublications) await privateDirectory(assetDirectory(entry.name));
     }
-    // Written before the config that embeds it, every time, so a router
-    // improvement reaches a deployment on its next reload rather than
-    // whenever somebody remembers.
-    await writeFile(join(scriptsRoot, "router.js"), ROUTER_SOURCE, "utf8");
-    await writeFile(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, "utf8");
-    await writeFile(join(scriptsRoot, "asset-router.js"), ASSET_ROUTER_SOURCE, "utf8");
-    await writeFile(join(scriptsRoot, SERVICE_ROUTER_MODULE), SERVICE_ROUTER_SOURCE, "utf8");
-    await writeFile(join(scriptsRoot, DEPLOYMENT_ROUTER_MODULE), DEPLOYMENT_ROUTER_SOURCE, "utf8");
-    await writeFile(join(scriptsRoot, EVENT_DISPATCHER_MODULE), EVENT_DISPATCHER_SOURCE, "utf8");
+    // Materialize the current Host helpers before the config that embeds them.
+    // Identical helper writes would trigger --watch before the config/socket
+    // transition. These sources are constant for this Host incarnation.
+    const immutableHelpers = serviceSocketDirectory !== undefined && privateSocketTransition > 0;
+    await writeRuntimeModule(join(scriptsRoot, "router.js"), ROUTER_SOURCE, immutableHelpers);
+    await writeRuntimeModule(join(scriptsRoot, "assets.js"), ASSETS_SOURCE, immutableHelpers);
+    await writeRuntimeModule(
+      join(scriptsRoot, "asset-router.js"),
+      ASSET_ROUTER_SOURCE,
+      immutableHelpers,
+    );
+    await writeRuntimeModule(
+      join(scriptsRoot, SERVICE_ROUTER_MODULE),
+      SERVICE_ROUTER_SOURCE,
+      immutableHelpers,
+    );
+    await writeRuntimeModule(
+      join(scriptsRoot, DEPLOYMENT_ROUTER_MODULE),
+      DEPLOYMENT_ROUTER_SOURCE,
+      immutableHelpers,
+    );
+    await writeRuntimeModule(
+      join(scriptsRoot, EVENT_DISPATCHER_MODULE),
+      EVENT_DISPATCHER_SOURCE,
+      immutableHelpers,
+    );
     await privateDirectory(dirname(configPath));
     // The rendered configuration contains every binding value, sensitive ones
     // included, so it is created `0600` and moved into place atomically.
@@ -571,8 +743,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         configProbeToken,
         internalReadinessCapability,
         dataPlaneAddress,
+        privateServiceGraph(published),
       ),
       "utf8",
+      () => transitionPrivateSockets(published),
     );
   };
 
@@ -584,9 +758,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     // cannot prove serving truth, but `has()` will still fail closed unless its
     // composition supplies a live `isReady` probe.
     if (options.onReload === undefined) return;
-    const expected = publishedGraphIdentity(published);
+    const expected = publishedGraphIdentity(published, privateServiceGraph(published));
     const deadline = Date.now() + 5_000;
     for (;;) {
+      let confirmed = false;
       try {
         const response = await fetch(
           `${options.tls ? "https" : "http"}://127.0.0.1:${port}${CONFIG_PROBE_PATH}`,
@@ -600,12 +775,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             signal: AbortSignal.timeout(1_000),
           },
         );
-        if (response.status === 204 && response.headers.get(CONFIG_IDENTITY_HEADER) === expected) {
-          return;
-        }
+        confirmed =
+          response.status === 204 && response.headers.get(CONFIG_IDENTITY_HEADER) === expected;
       } catch {
         // The watcher may still be crossing to the atomically replaced file.
       }
+      if (confirmed && (await capturePrivateSockets())) return;
       if (Date.now() >= deadline) {
         throw new Error("worker runtime did not confirm the rendered configuration");
       }
@@ -618,10 +793,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    * pointer, and activation truth as one recoverable transaction.
    *
    * `onReload` is an arbitrary process boundary: a throw does not prove that a
-   * watching workerd ignored the new config. Therefore every failure restores
-   * the prior config and calls the hook again. Only that successful second
-   * crossing proves the old graph is live; if it cannot be proved, activation
-   * truth is cleared rather than fabricated.
+   * watching workerd ignored the new config. The default topology restores the
+   * prior graph and proves that second crossing. Private Unix listeners instead
+   * require a fresh supervised incarnation after an unproved transition: a
+   * rollback could race sockets bound late by the first reload. Only a proved
+   * private graph may roll back after a later commit failure. Uncertain
+   * activation truth is cleared rather than fabricated.
    */
   const activate = async (
     published: readonly PublishedDeployment[],
@@ -632,6 +809,9 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       readonly commitAfterActivation?: boolean;
     },
   ): Promise<void> => {
+    requireCertainRuntime();
+    const initialSocketTransition = privateSocketTransition;
+    let graphProved = false;
     try {
       const before = activated(previous);
       const after = activated(published);
@@ -650,12 +830,32 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       await writeRendered(published);
       await options.onReload?.(configPath);
       await proveRendered(published);
+      graphProved = options.onReload !== undefined;
       if (!pointer?.commitAfterActivation) await pointer?.commit();
       await writeActivation(activationPath, activated(published));
       // Retiring a validated scalar carrier is the final fallible operation.
       // Its absence must not precede a marker write that could still fail.
       if (pointer?.commitAfterActivation) await pointer.commit();
+      retainRenderedRouters(published);
     } catch (failure) {
+      if (
+        serviceSocketDirectory !== undefined &&
+        initialSocketTransition === privateSocketTransition
+      ) {
+        // Preflight failed before any socket unlink or config rename. Do not
+        // disrupt the old listeners by trying a second render of an unknown
+        // filesystem. No pointer commit has happened; refuse serving claims.
+        await clearFailedActivation(failure);
+        throw failure;
+      }
+      if (serviceSocketDirectory !== undefined && !graphProved) {
+        // A timed-out/throwing reload can still bind listeners after this
+        // catch. Only external stop/reap and a fresh runtime/socket directory
+        // can recover it; do not race that process with a rollback sweep.
+        privateSocketUncertain = true;
+        await clearFailedActivation(failure);
+        throw failure;
+      }
       try {
         await pointer?.rollback();
         // Re-render the exact prior graph with this process's private probe
@@ -669,15 +869,18 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // this call may be stale after a crash between pointer commit and
         // marker commit, especially during boot restore.
         await writeActivation(activationPath, activated(previous));
+        retainRenderedRouters(previous);
       } catch (rollbackFailure) {
         // The child may now be serving either graph. No per-script marker is
         // trustworthy across a failed process boundary, so fail closed for
         // the whole runtime rather than claiming a rollback that was not seen.
-        await writeActivation(activationPath, {}).catch(() => undefined);
-        throw new AggregateError(
+        if (serviceSocketDirectory !== undefined) privateSocketUncertain = true;
+        const unknownState = new AggregateError(
           [failure, rollbackFailure],
           "worker runtime activation state is unknown",
         );
+        await clearFailedActivation(unknownState);
+        throw unknownState;
       }
       throw failure;
     }
@@ -814,7 +1017,98 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
 
   return {
     inspectModule: (input) => moduleInspector.inspect(input),
+    acquirePrivateServiceBindings(identity) {
+      // Copy before entering the queue so a caller cannot change the requested
+      // identity while another publication owns the activation lock.
+      const requested = { ...identity };
+      return exclusiveActivation(async () => {
+        const unavailable = () =>
+          new Error("private execution service binding bridge is unavailable");
+        if (
+          serviceSocketDirectory === undefined ||
+          options.onReload === undefined ||
+          options.isReady?.() !== true
+        ) {
+          throw unavailable();
+        }
+        await requireSocketRoot();
+        const active = await readWorkerdActiveDeployment(options.root, requested.script);
+        if (!active || active.generation !== requested.generation) throw unavailable();
+        let basisPoint = 0;
+        let found = false;
+        for (const version of active.versions) {
+          if (
+            version.versionId === requested.versionId &&
+            version.workerVersionUid === requested.workerVersionUid
+          ) {
+            found = true;
+            break;
+          }
+          basisPoint += version.weight;
+        }
+        if (!found) throw unavailable();
+        const selected = await readWorkerdSelectedActiveVersion(options.root, requested.script, {
+          expectedWorkerResourceUid: requested.workerResourceUid,
+          basisPoint,
+        });
+        if (
+          !selected ||
+          selected.generation !== requested.generation ||
+          selected.generationKey !== requested.generationKey ||
+          selected.workerResourceUid !== requested.workerResourceUid ||
+          selected.versionId !== requested.versionId ||
+          selected.workerVersionUid !== requested.workerVersionUid ||
+          options.isReady?.() !== true
+        ) {
+          throw unavailable();
+        }
+        // Binding declarations come only from the authenticated immutable
+        // manifest. The caller cannot supply a different target or token.
+        const bindings = validServiceBindings(selected.site.serviceBindings ?? []);
+        const routers = bindings.map(serviceRouterName);
+        if (routers.some((router) => !renderedPrivateRouters.has(router))) throw unavailable();
+        for (const router of routers) {
+          const path = privateServiceSocket(serviceSocketDirectory, router);
+          const owned = ownedPrivateSockets.get(path);
+          const metadata = await privateSocketMetadata(path);
+          if (!owned || !metadata || !samePrivateSocketIdentity(owned, metadata)) {
+            throw unavailable();
+          }
+        }
+        for (const binding of bindings) {
+          const router = serviceRouterName(binding);
+          const existing = servicePins.get(router);
+          if (existing) existing.count += 1;
+          else servicePins.set(router, { binding, count: 1 });
+        }
+        let released = false;
+        return {
+          services: bindings.map((binding) => ({
+            name: binding.name,
+            upstreamSocket: privateServiceSocket(
+              serviceSocketDirectory,
+              serviceRouterName(binding),
+            ),
+            unavailableToken: binding.unavailableToken,
+          })),
+          release: () =>
+            exclusiveActivation(async () => {
+              if (released) return;
+              released = true;
+              for (const router of routers) {
+                const pin = servicePins.get(router);
+                if (!pin) continue;
+                pin.count -= 1;
+                if (pin.count === 0) servicePins.delete(router);
+              }
+              // No child can hold the socket after this lifecycle barrier. Lazy
+              // pruning avoids a shared-graph reload for every completed run.
+            }),
+        };
+      });
+    },
     async publish(name, publication) {
+      requireCertainRuntime();
       const directory = scriptDirectory(name);
       const pointerPath = join(directory, MANIFEST);
       const removePointer = async (): Promise<void> => {
@@ -828,12 +1122,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
         }
       };
-      // Byte capture and immutable generation staging can proceed in parallel
-      // for different Workers. Only the shared graph snapshot/commit is
-      // serialized; otherwise two valid publishes can each render a graph
-      // missing the other and the last config wins.
-      const staged = publication === null ? null : await stageDeployment(name, publication);
+      // Without private sockets, immutable generation staging can proceed in
+      // parallel for different Workers. The shared graph snapshot/commit is
+      // always serialized so two valid publishes cannot each render a graph
+      // missing the other. Private staging also shares the uncertainty fence.
+      const concurrentStaged =
+        publication === null || serviceSocketDirectory !== undefined
+          ? null
+          : await stageDeployment(name, publication);
       await exclusiveActivation(async () => {
+        requireCertainRuntime();
+        // Private publication staging shares the uncertain-state fence. It
+        // cannot keep writing after another activation invalidates this Host.
+        const staged =
+          serviceSocketDirectory !== undefined && publication !== null
+            ? await stageDeployment(name, publication)
+            : concurrentStaged;
         const previous = await readPublished(scriptsRoot, assetsRoot);
         const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
         const next = (
@@ -901,6 +1205,10 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       });
     },
     async write(name, site, modules, assets, hostModules) {
+      requireCertainRuntime();
+      if (serviceSocketDirectory !== undefined) {
+        throw new Error("private service runtime requires immutable weighted publication");
+      }
       const directory = scriptDirectory(name);
       // Validate the declaration before removing the currently serving
       // directory. A bad media map is a rejected publication, not a reason to
@@ -1004,12 +1312,17 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     },
 
     async remove(name) {
+      requireCertainRuntime();
+      if (serviceSocketDirectory !== undefined) {
+        throw new Error("private service runtime requires immutable weighted publication");
+      }
       await rm(scriptDirectory(name), { recursive: true, force: true });
       await rm(assetDirectory(name), { recursive: true, force: true });
     },
 
     async has(name, generation) {
       return await exclusiveActivation(async () => {
+        if (privateSocketUncertain) return false;
         const active = await readActivation(activationPath);
         if (!(name in active)) return false;
         if (generation !== undefined && active[name] !== generation) return false;
@@ -1031,6 +1344,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     },
 
     async probe(name, path, init) {
+      if (privateSocketUncertain) return null;
       let hostname: string;
       try {
         hostname = init.route === "events" ? eventHostname(name) : internalHostname(name);
@@ -1074,6 +1388,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // Bounded because the answer is this Host's own small envelope and the
         // body on the other side of that router is a tenant's Worker.
         const body = (await response.text()).slice(0, 65_536);
+        if (privateSocketUncertain) return null;
         return { status: response.status, body };
       } catch {
         return null;
@@ -1087,6 +1402,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // asked for, which is exactly what deferring the start to the first
       // publish was avoiding.
       return await exclusiveActivation(async () => {
+        requireCertainRuntime();
         const published = await readPublished(scriptsRoot, assetsRoot);
         if (published.length === 0) return [];
         await activate(published, published);
@@ -1096,6 +1412,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
 
     async reload() {
       await exclusiveActivation(async () => {
+        requireCertainRuntime();
         const published = await readPublished(scriptsRoot, assetsRoot);
         await activate(published, published);
       });
@@ -1110,7 +1427,12 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
  * directory cannot pre-place a symlink and have the secret written through it,
  * and the rename means a reader never observes a partially written config.
  */
-async function writePrivate(path: string, contents: string, encoding: "utf8"): Promise<void> {
+async function writePrivate(
+  path: string,
+  contents: string,
+  encoding: "utf8",
+  beforeRename?: () => Promise<void>,
+): Promise<void> {
   const temporary = `${path}.tmp`;
   await rm(temporary, { force: true });
   let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -1125,11 +1447,29 @@ async function writePrivate(path: string, contents: string, encoding: "utf8"): P
     await handle.sync();
     await handle.close();
     closed = true;
+    await beforeRename?.();
     await rename(temporary, path);
   } finally {
     if (!closed) await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+async function writeRuntimeModule(
+  path: string,
+  contents: string,
+  immutable: boolean,
+): Promise<void> {
+  try {
+    if ((await readFile(path, "utf8")) === contents) return;
+  } catch (error) {
+    if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  if (immutable)
+    throw new Error("private service runtime helpers require a fresh supervised incarnation");
+  await writeFile(path, contents, "utf8");
 }
 
 /**
@@ -1750,8 +2090,8 @@ async function writePreparedWorkerdSite(
  * Private, single-execution materialization. The caller owns a fresh directory
  * and cleanup; this never publishes a route or changes the active graph.
  * Assets/event routers are HTTP delivery services, not class environment
- * bindings. Service bindings require an incarnation-fenced bridge which this
- * dormant execution path does not yet own, so they are explicitly refused.
+ * bindings. Service bindings require an exact private per-binding gateway
+ * mapping acquired from the shared runtime; no target URL is derived here.
  */
 export async function writeWorkerdPrivateExecution(options: {
   readonly root: string;
@@ -1762,6 +2102,8 @@ export async function writeWorkerdPrivateExecution(options: {
   readonly runSocketPath: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
   readonly dataPlaneAddress?: string;
+  /** Exact child-local guard listeners, not shared sockets or public endpoints. */
+  readonly serviceBindings?: readonly { readonly name: string; readonly socketPath: string }[];
 }): Promise<string> {
   const { root, site, runSocketPath } = options;
   if (
@@ -1776,8 +2118,29 @@ export async function writeWorkerdPrivateExecution(options: {
   if (!site.hostEntrypoint || site.hostEntrypoint === site.mainModule) {
     throw new Error("private execution requires a distinct Host entrypoint");
   }
-  if ((site.serviceBindings?.length ?? 0) > 0) {
+  const declaredServices = validServiceBindings(site.serviceBindings ?? []);
+  const serviceMappings = options.serviceBindings ?? [];
+  const serviceNames = new Set(declaredServices.map((binding) => binding.name));
+  const servicePaths = new Set<string>();
+  if (!Array.isArray(serviceMappings) || serviceMappings.length !== declaredServices.length) {
     throw new Error("private execution service binding bridge is unavailable");
+  }
+  for (const mapping of serviceMappings) {
+    if (
+      !mapping ||
+      !serviceNames.delete(mapping.name) ||
+      typeof mapping.socketPath !== "string" ||
+      !isAbsolute(mapping.socketPath) ||
+      resolve(mapping.socketPath) !== mapping.socketPath ||
+      mapping.socketPath.includes("\u0000") ||
+      Buffer.byteLength(mapping.socketPath) > 100 ||
+      dirname(mapping.socketPath) !== root ||
+      mapping.socketPath === runSocketPath ||
+      servicePaths.has(mapping.socketPath)
+    ) {
+      throw new Error("unusable private execution service binding bridge");
+    }
+    servicePaths.add(mapping.socketPath);
   }
   const companion = validDataPlaneAddress(options.companionAddress);
   const planeAddress = site.dataPlane
@@ -1802,12 +2165,20 @@ export async function writeWorkerdPrivateExecution(options: {
     prepared.manifest.vars?.some(
       (binding) =>
         binding.name === companionBinding ||
+        declaredServices.some((service) => service.name === binding.name) ||
         (prepared.manifest.dataPlane && binding.name === DATA_SERVICE_BINDING),
     )
   ) {
     throw new Error("private execution internal binding collision");
   }
   bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
+  const serviceExternals = serviceMappings
+    .map((mapping, index) => {
+      const name = `service-${index}`;
+      bindings.push(`(name = ${capnpText(mapping.name)}, service = ${capnpText(name)})`);
+      return `\n  (name = ${capnpText(name)}, external = (address = ${capnpText(`unix:${mapping.socketPath}`)}, http = (style = proxy))),`;
+    })
+    .join("");
   let dataServices = "";
   if (prepared.manifest.dataPlane) {
     const plane = prepared.manifest.dataPlane;
@@ -1838,7 +2209,7 @@ const config :Workerd.Config = (
     compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}
+  (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}${serviceExternals}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = "workflow", address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = "application")]
@@ -2765,6 +3136,84 @@ function serviceRouterName(binding: WorkerdServiceBinding): string {
   return `selfhost-service-${digest}`;
 }
 
+function validPrivateSocketDirectory(path: string): void {
+  if (
+    typeof path !== "string" ||
+    !isAbsolute(path) ||
+    resolve(path) !== path ||
+    path.includes("\u0000") ||
+    Buffer.byteLength(join(path, `${"0".repeat(64)}.sock`)) > 100
+  ) {
+    throw new Error("unusable private service socket directory");
+  }
+}
+
+interface PrivateSocketIdentity {
+  readonly dev: number;
+  readonly ino: number;
+  readonly uid: number;
+}
+
+function samePrivateSocketIdentity(
+  left: PrivateSocketIdentity,
+  right: PrivateSocketIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.uid === right.uid;
+}
+
+async function privateSocketMetadata(path: string): Promise<PrivateSocketIdentity | undefined> {
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isSocket() || metadata.uid !== process.getuid?.()) {
+      throw new Error("private service socket path is not an owned socket");
+    }
+    return metadata;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function requirePrivateSocketDirectory(path: string): Promise<PrivateSocketIdentity> {
+  const metadata = await lstat(path);
+  if (
+    !metadata.isDirectory() ||
+    (metadata.mode & 0o777) !== 0o700 ||
+    metadata.uid !== process.getuid?.() ||
+    (await realpath(path)) !== path
+  ) {
+    throw new Error("unusable private service socket directory");
+  }
+  return metadata;
+}
+
+function privateServiceSocket(directory: string, router: string): string {
+  return join(directory, `${router.slice("selfhost-service-".length)}.sock`);
+}
+
+interface PrivateServiceGraph {
+  readonly socketDirectory: string;
+  readonly bindings: ReadonlyMap<string, WorkerdServiceBinding>;
+}
+
+function collectServiceBindings(
+  published: readonly PublishedDeployment[],
+  retained: readonly WorkerdServiceBinding[] = [],
+): ReadonlyMap<string, WorkerdServiceBinding> {
+  const bindings = new Map<string, WorkerdServiceBinding>();
+  for (const deployment of published) {
+    for (const entry of deployment.variants) {
+      for (const binding of validServiceBindings(entry.manifest.serviceBindings ?? [])) {
+        bindings.set(serviceRouterName(binding), binding);
+      }
+    }
+  }
+  for (const binding of retained) bindings.set(serviceRouterName(binding), binding);
+  return new Map([...bindings].sort(([left], [right]) => left.localeCompare(right)));
+}
+
 function variantFetchService(entry: PublishedVariant): string {
   return entry.manifest.assets ? `${entry.name}-asset-router` : entry.name;
 }
@@ -2785,30 +3234,42 @@ function logicalEventService(entry: PublishedDeployment): string | null {
   return variant?.manifest.events ? `${variant.name}-selfhost-events` : null;
 }
 
-function publishedGraphIdentity(published: readonly PublishedDeployment[]): string {
-  return createHash("sha256")
-    .update(
-      JSON.stringify(
-        published.map((deployment) => ({
-          name: deployment.name,
-          generation: deployment.generation ?? null,
-          workerResourceUid: deployment.workerResourceUid ?? null,
-          hostnames: deployment.hostnames,
-          weighted: deployment.weighted,
-          variants: deployment.variants.map((variant) => ({
-            name: variant.name,
-            storagePrefix: variant.storagePrefix,
-            assetRoot: variant.assetRoot,
-            versionId: variant.versionId ?? null,
-            workerVersionUid: variant.workerVersionUid ?? null,
-            weight: variant.weight ?? null,
-            manifest: variant.manifest,
-          })),
+function publishedGraphIdentity(
+  published: readonly PublishedDeployment[],
+  privateServices?: PrivateServiceGraph,
+): string {
+  const hash = createHash("sha256").update(
+    JSON.stringify(
+      published.map((deployment) => ({
+        name: deployment.name,
+        generation: deployment.generation ?? null,
+        workerResourceUid: deployment.workerResourceUid ?? null,
+        hostnames: deployment.hostnames,
+        weighted: deployment.weighted,
+        variants: deployment.variants.map((variant) => ({
+          name: variant.name,
+          storagePrefix: variant.storagePrefix,
+          assetRoot: variant.assetRoot,
+          versionId: variant.versionId ?? null,
+          workerVersionUid: variant.workerVersionUid ?? null,
+          weight: variant.weight ?? null,
+          manifest: variant.manifest,
         })),
-      ),
-      "utf8",
-    )
-    .digest("hex");
+      })),
+    ),
+    "utf8",
+  );
+  if (privateServices) {
+    // A reload that only prunes retired callers must not be acknowledged by
+    // the prior graph's probe. Private topology is part of config identity.
+    hash.update("\u0000private-services\u0000").update(
+      JSON.stringify({
+        directory: privateServices.socketDirectory,
+        routers: [...privateServices.bindings.keys()],
+      }),
+    );
+  }
+  return hash.digest("hex");
 }
 
 /**
@@ -2863,9 +3324,10 @@ function renderConfig(
   configProbeToken?: string,
   internalReadinessCapability = "",
   dataPlaneAddress?: string,
+  privateServices?: PrivateServiceGraph,
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
-  const graphIdentity = publishedGraphIdentity(published);
+  const graphIdentity = publishedGraphIdentity(published, privateServices);
   const services = variants
     .map((entry) => {
       const bindings = [
@@ -2959,12 +3421,7 @@ function renderConfig(
   // included. Target selection is only the persisted script + Resource UID;
   // the request URL and Host header are never consulted.
   const publishedByName = new Map(published.map((entry) => [entry.name, entry] as const));
-  const routedBindings = new Map<string, WorkerdServiceBinding>();
-  for (const entry of variants) {
-    for (const binding of validServiceBindings(entry.manifest.serviceBindings ?? [])) {
-      routedBindings.set(serviceRouterName(binding), binding);
-    }
-  }
+  const routedBindings = privateServices?.bindings ?? collectServiceBindings(published);
   const serviceBindingServices = [...routedBindings]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([name, binding]) => {
@@ -3161,6 +3618,13 @@ function renderConfig(
       .map((entry) => `      (name = ${capnpText(entry)}, service = ${capnpText(entry)}),`),
   ].join("\n");
 
+  const privateSockets = privateServices
+    ? [...privateServices.bindings.keys()].map(
+        (router) =>
+          `( name = ${capnpText(router)}, address = ${capnpText(`unix:${privateServiceSocket(privateServices.socketDirectory, router)}`)}, http = (style = proxy), service = ${capnpText(router)} )`,
+      )
+    : [];
+
   return `using Workerd = import "/workerd/workerd.capnp";
 
 const config :Workerd.Config = (
@@ -3182,7 +3646,7 @@ ${bindings}
     )
   ),
   ],
-  sockets = [ ${socket(port, tls)} ]
+  sockets = [ ${[socket(port, tls), ...privateSockets].join(", ")} ]
 );
 `;
 }

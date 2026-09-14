@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   createWorkerdExecutionGuard,
   type WorkerdExecutionRegistration,
+  type WorkerdExecutionServiceGateway,
   type WorkerdGuardProcess,
 } from "../src/workerd-execution-guard.ts";
 
@@ -10,6 +11,12 @@ const registration: WorkerdExecutionRegistration = {
   deadlineAt: 30_000,
   until: 10_000,
 };
+
+const gateway = (index: number): WorkerdExecutionServiceGateway => ({
+  listenPath: `/private/run/s${index}.sock`,
+  upstreamPath: `/private/shared/${index.toString(16).padStart(64, "0")}.sock`,
+  unavailableToken: "b".repeat(64),
+});
 
 function fixture(
   timeout = 1_000,
@@ -96,6 +103,126 @@ test("registration is paused; start, renewal and stop preserve ordered identity 
   expect(f.killed()).toBe(0);
   f.exit(0);
   f.eof();
+});
+
+test("service gateways use bounded ordered frames before the unchanged START frame", async () => {
+  const f = fixture();
+  await f.reply(1, "registered");
+  await f.guard.registered;
+  const firstGateway = gateway(1);
+  const secondGateway = gateway(2);
+  const gateways = [firstGateway, secondGateway];
+  const start = f.guard.start("/private/run/workerd.capnp", gateways);
+
+  await f.sent(2);
+  expect(f.frames).toHaveLength(2);
+  expect(f.frames[1]).toEqual({
+    id: 2,
+    op: "gateway",
+    identity: registration.identity,
+    ...firstGateway,
+  });
+  await f.reply(2, "configured");
+  await f.sent(3);
+  expect(f.frames[2]).toEqual({
+    id: 3,
+    op: "gateway",
+    identity: registration.identity,
+    ...secondGateway,
+  });
+  await f.reply(3, "configured");
+  await f.sent(4);
+  expect(f.frames[3]).toEqual({
+    id: 4,
+    op: "start",
+    identity: registration.identity,
+    configPath: "/private/run/workerd.capnp",
+  });
+  await f.reply(4, "started");
+  await start;
+  const stop = f.guard.stop();
+  await f.reply(5, "stopped");
+  await stop;
+  f.eof();
+  f.exit(0);
+});
+
+test("the full 64-binding manifest stays below both frame and pending bounds", async () => {
+  const f = fixture();
+  await f.reply(1, "registered");
+  await f.guard.registered;
+  const gateways = Array.from({ length: 64 }, (_, index) => gateway(index));
+  const start = f.guard.start("/private/run/workerd.capnp", gateways);
+  for (let index = 0; index < gateways.length; index += 1) {
+    const id = index + 2;
+    await f.reply(id, "configured");
+    expect(
+      new TextEncoder().encode(`${JSON.stringify(f.frames[id - 1])}\n`).length,
+    ).toBeLessThanOrEqual(16 * 1_024);
+  }
+  await f.reply(66, "started");
+  await start;
+  expect(f.frames.map((frame) => frame.op)).toEqual([
+    "register",
+    ...Array.from({ length: 64 }, () => "gateway"),
+    "start",
+  ]);
+  const stop = f.guard.stop();
+  await f.reply(67, "stopped");
+  await stop;
+  f.eof();
+  f.exit(0);
+});
+
+test("STOP preempts pending gateway configuration without sending START", async () => {
+  const f = fixture();
+  await f.reply(1, "registered");
+  await f.guard.registered;
+  const start = f.guard
+    .start("/private/run/workerd.capnp", [gateway(1), gateway(2)])
+    .catch((error: Error) => error.message);
+  await f.sent(2);
+  const stop = f.guard.stop();
+  await f.reply(3, "stopped");
+  await stop;
+  expect(await start).toBe("stopped");
+  expect(f.frames.map((frame) => frame.op)).toEqual(["register", "gateway", "stop"]);
+  expect(f.killed()).toBe(0);
+  f.eof();
+  f.exit(0);
+});
+
+test("every service gateway is validated before the first configuration frame", async () => {
+  const f = fixture();
+  await f.reply(1, "registered");
+  await f.guard.registered;
+  const valid = gateway(1);
+  const invalidSets: readonly (readonly WorkerdExecutionServiceGateway[])[] = [
+    [valid, { ...gateway(2), listenPath: valid.listenPath }],
+    [{ ...valid, listenPath: "/private/run/run.sock" }],
+    [{ ...valid, listenPath: "relative.sock" }],
+    [{ ...valid, upstreamPath: "/private/shared/router.sock" }],
+    [{ ...valid, unavailableToken: "B".repeat(64) }],
+    [{ ...valid, listenPath: `/private/run/${"é".repeat(50)}.sock` }],
+    Array.from({ length: 65 }, (_, index) => gateway(index)),
+  ];
+  for (const gateways of invalidSets) {
+    await expect(f.guard.start("/private/run/workerd.capnp", gateways)).rejects.toThrow(
+      "invalid_input",
+    );
+    expect(f.frames.map((frame) => frame.op)).toEqual(["register"]);
+  }
+  await expect(
+    f.guard.start("/private/run/workerd.capnp", [
+      { ...valid, extra: true } as WorkerdExecutionServiceGateway,
+    ]),
+  ).rejects.toThrow("invalid_input");
+  expect(f.frames.map((frame) => frame.op)).toEqual(["register"]);
+  const stop = f.guard.stop();
+  await f.reply(2, "stopped");
+  await stop;
+  f.eof();
+  f.exit(0);
 });
 
 test("stop during registration never permits a later start or renewal", async () => {

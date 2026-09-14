@@ -5,6 +5,7 @@ import {
   spawnWorkerdExecutionGuard,
   type WorkerdExecutionGuard,
   type WorkerdExecutionRegistration,
+  type WorkerdExecutionServiceGateway,
 } from "./workerd-execution-guard.ts";
 import {
   encodeDocument,
@@ -33,6 +34,8 @@ import {
  */
 export interface PreparedWorkerdWorkflow {
   readonly configPath: string;
+  /** Private per-binding listeners the guard must bind before START. */
+  readonly serviceGateways?: readonly WorkerdExecutionServiceGateway[];
   /** Bounded synchronous control latch for one already-correlated frame. */
   acceptFrame(sequence: number, payload: string): void;
   /** Called once, only after the exact guard acknowledges start. */
@@ -319,7 +322,7 @@ export function createWorkerdWorkflowExecutionHost(options: {
               }
               entry.preparedValue = prepared;
               entry.startRequested = true;
-              await guard.start(prepared.configPath);
+              await guard.start(prepared.configPath, prepared.serviceGateways);
               requireLive(entry);
               return await prepared.run(driver);
             } catch (error) {

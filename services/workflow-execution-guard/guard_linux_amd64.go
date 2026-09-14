@@ -40,13 +40,16 @@ var (
 )
 
 type request struct {
-	ID           int64
-	Op           string
-	Identity     string
-	DeadlineAt   int64
-	Until        int64
-	ConfigPath   string
-	JournalToken string
+	ID               int64
+	Op               string
+	Identity         string
+	DeadlineAt       int64
+	Until            int64
+	ConfigPath       string
+	JournalToken     string
+	ListenPath       string
+	UpstreamPath     string
+	UnavailableToken string
 }
 
 type reply struct {
@@ -159,6 +162,11 @@ func Run(options Options) error {
 				err = controller.start(request)
 				// A start is acknowledged only from startResults, after the
 				// child has been created and the STOP/EOF race is resolved.
+			case "gateway":
+				err = controller.configureGateway(request)
+				if err == nil {
+					err = writer.send(reply{ID: request.ID, Kind: "configured"})
+				}
 			case "extend":
 				err = controller.extend(request)
 				if err == nil {
@@ -375,6 +383,19 @@ func decodeRequest(raw []byte) (request, error) {
 		if err != nil || !filepath.IsAbs(result.ConfigPath) || strings.IndexByte(result.ConfigPath, 0) >= 0 {
 			return result, guardError(CodeInvalidConfigPath, errors.New("configPath must be an absolute path"))
 		}
+	case "gateway":
+		result.ListenPath, err = parseString(fields["listenPath"])
+		if err != nil || !validUnixSocketPath(result.ListenPath) {
+			return result, guardError(CodeInvalidGateway, errors.New("listenPath must be a canonical bounded absolute path"))
+		}
+		result.UpstreamPath, err = parseString(fields["upstreamPath"])
+		if err != nil || !validUnixSocketPath(result.UpstreamPath) || !validUpstreamSocketName(result.UpstreamPath) {
+			return result, guardError(CodeInvalidGateway, errors.New("upstreamPath must name a bounded private router socket"))
+		}
+		result.UnavailableToken, err = parseString(fields["unavailableToken"])
+		if err != nil || !validIdentity(result.UnavailableToken) {
+			return result, guardError(CodeInvalidGateway, errors.New("unavailableToken must be 64 lowercase hexadecimal characters"))
+		}
 	case "stop":
 	default:
 		return result, guardError(CodeInvalidFrame, errors.New("unsupported operation"))
@@ -384,7 +405,7 @@ func decodeRequest(raw []byte) (request, error) {
 
 func isFrameField(field string) bool {
 	switch field {
-	case "id", "op", "identity", "deadlineAt", "until", "configPath", "journalToken":
+	case "id", "op", "identity", "deadlineAt", "until", "configPath", "journalToken", "listenPath", "upstreamPath", "unavailableToken":
 		return true
 	default:
 		return false
@@ -400,6 +421,8 @@ func requireFrameFields(fields map[string]json.RawMessage, op string) error {
 		want["until"] = true
 	case "start":
 		want["configPath"] = true
+	case "gateway":
+		want["listenPath"], want["upstreamPath"], want["unavailableToken"] = true, true, true
 	case "stop":
 	default:
 		return guardError(CodeInvalidFrame, errors.New("unsupported operation"))
@@ -462,6 +485,19 @@ func validIdentity(identity string) bool {
 		}
 	}
 	return true
+}
+
+func validUnixSocketPath(path string) bool {
+	return filepath.IsAbs(path) &&
+		filepath.Clean(path) == path &&
+		strings.IndexByte(path, 0) < 0 &&
+		len(path) <= MaxUnixSocketPathBytes
+}
+
+func validUpstreamSocketName(path string) bool {
+	name := filepath.Base(path)
+	const suffix = ".sock"
+	return strings.HasSuffix(name, suffix) && validIdentity(strings.TrimSuffix(name, suffix))
 }
 
 func errorCode(err error, fallback Code) Code {
@@ -841,6 +877,8 @@ type controller struct {
 	startIssued   bool
 	child         *os.Process
 	spawn         *spawnAttempt
+	gateways      []serviceGatewayDescriptor
+	gatewayGroup  *serviceGatewayGroup
 	failures      chan lifecycleFailure
 	startResults  chan startResult
 }
@@ -989,15 +1027,60 @@ func (controller *controller) start(request request) error {
 		controller.mu.Unlock()
 		return guardError(expired, nil)
 	}
+	descriptors := append([]serviceGatewayDescriptor(nil), controller.gateways...)
+	var gatewayGroup *serviceGatewayGroup
+	if len(descriptors) > 0 {
+		validated, err := validateServiceGatewaySet(request.ConfigPath, descriptors)
+		if err != nil {
+			controller.mu.Unlock()
+			return err
+		}
+		gatewayGroup = newServiceGatewayGroup(validated, func() {
+			controller.signal(CodeServiceGateway)
+		})
+	}
 	attempt := newSpawnAttempt()
 	controller.startIssued = true
 	controller.spawn = attempt
+	controller.gatewayGroup = gatewayGroup
 	controller.mu.Unlock()
-	go controller.spawnChild(request.ConfigPath, attempt)
+	go controller.spawnChild(request.ConfigPath, attempt, gatewayGroup)
 
 	go func() {
 		controller.startResults <- startResult{id: request.ID, err: <-attempt.result}
 	}()
+	return nil
+}
+
+func (controller *controller) configureGateway(request request) error {
+	descriptor := serviceGatewayDescriptor{
+		listenPath:       request.ListenPath,
+		upstreamPath:     request.UpstreamPath,
+		unavailableToken: request.UnavailableToken,
+	}
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	if !controller.registered {
+		return guardError(CodeNotRegistered, errors.New("register is required"))
+	}
+	if request.Identity != controller.identity {
+		return guardError(CodeInvalidIdentity, errors.New("identity does not match registration"))
+	}
+	if controller.terminal {
+		return guardError(controller.terminalError, nil)
+	}
+	if controller.startIssued {
+		return guardError(CodeAlreadyStarted, errors.New("gateway cannot be configured after start"))
+	}
+	if len(controller.gateways) >= MaxServiceGateways {
+		return guardError(CodeInvalidGateway, errors.New("too many service gateways"))
+	}
+	for _, existing := range controller.gateways {
+		if existing.listenPath == descriptor.listenPath {
+			return guardError(CodeInvalidGateway, errors.New("duplicate service gateway listener"))
+		}
+	}
+	controller.gateways = append(controller.gateways, descriptor)
 	return nil
 }
 
@@ -1164,9 +1247,33 @@ func (controller *controller) watchTimer(timer *realtimeTimer) {
 	}
 }
 
-func (controller *controller) spawnChild(configPath string, attempt *spawnAttempt) {
+func (controller *controller) spawnChild(
+	configPath string,
+	attempt *spawnAttempt,
+	gateways *serviceGatewayGroup,
+) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	childOwnsGateways := false
+	defer func() {
+		if gateways != nil && !childOwnsGateways {
+			_ = gateways.stopAndWait()
+		}
+	}()
+	if gateways != nil {
+		if err := gateways.start(); err != nil {
+			wrapped := guardError(errorCode(err, CodeServiceGateway), err)
+			attempt.result <- wrapped
+			controller.markTerminal(errorCode(wrapped, CodeServiceGateway))
+			close(attempt.done)
+			return
+		}
+	}
+	if terminal := controller.terminalCode(); terminal != "" {
+		attempt.result <- guardError(terminal, nil)
+		close(attempt.done)
+		return
+	}
 
 	command := exec.Command(controller.binary, "serve", configPath)
 	command.Env = []string{}
@@ -1239,6 +1346,7 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 			close(attempt.done)
 			return
 		}
+		childOwnsGateways = true
 		attempt.result <- nil
 		waitErr := command.Wait()
 		controller.mu.Lock()
@@ -1278,6 +1386,7 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 		close(attempt.done)
 		return
 	}
+	childOwnsGateways = true
 	attempt.result <- nil
 	waitErr := command.Wait()
 	controller.mu.Lock()
@@ -1349,6 +1458,7 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 	}
 	process := controller.child
 	attempt := controller.spawn
+	gateways := controller.gatewayGroup
 	controller.child = nil
 	timer := controller.timer
 	deadlineTimer := controller.deadlineTimer
@@ -1362,7 +1472,13 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 			killErr = nil
 		}
 	}
+	if gateways != nil {
+		gateways.stop()
+	}
 	if attempt != nil {
+		// STOP can win while a gateway listener is bound but not yet registered
+		// with the group. The spawn barrier proves that listener was closed and
+		// inode-safely unlinked before a stopped ACK is possible.
 		select {
 		case <-attempt.done:
 		case <-time.After(replyWriteTimeout):
@@ -1383,6 +1499,10 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 		default:
 		}
 	}
+	var gatewayErr error
+	if gateways != nil {
+		gatewayErr = gateways.wait()
+	}
 	var journalErr error
 	if stream := controller.journalStreamValue(); stream != nil {
 		journalErr = controller.waitJournal(stream)
@@ -1400,6 +1520,9 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 	}
 	if killErr != nil {
 		return guardError(CodeStopFailed, killErr)
+	}
+	if gatewayErr != nil {
+		return guardError(CodeStopFailed, gatewayErr)
 	}
 	if journalErr != nil {
 		return journalErr

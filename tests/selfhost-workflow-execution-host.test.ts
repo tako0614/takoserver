@@ -7,6 +7,7 @@ import {
 import type {
   WorkerdExecutionGuard,
   WorkerdExecutionRegistration,
+  WorkerdExecutionServiceGateway,
 } from "../src/workerd-execution-guard.ts";
 import type {
   WorkflowApplicationOutcome,
@@ -63,6 +64,7 @@ function fixture(
     ) => Promise<PreparedWorkerdWorkflow>;
     acceptFrame?: (sequence: number, payload: string) => void;
     run?: () => Promise<WorkflowApplicationOutcome>;
+    serviceGateways?: readonly WorkerdExecutionServiceGateway[];
     drain?: () => Promise<void>;
     dispose?: () => Promise<void>;
   } = {},
@@ -75,8 +77,10 @@ function fixture(
   const preparedStarted = deferred<void>();
   const guardStarted = deferred<void>();
   const guardStopped = deferred<void>();
+  const startedGateways: Array<readonly WorkerdExecutionServiceGateway[]> = [];
   const prepared: PreparedWorkerdWorkflow = {
     configPath: "/retained/execution.capnp",
+    ...(options.serviceGateways === undefined ? {} : { serviceGateways: options.serviceGateways }),
     acceptFrame(sequence, payload) {
       options.acceptFrame?.(sequence, payload);
     },
@@ -107,8 +111,9 @@ function fixture(
       return {
         registered: options.registered ?? Promise.resolve(),
         exited: options.exited ?? new Promise<number>(() => {}),
-        async start(path) {
+        async start(path, gateways) {
           expect(path).toBe(prepared.configPath);
+          startedGateways.push(gateways ?? []);
           events.push("start");
           guardStarted.resolve();
           await options.start?.();
@@ -141,6 +146,7 @@ function fixture(
     preparedStarted: preparedStarted.promise,
     guardStarted: guardStarted.promise,
     guardStopped: guardStopped.promise,
+    startedGateways,
     time(value: number) {
       time = value;
     },
@@ -148,6 +154,23 @@ function fixture(
 }
 
 describe("private guarded Workflow lifecycle", () => {
+  test("forwards private service gateways to the guard before START and preserves disposal order", async () => {
+    const gateway: WorkerdExecutionServiceGateway = {
+      listenPath: "/tmp/workflow-service-listen.sock",
+      upstreamPath: "/tmp/workflow-service-upstream.sock",
+      unavailableToken: "b".repeat(64),
+    };
+    const f = fixture({ serviceGateways: [gateway] });
+    const session = await f.host.openPaused(identity, undefined, 100);
+    await expect(session.run(driver)).resolves.toEqual({
+      kind: "complete",
+      output: { ok: true },
+    });
+    expect(f.startedGateways).toEqual([[gateway]]);
+    expect(await f.host.stop(identity, "complete")).toBe("stopped");
+    expect(f.events).toEqual(["register", "prepare", "start", "run", "stop", "drain", "dispose"]);
+  });
+
   test("registration is paused; selection/preparation happens only at run", async () => {
     const f = fixture();
     const session = await f.host.openPaused(identity, undefined, 100);

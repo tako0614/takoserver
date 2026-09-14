@@ -1,4 +1,5 @@
-import { isAbsolute } from "node:path";
+import { Buffer } from "node:buffer";
+import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 
 /** Host-private process protocol. This is not an application Binding or a qualified Workflow host. */
 export interface WorkerdExecutionRegistration {
@@ -10,11 +11,21 @@ export interface WorkerdExecutionRegistration {
   readonly journalToken?: string;
 }
 
+/** One guard-owned Unix listener for a private, incarnation-fenced service binding. */
+export interface WorkerdExecutionServiceGateway {
+  /** Per-execution listener rendered into the prepared workerd configuration. */
+  readonly listenPath: string;
+  /** Current shared-runtime router socket; never an application-selected address. */
+  readonly upstreamPath: string;
+  /** Exact private marker used only when the upstream socket cannot be connected. */
+  readonly unavailableToken: string;
+}
+
 export interface WorkerdExecutionGuard {
   /** Registration arms the independent deadline but does not start workerd. */
   readonly registered: Promise<void>;
   readonly exited: Promise<number>;
-  start(configPath: string): Promise<void>;
+  start(configPath: string, gateways?: readonly WorkerdExecutionServiceGateway[]): Promise<void>;
   extendDeadline(until: number): Promise<void>;
   /** Only a matching guard ACK proves that its exact child has been reaped. */
   stop(): Promise<void>;
@@ -38,7 +49,11 @@ export class WorkerdExecutionGuardError extends Error {
 
 const FRAME_LIMIT = 16 * 1_024;
 const MAX_PENDING = 32;
-type Ack = "registered" | "started" | "extended" | "stopped";
+const MAX_SERVICE_GATEWAYS = 64;
+const MAX_UNIX_SOCKET_PATH_BYTES = 100;
+const SERVICE_UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
+const SERVICE_UPSTREAM_SOCKET = /^[0-9a-f]{64}\.sock$/u;
+type Ack = "registered" | "configured" | "started" | "extended" | "stopped";
 
 /**
  * Binary paths must be operator-owned retained artifacts; this function does
@@ -300,16 +315,28 @@ export function createWorkerdExecutionGuard(options: {
   return {
     registered,
     exited: child.exited,
-    start(configPath) {
+    start(configPath, gateways = []) {
       if (stopping) return Promise.reject(new WorkerdExecutionGuardError("stopped"));
       if (started) return Promise.reject(new WorkerdExecutionGuardError("invalid_input"));
+      let validated: readonly WorkerdExecutionServiceGateway[];
       try {
         validatePath(configPath);
+        validated = validateServiceGateways(configPath, gateways);
       } catch (error) {
         return Promise.reject(error);
       }
       started = true;
-      return request("start", "started", { configPath });
+      return (async () => {
+        // Configure one descriptor per bounded frame. Waiting for each ACK keeps
+        // even the full manifest bound below MAX_PENDING and gives STOP a point
+        // at which to preempt the remaining configuration and child spawn.
+        for (const gateway of validated) {
+          if (stopping) throw new WorkerdExecutionGuardError("stopped");
+          await request("gateway", "configured", { ...gateway });
+        }
+        if (stopping) throw new WorkerdExecutionGuardError("stopped");
+        await request("start", "started", { configPath });
+      })();
     },
     extendDeadline(until) {
       if (stopping) return Promise.reject(new WorkerdExecutionGuardError("stopped"));
@@ -339,4 +366,56 @@ function validatePath(path: string): void {
   if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0")) {
     throw new WorkerdExecutionGuardError("invalid_input");
   }
+}
+
+function validateServiceGateways(
+  configPath: string,
+  gateways: readonly WorkerdExecutionServiceGateway[],
+): readonly WorkerdExecutionServiceGateway[] {
+  if (!Array.isArray(gateways) || gateways.length > MAX_SERVICE_GATEWAYS) {
+    throw new WorkerdExecutionGuardError("invalid_input");
+  }
+  if (gateways.length === 0) return [];
+
+  const configDirectory = dirname(configPath);
+  if (normalize(configPath) !== configPath || normalize(configDirectory) !== configDirectory) {
+    throw new WorkerdExecutionGuardError("invalid_input");
+  }
+  const runSocketPath = join(configDirectory, "run.sock");
+  const listenPaths = new Set<string>();
+  return gateways.map((gateway) => {
+    if (
+      typeof gateway !== "object" ||
+      gateway === null ||
+      Array.isArray(gateway) ||
+      Object.keys(gateway).sort().join(",") !== "listenPath,unavailableToken,upstreamPath" ||
+      typeof gateway.listenPath !== "string" ||
+      typeof gateway.upstreamPath !== "string" ||
+      typeof gateway.unavailableToken !== "string"
+    ) {
+      throw new WorkerdExecutionGuardError("invalid_input");
+    }
+    const { listenPath, upstreamPath, unavailableToken } = gateway;
+    if (
+      !isAbsolute(listenPath) ||
+      normalize(listenPath) !== listenPath ||
+      listenPath.includes("\0") ||
+      Buffer.byteLength(listenPath) > MAX_UNIX_SOCKET_PATH_BYTES ||
+      dirname(listenPath) !== configDirectory ||
+      listenPath === configPath ||
+      listenPath === runSocketPath ||
+      listenPaths.has(listenPath) ||
+      !isAbsolute(upstreamPath) ||
+      normalize(upstreamPath) !== upstreamPath ||
+      upstreamPath.includes("\0") ||
+      Buffer.byteLength(upstreamPath) > MAX_UNIX_SOCKET_PATH_BYTES ||
+      !SERVICE_UPSTREAM_SOCKET.test(basename(upstreamPath)) ||
+      upstreamPath === listenPath ||
+      !SERVICE_UNAVAILABLE_TOKEN.test(unavailableToken)
+    ) {
+      throw new WorkerdExecutionGuardError("invalid_input");
+    }
+    listenPaths.add(listenPath);
+    return { listenPath, upstreamPath, unavailableToken };
+  });
 }

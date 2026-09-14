@@ -6,8 +6,11 @@ import { WORKFLOW_HTTP_BOOTSTRAP_SOURCE } from "./generated/workflow-http-bootst
 import type { JsonObject } from "./ports.ts";
 import type { PreparedWorkerdWorkflow } from "./selfhost-workflow-execution-host.ts";
 import { prepareWorkflowHttpExecution } from "./selfhost-workflow-http-transport.ts";
+import type { WorkerdExecutionServiceGateway } from "./workerd-execution-guard.ts";
 import {
+  type HostedWorkerdRuntime,
   readWorkerdSelectedActiveVersion,
+  type WorkerdSite,
   writeWorkerdPrivateExecution,
 } from "./workerd-runtime.ts";
 import { WorkflowRuntimeError } from "./workflow-driver.ts";
@@ -22,6 +25,56 @@ export interface SelfhostWorkflowTarget {
   readonly className: string;
 }
 
+type PrivateServiceRuntime = Pick<HostedWorkerdRuntime, "acquirePrivateServiceBindings">;
+type PrivateServiceLease = Awaited<
+  ReturnType<PrivateServiceRuntime["acquirePrivateServiceBindings"]>
+>;
+
+function privateServiceMappings(
+  root: string,
+  bindings: NonNullable<WorkerdSite["serviceBindings"]>,
+  lease: PrivateServiceLease,
+): {
+  readonly bindings: readonly { readonly name: string; readonly socketPath: string }[];
+  readonly gateways: readonly WorkerdExecutionServiceGateway[];
+} {
+  if (!lease || !Array.isArray(lease.services) || typeof lease.release !== "function") {
+    throw new Error("invalid private service lease");
+  }
+  if (lease.services.length !== bindings.length) {
+    throw new Error("private service lease does not match selected Version");
+  }
+  const services = new Map<string, (typeof lease.services)[number]>();
+  for (const service of lease.services) {
+    if (
+      typeof service?.name !== "string" ||
+      typeof service.upstreamSocket !== "string" ||
+      service.upstreamSocket.length === 0 ||
+      typeof service.unavailableToken !== "string" ||
+      services.has(service.name)
+    ) {
+      throw new Error("invalid private service lease");
+    }
+    services.set(service.name, service);
+  }
+  const mappedBindings: Array<{ readonly name: string; readonly socketPath: string }> = [];
+  const gateways: WorkerdExecutionServiceGateway[] = [];
+  for (const [index, binding] of bindings.entries()) {
+    const service = services.get(binding.name);
+    if (!service || service.unavailableToken !== binding.unavailableToken) {
+      throw new Error("private service lease does not match selected Version");
+    }
+    const socketPath = join(root, `s${index.toString(10)}.sock`);
+    mappedBindings.push({ name: binding.name, socketPath });
+    gateways.push({
+      listenPath: socketPath,
+      upstreamPath: service.upstreamSocket,
+      unavailableToken: service.unavailableToken,
+    });
+  }
+  return { bindings: mappedBindings, gateways };
+}
+
 /**
  * Dormant concrete loader. No serving entry wires this factory. Its caller must
  * resolve the exact accepted Workflow Resource/worker relation, immutable class
@@ -32,6 +85,8 @@ export interface SelfhostWorkflowTarget {
 export function createSelfhostWorkflowPreparation(options: {
   readonly runtimeRoot: string;
   readonly temporaryRoot?: string;
+  /** Host-owned private service socket authority; never a provider/public port. */
+  readonly serviceRuntime?: PrivateServiceRuntime;
   /** Read-only resolver; honor cancellation and never allocate runtime artifacts. */
   readonly resolveTarget: (
     identity: WorkflowRunIdentity,
@@ -134,9 +189,38 @@ export function createSelfhostWorkflowPreparation(options: {
       async configure(companionAddress, configureSignal) {
         configureSignal.throwIfAborted();
         const root = await mkdtemp(join(temporaryRoot, "twf-"));
+        let serviceLease: PrivateServiceLease | undefined;
+        let serviceLeaseReleased = false;
+        const releaseServiceLease = async (): Promise<void> => {
+          if (!serviceLease || serviceLeaseReleased) return;
+          await serviceLease.release();
+          serviceLeaseReleased = true;
+        };
         try {
           await chmod(root, 0o700);
           const runSocketPath = join(root, "run.sock");
+          let serviceBindings:
+            | readonly { readonly name: string; readonly socketPath: string }[]
+            | undefined;
+          let serviceGateways: readonly WorkerdExecutionServiceGateway[] | undefined;
+          const selectedBindings = selected.site.serviceBindings ?? [];
+          if (selectedBindings.length > 0) {
+            if (!options.serviceRuntime) {
+              throw new Error("private execution service binding bridge is unavailable");
+            }
+            serviceLease = await options.serviceRuntime.acquirePrivateServiceBindings({
+              script: target.script,
+              generation: selected.generation,
+              generationKey: selected.generationKey,
+              workerResourceUid: selected.workerResourceUid,
+              versionId: selected.versionId,
+              workerVersionUid: selected.workerVersionUid,
+            });
+            configureSignal.throwIfAborted();
+            const mapped = privateServiceMappings(root, selectedBindings, serviceLease);
+            serviceBindings = mapped.bindings;
+            serviceGateways = mapped.gateways;
+          }
           const dataPlaneAddress = selected.site.dataPlane
             ? options.dataPlaneAddress?.()
             : undefined;
@@ -153,16 +237,40 @@ export function createSelfhostWorkflowPreparation(options: {
             hostModules,
             companionAddress,
             runSocketPath,
+            ...(serviceBindings === undefined ? {} : { serviceBindings }),
             ...(dataPlaneAddress === undefined ? {} : { dataPlaneAddress }),
           });
           configureSignal.throwIfAborted();
           return {
             configPath,
             runSocketPath,
-            dispose: () => rm(root, { recursive: true, force: true }),
+            ...(serviceGateways === undefined ? {} : { serviceGateways }),
+            async dispose() {
+              await rm(root, { recursive: true, force: true });
+              await releaseServiceLease();
+            },
           };
         } catch (error) {
-          await rm(root, { recursive: true, force: true });
+          let cleanupError: unknown;
+          try {
+            await rm(root, { recursive: true, force: true });
+          } catch (failure) {
+            cleanupError = failure;
+          }
+          let releaseError: unknown;
+          try {
+            // Configuration failed before a child could start, so the lease
+            // may be released even when artifact removal itself needs retry.
+            await releaseServiceLease();
+          } catch (failure) {
+            releaseError = failure;
+          }
+          if (cleanupError !== undefined || releaseError !== undefined) {
+            throw new AggregateError(
+              [error, cleanupError, releaseError].filter((value) => value !== undefined),
+              "private execution preparation cleanup failed",
+            );
+          }
           throw error;
         }
       },

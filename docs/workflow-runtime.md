@@ -411,16 +411,91 @@ directory and 0600 code/config files, exact committed vars, no public hostname
 routes and a denied global outbound service. A declared data-plane facade uses
 the current Host listener supplied by composition, never its persisted
 prior-process address. Its sensitive bindings remain on the facade only.
-Versions declaring service bindings are explicitly refused until a private,
-target-UID-fenced bridge exists. Asset/event ingress services are not class env
-bindings and are not installed in the subprocess.
+Versions declaring service bindings require the composition's private
+`HostedWorkerdRuntime.acquirePrivateServiceBindings` port. An unconfigured
+bridge is refused; bindings are never silently omitted. Asset/event ingress
+services are not class env bindings and are not installed in the subprocess.
+
+### Private service bindings
+
+The shared runtime owns a reference-counted lease for each captured caller's
+service routers. Acquisition is serialized with graph activation, checks the
+exact Worker UID, deployment generation and generation key, and selected
+Version ID/UID, then derives bindings from the verified immutable manifest.
+The execution cannot provide a new target or token. This capability is not on
+the provider-facing runtime port or package-root exports.
+
+An opt-in, existing operator-owned 0700 directory outside the runtime root
+holds the shared Unix sockets; removing a publication cannot remove it.
+Its canonical path must not traverse symlinks and must fit the native socket
+path limit including each hashed filename. It must be fresh and empty for each
+shared-runtime incarnation; a restarted Host never adopts stale socket paths.
+This opt-in requires immutable weighted `publish()` for updates and retirement;
+legacy in-place `write()`/`remove()` calls are refused before any mutation.
+The composition owns this directory until the shared supervisor has stopped.
+Ordinary graph renders expose sockets
+for current bindings and retain routers with live execution leases. Acquisition
+does not normally reload the shared process. Acquisition requires the
+authenticated reload/readback path, not a liveness flag on staged files.
+The configuration readback identity
+includes the private socket topology, including retained routers.
+
+The native watcher re-executes workerd without retaining configuration-created
+Unix listeners. Before the staged configuration is atomically renamed, the
+runtime validates the directory incarnation and every owned socket inode,
+requires new paths to be absent, and unlinks only its exact prior sockets.
+Helper modules are immutable after the first transition; a mismatch requires
+a supervised restart rather than a premature watcher reload. The new graph and
+its complete socket set must both be confirmed before activation. An unproved
+reload permanently refuses further activation/acquisition for that runtime
+incarnation and preserves its paths, including sockets that may appear late.
+Recovery requires the composition to stop/reap the shared process and create a
+fresh runtime and socket directory. This is a Host authority fence, not physical
+serving shutdown: existing routes/connections may remain reachable until that
+stop/reap. A future serving composition must perform that stop before this
+adapter may be enabled. Automatic rollback is allowed only after
+the forward graph and socket set were proved but a later commit failed. Unknown
+or replaced paths are preserved and activation is cleared. Reload can interrupt
+existing connections and temporarily refuse new ones; this is not a zero-downtime
+supervisor or a guarantee of transparent retry.
+
+A captured caller may finish after its Version is retired. Its router still
+selects the target's **current** deployment using the original target Resource
+UID. Target deletion, loss of a fetch handler, or reuse of the logical name with
+a different UID yields the existing authenticated unavailable response. It
+never falls back to a public endpoint or another Resource.
+
+The execution guard binds a fresh per-binding Unix listener before starting its
+child. It connects to the shared router before copying request bytes. A failed
+upstream connection returns the same private unavailable signal. It half-closes
+the response side and drains unread request bytes for at most 250 ms before
+full close, preventing a preloaded POST body from resetting an already-written
+unavailable response. Stop still interrupts and joins that bounded drain. After a
+successful connection, it only forwards bytes in both directions. Native
+proxy-style HTTP at both workerd ends carries the original URL and request
+headers without adding routing metadata. Streams, WebSockets, cancellation and
+ordinary target error responses are not reconstructed by a controller-side HTTP
+dispatcher. A post-connect stream failure is not relabeled as unavailable.
+
+Guard stop, deadline and controller EOF close and join the forwarders as well
+as reaping the child. The outer host then drains ingress and seals its journal.
+Successful preparation releases the lease only after that barrier and removal
+of the temporary execution directory. A released inactive router may be pruned
+by the next ordinary reload; it has no surviving execution holder. Preparation
+failure occurs before any child starts and owns cleanup of its partial lease
+and artifacts. No new public Form or Interface contract is introduced here.
+
+The focused native service-binding fixture exercises this bridge with the
+pinned runtime and guard, including caller retirement, target replacement,
+deletion and same-name UID reuse. Its existence is not a successful native
+qualification or public admission claim; recorded test results determine that.
 
 The native fixture publishes a weighted filesystem graph and uses this loader,
 rather than assembling a second handwritten config or bundling per run. Its
 fake publication readiness is fixture setup, not Form admission or live
 serving evidence. Before RUN it checks native readiness even for a module that
 throws at top level, proving that readiness does not evaluate that module.
-Full binding/resource routing, durable target resolution, scheduler integration,
+Complete resource-binding coverage, durable target resolution, scheduler integration,
 complete native failure qualification and the managed WfP backend remain
 unfinished. No serving entrypoint selects this execution adapter; Workflow and
 Actor support remain false.
@@ -520,8 +595,9 @@ are unchanged; no migration or new serving path is implied by that extension.
 The coordinator and class projection are not wired to production entrypoints
 or exported from the package root. Their execution-host protocol is not a
 selected app-facing Binding. The private class/transport composition still
-needs the real then-current weighted deployment selector, complete resource
-bindings and native qualification. Publication and exact contract
+needs durable Resource resolution, scheduler composition, complete resource
+bindings and native qualification. The private loader selects the then-current
+weighted deployment; that does not itself provide serving composition. Publication and exact contract
 selection remain separate from this private implementation. These are runtime
 responsibilities, not tasks for Takosumi or an application-specific adapter.
 

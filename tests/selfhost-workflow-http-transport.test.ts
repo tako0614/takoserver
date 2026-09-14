@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { prepareWorkflowHttpExecution } from "../src/selfhost-workflow-http-transport.ts";
+import type { WorkerdExecutionServiceGateway } from "../src/workerd-execution-guard.ts";
 import { type WorkflowDriver, WorkflowRuntimeError } from "../src/workflow-driver.ts";
 
 const token = "a".repeat(64);
@@ -23,6 +24,7 @@ interface FixtureOptions {
   readonly runAction?: (companionOrigin: string) => Promise<void>;
   readonly runHeaders?: Readonly<Record<string, string>>;
   readonly runSocketPath?: string;
+  readonly serviceGateways?: readonly WorkerdExecutionServiceGateway[];
 }
 
 interface TransportFixture {
@@ -90,6 +92,9 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
         return {
           configPath: "/tmp/workflow-http-test.capnp",
           runSocketPath: options.runSocketPath ?? socketPath,
+          ...(options.serviceGateways === undefined
+            ? {}
+            : { serviceGateways: options.serviceGateways }),
           async dispose() {
             disposed += 1;
             await stopChild();
@@ -155,6 +160,26 @@ async function postFrame(origin: string, sequence: number, payload: string) {
   });
   return { status: response.status, body: await response.text() };
 }
+
+test("retains private service gateways on the prepared transport", async () => {
+  const gateway: WorkerdExecutionServiceGateway = {
+    listenPath: "/tmp/workflow-http-service-listen.sock",
+    upstreamPath: "/tmp/workflow-http-service-upstream.sock",
+    unavailableToken: "b".repeat(64),
+  };
+  const f = await fixture({
+    runStatus: 200,
+    runBody: '{"kind":"complete","present":false}',
+    serviceGateways: [gateway],
+  });
+  try {
+    expect(f.prepared.serviceGateways).toEqual([gateway]);
+    await expect(f.drain()).resolves.toBeUndefined();
+    await expect(f.dispose()).resolves.toBeUndefined();
+  } finally {
+    await f.cleanup();
+  }
+});
 
 test("a non-200 RUN rejects but clean ingress after sender stop still permits disposal", async () => {
   const f = await fixture({ runStatus: 500, runBody: "child failed" });

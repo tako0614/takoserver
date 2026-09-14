@@ -13,6 +13,8 @@ import {
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
   type WorkerdDeploymentVariant,
+  type WorkerdPrivateServiceLease,
+  type WorkerdSelectedVersionIdentity,
   type WorkerdServiceBinding,
 } from "../src/workerd-runtime.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
@@ -57,6 +59,13 @@ interface PublicationOptions {
   readonly collisionNames?: boolean;
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
 }
+
+const SERVICE_BINDING: WorkerdServiceBinding = {
+  name: "__TAKOSERVER_SELFHOST_SERVICE_00001",
+  target: "other",
+  targetResourceUid: "uid-Other",
+  unavailableToken: "b".repeat(64),
+};
 
 function publication(options: PublicationOptions = {}): WorkerdDeploymentPublication {
   const generation = options.generation ?? "generation-1";
@@ -184,6 +193,11 @@ function preparation(
   options: {
     readonly dataPlaneAddress?: () => string;
     readonly onResolve?: (value: WorkflowRunIdentity) => void;
+    readonly serviceRuntime?: {
+      readonly acquirePrivateServiceBindings: (
+        identity: WorkerdSelectedVersionIdentity,
+      ) => Promise<WorkerdPrivateServiceLease>;
+    };
   } = {},
 ) {
   return createSelfhostWorkflowPreparation({
@@ -193,6 +207,7 @@ function preparation(
     ...(options.dataPlaneAddress === undefined
       ? {}
       : { dataPlaneAddress: options.dataPlaneAddress }),
+    ...(options.serviceRuntime === undefined ? {} : { serviceRuntime: options.serviceRuntime }),
     resolveTarget: async (value) => {
       options.onResolve?.(value);
       return resolved;
@@ -370,17 +385,128 @@ test("uses the current data-plane callback and refuses service bindings instead 
   ).rejects.toThrow("unusable data plane address");
   expect(await readdir(temporaryRoot)).toEqual([]);
 
-  const serviceBinding: WorkerdServiceBinding = {
-    name: "__TAKOSERVER_SELFHOST_SERVICE_00001",
-    target: "other",
-    targetResourceUid: "uid-Other",
-    unavailableToken: "b".repeat(64),
-  };
-  await publish({ generation: "generation-service-binding", serviceBindings: [serviceBinding] });
+  await publish({ generation: "generation-service-binding", serviceBindings: [SERVICE_BINDING] });
   const refused = preparation(target());
   await expect(
     refused(identity, undefined, new AbortController().signal, channel()),
   ).rejects.toThrow("service binding bridge is unavailable");
+  expect(await readdir(temporaryRoot)).toEqual([]);
+});
+
+test("pins the selected service binding and releases it only after prepared disposal", async () => {
+  await publish({ generation: "generation-service-positive", serviceBindings: [SERVICE_BINDING] });
+  let acquiredIdentity: WorkerdSelectedVersionIdentity | undefined;
+  let releaseCount = 0;
+  const lease: WorkerdPrivateServiceLease = {
+    services: [
+      {
+        name: SERVICE_BINDING.name,
+        upstreamSocket: "/tmp/takoserver-service-upstream.sock",
+        unavailableToken: SERVICE_BINDING.unavailableToken,
+      },
+    ],
+    async release() {
+      releaseCount += 1;
+    },
+  };
+  const prepared = await preparation(target(), {
+    dataPlaneAddress: () => currentDataPlaneAddress,
+    serviceRuntime: {
+      async acquirePrivateServiceBindings(value) {
+        acquiredIdentity = value;
+        return lease;
+      },
+    },
+  })(identity, undefined, new AbortController().signal, channel());
+  try {
+    const config = await readFile(prepared.configPath, "utf8");
+    const preparedRoot = dirname(prepared.configPath);
+    expect(acquiredIdentity).toMatchObject({
+      script: "site",
+      generation: "generation-service-positive",
+      generationKey: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      workerResourceUid: "uid-ModuleWorker-site",
+      versionId: "site-v-a",
+      workerVersionUid: "uid-WorkerVersion-site-a",
+    });
+    expect(config).toContain(`(name = "${SERVICE_BINDING.name}", service = "service-0")`);
+    expect(config).toContain(`unix:${preparedRoot}/s0.sock`);
+    expect(prepared.serviceGateways).toEqual([
+      {
+        listenPath: join(preparedRoot, "s0.sock"),
+        upstreamPath: "/tmp/takoserver-service-upstream.sock",
+        unavailableToken: SERVICE_BINDING.unavailableToken,
+      },
+    ]);
+    expect(releaseCount).toBe(0);
+    await prepared.drainAfterStop();
+    expect(releaseCount).toBe(0);
+    await prepared.dispose();
+    expect(releaseCount).toBe(1);
+    await prepared.dispose();
+    expect(releaseCount).toBe(1);
+  } catch (error) {
+    await prepared.drainAfterStop().catch(() => undefined);
+    await prepared.dispose().catch(() => undefined);
+    throw error;
+  }
+  expect(await readdir(temporaryRoot)).toEqual([]);
+});
+
+test("releases a service lease when mapping fails or cancellation arrives after acquisition", async () => {
+  await publish({ generation: "generation-service-failure", serviceBindings: [SERVICE_BINDING] });
+  let mismatchReleaseCount = 0;
+  const mismatch = preparation(target(), {
+    dataPlaneAddress: () => currentDataPlaneAddress,
+    serviceRuntime: {
+      async acquirePrivateServiceBindings() {
+        return {
+          services: [
+            {
+              name: "__TAKOSERVER_SELFHOST_SERVICE_00002",
+              upstreamSocket: "/tmp/takoserver-service-upstream.sock",
+              unavailableToken: SERVICE_BINDING.unavailableToken,
+            },
+          ],
+          async release() {
+            mismatchReleaseCount += 1;
+          },
+        };
+      },
+    },
+  });
+  await expect(
+    mismatch(identity, undefined, new AbortController().signal, channel()),
+  ).rejects.toThrow("does not match selected Version");
+  expect(mismatchReleaseCount).toBe(1);
+  expect(await readdir(temporaryRoot)).toEqual([]);
+
+  const abortDuringAcquire = new AbortController();
+  let abortReleaseCount = 0;
+  const aborting = preparation(target(), {
+    dataPlaneAddress: () => currentDataPlaneAddress,
+    serviceRuntime: {
+      async acquirePrivateServiceBindings() {
+        abortDuringAcquire.abort();
+        return {
+          services: [
+            {
+              name: SERVICE_BINDING.name,
+              upstreamSocket: "/tmp/takoserver-service-upstream.sock",
+              unavailableToken: SERVICE_BINDING.unavailableToken,
+            },
+          ],
+          async release() {
+            abortReleaseCount += 1;
+          },
+        };
+      },
+    },
+  });
+  await expect(
+    aborting(identity, undefined, abortDuringAcquire.signal, channel()),
+  ).rejects.toThrow();
+  expect(abortReleaseCount).toBe(1);
   expect(await readdir(temporaryRoot)).toEqual([]);
 });
 

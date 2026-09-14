@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import type { PreparedWorkerdWorkflow } from "./selfhost-workflow-execution-host.ts";
+import type { WorkerdExecutionServiceGateway } from "./workerd-execution-guard.ts";
 import { WorkflowRuntimeError } from "./workflow-driver.ts";
 import { createWorkflowHttpController } from "./workflow-http-controller.ts";
 
@@ -37,6 +38,8 @@ export async function prepareWorkflowHttpExecution(options: {
     readonly configPath: string;
     /** Exact private filesystem Unix socket of this one guarded process. */
     readonly runSocketPath: string;
+    /** Guard-owned listener/upstream bridges for private service bindings. */
+    readonly serviceGateways?: readonly WorkerdExecutionServiceGateway[];
     readonly dispose: () => Promise<void>;
   }>;
 }): Promise<PreparedWorkerdWorkflow> {
@@ -111,11 +114,12 @@ export async function prepareWorkflowHttpExecution(options: {
     await configured?.dispose();
     throw error;
   }
-  const { configPath, dispose } = configured;
+  const { configPath, serviceGateways, dispose } = configured;
   let running = false;
   let drained = false;
   return {
     configPath,
+    ...(serviceGateways === undefined ? {} : { serviceGateways }),
     acceptFrame: (sequence, payload) => controller.acceptFrame(sequence, payload),
     async run(driver) {
       if (running || !accepting || signal.aborted)
