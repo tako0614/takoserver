@@ -310,6 +310,14 @@ declared imports work while builtin, Host-private and undeclared application
 imports fail, including generated dynamic imports. Tail-free A→B→A replacement
 preserves the facet ID and SQL data and invalidates old stubs.
 
+The static fixture also holds an application callback at an explicit loopback
+I/O gate, aborts its facet, and then releases the gate. It checks rejection of
+the outstanding call and stale stub, absence of post-abort markers/reports,
+continuity of an existing sibling and state retention in a replacement class.
+This extended scenario passes against the exact pinned artifact; it is not
+CPU-preemption, controller-loss deadline or stop-before-open qualification.
+The loopback service is an explicit fixture binding, not global outbound access.
+
 These are mechanism checks, not an implemented Actor adapter or a class ABI.
 They do not prove in-flight version handoff, code-update WebSocket continuity,
 weighted routing, or managed WfP behavior. The static fixture intentionally

@@ -107,11 +107,22 @@ Cloudflare documents [facet abort](https://developers.cloudflare.com/dynamic-wor
 as shutting down a running facet and invalidating its stubs while preserving
 storage. This is a candidate scoped stop primitive when application code runs
 inside that facet, not evidence that disposing an ordinary RPC handle stops
-code. The existing static closed-graph native fixture now includes a held-I/O
-abort scenario, stale-stub rejection, sibling continuity and replacement-state
-checks. That extension has not yet been run against the pinned artifact. Even
-a passing result would not establish CPU-bound preemption, deadline enforcement
-after controller loss, stop-before-open ordering or managed WfP conformance.
+code. The static closed-graph native fixture passed against the exact pinned
+artifact on 2026-09-14: one test, 61 assertions. It verifies aborting a held-I/O
+callback, rejection of stale and outstanding calls, an existing sibling's
+unchanged generation, and replacement with retained state and no post-abort
+marker or catch/finally report. The fixture retains its A-B-A replacement and
+closed-import checks. This result does not establish CPU-bound preemption,
+deadline enforcement after controller loss, stop-before-open ordering or
+managed WfP conformance.
+
+The next implementation prerequisite is the forward callee contract owned by
+the Form publisher. A host-private transport cannot quietly choose constructor,
+environment, step callback or error semantics for applications: that would
+make it the missing public ABI. The existing caller-only Binding is not that
+contract. A future facet carrier can live inside the existing workerd process,
+but still needs its own Host-private supervisor namespace and real lifecycle
+proof before it can implement the execution-host protocol.
 
 Cloudflare's [Dynamic Workflows](https://developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows/)
 provide a separate durable-execution integration. Their existence does not
