@@ -156,6 +156,7 @@ interface ReservedMessage {
   readonly messageId: string;
   readonly body: string;
   readonly enqueuedAtMillis: number;
+  readonly visibleAtMillis: number;
   readonly attempts: number;
 }
 
@@ -271,6 +272,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
         messageId: String(row.message_id),
         body: base64(row.body),
         enqueuedAtMillis: integer(row.enqueued_at_ms),
+        visibleAtMillis: integer(row.visible_at_ms),
         // The count on the row is deliveries already made, and this claim is
         // about to be one of them; the handler is told which attempt it sees.
         attempts: integer(row.deliveries) + 1,
@@ -288,19 +290,30 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       if (oldest + consumer.maxBatchTimeoutSeconds * 1_000 > millis) return null;
     }
     const token = randomId();
+    // The SELECT may have waited while another pump settled these messages.
+    // Claim the observed incarnation/count/visibility only if it is still due
+    // and retained now; an old read must not bypass a retry or renew expiry.
+    const claimMillis = now().getTime();
     const written = await sql.batch(
       candidates.map((message) => ({
         sql:
           "UPDATE selfhost_queue_messages " +
           "SET lease_token = ?, lease_expires_at_ms = ?, deliveries = deliveries + 1 " +
           "WHERE queue_id = ? AND message_id = ? " +
+          "AND deliveries = ? AND enqueued_at_ms = ? AND visible_at_ms = ? " +
+          "AND visible_at_ms <= ? AND expires_at_ms > ? " +
           "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)",
         params: [
           token,
-          millis + leaseMillis,
+          claimMillis + leaseMillis,
           consumer.queue,
           message.messageId,
-          millis,
+          message.attempts - 1,
+          message.enqueuedAtMillis,
+          message.visibleAtMillis,
+          claimMillis,
+          claimMillis,
+          claimMillis,
         ] as readonly SqlParam[],
       })),
     );
@@ -409,8 +422,8 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       await release(consumer, reserved.token, reserved.messages, now().getTime());
       return { settled: 0, answered: false };
     }
-    await settle(consumer, reserved, decisions);
-    return { settled: reserved.messages.length, answered: true };
+    const settled = await settle(consumer, reserved, decisions);
+    return { settled, answered: true };
   };
 
   /**
@@ -453,10 +466,11 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     consumer: SelfhostQueueConsumerAttachment,
     reserved: ReservedBatch,
     decisions: readonly SelfhostQueueDecision[] | null,
-  ): Promise<void> => {
+  ): Promise<number> => {
     const byId = new Map((decisions ?? []).map((decision) => [decision.messageId, decision]));
     const millis = now().getTime();
     const statements: SqlStatement[] = [];
+    const settlements: number[] = [];
     for (const message of reserved.messages) {
       const decision = byId.get(message.messageId);
       if (decision?.outcome === "ack") {
@@ -464,26 +478,34 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           sql: "DELETE FROM selfhost_queue_messages WHERE queue_id = ? AND message_id = ? AND lease_token = ?",
           params: [consumer.queue, message.messageId, reserved.token],
         });
-        continue;
-      }
-      // Exhausted counts redeliveries: the first delivery is free, so a message
-      // is done once it has been delivered `1 + maxRetries` times.
-      if (message.attempts >= 1 + consumer.maxRetries) {
+      } else if (message.attempts >= 1 + consumer.maxRetries) {
+        // Exhausted counts redeliveries: the first delivery is free, so a
+        // message is done after `1 + maxRetries` deliveries.
         statements.push(...exhausted(consumer, message, reserved.token, millis));
-        continue;
+      } else {
+        const delaySeconds =
+          decision?.outcome === "retry" && decision.delaySeconds !== undefined
+            ? decision.delaySeconds
+            : consumer.retryDelaySeconds;
+        statements.push({
+          sql:
+            "UPDATE selfhost_queue_messages SET visible_at_ms = ?, lease_token = NULL, " +
+            "lease_expires_at_ms = NULL WHERE queue_id = ? AND message_id = ? AND lease_token = ?",
+          params: [
+            millis + delaySeconds * 1_000,
+            consumer.queue,
+            message.messageId,
+            reserved.token,
+          ],
+        });
       }
-      const delaySeconds =
-        decision?.outcome === "retry" && decision.delaySeconds !== undefined
-          ? decision.delaySeconds
-          : consumer.retryDelaySeconds;
-      statements.push({
-        sql:
-          "UPDATE selfhost_queue_messages SET visible_at_ms = ?, lease_token = NULL, " +
-          "lease_expires_at_ms = NULL WHERE queue_id = ? AND message_id = ? AND lease_token = ?",
-        params: [millis + delaySeconds * 1_000, consumer.queue, message.messageId, reserved.token],
-      });
+      // Count the final source write, not the DLQ insert as a second message
+      // and not an old holder's token-fenced no-op as a successful settlement.
+      settlements.push(statements.length - 1);
     }
-    if (statements.length > 0) await sql.batch(statements);
+    if (statements.length === 0) return 0;
+    const written = await sql.batch(statements);
+    return settlements.filter((index) => written[index]?.changes === 1).length;
   };
 
   /** Where a message goes once its redeliveries are spent. */
@@ -507,14 +529,17 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
         sql:
           "INSERT INTO selfhost_queue_messages " +
           "(queue_id, message_id, body, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries) " +
-          "VALUES (?, ?, ?, ?, ?, ?, 0)",
+          "SELECT ?, ?, body, ?, ?, ?, 0 FROM selfhost_queue_messages " +
+          "WHERE queue_id = ? AND message_id = ? AND lease_token = ?",
         params: [
           target.queue,
           randomId(),
-          bytes(message.body),
           millis,
           millis + target.deliveryDelaySeconds * 1_000,
           millis + target.messageRetentionSeconds * 1_000,
+          consumer.queue,
+          message.messageId,
+          token,
         ],
       },
       removal,
@@ -705,12 +730,4 @@ function base64(value: unknown): string {
     binary += String.fromCharCode(...raw.subarray(offset, offset + 4_096));
   }
   return btoa(binary);
-}
-
-/** The same bytes back, for the copy a dead-letter transfer writes. */
-function bytes(encoded: string): SqlParam {
-  const binary = atob(encoded);
-  const raw = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) raw[index] = binary.charCodeAt(index);
-  return raw.buffer.slice(0) as ArrayBuffer;
 }

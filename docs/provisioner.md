@@ -645,6 +645,12 @@ are not exposed by this public provisioner.
 - A batch owns its messages under a lease. A process that dies between dispatch
   and settlement leaves rows whose lease expires and which the next pass takes
   again, so a handler may see a message twice. At-least-once is the contract.
+  Reservation rechecks the observed message incarnation, delivery count and
+  visibility against the current claim time, including retention. Settlement
+  checks the same lease token inside every write. DLQ insertion reads only the
+  still-owned source row and commits with its removal: a late response cannot
+  manufacture a copy after another holder has acknowledged or moved the source.
+  A stale no-op is not counted as a settled message.
 
 **A redelivery is only ever spent by an answer the Worker gave.** A workerd that
 is restarting, a refused connection, a delivery that ran out of time, and a reply
