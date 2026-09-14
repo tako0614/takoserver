@@ -156,6 +156,69 @@ establish conformance to the selected name, deployment-selection, lifecycle or
 retention semantics, and does not qualify a generic WorkerLoader as a stop
 port. A concrete adapter must prove these properties before activation.
 
+### Self-host process carrier
+
+The first replacement carrier uses one small, Host-owned Go guard and one
+dedicated workerd child per active execution. The ordinary shared HTTP workerd
+is not its child and is never killed to terminate a Workflow. A new native
+per-execution isolate with an externally routable interrupt was also considered:
+it requires native allocation, interrupt lifetime and deployment ownership that
+the currently pinned runtime does not provide. The separate-process boundary
+is the smaller first implementation. Its cold-start and memory costs must be
+measured and bounded by operator concurrency before activation; it is not a
+claim that unlimited parallel workerd processes are economical.
+
+[`services/workflow-execution-guard`](../services/workflow-execution-guard/)
+owns the direct child, deadline and reap. The private
+[`workerd-execution-guard` client](../src/workerd-execution-guard.ts) sends
+bounded, ordered JSONL commands over inherited pipes. Registration arms a lease
+without starting workerd. Start accepts only the prepared private configuration
+for the already-selected workerd binary. No shell, PATH lookup, provider
+credentials, inherited controller environment or app-facing process API is
+introduced. The transport carries neither app input nor step results.
+
+The guard enforces the absolute realtime lease and a monotonic upper bound.
+A discontinuous system-clock change fails the run closed rather than granting
+a longer lease. Renewal may not revive an expired lease or exceed the instance
+lifetime. Linux's
+[`timerfd` cancellation-on-clock-set](https://man7.org/linux/man-pages/man2/timerfd_create.2.html)
+provides that clock-change notification. No test changes the machine clock.
+
+Controller pipe EOF stops and reaps the child. Guard death has a separate
+kernel-backed boundary: the child receives `Pdeathsig = SIGKILL`; the spawning
+Go goroutine remains on its creating OS thread through `Wait`, because Go
+documents [parent-death notification as thread-scoped](https://pkg.go.dev/syscall#SysProcAttr).
+The guard controls the exact direct child, not arbitrary descendants, stale
+PIDs or a shared process group. The selected workerd application sandbox has
+no subprocess interface. Privileged process suspension, a suspended kernel or
+a compromised operator are outside this user-process fault model.
+
+A stopped ACK is sent only after child reap, or after stopping a registration
+that never spawned. Client timeout, EOF and guard exit are infrastructure
+failure, not stop proof. The adapter must still use the coordinator's existing
+lease wait when local ownership cannot be proved. Stopped registrations cannot
+be started or renewed. Replies match request IDs; registration must be
+acknowledged first, but completed stop may overtake an in-flight start/renew
+and cancels those unresolved requests. No execution is automatically restarted
+by the guard.
+
+This is a private process primitive, not yet a complete
+`WorkflowExecutionHost`. The class loader, verified module/env projection,
+weighted deployment selection, step callback transport and genuine-error
+provenance still have to be composed with it. In particular, starting a
+prepared workerd process does not prove the selected class is ready or that a
+Workflow step is durable. The client is not connected to serving entrypoints,
+and no new binary search or implicit runtime fallback is enabled. WfP needs
+its own qualified implementation of the same private host protocol; a local
+Linux process guard is not a managed Cloudflare implementation.
+
+The opt-in `tests/workerd-native-execution-guard.test.ts` targets only the
+exact pinned workerd and an explicitly supplied guard binary. It exercises
+paused registration, synchronous CPU execution, stop/reap, lease expiry,
+controller EOF, guard loss and an independently running HTTP sibling. This
+is distinct from the failed same-process facet probe, which remains unchanged.
+Portable protocol tests do not substitute for this native qualification.
+
 ## Schema and rollout
 
 Migration `0050_workflow_instances.sql` adds the instance and event tables.
