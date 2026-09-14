@@ -532,6 +532,30 @@ complete native failure qualification and the managed WfP backend remain
 unfinished. No serving entrypoint selects this execution adapter; Workflow and
 Actor support remain false.
 
+### Native data-binding qualification
+
+`tests/workerd-native-workflow-data-bindings.test.ts` runs two separate guarded
+Workflow executions against the actual self-host KV, SQLite, ObjectBucket and
+Queue data planes. It publishes the weighted filesystem graph, uses the generated
+environment projector and private data facade, and passes the current Host-owned
+listener to preparation. It does not substitute mocked Binding methods.
+
+The writer stores KV metadata, a SQL row and an object, and sends individual and
+batch queue messages. The reader instance retrieves the stored values through
+the same bindings. Both instance status/output projections are checked; the
+projected environment contains only the four declared public names, without the
+private token or control bindings. Queue message IDs prove acceptance, not
+delivery or deduplication. The fixture closes the guarded executions, cached
+tenant SQLite handle, listener and control databases before removing its files.
+
+This native case was qualified with the pinned closed-graph workerd and Go
+guard. Its synthetic grant and trusted target resolver are fixture setup, not
+Resource admission, execution authorization or a real installation. The test is
+an explicit opt-in requiring both `TAKOSERVER_WORKERD_BINARY` and
+`TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`; a skipped portable run does not
+count as native evidence. AI/Vector/Actor bindings, managed WfP execution and the
+remaining activation/scheduler boundaries above are not covered by this result.
+
 ## Schema and rollout
 
 Migration `0050_workflow_instances.sql` adds the instance and event tables.
