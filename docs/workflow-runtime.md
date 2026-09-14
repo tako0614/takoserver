@@ -321,6 +321,11 @@ physical stop proof; incomplete ingress still refuses the barrier. Its
 configuration callback is abort-aware and owns cleanup of partial artifacts. It is not a
 general RPC framework or a published Binding.
 
+RUN and readiness use one per-execution Unix socket and a fixed private request
+origin, with redirects refused and bounded response bodies. The companion
+continues to own its listening loopback socket throughout preparation; neither
+direction reserves and closes a TCP port for a later process to reopen.
+
 The opt-in `tests/workerd-native-workflow-http.test.ts` exercises the pinned
 runtime, dynamic class load, generated env, durable completed-name replay and
 genuine/forged error paths. Captured native Response accessors are located
@@ -379,11 +384,46 @@ child disposal; JavaScript strings do not provide a meaningful zeroization
 guarantee. Missing/deactivated or crossing publications and a stale expected
 Worker UID return no selection; malformed or tampered storage is an error.
 
-The native fixture still supplies its own closed module graph. Connecting this
-reader to preparation, full binding/resource routing, scheduler integration,
-complete native failure corpus and the managed WfP backend remain unfinished.
-The reader neither evaluates application code nor qualifies or activates an
-execution adapter. No serving entrypoint selects this transport yet.
+### Preparing a private execution
+
+`createSelfhostWorkflowPreparation` now connects that reader to the guarded
+HTTP transport. Its trusted target resolver is called for each preparation,
+not when an instance is created. The target must come from the exact accepted
+Workflow Resource, immutable class name, worker relation and active self-host
+realization in the same tenant. Instance parameters cannot select a script,
+Worker UID or class. The durable target resolver and scheduler are not wired
+yet; this seam does not bypass the existing class-runtime admission refusal.
+
+The loader adds a tiny literal startup module and the tracked Host-only
+bootstrap bundle to the selected closed graph. The generator bundles only
+trusted helpers, independently of executions; ordinary check compares its
+output without writing. Tenant code is never bundled by the controller.
+Startup imports the helper statically, while wrapper/application imports happen
+only on RUN. Generated module names avoid Host namespace collisions and the
+application main name. The pinned resolver resolves an import of the exact
+application main before a same-named Host module; only the configured startup
+entry is exempt. A published wrapper whose name equals application main is
+therefore refused here, not reinterpreted or silently replaced.
+
+`writeWorkerdPrivateExecution` reuses the serving renderer's module provenance,
+media type and private ordinal-file mapping. Each execution gets a fresh 0700
+directory and 0600 code/config files, exact committed vars, no public hostname
+routes and a denied global outbound service. A declared data-plane facade uses
+the current Host listener supplied by composition, never its persisted
+prior-process address. Its sensitive bindings remain on the facade only.
+Versions declaring service bindings are explicitly refused until a private,
+target-UID-fenced bridge exists. Asset/event ingress services are not class env
+bindings and are not installed in the subprocess.
+
+The native fixture publishes a weighted filesystem graph and uses this loader,
+rather than assembling a second handwritten config or bundling per run. Its
+fake publication readiness is fixture setup, not Form admission or live
+serving evidence. Before RUN it checks native readiness even for a module that
+throws at top level, proving that readiness does not evaluate that module.
+Full binding/resource routing, durable target resolution, scheduler integration,
+complete native failure qualification and the managed WfP backend remain
+unfinished. No serving entrypoint selects this execution adapter; Workflow and
+Actor support remain false.
 
 ## Schema and rollout
 

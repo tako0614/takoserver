@@ -1,21 +1,21 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   selfhostWorkerPreludeModuleName,
   selfhostWorkerPreludeSource,
 } from "../src/providers/selfhost-worker-prelude.ts";
 import {
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
-  SELFHOST_WORKER_PROJECT_ENV_EXPORT,
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { createWorkerdWorkflowExecutionHost } from "../src/selfhost-workflow-execution-host.ts";
-import { prepareWorkflowHttpExecution } from "../src/selfhost-workflow-http-transport.ts";
+import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 
 const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
@@ -52,6 +52,11 @@ define(originalPromise, Symbol.species, { value: broken, configurable: true });
 `;
 
 const applications = [
+  {
+    name: "module-load-error-after-ready",
+    source: `throw Error("module import occurs only after RUN"); export class Application {}`,
+    infrastructure: "host_unavailable",
+  },
   {
     name: "memo-and-private-env",
     source: `
@@ -195,85 +200,44 @@ test.skipIf(workerd === undefined || guardBinary === undefined)(
         ]) {
           db.exec(await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
         }
-        let configured = 0;
-        let disposed = 0;
-        const host = createWorkerdWorkflowExecutionHost({
-          guardBinary: guardBinary as string,
-          workerdBinary: binary,
-          maximumRegistrations: 4,
-          async prepare(identity, input, signal, channel) {
-            configured += 1;
-            return prepareWorkflowHttpExecution({
-              channel,
-              signal,
-              async configure(companionAddress, configureSignal) {
-                try {
-                  configureSignal.throwIfAborted();
-                  const reservation = Bun.serve({
-                    hostname: "127.0.0.1",
-                    port: 0,
-                    fetch: () => new Response(),
-                  });
-                  const port = reservation.port;
-                  reservation.stop(true);
-                  const prelude = selfhostWorkerPreludeModuleName("app.js");
-                  const wrapper = SELFHOST_WORKER_ENTRYPOINT_MODULE;
-                  const entrySource = `
-import { createWorkflowHttpWorker } from ${JSON.stringify(new URL("../src/workflow-http-worker.ts", import.meta.url).pathname)};
-import { adoptTrustedWorkflowPromise as trusted } from ${JSON.stringify(new URL("../src/workflow-driver.ts", import.meta.url).pathname)};
-const create = Object.create;
-const implementation = createWorkflowHttpWorker({
- token: ${JSON.stringify(channel.journalToken)}, className: "Application",
- instanceId: ${JSON.stringify(identity.instanceId)}, params: ${JSON.stringify(input)},
- async load() {
-   globalThis.__workflowFixtureRun = true;
-   const wrapper = (await trusted(import(${JSON.stringify(`./${wrapper}`)}))).value;
-   const namespace = (await trusted(import("./app.js"))).value;
-   const loaded = create(null);
-   loaded.namespace = namespace;
-   loaded.projectEnv = wrapper[${JSON.stringify(SELFHOST_WORKER_PROJECT_ENV_EXPORT)}];
-   return loaded;
- }
-});
-export default implementation;`;
-                  const entry = join(directory, "entry.ts");
-                  await writeFile(entry, entrySource, { mode: 0o600 });
-                  const externalized = new Set<string>();
-                  const build = await Bun.build({
-                    entrypoints: [entry],
-                    target: "browser",
-                    format: "esm",
-                    plugins: [
-                      {
-                        name: "retain-private-workerd-imports",
-                        setup(builder) {
-                          builder.onResolve({ filter: /^\.\//u }, (args) => {
-                            if (
-                              args.importer !== entry ||
-                              (args.path !== `./${wrapper}` && args.path !== "./app.js")
-                            )
-                              return undefined;
-                            externalized.add(args.path);
-                            return { path: args.path, external: true };
-                          });
-                        },
-                      },
-                    ],
-                  });
-                  configureSignal.throwIfAborted();
-                  if (!build.success || build.outputs.length !== 1)
-                    throw new Error(`workflow bootstrap build: ${build.logs.join("\n")}`);
-                  expect([...externalized].sort()).toEqual([`./${wrapper}`, "./app.js"].sort());
-                  await writeFile(
-                    join(directory, "entry.js"),
-                    (await build.outputs[0]?.text()) ?? "",
-                    { mode: 0o600 },
-                  );
-                  await writeFile(join(directory, prelude), selfhostWorkerPreludeSource(), {
-                    mode: 0o600,
-                  });
-                  await writeFile(
-                    join(directory, wrapper),
+        const prelude = selfhostWorkerPreludeModuleName("app.js");
+        const wrapper = SELFHOST_WORKER_ENTRYPOINT_MODULE;
+        const serving = createWorkerdRuntime({ root: directory, isReady: () => true });
+        if (!serving.publish) throw new Error("weighted publication is unavailable");
+        // Filesystem publication fixture, not semantic admission of the forward
+        // Workflow candidate or readiness qualification of the HTTP serving graph.
+        await serving.publish("workflow", {
+          generation: "workflow.selected",
+          workerResourceUid: "uid-ModuleWorker-workflow",
+          hostnames: [],
+          versions: [
+            {
+              versionId: "version",
+              workerVersionUid: "uid-WorkerVersion-workflow",
+              weight: 10_000,
+              site: {
+                directory: "workflow",
+                mainModule: "app.js",
+                hostEntrypoint: wrapper,
+                hostModules: [prelude],
+                hostnames: [],
+                fetchHandler: true,
+                workerResourceUid: "uid-ModuleWorker-workflow",
+                vars: [{ name: "SETTING", kind: "text", value: "selected" }],
+              },
+              modules: new Map([
+                [
+                  "app.js",
+                  new TextEncoder().encode(
+                    `${application.source}\nexport default { fetch() { return new Response("ordinary required default"); } };`,
+                  ),
+                ],
+              ]),
+              hostModules: new Map([
+                [prelude, new TextEncoder().encode(selfhostWorkerPreludeSource())],
+                [
+                  wrapper,
+                  new TextEncoder().encode(
                     selfhostWorkerEntrypointSource({
                       originalMainModule: "app.js",
                       publication: "workflow.selected",
@@ -281,58 +245,62 @@ export default implementation;`;
                       declaredHandlers: ["fetch"],
                       bindings: [{ type: "plain_text", name: "SETTING" }],
                     }),
-                    { mode: 0o600 },
-                  );
-                  await writeFile(
-                    join(directory, "app.js"),
-                    `
-if (globalThis.__workflowFixtureRun !== true) throw Error("application evaluated before RUN");
-${application.source}
-export default { fetch() { return new Response("ordinary required default"); } };`,
-                    { mode: 0o600 },
-                  );
-                  const configPath = join(directory, "run.capnp");
-                  await writeFile(
-                    configPath,
-                    `using Workerd = import "/workerd/workerd.capnp";
-const config :Workerd.Config = (
- services = [
-  (name = "application", worker = (
-   modules = [
-    (name = "entry.js", esModule = embed "entry.js", role = hostPrivate),
-    (name = ${JSON.stringify(prelude)}, esModule = embed ${JSON.stringify(prelude)}, role = hostPrivate),
-    (name = ${JSON.stringify(wrapper)}, esModule = embed ${JSON.stringify(wrapper)}, role = hostPrivate),
-    (name = "app.js", esModule = embed "app.js", role = application)
-   ],
-   modulePolicy = (applicationMain = "app.js"), compatibilityDate = "2026-01-01",
-   compatibilityFlags = ["disallow_importable_env"], globalOutbound = "deny",
-   bindings = [
-    (name = "SETTING", text = "selected"),
-    (name = "__TAKOSERVER_WORKFLOW_COMPANION", service = "companion")
-   ]
-  )),
-  (name = "companion", external = (address = ${JSON.stringify(companionAddress)}, http = ())),
-  (name = "deny", network = (allow = []))
- ],
- sockets = [(name = "http", address = "127.0.0.1:${port}", http = (), service = "application")]
-);`,
-                    { mode: 0o600 },
-                  );
-                  configureSignal.throwIfAborted();
-                  return {
-                    configPath,
-                    runOrigin: `http://127.0.0.1:${port}`,
-                    async dispose() {
-                      disposed += 1;
-                      await rm(directory, { recursive: true, force: true });
-                    },
-                  };
-                } catch (error) {
-                  await rm(directory, { recursive: true, force: true });
-                  throw error;
+                  ),
+                ],
+              ]),
+            },
+          ],
+        });
+        const prepare = createSelfhostWorkflowPreparation({
+          runtimeRoot: directory,
+          // A short private socket path, independent of the long evidence root.
+          resolveTarget: async () => ({
+            ...scope,
+            script: "workflow",
+            workerResourceUid: "uid-ModuleWorker-workflow",
+            className: "Application",
+          }),
+        });
+        let configured = 0;
+        let readyChecks = 0;
+        let disposed = 0;
+        const host = createWorkerdWorkflowExecutionHost({
+          guardBinary: guardBinary as string,
+          workerdBinary: binary,
+          maximumRegistrations: 4,
+          async prepare(identity, input, signal, channel) {
+            configured += 1;
+            const prepared = await prepare(identity, input, signal, channel);
+            return {
+              ...prepared,
+              async run(driver) {
+                // The real guard has started, but RUN has not been sent.
+                // Even the top-level-throw application must answer ready here:
+                // this replaces the old fixture-only global import sentinel.
+                let ready: Response | undefined;
+                const until = Date.now() + 2_000;
+                while (!ready && Date.now() < until) {
+                  try {
+                    ready = await fetch(`http://workflow.internal/${channel.journalToken}/ready`, {
+                      unix: join(dirname(prepared.configPath), "run.sock"),
+                      redirect: "error",
+                      signal: AbortSignal.timeout(200),
+                    });
+                  } catch {
+                    await Bun.sleep(10);
+                  }
                 }
+                if (!ready) throw new Error("private child was not ready before RUN");
+                expect(ready.status).toBe(200);
+                expect(await ready.text()).toBe("ready");
+                readyChecks += 1;
+                return prepared.run(driver);
               },
-            });
+              async dispose() {
+                await prepared.dispose();
+                disposed += 1;
+              },
+            };
           },
         });
         let random = 0;
@@ -403,6 +371,7 @@ const config :Workerd.Config = (
             }
           }
           expect(configured).toBe(1);
+          expect(readyChecks).toBe(1);
           expect(disposed).toBe(1);
         } finally {
           await host.close();

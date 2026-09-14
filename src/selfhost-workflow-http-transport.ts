@@ -1,8 +1,22 @@
+import { isAbsolute } from "node:path";
 import type { PreparedWorkerdWorkflow } from "./selfhost-workflow-execution-host.ts";
 import { WorkflowRuntimeError } from "./workflow-driver.ts";
 import { createWorkflowHttpController } from "./workflow-http-controller.ts";
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
+const WORKFLOW_INTERNAL_ORIGIN = "http://workflow.internal";
+
+function validRunSocketPath(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    !isAbsolute(value) ||
+    value.includes("\u0000")
+  ) {
+    throw new WorkflowRuntimeError("invalid_runtime_input");
+  }
+  return value;
+}
 
 /**
  * Concrete loopback transport for the guarded class loader. Configuration is
@@ -21,8 +35,8 @@ export async function prepareWorkflowHttpExecution(options: {
     signal: AbortSignal,
   ) => Promise<{
     readonly configPath: string;
-    /** Exact private loopback socket of this one guarded process. */
-    readonly runOrigin: string;
+    /** Exact private filesystem Unix socket of this one guarded process. */
+    readonly runSocketPath: string;
     readonly dispose: () => Promise<void>;
   }>;
 }): Promise<PreparedWorkerdWorkflow> {
@@ -85,20 +99,10 @@ export async function prepareWorkflowHttpExecution(options: {
     },
   });
   let configured: Awaited<ReturnType<typeof options.configure>> | undefined;
+  let runSocketPath: string;
   try {
     configured = await options.configure(`127.0.0.1:${server.port}`, signal);
-    const origin = new URL(configured.runOrigin);
-    if (
-      origin.protocol !== "http:" ||
-      origin.hostname !== "127.0.0.1" ||
-      !origin.port ||
-      origin.username ||
-      origin.password ||
-      origin.pathname !== "/" ||
-      origin.search ||
-      origin.hash
-    )
-      throw new WorkflowRuntimeError("invalid_runtime_input");
+    runSocketPath = validRunSocketPath(configured.runSocketPath);
     if (signal.aborted) throw new WorkflowRuntimeError("host_unavailable");
   } catch (error) {
     accepting = false;
@@ -108,7 +112,6 @@ export async function prepareWorkflowHttpExecution(options: {
     throw error;
   }
   const { configPath, dispose } = configured;
-  const runOrigin = new URL(configured.runOrigin).origin;
   let running = false;
   let drained = false;
   return {
@@ -124,10 +127,12 @@ export async function prepareWorkflowHttpExecution(options: {
         let ready = false;
         while (Date.now() < deadline && !signal.aborted && accepting) {
           try {
-            const response = await fetch(`${runOrigin}/${token}/ready`, {
+            const response = await fetch(`${WORKFLOW_INTERNAL_ORIGIN}/${token}/ready`, {
+              unix: runSocketPath,
+              redirect: "error",
               signal: AbortSignal.any([signal, AbortSignal.timeout(200)]),
             });
-            if (response.status === 200 && (await response.text()) === "ready") {
+            if (response.status === 200 && (await readFrame(response)) === "ready") {
               ready = true;
               break;
             }
@@ -140,7 +145,12 @@ export async function prepareWorkflowHttpExecution(options: {
           throw new WorkflowRuntimeError("host_unavailable");
         // One RUN only. Lost responses reject infrastructure; never replay in
         // this context and never synthesize a successful application outcome.
-        const response = await fetch(`${runOrigin}/${token}/run`, { method: "POST", signal });
+        const response = await fetch(`${WORKFLOW_INTERNAL_ORIGIN}/${token}/run`, {
+          method: "POST",
+          unix: runSocketPath,
+          redirect: "error",
+          signal,
+        });
         if (response.status !== 200) throw new WorkflowRuntimeError("host_unavailable");
         const payload = await readFrame(response);
         return controller.outcome(payload);

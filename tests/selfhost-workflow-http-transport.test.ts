@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { prepareWorkflowHttpExecution } from "../src/selfhost-workflow-http-transport.ts";
 import { type WorkflowDriver, WorkflowRuntimeError } from "../src/workflow-driver.ts";
 
@@ -18,11 +21,14 @@ interface FixtureOptions {
   readonly runBody: string;
   readonly recordFailure?: Error;
   readonly runAction?: (companionOrigin: string) => Promise<void>;
+  readonly runHeaders?: Readonly<Record<string, string>>;
+  readonly runSocketPath?: string;
 }
 
 interface TransportFixture {
   readonly prepared: Awaited<ReturnType<typeof prepareWorkflowHttpExecution>>;
   readonly companionOrigin: string;
+  readonly runRequests: string[];
   readonly records: Array<{ sequence: number; payload: string }>;
   readonly disposeCount: () => number;
   readonly drain: () => Promise<void>;
@@ -31,6 +37,9 @@ interface TransportFixture {
 }
 
 async function fixture(options: FixtureOptions): Promise<TransportFixture> {
+  const socketRoot = mkdtempSync(join(tmpdir(), "takoserver-workflow-http-socket-"));
+  chmodSync(socketRoot, 0o700);
+  const socketPath = join(socketRoot, "workerd.sock");
   let companionOrigin = "";
   let child: ReturnType<typeof Bun.serve> | undefined;
   let childStopped = false;
@@ -39,6 +48,7 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
   let drainAttempted = false;
   let disposeAttempted = false;
   const records: Array<{ sequence: number; payload: string }> = [];
+  const runRequests: string[] = [];
 
   const stopChild = async () => {
     if (!child || childStopped) return;
@@ -60,23 +70,26 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
       async configure(address) {
         companionOrigin = `http://${address}`;
         child = Bun.serve({
-          hostname: "127.0.0.1",
-          port: 0,
+          unix: socketPath,
           async fetch(request) {
             const pathname = new URL(request.url).pathname;
             if (request.method === "GET" && pathname === `/${token}/ready`) {
               return new Response("ready");
             }
             if (request.method === "POST" && pathname === `/${token}/run`) {
+              runRequests.push(request.url);
               await options.runAction?.(companionOrigin);
-              return new Response(options.runBody, { status: options.runStatus });
+              return new Response(options.runBody, {
+                status: options.runStatus,
+                ...(options.runHeaders === undefined ? {} : { headers: options.runHeaders }),
+              });
             }
             return new Response(null, { status: 404 });
           },
         });
         return {
           configPath: "/tmp/workflow-http-test.capnp",
-          runOrigin: `http://127.0.0.1:${child.port}`,
+          runSocketPath: options.runSocketPath ?? socketPath,
           async dispose() {
             disposed += 1;
             await stopChild();
@@ -86,6 +99,7 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
     });
   } catch (error) {
     await stopChild();
+    rmSync(socketRoot, { recursive: true, force: true });
     throw error;
   }
 
@@ -93,6 +107,7 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
   return {
     prepared: actual,
     companionOrigin,
+    runRequests,
     records,
     disposeCount: () => disposed,
     async drain() {
@@ -108,22 +123,26 @@ async function fixture(options: FixtureOptions): Promise<TransportFixture> {
       return actual.dispose();
     },
     async cleanup() {
-      await stopChild();
-      if (!drainAttempted) {
-        drainAttempted = true;
-        try {
-          await actual.drainAfterStop();
-        } catch {
-          // A negative barrier test has already proved the retained failure.
+      try {
+        await stopChild();
+        if (!drainAttempted) {
+          drainAttempted = true;
+          try {
+            await actual.drainAfterStop();
+          } catch {
+            // A negative barrier test has already proved the retained failure.
+          }
         }
-      }
-      if (!disposeAttempted) {
-        disposeAttempted = true;
-        try {
-          await actual.dispose();
-        } catch {
-          // Failed ingress intentionally refuses artifact disposal.
+        if (!disposeAttempted) {
+          disposeAttempted = true;
+          try {
+            await actual.dispose();
+          } catch {
+            // Failed ingress intentionally refuses artifact disposal.
+          }
         }
+      } finally {
+        rmSync(socketRoot, { recursive: true, force: true });
       }
     },
   };
@@ -146,6 +165,7 @@ test("a non-200 RUN rejects but clean ingress after sender stop still permits di
     await expect(f.drain()).resolves.toBeUndefined();
     await expect(f.dispose()).resolves.toBeUndefined();
     expect(f.records).toEqual([]);
+    expect(f.runRequests).toEqual([`http://workflow.internal/${token}/run`]);
     expect(f.disposeCount()).toBe(1);
   } finally {
     await f.cleanup();
@@ -243,6 +263,34 @@ test("a paired response that later rejects does not poison a clean ingress barri
     await expect(f.drain()).resolves.toBeUndefined();
     await expect(f.dispose()).resolves.toBeUndefined();
     expect(f.disposeCount()).toBe(1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("rejects a non-filesystem run socket path during configuration", async () => {
+  await expect(
+    fixture({
+      runStatus: 200,
+      runBody: '{"kind":"complete","present":false}',
+      runSocketPath: "relative.sock",
+    }),
+  ).rejects.toMatchObject({ code: "invalid_runtime_input" });
+});
+
+test("refuses redirects on the private Unix-socket RUN request", async () => {
+  const f = await fixture({
+    runStatus: 302,
+    runBody: "redirected",
+    runHeaders: { location: "http://workflow.redirect.invalid/elsewhere" },
+  });
+  try {
+    await expect(f.prepared.run(noOpDriver())).rejects.toBeDefined();
+    // `redirect: error` rejects before issuing a second request, and the
+    // fixed private URL remains the only request observed by this socket.
+    expect(f.runRequests).toEqual([`http://workflow.internal/${token}/run`]);
+    await expect(f.drain()).resolves.toBeUndefined();
+    await expect(f.dispose()).resolves.toBeUndefined();
   } finally {
     await f.cleanup();
   }

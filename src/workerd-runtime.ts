@@ -14,7 +14,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { bytesDigest } from "./json.ts";
 import {
   canonicalSelfhostWeightedVersions,
@@ -1732,14 +1732,121 @@ async function writePreparedWorkerdSite(
   }
   if (prepared.assets) await privateDirectory(join(root, ASSETS_ROOT_DIRECTORY));
   for (const entry of prepared.application) {
-    await writeFile(join(root, APPLICATION_MODULE_DIRECTORY, entry.key), entry.bytes);
+    await writeFile(join(root, APPLICATION_MODULE_DIRECTORY, entry.key), entry.bytes, {
+      mode: 0o600,
+    });
   }
   for (const entry of prepared.hostPrivate) {
-    await writeFile(join(root, HOST_PRIVATE_MODULE_DIRECTORY, entry.key), entry.bytes);
+    await writeFile(join(root, HOST_PRIVATE_MODULE_DIRECTORY, entry.key), entry.bytes, {
+      mode: 0o600,
+    });
   }
   for (const [assetName, bytes] of prepared.assets ?? []) {
     await writeFile(join(root, ASSETS_ROOT_DIRECTORY, assetName), bytes);
   }
+}
+
+/**
+ * Private, single-execution materialization. The caller owns a fresh directory
+ * and cleanup; this never publishes a route or changes the active graph.
+ * Assets/event routers are HTTP delivery services, not class environment
+ * bindings. Service bindings require an incarnation-fenced bridge which this
+ * dormant execution path does not yet own, so they are explicitly refused.
+ */
+export async function writeWorkerdPrivateExecution(options: {
+  readonly root: string;
+  readonly site: WorkerdSite;
+  readonly modules: ReadonlyMap<string, Uint8Array>;
+  readonly hostModules: ReadonlyMap<string, Uint8Array>;
+  readonly companionAddress: string;
+  readonly runSocketPath: string;
+  /** Current Host-owned listener, never the persisted prior-process address. */
+  readonly dataPlaneAddress?: string;
+}): Promise<string> {
+  const { root, site, runSocketPath } = options;
+  if (
+    !isAbsolute(root) ||
+    !isAbsolute(runSocketPath) ||
+    runSocketPath.includes("\u0000") ||
+    Buffer.byteLength(runSocketPath) > 100 ||
+    dirname(runSocketPath) !== root
+  ) {
+    throw new Error("unusable private execution directory or socket");
+  }
+  if (!site.hostEntrypoint || site.hostEntrypoint === site.mainModule) {
+    throw new Error("private execution requires a distinct Host entrypoint");
+  }
+  if ((site.serviceBindings?.length ?? 0) > 0) {
+    throw new Error("private execution service binding bridge is unavailable");
+  }
+  const companion = validDataPlaneAddress(options.companionAddress);
+  const planeAddress = site.dataPlane
+    ? validDataPlaneAddress(options.dataPlaneAddress ?? "")
+    : undefined;
+  // Deliberately select declarations: never carry hostname, assets or event
+  // ingress into a guarded class process. Their Host-private module bytes can
+  // remain in the exact closed graph without installing their routing services.
+  const { assets: _assets, events: _events, ...classSite } = site;
+  const prepared = await prepareWorkerdSite(
+    { ...classSite, hostnames: [] },
+    options.modules,
+    undefined,
+    options.hostModules,
+  );
+  const bindings = validBindings(prepared.manifest.vars ?? []).map(
+    (binding) =>
+      `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+  );
+  const companionBinding = "__TAKOSERVER_WORKFLOW_COMPANION";
+  if (
+    prepared.manifest.vars?.some(
+      (binding) =>
+        binding.name === companionBinding ||
+        (prepared.manifest.dataPlane && binding.name === DATA_SERVICE_BINDING),
+    )
+  ) {
+    throw new Error("private execution internal binding collision");
+  }
+  bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
+  let dataServices = "";
+  if (prepared.manifest.dataPlane) {
+    const plane = prepared.manifest.dataPlane;
+    const module = requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, plane.module);
+    bindings.push(`(name = "${DATA_SERVICE_BINDING}", service = "data")`);
+    const facadeBindings = [
+      `(name = "${DATA_PLANE_BINDING}", service = "data-origin")`,
+      ...validBindings(plane.vars).map(
+        (binding) =>
+          `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+      ),
+    ];
+    dataServices = `
+  (name = "data", worker = (
+    modules = [(name = ${capnpText(plane.module)}, esModule = embed ${capnpText(`${HOST_PRIVATE_MODULE_DIRECTORY}/${module.key}`)})],
+    bindings = [${facadeBindings.join(", ")}], compatibilityDate = "2026-01-01", globalOutbound = "deny"
+  )),
+  (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
+  }
+  const config = `using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+ services = [
+  (name = "application", worker = (
+    modules = [${renderWorkerdModules(prepared.manifest, ".")}],
+    bindings = [${bindings.join(", ")}],
+    modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
+    compatibilityDate = "2026-01-01",
+    compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
+    globalOutbound = "deny"
+  )),
+  (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}
+  (name = "deny", network = (allow = []))
+ ],
+ sockets = [(name = "workflow", address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = "application")]
+);`;
+  await writePreparedWorkerdSite(root, prepared);
+  const configPath = join(root, "workerd.capnp");
+  await writeFile(configPath, config, { mode: 0o600, flag: "wx" });
+  return configPath;
 }
 
 /**
@@ -2712,6 +2819,42 @@ function publishedGraphIdentity(published: readonly PublishedDeployment[]): stri
  * picks by `Host`; anything unclaimed gets a 404 that says so, which is the
  * only honest answer when nobody has asked for that name.
  */
+function renderWorkerdModules(manifest: Manifest, storagePrefix: string): string {
+  const mainModule = validModules([manifest.mainModule])[0] as string;
+  const declaredModules = validModules(manifest.modules ?? [], manifest.mainModule);
+  const moduleMediaTypes = validModuleMediaTypes(
+    mainModule,
+    declaredModules,
+    manifest.moduleMediaTypes,
+  );
+  const applicationModules = manifest.moduleFiles.application;
+  const hostModules = manifest.moduleFiles.hostPrivate;
+  const hostEntrypoint = manifest.hostEntrypoint;
+  const orderedHostModules =
+    hostEntrypoint === undefined
+      ? hostModules
+      : [
+          requiredStoredModule(hostModules, hostEntrypoint),
+          ...hostModules.filter((module) => module.name !== hostEntrypoint),
+        ];
+  const application = applicationModules.map((module) => ({
+    module,
+    role: "application" as const,
+  }));
+  const host = orderedHostModules.map((module) => ({ module, role: "hostPrivate" as const }));
+  return (hostEntrypoint === undefined ? [...application, ...host] : [...host, ...application])
+    .map(({ module, role }) => {
+      const mediaType =
+        role === "application"
+          ? (moduleMediaTypes?.[module.name] ?? "application/javascript+module")
+          : "application/javascript+module";
+      const directory =
+        role === "application" ? APPLICATION_MODULE_DIRECTORY : HOST_PRIVATE_MODULE_DIRECTORY;
+      return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${storagePrefix}/${directory}/${module.key}`)}, role = ${role})`;
+    })
+    .join(", ");
+}
+
 function renderConfig(
   published: readonly PublishedDeployment[],
   port: number,
@@ -2750,43 +2893,7 @@ function renderConfig(
       // names are equal; only the Host entrypoint has the explicit bridge to
       // this publication's exact application main.
       const mainModule = validModules([entry.manifest.mainModule])[0] as string;
-      const declaredModules = validModules(entry.manifest.modules ?? [], entry.manifest.mainModule);
-      const moduleMediaTypes = validModuleMediaTypes(
-        mainModule,
-        declaredModules,
-        entry.manifest.moduleMediaTypes,
-      );
-      const applicationModules = entry.manifest.moduleFiles.application;
-      const hostModules = entry.manifest.moduleFiles.hostPrivate;
-      const hostEntrypoint = entry.manifest.hostEntrypoint;
-      const orderedHostModules =
-        hostEntrypoint === undefined
-          ? hostModules
-          : [
-              requiredStoredModule(hostModules, hostEntrypoint),
-              ...hostModules.filter((module) => module.name !== hostEntrypoint),
-            ];
-      const orderedModules =
-        hostEntrypoint === undefined
-          ? [
-              ...applicationModules.map((module) => ({ module, role: "application" as const })),
-              ...orderedHostModules.map((module) => ({ module, role: "hostPrivate" as const })),
-            ]
-          : [
-              ...orderedHostModules.map((module) => ({ module, role: "hostPrivate" as const })),
-              ...applicationModules.map((module) => ({ module, role: "application" as const })),
-            ];
-      const moduleList = orderedModules
-        .map(({ module, role }) => {
-          const mediaType =
-            role === "application"
-              ? (moduleMediaTypes?.[module.name] ?? "application/javascript+module")
-              : "application/javascript+module";
-          const provenanceDirectory =
-            role === "application" ? APPLICATION_MODULE_DIRECTORY : HOST_PRIVATE_MODULE_DIRECTORY;
-          return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${entry.storagePrefix}/${provenanceDirectory}/${module.key}`)}, role = ${role})`;
-        })
-        .join(", ");
+      const moduleList = renderWorkerdModules(entry.manifest, entry.storagePrefix);
       // Rendered only for a script published through a generated entrypoint, so
       // a script that binds no data plane produces the bytes it always did.
       const flagList = hasHostEntrypoint(entry)
