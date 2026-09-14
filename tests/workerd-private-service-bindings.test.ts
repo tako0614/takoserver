@@ -442,6 +442,65 @@ test("acquisition returns private sockets without reloading the serving config",
   await lease.release();
 });
 
+test("aborted acquisition settles behind a held activation and cannot create late pins", async () => {
+  let probe!: ConfigProbe;
+  const runtime = runtimeWithPrivateSockets({
+    captureProbe: (value) => {
+      probe = value;
+    },
+  });
+  await publish(runtime, "target", publication("target", { workerResourceUid: TARGET_UID }));
+  await publish(
+    runtime,
+    "caller",
+    publication("caller", { workerResourceUid: CALLER_UID, serviceBindings: [SERVICE_BINDING] }),
+  );
+  const identity = await selectedIdentity("caller", CALLER_UID);
+  let releaseReload!: () => void;
+  let enteredReload!: () => void;
+  const held = new Promise<void>((resolve) => {
+    releaseReload = resolve;
+  });
+  const entered = new Promise<void>((resolve) => {
+    enteredReload = resolve;
+  });
+  probe.behavior = async () => {
+    enteredReload();
+    await held;
+  };
+  const reloading = runtime.reload();
+  await entered;
+  const abort = new AbortController();
+  const reason = new Error("cancel queued acquisition");
+  const pending = runtime.acquirePrivateServiceBindings(identity, abort.signal);
+  const settled = pending.then(
+    (lease) => lease,
+    (error: unknown) => error,
+  );
+  let timeout!: ReturnType<typeof setTimeout>;
+  try {
+    abort.abort(reason);
+    const bounded = new Promise<symbol>((resolve) => {
+      timeout = setTimeout(() => resolve(Symbol("acquisition still queued")), 1_000);
+    });
+    // The activation lock is deliberately still held at this assertion.
+    expect(await Promise.race([settled, bounded])).toBe(reason);
+  } finally {
+    clearTimeout(timeout);
+    releaseReload();
+    delete probe.behavior;
+    await reloading;
+    const result = await settled;
+    if (typeof result === "object" && result !== null && "release" in result) {
+      await (result as { release(): Promise<void> }).release();
+    }
+  }
+  // This mutation queues after the abandoned read. Its continued execution
+  // must see the aborted signal before pinning an otherwise retired router.
+  await publish(runtime, "caller", null);
+  expect(await runtimeConfig()).not.toContain(SERVICE_TOKEN);
+});
+
 test("repeated reload closes and rebinds each private Unix socket", async () => {
   let probe: ConfigProbe | undefined;
   const runtime = runtimeWithPrivateSockets({

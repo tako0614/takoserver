@@ -320,7 +320,13 @@ export interface WorkerdPrivateServiceLease {
     readonly upstreamSocket: string;
     readonly unavailableToken: string;
   }[];
-  /** Release only after child reap, ingress drain and temporary config removal. */
+  /**
+   * Release only before a child starts or after child/gateway reap and ingress
+   * drain. Artifact removal is an independent cleanup obligation: its failure
+   * must not retain an otherwise unused live service lease.
+   * Idempotent and retry-safe: even a rejection after release took effect must
+   * allow another call without releasing a different holder's pin.
+   */
   release(): Promise<void>;
 }
 
@@ -340,9 +346,14 @@ export interface HostedWorkerdRuntime extends WorkerdRuntime {
    * build comes back on this one's router.
    */
   restore(): Promise<readonly string[]>;
-  /** Pin a captured caller's binding routers while their targets follow the current graph. */
+  /**
+   * Pin a captured caller's binding routers while targets follow the current
+   * graph. Abort before acquisition rejects without waiting for queued reads;
+   * an already acquired lease is returned for the caller's owned cleanup.
+   */
   acquirePrivateServiceBindings(
     identity: WorkerdSelectedVersionIdentity,
+    signal?: AbortSignal,
   ): Promise<WorkerdPrivateServiceLease>;
 }
 
@@ -1017,11 +1028,13 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
 
   return {
     inspectModule: (input) => moduleInspector.inspect(input),
-    acquirePrivateServiceBindings(identity) {
+    acquirePrivateServiceBindings(identity, signal) {
       // Copy before entering the queue so a caller cannot change the requested
       // identity while another publication owns the activation lock.
       const requested = { ...identity };
-      return exclusiveActivation(async () => {
+      let leaseAcquired = false;
+      const pending = exclusiveActivation(async () => {
+        signal?.throwIfAborted();
         const unavailable = () =>
           new Error("private execution service binding bridge is unavailable");
         if (
@@ -1075,14 +1088,8 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
             throw unavailable();
           }
         }
-        for (const binding of bindings) {
-          const router = serviceRouterName(binding);
-          const existing = servicePins.get(router);
-          if (existing) existing.count += 1;
-          else servicePins.set(router, { binding, count: 1 });
-        }
         let released = false;
-        return {
+        const lease: WorkerdPrivateServiceLease = {
           services: bindings.map((binding) => ({
             name: binding.name,
             upstreamSocket: privateServiceSocket(
@@ -1105,6 +1112,43 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
               // pruning avoids a shared-graph reload for every completed run.
             }),
         };
+        // Build paths and the complete lease before the synchronous pin
+        // commit. No fallible service mapping or await can lose a new pin.
+        const additions = bindings.map((binding) => ({
+          binding,
+          router: serviceRouterName(binding),
+        }));
+        signal?.throwIfAborted();
+        for (const { binding, router } of additions) {
+          const existing = servicePins.get(router);
+          if (existing) existing.count += 1;
+          else servicePins.set(router, { binding, count: 1 });
+        }
+        leaseAcquired = true;
+        return lease;
+      });
+      if (!signal) return pending;
+      return new Promise<WorkerdPrivateServiceLease>((resolve, reject) => {
+        const onAbort = (): void => {
+          if (leaseAcquired) return;
+          signal.removeEventListener("abort", onAbort);
+          reject(signal.reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        // Retain both handlers after an early abort. If the synchronous pin
+        // commit already happened, deliver its lease rather than losing it to
+        // an abort race; preparation observes abort and owns the release.
+        void pending.then(
+          (lease) => {
+            signal.removeEventListener("abort", onAbort);
+            resolve(lease);
+          },
+          (error: unknown) => {
+            signal.removeEventListener("abort", onAbort);
+            reject(error);
+          },
+        );
       });
     },
     async publish(name, publication) {

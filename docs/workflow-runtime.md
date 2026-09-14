@@ -556,6 +556,63 @@ an explicit opt-in requiring both `TAKOSERVER_WORKERD_BINARY` and
 count as native evidence. AI/Vector/Actor bindings, managed WfP execution and the
 remaining activation/scheduler boundaries above are not covered by this result.
 
+## Host-runtime library entrypoints
+
+Two software-library subpaths expose the reusable runtime without changing any
+Takoform API, Form, Interface or Binding version:
+
+- `@takoserver/core/workflow-runtime` is the platform-neutral coordinator and
+  Host port. It exports `createWorkflowRuntime`, the execution/driver/instance
+  types, `SqlError`, `WorkflowInstanceError`, and the runtime/input error brands
+  and guards. An alternative Host needs the checked-input guards to preserve
+  lazy argument validation without misclassifying an application's own
+  `TypeError`. `WorkflowStepError` is type-only; `isWorkflowStepError` preserves
+  genuine exhausted-step correlation. Raw instance construction, Promise
+  machinery, JSON codec and transport/controller internals are not exported.
+- `@takoserver/core/workflow-runtime/workerd` is trusted Bun/Linux composition,
+  not a module to import into a Cloudflare Worker or tenant application. It
+  exports `createWorkerdWorkflowExecutionHost` and
+  `prepareWorkerdWorkflowExecution`, with their input/result types. The public
+  factory always uses the retained guard executable and does not forward the
+  internal test-only guard factory.
+
+Neither subpath is re-exported from the package root or provider extension.
+The build checks a browser-target closure for the neutral entrypoint separately
+from the concrete Bun closure. Package imports do not enable Workflow support
+or authorize an unpublished Form candidate.
+
+At `session.run()`, a Host-owned reader must resolve the exact same-tenant
+Workflow/Worker relation, immutable class and current active Version, verifying
+its module digests before handing the captured graph to the preparer. The
+preparer accepts that selected graph, not a mutable path or an `authorized`
+boolean; it checks structural consistency but is not an admission authority.
+Its input does not require the self-host publication's `generationKey`.
+The self-host adapter retains its committed weighted selection reader; another
+Host must supply its own exact, receipt-qualified reader rather than inventing
+self-host filesystem metadata. Selection does not occur in `openPaused()`.
+
+The shared preparer snapshots nested declarations and module bytes before its
+first asynchronous operation. It owns bootstrap injection, namespace-safe
+module allocation, the private HTTP controller, workerd configuration and
+temporary artifacts. The caller supplies Host-owned data-plane and exact
+selected-Version service-lease callbacks; provider/application state cannot
+choose them. Once acquired, a lease belongs to this preparation lifecycle.
+Acquisition receives the preparation's abort signal and must settle on abort
+without leaving an ownerless late lease. The self-host adapter can cancel an
+acquisition waiting behind activation work; a late continuation cannot pin new
+routers. A lease already acquired is delivered for owned cleanup, not discarded
+by an abort race. Release must be idempotent and retry-safe even after an
+ambiguous failure.
+After child/gateway reap and the frame barrier, disposal attempts both artifact
+removal and lease release. Either failure remains a failed cleanup for retry;
+an artifact-removal error must not leak an otherwise unused live service lease.
+
+These source/library entrypoints are not a shipped managed executable. A
+retained, operator-qualified guard/workerd artifact set, a trusted companion
+entrypoint, durable SQL ownership, exact Version receipts and scheduling still
+need integration. There is no standalone guarded-Host image or launcher in this
+package, and this change does not claim managed WfP execution qualification.
+
 ## Schema and rollout
 
 Migration `0050_workflow_instances.sql` adds the instance and event tables.

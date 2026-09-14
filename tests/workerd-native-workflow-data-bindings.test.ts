@@ -3,6 +3,8 @@ import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createWorkflowRuntime } from "@takoserver/core/workflow-runtime";
+import { createWorkerdWorkflowExecutionHost } from "@takoserver/core/workflow-runtime/workerd";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -22,12 +24,10 @@ import {
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
-import { createWorkerdWorkflowExecutionHost } from "../src/selfhost-workflow-execution-host.ts";
 import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/workerd-runtime.ts";
-import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 
 const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
 const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;

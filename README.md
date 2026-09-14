@@ -570,6 +570,14 @@ managed extension may bind that same operator-selected database, but it does
 not copy the migration lineage or become a second schema writer. Source
 separation alone is not proof of a deployed managed installation.
 
+Workflow Host embedders have two separate source-library entries:
+`@takoserver/core/workflow-runtime` exposes the platform-neutral coordinator and
+ports; `@takoserver/core/workflow-runtime/workerd` exposes trusted Bun/Linux
+guarded execution and selected-Version preparation. Neither is a provider
+extension or an app-facing Binding. See [Workflow runtime](docs/workflow-runtime.md#host-runtime-library-entrypoints)
+for selection and lifecycle responsibilities. These entries do not ship a
+managed companion image, enable Workflow support, or change any API/Form version.
+
 Three properties are worth knowing before reading the code:
 
 **Shipped Form definitions come from exact Takoform bytes.** Takoserver cannot

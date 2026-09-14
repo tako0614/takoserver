@@ -90,7 +90,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/workflow-http-bootstrap\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/workflow-http-bootstrap\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -109,7 +109,7 @@ const LAYERS: readonly Layer[] = [
   // to construct — but it stays below `entry`, which owns a running process.
   {
     name: "package-surface",
-    match: /^src\/(?:index|provider-extension)\.ts$/u,
+    match: /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-workerd)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
 ];
