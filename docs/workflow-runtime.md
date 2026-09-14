@@ -13,14 +13,27 @@ The selected `worker.workflow@1.0.0` Interface already defines instance
 creation, status, durable event delivery, terminal retention and lifetime.
 Its consumer Binding defines `create`, `get`, `status`, `sendEvent` and
 `terminate`. These contracts do not require a vendor-native workflow service.
-The JavaScript step callback projection and the workflow class's access to
-declared environment bindings still need an explicit forward contract. Retry
-normalization also remains unspecified: `retryPolicy` is optional, most of its
-fields have no defaults, and `exponential` defines no multiplier. This
-implementation does not supply those missing clauses by convention or edit
-published definitions. An unfinished step replayed under a different step kind
-also needs an explicit outcome; a completed memo, by contrast, is already
-defined to replay by name alone.
+That published closure does not fully define the JavaScript step callback,
+class environment, retry normalization or incomplete cross-kind replay. A
+separate, unregistered forward candidate now supplies those clauses in
+`takoform-forms`, at commit `59606f11d6d50e781383332f7c597de20a096e83`
+(`docs/proposals/workflow-execution-contract.md`). It defines an ordinary
+`new Export(env)` / `instance.run(event, step)` class surface without a vendor
+base class. The candidate is authored and checked, not published, selected or
+activated. This implementation does not fill the old contract's gaps by
+convention or edit its published bytes.
+
+The private coordinator records its normalized `retryDelaysSeconds` array on
+first use and reuses that journaled array for every later attempt, including
+replay under changed code. This is pre-activation conformance for the forward
+candidate; it does not amend the published `worker.workflow@1.0.0` definition
+or enable Workflow support.
+
+An invalid or oversized `do` result consumes a failed attempt under that same
+saved policy. The data-only encoder runs once before the result commit and
+never invokes getters. A successful result is committed before a decoded copy
+is returned. SQL failures stay infrastructure failures: they do not consume an
+application retry or manufacture `step_failed`.
 
 ## One persistence module
 
@@ -112,17 +125,30 @@ artifact on 2026-09-14: one test, 61 assertions. It verifies aborting a held-I/O
 callback, rejection of stale and outstanding calls, an existing sibling's
 unchanged generation, and replacement with retained state and no post-abort
 marker or catch/finally report. The fixture retains its A-B-A replacement and
-closed-import checks. This result does not establish CPU-bound preemption,
-deadline enforcement after controller loss, stop-before-open ordering or
-managed WfP conformance.
+closed-import checks.
 
-The next implementation prerequisite is the forward callee contract owned by
-the Form publisher. A host-private transport cannot quietly choose constructor,
-environment, step callback or error semantics for applications: that would
-make it the missing public ABI. The existing caller-only Binding is not that
-contract. A future facet carrier can live inside the existing workerd process,
-but still needs its own Host-private supervisor namespace and real lifecycle
-proof before it can implement the execution-host protocol.
+A separate native CPU-bound probe on the same pinned artifact subsequently
+failed: after the synchronous application entry marker, its supervisor's
+control/stop sequence could not finish within two seconds. The test process
+then killed only its own fixture child. That cleanup is not a per-execution
+stop acknowledgement. The existing same-process static-facet carrier therefore
+does not qualify this coordinator's stop/deadline protocol. Held-I/O abort is
+still proven; synchronous CPU preemption, controller-loss deadline enforcement,
+stop-before-open ordering and managed WfP conformance are not. The opt-in probe
+is `tests/workerd-native-workflow-facets.test.ts`; its failure must not be
+silently converted into supported discovery or an expected-success test.
+
+The Form publisher's forward callee candidate is now available for
+pre-activation implementation. A host-private transport must follow that exact
+contract rather than quietly choose constructor, environment, callback or error
+semantics. The existing caller-only Binding is not a substitute. A
+JavaScript-only facet supervisor in that same native process is insufficient
+on the tested artifact. The next carrier needs a stop/deadline mechanism
+outside application execution, such as native interruption or a separately
+supervised execution process. Killing the existing shared workerd process is
+not a per-run solution. Either replacement must prove isolated stop and
+controller-loss recovery before being adopted. This native result does not
+establish the behavior of Cloudflare's managed runtime.
 
 Cloudflare's [Dynamic Workflows](https://developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows/)
 provide a separate durable-execution integration. Their existence does not
@@ -174,9 +200,10 @@ application-specific state authority is introduced.
 The coordinator is not wired to production entrypoints or exported from the
 package root. Its execution-host protocol is not a selected app-facing Binding.
 It still needs a real isolated class loader with then-current weighted
-deployment selection, a qualified stop/deadline adapter and the forward callee
-contract described above. These are runtime responsibilities, not tasks for
-Takosumi or an application-specific adapter.
+deployment selection, a qualified stop/deadline adapter and implementation of
+the forward callee candidate described above. Publication and exact contract
+selection remain separate from this private implementation. These are runtime
+responsibilities, not tasks for Takosumi or an application-specific adapter.
 
 Self-host and managed implementations must ultimately project the same exact
 consumer Binding, authorize each declared target, and connect it to this

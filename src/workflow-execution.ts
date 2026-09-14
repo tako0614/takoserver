@@ -1,7 +1,6 @@
 import type { Clock, JsonObject, Row, Sql, SqlParam } from "./ports.ts";
 import {
   addDuration,
-  DocumentValidationError,
   encodeDocument,
   generatedIdentifier,
   inputIdentifier,
@@ -554,22 +553,16 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     async function completeStep(
       name: string,
       prior: StepRow,
-      output: JsonObject | undefined,
+      resultJson: string | null,
     ): Promise<JsonObject | undefined> {
-      let json: string | null;
-      try {
-        json = output === undefined ? null : encodeDocument(output);
-      } catch (error) {
-        if (error instanceof DocumentValidationError && error.kind === "too_large") {
-          throw new WorkflowStepError("document_too_large");
-        }
-        throw new WorkflowRuntimeError("invalid_runtime_input");
-      }
+      // The callback result is encoded before entering this helper. Keeping
+      // SQL settlement outside that validation path prevents a failed commit
+      // from being mistaken for an application retryable failure.
       const saved = await changeStep(
         name,
         prior,
         "state = 'complete', result_json = ?, error_json = NULL, wake_at = NULL, timeout_at = NULL",
-        [json],
+        [resultJson],
       );
       return memo(saved);
     }
@@ -581,23 +574,28 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           let current = await readStep(identity, key);
           if (current && (current.state === "complete" || current.state === "errored"))
             return memo(current);
-          const delays = retryDelays(retryDelaysSeconds);
+          // Validate the call even when this is a replay, but never let a new
+          // deployment replace the first policy committed to the step journal.
+          const requestedDelays = retryDelays(retryDelaysSeconds);
           if (typeof effect !== "function") throw new WorkflowRuntimeError("invalid_runtime_input");
-          current = await step(key, "do", { retryDelaysSeconds: delays });
+          current = await step(key, "do", { retryDelaysSeconds: requestedDelays });
+          const savedConfig = parseDocument(current.configJson);
+          const delays = retryDelays(savedConfig.retryDelaysSeconds);
           if (current.state === "retry_wait") {
             const wake = integer(current.wakeAt);
             if (wake > now()) return park(key, "sleeping", Math.min(wake, identity.deadlineAt));
             current = await changeStep(key, current, "state = 'pending', wake_at = NULL", []);
           }
-          // New code may choose a new explicit retry plan. Already-durable
-          // wake times above are never recomputed from the new plan.
+          // Both future attempts and already-durable wake times belong to the
+          // first journaled plan, even when replay runs a newer deployment.
           const attempts =
             current.retryProgressJson === null
               ? 0
               : integer(parseDocument(current.retryProgressJson).attempt);
-          let value: JsonObject | undefined;
+          let resultJson: string | null = null;
           try {
-            value = await effect();
+            const value = await effect();
+            resultJson = value === undefined ? null : encodeDocument(value);
           } catch (error) {
             if (error instanceof WorkflowRuntimeError) throw error;
             const delay = delays[attempts];
@@ -616,7 +614,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
             );
             return park(key, "sleeping", Math.min(wake, identity.deadlineAt));
           }
-          return completeStep(key, current, value);
+          return completeStep(key, current, resultJson);
         });
       },
       sleep(name, seconds) {
@@ -634,7 +632,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
             current.wakeAt ?? addDuration(current.createdAt, savedDuration * 1_000, "sleep wake");
           if (wake > identity.deadlineAt) return boundedFailure("lifetime_exceeded");
           if (wake <= now()) {
-            await completeStep(key, current, undefined);
+            await completeStep(key, current, null);
             return;
           }
           if (current.state === "pending") {
@@ -999,7 +997,7 @@ function secondsValue(value: unknown, minimum: number): number {
   }
   return value;
 }
-function retryDelays(value: readonly number[]): number[] {
+function retryDelays(value: unknown): number[] {
   if (!Array.isArray(value) || value.length > 99)
     throw new WorkflowRuntimeError("invalid_runtime_input");
   return value.map((delay) => {

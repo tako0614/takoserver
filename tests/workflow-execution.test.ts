@@ -371,6 +371,159 @@ describe("internal Workflow execution coordinator", () => {
     });
   });
 
+  test("a replay keeps the journaled retry plan after the first retry", async () => {
+    const f = fixture();
+    await f.create();
+    let attempts = 0;
+    f.hooks.application = (step) =>
+      step.do("retry", [1, 1], () => {
+        attempts += 1;
+        if (attempts <= 2) throw new Error("app failure");
+        return { attempts };
+      });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    await f.advance(1_000);
+    f.hooks.application = (step) =>
+      step.do("retry", [], () => {
+        attempts += 1;
+        if (attempts <= 2) throw new Error("replayed app failure");
+        return { attempts };
+      });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 2_000 });
+    await f.advance(2_000);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { attempts: 3 },
+    });
+  });
+
+  test("a pending zero-retry journal cannot gain a retry from changed code", async () => {
+    let failAfterInsert = false;
+    const f = fixture((sql) => ({
+      ...sql,
+      async run(statement, params) {
+        const result = await sql.run(statement, params);
+        if (statement.startsWith("INSERT INTO tf_workflow_steps") && result.changes === 1) {
+          failAfterInsert = true;
+        }
+        return result;
+      },
+      async query(statement, params) {
+        if (
+          statement.startsWith("SELECT * FROM tf_workflow_steps WHERE execution_id = ?") &&
+          failAfterInsert
+        ) {
+          failAfterInsert = false;
+          throw new Error("crash after pending journal");
+        }
+        return sql.query(statement, params);
+      },
+    }));
+    await f.create();
+    let effects = 0;
+    f.hooks.application = (step) =>
+      step.do("retry", [], () => {
+        effects += 1;
+        throw new Error("initial app failure");
+      });
+    await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
+      code: "backend_unavailable",
+    });
+    expect(f.row()).toMatchObject({ status: "running", run_owner: null });
+    expect(f.db.query("SELECT state, config_json FROM tf_workflow_steps").get()).toEqual({
+      state: "pending",
+      config_json: '{"retryDelaysSeconds":[]}',
+    });
+    f.hooks.application = (step) =>
+      step.do("retry", [1], () => {
+        effects += 1;
+        throw new Error("replayed app failure");
+      });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "errored",
+    });
+    expect(effects).toBe(1);
+    expect(f.row()).toMatchObject({ status: "errored", wake_at: null, run_owner: null });
+  });
+
+  test("a changed valid retry delay cannot recompute persisted future wakes", async () => {
+    const f = fixture();
+    await f.create();
+    let attempts = 0;
+    f.hooks.application = (step) =>
+      step.do("retry", [5, 7], () => {
+        attempts += 1;
+        throw new Error("app failure");
+      });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 5_000 });
+    f.hooks.application = (step) =>
+      step.do("retry", [1, 2], () => {
+        attempts += 1;
+        throw new Error("replayed app failure");
+      });
+    await f.advance(1_000);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "deferred",
+      retryAt: START + 5_000,
+    });
+    await f.advance(5_000);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 12_000 });
+    expect(attempts).toBe(2);
+  });
+
+  test("an invalid do result is a failed attempt without invoking getters", async () => {
+    const f = fixture();
+    await f.create();
+    let getterReads = 0;
+    const invalid = {};
+    Object.defineProperty(invalid, "forbidden", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        throw new Error("getter must not run");
+      },
+    });
+    f.hooks.application = (step) => step.do("invalid", [], () => invalid as unknown as JsonObject);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "errored",
+    });
+    expect(getterReads).toBe(0);
+    expect(JSON.parse(String(f.row().error_json))).toEqual({ reason: "step_failed" });
+  });
+
+  test("an oversized do result retries under its saved plan before replay success", async () => {
+    const f = fixture();
+    await f.create();
+    const oversized = { payload: "x".repeat(1_048_577) } as unknown as JsonObject;
+    let attempts = 0;
+    f.hooks.application = (step) =>
+      step.do("oversized", [1, 1], () => {
+        attempts += 1;
+        return oversized;
+      });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 1_000 });
+    f.hooks.application = (step) =>
+      step.do("oversized", [], () => {
+        attempts += 1;
+        return attempts <= 2 ? oversized : { ok: true };
+      });
+    await f.advance(1_000);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+    expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 2_000 });
+    await f.advance(2_000);
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "complete",
+      output: { ok: true },
+    });
+    expect(attempts).toBe(3);
+  });
+
   test("retained pre-wait events are consumed once, including omitted payload", async () => {
     const f = fixture();
     await f.create();
@@ -611,7 +764,7 @@ describe("internal Workflow execution coordinator", () => {
     expect(f.row()).toMatchObject({ status: "running", error_json: null, run_owner: null });
   });
 
-  test("effect-before-commit storage failure re-executes without inventing an app failure", async () => {
+  test("a successful-result commit failure stays infrastructure and retryable", async () => {
     let failCommit = true;
     const f = fixture((sql) => ({
       ...sql,
@@ -625,11 +778,18 @@ describe("internal Workflow execution coordinator", () => {
     }));
     await f.create();
     let effects = 0;
-    f.hooks.application = (step) => step.do("effect", [], () => ({ count: ++effects }));
+    f.hooks.application = (step) => step.do("effect", [1], () => ({ count: ++effects }));
     await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
       code: "backend_unavailable",
     });
     expect(f.row()).toMatchObject({ status: "running", run_owner: null, error_json: null });
+    expect(
+      f.db.query("SELECT state, retry_progress_json, wake_at FROM tf_workflow_steps").get(),
+    ).toEqual({
+      state: "pending",
+      retry_progress_json: null,
+      wake_at: null,
+    });
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "complete",
       output: { count: 2 },
