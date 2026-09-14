@@ -11,7 +11,10 @@ const registration: WorkerdExecutionRegistration = {
   until: 10_000,
 };
 
-function fixture(timeout = 1_000) {
+function fixture(
+  timeout = 1_000,
+  journal?: { token: string; onMarker: (sequence: number) => void },
+) {
   const frames: Record<string, unknown>[] = [];
   let output!: ReadableStreamDefaultController<Uint8Array>;
   let exit!: (code: number) => void;
@@ -41,7 +44,8 @@ function fixture(timeout = 1_000) {
     },
   };
   const guard = createWorkerdExecutionGuard({
-    registration,
+    registration: { ...registration, ...(journal ? { journalToken: journal.token } : {}) },
+    ...(journal ? { onJournalMarker: journal.onMarker } : {}),
     commandTimeoutMs: timeout,
     spawn: () => process,
   });
@@ -228,4 +232,97 @@ test("input validation precedes spawn and invalid renewal is never sent", async 
   expect(f.frames.map((frame) => frame.op)).toEqual(["register", "stop"]);
   f.eof();
   f.exit(0);
+});
+
+test("journal markers are synchronously latched before an overtaking STOP ACK", async () => {
+  const markers: number[] = [];
+  const f = fixture(1_000, {
+    token: "b".repeat(64),
+    onMarker: (sequence) => {
+      markers.push(sequence);
+    },
+  });
+  await f.reply(1, "registered");
+  await f.guard.registered;
+  expect(f.frames[0]?.journalToken).toBe("b".repeat(64));
+  const start = f.guard.start("/private/run.capnp").catch((error: Error) => error.message);
+  const stop = f.guard.stop();
+  await f.sent(3);
+  f.raw(
+    '{"kind":"journal","sequence":1}\n{"kind":"journal","sequence":2}\n{"id":3,"kind":"stopped"}\n',
+  );
+  await stop;
+  expect(markers).toEqual([1, 2]);
+  expect(await start).toBe("stopped");
+  expect(f.killed()).toBe(0);
+  f.eof();
+  f.exit(0);
+});
+
+test("a journal gap, duplicate, unrequested profile or malformed marker cannot acknowledge stop", async () => {
+  for (const mode of ["gap", "duplicate", "extra", "unrequested", "before-start"] as const) {
+    const f = fixture(
+      1_000,
+      mode === "unrequested" ? undefined : { token: "b".repeat(64), onMarker: () => {} },
+    );
+    await f.reply(1, "registered");
+    await f.guard.registered;
+    if (mode !== "before-start") {
+      const start = f.guard.start("/private/run.capnp");
+      await f.reply(2, "started");
+      await start;
+    }
+    const stop = f.guard.stop();
+    await f.sent(mode === "before-start" ? 2 : 3);
+    if (mode === "duplicate") f.raw('{"kind":"journal","sequence":1}\n');
+    f.raw(
+      `${JSON.stringify({ kind: "journal", sequence: mode === "gap" ? 2 : 1, ...(mode === "extra" ? { id: 1 } : {}) })}\n`,
+    );
+    await expect(stop).rejects.toThrow("protocol_failure");
+    expect(f.killed()).toBe(1);
+    f.eof();
+    f.exit(1);
+  }
+});
+
+test("failed or asynchronous marker bookkeeping rejects the guard session", async () => {
+  for (const onMarker of [
+    () => {
+      throw new Error("sink failed");
+    },
+    async () => {},
+  ]) {
+    const f = fixture(1_000, { token: "b".repeat(64), onMarker });
+    await f.reply(1, "registered");
+    await f.guard.registered;
+    const start = f.guard.start("/private/run.capnp");
+    await f.reply(2, "started");
+    await start;
+    const stop = f.guard.stop();
+    await f.sent(3);
+    f.raw('{"kind":"journal","sequence":1}\n');
+    await expect(stop).rejects.toThrow("protocol_failure");
+    f.eof();
+    f.exit(1);
+  }
+});
+
+test("journal token and synchronous observer must be selected together before spawn", () => {
+  for (const option of [
+    { registration: { ...registration, journalToken: "b".repeat(64) } },
+    { registration, onJournalMarker: () => {} },
+    { registration: { ...registration, journalToken: "invalid" }, onJournalMarker: () => {} },
+  ]) {
+    let spawned = false;
+    expect(() =>
+      createWorkerdExecutionGuard({
+        ...option,
+        spawn: () => {
+          spawned = true;
+          throw new Error("must not spawn");
+        },
+      }),
+    ).toThrow("invalid_input");
+    expect(spawned).toBe(false);
+  }
 });

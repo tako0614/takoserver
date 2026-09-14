@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -283,6 +284,180 @@ func TestGuardStopReapsCPUChildAndControllerEOFReapsCPUChild(t *testing.T) {
 				t.Fatalf("child pid %d remains after %s", pid, mode)
 			}
 		})
+	}
+}
+
+func TestDecodeRequestOptionalJournalTokenAndStrictRegisterFields(t *testing.T) {
+	fields := registrationFields(t, 5*time.Second, 10*time.Second)
+	fields["journalToken"] = testIdentity
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := decodeRequest(raw)
+	if err != nil {
+		t.Fatalf("journal registration rejected: %v", err)
+	}
+	if request.JournalToken != testIdentity {
+		t.Fatalf("journal token = %q, want %q", request.JournalToken, testIdentity)
+	}
+
+	for _, invalid := range []string{"A" + testIdentity[1:], testIdentity + "0", strings.ToUpper(testIdentity)} {
+		fields["journalToken"] = invalid
+		raw, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeRequest(raw); errorCode(err, "") != CodeInvalidFrame {
+			t.Fatalf("journal token %q error = %v", invalid, err)
+		}
+	}
+
+	fields["journalToken"] = testIdentity
+	fields["extra"] = true
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeRequest(raw); errorCode(err, "") != CodeInvalidFrame {
+		t.Fatalf("unknown register field error = %v", err)
+	}
+
+	start := startFields(2, "/tmp/workflow.capnp")
+	start["journalToken"] = testIdentity
+	raw, err = json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeRequest(raw); errorCode(err, "") != CodeInvalidFrame {
+		t.Fatalf("journal token on start error = %v", err)
+	}
+}
+
+func TestJournalMarkerStreamAcceptsOnlyConsecutiveTrustedMarkers(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		want     []int64
+		wantCode Code
+	}{
+		{name: "accepted", input: journalMarkerPrefix + testIdentity + ":1\n" + journalMarkerPrefix + testIdentity + ":2\n", want: []int64{1, 2}},
+		{name: "wrong-token-is-ordinary", input: journalMarkerPrefix + strings.Repeat("f", 64) + ":9\n" + journalMarkerPrefix + testIdentity + ":1\n", want: []int64{1}},
+		{name: "embedded-marker-is-ordinary", input: "application log " + journalMarkerPrefix + testIdentity + ":9\n" + journalMarkerPrefix + testIdentity + ":1\n", want: []int64{1}},
+		{name: "long-ordinary-before-marker", input: strings.Repeat("x", 4*MaxFrameBytes) + "\n" + journalMarkerPrefix + testIdentity + ":1\n", want: []int64{1}},
+		{name: "long-wrong-token-before-marker", input: journalMarkerPrefix + strings.Repeat("f", 64) + ":" + strings.Repeat("x", 4*MaxFrameBytes) + "\n" + journalMarkerPrefix + testIdentity + ":1\n", want: []int64{1}},
+		{name: "long-ordinary-without-newline", input: strings.Repeat("x", 4*MaxFrameBytes)},
+		{name: "sequence-gap", input: journalMarkerPrefix + testIdentity + ":2\n", wantCode: CodeProtocolJournal},
+		{name: "truncated", input: journalMarkerPrefix + testIdentity + ":1", wantCode: CodeProtocolJournal},
+		{name: "missing-sequence", input: journalMarkerPrefix + testIdentity + "\n", wantCode: CodeProtocolJournal},
+		{name: "noncanonical-sequence", input: journalMarkerPrefix + testIdentity + ":01\n", wantCode: CodeProtocolJournal},
+		{name: "oversized-trusted-marker", input: journalMarkerPrefix + testIdentity + ":" + strings.Repeat("1", MaxFrameBytes) + "\n", wantCode: CodeProtocolJournal},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			defer writer.Close()
+			var output bytes.Buffer
+			replyWriter := newReplyWriter(&output, nil)
+			replyWriter.start()
+			controller := newController(testExecutable(t))
+			stream := newJournalStream(testIdentity, reader)
+			go stream.run(controller, replyWriter)
+			if _, err := io.WriteString(writer, testCase.input); err != nil && testCase.wantCode == "" {
+				t.Fatal(err)
+			}
+			_ = writer.Close()
+			select {
+			case <-stream.done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("journal reader did not finish")
+			}
+			if got := controller.terminalCode(); got != testCase.wantCode {
+				t.Fatalf("terminal code = %s, want %s", got, testCase.wantCode)
+			}
+			// Enqueue a barrier to ensure accepted journal frames reached the
+			// bounded writer before inspecting the output bytes.
+			if err := replyWriter.sendAndWait(reply{ID: 1, Kind: "barrier"}); err != nil {
+				t.Fatal(err)
+			}
+			replyWriter.stop()
+			lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'})
+			var got []int64
+			for _, line := range lines {
+				var frame journalReply
+				if json.Unmarshal(line, &frame) == nil && frame.Kind == "journal" {
+					got = append(got, frame.Sequence)
+				}
+			}
+			if fmt.Sprint(got) != fmt.Sprint(testCase.want) {
+				t.Fatalf("journal sequence = %v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
+func TestJournalLineUsesTheControllerFrameBound(t *testing.T) {
+	input := []byte(journalMarkerPrefix + testIdentity + ":" + strings.Repeat("1", MaxFrameBytes) + "\n")
+	_, _, err := readJournalLine(bufio.NewReader(bytes.NewReader(input)), testIdentity)
+	if !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("oversized journal line error = %v", err)
+	}
+}
+
+func TestReplyWriterAfterStopRejectsLateJournal(t *testing.T) {
+	writer := newReplyWriter(io.Discard, nil)
+	writer.start()
+	writer.stop()
+	if err := writer.sendJournal(1); errorCode(err, "") != CodeProtocolOutput {
+		t.Fatalf("late journal error = %v, want protocol_output", err)
+	}
+	if err := writer.sendAndWait(reply{ID: 1, Kind: "stopped"}); errorCode(err, "") != CodeProtocolOutput {
+		t.Fatalf("closed writer must not acknowledge stop: %v", err)
+	}
+}
+
+func TestReplyWriterConcurrentStopAndJournal(t *testing.T) {
+	for attempt := 0; attempt < 64; attempt++ {
+		writer := newReplyWriter(io.Discard, nil)
+		writer.start()
+		start := make(chan struct{})
+		var pending sync.WaitGroup
+		pending.Add(2)
+		go func() { defer pending.Done(); <-start; writer.stop() }()
+		go func() { defer pending.Done(); <-start; _ = writer.sendJournal(1) }()
+		close(start)
+		pending.Wait()
+		if err := writer.sendJournal(2); errorCode(err, "") != CodeProtocolOutput {
+			t.Fatalf("attempt %d accepted a marker after close: %v", attempt, err)
+		}
+	}
+}
+
+func TestJournalTimeoutCannotBecomeStopProofAfterLateEOF(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	defer writer.Close()
+	controller := newController(testExecutable(t))
+	stream := newJournalStream(testIdentity, reader)
+	controller.journal = stream
+	// Model a reader stalled beyond both bounded joins, then a late completion.
+	first := controller.waitJournal(stream)
+	if errorCode(first, "") != CodeProtocolJournal {
+		t.Fatalf("missing EOF was accepted: %v", first)
+	}
+	close(stream.done)
+	if second := controller.waitJournal(stream); second != first {
+		t.Fatalf("late EOF replaced failure: %v", second)
+	}
+	if stopped := controller.stopAndReap(CodeStopped); stopped != first {
+		t.Fatalf("late EOF became stop proof: %v", stopped)
 	}
 }
 

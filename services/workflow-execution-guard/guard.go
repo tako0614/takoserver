@@ -50,6 +50,7 @@ const (
 	CodeStopFailed           Code = "stop_failed"
 	CodeProtocolOutput       Code = "protocol_output"
 	CodeProtocolBackpressure Code = "protocol_backpressure"
+	CodeProtocolJournal      Code = "protocol_journal"
 	CodeUnsupported          Code = "unsupported_platform"
 )
 

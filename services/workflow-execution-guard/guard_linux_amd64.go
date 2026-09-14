@@ -33,24 +33,31 @@ const (
 )
 
 var (
-	errClockChanged = errors.New("realtime clock changed")
-	errTimerClosed  = errors.New("realtime timer closed")
-	errReapTimeout  = errors.New("child reap did not complete before timeout")
+	errClockChanged         = errors.New("realtime clock changed")
+	errTimerClosed          = errors.New("realtime timer closed")
+	errReapTimeout          = errors.New("child reap did not complete before timeout")
+	errJournalReaderTimeout = errors.New("journal reader did not complete before timeout")
 )
 
 type request struct {
-	ID         int64
-	Op         string
-	Identity   string
-	DeadlineAt int64
-	Until      int64
-	ConfigPath string
+	ID           int64
+	Op           string
+	Identity     string
+	DeadlineAt   int64
+	Until        int64
+	ConfigPath   string
+	JournalToken string
 }
 
 type reply struct {
 	ID   int64  `json:"id"`
 	Kind string `json:"kind"`
 	Code Code   `json:"code,omitempty"`
+}
+
+type journalReply struct {
+	Kind     string `json:"kind"`
+	Sequence int64  `json:"sequence"`
 }
 
 type inputEvent struct {
@@ -83,6 +90,7 @@ func Run(options Options) error {
 
 	controller := newController(options.WorkerdBinary)
 	writer := newReplyWriter(options.Out, controller.signalWriterFailure)
+	controller.setJournalWriter(writer)
 	writer.start()
 
 	inputEvents := make(chan inputEvent, 1)
@@ -351,6 +359,12 @@ func decodeRequest(raw []byte) (request, error) {
 		if err != nil || result.Until <= 0 {
 			return result, guardError(CodeInvalidLease, errors.New("until must be a positive safe integer"))
 		}
+		if journalTokenRaw, ok := fields["journalToken"]; ok {
+			result.JournalToken, err = parseString(journalTokenRaw)
+			if err != nil || !validIdentity(result.JournalToken) {
+				return result, guardError(CodeInvalidFrame, errors.New("journalToken must be 64 lowercase hexadecimal characters"))
+			}
+		}
 	case "extend":
 		result.Until, err = parseSafeInteger(fields["until"])
 		if err != nil || result.Until <= 0 {
@@ -370,7 +384,7 @@ func decodeRequest(raw []byte) (request, error) {
 
 func isFrameField(field string) bool {
 	switch field {
-	case "id", "op", "identity", "deadlineAt", "until", "configPath":
+	case "id", "op", "identity", "deadlineAt", "until", "configPath", "journalToken":
 		return true
 	default:
 		return false
@@ -390,7 +404,13 @@ func requireFrameFields(fields map[string]json.RawMessage, op string) error {
 	default:
 		return guardError(CodeInvalidFrame, errors.New("unsupported operation"))
 	}
-	if len(fields) != len(want) {
+	expectedFields := len(want)
+	if op == "register" {
+		if _, ok := fields["journalToken"]; ok {
+			expectedFields++
+		}
+	}
+	if len(fields) != expectedFields {
 		return guardError(CodeInvalidFrame, errors.New("wrong frame fields"))
 	}
 	for key := range want {
@@ -460,6 +480,7 @@ type replyWriter struct {
 	failOnce  sync.Once
 	mu        sync.Mutex
 	err       error
+	closed    bool
 	onFailure func(Code, error)
 }
 
@@ -515,6 +536,10 @@ func (writer *replyWriter) send(value reply) error {
 	return writer.enqueue(value, nil)
 }
 
+func (writer *replyWriter) sendJournal(sequence int64) error {
+	return writer.enqueueValue(journalReply{Kind: "journal", Sequence: sequence}, nil)
+}
+
 func (writer *replyWriter) sendAndWait(value reply) error {
 	done := make(chan error, 1)
 	if err := writer.enqueue(value, done); err != nil {
@@ -534,6 +559,10 @@ func (writer *replyWriter) sendAndWait(value reply) error {
 }
 
 func (writer *replyWriter) enqueue(value reply, done chan error) error {
+	return writer.enqueueValue(value, done)
+}
+
+func (writer *replyWriter) enqueueValue(value any, done chan error) error {
 	frame, err := json.Marshal(value)
 	if err != nil {
 		return guardError(CodeProtocolOutput, err)
@@ -549,11 +578,18 @@ func (writer *replyWriter) enqueue(value reply, done chan error) error {
 		writer.mu.Unlock()
 		return err
 	}
-	writer.mu.Unlock()
+	if writer.closed {
+		writer.mu.Unlock()
+		return guardError(CodeProtocolOutput, errors.New("reply writer closed"))
+	}
+	// Nonblocking enqueue and channel close share this lock. A journal reader
+	// may outlive a failed EOF barrier, but can never send on a closed queue.
 	select {
 	case writer.queue <- replyFrame{data: frame, done: done}:
+		writer.mu.Unlock()
 		return nil
 	default:
+		writer.mu.Unlock()
 		failure := errors.New("reply queue full")
 		writer.fail(CodeProtocolBackpressure, failure)
 		return guardError(CodeProtocolBackpressure, failure)
@@ -572,7 +608,12 @@ func (writer *replyWriter) fail(code Code, cause error) {
 }
 
 func (writer *replyWriter) stop() {
-	writer.closeOnce.Do(func() { close(writer.queue) })
+	writer.closeOnce.Do(func() {
+		writer.mu.Lock()
+		writer.closed = true
+		close(writer.queue)
+		writer.mu.Unlock()
+	})
 	select {
 	case <-writer.done:
 	case <-time.After(replyWriteTimeout):
@@ -615,6 +656,167 @@ func (attempt *spawnAttempt) waitErrorValue() error {
 	return attempt.waitErr
 }
 
+type journalStream struct {
+	token     string
+	stderr    *os.File
+	done      chan struct{}
+	closeOnce sync.Once
+	waitOnce  sync.Once
+	waitErr   error
+	errMu     sync.Mutex
+	err       error
+}
+
+func newJournalStream(token string, stderr *os.File) *journalStream {
+	return &journalStream{token: token, stderr: stderr, done: make(chan struct{})}
+}
+
+func (stream *journalStream) setError(err error) {
+	if err == nil {
+		return
+	}
+	stream.errMu.Lock()
+	if stream.err == nil {
+		stream.err = err
+	}
+	stream.errMu.Unlock()
+}
+
+func (stream *journalStream) errorValue() error {
+	stream.errMu.Lock()
+	defer stream.errMu.Unlock()
+	return stream.err
+}
+
+func (stream *journalStream) close() {
+	stream.closeOnce.Do(func() {
+		if stream.stderr != nil {
+			_ = stream.stderr.Close()
+		}
+	})
+}
+
+func (stream *journalStream) run(controller *controller, writer *replyWriter) {
+	defer stream.close()
+	defer close(stream.done)
+	reader := bufio.NewReaderSize(stream.stderr, 4096)
+	expected := int64(1)
+	for {
+		line, terminated, err := readJournalLine(reader, stream.token)
+		if err != nil {
+			stream.fail(controller, guardError(CodeProtocolJournal, err))
+			return
+		}
+		if line == nil {
+			return
+		}
+		sequence, matched, markerErr := parseJournalMarker(line, stream.token)
+		if !matched {
+			// Child diagnostics are intentionally discarded. Only an exact
+			// token-qualified marker belongs to this private stream.
+			continue
+		}
+		if !terminated {
+			markerErr = errors.New("journal marker was truncated before newline")
+		}
+		if markerErr != nil {
+			stream.fail(controller, guardError(CodeProtocolJournal, markerErr))
+			return
+		}
+		if sequence != expected {
+			stream.fail(controller, guardError(CodeProtocolJournal, errors.New("journal sequence is not consecutive")))
+			return
+		}
+		if writer == nil {
+			stream.fail(controller, guardError(CodeProtocolJournal, errors.New("journal writer unavailable")))
+			return
+		}
+		if err := writer.sendJournal(sequence); err != nil {
+			stream.fail(controller, err)
+			return
+		}
+		expected++
+	}
+}
+
+func (stream *journalStream) fail(controller *controller, err error) {
+	stream.setError(err)
+	controller.signal(errorCode(err, CodeProtocolJournal))
+}
+
+func readJournalLine(reader *bufio.Reader, token string) ([]byte, bool, error) {
+	trustedPrefix := []byte(journalMarkerPrefix + token)
+	line := make([]byte, 0, len(trustedPrefix)+32)
+	discarding := false
+	for {
+		part, err := reader.ReadSlice('\n')
+		if err == nil {
+			part = part[:len(part)-1]
+		}
+		if !discarding {
+			for _, value := range part {
+				index := len(line)
+				if (index < len(trustedPrefix) && value != trustedPrefix[index]) ||
+					(index == len(trustedPrefix) && value != ':') {
+					// Arbitrarily long ordinary diagnostics use constant memory.
+					// Never reinterpret an embedded marker later in that line.
+					discarding = true
+					line = line[:0]
+					break
+				}
+				if index >= MaxFrameBytes {
+					return nil, false, errFrameTooLarge
+				}
+				line = append(line, value)
+			}
+		}
+		if err == nil {
+			if discarding || len(line) < len(trustedPrefix) {
+				discarding = false
+				line = line[:0]
+				continue
+			}
+			return line, true, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			if discarding || len(line) < len(trustedPrefix) {
+				return nil, false, nil
+			}
+			return line, false, nil
+		}
+		return nil, false, err
+	}
+}
+
+const journalMarkerPrefix = "TAKOSERVER_WORKFLOW_JOURNAL:"
+
+func parseJournalMarker(line []byte, token string) (int64, bool, error) {
+	prefix := []byte(journalMarkerPrefix)
+	if !bytes.HasPrefix(line, prefix) {
+		return 0, false, nil
+	}
+	rest := line[len(prefix):]
+	tokenEnd := bytes.IndexByte(rest, ':')
+	if tokenEnd < 0 {
+		if string(rest) == token {
+			return 0, true, errors.New("journal marker sequence was truncated")
+		}
+		return 0, false, nil
+	}
+	if string(rest[:tokenEnd]) != token {
+		return 0, false, nil
+	}
+	sequenceText := rest[tokenEnd+1:]
+	sequence, err := parseSafeInteger(json.RawMessage(sequenceText))
+	if err != nil || sequence <= 0 || strconv.FormatInt(sequence, 10) != string(sequenceText) {
+		return 0, true, errors.New("journal marker sequence must be a positive safe integer")
+	}
+	return sequence, true, nil
+}
+
 type controller struct {
 	mu sync.Mutex
 
@@ -624,6 +826,9 @@ type controller struct {
 	terminal      bool
 	terminalError Code
 	identity      string
+	journalToken  string
+	journalWriter *replyWriter
+	journal       *journalStream
 	lastID        int64
 	deadlineAt    int64
 	until         int64
@@ -646,6 +851,12 @@ func newController(binary string) *controller {
 		failures:     make(chan lifecycleFailure, 1),
 		startResults: make(chan startResult, 1),
 	}
+}
+
+func (controller *controller) setJournalWriter(writer *replyWriter) {
+	controller.mu.Lock()
+	controller.journalWriter = writer
+	controller.mu.Unlock()
 }
 
 func (controller *controller) signalWriterFailure(code Code, cause error) {
@@ -737,6 +948,7 @@ func (controller *controller) register(request request) error {
 	}
 	controller.registered = true
 	controller.identity = request.Identity
+	controller.journalToken = request.JournalToken
 	controller.deadlineAt = request.DeadlineAt
 	controller.until = request.Until
 	controller.deadlineMono = now.Add(time.Duration(request.DeadlineAt-nowMS) * time.Millisecond)
@@ -960,6 +1172,10 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 	command.Env = []string{}
 	command.ExtraFiles = nil
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	controller.mu.Lock()
+	journalToken := controller.journalToken
+	journalWriter := controller.journalWriter
+	controller.mu.Unlock()
 	stdin, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
 	if err != nil {
 		attempt.result <- guardError(CodeChildStartFailed, err)
@@ -976,17 +1192,28 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 		return
 	}
 	defer stdout.Close()
-	stderr, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	var stderrReader, stderrWriter *os.File
+	if journalToken != "" {
+		stderrReader, stderrWriter, err = os.Pipe()
+	} else {
+		stderrWriter, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	}
 	if err != nil {
 		attempt.result <- guardError(CodeChildStartFailed, err)
 		controller.markTerminal(CodeChildStartFailed)
 		close(attempt.done)
 		return
 	}
-	defer stderr.Close()
-	command.Stdin, command.Stdout, command.Stderr = stdin, stdout, stderr
+	if journalToken == "" {
+		defer stderrWriter.Close()
+	}
+	command.Stdin, command.Stdout, command.Stderr = stdin, stdout, stderrWriter
 
 	if err := command.Start(); err != nil {
+		if journalToken != "" {
+			_ = stderrReader.Close()
+			_ = stderrWriter.Close()
+		}
 		wrapped := guardError(CodeChildStartFailed, err)
 		attempt.result <- wrapped
 		controller.markTerminal(CodeChildStartFailed)
@@ -994,12 +1221,52 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 		return
 	}
 
+	if journalToken == "" {
+		controller.mu.Lock()
+		stopped := controller.terminal
+		if !stopped {
+			controller.child = command.Process
+		}
+		controller.mu.Unlock()
+		if stopped {
+			killErr := killAndWait(command.Process)
+			attempt.setKillError(killErr)
+			if killErr != nil {
+				attempt.result <- guardError(CodeStopFailed, killErr)
+			} else {
+				attempt.result <- guardError(CodeStopped, nil)
+			}
+			close(attempt.done)
+			return
+		}
+		attempt.result <- nil
+		waitErr := command.Wait()
+		controller.mu.Lock()
+		if controller.child == command.Process {
+			controller.child = nil
+		}
+		wasTerminal := controller.terminal
+		controller.mu.Unlock()
+		attempt.setWaitError(waitErr)
+		close(attempt.done)
+		if !wasTerminal {
+			controller.signal(CodeChildExited)
+		}
+		return
+	}
+
+	// Close the parent's copy so the reader observes EOF after the child (and
+	// any direct descendants retaining the descriptor) releases its stderr.
+	_ = stderrWriter.Close()
+	stream := newJournalStream(journalToken, stderrReader)
 	controller.mu.Lock()
 	stopped := controller.terminal
+	controller.journal = stream
 	if !stopped {
 		controller.child = command.Process
 	}
 	controller.mu.Unlock()
+	go stream.run(controller, journalWriter)
 	if stopped {
 		killErr := killAndWait(command.Process)
 		attempt.setKillError(killErr)
@@ -1022,7 +1289,11 @@ func (controller *controller) spawnChild(configPath string, attempt *spawnAttemp
 	attempt.setWaitError(waitErr)
 	close(attempt.done)
 	if !wasTerminal {
-		controller.signal(CodeChildExited)
+		if journalErr := controller.waitJournal(stream); journalErr != nil {
+			controller.signal(errorCode(journalErr, CodeProtocolJournal))
+		} else {
+			controller.signal(CodeChildExited)
+		}
 	}
 }
 
@@ -1039,6 +1310,35 @@ func killAndWait(process *os.Process) error {
 		return waitErr
 	}
 	return nil
+}
+
+func (controller *controller) journalStreamValue() *journalStream {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.journal
+}
+
+func (controller *controller) waitJournal(stream *journalStream) error {
+	stream.waitOnce.Do(func() {
+		select {
+		case <-stream.done:
+			stream.waitErr = stream.errorValue()
+		case <-time.After(replyWriteTimeout):
+			// A child or direct descendant retaining stderr can keep the pipe
+			// open forever. Closing our read side bounds STOP latency; the
+			// missing EOF remains a private protocol failure and can never
+			// produce STOPACK.
+			stream.close()
+			stream.waitErr = guardError(CodeProtocolJournal, errJournalReaderTimeout)
+			// Closing the descriptor normally releases the reader immediately.
+			// Bound cleanup as well, retaining the original failed EOF proof.
+			select {
+			case <-stream.done:
+			case <-time.After(replyWriteTimeout):
+			}
+		}
+	})
+	return stream.waitErr
 }
 
 func (controller *controller) stopAndReap(defaultCode Code) error {
@@ -1083,6 +1383,10 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 		default:
 		}
 	}
+	var journalErr error
+	if stream := controller.journalStreamValue(); stream != nil {
+		journalErr = controller.waitJournal(stream)
+	}
 	if timer != nil {
 		if err := timer.close(); killErr == nil && err != nil && !errors.Is(err, os.ErrClosed) {
 			killErr = err
@@ -1096,6 +1400,9 @@ func (controller *controller) stopAndReap(defaultCode Code) error {
 	}
 	if killErr != nil {
 		return guardError(CodeStopFailed, killErr)
+	}
+	if journalErr != nil {
+		return journalErr
 	}
 	return nil
 }

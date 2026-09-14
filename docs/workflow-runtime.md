@@ -219,6 +219,42 @@ controller EOF, guard loss and an independently running HTTP sibling. This
 is distinct from the failed same-process facet probe, which remains unchanged.
 Portable protocol tests do not substitute for this native qualification.
 
+### Private stop/message barrier
+
+The guard has an opt-in child-stderr journal profile. A host-private bridge
+captures the original console logger and invocation primitive before tenant
+module evaluation. Before each application-to-host frame, it emits a small
+private-token/sequence marker synchronously. The bounded payload travels over
+a separate private asynchronous channel. No application data or provider
+credential is written to the journal pipe. Ordinary child logs are discarded;
+only exact token-qualified markers enter the controller protocol.
+
+For this profile, STOP acknowledgement additionally requires child-stderr EOF,
+reader completion and ordered forwarding of all preceding markers. An invalid,
+missing or unbounded marker stream fails closed. The controller's marker
+observer performs synchronous bounded bookkeeping before a following ACK can
+resolve. A callback Promise is not proof of completed bookkeeping.
+
+`workflow-transport-journal` correlates these markers and payloads for one
+execution. It is an ephemeral transport buffer, not another durable step
+history. It dispatches only paired frames, in sequence, within a 64-frame
+window. After physical stop and both ingress barriers, its irreversible seal
+rejects an unmatched marker or payload and refuses later dispatch. A full
+transport envelope is limited to 2 MiB; the separate published Workflow data
+limits still apply to decoded application values. Dispatch only latches a
+driver/control operation and must not wait for the result of a parked step.
+
+The opt-in `tests/workerd-native-workflow-journal.test.ts` checks the exact
+pinned runtime with a newly built guard. It replaces tenant-visible console
+and Reflect operations, emits a marker and enters non-yielding JavaScript,
+then observes exact child CPU progress without waiting for the marker before
+STOP. A delivered asynchronous companion permits seal; a withheld companion
+must reject seal and every late payload. This is a native primitive check,
+not qualification of a complete class loader or application-facing transport.
+An asynchronous-only transport cannot distinguish an absent frame from a
+frame lost in the application's in-memory send queue at forced stop, so it is
+not a fallback when this journal cannot be proved on a runtime.
+
 ### Private self-host lifecycle composition
 
 `selfhost-workflow-execution-host` connects the coordinator's private port to

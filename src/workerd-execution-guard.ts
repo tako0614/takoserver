@@ -6,6 +6,8 @@ export interface WorkerdExecutionRegistration {
   readonly identity: string;
   readonly deadlineAt: number;
   readonly until: number;
+  /** Opt-in private child-stderr journal; never an application credential. */
+  readonly journalToken?: string;
 }
 
 export interface WorkerdExecutionGuard {
@@ -47,6 +49,7 @@ export function spawnWorkerdExecutionGuard(options: {
   readonly guardBinary: string;
   readonly workerdBinary: string;
   readonly registration: WorkerdExecutionRegistration;
+  readonly onJournalMarker?: (sequence: number) => void;
 }): WorkerdExecutionGuard {
   validatePath(options.guardBinary);
   validatePath(options.workerdBinary);
@@ -55,6 +58,7 @@ export function spawnWorkerdExecutionGuard(options: {
   }
   return createWorkerdExecutionGuard({
     registration: options.registration,
+    ...(options.onJournalMarker === undefined ? {} : { onJournalMarker: options.onJournalMarker }),
     spawn: () => {
       const child = Bun.spawn([options.guardBinary, "--workerd-binary", options.workerdBinary], {
         stdin: "pipe",
@@ -83,16 +87,26 @@ export function spawnWorkerdExecutionGuard(options: {
 export function createWorkerdExecutionGuard(options: {
   readonly registration: WorkerdExecutionRegistration;
   readonly spawn: () => WorkerdGuardProcess;
+  /**
+   * Synchronous, bounded marker bookkeeping only, not an application callback.
+   * All markers preceding a stopped ACK are latched before stop resolves.
+   */
+  readonly onJournalMarker?: (sequence: number) => void;
   /** Transport bound only, never used as proof that application execution stopped. */
   readonly commandTimeoutMs?: number;
 }): WorkerdExecutionGuard {
   const registration = { ...options.registration };
+  const onJournalMarker = options.onJournalMarker;
   const timeout = options.commandTimeoutMs ?? 5_000;
   if (
     !/^[a-f0-9]{64}$/u.test(registration.identity) ||
     !instant(registration.until) ||
     !instant(registration.deadlineAt) ||
     registration.until > registration.deadlineAt ||
+    (registration.journalToken !== undefined &&
+      !/^[a-f0-9]{64}$/u.test(registration.journalToken)) ||
+    (registration.journalToken === undefined) !== (onJournalMarker === undefined) ||
+    (onJournalMarker !== undefined && typeof onJournalMarker !== "function") ||
     !Number.isSafeInteger(timeout) ||
     timeout < 1 ||
     timeout > 60_000
@@ -122,6 +136,7 @@ export function createWorkerdExecutionGuard(options: {
   let stopping: Promise<void> | undefined;
   let stopAcknowledged = false;
   let lastDeadline = registration.until;
+  let lastJournalSequence = 0;
 
   function fail(code: "protocol_failure" | "unavailable"): void {
     if (failure || stopAcknowledged) return;
@@ -181,6 +196,31 @@ export function createWorkerdExecutionGuard(options: {
       return;
     }
     const reply = value as Record<string, unknown>;
+    if (reply.kind === "journal") {
+      if (
+        !started ||
+        pending.has(1) ||
+        onJournalMarker === undefined ||
+        Object.keys(reply).length !== 2 ||
+        typeof reply.sequence !== "number" ||
+        !Number.isSafeInteger(reply.sequence) ||
+        reply.sequence !== lastJournalSequence + 1
+      ) {
+        fail("protocol_failure");
+        return;
+      }
+      try {
+        // Async observers cannot establish the barrier before a following ACK.
+        if (onJournalMarker(reply.sequence) !== undefined) {
+          fail("protocol_failure");
+          return;
+        }
+        lastJournalSequence = reply.sequence;
+      } catch {
+        fail("protocol_failure");
+      }
+      return;
+    }
     const entry = typeof reply.id === "number" ? pending.get(reply.id) : undefined;
     if (
       !entry ||
@@ -248,6 +288,7 @@ export function createWorkerdExecutionGuard(options: {
   const registered = request("register", "registered", {
     deadlineAt: registration.deadlineAt,
     until: registration.until,
+    ...(registration.journalToken === undefined ? {} : { journalToken: registration.journalToken }),
   });
   // A caller may stop before awaiting registration; keep its rejection observable but handled.
   void registered.catch(() => undefined);
