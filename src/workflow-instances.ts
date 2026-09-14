@@ -30,7 +30,9 @@ export type WorkflowErrorReason =
   | "run_threw"
   | "step_failed"
   | "step_limit_exceeded"
-  | "lifetime_exceeded";
+  | "lifetime_exceeded"
+  /** Candidate-only execution definition mismatch; not in released 1.0.0. */
+  | "step_definition_mismatch";
 
 export interface WorkflowScope {
   readonly tenantId: string;
@@ -130,6 +132,7 @@ const ERROR_REASONS = new Set<WorkflowErrorReason>([
   "step_failed",
   "step_limit_exceeded",
   "lifetime_exceeded",
+  "step_definition_mismatch",
 ]);
 
 const INSTANCE_LIFETIME_MS = WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000;

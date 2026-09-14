@@ -201,7 +201,10 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     f.hooks.application = async (step) => {
       try {
-        await step.sleep("invalid", -1);
+        await step.sleep(
+          () => "invalid",
+          () => -1,
+        );
       } catch (error) {
         if (!(error instanceof WorkflowStepError)) throw error;
         // TypeScript readonly does not protect values returned to JavaScript.
@@ -226,16 +229,33 @@ describe("internal Workflow execution coordinator", () => {
     };
     f.hooks.application = async (step) => {
       try {
-        await step.do("failed", [], fail);
+        await step.do(
+          () => "failed",
+          () => ({ retryDelaysSeconds: [], effect: fail }),
+        );
       } catch (error) {
         expect(error).toMatchObject({ code: "step_failed" });
       }
-      await step.sleep("later", 1);
+      await step.sleep(
+        () => "later",
+        () => 1,
+      );
       return undefined;
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     await f.advance(1_000);
-    f.hooks.application = (step) => step.do("failed", [], fail);
+    f.hooks.application = async (step) => {
+      // Settle the retained sleep before testing exhausted-error provenance;
+      // leaving it unfinished would independently require a mismatch outcome.
+      await step.sleep(
+        () => "later",
+        () => 1,
+      );
+      return step.do(
+        () => "failed",
+        () => ({ retryDelaysSeconds: [], effect: fail }),
+      );
+    };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "terminal",
       status: "errored",
@@ -252,36 +272,322 @@ describe("internal Workflow execution coordinator", () => {
       const entered = latch<void>();
       const effect = latch<JsonObject>();
       let effects = 0;
+      let caught = false;
+      let finallyRan = false;
       f.hooks.application = async (step) => {
-        void step.do("effect", [], async () => {
-          effects += 1;
-          entered.resolve();
-          return effect.promise;
-        });
+        void step
+          .do(
+            () => "effect",
+            () => ({
+              retryDelaysSeconds: [],
+              effect: async () => {
+                effects += 1;
+                entered.resolve();
+                return effect.promise;
+              },
+            }),
+          )
+          .catch(() => {
+            caught = true;
+          })
+          .finally(() => {
+            finallyRan = true;
+          });
         await entered.promise;
         if (kind === "failed") throw new Error("application returned early");
         return { premature: true };
       };
-      await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
-        code: "step_conflict",
+      expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+        kind: "terminal",
+        status: "errored",
       });
+      expect(f.row()).toMatchObject({
+        status: "errored",
+        output_json: null,
+        error_json: '{"reason":"step_definition_mismatch"}',
+        run_owner: null,
+      });
+      expect(f.db.query("SELECT state FROM tf_workflow_steps").get()).toBeNull();
+      // This double cannot kill JS: a late old callback must still be fenced.
+      effect.resolve({ stale: true });
+      await flush();
+      expect(effects).toBe(1);
+      expect(caught).toBe(false);
+      expect(finallyRan).toBe(false);
+      expect(f.row()).toMatchObject({
+        status: "errored",
+        output_json: null,
+        error_json: '{"reason":"step_definition_mismatch"}',
+      });
+    },
+  );
+
+  test("terminal publication waits for physical stop acknowledgement", async () => {
+    const f = fixture();
+    await f.create();
+    const stopping = latch<void>();
+    const proceed = latch<void>();
+    const output = { committed: true };
+    f.hooks.application = async () => output;
+    f.hooks.beforeStop = async () => {
       expect(f.row()).toMatchObject({
         status: "running",
         output_json: null,
         error_json: null,
-        run_owner: null,
       });
-      expect(f.db.query("SELECT state FROM tf_workflow_steps").get()).toEqual({ state: "pending" });
-      // This double cannot kill JS: a late old callback must still be fenced.
-      effect.resolve({ stale: true });
-      await flush();
-      f.hooks.application = (step) => step.do("effect", [], () => ({ effects: ++effects }));
-      expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
-        kind: "complete",
-        output: { effects: 2 },
-      });
-    },
-  );
+      output.committed = false;
+      stopping.resolve();
+      await proceed.promise;
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    await stopping.promise;
+    expect(f.row()).toMatchObject({ status: "running", run_owner: expect.any(String) });
+    proceed.resolve();
+    expect(await run).toEqual({ kind: "complete", output: { committed: true } });
+    expect(f.row()).toMatchObject({
+      status: "complete",
+      output_json: '{"committed":true}',
+      run_owner: null,
+    });
+  });
+
+  test("a mismatch during pending preparation cannot publish the park state", async () => {
+    const f = fixture();
+    await f.create();
+    const stopping = latch<void>();
+    const proceed = latch<void>();
+    let driver!: WorkflowDriver;
+    f.hooks.application = async (step) => {
+      driver = step;
+      await step.sleep(
+        () => "sleeping",
+        () => 60,
+      );
+      return undefined;
+    };
+    f.hooks.beforeStop = async () => {
+      stopping.resolve();
+      await proceed.promise;
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    await stopping.promise;
+    void driver.definitionMismatch();
+    proceed.resolve();
+    expect(await run).toEqual({ kind: "terminal", status: "errored" });
+    expect(f.row()).toMatchObject({
+      status: "errored",
+      wake_at: null,
+      error_json: '{"reason":"step_definition_mismatch"}',
+      run_owner: null,
+    });
+  });
+
+  test("an async pending preparation is fenced after a mismatch latch", async () => {
+    const f = fixture();
+    await f.create();
+    const prepared = latch<void>();
+    const release = latch<void>();
+    let driver!: WorkflowDriver;
+    let effects = 0;
+    let caught = false;
+    let finalized = false;
+    f.hooks.application = async (step) => {
+      driver = step;
+      try {
+        await step.do(
+          () => "async-pending",
+          async () => {
+            prepared.resolve();
+            await release.promise;
+            return {
+              retryDelaysSeconds: [],
+              effect: () => {
+                effects += 1;
+                return { stale: true };
+              },
+            };
+          },
+        );
+      } catch {
+        caught = true;
+      } finally {
+        finalized = true;
+      }
+      return { unreachable: true };
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    await prepared.promise;
+    void driver.definitionMismatch();
+    release.resolve();
+    expect(await run).toEqual({ kind: "terminal", status: "errored" });
+    expect(effects).toBe(0);
+    expect(caught).toBe(false);
+    expect(finalized).toBe(false);
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test("pending cross-kind mismatch stops before validating new pending arguments", async () => {
+    const f = fixture();
+    await f.create();
+    f.hooks.application = async (step) => {
+      await step.sleep(
+        () => "same-name",
+        () => 60,
+      );
+      return { unreachable: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
+
+    await f.advance(60_000);
+    let pendingPrepared = 0;
+    let caught = false;
+    let finallyRan = false;
+    f.hooks.application = async (step) => {
+      try {
+        await step.do(
+          () => "same-name",
+          () => {
+            pendingPrepared += 1;
+            throw new TypeError("must not validate a cross-kind call");
+          },
+        );
+      } catch {
+        caught = true;
+      } finally {
+        finallyRan = true;
+      }
+      return { unreachable: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "errored",
+    });
+    expect(pendingPrepared).toBe(0);
+    expect(caught).toBe(false);
+    expect(finallyRan).toBe(false);
+    expect(f.row()).toMatchObject({
+      status: "errored",
+      error_json: '{"reason":"step_definition_mismatch"}',
+      run_owner: null,
+    });
+  });
+
+  test("overlapping step calls latch an uncatchable mismatch and fence late writes", async () => {
+    const f = fixture();
+    await f.create();
+    const entered = latch<void>();
+    const release = latch<JsonObject>();
+    let caught = false;
+    let finallyRan = false;
+    let effects = 0;
+    f.hooks.application = async (step) => {
+      void step
+        .do(
+          () => "held",
+          () => ({
+            retryDelaysSeconds: [],
+            effect: async () => {
+              effects += 1;
+              entered.resolve();
+              return release.promise;
+            },
+          }),
+        )
+        .catch(() => {
+          caught = true;
+        })
+        .finally(() => {
+          finallyRan = true;
+        });
+      await entered.promise;
+      try {
+        await step.sleep(
+          () => "overlap",
+          () => 0,
+        );
+      } catch {
+        caught = true;
+      } finally {
+        finallyRan = true;
+      }
+      return { unreachable: true };
+    };
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "errored",
+    });
+    expect(caught).toBe(false);
+    expect(finallyRan).toBe(false);
+    expect(effects).toBe(1);
+    release.resolve({ stale: true });
+    await flush();
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+    expect(f.row()).toMatchObject({
+      status: "errored",
+      error_json: '{"reason":"step_definition_mismatch"}',
+      run_owner: null,
+    });
+  });
+
+  test("a retained pending history cannot settle around a new application run", async () => {
+    const f = fixture();
+    await f.create();
+    await f.sql.run(
+      `INSERT INTO tf_workflow_steps
+         (tenant_id, workflow_resource_uid, instance_id, execution_id, execution_created_at,
+          name, kind, state, config_json, created_at, updated_at, revision)
+       SELECT tenant_id, workflow_resource_uid, instance_id, execution_id, created_at,
+              'unfinished', 'do', 'pending', '{"retryDelaysSeconds":[]}', created_at, created_at, 1
+       FROM tf_workflow_instances
+       WHERE instance_id = ?`,
+      ["instance"],
+    );
+    f.hooks.application = async () => ({ settled: true });
+    expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
+      kind: "terminal",
+      status: "errored",
+    });
+    expect(f.row()).toMatchObject({
+      status: "errored",
+      output_json: null,
+      error_json: '{"reason":"step_definition_mismatch"}',
+      run_owner: null,
+    });
+    expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_steps").get()).toEqual({
+      count: 0,
+    });
+  });
+
+  test("a host.run transport rejection remains infrastructure with pending history", async () => {
+    const f = fixture();
+    await f.create();
+    await f.sql.run(
+      `INSERT INTO tf_workflow_steps
+         (tenant_id, workflow_resource_uid, instance_id, execution_id, execution_created_at,
+          name, kind, state, config_json, created_at, updated_at, revision)
+       SELECT tenant_id, workflow_resource_uid, instance_id, execution_id, created_at,
+              'transport-pending', 'do', 'pending', '{"retryDelaysSeconds":[]}', created_at, created_at, 1
+       FROM tf_workflow_instances
+       WHERE instance_id = ?`,
+      ["instance"],
+    );
+    f.hooks.application = async () => {
+      throw new WorkflowRuntimeError("host_unavailable");
+    };
+    await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+    expect(f.row()).toMatchObject({
+      status: "running",
+      output_json: null,
+      error_json: null,
+      run_owner: null,
+    });
+  });
 
   test("the instance facade preserves private ID collision recovery", async () => {
     const f = fixture(undefined, ["repeated", "repeated", "fresh"]);
@@ -295,7 +601,7 @@ describe("internal Workflow execution coordinator", () => {
     ).toEqual([{ execution_id: "fresh" }, { execution_id: "repeated" }]);
   });
 
-  test("completion returns the persisted output and settlement time despite a delayed stop acknowledgement", async () => {
+  test("a delayed stop acknowledgement rechecks the absolute lifetime before publication", async () => {
     const f = fixture();
     await f.create();
     const output = { snapshot: "committed" };
@@ -305,13 +611,14 @@ describe("internal Workflow execution coordinator", () => {
       await f.advance(WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000);
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
-      kind: "complete",
-      output: { snapshot: "committed" },
+      kind: "terminal",
+      status: "errored",
     });
     expect(f.row()).toMatchObject({
-      status: "complete",
-      output_json: '{"snapshot":"committed"}',
-      updated_at: START,
+      status: "errored",
+      output_json: null,
+      error_json: '{"reason":"lifetime_exceeded"}',
+      updated_at: START + WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000,
     });
   });
 
@@ -321,8 +628,14 @@ describe("internal Workflow execution coordinator", () => {
     f.db.exec("PRAGMA foreign_keys = OFF");
     let effects = 0;
     f.hooks.application = async (step) => {
-      const result = await step.do("effect", [], () => ({ count: ++effects }));
-      await step.sleep("delay", 2);
+      const result = await step.do(
+        () => "effect",
+        () => ({ retryDelaysSeconds: [], effect: () => ({ count: ++effects }) }),
+      );
+      await step.sleep(
+        () => "delay",
+        () => 2,
+      );
       return result;
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
@@ -352,11 +665,17 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     let attempts = 0;
     f.hooks.application = (step) =>
-      step.do("retry", [2], () => {
-        attempts += 1;
-        if (attempts === 1) throw new Error("app failure");
-        return { attempts };
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [2],
+          effect: () => {
+            attempts += 1;
+            if (attempts === 1) throw new Error("app failure");
+            return { attempts };
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     await f.advance(1_999);
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -376,19 +695,31 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     let attempts = 0;
     f.hooks.application = (step) =>
-      step.do("retry", [1, 1], () => {
-        attempts += 1;
-        if (attempts <= 2) throw new Error("app failure");
-        return { attempts };
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [1, 1],
+          effect: () => {
+            attempts += 1;
+            if (attempts <= 2) throw new Error("app failure");
+            return { attempts };
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     await f.advance(1_000);
     f.hooks.application = (step) =>
-      step.do("retry", [], () => {
-        attempts += 1;
-        if (attempts <= 2) throw new Error("replayed app failure");
-        return { attempts };
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: () => {
+            attempts += 1;
+            if (attempts <= 2) throw new Error("replayed app failure");
+            return { attempts };
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 2_000 });
     await f.advance(2_000);
@@ -423,10 +754,16 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     let effects = 0;
     f.hooks.application = (step) =>
-      step.do("retry", [], () => {
-        effects += 1;
-        throw new Error("initial app failure");
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: () => {
+            effects += 1;
+            throw new Error("initial app failure");
+          },
+        }),
+      );
     await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
       code: "backend_unavailable",
     });
@@ -436,10 +773,16 @@ describe("internal Workflow execution coordinator", () => {
       config_json: '{"retryDelaysSeconds":[]}',
     });
     f.hooks.application = (step) =>
-      step.do("retry", [1], () => {
-        effects += 1;
-        throw new Error("replayed app failure");
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [1],
+          effect: () => {
+            effects += 1;
+            throw new Error("replayed app failure");
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "terminal",
       status: "errored",
@@ -453,17 +796,29 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     let attempts = 0;
     f.hooks.application = (step) =>
-      step.do("retry", [5, 7], () => {
-        attempts += 1;
-        throw new Error("app failure");
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [5, 7],
+          effect: () => {
+            attempts += 1;
+            throw new Error("app failure");
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 5_000 });
     f.hooks.application = (step) =>
-      step.do("retry", [1, 2], () => {
-        attempts += 1;
-        throw new Error("replayed app failure");
-      });
+      step.do(
+        () => "retry",
+        () => ({
+          retryDelaysSeconds: [1, 2],
+          effect: () => {
+            attempts += 1;
+            throw new Error("replayed app failure");
+          },
+        }),
+      );
     await f.advance(1_000);
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "deferred",
@@ -487,7 +842,11 @@ describe("internal Workflow execution coordinator", () => {
         throw new Error("getter must not run");
       },
     });
-    f.hooks.application = (step) => step.do("invalid", [], () => invalid as unknown as JsonObject);
+    f.hooks.application = (step) =>
+      step.do(
+        () => "invalid",
+        () => ({ retryDelaysSeconds: [], effect: () => invalid as unknown as JsonObject }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "terminal",
       status: "errored",
@@ -502,17 +861,29 @@ describe("internal Workflow execution coordinator", () => {
     const oversized = { payload: "x".repeat(1_048_577) } as unknown as JsonObject;
     let attempts = 0;
     f.hooks.application = (step) =>
-      step.do("oversized", [1, 1], () => {
-        attempts += 1;
-        return oversized;
-      });
+      step.do(
+        () => "oversized",
+        () => ({
+          retryDelaysSeconds: [1, 1],
+          effect: () => {
+            attempts += 1;
+            return oversized;
+          },
+        }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 1_000 });
     f.hooks.application = (step) =>
-      step.do("oversized", [], () => {
-        attempts += 1;
-        return attempts <= 2 ? oversized : { ok: true };
-      });
+      step.do(
+        () => "oversized",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: () => {
+            attempts += 1;
+            return attempts <= 2 ? oversized : { ok: true };
+          },
+        }),
+      );
     await f.advance(1_000);
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row()).toMatchObject({ status: "sleeping", wake_at: START + 2_000 });
@@ -529,8 +900,16 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     await f.runtime.instances.sendEvent(SCOPE, "instance", { type: "approval" });
     f.hooks.application = async (step) => {
-      expect(await step.waitForEvent("first", "approval", 10)).toBeUndefined();
-      return step.waitForEvent("second", "approval", 10);
+      expect(
+        await step.waitForEvent(
+          () => "first",
+          () => ({ type: "approval", timeoutSeconds: 10 }),
+        ),
+      ).toBeUndefined();
+      return step.waitForEvent(
+        () => "second",
+        () => ({ type: "approval", timeoutSeconds: 10 }),
+      );
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.db.query("SELECT COUNT(*) AS count FROM tf_workflow_events").get()).toEqual({
@@ -565,7 +944,11 @@ describe("internal Workflow execution coordinator", () => {
         type: "approval",
         payload: { raced: true },
       });
-    f.hooks.application = (step) => step.waitForEvent("wait", "approval", 10);
+    f.hooks.application = (step) =>
+      step.waitForEvent(
+        () => "wait",
+        () => ({ type: "approval", timeoutSeconds: 10 }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row().wake_at).toBe(START);
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -583,7 +966,11 @@ describe("internal Workflow execution coordinator", () => {
       stopping.resolve();
       await proceed.promise;
     };
-    f.hooks.application = (step) => step.waitForEvent("wait", "approval", 10);
+    f.hooks.application = (step) =>
+      step.waitForEvent(
+        () => "wait",
+        () => ({ type: "approval", timeoutSeconds: 10 }),
+      );
     const run = f.runtime.runOne(SCOPE, "instance");
     await stopping.promise;
     const statusWhileStopping = await f.runtime.instances.status(SCOPE, "instance");
@@ -611,7 +998,10 @@ describe("internal Workflow execution coordinator", () => {
       await stopped.promise;
     };
     f.hooks.application = async (step) => {
-      await step.sleep("sleep", 60);
+      await step.sleep(
+        () => "sleep",
+        () => 60,
+      );
       return undefined;
     };
     const run = f.runtime.runOne(SCOPE, "instance");
@@ -633,7 +1023,10 @@ describe("internal Workflow execution coordinator", () => {
       throw new Error("stop is unacknowledged");
     };
     f.hooks.application = async (step) => {
-      await step.sleep("sleep", 60);
+      await step.sleep(
+        () => "sleep",
+        () => 60,
+      );
       return undefined;
     };
     await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
@@ -648,12 +1041,49 @@ describe("internal Workflow execution coordinator", () => {
     });
   });
 
+  test("a bounded-failure stop rejection reaches the host, never app catch/finally", async () => {
+    const f = fixture();
+    await f.create();
+    let caught = false;
+    let finalized = false;
+    f.hooks.beforeStop = async () => {
+      throw new Error("stop is unacknowledged");
+    };
+    f.hooks.application = async (step) => {
+      try {
+        await step.sleep(
+          () => "past-lifetime",
+          () => WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS,
+        );
+      } catch {
+        caught = true;
+      } finally {
+        finalized = true;
+      }
+      return undefined;
+    };
+    await f.advance(1_000);
+    await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+    expect(caught).toBe(false);
+    expect(finalized).toBe(false);
+    expect(f.row()).toMatchObject({
+      status: "running",
+      error_json: null,
+      run_owner: expect.any(String),
+    });
+  });
+
   test("wait timeout is a stored error, not a successful undefined result", async () => {
     const f = fixture();
     await f.create();
     f.hooks.application = async (step) => {
       try {
-        await step.waitForEvent("wait", "approval", 1);
+        await step.waitForEvent(
+          () => "wait",
+          () => ({ type: "approval", timeoutSeconds: 1 }),
+        );
       } catch (error) {
         expect(error).toMatchObject({ code: "wait_timeout" });
         return { timedOut: true };
@@ -676,12 +1106,18 @@ describe("internal Workflow execution coordinator", () => {
     const f = fixture();
     await f.create();
     f.hooks.application = async (step) => {
-      await step.sleep("delay", 2);
+      await step.sleep(
+        () => "delay",
+        () => 2,
+      );
       return { done: true };
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     f.hooks.application = async (step) => {
-      await step.sleep("delay", 0);
+      await step.sleep(
+        () => "delay",
+        () => 0,
+      );
       return { done: true };
     };
     await f.advance(1_000);
@@ -697,19 +1133,34 @@ describe("internal Workflow execution coordinator", () => {
     const f = fixture();
     await f.create();
     f.hooks.application = async (step) => {
-      await step.sleep("memo", 0);
-      await step.sleep("later", 1);
+      await step.sleep(
+        () => "memo",
+        () => 0,
+      );
+      await step.sleep(
+        () => "later",
+        () => 1,
+      );
       return undefined;
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     await f.advance(1_000);
     f.hooks.application = async (step) => {
       expect(
-        await step.do("memo", [], () => {
-          throw new Error("must not execute");
-        }),
+        await step.do(
+          () => "memo",
+          () => ({
+            retryDelaysSeconds: [],
+            effect: () => {
+              throw new Error("must not execute");
+            },
+          }),
+        ),
       ).toBeUndefined();
-      await step.sleep("later", 1);
+      await step.sleep(
+        () => "later",
+        () => 1,
+      );
       return { replayed: true };
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -724,10 +1175,16 @@ describe("internal Workflow execution coordinator", () => {
     const entered = latch<void>();
     const effect = latch<JsonObject>();
     f.hooks.application = (step) =>
-      step.do("held", [], async () => {
-        entered.resolve();
-        return effect.promise;
-      });
+      step.do(
+        () => "held",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: async () => {
+            entered.resolve();
+            return effect.promise;
+          },
+        }),
+      );
     const run = f.runtime.runOne(SCOPE, "instance");
     await entered.promise;
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -749,10 +1206,16 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     const entered = latch<void>();
     f.hooks.application = (step) =>
-      step.do("held", [], async () => {
-        entered.resolve();
-        return new Promise(() => undefined);
-      });
+      step.do(
+        () => "held",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: async () => {
+            entered.resolve();
+            return new Promise(() => undefined);
+          },
+        }),
+      );
     f.hooks.beforeExtend = async () => {
       throw new Error("host unavailable");
     };
@@ -778,7 +1241,11 @@ describe("internal Workflow execution coordinator", () => {
     }));
     await f.create();
     let effects = 0;
-    f.hooks.application = (step) => step.do("effect", [1], () => ({ count: ++effects }));
+    f.hooks.application = (step) =>
+      step.do(
+        () => "effect",
+        () => ({ retryDelaysSeconds: [1], effect: () => ({ count: ++effects }) }),
+      );
     await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
       code: "backend_unavailable",
     });
@@ -804,10 +1271,16 @@ describe("internal Workflow execution coordinator", () => {
     const stopping = latch<void>();
     const acknowledge = latch<void>();
     f.hooks.application = (step) =>
-      step.do("held", [], async () => {
-        entered.resolve();
-        return new Promise(() => undefined);
-      });
+      step.do(
+        () => "held",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: async () => {
+            entered.resolve();
+            return new Promise(() => undefined);
+          },
+        }),
+      );
     const run = f.runtime.runOne(SCOPE, "instance");
     void run.catch(() => undefined);
     await entered.promise;
@@ -860,11 +1333,23 @@ describe("internal Workflow execution coordinator", () => {
     let effects = 0;
     f.hooks.application = async (step) => {
       for (let i = 0; i < 1_024; i += 1)
-        await step.do(`step-${i}`, [], () => ({ i, effects: ++effects }));
-      await step.do("step-0", [], () => {
-        throw new Error("memo was rerun");
-      });
-      await step.sleep("too-many", 1);
+        await step.do(
+          () => `step-${i}`,
+          () => ({ retryDelaysSeconds: [], effect: () => ({ i, effects: ++effects }) }),
+        );
+      await step.do(
+        () => "step-0",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: () => {
+            throw new Error("memo was rerun");
+          },
+        }),
+      );
+      await step.sleep(
+        () => "too-many",
+        () => 1,
+      );
       return { unreachable: true };
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -880,7 +1365,10 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     await f.advance(1);
     f.hooks.application = async (step) => {
-      await step.sleep("beyond", WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS);
+      await step.sleep(
+        () => "beyond",
+        () => WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS,
+      );
       return undefined;
     };
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
@@ -900,7 +1388,10 @@ describe("internal Workflow execution coordinator", () => {
       payload: { early: true },
     });
     f.hooks.application = (step) =>
-      step.waitForEvent("wait", "approval", WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS);
+      step.waitForEvent(
+        () => "wait",
+        () => ({ type: "approval", timeoutSeconds: WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "complete",
       output: { early: true },
@@ -912,7 +1403,10 @@ describe("internal Workflow execution coordinator", () => {
     await f.create();
     await f.advance(1_000);
     f.hooks.application = (step) =>
-      step.waitForEvent("wait", "approval", WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS);
+      step.waitForEvent(
+        () => "wait",
+        () => ({ type: "approval", timeoutSeconds: WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({ kind: "parked" });
     expect(f.row().status).toBe("waiting");
     await f.advance(WORKFLOW_MAX_INSTANCE_LIFETIME_SECONDS * 1_000);
@@ -929,16 +1423,26 @@ describe("internal Workflow execution coordinator", () => {
     const entered = latch<void>();
     const oldResult = latch<JsonObject>();
     f.hooks.application = (step) =>
-      step.do("effect", [], async () => {
-        entered.resolve();
-        return oldResult.promise;
-      });
+      step.do(
+        () => "effect",
+        () => ({
+          retryDelaysSeconds: [],
+          effect: async () => {
+            entered.resolve();
+            return oldResult.promise;
+          },
+        }),
+      );
     const oldRun = f.runtime.runOne(SCOPE, "instance");
     void oldRun.catch(() => undefined);
     await entered.promise;
     await f.advance(10_001);
     await oldRun.catch(() => undefined);
-    f.hooks.application = (step) => step.do("effect", [], () => ({ owner: "replacement" }));
+    f.hooks.application = (step) =>
+      step.do(
+        () => "effect",
+        () => ({ retryDelaysSeconds: [], effect: () => ({ owner: "replacement" }) }),
+      );
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "complete",
       output: { owner: "replacement" },
@@ -959,14 +1463,14 @@ describe("internal Workflow execution coordinator", () => {
     await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
       code: "host_unavailable",
     });
-    expect(f.row()).toMatchObject({ status: "complete", run_owner: expect.any(String) });
+    expect(f.row()).toMatchObject({ status: "running", run_owner: expect.any(String) });
     await expect(f.runtime.instances.terminate(SCOPE, "instance")).rejects.toMatchObject({
       name: "backend_unavailable",
       code: "backend_unavailable",
     });
-    expect(f.row()).toMatchObject({ status: "complete", run_owner: expect.any(String) });
+    expect(f.row()).toMatchObject({ status: "terminated", run_owner: expect.any(String) });
     f.hooks.beforeStop = async () => undefined;
     await f.runtime.instances.terminate(SCOPE, "instance");
-    expect(f.row()).toMatchObject({ status: "complete", run_owner: null });
+    expect(f.row()).toMatchObject({ status: "terminated", run_owner: null });
   });
 });

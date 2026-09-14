@@ -478,6 +478,19 @@ describe("Durable workflow events and terminal transitions", () => {
     });
   });
 
+  test("materializes the candidate definition-mismatch terminal reason", async () => {
+    const f = fixture(["execution_definition_mismatch"]);
+    await f.store.create(SCOPE, { id: "definition-mismatch" });
+    await f.sql.run(
+      "UPDATE tf_workflow_instances SET status = 'errored', error_json = ? WHERE instance_id = ?",
+      ['{"reason":"step_definition_mismatch"}', "definition-mismatch"],
+    );
+    expect(await f.store.status(SCOPE, "definition-mismatch")).toEqual({
+      status: "errored",
+      error: { reason: "step_definition_mismatch" },
+    });
+  });
+
   test("samples the clock once at the lifetime boundary", async () => {
     const f = fixture(["execution_clock_boundary"]);
     await f.store.create(SCOPE, { id: "clock-boundary" });

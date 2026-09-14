@@ -251,22 +251,70 @@ path owns outcomes, retention and cleanup. The consumer instance facade waits
 for stop acknowledgement even when an earlier controller has already written
 a terminal status. Application outcomes and host/storage failures are separate:
 a failed SQL commit or lost host session does not become `run_threw`.
-Only the coordinator decides step-count and lifetime failures. An adapter's
+Only the coordinator decides step-count, lifetime and step-definition failures. An adapter's
 `step_failed` outcome must correlate to an exhausted-step error emitted by that
 same execution; an error label alone is not evidence. An application outcome
-with an outstanding step is stopped and left retryable, not saved as complete.
-The returned terminal result reflects the atomic settlement, not a mutable
-application object or a later clock reading after stop acknowledgement.
+with an outstanding step, overlapping calls or pending cross-kind name reuse
+causes the forward candidate's `step_definition_mismatch`. This is a Host
+stop, not an exception that application catch/finally can intercept. For run
+settlement, stop acknowledgement precedes terminal publication, including completion and bounds;
+an elapsed lifetime while stopping cannot be published as timely completion.
+The returned terminal result reflects the atomic settlement and a validated
+output snapshot, not a mutable application object.
 The shared data codec is in `workflow-data`; no second JSON implementation or
 application-specific state authority is introduced.
 
-The coordinator is not wired to production entrypoints or exported from the
-package root. Its execution-host protocol is not a selected app-facing Binding.
-It still needs a real isolated class loader with then-current weighted
-deployment selection, a qualified stop/deadline adapter and implementation of
-the forward callee candidate described above. Publication and exact contract
+`workflow-class-execution` now projects ordinary JavaScript constructor/run
+semantics onto that private driver. It receives only the selected declared env
+and an instance event; no vendor base class is required. The module is **not an
+isolation boundary**: a loader must evaluate it and application modules inside
+the qualified execution context, never import tenant modules into the Host
+controller. It does not perform weighted selection or class-readiness checks.
+
+The driver receives lazy name and pending-argument preparation separately.
+This keeps serialization, finished-history lookup and first configuration in
+one authority: completed names skip unused invalid arguments, while new or
+pending same-kind calls validate before any write or effect. A separate facade
+history cache or eager argument validation would produce different replay
+behavior. Only checked JavaScript argument errors are projected as TypeError;
+storage/control failures are not delivered to application catch/finally.
+Retry policies become bounded private delay arrays, and the existing durable
+journal keeps the first policy across fresh class invocations.
+
+The class projection tracks its app-facing Promise settlement, not just the
+controller's Driver call. Overlap or run settlement with an unresolved app
+step invokes a private mismatch control; the coordinator still owns stop and
+terminal writes. Genuine step Errors have immutable own names and per-context
+WeakMap provenance. Exact rethrow retains the original controller error;
+name copies and wrappers do not. A future cross-process transport must retain
+that provenance without exposing its correlation material to the application.
+
+The complete private Host stop acknowledgement also needs a transport barrier:
+app-to-Host driver/control messages emitted or enqueued before physical stop
+must have been delivered and processed by the coordinator, or the session must
+permanently fail. No earlier message may arrive after that acknowledgement.
+Quietly dropping a delayed
+mismatch message could let a park operation publish first. The process guard's
+reap acknowledgement alone does not provide that message barrier. The future
+Host composition owns both; a failed transport is not a successful park.
+
+The additional stored mismatch reason is a source-type/parser extension for
+this internal implementation. Published Interface schemas and selected support
+are unchanged; no migration or new serving path is implied by that extension.
+
+The coordinator and class projection are not wired to production entrypoints
+or exported from the package root. Their execution-host protocol is not a
+selected app-facing Binding. They still need a real isolated class loader with
+then-current weighted deployment selection, guarded process composition,
+private step transport and complete native qualification. Publication and exact contract
 selection remain separate from this private implementation. These are runtime
 responsibilities, not tasks for Takosumi or an application-specific adapter.
+
+Consumer-requested termination remains a separate ordering gap: the existing
+instance store writes `terminated` before the runtime facade waits for stop.
+Waiting before returning the terminate operation is not the same as stopping
+before another reader can see that terminal status. The forward candidate
+requires the latter; fixing run settlement alone does not qualify this path.
 
 Self-host and managed implementations must ultimately project the same exact
 consumer Binding, authorize each declared target, and connect it to this

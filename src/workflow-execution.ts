@@ -36,6 +36,13 @@ export interface WorkflowExecutionHost {
     input: JsonObject | undefined,
     hardDeadline: number,
   ): Promise<WorkflowPausedSession>;
+  /**
+   * A "stopped" acknowledgement includes the host-side barrier: all
+   * application/driver frames emitted or enqueued before the stop are
+   * delivered and processed (or the session permanently fails) before this
+   * Promise resolves.  No old frame may arrive after the acknowledgement;
+   * adapters that cannot prove that barrier must reject.
+   */
   stop(
     identity: WorkflowRunIdentity,
     reason: WorkflowStopReason,
@@ -75,12 +82,29 @@ export interface WorkflowRunIdentity {
 
 export interface WorkflowDriver {
   do(
-    name: string,
-    retryDelaysSeconds: readonly number[],
-    effect: () => Promise<JsonObject | undefined> | JsonObject | undefined,
+    prepareName: () => string | Promise<string>,
+    preparePending: () =>
+      | {
+          readonly retryDelaysSeconds: readonly number[];
+          readonly effect: () => Promise<JsonObject | undefined> | JsonObject | undefined;
+        }
+      | Promise<{
+          readonly retryDelaysSeconds: readonly number[];
+          readonly effect: () => Promise<JsonObject | undefined> | JsonObject | undefined;
+        }>,
   ): Promise<JsonObject | undefined>;
-  sleep(name: string, seconds: number): Promise<void>;
-  waitForEvent(name: string, type: string, timeoutSeconds: number): Promise<JsonObject | undefined>;
+  sleep(
+    prepareName: () => string | Promise<string>,
+    preparePending: () => number | Promise<number>,
+  ): Promise<void>;
+  waitForEvent(
+    prepareName: () => string | Promise<string>,
+    preparePending: () =>
+      | { readonly type: string; readonly timeoutSeconds: number }
+      | Promise<{ readonly type: string; readonly timeoutSeconds: number }>,
+  ): Promise<JsonObject | undefined>;
+  /** Private host control used when the application settles around a step. */
+  definitionMismatch(): Promise<never>;
 }
 
 export interface WorkflowRuntimeOptions {
@@ -112,11 +136,23 @@ export class WorkflowRuntimeError extends Error {
       | "backend_unavailable"
       | "host_unavailable"
       | "stale_claim"
-      | "invalid_runtime_input"
-      | "step_conflict",
+      | "invalid_runtime_input",
   ) {
     super(code);
     this.name = "WorkflowRuntimeError";
+  }
+}
+
+/**
+ * Private bridge for application argument validators.  The class lets the
+ * core distinguish a TypeError deliberately raised by the facade from a
+ * TypeError raised by storage/host code, without making the application
+ * validator itself part of this private coordinator's API.
+ */
+export class WorkflowCallInputError extends Error {
+  constructor(readonly error: TypeError) {
+    super("workflow call input");
+    this.name = "WorkflowCallInputError";
   }
 }
 
@@ -312,6 +348,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   async function terminalize(
     identity: WorkflowRunIdentity,
     outcome: TerminalOutcome,
+    encodedOutput?: string | null,
   ): Promise<WorkflowRunOutcome> {
     const timestamp = now();
     const expired = timestamp >= identity.deadlineAt;
@@ -319,7 +356,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     const endedAt = expired ? identity.deadlineAt : timestamp;
     const output =
       !expired && outcome.kind === "complete" && outcome.output !== undefined
-        ? encodeDocument(outcome.output)
+        ? (encodedOutput ?? encodeDocument(outcome.output))
         : null;
     const reason = expired
       ? "lifetime_exceeded"
@@ -383,15 +420,67 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     let finishing = false;
     let fatal: unknown;
     let stepActive = false;
+    let finishPromise: Promise<WorkflowRunOutcome> | undefined;
+    let mutationTail: Promise<void> = Promise.resolve();
     const exhaustedStepErrors = new WeakSet<WorkflowStepError>();
     let heartbeat: Promise<void> = Promise.resolve();
 
+    async function withMutation<T>(work: () => Promise<T>): Promise<T> {
+      const previous = mutationTail;
+      let release!: () => void;
+      mutationTail = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      await previous;
+      if (finishing) {
+        release();
+        throw new WorkflowRuntimeError("stale_claim");
+      }
+      try {
+        return await work();
+      } finally {
+        release();
+      }
+    }
+
+    async function drainMutations(): Promise<void> {
+      await mutationTail;
+    }
+
     async function finish(outcome: TerminalOutcome): Promise<WorkflowRunOutcome> {
+      if (finishPromise) return finishPromise;
       finishing = true;
       heartbeatAbort.abort();
-      const settled = await terminalize(identity, outcome);
-      await stopAndClear(identity, outcome.kind === "complete" ? "complete" : "run_failed");
-      return settled;
+      finishPromise = (async () => {
+        // Snapshot a successful output before a delayed host stop can mutate
+        // the application object.  Publication itself still waits for stop
+        // acknowledgement below.
+        const encodedOutput =
+          outcome.kind === "complete" && outcome.output !== undefined
+            ? encodeDocument(outcome.output)
+            : null;
+        await stop(identity, outcome.kind === "complete" ? "complete" : "run_failed");
+        await drainMutations();
+        const settled = await terminalize(identity, outcome, encodedOutput);
+        await clearOwner(identity);
+        return settled;
+      })();
+      // A transition failure is a coordinator/host failure, not a signal to
+      // the application Promise.  Surface it through the private interrupted
+      // channel while keeping post-latch app errors suppressed below.
+      void finishPromise.catch(failInfrastructure);
+      return finishPromise;
+    }
+
+    function mismatch(): Promise<never> {
+      if (!finishPromise) {
+        const terminal = finish({
+          kind: "failed",
+          reason: "step_definition_mismatch",
+        });
+        void terminal.then(interrupted.resolve, failInfrastructure);
+      }
+      return never();
     }
 
     function failInfrastructure(error: unknown): void {
@@ -404,7 +493,8 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     async function boundedFailure(
       reason: "lifetime_exceeded" | "step_limit_exceeded",
     ): Promise<never> {
-      interrupted.resolve(await finish({ kind: "failed", reason }));
+      const terminal = finish({ kind: "failed", reason });
+      void terminal.then(interrupted.resolve, failInfrastructure);
       return never();
     }
 
@@ -417,54 +507,70 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
       heartbeatAbort.abort();
       // The journal holds the private park intent. Publish sleeping/waiting
       // only after this execution context has actually stopped.
-      await stop(identity, "park");
-      const timestamp = now();
-      const updated = await sql.run(
-        "UPDATE tf_workflow_instances SET status = ?, pending_step_name = ?, " +
-          // Close event-before-park even when sendEvent saw status=running.
-          "wake_at = CASE WHEN ? = 'waiting' AND EXISTS (" +
-          "SELECT 1 FROM tf_workflow_events AS event JOIN tf_workflow_steps AS step " +
-          "ON event.execution_id = step.execution_id AND event.type = step.wait_type " +
-          "WHERE step.execution_id = tf_workflow_instances.execution_id AND step.execution_created_at = tf_workflow_instances.created_at " +
-          "AND step.name = ? AND event.created_at <= step.timeout_at) THEN ? ELSE ? END, " +
-          "run_owner = NULL, run_lease_until = NULL, updated_at = ?, revision = revision + 1 WHERE " +
-          RUNNABLE,
-        [
-          status,
-          name,
-          status,
-          name,
-          timestamp,
-          wakeAt,
-          timestamp,
-          ...claimParams(identity),
-          timestamp,
-          timestamp,
-          timestamp,
-        ],
-      );
-      // Another terminal transition may have won while stop was pending.
-      // Its same-claim owner can now be released; a replacement is untouched.
-      if (updated.changes !== 1) await clearOwner(identity);
-      interrupted.resolve(updated.changes === 1 ? { kind: "parked" } : { kind: "stale" });
+      try {
+        await stop(identity, "park");
+        await drainMutations();
+        // A definition mismatch may have latched while the park stop was
+        // pending.  Its terminal transition owns publication and this park
+        // continuation must not resurrect a sleeping/waiting state.
+        if (finishPromise) return never();
+        const timestamp = now();
+        const updated = await sql.run(
+          "UPDATE tf_workflow_instances SET status = ?, pending_step_name = ?, " +
+            // Close event-before-park even when sendEvent saw status=running.
+            "wake_at = CASE WHEN ? = 'waiting' AND EXISTS (" +
+            "SELECT 1 FROM tf_workflow_events AS event JOIN tf_workflow_steps AS step " +
+            "ON event.execution_id = step.execution_id AND event.type = step.wait_type " +
+            "WHERE step.execution_id = tf_workflow_instances.execution_id AND step.execution_created_at = tf_workflow_instances.created_at " +
+            "AND step.name = ? AND event.created_at <= step.timeout_at) THEN ? ELSE ? END, " +
+            "run_owner = NULL, run_lease_until = NULL, updated_at = ?, revision = revision + 1 WHERE " +
+            RUNNABLE,
+          [
+            status,
+            name,
+            status,
+            name,
+            timestamp,
+            wakeAt,
+            timestamp,
+            ...claimParams(identity),
+            timestamp,
+            timestamp,
+            timestamp,
+          ],
+        );
+        // Another terminal transition may have won while stop was pending.
+        // Its same-claim owner can now be released; a replacement is untouched.
+        if (updated.changes !== 1) await clearOwner(identity);
+        interrupted.resolve(updated.changes === 1 ? { kind: "parked" } : { kind: "stale" });
+      } catch (error) {
+        // A park transition owns its own Promise and must report stop/SQL
+        // failures through the private coordinator channel.  serialize's
+        // finishing suppression intentionally does not handle this path.
+        failInfrastructure(error);
+      }
       return never();
     }
 
     async function serialize<T>(work: () => Promise<T>): Promise<T> {
-      if (stepActive || finishing) {
-        failInfrastructure(new WorkflowRuntimeError("step_conflict"));
-        return never();
-      }
+      if (finishing) return never();
+      if (stepActive) return mismatch();
       stepActive = true;
       try {
         if (!(await runnable(identity))) throw new WorkflowRuntimeError("stale_claim");
-        return await work();
+        if (finishing) return never();
+        const result = await work();
+        if (finishing) return never();
+        return result;
       } catch (error) {
+        if (finishing) return never();
+        if (error instanceof WorkflowCallInputError) throw error.error;
         if (error instanceof WorkflowStepError) {
           // Capture the classification before JavaScript receives the object.
           if (error.code === "step_failed") exhaustedStepErrors.add(error);
           throw error;
         }
+        if (finishing) return never();
         failInfrastructure(error);
         // Infrastructure faults cannot be caught by app code as a park/error
         // sentinel. The host is stopped by execute's rejection path.
@@ -482,38 +588,42 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           existing.state !== "errored" &&
           existing.kind !== kind
         ) {
-          throw new WorkflowRuntimeError("step_conflict");
+          return mismatch();
         }
         return existing;
       }
-      const timestamp = now();
-      const inserted = await sql.run(
-        "INSERT INTO tf_workflow_steps (tenant_id, workflow_resource_uid, instance_id, execution_id, execution_created_at, name, kind, state, config_json, created_at, updated_at, revision) " +
-          "SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 1 WHERE " +
-          RUN_EXISTS +
-          " AND (SELECT COUNT(*) FROM tf_workflow_steps WHERE execution_id = ? AND execution_created_at = ?) < ?",
-        [
-          ...incarnationParams(identity),
-          name,
-          kind,
-          encodeDocument(config),
-          timestamp,
-          timestamp,
-          ...claimParams(identity),
-          timestamp,
-          timestamp,
-          timestamp,
-          identity.executionId,
-          identity.createdAt,
-          MAX_STEPS,
-        ],
-      );
-      if (inserted.changes !== 1) {
-        if (!(await runnable(identity))) throw new WorkflowRuntimeError("stale_claim");
-        return boundedFailure("step_limit_exceeded");
-      }
-      const created = await readStep(identity, name);
-      if (!created) throw new WorkflowRuntimeError("backend_unavailable");
+      const created = await withMutation(async (): Promise<StepRow | null> => {
+        const timestamp = now();
+        const inserted = await sql.run(
+          "INSERT INTO tf_workflow_steps (tenant_id, workflow_resource_uid, instance_id, execution_id, execution_created_at, name, kind, state, config_json, created_at, updated_at, revision) " +
+            "SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 1 WHERE " +
+            RUN_EXISTS +
+            " AND (SELECT COUNT(*) FROM tf_workflow_steps WHERE execution_id = ? AND execution_created_at = ?) < ?",
+          [
+            ...incarnationParams(identity),
+            name,
+            kind,
+            encodeDocument(config),
+            timestamp,
+            timestamp,
+            ...claimParams(identity),
+            timestamp,
+            timestamp,
+            timestamp,
+            identity.executionId,
+            identity.createdAt,
+            MAX_STEPS,
+          ],
+        );
+        if (inserted.changes !== 1) {
+          if (!(await runnable(identity))) throw new WorkflowRuntimeError("stale_claim");
+          return null;
+        }
+        const insertedStep = await readStep(identity, name);
+        if (!insertedStep) throw new WorkflowRuntimeError("backend_unavailable");
+        return insertedStep;
+      });
+      if (created === null) return boundedFailure("step_limit_exceeded");
       return created;
     }
 
@@ -523,31 +633,33 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
       assignment: string,
       values: readonly SqlParam[],
     ): Promise<StepRow> {
-      const timestamp = now();
-      const result = await sql.run(
-        "UPDATE tf_workflow_steps SET " +
-          assignment +
-          ", updated_at = ?, revision = revision + 1 WHERE " +
-          STEP_ID +
-          " AND revision = ? AND " +
-          RUN_EXISTS,
-        [
-          ...values,
-          timestamp,
-          identity.executionId,
-          identity.createdAt,
-          name,
-          prior.revision,
-          ...claimParams(identity),
-          timestamp,
-          timestamp,
-          timestamp,
-        ],
-      );
-      if (result.changes !== 1) throw new WorkflowRuntimeError("stale_claim");
-      const updated = await readStep(identity, name);
-      if (!updated) throw new WorkflowRuntimeError("stale_claim");
-      return updated;
+      return withMutation(async () => {
+        const timestamp = now();
+        const result = await sql.run(
+          "UPDATE tf_workflow_steps SET " +
+            assignment +
+            ", updated_at = ?, revision = revision + 1 WHERE " +
+            STEP_ID +
+            " AND revision = ? AND " +
+            RUN_EXISTS,
+          [
+            ...values,
+            timestamp,
+            identity.executionId,
+            identity.createdAt,
+            name,
+            prior.revision,
+            ...claimParams(identity),
+            timestamp,
+            timestamp,
+            timestamp,
+          ],
+        );
+        if (result.changes !== 1) throw new WorkflowRuntimeError("stale_claim");
+        const updated = await readStep(identity, name);
+        if (!updated) throw new WorkflowRuntimeError("stale_claim");
+        return updated;
+      });
     }
 
     async function completeStep(
@@ -568,16 +680,21 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     }
 
     const driver: WorkflowDriver = {
-      do(name, retryDelaysSeconds, effect) {
+      do(prepareName, preparePending) {
         return serialize(async () => {
-          const key = inputIdentifier(name, "step name");
+          const rawName = await prepareName();
+          if (finishing) return never();
+          const key = inputIdentifier(rawName, "step name");
           let current = await readStep(identity, key);
+          if (finishing) return never();
           if (current && (current.state === "complete" || current.state === "errored"))
             return memo(current);
-          // Validate the call even when this is a replay, but never let a new
-          // deployment replace the first policy committed to the step journal.
-          const requestedDelays = retryDelays(retryDelaysSeconds);
-          if (typeof effect !== "function") throw new WorkflowRuntimeError("invalid_runtime_input");
+          if (current && current.kind !== "do") return mismatch();
+          const pending = await preparePending();
+          if (finishing) return never();
+          const requestedDelays = retryDelays(pending.retryDelaysSeconds);
+          if (typeof pending.effect !== "function")
+            throw new WorkflowRuntimeError("invalid_runtime_input");
           current = await step(key, "do", { retryDelaysSeconds: requestedDelays });
           const savedConfig = parseDocument(current.configJson);
           const delays = retryDelays(savedConfig.retryDelaysSeconds);
@@ -592,9 +709,11 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
             current.retryProgressJson === null
               ? 0
               : integer(parseDocument(current.retryProgressJson).attempt);
-          let resultJson: string | null = null;
+          if (finishing) return never();
+          let resultJson: string | null;
           try {
-            const value = await effect();
+            const value = await pending.effect();
+            if (finishing) return never();
             resultJson = value === undefined ? null : encodeDocument(value);
           } catch (error) {
             if (error instanceof WorkflowRuntimeError) throw error;
@@ -617,16 +736,22 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           return completeStep(key, current, resultJson);
         });
       },
-      sleep(name, seconds) {
+      sleep(prepareName, preparePending) {
         return serialize(async () => {
-          const key = inputIdentifier(name, "step name");
+          const rawName = await prepareName();
+          if (finishing) return never();
+          const key = inputIdentifier(rawName, "step name");
           const previous = await readStep(identity, key);
+          if (finishing) return never();
           if (previous && (previous.state === "complete" || previous.state === "errored")) {
             memo(previous);
             return;
           }
-          const duration = secondsValue(seconds, 0);
+          if (previous && previous.kind !== "sleep") return mismatch();
+          const duration = secondsValue(await preparePending(), 0);
+          if (finishing) return never();
           let current = await step(key, "sleep", { seconds: duration });
+          if (finishing) return never();
           const savedDuration = secondsValue(parseDocument(current.configJson).seconds, 0);
           const wake =
             current.wakeAt ?? addDuration(current.createdAt, savedDuration * 1_000, "sleep wake");
@@ -641,15 +766,22 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           return park(key, "sleeping", integer(current.wakeAt));
         });
       },
-      waitForEvent(name, type, timeoutSeconds) {
+      waitForEvent(prepareName, preparePending) {
         return serialize(async () => {
-          const key = inputIdentifier(name, "step name");
+          const rawName = await prepareName();
+          if (finishing) return never();
+          const key = inputIdentifier(rawName, "step name");
           const previous = await readStep(identity, key);
+          if (finishing) return never();
           if (previous && (previous.state === "complete" || previous.state === "errored"))
             return memo(previous);
-          const normalizedType = inputIdentifier(type, "event type");
-          const timeout = secondsValue(timeoutSeconds, 1);
+          if (previous && previous.kind !== "wait") return mismatch();
+          const pending = await preparePending();
+          if (finishing) return never();
+          const normalizedType = inputIdentifier(pending.type, "event type");
+          const timeout = secondsValue(pending.timeoutSeconds, 1);
           let current = await step(key, "wait", { type: normalizedType, timeoutSeconds: timeout });
+          if (finishing) return never();
           const config = parseDocument(current.configJson);
           const savedType = inputIdentifier(config.type, "event type");
           const timeoutAt =
@@ -683,52 +815,54 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
               savedType,
               timeoutAt,
             ];
-            const results = await sql.batch([
-              {
-                sql:
-                  "UPDATE tf_workflow_steps SET state = 'complete', result_json = (SELECT payload_json FROM tf_workflow_events WHERE " +
-                  eventWhere +
-                  "), error_json = NULL, wake_at = NULL, updated_at = ?, revision = revision + 1 WHERE " +
-                  STEP_ID +
-                  " AND revision = ? AND state = 'waiting' AND EXISTS (SELECT 1 FROM tf_workflow_events WHERE " +
-                  eventWhere +
-                  ") AND " +
-                  RUN_EXISTS,
-                params: [
-                  ...eventParams,
-                  timestamp,
-                  identity.executionId,
-                  identity.createdAt,
-                  key,
-                  current.revision,
-                  ...eventParams,
-                  ...claimParams(identity),
-                  timestamp,
-                  timestamp,
-                  timestamp,
-                ],
-              },
-              {
-                sql:
-                  "DELETE FROM tf_workflow_events WHERE " +
-                  eventWhere +
-                  " AND EXISTS (SELECT 1 FROM tf_workflow_steps WHERE " +
-                  STEP_ID +
-                  " AND revision = ? AND state = 'complete') AND " +
-                  RUN_EXISTS,
-                params: [
-                  ...eventParams,
-                  identity.executionId,
-                  identity.createdAt,
-                  key,
-                  current.revision + 1,
-                  ...claimParams(identity),
-                  timestamp,
-                  timestamp,
-                  timestamp,
-                ],
-              },
-            ]);
+            const results = await withMutation(() =>
+              sql.batch([
+                {
+                  sql:
+                    "UPDATE tf_workflow_steps SET state = 'complete', result_json = (SELECT payload_json FROM tf_workflow_events WHERE " +
+                    eventWhere +
+                    "), error_json = NULL, wake_at = NULL, updated_at = ?, revision = revision + 1 WHERE " +
+                    STEP_ID +
+                    " AND revision = ? AND state = 'waiting' AND EXISTS (SELECT 1 FROM tf_workflow_events WHERE " +
+                    eventWhere +
+                    ") AND " +
+                    RUN_EXISTS,
+                  params: [
+                    ...eventParams,
+                    timestamp,
+                    identity.executionId,
+                    identity.createdAt,
+                    key,
+                    current.revision,
+                    ...eventParams,
+                    ...claimParams(identity),
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                  ],
+                },
+                {
+                  sql:
+                    "DELETE FROM tf_workflow_events WHERE " +
+                    eventWhere +
+                    " AND EXISTS (SELECT 1 FROM tf_workflow_steps WHERE " +
+                    STEP_ID +
+                    " AND revision = ? AND state = 'complete') AND " +
+                    RUN_EXISTS,
+                  params: [
+                    ...eventParams,
+                    identity.executionId,
+                    identity.createdAt,
+                    key,
+                    current.revision + 1,
+                    ...claimParams(identity),
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                  ],
+                },
+              ]),
+            );
             if (results[0]?.changes !== 1 || results[1]?.changes !== 1)
               throw new WorkflowRuntimeError("stale_claim");
             const saved = await readStep(identity, key);
@@ -744,7 +878,20 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           return park(key, "waiting", Math.min(timeoutAt, identity.deadlineAt));
         });
       },
+      definitionMismatch() {
+        return mismatch();
+      },
     };
+
+    async function hasUnsettledStep(): Promise<boolean> {
+      // An unfinished journal from a prior context is still an unsettled
+      // definition; replay cannot silently settle around it.
+      const rows = await sql.query(
+        "SELECT 1 AS unsettled FROM tf_workflow_steps WHERE execution_id = ? AND execution_created_at = ? AND state NOT IN ('complete', 'errored') LIMIT 1",
+        [identity.executionId, identity.createdAt],
+      );
+      return rows.length !== 0;
+    }
 
     try {
       const session = await hostCall(() =>
@@ -799,7 +946,12 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         .then(
           async (outcome) => {
             if (finishing) return interrupted.promise;
-            if (stepActive) throw new WorkflowRuntimeError("step_conflict");
+            // A host run cannot settle while any step call is still in flight
+            // or while a prior crash left an unfinished journal entry.  Latch
+            // the private mismatch terminal before inspecting the outcome so
+            // even a fabricated run_threw cannot outrank it.
+            if (stepActive || (await hasUnsettledStep())) return mismatch();
+            if (finishing) return interrupted.promise;
             if (
               !outcome ||
               (outcome.kind !== "complete" && outcome.kind !== "failed") ||
