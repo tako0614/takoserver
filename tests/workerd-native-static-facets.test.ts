@@ -41,6 +41,14 @@ async function probeImport(loader) {
   }
 }
 
+async function report(control, facet, slot) {
+  const url = new URL("http://loopback/facet-event");
+  url.searchParams.set("facet", facet);
+  url.searchParams.set("slot", slot);
+  const response = await control.fetch(url.toString());
+  await response.arrayBuffer();
+}
+
 export class NativeBridge {
   constructor(ctx, env) {
     // This class is a fixture-only plain application object. Its context is
@@ -116,6 +124,41 @@ export class NativeBridge {
       );
       return Response.json(this.snapshot());
     }
+    if (path === "/hold") {
+      const facet = this.ctx.id.toString();
+      const enteredMarker = "hold_entered_" + this.version;
+      const postMarker = "hold_post_" + this.version;
+      this.ctx.storage.sql.exec(
+        "INSERT OR REPLACE INTO static_state (name, value) VALUES (?, 'true')",
+        enteredMarker,
+      );
+      try {
+        await report(this.env.control, facet, "hold-entered");
+        const gate = new URL("http://loopback/facet-gate");
+        gate.searchParams.set("facet", facet);
+        const response = await this.env.control.fetch(gate.toString());
+        await response.arrayBuffer();
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO static_state (name, value) VALUES (?, 'true')",
+          postMarker,
+        );
+        await report(this.env.control, facet, "hold-post-marker");
+        return Response.json({ status: "completed", marker: postMarker, state: this.state() });
+      } catch (error) {
+        try {
+          await report(this.env.control, facet, "hold-catch");
+        } catch {
+          // Facet abort may also invalidate the explicit report binding.
+        }
+        throw error;
+      } finally {
+        try {
+          await report(this.env.control, facet, "hold-finally");
+        } catch {
+          // Facet abort may terminate the callback before finally can report.
+        }
+      }
+    }
     if (path === "/probe") return Response.json({ ...this.snapshot(), imports: await this.probe() });
     if (path === "/snapshot") return Response.json(this.snapshot());
     return new Response("not found", { status: 404 });
@@ -141,6 +184,7 @@ export class NativeBridge {
       marker: env.MARKER,
       version: env.VERSION,
       hostPrivateMarker: HOST_PRIVATE_MARKER,
+      control: env.CONTROL,
     });
     this.application = new ApplicationBridge(fixtureContext, declaredEnv);
     void HOST_PRIVATE_MARKER;
@@ -172,6 +216,9 @@ export class StaticSupervisor extends DurableObject {
     super(ctx, env);
     this.facets = new Map();
     this.versions = new Map();
+    this.staleFacets = new Map();
+    this.inFlight = new Map();
+    this.inFlightResults = new Map();
   }
 
   facet(name, version) {
@@ -185,6 +232,26 @@ export class StaticSupervisor extends DurableObject {
     return stub;
   }
 
+  startHeld(name) {
+    const existing = this.inFlight.get(name);
+    if (existing !== undefined) return { started: false, stub: existing.stub };
+    const stub = this.facet(name, "A");
+    this.inFlightResults.delete(name);
+    const pending = (async () => {
+      try {
+        const response = await stub.fetch(new Request("http://facet.local/hold"));
+        this.inFlightResults.set(name, { status: "fulfilled", body: await response.text() });
+      } catch (error) {
+        this.inFlightResults.set(name, { status: "rejected", reason: String(error) });
+      } finally {
+        this.inFlight.delete(name);
+      }
+    })();
+    this.inFlight.set(name, { stub });
+    this.ctx.waitUntil(pending);
+    return { started: true, stub };
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname === "/facet") {
@@ -192,6 +259,54 @@ export class StaticSupervisor extends DurableObject {
       const version = url.searchParams.get("version") === "B" ? "B" : "A";
       const target = url.searchParams.get("target") ?? "/snapshot";
       return this.facet(name, version).fetch(new Request("http://facet.local" + target));
+    }
+    if (url.pathname === "/start-hold") {
+      const name = url.searchParams.get("name") ?? "inflight";
+      const started = this.startHeld(name);
+      return Response.json({
+        name,
+        started: started.started,
+        facetId: "facet:" + name,
+        invocation: "pending",
+      });
+    }
+    if (url.pathname === "/abort-hold") {
+      const name = url.searchParams.get("name") ?? "inflight";
+      const stub = this.facets.get(name);
+      if (stub === undefined) {
+        return Response.json(
+          { name, acknowledged: false, reason: "facet-not-running" },
+          { status: 404 },
+        );
+      }
+      const reason = "static-inflight-abort";
+      this.staleFacets.set(name, stub);
+      this.ctx.facets.abort(name, reason);
+      this.facets.delete(name);
+      this.versions.delete(name);
+      return Response.json({ name, acknowledged: true, reason });
+    }
+    if (url.pathname === "/stale") {
+      const name = url.searchParams.get("name") ?? "inflight";
+      const stub = this.staleFacets.get(name);
+      if (stub === undefined) {
+        return Response.json(
+          { name, status: "missing", reason: "stale-facet-not-recorded" },
+          { status: 404 },
+        );
+      }
+      try {
+        const response = await stub.fetch(new Request("http://facet.local/snapshot"));
+        return Response.json({ name, status: "fulfilled", body: await response.text() });
+      } catch (error) {
+        return Response.json({ name, status: "rejected", reason: String(error) });
+      }
+    }
+    if (url.pathname === "/hold-result") {
+      const name = url.searchParams.get("name") ?? "inflight";
+      const result = this.inFlightResults.get(name);
+      if (result !== undefined) return Response.json({ name, ...result });
+      return Response.json({ name, status: this.inFlight.has(name) ? "pending" : "missing" });
     }
     if (url.pathname === "/replace") {
       const name = url.searchParams.get("name") ?? "versioned";
@@ -278,12 +393,13 @@ function versionWorker(version: StaticVersion): string {
         bindings = [
           (name = "MARKER", text = "static-facet-env-${version}"),
           (name = "VERSION", text = "${version}"),
+          (name = "CONTROL", service = "static-loopback"),
         ],
       ),
     ),`;
 }
 
-function nativeConfig(root: string, port: number): string {
+function nativeConfig(root: string, port: number, controlPort: number): string {
   const storage = join(root, "static-facets-storage");
   return `using Workerd = import "/workerd/workerd.capnp";
 
@@ -313,6 +429,7 @@ ${versionWorker(STATIC_VERSION_A)}
 ${versionWorker(STATIC_VERSION_B)}
     (name = "static-facets-storage", disk = (path = ${capnpText(storage)}, writable = true)),
     (name = "static-network-deny", network = (allow = [])),
+    (name = "static-loopback", external = (address = "127.0.0.1:${controlPort}", http = ())),
   ],
   sockets = [
     (name = "http", address = "127.0.0.1:${port}", http = (), service = "static-supervisor"),
@@ -338,19 +455,57 @@ async function waitForHttp(origin: string, timeoutMs = 5_000): Promise<void> {
   throw new Error(`static facet workerd did not become ready at ${origin}`);
 }
 
-async function getJson(origin: string, path: string): Promise<Record<string, unknown>> {
-  const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(2_000) });
+async function getJson(
+  origin: string,
+  path: string,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${origin}${path}`, { signal: AbortSignal.timeout(timeoutMs) });
   const body = await response.text();
   expect(response.status).toBe(200);
   return JSON.parse(body) as Record<string, unknown>;
 }
 
+async function waitForHoldResult(
+  origin: string,
+  name: string,
+  timeoutMs = 2_000,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + timeoutMs;
+  const encodedName = encodeURIComponent(name);
+  while (Date.now() < deadline) {
+    const result = await getJson(origin, `/hold-result?name=${encodedName}`);
+    if (result.status === "fulfilled" || result.status === "rejected") return result;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`static facet held invocation did not settle for ${name}`);
+}
+
 test.skipIf(CONFIGURED_WORKERD === undefined)(
-  "the pinned native workerd runs static closed-graph facets through A-B-A replacement",
+  "the pinned native workerd aborts held static facets and preserves A-B-A replacement",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "takoserver-native-static-facets-"));
     let child: ReturnType<typeof Bun.spawn> | undefined;
     let control: ReturnType<typeof Bun.serve> | undefined;
+    const events: Array<{ facet: string; slot: string }> = [];
+    let holdEnteredResolve: (() => void) | undefined;
+    const holdEntered = new Promise<void>((resolve) => {
+      holdEnteredResolve = resolve;
+    });
+    let holdGateRequestedResolve: (() => void) | undefined;
+    const holdGateRequested = new Promise<void>((resolve) => {
+      holdGateRequestedResolve = resolve;
+    });
+    let releaseHoldGateResolve: (() => void) | undefined;
+    const holdGate = new Promise<void>((resolve) => {
+      releaseHoldGateResolve = resolve;
+    });
+    let holdGateReleased = false;
+    const releaseHoldGate = () => {
+      if (holdGateReleased) return;
+      holdGateReleased = true;
+      releaseHoldGateResolve?.();
+    };
     try {
       const selected = await selectClosedGraphWorkerd({
         binary: CONFIGURED_WORKERD,
@@ -361,6 +516,28 @@ test.skipIf(CONFIGURED_WORKERD === undefined)(
         throw new Error(selected.diagnostic ?? "the supplied workerd binary was not selected");
       }
 
+      control = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          const facet = url.searchParams.get("facet") ?? "";
+          const slot = url.searchParams.get("slot") ?? "";
+          if (url.pathname === "/facet-event") {
+            events.push({ facet, slot });
+            if (slot === "hold-entered") holdEnteredResolve?.();
+            return new Response("ok");
+          }
+          if (url.pathname === "/facet-gate") {
+            events.push({ facet, slot: "hold-gate-requested" });
+            holdGateRequestedResolve?.();
+            await holdGate;
+            return new Response("released");
+          }
+          return new Response("not found", { status: 404 });
+        },
+      });
+      const controlPort = Number(control.port);
       const reserved = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
@@ -376,10 +553,12 @@ test.skipIf(CONFIGURED_WORKERD === undefined)(
       await writeVersionFiles(root, STATIC_VERSION_B);
       await mkdir(join(root, "static-facets-storage"), { recursive: true, mode: 0o700 });
       const configPath = join(root, "workerd.capnp");
-      const config = nativeConfig(root, port);
+      const config = nativeConfig(root, port, controlPort);
       expect(config).not.toContain("workerLoader");
       expect(config).not.toContain("tails");
       expect(config).not.toContain("streamingTails");
+      expect(config).toContain('globalOutbound = "static-network-deny"');
+      expect(config).toContain('(name = "CONTROL", service = "static-loopback")');
       expect(config).toContain(
         '(name = "VERSION_A", durableObjectClass = (name = "version-a", entrypoint = "NativeBridge"))',
       );
@@ -403,7 +582,7 @@ test.skipIf(CONFIGURED_WORKERD === undefined)(
       expect(probe.version).toBe("A");
       expect(probe.codeMarker).toBe("static-app-source-A-v1");
       expect(probe.envMarker).toBe("static-facet-env-A");
-      expect(probe.envKeys).toEqual(["hostPrivateMarker", "marker", "version"]);
+      expect(probe.envKeys).toEqual(["control", "hostPrivateMarker", "marker", "version"]);
       expect(probe.id).toBe("facet:imports");
       expect(probe.declaredModule).toBe("declared-application-A");
       expect((probe.imports as Record<string, unknown>).cloudflareWorkers).toBe("blocked");
@@ -414,6 +593,89 @@ test.skipIf(CONFIGURED_WORKERD === undefined)(
       expect((probe.imports as Record<string, unknown>).functionWorkerdUnsafe).toBe("blocked");
       expect((probe.imports as Record<string, unknown>).asyncFunctionHostPrivate).toBe("blocked");
       expect(probe.hostPrivateMarker).toBe("host-only-A");
+
+      const holdName = "inflight";
+      const started = await getJson(origin, `/start-hold?name=${holdName}`);
+      expect(started).toMatchObject({
+        name: holdName,
+        started: true,
+        invocation: "pending",
+        facetId: "facet:inflight",
+      });
+      await Promise.race([
+        holdEntered,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("held static facet did not report entry")), 2_000),
+        ),
+      ]);
+      await Promise.race([
+        holdGateRequested,
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("held static facet did not reach loopback gate")),
+            2_000,
+          ),
+        ),
+      ]);
+
+      const otherBefore = await getJson(origin, "/facet?name=other&version=A&target=/mark");
+      const aborted = await getJson(origin, `/abort-hold?name=${holdName}`);
+      expect(aborted).toMatchObject({
+        name: holdName,
+        acknowledged: true,
+        reason: "static-inflight-abort",
+      });
+      const stale = await getJson(origin, `/stale?name=${holdName}`);
+      expect(stale).toMatchObject({ name: holdName, status: "rejected" });
+      expect(String(stale.reason)).toContain("static-inflight-abort");
+
+      const other = await getJson(origin, "/facet?name=other&version=A&target=/snapshot");
+      expect(other).toMatchObject({ version: "A", id: "facet:other" });
+      expect((other.state as Record<string, unknown>).seen_A).toBe("true");
+      expect(other.generation).toBe(otherBefore.generation);
+
+      // Release only after the supervisor has acknowledged abort and the stale
+      // stub has rejected; the old callback must not resume into post-abort work.
+      releaseHoldGate();
+      const heldResult = await waitForHoldResult(origin, holdName);
+      expect(heldResult).toMatchObject({ name: holdName, status: "rejected" });
+      expect(String(heldResult.reason)).toContain("static-inflight-abort");
+
+      const replacementHeld = await getJson(
+        origin,
+        `/facet?name=${holdName}&version=B&target=/snapshot`,
+      );
+      expect(replacementHeld).toMatchObject({
+        version: "B",
+        codeMarker: "static-app-source-B-v1",
+        envMarker: "static-facet-env-B",
+        id: "facet:inflight",
+        declaredModule: "declared-application-B",
+      });
+      const replacementState = replacementHeld.state as Record<string, unknown>;
+      expect(Object.keys(replacementState).sort()).toEqual(["constructor_count", "hold_entered_A"]);
+      expect(replacementState.hold_entered_A).toBe("true");
+      expect(replacementState.hold_post_A).toBeUndefined();
+      expect(
+        events.some((event) => event.facet === "facet:inflight" && event.slot === "hold-entered"),
+      ).toBe(true);
+      expect(
+        events.some(
+          (event) => event.facet === "facet:inflight" && event.slot === "hold-gate-requested",
+        ),
+      ).toBe(true);
+      expect(
+        events.some(
+          (event) => event.facet === "facet:inflight" && event.slot === "hold-post-marker",
+        ),
+      ).toBe(false);
+      expect(
+        events.some(
+          (event) =>
+            event.facet === "facet:inflight" &&
+            (event.slot === "hold-catch" || event.slot === "hold-finally"),
+        ),
+      ).toBe(false);
 
       const replacement = await getJson(origin, "/replace?name=versioned");
       expect(replacement.facetId).toBe("facet:versioned");
@@ -448,11 +710,12 @@ test.skipIf(CONFIGURED_WORKERD === undefined)(
       expect(Number(middle.generation)).toBeGreaterThan(Number(before.generation));
       expect(Number(after.generation)).toBeGreaterThan(Number(middle.generation));
     } finally {
-      control?.stop(true);
+      releaseHoldGate();
       if (child) {
         child.kill(9);
         await child.exited.catch(() => undefined);
       }
+      control?.stop(true);
       await rm(root, { recursive: true, force: true });
     }
   },

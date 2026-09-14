@@ -421,7 +421,7 @@ describe("internal Workflow execution coordinator", () => {
     });
   });
 
-  test("stop acknowledgement never overwrites a newer matching-event wake", async () => {
+  test("parking waits for stop acknowledgement without losing a matching event", async () => {
     const f = fixture();
     await f.create();
     const stopping = latch<void>();
@@ -433,16 +433,65 @@ describe("internal Workflow execution coordinator", () => {
     f.hooks.application = (step) => step.waitForEvent("wait", "approval", 10);
     const run = f.runtime.runOne(SCOPE, "instance");
     await stopping.promise;
+    const statusWhileStopping = await f.runtime.instances.status(SCOPE, "instance");
     await f.runtime.instances.sendEvent(SCOPE, "instance", {
       type: "approval",
       payload: { raced: true },
     });
     proceed.resolve();
     expect(await run).toEqual({ kind: "parked" });
+    expect(statusWhileStopping.status).toBe("running");
     expect(f.row()).toMatchObject({ wake_at: START, run_owner: null });
     expect(await f.runtime.runOne(SCOPE, "instance")).toEqual({
       kind: "complete",
       output: { raced: true },
+    });
+  });
+
+  test("parking never exposes sleeping while the execution context is still stopping", async () => {
+    const f = fixture();
+    await f.create();
+    const stopping = latch<void>();
+    const stopped = latch<void>();
+    f.hooks.beforeStop = async () => {
+      stopping.resolve();
+      await stopped.promise;
+    };
+    f.hooks.application = async (step) => {
+      await step.sleep("sleep", 60);
+      return undefined;
+    };
+    const run = f.runtime.runOne(SCOPE, "instance");
+    await stopping.promise;
+    const statusWhileStopping = await f.runtime.instances.status(SCOPE, "instance");
+    stopped.resolve();
+    expect(await run).toEqual({ kind: "parked" });
+    expect(statusWhileStopping.status).toBe("running");
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toMatchObject({
+      status: "sleeping",
+    });
+    expect(f.row()).toMatchObject({ wake_at: START + 60_000, run_owner: null });
+  });
+
+  test("failed parking stop cannot publish a sleeping instance", async () => {
+    const f = fixture();
+    await f.create();
+    f.hooks.beforeStop = async () => {
+      throw new Error("stop is unacknowledged");
+    };
+    f.hooks.application = async (step) => {
+      await step.sleep("sleep", 60);
+      return undefined;
+    };
+    await expect(f.runtime.runOne(SCOPE, "instance")).rejects.toMatchObject({
+      code: "host_unavailable",
+    });
+    expect(await f.runtime.instances.status(SCOPE, "instance")).toMatchObject({
+      status: "running",
+    });
+    expect(f.row()).toMatchObject({
+      run_owner: expect.any(String),
+      wake_at: null,
     });
   });
 

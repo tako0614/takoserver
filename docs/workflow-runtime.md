@@ -76,6 +76,22 @@ code. Termination retains the run identity until the host acknowledges stop
 or the hard deadline has elapsed. Seeing a terminal database status is not by
 itself permission for the consumer's `terminate()` Promise to resolve.
 
+Parking has the same ordering requirement: the step journal records private
+intent, the host acknowledges stop, and only then does one exact-claim update
+publish `sleeping`/`waiting` and clear ownership. A failed stop leaves the
+instance running and owned. Events arriving while stop is pending remain in
+the durable inbox and participate in that update's wake calculation. An expiry
+or terminal transition that wins during stop cannot be overwritten by parking.
+
+The selected Interface requires an absolute instance lifetime cutoff and
+actual execution shutdown; it does not prescribe renewable short leases. The
+current coordinator does use its short lease's expiry as proof that an old
+execution is dead, so an adapter for this implementation must enforce that
+deadline independently of the controller. A SQL lease or a timer in the same
+application context is insufficient. Changing that private recovery strategy
+would require separate implementation and qualification, not a new public
+Workflow contract.
+
 This is not yet a qualified self-host or WfP adapter. In particular, disposing
 a Worker RPC handle is not such an acknowledgement: upstream workerd states
 that RPC cancellation cannot cancel already-running JavaScript continuations.
@@ -86,6 +102,16 @@ a reason to redefine the selected Interface. See the
 and [Dynamic Worker limits](https://developers.cloudflare.com/dynamic-workers/usage/limits/).
 Those upstream observations are not a runtime qualification of the locally
 pinned binary.
+
+Cloudflare documents [facet abort](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/#abort)
+as shutting down a running facet and invalidating its stubs while preserving
+storage. This is a candidate scoped stop primitive when application code runs
+inside that facet, not evidence that disposing an ordinary RPC handle stops
+code. The existing static closed-graph native fixture now includes a held-I/O
+abort scenario, stale-stub rejection, sibling continuity and replacement-state
+checks. That extension has not yet been run against the pinned artifact. Even
+a passing result would not establish CPU-bound preemption, deadline enforcement
+after controller loss, stop-before-open ordering or managed WfP conformance.
 
 Cloudflare's [Dynamic Workflows](https://developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows/)
 provide a separate durable-execution integration. Their existence does not

@@ -416,6 +416,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
     ): Promise<never> {
       finishing = true;
       heartbeatAbort.abort();
+      // The journal holds the private park intent. Publish sleeping/waiting
+      // only after this execution context has actually stopped.
+      await stop(identity, "park");
       const timestamp = now();
       const updated = await sql.run(
         "UPDATE tf_workflow_instances SET status = ?, pending_step_name = ?, " +
@@ -425,7 +428,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           "ON event.execution_id = step.execution_id AND event.type = step.wait_type " +
           "WHERE step.execution_id = tf_workflow_instances.execution_id AND step.execution_created_at = tf_workflow_instances.created_at " +
           "AND step.name = ? AND event.created_at <= step.timeout_at) THEN ? ELSE ? END, " +
-          "updated_at = ?, revision = revision + 1 WHERE " +
+          "run_owner = NULL, run_lease_until = NULL, updated_at = ?, revision = revision + 1 WHERE " +
           RUNNABLE,
         [
           status,
@@ -441,7 +444,9 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
           timestamp,
         ],
       );
-      await stopAndClear(identity, "park");
+      // Another terminal transition may have won while stop was pending.
+      // Its same-claim owner can now be released; a replacement is untouched.
+      if (updated.changes !== 1) await clearOwner(identity);
       interrupted.resolve(updated.changes === 1 ? { kind: "parked" } : { kind: "stale" });
       return never();
     }
