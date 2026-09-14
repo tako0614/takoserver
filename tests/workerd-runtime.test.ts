@@ -12,6 +12,7 @@ import {
   DEPLOYMENT_ROUTER_SOURCE,
   ROUTER_SOURCE,
   readWorkerdActiveDeployment,
+  readWorkerdSelectedActiveVersion,
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
 } from "../src/workerd-runtime.ts";
@@ -1663,4 +1664,336 @@ test("serializes shared config commit and rollback across two Worker publication
     letBetaCommit.resolve();
     probe.stop();
   }
+});
+
+test("reads exactly one selected Version at weighted boundaries", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+
+  const first = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 0,
+  });
+  const second = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 1,
+  });
+  if (!first || !second) throw new Error("active Version snapshot is unavailable");
+  expect(first.versionId).toBe("site-v-a");
+  expect(first.workerVersionUid).toBe("uid-WorkerVersion-site-a");
+  expect(first.workerResourceUid).toBe("uid-ModuleWorker-site");
+  expect(first.generation).toBe("generation-1");
+  expect(first.generationKey).toMatch(/^[0-9a-f]{64}$/u);
+  expect(second.versionId).toBe("site-v-b");
+  expect([...first.modules.keys()]).toEqual(["index.js"]);
+  expect([...first.hostModules.keys()]).toEqual([HOST_ENTRYPOINT]);
+  expect(first.site).toMatchObject({
+    directory: "site",
+    mainModule: "index.js",
+    hostEntrypoint: HOST_ENTRYPOINT,
+    hostnames: [],
+    generation: "generation-1",
+    workerResourceUid: "uid-ModuleWorker-site",
+    fetchHandler: true,
+  });
+});
+
+test("reads the fresh active generation and never selects a legacy scalar", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+  const first = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 5_000,
+  });
+  if (!first) throw new Error("first active Version snapshot is unavailable");
+
+  await runtime.publish("site", weightedPublication("site", "generation-2", [9_999, 1]));
+  const second = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 5_000,
+  });
+  if (!second) throw new Error("second active Version snapshot is unavailable");
+  expect(first.generation).toBe("generation-1");
+  expect(second.generation).toBe("generation-2");
+  expect(second.generationKey).not.toBe(first.generationKey);
+  expect(first.versionId).toBe("site-v-b");
+  expect(second.versionId).toBe("site-v-a");
+
+  const scalar = weightedPublication("site", "scalar-generation").versions[0];
+  if (!scalar) throw new Error("scalar fixture is unavailable");
+  await runtime.write(
+    "scalar",
+    {
+      ...scalar.site,
+      directory: "scalar",
+      workerResourceUid: "uid-ModuleWorker-scalar",
+      hostnames: ["scalar.localhost"],
+    },
+    scalar.modules,
+    undefined,
+    scalar.hostModules,
+  );
+  await runtime.reload();
+  // The scalar carrier has no weighted publication pointer. The weighted-only
+  // reader refuses it rather than selecting its one module implicitly.
+  await expect(
+    readWorkerdSelectedActiveVersion(root, "scalar", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-scalar",
+      basisPoint: 0,
+    }),
+  ).rejects.toThrow("unusable worker active version snapshot");
+});
+
+test("returns null while a weighted activation is crossing", async () => {
+  const probe = createConfigProbe();
+  const loaded = deferred();
+  const release = deferred();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    probe.behavior = async (_config, invocation) => {
+      if (invocation !== 2) return;
+      loaded.resolve();
+      await release.promise;
+    };
+    const publishing = runtime.publish(
+      "site",
+      weightedPublication("site", "generation-2", [9_999, 1]),
+    );
+    await loaded.promise;
+    expect(
+      await readWorkerdSelectedActiveVersion(root, "site", {
+        expectedWorkerResourceUid: "uid-ModuleWorker-site",
+        basisPoint: 0,
+      }),
+    ).toBeNull();
+    release.resolve();
+    await publishing;
+    expect(
+      await readWorkerdSelectedActiveVersion(root, "site", {
+        expectedWorkerResourceUid: "uid-ModuleWorker-site",
+        basisPoint: 0,
+      }),
+    ).toMatchObject({ generation: "generation-2", versionId: "site-v-a" });
+  } finally {
+    release.resolve();
+    probe.stop();
+  }
+});
+
+test("keeps the prior selected Version after a failed activation rolls back", async () => {
+  const probe = createConfigProbe();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish) throw new Error("weighted publication is unavailable");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    probe.behavior = (_config, invocation) => {
+      if (invocation === 2) throw new Error("activation acknowledgement failed");
+    };
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-2", [9_999, 1])),
+    ).rejects.toThrow("activation acknowledgement failed");
+    expect(
+      await readWorkerdSelectedActiveVersion(root, "site", {
+        expectedWorkerResourceUid: "uid-ModuleWorker-site",
+        basisPoint: 0,
+      }),
+    ).toMatchObject({ generation: "generation-1", versionId: "site-v-a" });
+  } finally {
+    probe.stop();
+  }
+});
+
+test("rejects a stale expected Worker UID before reading a selected Version", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+  expect(
+    await readWorkerdSelectedActiveVersion(root, "site", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-other",
+      basisPoint: 0,
+    }),
+  ).toBeNull();
+});
+
+test("captures and verifies selected application, Host-private, and asset bytes", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const base = weightedPublication("site", "generation-assets");
+  const publication: WorkerdDeploymentPublication = {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        vars: [{ name: "SECRET_VALUE", value: "durable-secret", kind: "text" }],
+        assets: {
+          notFoundHandling: "none",
+          runWorkerFirst: false,
+          mediaTypes: { "index.html": "text/html" },
+        },
+      },
+      assets: new Map([["index.html", new TextEncoder().encode("<h1>site</h1>")]]),
+    })),
+  };
+  await runtime.publish("site", publication);
+  const pointer = JSON.parse(
+    await readFile(join(root, "workers", "site", "takoserver-site.json"), "utf8"),
+  ) as { generationKey: string };
+  const versionRoot = join(
+    root,
+    "workers",
+    ".publications",
+    "site",
+    pointer.generationKey,
+    "version-00000",
+  );
+  const applicationPath = join(versionRoot, "application", "module-00000");
+  const hostPath = join(versionRoot, "host-private", "module-00000");
+  const assetPath = join(versionRoot, "assets", "asset-00000");
+  const applicationBytes = await readFile(applicationPath);
+  const hostBytes = await readFile(hostPath);
+  const assetBytes = await readFile(assetPath);
+  const snapshot = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 0,
+  });
+  if (!snapshot) throw new Error("asset Version snapshot is unavailable");
+  expect(snapshot.site.vars).toEqual([
+    { name: "SECRET_VALUE", value: "durable-secret", kind: "text" },
+  ]);
+  expect(snapshot.site.assets).toEqual({
+    notFoundHandling: "none",
+    runWorkerFirst: false,
+    mediaTypes: { "index.html": "text/html" },
+  });
+  expect(new TextDecoder().decode(snapshot.modules.get("index.js"))).toContain("site-a");
+  expect(new TextDecoder().decode(snapshot.hostModules.get(HOST_ENTRYPOINT))).toContain(
+    "./index.js",
+  );
+  expect(new TextDecoder().decode(snapshot.assets?.get("index.html"))).toBe("<h1>site</h1>");
+  const capturedApplication = new Uint8Array(snapshot.modules.get("index.js") as Uint8Array);
+  const capturedHost = new Uint8Array(snapshot.hostModules.get(HOST_ENTRYPOINT) as Uint8Array);
+  const capturedAsset = new Uint8Array(snapshot.assets?.get("index.html") as Uint8Array);
+
+  await writeFile(applicationPath, new TextEncoder().encode("tampered application"));
+  await expect(
+    readWorkerdSelectedActiveVersion(root, "site", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-site",
+      basisPoint: 0,
+    }),
+  ).rejects.toThrow("unusable worker active version snapshot");
+  expect(snapshot.modules.get("index.js")).toEqual(capturedApplication);
+  expect(snapshot.hostModules.get(HOST_ENTRYPOINT)).toEqual(capturedHost);
+  expect(snapshot.assets?.get("index.html")).toEqual(capturedAsset);
+  await writeFile(applicationPath, applicationBytes);
+
+  await writeFile(hostPath, new TextEncoder().encode("tampered host"));
+  await expect(
+    readWorkerdSelectedActiveVersion(root, "site", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-site",
+      basisPoint: 0,
+    }),
+  ).rejects.toThrow("unusable worker active version snapshot");
+  expect(snapshot.modules.get("index.js")).toEqual(capturedApplication);
+  expect(snapshot.hostModules.get(HOST_ENTRYPOINT)).toEqual(capturedHost);
+  expect(snapshot.assets?.get("index.html")).toEqual(capturedAsset);
+  await writeFile(hostPath, hostBytes);
+
+  await writeFile(assetPath, new TextEncoder().encode("tampered asset"));
+  await expect(
+    readWorkerdSelectedActiveVersion(root, "site", {
+      expectedWorkerResourceUid: "uid-ModuleWorker-site",
+      basisPoint: 0,
+    }),
+  ).rejects.toThrow("unusable worker active version snapshot");
+  expect(snapshot.modules.get("index.js")).toEqual(capturedApplication);
+  expect(snapshot.hostModules.get(HOST_ENTRYPOINT)).toEqual(capturedHost);
+  expect(snapshot.assets?.get("index.html")).toEqual(capturedAsset);
+  await writeFile(assetPath, assetBytes);
+});
+
+test("returns an owned logical graph with frozen bytes, vars, and namespaces", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication is unavailable");
+  const sharedName = "shared-entry.js";
+  const applicationSource = new TextEncoder().encode("export const owner = 'application';");
+  const hostSource = new TextEncoder().encode("export const owner = 'host-private';");
+  const base = weightedPublication("site", "generation-owned");
+  const publication: WorkerdDeploymentPublication = {
+    ...base,
+    versions: base.versions.map((version) => ({
+      ...version,
+      site: {
+        ...version.site,
+        mainModule: sharedName,
+        hostEntrypoint: sharedName,
+        vars: [{ name: "SECRET_VALUE", value: "owned-value", kind: "text" }],
+      },
+      modules: new Map([[sharedName, applicationSource]]),
+      hostModules: new Map([[sharedName, hostSource]]),
+    })),
+  };
+  await runtime.publish("site", publication);
+  const snapshot = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 0,
+  });
+  if (!snapshot) throw new Error("owned Version snapshot is unavailable");
+  const expectedApplication = new Uint8Array(applicationSource);
+  const expectedHost = new Uint8Array(hostSource);
+  expect(snapshot.modules.get(sharedName)).toEqual(expectedApplication);
+  expect(snapshot.hostModules.get(sharedName)).toEqual(expectedHost);
+  expect(snapshot.site.vars).toEqual([
+    { name: "SECRET_VALUE", value: "owned-value", kind: "text" },
+  ]);
+  expect([...snapshot.modules.keys()]).toEqual([sharedName]);
+  expect([...snapshot.hostModules.keys()]).toEqual([sharedName]);
+  expect(JSON.stringify(snapshot.site)).not.toContain("module-00000");
+  expect(JSON.stringify(snapshot.site)).not.toContain(".publications");
+  expect(JSON.stringify(snapshot.site)).not.toContain("storageKey");
+
+  const mutableApplication = snapshot.modules.get(sharedName);
+  if (!mutableApplication) throw new Error("application bytes are unavailable");
+  mutableApplication.fill(0);
+  (snapshot.site.vars as Array<{ name: string; value: string; kind: "text" | "json" }>)[0]!.value =
+    "caller-mutated";
+  const sameGeneration = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 0,
+  });
+  if (!sameGeneration) throw new Error("same-generation snapshot is unavailable");
+  expect(sameGeneration.modules.get(sharedName)).toEqual(expectedApplication);
+  expect(sameGeneration.hostModules.get(sharedName)).toEqual(expectedHost);
+  expect(sameGeneration.site.vars).toEqual([
+    { name: "SECRET_VALUE", value: "owned-value", kind: "text" },
+  ]);
+
+  await runtime.publish("site", weightedPublication("site", "generation-owned-next"));
+  expect(sameGeneration.modules.get(sharedName)).toEqual(expectedApplication);
+  expect(sameGeneration.hostModules.get(sharedName)).toEqual(expectedHost);
+  expect(sameGeneration.site.vars).toEqual([
+    { name: "SECRET_VALUE", value: "owned-value", kind: "text" },
+  ]);
+
+  const fresh = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: "uid-ModuleWorker-site",
+    basisPoint: 0,
+  });
+  if (!fresh) throw new Error("fresh Version snapshot is unavailable");
+  expect(fresh.modules.get("index.js")).toBeDefined();
+  expect(fresh.site.vars).toBeUndefined();
 });

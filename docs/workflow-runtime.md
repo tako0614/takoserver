@@ -353,10 +353,37 @@ Ordinary completed-name replay and the helper's own final Response protection
 remain separate positive cases. These native gaps require a different qualified
 transport/runtime boundary, not an observable rewrite of tenant prototypes.
 
-The fixture supplies its own closed module graph;
-production selection, full binding/resource routing, scheduler integration,
-complete native failure corpus and the managed WfP backend remain separate
-unfinished work. No serving entrypoint selects this transport yet.
+### Capturing the active Worker Version
+
+`readWorkerdSelectedActiveVersion` in `workerd-runtime` provides a Host-private
+publication reader, outside the provider-facing `WorkerdRuntime` interface and
+the package-root exports. It selects once from the authenticated, actually
+activated weighted deployment using a caller-supplied basis point. It does not
+reconstruct an environment from the provider's desired bindings: those may
+describe a publication that failed to activate.
+
+The reader requires the expected ModuleWorker resource UID and captures the
+selected application modules, Host-private modules and optional assets in the
+same reads that verify their sizes and digests. The logical site preserves the
+committed environment and binding declarations, including the variant's empty
+hostnames; deployment routes are not projected into an execution subprocess.
+No physical paths or unselected Versions are returned. A final target
+activation and exact-pointer reread refuses a crossing publication. A successful
+read owns an in-memory snapshot; later publication or file changes cannot
+change the context it captured.
+
+This snapshot includes secrets in vars and private binding declarations. It is
+short-lived execution input for the trusted config renderer, not a status DTO,
+log payload, provider response or durable record. Release references after
+child disposal; JavaScript strings do not provide a meaningful zeroization
+guarantee. Missing/deactivated or crossing publications and a stale expected
+Worker UID return no selection; malformed or tampered storage is an error.
+
+The native fixture still supplies its own closed module graph. Connecting this
+reader to preparation, full binding/resource routing, scheduler integration,
+complete native failure corpus and the managed WfP backend remain unfinished.
+The reader neither evaluates application code nor qualifies or activates an
+execution adapter. No serving entrypoint selects this transport yet.
 
 ## Schema and rollout
 

@@ -19,6 +19,7 @@ import { bytesDigest } from "./json.ts";
 import {
   canonicalSelfhostWeightedVersions,
   type SelfhostWeightedVersion,
+  selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 
@@ -208,6 +209,28 @@ export interface WorkerdActiveDeployment {
   readonly versions: readonly SelfhostWeightedVersion[];
   /** Whether the committed graph contains the one logical event dispatcher. */
   readonly events: boolean;
+}
+
+/**
+ * One exact Version selected from the active private weighted publication.
+ *
+ * The returned graph is caller-owned: module and asset bytes, bindings, and
+ * every nested declaration are copied out of the operator-private durable
+ * tree. No physical storage key or root is exposed to the caller.
+ * This includes secrets: never log or persist it, or expose it through a
+ * provider/status response. Retain it only for trusted child preparation and
+ * release references after disposal; JavaScript strings are not zeroizable.
+ */
+export interface WorkerdSelectedActiveVersion {
+  readonly generation: string;
+  readonly generationKey: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionUid: string;
+  readonly site: WorkerdSite;
+  readonly modules: ReadonlyMap<string, Uint8Array>;
+  readonly hostModules: ReadonlyMap<string, Uint8Array>;
+  readonly assets?: ReadonlyMap<string, Uint8Array>;
 }
 
 /** The gate service one script receives its events through. */
@@ -1845,6 +1868,18 @@ interface PublishedDeployment {
 }
 
 /**
+ * Optional byte collectors used by the active-version reader.
+ *
+ * The collectors are fed by the same reads that verify each durable digest;
+ * there is intentionally no verify-then-reread path for snapshot material.
+ */
+interface ReadbackCapture {
+  readonly application?: Map<string, Uint8Array>;
+  readonly hostPrivate?: Map<string, Uint8Array>;
+  readonly assets?: Map<string, Uint8Array>;
+}
+
+/**
  * Whether this publication runs through a generated entrypoint.
  *
  * The entrypoint identity is explicit. A retained manifest from the former
@@ -1859,6 +1894,7 @@ function hasHostEntrypoint(entry: PublishedVariant): boolean {
 async function readPublishedAssetSnapshot(
   root: string,
   value: unknown,
+  capture?: Map<string, Uint8Array>,
 ): Promise<WorkerdAssetManifest | undefined> {
   const manifest = validAssetManifest(value);
   if (!manifest) return undefined;
@@ -1874,11 +1910,15 @@ async function readPublishedAssetSnapshot(
   ) {
     throw new Error("unusable worker asset snapshot");
   }
-  for (const entry of Object.values(manifest.files)) {
+  for (const [logicalPath, entry] of Object.entries(manifest.files)) {
     const bytes = await readFile(join(root, entry.key));
     if (bytes.byteLength !== entry.size || (await bytesDigest(bytes)) !== entry.digest) {
       throw new Error("unusable worker asset snapshot");
     }
+    // Capture the logical path, never the operator-private flat key. The
+    // caller owns a copy, and this is the same read that just passed the
+    // size/digest fence above.
+    capture?.set(logicalPath, new Uint8Array(bytes));
   }
   return manifest;
 }
@@ -1928,6 +1968,7 @@ function validStoredModuleInventory(
 async function verifyStoredModuleDirectory(
   root: string,
   inventory: readonly WorkerdStoredModule[],
+  capture?: Map<string, Uint8Array>,
 ): Promise<void> {
   const rootStat = await lstat(root).catch(() => null);
   if (inventory.length === 0) {
@@ -1951,12 +1992,16 @@ async function verifyStoredModuleDirectory(
     if (bytes.byteLength !== entry.size || (await bytesDigest(bytes)) !== entry.digest) {
       throw new Error("unusable worker module storage snapshot");
     }
+    // The digest fence and the returned bytes come from one read. Keys exposed
+    // to callers are logical module names, never private ordinal filenames.
+    capture?.set(entry.name, new Uint8Array(bytes));
   }
 }
 
 async function readPublishedModuleSnapshot(
   root: string,
   manifest: Manifest,
+  capture?: Pick<ReadbackCapture, "application" | "hostPrivate">,
 ): Promise<WorkerdModuleStorageManifest> {
   if (
     manifest.moduleStorageLayout !== WORKERD_MODULE_STORAGE_LAYOUT ||
@@ -1977,8 +2022,16 @@ async function readPublishedModuleSnapshot(
     (manifest.moduleFiles as unknown as Record<string, unknown>).hostPrivate,
     hostNames,
   );
-  await verifyStoredModuleDirectory(join(root, APPLICATION_MODULE_DIRECTORY), application);
-  await verifyStoredModuleDirectory(join(root, HOST_PRIVATE_MODULE_DIRECTORY), hostPrivate);
+  await verifyStoredModuleDirectory(
+    join(root, APPLICATION_MODULE_DIRECTORY),
+    application,
+    capture?.application,
+  );
+  await verifyStoredModuleDirectory(
+    join(root, HOST_PRIVATE_MODULE_DIRECTORY),
+    hostPrivate,
+    capture?.hostPrivate,
+  );
   return { application, hostPrivate };
 }
 
@@ -1986,6 +2039,7 @@ async function readValidatedManifest(
   moduleRoot: string,
   assetRoot: string,
   value: unknown,
+  capture?: ReadbackCapture,
 ): Promise<Manifest> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker runtime manifest");
@@ -2000,9 +2054,9 @@ async function readValidatedManifest(
   validModules([manifest.mainModule]);
   const declaredModules = validModules(manifest.modules ?? [], manifest.mainModule);
   validModuleMediaTypes(manifest.mainModule, declaredModules, manifest.moduleMediaTypes);
-  const moduleFiles = await readPublishedModuleSnapshot(moduleRoot, manifest);
+  const moduleFiles = await readPublishedModuleSnapshot(moduleRoot, manifest, capture);
   manifest = { ...manifest, moduleFiles };
-  const assets = await readPublishedAssetSnapshot(assetRoot, manifest.assets);
+  const assets = await readPublishedAssetSnapshot(assetRoot, manifest.assets, capture?.assets);
   if (assets) manifest = { ...manifest, assets };
   validBindings(manifest.vars ?? []);
   if (manifest.workerResourceUid !== undefined) {
@@ -2288,6 +2342,230 @@ export async function readWorkerdActiveDeployment(
     generation: activeGeneration,
     versions: snapshot.canonical,
     events: eventShapes.has(true),
+  };
+}
+
+/**
+ * Reads one caller-owned Version snapshot from the active private publication.
+ *
+ * This is deliberately a Host-private seam rather than a provider API. It
+ * authenticates the active marker, stable pointer, immutable deployment
+ * manifest, and selected module/asset bytes, then fences the result with an
+ * exact final marker/pointer reread. A crossing or stale expected Worker UID
+ * returns `null`; malformed or tampered durable state throws one generic error
+ * without exposing bindings or operator-private paths.
+ */
+export async function readWorkerdSelectedActiveVersion(
+  root: string,
+  script: string,
+  options: {
+    readonly expectedWorkerResourceUid: string;
+    readonly basisPoint: number;
+  },
+): Promise<WorkerdSelectedActiveVersion | null> {
+  if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new Error("unusable worker active version options");
+  }
+  const expectedWorkerResourceUid = validWorkerResourceUid(options.expectedWorkerResourceUid);
+  const scriptsRoot = join(root, "workers");
+  const activationPath = join(scriptsRoot, ".takoserver-active.json");
+
+  let before: Record<string, string | null>;
+  try {
+    before = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active version snapshot");
+  }
+  const activeGeneration = before[script];
+  if (typeof activeGeneration !== "string") return null;
+
+  const pointerPath = join(scriptsRoot, script, MANIFEST);
+  const pointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active version snapshot");
+  });
+  if (pointerRaw === null) return null;
+
+  let pointerValue: unknown;
+  try {
+    pointerValue = JSON.parse(pointerRaw);
+  } catch {
+    throw new Error("unusable worker active version snapshot");
+  }
+  let deployment: WeightedDeploymentSnapshot;
+  try {
+    deployment = await readWeightedDeploymentSnapshot(scriptsRoot, script, pointerValue);
+  } catch {
+    throw new Error("unusable worker active version snapshot");
+  }
+  if (
+    deployment.deployment.generation !== activeGeneration ||
+    deployment.deployment.workerResourceUid !== expectedWorkerResourceUid
+  ) {
+    return null;
+  }
+
+  // This is the sole selection call. A graph crossing discovered by the final
+  // fence below returns null; it never causes a second sample. Invalid caller
+  // entropy retains the selector's range/type error for the caller.
+  const selected = selectSelfhostWeightedVersion(deployment.canonical, options.basisPoint);
+
+  const selectedIndex = deployment.deployment.versions.findIndex(
+    (version) =>
+      version.workerVersionUid === selected.workerVersionUid &&
+      version.versionId === selected.versionId &&
+      version.weight === selected.weight,
+  );
+  if (selectedIndex < 0) throw new Error("unusable worker active version snapshot");
+  const stored = deployment.deployment.versions[selectedIndex];
+  if (!stored) throw new Error("unusable worker active version snapshot");
+
+  // Check the selected Version's identity before opening its module or asset
+  // files. The top-level Worker UID check above already rejects a stale caller
+  // expectation before any secret-bearing Version material is read.
+  const selectedManifest = stored.manifest;
+  if (
+    typeof selectedManifest !== "object" ||
+    selectedManifest === null ||
+    Array.isArray(selectedManifest) ||
+    selectedManifest.generation !== deployment.deployment.generation ||
+    selectedManifest.workerResourceUid !== deployment.deployment.workerResourceUid ||
+    !Array.isArray(selectedManifest.hostnames) ||
+    selectedManifest.hostnames.length !== 0
+  ) {
+    throw new Error("unusable worker active version snapshot");
+  }
+
+  const capture: Required<ReadbackCapture> = {
+    application: new Map(),
+    hostPrivate: new Map(),
+    assets: new Map(),
+  };
+  let manifest: Manifest;
+  try {
+    const moduleRoot = join(deployment.generationRoot, stored.storageKey);
+    manifest = await readValidatedManifest(
+      moduleRoot,
+      join(moduleRoot, ASSETS_ROOT_DIRECTORY),
+      selectedManifest,
+      capture,
+    );
+  } catch {
+    throw new Error("unusable worker active version snapshot");
+  }
+  if (
+    manifest.generation !== deployment.deployment.generation ||
+    manifest.workerResourceUid !== deployment.deployment.workerResourceUid ||
+    manifest.hostnames.length !== 0
+  ) {
+    throw new Error("unusable worker active version snapshot");
+  }
+
+  let site: WorkerdSite;
+  try {
+    site = {
+      directory: script,
+      mainModule: manifest.mainModule,
+      ...(manifest.hostEntrypoint === undefined ? {} : { hostEntrypoint: manifest.hostEntrypoint }),
+      ...(manifest.hostModules === undefined ? {} : { hostModules: [...manifest.hostModules] }),
+      hostnames: [...manifest.hostnames],
+      ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
+      ...(manifest.workerResourceUid === undefined
+        ? {}
+        : { workerResourceUid: manifest.workerResourceUid }),
+      ...(manifest.fetchHandler === undefined ? {} : { fetchHandler: manifest.fetchHandler }),
+      ...(manifest.serviceBindings === undefined
+        ? {}
+        : {
+            serviceBindings: manifest.serviceBindings.map((binding) => ({
+              name: binding.name,
+              target: binding.target,
+              targetResourceUid: binding.targetResourceUid,
+              unavailableToken: binding.unavailableToken,
+            })),
+          }),
+      ...(manifest.assets === undefined
+        ? {}
+        : {
+            assets: {
+              notFoundHandling: manifest.assets.notFoundHandling,
+              runWorkerFirst: manifest.assets.runWorkerFirst,
+              mediaTypes: Object.fromEntries(
+                Object.entries(manifest.assets.files).map(([path, entry]) => [
+                  path,
+                  entry.mediaType,
+                ]),
+              ),
+            },
+          }),
+      ...(manifest.vars === undefined
+        ? {}
+        : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
+      ...(manifest.modules === undefined ? {} : { modules: [...manifest.modules] }),
+      ...(manifest.moduleMediaTypes === undefined
+        ? {}
+        : { moduleMediaTypes: { ...manifest.moduleMediaTypes } }),
+      ...(manifest.dataPlane === undefined
+        ? {}
+        : {
+            dataPlane: {
+              address: manifest.dataPlane.address,
+              module: manifest.dataPlane.module,
+              vars: manifest.dataPlane.vars.map((binding) => ({ ...binding })),
+            },
+          }),
+      ...(manifest.events === undefined
+        ? {}
+        : {
+            events: {
+              module: manifest.events.module,
+              vars: manifest.events.vars.map((binding) => ({ ...binding })),
+            },
+          }),
+    };
+  } catch {
+    // Validators normally reject these shapes earlier. Keep the reader's
+    // public failure generic even for legacy manifests with missing nested
+    // arrays that older validators treated as empty.
+    throw new Error("unusable worker active version snapshot");
+  }
+
+  // Each collector was allocated for this call and receives a fresh byte copy
+  // from the digest-verified read, so returning it directly gives ownership to
+  // the caller without a second full copy of potentially large modules/assets.
+  const modules = capture.application;
+  const hostModules = capture.hostPrivate;
+  const assets = manifest.assets === undefined ? undefined : capture.assets;
+
+  let after: Record<string, string | null>;
+  try {
+    after = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active version snapshot");
+  }
+  const finalPointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active version snapshot");
+  });
+  if (
+    finalPointerRaw === null ||
+    after[script] !== activeGeneration ||
+    finalPointerRaw !== pointerRaw
+  ) {
+    return null;
+  }
+
+  return {
+    generation: deployment.deployment.generation,
+    generationKey: deployment.pointer.generationKey,
+    workerResourceUid: deployment.deployment.workerResourceUid,
+    versionId: selected.versionId,
+    workerVersionUid: selected.workerVersionUid,
+    site,
+    modules,
+    hostModules,
+    ...(assets === undefined ? {} : { assets }),
   };
 }
 
