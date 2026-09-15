@@ -1802,6 +1802,119 @@ describe("publishing a Worker through the Edge Family", () => {
     ...extra,
   });
 
+  test("refuses non-empty actor bindings before lease or materialization", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: {
+        ...base.spec,
+        actorBindings: [
+          {
+            name: "COUNTER",
+            resource: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "ActorNamespace",
+              name: "counter",
+            },
+          },
+        ],
+      },
+      relations: [
+        ...base.relations,
+        relation("/actorBindings/0/resource", "ActorNamespace", "counter"),
+      ],
+    });
+
+    const ticket = await local.apply(request);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version actor bindings are not supported by this provider",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, request.operationId)).toBe(true);
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    const recovered = await local.recoverApply({ ...request, operationMode: "recovery" });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version actor bindings are not supported by this provider",
+      },
+    });
+    expect(providerFailureProvesNoMutation(recovered, request.operationId)).toBe(true);
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
+  test("keeps omitted and empty actor bindings supported for apply and recovery", async () => {
+    for (const [suffix, actorBindings] of [
+      ["omitted", undefined],
+      ["empty", []],
+    ] as const) {
+      const local = provider();
+      const base = sensitiveApply();
+      const request = {
+        ...base,
+        operationId: `op_actor_${suffix}`,
+        identity: { ...base.identity, name: `hello-actor-${suffix}` },
+        spec: {
+          ...base.spec,
+          requiredSensitiveVars: [],
+          ...(actorBindings === undefined ? {} : { actorBindings }),
+        },
+      };
+      expect(await local.apply(request)).toMatchObject({ phase: "succeeded" });
+      if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+      expect(await local.recoverApply({ ...request, operationMode: "recovery" })).toMatchObject({
+        phase: "succeeded",
+      });
+    }
+  });
+
+  test("rejects malformed actor bindings before lease or materialization", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    const base = sensitiveApply();
+    const request = sensitiveApply({
+      spec: { ...base.spec, actorBindings: {} },
+      relations: base.relations,
+    });
+
+    const ticket = await local.apply(request);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        retryable: false,
+        message: "the Worker Version actor bindings are invalid",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, request.operationId)).toBe(true);
+    expect(log.events).toEqual([]);
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing recovery");
+    expect(await local.recoverApply({ ...request, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "invalid_spec",
+        retryable: false,
+        message: "the Worker Version actor bindings are invalid",
+      },
+    });
+    expect(log.events).toEqual([]);
+    expect(existsSync(join(root, "selfhost", "versions"))).toBe(false);
+    expect(bindingFiles(root)).toEqual([]);
+  });
+
   test("refuses non-empty workflow bindings before lease or materialization", async () => {
     const { port, log } = fakeLeases(() => root);
     const local = provider({ runtimeInputs: port });

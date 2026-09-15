@@ -9,6 +9,7 @@ import type {
 import {
   type ApplyInput,
   failed,
+  failedWithoutProviderMutation,
   type Provider,
   type ProviderArtifactConsumption,
   type ProviderArtifactConsumptionInput,
@@ -852,6 +853,8 @@ export class CloudflareProvider implements Provider {
       });
     }
     if (native.kind === "version") {
+      const unsupportedBindingFailure = unsupportedWorkerVersionBindingFailure(input.spec);
+      if (unsupportedBindingFailure) return unsupportedBindingFailure;
       const read = await this.#call(
         "GET",
         `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(native.parent)}/versions/${encodeURIComponent(native.name)}`,
@@ -1481,6 +1484,11 @@ export class CloudflareProvider implements Provider {
 
   async #applyWorkerVersion(input: ApplyInput): Promise<ProviderTicket> {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
+    const unsupportedBindingFailure = unsupportedWorkerVersionBindingFailure(
+      input.spec,
+      input.operationId,
+    );
+    if (unsupportedBindingFailure) return unsupportedBindingFailure;
     const operationMarker = await workerVersionOperationMarker(input.operationId);
     if (!operationMarker) {
       return failed("invalid_spec", "the Worker Version operation identity is invalid");
@@ -3405,6 +3413,28 @@ function edgeBindings(
     result.push({ type: "r2_bucket", name, bucket_name: material.bucketName });
   }
   return result;
+}
+
+function unsupportedWorkerVersionBindingFailure(
+  spec: JsonObject,
+  operationId?: string,
+): ProviderTicket | null {
+  for (const [field, label] of [
+    ["workflowBindings", "workflow bindings"],
+    ["actorBindings", "actor bindings"],
+  ] as const) {
+    const declared = spec[field];
+    if (declared === undefined || (Array.isArray(declared) && declared.length === 0)) continue;
+    const refusal = (code: "denied" | "invalid_spec", message: string): ProviderTicket =>
+      operationId === undefined
+        ? failed(code, message)
+        : failedWithoutProviderMutation(operationId, code, message);
+    if (!Array.isArray(declared)) {
+      return refusal("invalid_spec", `the Worker Version ${label} are invalid`);
+    }
+    return refusal("denied", `the Worker Version ${label} are not supported by this provider`);
+  }
+  return null;
 }
 
 async function shortDigest(value: string): Promise<string> {

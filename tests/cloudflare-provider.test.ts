@@ -6,11 +6,12 @@ import {
 } from "../src/edge-forms.ts";
 import { bytesDigest } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
-import type {
-  ProviderOffering,
-  ProviderRelation,
-  ProviderRuntimeBinding,
-  ProviderSqliteMigrationIdentity,
+import {
+  type ProviderOffering,
+  type ProviderRelation,
+  type ProviderRuntimeBinding,
+  type ProviderSqliteMigrationIdentity,
+  providerFailureProvesNoMutation,
 } from "../src/provider-port.ts";
 import type {
   ProviderRuntimeInputLeasePort,
@@ -1280,6 +1281,187 @@ describe("released edge Form placement", () => {
     expect(deployment?.url).toContain("/workers/scripts/script-name/deployments");
     expect(deployment?.body).toContain('"percentage":100');
     expect(deployment?.body).toContain('"version_id":"version-id"');
+  });
+
+  test("refuses unsupported Worker Version class bindings before artifacts or native calls", async () => {
+    const workerOffering = technical("ModuleWorker");
+    const versionOffering = technical("WorkerVersion");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [workerOffering, versionOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: { id: "version-empty" },
+        });
+      },
+    });
+    const relations = [
+      related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+        nativeId: "worker:script-name",
+        offeringId: workerOffering.id,
+        providerPackRef: "cloudflare",
+        outputs: { scriptName: "script-name" },
+      }),
+      related(
+        "/bundle",
+        stored("WorkerBundle", "bundle-uid", {
+          manifestDigest: `sha256:${"d".repeat(64)}`,
+        }),
+      ),
+    ];
+    const declarations = [
+      {
+        name: "workflow",
+        spec: {
+          workflowBindings: [
+            {
+              name: "ORDERS",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "DurableWorkflow",
+                name: "orders",
+              },
+            },
+          ],
+        },
+        code: "denied",
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+      {
+        name: "actor",
+        spec: {
+          actorBindings: [
+            {
+              name: "COUNTER",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "ActorNamespace",
+                name: "counter",
+              },
+            },
+          ],
+        },
+        code: "denied",
+        message: "the Worker Version actor bindings are not supported by this provider",
+      },
+      {
+        name: "workflow-malformed",
+        spec: { workflowBindings: {} },
+        code: "invalid_spec",
+        message: "the Worker Version workflow bindings are invalid",
+      },
+      {
+        name: "actor-malformed",
+        spec: { actorBindings: {} },
+        code: "invalid_spec",
+        message: "the Worker Version actor bindings are invalid",
+      },
+    ] as const;
+
+    for (const declaration of declarations) {
+      const ticket = await provider.apply({
+        operationId: `op-version-${declaration.name}`,
+        operationMode: "initial",
+        offering: versionOffering,
+        identity: { ...IDENTITY, name: declaration.name },
+        spec: { handlers: ["fetch"], ...declaration.spec },
+        relations,
+      });
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: {
+          code: declaration.code,
+          retryable: false,
+          message: declaration.message,
+        },
+      });
+      expect(providerFailureProvesNoMutation(ticket, `op-version-${declaration.name}`)).toBe(true);
+    }
+    expect(calls).toEqual([]);
+
+    const empty = {
+      operationId: "op-version-empty",
+      operationMode: "initial" as const,
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "empty" },
+      spec: { handlers: ["fetch"], actorBindings: [], workflowBindings: [] },
+      relations,
+    };
+    expect(await provider.apply(empty)).toMatchObject({ phase: "succeeded" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("POST");
+
+    const beforeObserve = calls.length;
+    expect(
+      await provider.observe({
+        offering: versionOffering,
+        nativeId: "version:script-name:version-empty",
+        identity: empty.identity,
+        spec: {
+          handlers: ["fetch"],
+          actorBindings: [
+            {
+              name: "COUNTER",
+              resource: {
+                apiVersion: "edge.forms.takoform.com",
+                kind: "ActorNamespace",
+                name: "counter",
+              },
+            },
+          ],
+        },
+        relations,
+      }),
+    ).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version actor bindings are not supported by this provider",
+      },
+    });
+    expect(calls).toHaveLength(beforeObserve);
+
+    const recovered = await provider.recoverApply({
+      ...empty,
+      operationId: "op-version-recover-workflow",
+      operationMode: "recovery",
+      spec: {
+        handlers: ["fetch"],
+        workflowBindings: [
+          {
+            name: "ORDERS",
+            resource: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "DurableWorkflow",
+              name: "orders",
+            },
+          },
+        ],
+      },
+    });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        retryable: false,
+        message: "the Worker Version workflow bindings are not supported by this provider",
+      },
+    });
+    expect(providerFailureProvesNoMutation(recovered, "op-version-recover-workflow")).toBe(true);
+    expect(calls).toHaveLength(beforeObserve);
   });
 
   test("marks a first Worker Version dispatch without scanning existing history", async () => {

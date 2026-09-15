@@ -220,18 +220,27 @@ workerd evidence does not qualify a managed runtime.
 Class-backed Actor/Workflow capabilities without an executable provider
 implementation remain unsupported on both discovery and mutation paths.
 
-The self-host provider does not project `workflowBindings` into a Worker
-Version. A nonempty declaration is refused with a non-retryable provider
+The self-host provider does not project `actorBindings` or `workflowBindings`
+into a Worker Version. A nonempty declaration is refused with a non-retryable provider
 `denied` result before artifact materialization or sensitive-input dispatch,
 including apply recovery. Observation and import also refuse it rather than
 claiming that a retained Version satisfies the declaration. Omitted or empty
 lists keep the existing behavior; a non-array value is `invalid_spec`. This
-does not enable Workflow execution or change the published Form contract.
+does not enable Actor/Workflow execution or change the published Form contract.
 An apply-side refusal carries operation-bound no-mutation proof so the driver
 can close an initial refusal. During recovery the same proof covers only the
 current invocation, never an older operation's uncertain side effects.
 The [Workflow implementation note](workflow-runtime.md) separates the internal
 instance store from the execution and binding work still required for support.
+
+The ordinary Cloudflare provider also refuses these WorkerVersion declarations
+before upload or sensitive-input acquisition, including apply recovery and
+convergence. Observation refuses them before native readback. Omitted or empty
+arrays remain valid; malformed declarations are `invalid_spec`. Existing
+exact-identity deletion and artifact-consumption evidence remain separate from
+runtime support, so the refusal does not strand previous releases or erase
+evidence that their bundles are still in use. Concrete managed WfP execution is
+owned and qualified separately in the private provider implementation.
 
 The self-host adapter executes a `WorkerDeployment` containing one to eight
 exact Versions with positive integer weights totaling `10000`. It retains each
