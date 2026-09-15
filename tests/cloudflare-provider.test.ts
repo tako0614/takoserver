@@ -27,6 +27,7 @@ import {
   CloudflareProvider,
   type CloudflareZone,
 } from "../src/providers/cloudflare.ts";
+import type { CloudflareWorkerBackend } from "../src/providers/cloudflare-worker-backend.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 
 const FORM_REF = {
@@ -1076,6 +1077,102 @@ describe("released edge Form placement", () => {
       regions: ["global"],
     });
 
+  function managedBackendThatDoesNotOwnQueues(): CloudflareWorkerBackend {
+    const unavailable = () => ({
+      phase: "failed" as const,
+      failure: { code: "unavailable" as const, message: "unused backend stub", retryable: true },
+    });
+    return {
+      kind: "workers-for-platforms",
+      deriveOrigin: async () => ({ canonicalPublicOrigin: "https://managed.example.test" }),
+      owns: () => false,
+      apply: async () => unavailable(),
+      recoverApply: async () => unavailable(),
+      convergeApply: async () => unavailable(),
+      observe: async () => unavailable(),
+      delete: async () => unavailable(),
+      recoverDelete: async () => unavailable(),
+      createNativeReadbackDescriptor: () => ({
+        apiVersion: "providers.takoserver.com/readback/v1",
+        provider: "cloudflare.test",
+        kind: "AtLeastOnceQueue",
+        nativeId: "queue:queue-id",
+        data: {},
+      }),
+      verifyNativeAbsence: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+      verifyArtifactConsumption: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+    };
+  }
+
+  function queueResult(
+    messageRetentionSeconds: unknown,
+    deliveryDelaySeconds: unknown,
+    queueId = "queue-id",
+    queueName = "queue-name",
+  ) {
+    return {
+      queue_id: queueId,
+      queue_name: queueName,
+      settings: {
+        message_retention_period: messageRetentionSeconds,
+        delivery_delay: deliveryDelaySeconds,
+      },
+    };
+  }
+
+  function queueProvider(
+    responses: readonly unknown[],
+    backend?: CloudflareWorkerBackend,
+  ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
+    const calls: Call[] = [];
+    let responseIndex = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [technical("AtLeastOnceQueue")],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      ...(backend === undefined
+        ? {}
+        : { workerBackend: { kind: "workers-for-platforms" as const, create: () => backend } }),
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        const response = responses[Math.min(responseIndex++, Math.max(responses.length - 1, 0))];
+        return Response.json({ success: true, errors: [], result: response });
+      },
+    });
+    return { provider, calls };
+  }
+
+  function queueUpdateInput(
+    offering: ProviderOffering,
+    spec: JsonObject,
+    operationMode: "initial" | "recovery" = "initial",
+  ) {
+    return {
+      operationId: `op-queue-update-${operationMode}`,
+      operationMode,
+      offering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec,
+      previous: {
+        nativeId: "queue:queue-id",
+        spec: { messageRetentionSeconds: 300, deliveryDelaySeconds: 0 },
+      },
+    } as const;
+  }
+
   test("creates the provider-backed identity Forms without inventing their schema", async () => {
     const offerings = [
       technical("ModuleWorker"),
@@ -1140,6 +1237,7 @@ describe("released edge Form placement", () => {
     });
     const queue = await provider.apply({
       operationId: "op-queue",
+      operationMode: "initial",
       offering: offerings[3] as ProviderOffering,
       identity: { ...IDENTITY, name: "jobs" },
       spec: { messageRetentionSeconds: 86_400, deliveryDelaySeconds: 3 },
@@ -1165,6 +1263,294 @@ describe("released edge Form placement", () => {
       "/client/v4/accounts/acct_1/d1/database",
       "/client/v4/accounts/acct_1/queues",
     ]);
+  });
+
+  test("Queue settings update does not falsely succeed", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [queueOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return Response.json({
+          success: true,
+          errors: [],
+          result: {
+            queue_id: "queue-id",
+            queue_name: "queue-name",
+            settings: {
+              message_retention_period: 300,
+              delivery_delay: 0,
+            },
+          },
+        });
+      },
+    });
+    const ticket = await provider.apply({
+      operationId: "op-queue-settings-update",
+      operationMode: "initial",
+      offering: queueOffering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 },
+      previous: {
+        nativeId: "queue:queue-id",
+        spec: { messageRetentionSeconds: 300, deliveryDelaySeconds: 0 },
+      },
+    });
+
+    expect(ticket.phase).not.toBe("succeeded");
+    expect(calls).not.toHaveLength(0);
+    expect(calls[0]).toMatchObject({
+      method: "GET",
+      url: "https://api.cloudflare.test/client/v4/accounts/acct_1/queues/queue-id",
+    });
+  });
+
+  test("updates Queue settings and preserves the native name after exact readback", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueProvider([queueResult(300, 0), {}, queueResult(600, 0)]);
+    const ticket = await provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600 }),
+    );
+
+    expect(ticket).toMatchObject({
+      phase: "succeeded",
+      result: {
+        nativeId: "queue:queue-id",
+        outputs: { queueId: "queue-id", queueName: "queue-name" },
+      },
+    });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+    expect(JSON.parse(calls[1]?.body ?? "{}")).toEqual({
+      settings: { message_retention_period: 600, delivery_delay: 0 },
+    });
+  });
+
+  test("does not PATCH an unchanged Queue", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueProvider([queueResult(600, 0)]);
+    const ticket = await provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600 }),
+    );
+
+    expect(ticket).toMatchObject({ phase: "succeeded", result: { nativeId: "queue:queue-id" } });
+    expect(calls.map((call) => call.method)).toEqual(["GET"]);
+  });
+
+  test("accepts Cloudflare's wider native delivery-delay readback", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueProvider([queueResult(600, 86_400), {}, queueResult(600, 0)]);
+    const ticket = await provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600 }),
+    );
+
+    expect(ticket).toMatchObject({ phase: "succeeded", result: { nativeId: "queue:queue-id" } });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+  });
+
+  test("keeps Queue recovery GET-only for desired and drifted settings", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueProvider([queueResult(600, 0), queueResult(300, 0)]);
+    const desired = await provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600 }, "recovery"),
+    );
+    const drifted = await provider.recoverApply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600 }, "recovery"),
+    );
+    const omittedMode = await provider.apply({
+      operationId: "op-queue-update-omitted-mode",
+      offering: queueOffering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600 },
+      previous: {
+        nativeId: "queue:queue-id",
+        spec: { messageRetentionSeconds: 300, deliveryDelaySeconds: 0 },
+      },
+    });
+
+    expect(desired).toMatchObject({ phase: "succeeded", result: { nativeId: "queue:queue-id" } });
+    expect(drifted).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(omittedMode).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(calls.map((call) => call.method)).toEqual(["GET", "GET", "GET"]);
+  });
+
+  test("refuses Workers for Platforms retention changes but updates delay only", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const managedBackend = managedBackendThatDoesNotOwnQueues();
+    const refused = queueProvider([queueResult(300, 0)], managedBackend);
+    const refusedTicket = await refused.provider.apply(
+      queueUpdateInput(queueOffering, {
+        messageRetentionSeconds: 600,
+        deliveryDelaySeconds: 3,
+      }),
+    );
+    expect(refusedTicket).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(refused.calls.map((call) => call.method)).toEqual(["GET"]);
+
+    const updated = queueProvider(
+      [queueResult(600, 0), {}, queueResult(600, 3)],
+      managedBackendThatDoesNotOwnQueues(),
+    );
+    const updatedTicket = await updated.provider.apply(
+      queueUpdateInput(queueOffering, {
+        messageRetentionSeconds: 600,
+        deliveryDelaySeconds: 3,
+      }),
+    );
+    expect(updatedTicket).toMatchObject({ phase: "succeeded" });
+    expect(updated.calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+    expect(JSON.parse(updated.calls[1]?.body ?? "{}")).toEqual({
+      settings: { delivery_delay: 3 },
+    });
+  });
+
+  test("refuses malformed Queue readback before mutation and detects post-PATCH drift", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const malformed: readonly [string, unknown][] = [
+      ["wrong queue id", queueResult(300, 0, "other-queue")],
+      ["missing queue name", { ...queueResult(300, 0), queue_name: "" }],
+      ["non-numeric settings", queueResult("300", 0)],
+    ];
+    for (const [label, result] of malformed) {
+      const { provider, calls } = queueProvider([result]);
+      const ticket = await provider.apply(
+        queueUpdateInput(queueOffering, { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 }),
+      );
+      expect(ticket, label).toMatchObject({ phase: "failed", failure: { code: "provider_error" } });
+      expect(
+        calls.map((call) => call.method),
+        label,
+      ).toEqual(["GET"]);
+    }
+
+    const drift = queueProvider([queueResult(300, 0), {}, queueResult(300, 3)]);
+    const drifted = await drift.provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 }),
+    );
+    expect(drifted).toMatchObject({ phase: "failed", failure: { code: "provider_error" } });
+    expect(drift.calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+
+    const renamed = queueProvider([
+      queueResult(300, 0),
+      {},
+      queueResult(600, 3, "queue-id", "renamed"),
+    ]);
+    const renamedTicket = await renamed.provider.apply(
+      queueUpdateInput(queueOffering, { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 }),
+    );
+    expect(renamedTicket).toMatchObject({ phase: "failed", failure: { code: "provider_error" } });
+    expect(renamed.calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+  });
+
+  test("does not resend a Queue PATCH after a lost acknowledgement", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const calls: Call[] = [];
+    let patchAttempts = 0;
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [queueOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        if (request.method === "PATCH") {
+          patchAttempts += 1;
+          throw new TypeError("connection closed after PATCH");
+        }
+        return Response.json({
+          success: true,
+          errors: [],
+          result: queueResult(300, 0),
+        });
+      },
+    });
+    const input = queueUpdateInput(
+      queueOffering,
+      { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 },
+      "initial",
+    );
+    const first = await provider.apply(input);
+    const recovered = await provider.apply({ ...input, operationMode: "recovery" });
+
+    expect(first).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(recovered).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(patchAttempts).toBe(1);
+    expect(calls.map((call) => call.method)).toEqual(["GET", "PATCH", "GET"]);
+  });
+
+  test("does not report Queue observe success when native settings drift", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const exact = queueProvider([queueResult(600, 3)]);
+    const observedExact = await exact.provider.observe({
+      offering: queueOffering,
+      nativeId: "queue:queue-id",
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 },
+    });
+    expect(observedExact).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: "queue:queue-id", outputs: { queueName: "queue-name" } },
+    });
+    expect(exact.calls.map((call) => call.method)).toEqual(["GET"]);
+
+    const { provider, calls } = queueProvider([queueResult(300, 0)]);
+    const observed = await provider.observe({
+      offering: queueOffering,
+      nativeId: "queue:queue-id",
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600, deliveryDelaySeconds: 3 },
+    });
+
+    expect(observed).toMatchObject({ phase: "failed", failure: { code: "provider_error" } });
+    expect(calls.map((call) => call.method)).toEqual(["GET"]);
+  });
+
+  test("keeps create recovery unavailable without a deterministic Queue identity", async () => {
+    const queueOffering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueProvider([]);
+    const recovered = await provider.apply({
+      operationId: "op-queue-create-recovery",
+      operationMode: "recovery",
+      offering: queueOffering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600 },
+    });
+    const omittedMode = await provider.apply({
+      operationId: "op-queue-create-omitted-mode",
+      offering: queueOffering,
+      identity: { ...IDENTITY, name: "jobs" },
+      spec: { messageRetentionSeconds: 600 },
+    });
+    const malformedPrevious = JSON.parse(
+      JSON.stringify({
+        operationId: "op-queue-null-previous",
+        operationMode: "recovery",
+        offering: queueOffering,
+        identity: { ...IDENTITY, name: "jobs" },
+        spec: { messageRetentionSeconds: 600 },
+        previous: null,
+      }),
+    );
+    const malformed = await provider.apply(malformedPrevious);
+    expect(recovered).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(omittedMode).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(malformed).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(calls).toEqual([]);
   });
 
   test("uploads a Worker Version then deploys that exact provider Version", async () => {

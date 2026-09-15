@@ -735,6 +735,30 @@ queue identifiers, managed gateway routes, or private service bindings. Consult
 the private deployment runbook for operator qualification and recovery; the
 portable Worker contract remains the authority for application behavior.
 
+### Cloudflare Queue settings updates
+
+For an existing Cloudflare-backed `AtLeastOnceQueue`, an update succeeds only
+when native readback matches the requested retention and delivery delay. An
+omitted `deliveryDelaySeconds` means zero. An unchanged Queue needs only a read;
+an ordinary update reads the existing identity, sends one settings-only
+[PATCH](https://developers.cloudflare.com/api/resources/queues/methods/edit/),
+and reads the same Queue again. It does not rename or recreate the Queue.
+Only an explicitly initial Host execution may write; an omitted execution mode
+is recovery-only and cannot create a Queue or change its settings.
+Recovery reads that existing identity without repeating the write. A lost
+acknowledgement or mismatched readback is not successful completion, and this
+read-only recovery does not authorize adoption after an uncertain create.
+Ordinary observation also checks the requested settings; merely finding a Queue
+with the same native identifier does not establish readiness after settings drift.
+
+In a Workers for Platforms composition, delivery-delay-only updates are
+supported, but retention changes remain unavailable. Managed dead-letter
+transfer retains the source retention policy for its in-flight work; changing
+the native Queue independently would invalidate that policy. Retention updates
+need coordinated transfer lifecycle support before they can be enabled. This
+is a Cloudflare implementation gap, not an immutable field or a change to the
+published Form. The self-host acceptance-time behavior above is unchanged.
+
 ## Retired Cloudflare ObjectBucket drain
 
 One closed recovery mode remains for Deployments already recorded under the

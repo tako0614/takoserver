@@ -520,7 +520,9 @@ export class CloudflareProvider implements Provider {
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
       input.offering.form.kind === "WorkerVersion";
-    if (input.operationMode === "recovery" && !canRecoverWorkerVersion) {
+    const canRecoverQueue =
+      cloudflareQueueOffering(input.offering) && queuePreviousNativeName(input.previous) !== null;
+    if (input.operationMode === "recovery" && !canRecoverWorkerVersion && !canRecoverQueue) {
       // The request may have crossed a mutating Cloudflare endpoint before its
       // response was lost. Unless this operation has a deterministic recovery
       // identity, a second POST/PUT would be an unbounded duplicate mutation.
@@ -583,10 +585,14 @@ export class CloudflareProvider implements Provider {
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
       input.offering.form.kind === "WorkerVersion";
-    if (!deterministicWorkerVersion) {
+    const deterministicQueue =
+      cloudflareQueueOffering(input.offering) && queuePreviousNativeName(input.previous) !== null;
+    if (!deterministicWorkerVersion && !deterministicQueue) {
       return failed("unavailable", indeterminateMutationRepair(input.offering), true);
     }
-    return await this.#applyWorkerVersion({ ...input, operationMode: "recovery" });
+    return deterministicWorkerVersion
+      ? await this.#applyWorkerVersion({ ...input, operationMode: "recovery" })
+      : await this.#applyQueue({ ...input, operationMode: "recovery" });
   }
 
   /** Resume one exact Host-owned command; never inferred from read-only recovery. */
@@ -953,6 +959,19 @@ export class CloudflareProvider implements Provider {
         },
         outputs: {},
       });
+    }
+    if (native.kind === "queue" && input.offering.form.kind === "AtLeastOnceQueue") {
+      const desired = queueSettings(input.spec);
+      if (!desired) return failed("invalid_spec", "the Queue settings are invalid");
+      const readback = await this.#readQueueSettings(native.name);
+      if (!readback.ok) return readback.ticket;
+      if (!sameQueueSettings(readback.value, desired)) {
+        return failed(
+          "provider_error",
+          "the Queue settings readback did not match the desired state",
+        );
+      }
+      return queueTicket(readback.value);
     }
     const path =
       native.kind === "r2"
@@ -1457,11 +1476,63 @@ export class CloudflareProvider implements Provider {
   }
 
   async #applyQueue(input: ApplyInput): Promise<ProviderTicket> {
-    if (input.previous) {
-      return await this.observe({
-        ...input,
-        nativeId: input.previous.nativeId,
-      });
+    if (input.previous !== undefined) {
+      const native =
+        input.previous !== null && typeof input.previous === "object"
+          ? parseNativeId(input.previous.nativeId)
+          : null;
+      if (native?.kind !== "queue") {
+        return failed("invalid_spec", "the previous Queue native identity is unusable");
+      }
+      const desired = queueSettings(input.spec);
+      if (!desired) {
+        return failed("invalid_spec", "the Queue settings are invalid");
+      }
+      const current = await this.#readQueueSettings(native.name);
+      if (!current.ok) return current.ticket;
+      if (sameQueueSettings(current.value, desired)) {
+        return queueTicket(current.value);
+      }
+      if (input.operationMode !== "initial") {
+        return failed("unavailable", "the Queue settings do not match the desired state", true);
+      }
+      if (
+        this.#workerBackend?.kind === "workers-for-platforms" &&
+        current.value.messageRetentionSeconds !== desired.messageRetentionSeconds
+      ) {
+        return failed(
+          "unavailable",
+          "Workers for Platforms Queue retention cannot be changed independently",
+        );
+      }
+      const settings =
+        this.#workerBackend?.kind === "workers-for-platforms"
+          ? { delivery_delay: desired.deliveryDelaySeconds }
+          : {
+              delivery_delay: desired.deliveryDelaySeconds,
+              message_retention_period: desired.messageRetentionSeconds,
+            };
+      const updated = await this.#call(
+        "PATCH",
+        `/accounts/${this.#accountId}/queues/${encodeURIComponent(native.name)}`,
+        { settings },
+      );
+      if (!updated.ok) return updated.ticket;
+      const readback = await this.#readQueueSettings(native.name);
+      if (!readback.ok) return readback.ticket;
+      if (
+        readback.value.queueName !== current.value.queueName ||
+        !sameQueueSettings(readback.value, desired)
+      ) {
+        return failed(
+          "provider_error",
+          "the Queue settings readback did not match the desired state",
+        );
+      }
+      return queueTicket(readback.value);
+    }
+    if (input.operationMode !== "initial") {
+      return failed("unavailable", indeterminateMutationRepair(input.offering), true);
     }
     const queueName = await derivedProviderResourceName("tsq", input.identity);
     const created = await this.#call("POST", `/accounts/${this.#accountId}/queues`, {
@@ -1480,6 +1551,18 @@ export class CloudflareProvider implements Provider {
       observed: { queueId: id, queueName },
       outputs: { queueId: id, queueName },
     });
+  }
+
+  async #readQueueSettings(queueId: string): Promise<QueueReadResult> {
+    const read = await this.#call(
+      "GET",
+      `/accounts/${this.#accountId}/queues/${encodeURIComponent(queueId)}`,
+    );
+    if (!read.ok) return { ok: false, ticket: read.ticket };
+    const value = queueReadback(read.result, queueId);
+    return value
+      ? { ok: true, value }
+      : { ok: false, ticket: failed("provider_error", "the Queue readback is invalid") };
   }
 
   async #applyWorkerVersion(input: ApplyInput): Promise<ProviderTicket> {
@@ -2523,7 +2606,7 @@ export class CloudflareProvider implements Provider {
   // --- transport ------------------------------------------------------------
 
   async #call(
-    method: "GET" | "POST" | "DELETE" | "PUT",
+    method: "GET" | "POST" | "DELETE" | "PUT" | "PATCH",
     path: string,
     body?: unknown,
   ): Promise<CallResult> {
@@ -3202,6 +3285,103 @@ type NativeId =
       readonly parent: string;
       readonly name: string;
     };
+
+interface QueueSettings {
+  readonly messageRetentionSeconds: number;
+  readonly deliveryDelaySeconds: number;
+}
+
+interface QueueReadback extends QueueSettings {
+  readonly queueId: string;
+  readonly queueName: string;
+}
+
+type QueueReadResult =
+  | { readonly ok: true; readonly value: QueueReadback }
+  | { readonly ok: false; readonly ticket: ProviderTicket };
+
+function cloudflareQueueOffering(offering: ProviderOffering): boolean {
+  return (
+    offering.kind.startsWith("takoform.") &&
+    isEdgeFormsApiVersion(offering.form.apiVersion) &&
+    offering.form.kind === "AtLeastOnceQueue"
+  );
+}
+
+function queuePreviousNativeName(
+  previous: ApplyInput["previous"] | null | undefined,
+): string | null {
+  if (previous === null || typeof previous !== "object" || typeof previous.nativeId !== "string") {
+    return null;
+  }
+  const native = parseNativeId(previous.nativeId);
+  return native?.kind === "queue" ? native.name : null;
+}
+
+function queueSettings(spec: JsonObject): QueueSettings | null {
+  const messageRetentionSeconds = integer(spec.messageRetentionSeconds);
+  const deliveryDelaySeconds =
+    spec.deliveryDelaySeconds === undefined ? 0 : integer(spec.deliveryDelaySeconds);
+  if (
+    messageRetentionSeconds === undefined ||
+    messageRetentionSeconds < 60 ||
+    messageRetentionSeconds > 1_209_600 ||
+    deliveryDelaySeconds === undefined ||
+    deliveryDelaySeconds < 0 ||
+    deliveryDelaySeconds > 43_200
+  ) {
+    return null;
+  }
+  return { messageRetentionSeconds, deliveryDelaySeconds };
+}
+
+function queueReadback(value: unknown, expectedQueueId: string): QueueReadback | null {
+  const result = record(value);
+  const queueId = optionalString(result?.queue_id);
+  const queueName = optionalString(result?.queue_name);
+  const settings = record(result?.settings);
+  const messageRetentionSeconds = integer(settings?.message_retention_period);
+  const deliveryDelaySeconds = integer(settings?.delivery_delay);
+  if (
+    !queueId ||
+    queueId !== expectedQueueId ||
+    !queueName ||
+    messageRetentionSeconds === undefined ||
+    messageRetentionSeconds < 60 ||
+    messageRetentionSeconds > 1_209_600 ||
+    deliveryDelaySeconds === undefined ||
+    deliveryDelaySeconds < 0 ||
+    deliveryDelaySeconds > 86_400
+  ) {
+    return null;
+  }
+  return {
+    queueId,
+    queueName,
+    messageRetentionSeconds,
+    deliveryDelaySeconds,
+  };
+}
+
+function sameQueueSettings(left: QueueSettings, right: QueueSettings): boolean {
+  return (
+    left.messageRetentionSeconds === right.messageRetentionSeconds &&
+    left.deliveryDelaySeconds === right.deliveryDelaySeconds
+  );
+}
+
+function queueTicket(value: QueueReadback): ProviderTicket {
+  return succeeded({
+    nativeId: `queue:${value.queueId}`,
+    observed: {
+      queueId: value.queueId,
+      queueName: value.queueName,
+      messageRetentionSeconds: value.messageRetentionSeconds,
+      deliveryDelaySeconds: value.deliveryDelaySeconds,
+    },
+    outputs: { queueId: value.queueId, queueName: value.queueName },
+  });
+}
 
 function parseNativeId(value: string): NativeId | null {
   const parts = value.split(":");
