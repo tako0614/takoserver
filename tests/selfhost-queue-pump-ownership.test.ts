@@ -218,7 +218,11 @@ function bytes(value: unknown): Uint8Array {
   throw new Error("queue body was not returned as bytes");
 }
 
-function holdFirstSelect(base: Sql): {
+function holdFirstSelect(
+  base: Sql,
+  shouldHold: (statement: string) => boolean = (statement) =>
+    /^\s*SELECT message_id, body,/iu.test(statement),
+): {
   readonly sql: Sql;
   readonly captured: Promise<readonly Row[]>;
   readonly release: () => void;
@@ -235,7 +239,7 @@ function holdFirstSelect(base: Sql): {
   const sql: Sql = {
     async query(statement, params) {
       const rows = await base.query(statement, params);
-      if (!held && /^\s*SELECT\b/iu.test(statement)) {
+      if (!held && /^\s*SELECT\b/iu.test(statement) && shouldHold(statement)) {
         held = true;
         capturedResolve?.(rows);
         await gate;
@@ -265,6 +269,22 @@ function consumerWithDeadLetter(): SelfhostQueueConsumerAttachment {
   };
 }
 
+async function markExpiredFinal(
+  sql: Sql,
+  queue: string,
+  messageId: string,
+  deliveries: number,
+  millis: number,
+  leaseToken = "expired-final",
+): Promise<void> {
+  await sql.run(
+    "UPDATE selfhost_queue_messages " +
+      "SET deliveries = ?, lease_token = ?, lease_expires_at_ms = ?, visible_at_ms = ? " +
+      "WHERE queue_id = ? AND message_id = ?",
+    [deliveries, leaseToken, millis - 1, millis, queue, messageId],
+  );
+}
+
 test("queue ownership: stale retry after winner ACK never creates a dead-letter copy", async () => {
   const sql = createEphemeralSql();
   const body = new TextEncoder().encode("queue ownership ACK bytes");
@@ -274,11 +294,15 @@ test("queue ownership: stale retry after winner ACK never creates a dead-letter 
   const winnerRuntime = recordingRuntime((delivery) => queueResponse(delivery, "ack"));
   const oldIds = randomIds("old-ack");
   const winnerIds = randomIds("winner-ack");
-  const consumer = consumerWithDeadLetter();
+  const oldConsumer = consumerWithDeadLetter();
+  // The successor attachment legitimately gets one redelivery while the old
+  // holder is still in flight; the old attachment remains capped at its first
+  // delivery. Each attachment's own retry budget is respected.
+  const winnerConsumer = { ...oldConsumer, maxRetries: 1 };
   const oldPump = createSelfhostQueuePump({
     sql,
     runtime: oldRuntime.runtime,
-    targets: targets(consumer),
+    targets: targets(oldConsumer),
     clock: () => new Date(millis),
     leaseMillis: LEASE_MILLIS,
     randomId: oldIds.randomId,
@@ -286,7 +310,7 @@ test("queue ownership: stale retry after winner ACK never creates a dead-letter 
   const winnerPump = createSelfhostQueuePump({
     sql,
     runtime: winnerRuntime.runtime,
-    targets: targets(consumer),
+    targets: targets(winnerConsumer),
     clock: () => new Date(millis),
     leaseMillis: LEASE_MILLIS,
     randomId: winnerIds.randomId,
@@ -334,11 +358,14 @@ test("queue ownership: stale retry after winner DLQ creates no duplicate and pre
   const winnerRuntime = recordingRuntime((delivery) => queueResponse(delivery, "retry"));
   const oldIds = randomIds("old-dlq");
   const winnerIds = randomIds("winner-dlq");
-  const consumer = consumerWithDeadLetter();
+  const oldConsumer = consumerWithDeadLetter();
+  // The successor's attempt 2 is the final allowed delivery for the raised
+  // attachment limit; the stale old attempt 1 must still be fenced out.
+  const winnerConsumer = { ...oldConsumer, maxRetries: 1 };
   const oldPump = createSelfhostQueuePump({
     sql,
     runtime: oldRuntime.runtime,
-    targets: targets(consumer),
+    targets: targets(oldConsumer),
     clock: () => new Date(millis),
     leaseMillis: LEASE_MILLIS,
     randomId: oldIds.randomId,
@@ -346,7 +373,7 @@ test("queue ownership: stale retry after winner DLQ creates no duplicate and pre
   const winnerPump = createSelfhostQueuePump({
     sql,
     runtime: winnerRuntime.runtime,
-    targets: targets(consumer),
+    targets: targets(winnerConsumer),
     clock: () => new Date(millis),
     leaseMillis: LEASE_MILLIS,
     randomId: winnerIds.randomId,
@@ -533,4 +560,319 @@ test("queue ownership: a captured SELECT cannot reserve a message after it expir
     heldSelect.release();
     await tick?.catch(() => {});
   }
+});
+
+test("queue recovery: cap-101 recovery drains a healthy due message without poison dispatch", async () => {
+  const sql = createEphemeralSql();
+  const millis = INITIAL_MILLIS;
+  const poisonBody = new TextEncoder().encode("queue recovery cap-101 poison bytes");
+  const healthyBody = new TextEncoder().encode("queue recovery cap-101 healthy bytes");
+  const poisonId = "000-recovery-cap101-poison";
+  const healthyId = "001-recovery-cap101-healthy";
+  const poisonAcceptedAt = millis - 500;
+  await enqueue(sql, SOURCE_QUEUE, poisonId, poisonBody, poisonAcceptedAt);
+  await enqueue(sql, SOURCE_QUEUE, healthyId, healthyBody, millis);
+  await markExpiredFinal(sql, SOURCE_QUEUE, poisonId, 101, millis, "cap101-expired");
+
+  const ids = randomIds("recovery-cap101");
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "ack"));
+  const consumer: SelfhostQueueConsumerAttachment = {
+    ...BASE_CONSUMER,
+    maxBatchSize: 1,
+    maxRetries: 100,
+    deadLetterQueue: {
+      queue: DEAD_LETTER_QUEUE,
+      queueName: DEAD_LETTER_NAME,
+      messageRetentionSeconds: RETENTION_SECONDS,
+      deliveryDelaySeconds: 0,
+    },
+  };
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+    randomId: ids.randomId,
+  });
+
+  const settled = await pump.tick();
+  const sourceRows = await queueRows(sql, SOURCE_QUEUE);
+  const deadLetterRows = await queueRows(sql, DEAD_LETTER_QUEUE);
+  expect(sourceRows).toEqual([]);
+  expect(deadLetterRows).toHaveLength(1);
+  expect(deadLetterRows[0]).toMatchObject({
+    queue_id: DEAD_LETTER_QUEUE,
+    deliveries: 0,
+    enqueued_at_ms: millis,
+    visible_at_ms: millis,
+    expires_at_ms: millis + RETENTION_SECONDS * 1_000,
+  });
+  expect(bytes(deadLetterRows[0]?.body)).toEqual(poisonBody);
+  expect(String(deadLetterRows[0]?.message_id)).not.toBe(poisonId);
+  expect(ids.minted).toContain(String(deadLetterRows[0]?.message_id));
+  expect(runtime.deliveries).toHaveLength(1);
+  expect(runtime.deliveries[0]?.event.messages?.map((message) => message.messageId)).toEqual([
+    healthyId,
+  ]);
+  expect(runtime.deliveries[0]?.event.messages?.map((message) => message.attempts)).toEqual([1]);
+  expect(settled).toBe(2);
+});
+
+test("queue recovery: a lower retry cap never dispatches a fourth attempt", async () => {
+  const sql = createEphemeralSql();
+  const millis = INITIAL_MILLIS;
+  const body = new TextEncoder().encode("queue recovery cap-three bytes");
+  const messageId = "recovery-cap-three";
+  await enqueue(sql, SOURCE_QUEUE, messageId, body, millis);
+  await markExpiredFinal(sql, SOURCE_QUEUE, messageId, 3, millis, "cap-three-expired");
+
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "ack"));
+  const consumer: SelfhostQueueConsumerAttachment = {
+    ...BASE_CONSUMER,
+    maxBatchSize: 1,
+    maxRetries: 2,
+  };
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+  });
+
+  const settled = await pump.tick();
+  expect(runtime.deliveries).toEqual([]);
+  expect(await queueRows(sql, SOURCE_QUEUE)).toEqual([]);
+  expect(settled).toBe(1);
+});
+
+test("queue recovery: maxRetries zero drops an expired final lease without a DLQ", async () => {
+  const sql = createEphemeralSql();
+  const millis = INITIAL_MILLIS;
+  const body = new TextEncoder().encode("queue recovery no-DLQ bytes");
+  const messageId = "recovery-no-dlq";
+  await enqueue(sql, SOURCE_QUEUE, messageId, body, millis);
+  await markExpiredFinal(sql, SOURCE_QUEUE, messageId, 1, millis, "no-dlq-expired");
+
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "retry"));
+  const consumer: SelfhostQueueConsumerAttachment = {
+    ...BASE_CONSUMER,
+    maxBatchSize: 1,
+    maxRetries: 0,
+  };
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+  });
+
+  const settled = await pump.tick();
+  expect(runtime.deliveries).toEqual([]);
+  expect(await queueRows(sql, SOURCE_QUEUE)).toEqual([]);
+  expect(await queueRows(sql, DEAD_LETTER_QUEUE)).toEqual([]);
+  expect(settled).toBe(1);
+});
+
+test("queue recovery: live final and retention-expired rows stay until the right lifecycle", async () => {
+  const sql = createEphemeralSql();
+  const millis = INITIAL_MILLIS;
+  const liveBody = new TextEncoder().encode("queue recovery live final bytes");
+  const retainedBody = new TextEncoder().encode("queue recovery retained final bytes");
+  const liveId = "recovery-live-final";
+  const retainedId = "recovery-retention-final";
+  await enqueue(sql, SOURCE_QUEUE, liveId, liveBody, millis);
+  await enqueue(
+    sql,
+    SOURCE_QUEUE,
+    retainedId,
+    retainedBody,
+    millis - RETENTION_SECONDS * 1_000 - 1,
+  );
+  await sql.run(
+    "UPDATE selfhost_queue_messages " +
+      "SET deliveries = 1, lease_token = ?, lease_expires_at_ms = ?, visible_at_ms = ? " +
+      "WHERE queue_id = ? AND message_id = ?",
+    ["live-final", millis + LEASE_MILLIS, millis, SOURCE_QUEUE, liveId],
+  );
+  await markExpiredFinal(sql, SOURCE_QUEUE, retainedId, 1, millis, "retention-expired");
+  const before = await queueRows(sql, SOURCE_QUEUE);
+
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "retry"));
+  const consumer = consumerWithDeadLetter();
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+  });
+
+  const settled = await pump.tick();
+  expect(runtime.deliveries).toEqual([]);
+  expect(await queueRows(sql, SOURCE_QUEUE)).toEqual(before);
+  expect(await queueRows(sql, DEAD_LETTER_QUEUE)).toEqual([]);
+  expect(settled).toBe(0);
+  expect(await pump.sweep()).toBe(1);
+  const afterSweep = await queueRows(sql, SOURCE_QUEUE);
+  expect(afterSweep).toHaveLength(1);
+  expect(afterSweep[0]?.message_id).toBe(liveId);
+  expect(bytes(afterSweep[0]?.body)).toEqual(liveBody);
+});
+
+test("queue recovery: a captured recovery SELECT cannot reclaim a newer lease/count/visibility", async () => {
+  const baseSql = createEphemeralSql();
+  // The first SELECT is the normal reserve on the unfixed pump and the
+  // dedicated recovery read on the fixed pump; either way the state race is
+  // the assertion, not a projection detail.
+  const heldSelect = holdFirstSelect(baseSql, () => true);
+  const millis = INITIAL_MILLIS;
+  const body = new TextEncoder().encode("queue recovery newer lease bytes");
+  const messageId = "recovery-newer-lease";
+  await enqueue(baseSql, SOURCE_QUEUE, messageId, body, millis);
+  await markExpiredFinal(baseSql, SOURCE_QUEUE, messageId, 1, millis, "old-final");
+
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "ack"));
+  const consumer: SelfhostQueueConsumerAttachment = {
+    ...BASE_CONSUMER,
+    maxBatchSize: 1,
+    maxRetries: 0,
+  };
+  const pump = createSelfhostQueuePump({
+    sql: heldSelect.sql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+  });
+
+  let tick: Promise<number> | undefined;
+  try {
+    tick = pump.tick();
+    const capturedRows = await heldSelect.captured;
+    expect(capturedRows.length).toBeGreaterThan(0);
+    await baseSql.run(
+      "UPDATE selfhost_queue_messages " +
+        "SET deliveries = ?, lease_token = ?, lease_expires_at_ms = ?, visible_at_ms = ? " +
+        "WHERE queue_id = ? AND message_id = ?",
+      [
+        2,
+        "newer-final",
+        millis + LEASE_MILLIS,
+        millis + RETRY_DELAY_SECONDS * 1_000,
+        SOURCE_QUEUE,
+        messageId,
+      ],
+    );
+    const expected = await queueRows(baseSql, SOURCE_QUEUE);
+
+    heldSelect.release();
+    const settled = await tick;
+    expect(runtime.deliveries).toEqual([]);
+    expect(await queueRows(baseSql, SOURCE_QUEUE)).toEqual(expected);
+    expect(await queueRows(baseSql, DEAD_LETTER_QUEUE)).toEqual([]);
+    expect(settled).toBe(0);
+  } finally {
+    heldSelect.release();
+    await tick?.catch(() => {});
+  }
+});
+
+test("queue recovery: a dead-letter INSERT failure rolls back the recovery claim", async () => {
+  const baseSql = createEphemeralSql();
+  const millis = INITIAL_MILLIS;
+  const body = new TextEncoder().encode("queue recovery atomic DLQ bytes");
+  const messageId = "recovery-atomic-dlq";
+  await enqueue(baseSql, SOURCE_QUEUE, messageId, body, millis);
+  await markExpiredFinal(baseSql, SOURCE_QUEUE, messageId, 1, millis, "atomic-dlq-expired");
+  const before = await queueRows(baseSql, SOURCE_QUEUE);
+  // Fail inside the actual SQLite transaction, after any recovery claim.
+  await baseSql.run(
+    "CREATE TRIGGER reject_recovery_dlq BEFORE INSERT ON selfhost_queue_messages " +
+      "WHEN NEW.queue_id = 'queue-ownership-dlq' " +
+      "BEGIN SELECT RAISE(ABORT, 'injected recovery DLQ failure'); END",
+  );
+
+  const ids = randomIds("recovery-atomic-dlq");
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "retry"));
+  const consumer: SelfhostQueueConsumerAttachment = {
+    ...BASE_CONSUMER,
+    maxBatchSize: 1,
+    maxRetries: 0,
+    deadLetterQueue: {
+      queue: DEAD_LETTER_QUEUE,
+      queueName: DEAD_LETTER_NAME,
+      messageRetentionSeconds: RETENTION_SECONDS,
+      deliveryDelaySeconds: 0,
+    },
+  };
+  const pump = createSelfhostQueuePump({
+    sql: baseSql,
+    runtime: runtime.runtime,
+    targets: targets(consumer),
+    clock: () => new Date(millis),
+    leaseMillis: LEASE_MILLIS,
+    randomId: ids.randomId,
+  });
+
+  const failedSettled = await pump.tick();
+  expect(await queueRows(baseSql, SOURCE_QUEUE)).toEqual(before);
+  expect(await queueRows(baseSql, DEAD_LETTER_QUEUE)).toEqual([]);
+  expect(runtime.deliveries).toEqual([]);
+  expect(failedSettled).toBe(0);
+
+  await baseSql.run("DROP TRIGGER reject_recovery_dlq");
+  const recoveredSettled = await pump.tick();
+  expect(runtime.deliveries).toEqual([]);
+  expect(await queueRows(baseSql, SOURCE_QUEUE)).toEqual([]);
+  const deadLetterRows = await queueRows(baseSql, DEAD_LETTER_QUEUE);
+  expect(deadLetterRows).toHaveLength(1);
+  expect(deadLetterRows[0]).toMatchObject({
+    queue_id: DEAD_LETTER_QUEUE,
+    deliveries: 0,
+    enqueued_at_ms: millis,
+    visible_at_ms: millis,
+    expires_at_ms: millis + RETENTION_SECONDS * 1_000,
+  });
+  expect(bytes(deadLetterRows[0]?.body)).toEqual(body);
+  expect(String(deadLetterRows[0]?.message_id)).not.toBe(messageId);
+  expect(ids.minted).toContain(String(deadLetterRows[0]?.message_id));
+  expect(recoveredSettled).toBe(1);
+});
+
+test("queue recovery: a lowered retry limit settles an unleased row only when due", async () => {
+  const sql = createEphemeralSql();
+  let millis = INITIAL_MILLIS;
+  const body = new TextEncoder().encode("queue recovery lowered limit bytes");
+  const messageId = "recovery-lowered-limit";
+  await enqueue(sql, SOURCE_QUEUE, messageId, body, millis);
+  await sql.run(
+    "UPDATE selfhost_queue_messages SET deliveries = 1, visible_at_ms = ? " +
+      "WHERE queue_id = ? AND message_id = ?",
+    [millis + RETRY_DELAY_SECONDS * 1_000, SOURCE_QUEUE, messageId],
+  );
+  const before = await queueRows(sql, SOURCE_QUEUE);
+  const runtime = recordingRuntime((delivery) => queueResponse(delivery, "ack"));
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: runtime.runtime,
+    targets: targets(consumerWithDeadLetter()),
+    clock: () => new Date(millis),
+  });
+
+  expect(await pump.tick()).toBe(0);
+  expect(await queueRows(sql, SOURCE_QUEUE)).toEqual(before);
+  expect(await queueRows(sql, DEAD_LETTER_QUEUE)).toEqual([]);
+  millis += RETRY_DELAY_SECONDS * 1_000;
+  const settled = await pump.tick();
+  expect(runtime.deliveries).toEqual([]);
+  expect(await queueRows(sql, SOURCE_QUEUE)).toEqual([]);
+  const copies = await queueRows(sql, DEAD_LETTER_QUEUE);
+  expect(copies).toHaveLength(1);
+  expect(copies[0]?.enqueued_at_ms).toBe(millis);
+  expect(copies[0]?.deliveries).toBe(0);
+  expect(bytes(copies[0]?.body)).toEqual(body);
+  expect(settled).toBe(1);
 });

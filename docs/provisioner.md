@@ -644,7 +644,9 @@ are not exposed by this public provisioner.
   published Version rather than immediately.
 - A batch owns its messages under a lease. A process that dies between dispatch
   and settlement leaves rows whose lease expires and which the next pass takes
-  again, so a handler may see a message twice. At-least-once is the contract.
+  again only within the retry budget, so a handler may see a message twice.
+  An expired lease already at `1 + maxRetries` is settled to the DLQ or dropped
+  without another invocation. Retention-expired rows are left to the sweep.
   Reservation rechecks the observed message incarnation, delivery count and
   visibility against the current claim time, including retention. Settlement
   checks the same lease token inside every write. DLQ insertion reads only the
@@ -652,14 +654,16 @@ are not exposed by this public provisioner.
   manufacture a copy after another holder has acknowledged or moved the source.
   A stale no-op is not counted as a settled message.
 
-**A redelivery is only ever spent by an answer the Worker gave.** A workerd that
-is restarting, a refused connection, a delivery that ran out of time, and a reply
-that is not this protocol are all this Host failing to ask: the lease is
-released, the delivery count is put back where it was, and the consumer is left
-alone for a doubling wait of at most a minute before being asked again. So a
-machine whose runtime is down for a while empties nothing. What does spend a
-redelivery is the tenant's own answer — its decisions, or the wrapper's status
-for a handler that threw.
+**A known live delivery failure is unspent; an unknown crash is not.** While the
+pump is alive, a workerd that is restarting, a refused connection, a timeout, or
+a reply outside this protocol releases the lease and restores the delivery
+count. The consumer waits with doubling backoff up to a minute. The tenant's
+decisions, or the wrapper's response to a thrown handler, spend a delivery.
+If the pump itself dies before recording the outcome, its durable attempt stays
+spent: it cannot distinguish a request that never left from a handler whose
+answer was lost. Recovery never dispatches beyond the configured retry limit.
+The recovery claim, conditional DLQ copy and source removal share one SQL
+transaction, so a failed copy leaves the original message and lease unchanged.
 
 **A batch is also bounded by bytes.** The event envelope has a 2 MiB ceiling,
 so a pass takes messages until the next one would not fit and sends what it has;

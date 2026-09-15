@@ -62,14 +62,16 @@ import type { WorkerdRuntime } from "./workerd-runtime.ts";
  *   a refused connection, a timeout, and a reply that is not this protocol are
  *   all this Host failing to ask. The lease is released, the delivery count is
  *   put back where it was, and the consumer is left alone for a bounded moment.
- *   Only an answer the tenant's own module produced -- its decisions, or the
- *   wrapper's status for a handler that threw -- spends a redelivery.
+ *   An answer the tenant's own module produced -- its decisions, or the
+ *   wrapper's status for a handler that threw -- spends a redelivery. A process
+ *   that dies before recording either outcome leaves its durable attempt spent:
+ *   recovery cannot know whether the handler ran.
  *
  * A batch owns its messages under a lease. That is what makes a crash safe: a
  * process that dies between dispatch and settlement leaves rows whose lease
- * expires, and the next pass takes them again. At-least-once is the contract,
- * so a handler that acknowledged work this Host never recorded will see the
- * message twice, which is the guarantee rather than a defect.
+ * expires. The next pass takes them again only within the retry budget;
+ * exhausted messages go to the dead-letter queue or are dropped. At-least-once
+ * permits a handler to see work again when its acknowledgement was not recorded.
  *
  * One tenant cannot take the pass from another. Targets are worked a few at a
  * time and from a rotating start, each consumer gets a bounded slice of the
@@ -246,20 +248,22 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     millis: number,
     budget: number,
   ): Promise<ReservedBatch | null> => {
-    const rows = await sql.query(
-      "SELECT message_id, body, enqueued_at_ms, visible_at_ms, deliveries " +
-        "FROM selfhost_queue_messages " +
-        "WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ? " +
-        "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
-        "ORDER BY visible_at_ms, message_id LIMIT ?",
-      [
-        consumer.queue,
-        millis,
-        millis,
-        millis,
-        Math.min(consumer.maxBatchSize, MAX_SELFHOST_QUEUE_MESSAGES),
-      ],
-    );
+    const rows = (
+      await sql.query(
+        "SELECT message_id, body, enqueued_at_ms, visible_at_ms, deliveries " +
+          "FROM selfhost_queue_messages " +
+          "WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ? " +
+          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "ORDER BY visible_at_ms, message_id LIMIT ?",
+        [
+          consumer.queue,
+          millis,
+          millis,
+          millis,
+          Math.min(consumer.maxBatchSize, MAX_SELFHOST_QUEUE_MESSAGES),
+        ],
+      )
+    ).filter((row) => integer(row.deliveries) < 1 + consumer.maxRetries);
     if (rows.length === 0) return null;
     // Reserved by encoded size as well as by count. The first message always
     // goes, whatever it costs: refusing to move a row is how a queue stops
@@ -481,7 +485,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
       } else if (message.attempts >= 1 + consumer.maxRetries) {
         // Exhausted counts redeliveries: the first delivery is free, so a
         // message is done after `1 + maxRetries` deliveries.
-        statements.push(...exhausted(consumer, message, reserved.token, millis));
+        statements.push(...exhausted(consumer, message.messageId, reserved.token, millis));
       } else {
         const delaySeconds =
           decision?.outcome === "retry" && decision.delaySeconds !== undefined
@@ -511,13 +515,13 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
   /** Where a message goes once its redeliveries are spent. */
   const exhausted = (
     consumer: SelfhostQueueConsumerAttachment,
-    message: ReservedMessage,
+    messageId: string,
     token: string,
     millis: number,
   ): readonly SqlStatement[] => {
     const removal: SqlStatement = {
       sql: "DELETE FROM selfhost_queue_messages WHERE queue_id = ? AND message_id = ? AND lease_token = ?",
-      params: [consumer.queue, message.messageId, token],
+      params: [consumer.queue, messageId, token],
     };
     const target = consumer.deadLetterQueue;
     if (!target) return [removal];
@@ -538,12 +542,72 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           millis + target.deliveryDelaySeconds * 1_000,
           millis + target.messageRetentionSeconds * 1_000,
           consumer.queue,
-          message.messageId,
+          messageId,
           token,
         ],
       },
       removal,
     ];
+  };
+
+  /** Finishes spent deliveries abandoned by a crashed holder, without sending again. */
+  const recoverExhausted = async (consumer: DeliverableQueueConsumer): Promise<number> => {
+    const millis = now().getTime();
+    // Filter a bounded ready page in memory. Filtering on the unindexed count
+    // in SQL would scan the healthy backlog on every pass looking for failures.
+    const rows = (
+      await sql.query(
+        "SELECT message_id, enqueued_at_ms, visible_at_ms, deliveries, " +
+          "lease_token, lease_expires_at_ms FROM selfhost_queue_messages " +
+          "WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ? " +
+          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "ORDER BY visible_at_ms, message_id LIMIT ?",
+        [
+          consumer.queue,
+          millis,
+          millis,
+          millis,
+          Math.min(consumer.maxBatchSize, MAX_SELFHOST_QUEUE_MESSAGES),
+        ],
+      )
+    ).filter((row) => integer(row.deliveries) >= 1 + consumer.maxRetries);
+    if (rows.length === 0) return 0;
+    const token = randomId();
+    const claimMillis = now().getTime();
+    const statements: SqlStatement[] = [];
+    const settlements: number[] = [];
+    for (const row of rows) {
+      const messageId = String(row.message_id);
+      statements.push({
+        sql:
+          "UPDATE selfhost_queue_messages SET lease_token = ?, lease_expires_at_ms = ? " +
+          "WHERE queue_id = ? AND message_id = ? " +
+          "AND deliveries = ? AND enqueued_at_ms = ? AND visible_at_ms = ? " +
+          "AND lease_token IS ? AND lease_expires_at_ms IS ? " +
+          "AND visible_at_ms <= ? AND expires_at_ms > ? " +
+          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)",
+        params: [
+          token,
+          claimMillis + leaseMillis,
+          consumer.queue,
+          messageId,
+          integer(row.deliveries),
+          integer(row.enqueued_at_ms),
+          integer(row.visible_at_ms),
+          row.lease_token === null ? null : String(row.lease_token),
+          row.lease_expires_at_ms === null ? null : integer(row.lease_expires_at_ms),
+          claimMillis,
+          claimMillis,
+          claimMillis,
+        ],
+      });
+      // Claim, copy and removal are one transaction. A lost claim makes both
+      // following writes no-ops; a failed copy rolls the claim back as well.
+      statements.push(...exhausted(consumer, messageId, token, claimMillis));
+      settlements.push(statements.length - 1);
+    }
+    const written = await sql.batch(statements);
+    return settlements.filter((index) => written[index]?.changes === 1).length;
   };
 
   /** An invocation may not outlast the slice of the tick its consumer has. */
@@ -580,13 +644,18 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     for (let pass = 0; pass < MAX_BATCHES_PER_CONSUMER; pass += 1) {
       const millis = now().getTime();
       if (millis >= deadline) break;
+      const recovered = await recoverExhausted(consumer);
+      settled += recovered;
       const reserved: ReservedBatch[] = [];
       for (let slot = 0; slot < consumer.maxConcurrency; slot += 1) {
         const batch = await reserve(consumer, millis, budget);
         if (!batch) break;
         reserved.push(batch);
       }
-      if (reserved.length === 0) break;
+      if (reserved.length === 0) {
+        if (recovered > 0) continue;
+        break;
+      }
       const outcomes = await Promise.all(
         reserved.map(async (batch): Promise<DeliveryOutcome> => {
           let selected: SelfhostEventSelection | null = null;
