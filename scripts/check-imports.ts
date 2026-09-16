@@ -61,7 +61,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|standard-service-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|standard-service-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -70,13 +70,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|workflow-transport-journal)\.ts$|^src\/workerd-(?:artifact|execution-guard|runtime|supervisor|version-graph|worker-module-inspector)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|runtime|supervisor|version-graph|worker-module-inspector)\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|vector-index-codec|vector-index-store|worker-endpoint-origin-reservations|workflow-instances|workflow-resource-graph|workflow-data|workflow-driver|workflow-execution|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|worker-endpoint-origin-reservations|workflow-instances|workflow-resource-graph|workflow-data|workflow-driver|workflow-execution|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
