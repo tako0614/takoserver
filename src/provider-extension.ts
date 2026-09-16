@@ -5,6 +5,29 @@
  * carrier, or a second lifecycle authority. Concrete WfP construction belongs
  * to the operator composition, not the shared Cloudflare adapter.
  */
+/**
+ * CHILD-ONLY Actor class ABI helpers. The caller still owns isolation,
+ * admission, deployment selection, stream lifetime, and socket brokering.
+ */
+export type {
+  ActorClassExecution,
+  ActorClassExecutionOptions,
+  ActorClassInspection,
+  ActorContext,
+  ActorContextInput,
+  ActorEvent,
+  ActorRuntimeErrorCode,
+  ActorTurn,
+} from "./actor-class-execution.ts";
+export {
+  ActorRuntimeError,
+  createActorClassExecution,
+  createActorContext,
+  createActorTurn,
+  inspectActorClass,
+  isActorRuntimeError,
+} from "./actor-class-execution.ts";
+
 export { createCloudflareProviderSurface } from "./cloudflare-provider-surface.ts";
 export { buildEdgeForms } from "./edge-forms.ts";
 export { isEdgeFormsApiVersion } from "./form-ref.ts";
