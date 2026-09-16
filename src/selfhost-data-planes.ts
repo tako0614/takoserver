@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
 import { chmodSync, lstatSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import type { JsonValue, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
+import type { JsonValue, Row, Sql, SqlParam } from "./ports.ts";
 import type { SelfhostDataPlaneMaintenance, SelfhostGrantedQueue } from "./providers/selfhost.ts";
 import {
   MAX_SELFHOST_QUEUE_DELAY_SECONDS,
@@ -21,6 +21,7 @@ import {
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
+import { createQueueCustody, type QueueCustody } from "./queue-custody.ts";
 import {
   createSelfhostObjectStore,
   prefixCeiling,
@@ -171,6 +172,11 @@ class PlaneError extends Error {
 export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): SelfhostDataPlanes {
   const now = options.clock ?? (() => new Date());
   const messageId = options.messageId ?? (() => crypto.randomUUID());
+  const queueCustody = createQueueCustody({
+    sql: options.sql,
+    clock: now,
+    randomId: messageId,
+  });
   const databases = new Map<string, Database>();
   const objectStore = createSelfhostObjectStore({
     sql: options.sql,
@@ -292,7 +298,7 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
       if (queue) {
         if (!Object.hasOwn(grant.queue, binding)) return refusal("backend_unavailable", 404);
         const target = grant.queue[binding] as SelfhostGrantedQueue;
-        return answer(await queueOperation(options.sql, now, target, op, payload, messageId));
+        return answer(await queueOperation(queueCustody, target, op, payload, messageId));
       }
       if (!Object.hasOwn(grant.sql, binding)) return refusal("backend_unavailable", 404);
       const name = grant.sql[binding] as string;
@@ -751,15 +757,13 @@ function kvMetadata(value: unknown): string | null {
  * that outlives a restart must not have its clock restarted with the process.
  */
 async function queueOperation(
-  sql: Sql,
-  clock: () => Date,
+  custody: QueueCustody,
   target: SelfhostGrantedQueue,
   op: string,
   payload: Readonly<Record<string, unknown>>,
   mintMessageId: () => string,
 ): Promise<Record<string, unknown>> {
-  const millis = clock().getTime();
-  const accept = (body: unknown, delay: unknown): SqlStatement => {
+  const accept = (body: unknown, delay: unknown) => {
     let bytes: Uint8Array;
     try {
       bytes = decodeBase64(body, MAX_SELFHOST_QUEUE_MESSAGE_BYTES, "message_too_large");
@@ -778,26 +782,16 @@ async function queueOperation(
       throw new PlaneError("backend_unavailable");
     }
     return {
-      sql:
-        "INSERT INTO selfhost_queue_messages " +
-        "(queue_id, message_id, body, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries) " +
-        "VALUES (?, ?, ?, ?, ?, ?, 0)",
-      params: [
-        target.queueId,
-        id,
-        bufferOf(bytes),
-        millis,
-        millis + delaySeconds * 1_000,
-        millis + target.messageRetentionSeconds * 1_000,
-      ],
+      messageId: id,
+      body: bytes,
+      delaySeconds,
     };
   };
   switch (op) {
     case "send": {
-      const statement = accept(payload.body, payload.delaySeconds);
-      const id = String((statement.params as readonly SqlParam[])[1]);
-      await sql.run(statement.sql, statement.params);
-      return { messageId: id };
+      const message = accept(payload.body, payload.delaySeconds);
+      await custody.admit(target, message);
+      return { messageId: message.messageId };
     }
     case "sendBatch": {
       const messages = payload.messages;
@@ -807,7 +801,7 @@ async function queueOperation(
       if (messages.length > MAX_SELFHOST_QUEUE_MESSAGES) {
         throw new PlaneError("batch_too_large");
       }
-      const statements = messages.map((entry) => {
+      const accepted = messages.map((entry) => {
         const message = record(entry);
         if (!message) throw new PlaneError("invalid_body");
         for (const key of Object.keys(message)) {
@@ -818,11 +812,9 @@ async function queueOperation(
       // All or none: a partially accepted batch is a batch the caller has no
       // way to reason about, and `sendBatch` is the reason this seam has an
       // atomic capability at all.
-      await sql.batch(statements);
+      await custody.admitBatch(target, accepted);
       return {
-        messageIds: statements.map((statement) =>
-          String((statement.params as readonly SqlParam[])[1]),
-        ),
+        messageIds: accepted.map(({ messageId }) => messageId),
       };
     }
     default:

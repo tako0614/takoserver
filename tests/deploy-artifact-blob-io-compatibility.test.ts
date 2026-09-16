@@ -123,7 +123,7 @@ function receipt(path: string, overrides: Readonly<Record<string, unknown>> = {}
 }
 
 describe("0043 artifact blob I/O deployment compatibility", () => {
-  test("allows only the exact 0037-0043 lineage and contiguous later pending migrations through 0052", () => {
+  test("allows only the exact 0037-0043 lineage and contiguous later pending migrations through 0053", () => {
     const suffix = [
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
@@ -150,6 +150,8 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(artifactBlobIoCompatibilityAllowsPending(target, through0051)).toBe(true);
     const through0052 = [...through0051, "0052_workflow_termination_intent.sql"];
     expect(artifactBlobIoCompatibilityAllowsPending(target, through0052)).toBe(true);
+    const through0053 = [...through0052, "0053_queue_custody.sql"];
+    expect(artifactBlobIoCompatibilityAllowsPending(target, through0053)).toBe(true);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
         ...through0051.slice(0, -1),
@@ -161,12 +163,12 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     ).toBe(false);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
-        ...through0052,
-        "0053_unreviewed_extension.sql",
+        ...through0053,
+        "0054_unreviewed_extension.sql",
       ]),
     ).toBe(false);
     expect(
-      artifactBlobIoCompatibilityAllowsPending(targetWithoutCompatibilityMode(), through0052),
+      artifactBlobIoCompatibilityAllowsPending(targetWithoutCompatibilityMode(), through0053),
     ).toBe(false);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
@@ -214,6 +216,11 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(
       artifactBlobIoSchemaAllowsPending(targetWithoutCompatibilityMode(), [
         "0052_workflow_termination_intent.sql",
+      ]),
+    ).toBe(false);
+    expect(
+      artifactBlobIoSchemaAllowsPending(targetWithoutCompatibilityMode(), [
+        "0053_queue_custody.sql",
       ]),
     ).toBe(false);
   });

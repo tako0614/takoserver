@@ -33,16 +33,16 @@ afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 // ambient worktree migrations that are absent from a clean historical commit.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0053_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0053_container_runtime_input_custody (id TEXT);\n",
+    "0054_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0054_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0054_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0054_container_runtime_input_rewrap (id TEXT);\n",
+    "0055_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0055_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0055_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0055_container_runtime_input_acceptance (id TEXT);\n",
+    "0056_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0056_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -145,7 +145,7 @@ function migrationStateThrough(count: number, marker: string): D1SchemaState {
 function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
   return {
     applied: [
-      ...MIGRATIONS.slice(0, 52).map(({ name }) => name),
+      ...MIGRATIONS.slice(0, 53).map(({ name }) => name),
       ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
     ],
     shape: `${marker}\n`,
@@ -504,9 +504,10 @@ describe("forward-only D1 schema surface", () => {
           "0050_workflow_instances.sql",
           "0051_workflow_execution.sql",
           "0052_workflow_termination_intent.sql",
-          "0053_container_runtime_input_custody.sql",
-          "0054_container_runtime_input_rewrap.sql",
-          "0055_container_runtime_input_acceptance.sql",
+          "0053_queue_custody.sql",
+          "0054_container_runtime_input_custody.sql",
+          "0055_container_runtime_input_rewrap.sql",
+          "0056_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);
