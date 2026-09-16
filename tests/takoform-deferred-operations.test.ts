@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderMutationDefinitiveRefusalError } from "../src/index.ts";
@@ -116,8 +116,13 @@ const dependentForm: InstalledTakoformForm = {
 };
 
 const roots: string[] = [];
+let schemaSeedRoot: string | undefined;
+let schemaSeedPath: string | undefined;
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+afterAll(() => {
+  if (schemaSeedRoot) rmSync(schemaSeedRoot, { recursive: true, force: true });
 });
 
 describe("durable deferred Takoform operations", () => {
@@ -2234,11 +2239,13 @@ function persistentHarness(
   const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));
   roots.push(root);
   const databasePath = join(root, "control.sqlite");
+  // Keep each test on its own durable file while avoiding repeated migration
+  // transactions in this fixture-heavy suite.
+  copyFileSync(ensureSchemaSeed(), databasePath);
   let ids = 0;
   return {
     open() {
       const database = new Database(databasePath);
-      migrateSqlite(database);
       const host = createConfiguredHistoricalTakoformHost({
         sql: createSqliteSql(database),
         objects: createMemoryObjectStore(),
@@ -2288,6 +2295,26 @@ function persistentHarness(
       return { host, database, close: () => database.close() };
     },
   };
+}
+
+function ensureSchemaSeed(): string {
+  if (schemaSeedPath) return schemaSeedPath;
+  const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-schema-"));
+  const path = join(root, "control.sqlite");
+  try {
+    const database = new Database(path);
+    try {
+      migrateSqlite(database);
+    } finally {
+      database.close();
+    }
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+  schemaSeedRoot = root;
+  schemaSeedPath = path;
+  return path;
 }
 
 async function acceptCreate(
