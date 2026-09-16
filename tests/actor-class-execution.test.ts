@@ -222,6 +222,134 @@ describe("private Actor ordinary-class execution seam", () => {
     expect(order).toEqual(["constructor", "start-called", "start-finished", "fetch"]);
   });
 
+  test("explicit initialization runs constructor and start without dispatching an event", async () => {
+    const order: string[] = [];
+    class Actor {
+      constructor() {
+        order.push("constructor");
+      }
+      start() {
+        order.push("start");
+      }
+      fetch() {
+        order.push("fetch");
+        return new Response("ok");
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+
+    await execution.initialize(turn());
+
+    expect(order).toEqual(["constructor", "start"]);
+  });
+
+  test("overlapping initialization and dispatch share one constructor/start promise", async () => {
+    const order: string[] = [];
+    let releaseStart!: () => void;
+    const startFinished = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    class Actor {
+      constructor() {
+        order.push("constructor");
+      }
+      async start() {
+        order.push("start-called");
+        await startFinished;
+        order.push("start-finished");
+      }
+      fetch() {
+        order.push("fetch");
+        return new Response("ok");
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+    const currentTurn = turn();
+    const initialization = execution.initialize(currentTurn);
+    const dispatch = execution.dispatch(
+      { kind: "fetch", request: new Request("https://actor.invalid/") },
+      currentTurn,
+    );
+
+    expect(order).toEqual(["constructor", "start-called"]);
+    releaseStart();
+    await initialization;
+    expect((await dispatch)?.status).toBe(200);
+    expect(order).toEqual(["constructor", "start-called", "start-finished", "fetch"]);
+  });
+
+  test("initialization failure is sticky, and dispatch still redacts HTTP failures", async () => {
+    const failure = new Error("start secret");
+    let starts = 0;
+    class Actor {
+      start() {
+        starts += 1;
+        throw failure;
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+    const currentTurn = turn();
+
+    await expect(execution.initialize(currentTurn)).rejects.toBe(failure);
+    await expect(execution.initialize(currentTurn)).rejects.toBe(failure);
+    const result = await execution.dispatch(
+      { kind: "fetch", request: new Request("https://actor.invalid/") },
+      currentTurn,
+    );
+
+    expect(result?.status).toBe(500);
+    expect(await result?.text()).not.toContain("secret");
+    expect(starts).toBe(1);
+  });
+
+  test("explicit initialization does not require or invoke an optional start hook", async () => {
+    let fetches = 0;
+    class Actor {
+      fetch() {
+        fetches += 1;
+        return new Response("ok");
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+
+    await execution.initialize(turn());
+    await execution.initialize(turn());
+    expect(fetches).toBe(0);
+    expect(
+      (
+        await execution.dispatch(
+          { kind: "fetch", request: new Request("https://actor.invalid/") },
+          turn(),
+        )
+      )?.status,
+    ).toBe(200);
+    expect(fetches).toBe(1);
+  });
+
   test("optional start is not required or called when absent", async () => {
     let calls = 0;
     class Actor {}
