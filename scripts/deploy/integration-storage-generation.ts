@@ -670,7 +670,7 @@ function assertCompleteDatabase(
 ): void {
   if (JSON.stringify(state.applied) !== JSON.stringify(expectedMigrations)) {
     throw verificationError(
-      "D1 migration readback does not contain the exact audited 0001-0055 lineage; " +
+      "D1 migration readback does not contain the exact audited 0001-0056 lineage; " +
         "R2 creation is withheld",
       JSON.stringify({ databaseId, expectedMigrations, appliedMigrations: state.applied }),
     );
