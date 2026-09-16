@@ -512,17 +512,20 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 
-  test("parses only the fixed rehearsal baseline and approved schema wave boundaries", async () => {
+  describe("parses only the fixed rehearsal baseline and approved schema wave boundaries", () => {
     const sha = "a".repeat(40);
-    const baseline = await deploy([
-      "takoserver-d1-schema-rehearsal-baseline",
-      "--status",
-      "--environment=rehearsal",
-      `--commit=${sha}`,
-    ]);
-    expect(baseline.exitCode).toBe(2);
-    expect(baseline.stderr).toContain("deploy target descriptor not found");
-    expect(baseline.stderr).not.toContain("no target was touched");
+
+    test("accepts the fixed rehearsal baseline selector", async () => {
+      const baseline = await deploy([
+        "takoserver-d1-schema-rehearsal-baseline",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+      ]);
+      expect(baseline.exitCode).toBe(2);
+      expect(baseline.stderr).toContain("deploy target descriptor not found");
+      expect(baseline.stderr).not.toContain("no target was touched");
+    });
 
     for (const through of [
       "0022",
@@ -544,78 +547,108 @@ describe("Takoserver split deploy entrypoint", () => {
       "0055",
     ] as const) {
       for (const environment of ["integration", "rehearsal", "production"] as const) {
-        const accepted = await deploy([
-          "takoserver-d1-schema",
-          "--status",
-          `--environment=${environment}`,
-          `--commit=${sha}`,
-          `--through-migration=${through}`,
-        ]);
-        expect(accepted.exitCode).toBe(2);
-        expect(accepted.stderr).toContain("deploy target descriptor not found");
-        expect(accepted.stderr).not.toContain("no target was touched");
+        test(`accepts schema wave ${through} in ${environment}`, async () => {
+          const accepted = await deploy([
+            "takoserver-d1-schema",
+            "--status",
+            `--environment=${environment}`,
+            `--commit=${sha}`,
+            `--through-migration=${through}`,
+          ]);
+          expect(accepted.exitCode).toBe(2);
+          expect(accepted.stderr).toContain("deploy target descriptor not found");
+          expect(accepted.stderr).not.toContain("no target was touched");
+        });
       }
     }
 
-    const integrationWithoutWave = await deploy([
-      "takoserver-d1-schema",
-      "--status",
-      "--environment=integration",
-      `--commit=${sha}`,
-    ]);
-    expect(integrationWithoutWave.exitCode).toBe(2);
-    expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
-    expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
-
-    for (const args of [
-      [
-        "takoserver-d1-schema-rehearsal-baseline",
+    test("accepts the schema surface without a wave in disposable integration", async () => {
+      const integrationWithoutWave = await deploy([
+        "takoserver-d1-schema",
         "--status",
         "--environment=integration",
         `--commit=${sha}`,
+      ]);
+      expect(integrationWithoutWave.exitCode).toBe(2);
+      expect(integrationWithoutWave.stderr).toContain("deploy target descriptor not found");
+      expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
+    });
+
+    for (const [label, args] of [
+      [
+        "rehearsal baseline in integration",
+        [
+          "takoserver-d1-schema-rehearsal-baseline",
+          "--status",
+          "--environment=integration",
+          `--commit=${sha}`,
+        ],
       ],
       [
-        "takoserver-d1-schema-rehearsal-baseline",
-        "--status",
-        "--environment=production",
-        `--commit=${sha}`,
+        "rehearsal baseline in production",
+        [
+          "takoserver-d1-schema-rehearsal-baseline",
+          "--status",
+          "--environment=production",
+          `--commit=${sha}`,
+        ],
       ],
       [
-        "takoserver-d1-schema-rehearsal-baseline",
-        "--status",
-        "--environment=rehearsal",
-        `--commit=${sha}`,
-        "--through-migration=0028",
-      ],
-      ["takoserver-d1-schema", "--status", "--environment=rehearsal", `--commit=${sha}`],
-      ["takoserver-d1-schema", "--status", "--environment=production", `--commit=${sha}`],
-      [
-        "takoserver-d1-schema",
-        "--status",
-        "--environment=production",
-        `--commit=${sha}`,
-        "--through-migration=0029",
+        "rehearsal baseline with a wave selector",
+        [
+          "takoserver-d1-schema-rehearsal-baseline",
+          "--status",
+          "--environment=rehearsal",
+          `--commit=${sha}`,
+          "--through-migration=0028",
+        ],
       ],
       [
-        "takoserver-d1-schema",
-        "--status",
-        "--environment=production",
-        `--commit=${sha}`,
-        "--through-migration=0028_too_much",
+        "schema surface without a rehearsal wave",
+        ["takoserver-d1-schema", "--status", "--environment=rehearsal", `--commit=${sha}`],
       ],
       [
-        "takoserver-worker",
-        "--status",
-        "--environment=production",
-        `--commit=${sha}`,
-        "--through-migration=0028",
+        "schema surface without a production wave",
+        ["takoserver-d1-schema", "--status", "--environment=production", `--commit=${sha}`],
+      ],
+      [
+        "schema surface with an unapproved wave",
+        [
+          "takoserver-d1-schema",
+          "--status",
+          "--environment=production",
+          `--commit=${sha}`,
+          "--through-migration=0029",
+        ],
+      ],
+      [
+        "schema surface with a malformed wave",
+        [
+          "takoserver-d1-schema",
+          "--status",
+          "--environment=production",
+          `--commit=${sha}`,
+          "--through-migration=0028_too_much",
+        ],
+      ],
+      [
+        "routine Worker with a wave selector",
+        [
+          "takoserver-worker",
+          "--status",
+          "--environment=production",
+          `--commit=${sha}`,
+          "--through-migration=0028",
+        ],
       ],
     ] as const) {
-      const refused = await deploy(args);
-      expect(refused.exitCode).toBe(2);
-      expect(refused.stdout).toBe("");
-      expect(refused.stderr).toContain("no target was touched");
-      expect(refused.stderr).not.toContain("deploy target descriptor");
+      test(`rejects ${label}`, async () => {
+        const refused = await deploy(args);
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stdout).toBe("");
+        expect(refused.stderr).toContain("no target was touched");
+        expect(refused.stderr).not.toContain("deploy target descriptor");
+      });
     }
   });
 
