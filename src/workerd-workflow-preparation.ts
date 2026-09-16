@@ -453,10 +453,7 @@ export async function prepareWorkerdWorkflowExecution(
         const dataPlaneAddress = site.dataPlane ? readDataPlaneAddress?.() : undefined;
         const configPath = await writeWorkerdPrivateExecution({
           root,
-          site: {
-            ...site,
-            hostEntrypoint: site.hostEntrypoint,
-          },
+          site: { ...site },
           modules,
           hostModules,
           companionAddress,

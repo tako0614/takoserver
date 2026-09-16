@@ -2208,12 +2208,12 @@ export async function writeWorkerdPrivateExecution(options: {
   // ingress into a guarded class process. Their Host-private module bytes can
   // remain in the exact closed graph without installing their routing services.
   const { assets: _assets, events: _events, ...classSite } = site;
+  const { hostEntrypoint: _workflowHostEntrypoint, ...workflowClassSite } = classSite;
   const prepared = options.workflowLoader
     ? await prepareWorkerdSite(
         {
-          ...classSite,
+          ...workflowClassSite,
           mainModule: options.workflowLoader.outerEntrypoint,
-          hostEntrypoint: undefined,
           hostModules: [...options.workflowLoader.staticHostModules.keys()].filter(
             (name) => name !== classSite.dataPlane?.module,
           ),
