@@ -78,7 +78,7 @@ describe("D1 migration SQL import builder", () => {
     expect(artifact.sql.match(/INSERT INTO "d1_migrations" \(name\)/gu)).toHaveLength(1);
   });
 
-  test("executes the current 0053 fresh import into SQLite with exact application schema and lineage", () => {
+  test("executes the current 0054 fresh import into SQLite with exact application schema and lineage", () => {
     const currentSource = readMigrationArtifact(
       copyCurrentSchemaFixture(join(fixtureRoot, "current-migrations")),
     );

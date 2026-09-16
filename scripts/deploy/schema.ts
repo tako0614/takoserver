@@ -113,6 +113,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0051_workflow_execution.sql",
   "0052_workflow_termination_intent.sql",
   "0053_queue_custody.sql",
+  "0054_queue_custody_readiness.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -222,6 +223,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:f55d8f6a40b8ed539294517445f0472857f01a7ad2a958599a5b4a4e17cecb06",
   "0053_queue_custody.sql":
     "sha256:ff609a13b58b50cfd880efc4882620e5bba0c29f65fe8c9c74cfdb570a111276",
+  "0054_queue_custody_readiness.sql":
+    "sha256:e80e2f48e7df762cbc1c80805a75c6290d27bc7fe54a754ef2bbc8f8e3c3ff36",
 };
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
@@ -239,6 +242,7 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0051",
   "0052",
   "0053",
+  "0054",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -341,6 +345,12 @@ const SCHEMA_WAVES: Readonly<
     fromMigration: "0052_workflow_termination_intent.sql",
     throughCount: 53,
     throughMigration: "0053_queue_custody.sql",
+  },
+  "0054": {
+    fromCount: 53,
+    fromMigration: "0053_queue_custody.sql",
+    throughCount: 54,
+    throughMigration: "0054_queue_custody_readiness.sql",
   },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
@@ -1421,7 +1431,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0053",
+      "selected D1 wave requires the exact audited source inventory 0001-0054",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1476,7 +1486,7 @@ function assertAuditedMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0053 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0054 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1487,7 +1497,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0053",
+      "audited migration lineage must contain exactly 0001-0054",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }

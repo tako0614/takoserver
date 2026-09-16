@@ -149,7 +149,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "exact pending lineage through 0043",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain(
-      "accepted contiguous 0044-0053 tail",
+      "accepted contiguous 0044-0054 tail",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("all-traffic");
     expect(routineWorker?.obligations["failure-handling"]).toContain(
@@ -184,6 +184,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schema?.obligations.provenance).toContain("0051");
     expect(schema?.obligations.provenance).toContain("0052");
     expect(schema?.obligations.provenance).toContain("0053");
+    expect(schema?.obligations.provenance).toContain("0054");
     expect(schema?.obligations["post-conditions"]).toContain(
       "exact artifact-recovery singleton and its receipt constraints",
     );
@@ -198,6 +199,9 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(schema?.obligations["post-conditions"]).toContain("durable termination-intent bit");
     expect(schema?.obligations["post-conditions"]).toContain("shared Queue message custody state");
+    expect(schema?.obligations["post-conditions"]).toContain(
+      "bounded unleased Queue custody readiness index",
+    );
     expect(schema?.requiresEnv).toContain("TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH");
     expect(schema?.obligations["pre-mutation-proof"]).toContain("malformed FormRef");
     expect(schema?.obligations["pre-mutation-proof"]).toContain(
@@ -532,6 +536,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0051",
       "0052",
       "0053",
+      "0054",
     ] as const) {
       for (const environment of ["integration", "rehearsal", "production"] as const) {
         const accepted = await deploy([

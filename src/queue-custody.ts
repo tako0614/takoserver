@@ -8,6 +8,9 @@ const MAX_RETENTION_SECONDS = 1_209_600;
 const MAX_RETRIES = 100;
 const MAX_LEASE_MILLIS = 120_000;
 const MAX_REAP_MESSAGES = 50;
+const MAX_CUSTODY_WINDOW_MESSAGES = MAX_BATCH_MESSAGES;
+const MAX_BODY_QUERY_MESSAGES = 99;
+const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
@@ -54,14 +57,25 @@ export interface QueueCustodyClaimedMessage {
 export type QueueCustodyRetirementStatus =
   | { readonly state: "ready" }
   | { readonly state: "waiting"; readonly waitUntilMillis: number }
-  | { readonly state: "reap"; readonly remaining: number }
+  | { readonly state: "reap"; readonly remainingAtLeast: 1 }
   | { readonly state: "tombstone" };
 
 export type QueueCustodyRetirementCompletion =
   | { readonly state: "activated"; readonly generation: number }
   | { readonly state: "tombstone" }
   | { readonly state: "waiting"; readonly waitUntilMillis: number }
-  | { readonly state: "reap"; readonly remaining: number };
+  | { readonly state: "reap"; readonly remainingAtLeast: 1 };
+
+/**
+ * A transport-neutral scheduling observation, never authority to deliver or
+ * settle. The caller must still use `claim`, whose generation and lease
+ * predicates arbitrate concurrent lifecycle changes.
+ */
+export type QueueCustodyReadiness =
+  | { readonly state: "inactive" }
+  | { readonly state: "idle" }
+  | { readonly state: "ready" }
+  | { readonly state: "waiting"; readonly wakeAtMillis: number };
 
 export class QueueCustodyConflictError extends Error {
   constructor(message = "queue custody generation conflicts") {
@@ -74,6 +88,13 @@ export interface QueueCustody {
   admit(target: QueueCustodyTarget, message: QueueCustodyAdmission): Promise<void>;
   admitBatch(target: QueueCustodyTarget, messages: readonly QueueCustodyAdmission[]): Promise<void>;
   activateConsumer(generation: QueueCustodyConsumerGeneration): Promise<void>;
+  readiness(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly maxBatchSize: number;
+    readonly maxBatchTimeoutSeconds: number;
+  }): Promise<QueueCustodyReadiness>;
   claim(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -86,6 +107,7 @@ export interface QueueCustody {
     message: QueueCustodyClaimedMessage,
     decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number },
   ): Promise<boolean>;
+  sweepExpired(limit?: number): Promise<number>;
   beginRetirement(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -215,18 +237,16 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     if (current.state === "tombstone") return { state: "tombstone" };
     if (current.state !== "retiring") throw new QueueCustodyConflictError();
     const rows = await sql.query(
-      `SELECT COUNT(*) AS remaining,
-              MAX(CASE WHEN lease_expires_at_ms > ? THEN lease_expires_at_ms END) AS wait_until_ms
-       FROM selfhost_queue_messages
+      `SELECT lease_expires_at_ms
+       FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
        WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
-         AND lease_token IS NOT NULL`,
-      [millis, identity.queueId, identity.consumerId, identity.generation],
+       ORDER BY lease_expires_at_ms LIMIT 1`,
+      [identity.queueId, identity.consumerId, identity.generation],
     );
-    const remaining = nonNegativeStoredInteger(rows[0]?.remaining);
-    if (remaining === 0) return { state: "ready" };
-    const wait = nullableInteger(rows[0]?.wait_until_ms);
-    return wait === null
-      ? { state: "reap", remaining }
+    const wait = nullableInteger(rows[0]?.lease_expires_at_ms);
+    if (wait === null) return { state: "ready" };
+    return wait <= millis
+      ? { state: "reap", remainingAtLeast: 1 }
       : { state: "waiting", waitUntilMillis: wait };
   };
 
@@ -245,13 +265,15 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       readonly generation: number;
       readonly attempts: number;
       readonly maxRetries: number;
+      readonly retryDelaySeconds: number;
       readonly target?: QueueCustodyDeadLetterTarget;
+      readonly leaseExpiresAtMillis?: number;
     },
     millis: number,
-    expiredAtMillis?: number,
   ): readonly SqlStatement[] => {
     const target = lease.target;
-    const expirySql = expiredAtMillis === undefined ? "" : " AND lease_expires_at_ms <= ?";
+    const expirySql =
+      lease.leaseExpiresAtMillis === undefined ? "" : " AND lease_expires_at_ms = ?";
     const sourceParams = [
       lease.queueId,
       lease.messageId,
@@ -260,20 +282,29 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       lease.generation,
       lease.attempts,
       lease.maxRetries,
+      lease.retryDelaySeconds,
       target?.queueId ?? null,
       target?.deliveryDelaySeconds ?? null,
       target?.messageRetentionSeconds ?? null,
-      ...(expiredAtMillis === undefined ? [] : [expiredAtMillis]),
+      ...(lease.leaseExpiresAtMillis === undefined ? [] : [lease.leaseExpiresAtMillis]),
+      lease.queueId,
+      lease.consumerId,
+      lease.generation,
     ] as const;
     const removal: SqlStatement = {
-      sql:
-        `DELETE FROM selfhost_queue_messages
+      sql: `DELETE FROM selfhost_queue_messages
          WHERE queue_id = ? AND message_id = ? AND lease_token = ?
            AND lease_consumer_id = ? AND lease_generation = ?
            AND deliveries = ? AND lease_max_retries = ?
+           AND lease_retry_delay_seconds = ?
            AND lease_dead_letter_queue_id IS ?
            AND lease_dead_letter_delivery_delay_seconds IS ?
-           AND lease_dead_letter_retention_seconds IS ?` + expirySql,
+           AND lease_dead_letter_retention_seconds IS ?${expirySql}
+           AND EXISTS (
+             SELECT 1 FROM queue_consumer_custody
+             WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+               AND state IN ('active', 'retiring')
+           )`,
       params: sourceParams,
     };
     if (!target) return [removal];
@@ -281,8 +312,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
     messageId(deadLetterId);
     return [
       {
-        sql:
-          `INSERT INTO selfhost_queue_messages
+        sql: `INSERT INTO selfhost_queue_messages
              (queue_id, message_id, body, enqueued_at_ms, visible_at_ms,
               expires_at_ms, deliveries)
            SELECT lease_dead_letter_queue_id, ?, body, ?,
@@ -292,64 +322,122 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
            WHERE queue_id = ? AND message_id = ? AND lease_token = ?
              AND lease_consumer_id = ? AND lease_generation = ?
              AND deliveries = ? AND lease_max_retries = ?
+             AND lease_retry_delay_seconds = ?
              AND lease_dead_letter_queue_id IS ?
              AND lease_dead_letter_delivery_delay_seconds IS ?
-             AND lease_dead_letter_retention_seconds IS ?` + expirySql,
+             AND lease_dead_letter_retention_seconds IS ?${expirySql}
+             AND EXISTS (
+               SELECT 1 FROM queue_consumer_custody
+               WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+                 AND state IN ('active', 'retiring')
+             )`,
         params: [deadLetterId, millis, millis, millis, ...sourceParams],
       },
       removal,
     ];
   };
 
-  /** Reap exact expired leases, optionally releasing non-final attempts. */
+  /** Reap one bounded page of exact expired leases under their snapshotted policy. */
   const reapExpiredLeases = async (
     identity: Pick<QueueCustodyConsumerGeneration, "queueId" | "consumerId" | "generation">,
     millis: number,
     limit: number,
-    releaseNonFinal: boolean,
-  ): Promise<void> => {
+  ): Promise<boolean> => {
     const rows = await sql.query(
-      `SELECT message_id, lease_token, deliveries, lease_max_retries,
+      `SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms,
+              lease_token, lease_expires_at_ms, deliveries, lease_max_retries,
+              lease_retry_delay_seconds,
               lease_dead_letter_queue_id,
               lease_dead_letter_delivery_delay_seconds,
               lease_dead_letter_retention_seconds
-       FROM selfhost_queue_messages
+       FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
        WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
-         AND lease_token IS NOT NULL AND lease_expires_at_ms <= ?
-         ${releaseNonFinal ? "" : "AND deliveries >= 1 + lease_max_retries"}
-       ORDER BY lease_expires_at_ms, message_id LIMIT ?`,
+         AND lease_expires_at_ms <= ?
+       ORDER BY lease_expires_at_ms LIMIT ?`,
       [identity.queueId, identity.consumerId, identity.generation, millis, limit],
     );
+    if (rows.length === 0) return false;
     const statements: SqlStatement[] = [];
     for (const row of rows) {
       const id = messageId(row.message_id);
+      const enqueuedAt = positiveStoredInteger(row.enqueued_at_ms);
+      const visibleAt = positiveStoredInteger(row.visible_at_ms);
+      const expiresAt = positiveStoredInteger(row.expires_at_ms);
       const leaseToken = token(row.lease_token, 128, "queue custody lease token");
+      const leaseExpiresAt = positiveStoredInteger(row.lease_expires_at_ms);
       const deliveries = positiveStoredInteger(row.deliveries);
       const maxRetries = nonNegativeStoredInteger(row.lease_max_retries);
+      const retryDelaySeconds = nonNegativeStoredInteger(row.lease_retry_delay_seconds);
       const target = leaseTargetFromRow(row);
+      const snapshotParams = [
+        identity.queueId,
+        id,
+        enqueuedAt,
+        visibleAt,
+        expiresAt,
+        deliveries,
+        leaseToken,
+        leaseExpiresAt,
+        identity.consumerId,
+        identity.generation,
+        maxRetries,
+        retryDelaySeconds,
+        target?.queueId ?? null,
+        target?.deliveryDelaySeconds ?? null,
+        target?.messageRetentionSeconds ?? null,
+        identity.queueId,
+        identity.consumerId,
+        identity.generation,
+      ] as const;
+      if (expiresAt <= millis) {
+        statements.push({
+          sql: `DELETE FROM selfhost_queue_messages
+             WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+               AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+               AND lease_token = ? AND lease_expires_at_ms = ?
+               AND lease_consumer_id = ? AND lease_generation = ?
+               AND lease_max_retries = ? AND lease_retry_delay_seconds = ?
+               AND lease_dead_letter_queue_id IS ?
+               AND lease_dead_letter_delivery_delay_seconds IS ?
+               AND lease_dead_letter_retention_seconds IS ?
+               AND expires_at_ms <= ?
+               AND EXISTS (
+                 SELECT 1 FROM queue_consumer_custody
+                 WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+                   AND state IN ('active', 'retiring')
+               )`,
+          params: [...snapshotParams.slice(0, 15), millis, ...snapshotParams.slice(15)],
+        });
+        continue;
+      }
       if (deliveries < 1 + maxRetries) {
+        const retryAt = Math.max(
+          visibleAt,
+          safeFutureMillis(leaseExpiresAt, retryDelaySeconds * 1_000),
+        );
         statements.push({
           sql: `UPDATE selfhost_queue_messages
-             SET lease_token = NULL, lease_expires_at_ms = NULL,
+             SET visible_at_ms = ?, lease_token = NULL, lease_expires_at_ms = NULL,
                  lease_consumer_id = NULL, lease_generation = NULL,
                  lease_max_retries = NULL, lease_retry_delay_seconds = NULL,
                  lease_dead_letter_queue_id = NULL,
                  lease_dead_letter_delivery_delay_seconds = NULL,
                  lease_dead_letter_retention_seconds = NULL
-             WHERE queue_id = ? AND message_id = ? AND lease_token = ?
+             WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+               AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+               AND lease_token = ? AND lease_expires_at_ms = ?
                AND lease_consumer_id = ? AND lease_generation = ?
-               AND deliveries = ? AND lease_max_retries = ?
-               AND lease_expires_at_ms <= ?`,
-          params: [
-            identity.queueId,
-            id,
-            leaseToken,
-            identity.consumerId,
-            identity.generation,
-            deliveries,
-            maxRetries,
-            millis,
-          ],
+               AND lease_max_retries = ? AND lease_retry_delay_seconds = ?
+               AND lease_dead_letter_queue_id IS ?
+               AND lease_dead_letter_delivery_delay_seconds IS ?
+               AND lease_dead_letter_retention_seconds IS ?
+               AND expires_at_ms > ?
+               AND EXISTS (
+                 SELECT 1 FROM queue_consumer_custody
+                 WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+                   AND state IN ('active', 'retiring')
+               )`,
+          params: [retryAt, ...snapshotParams.slice(0, 15), millis, ...snapshotParams.slice(15)],
         });
         continue;
       }
@@ -363,42 +451,82 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
             generation: identity.generation,
             attempts: deliveries,
             maxRetries,
+            retryDelaySeconds,
             ...(target ? { target } : {}),
+            leaseExpiresAtMillis: leaseExpiresAt,
           },
-          millis,
           millis,
         ),
       );
     }
     if (statements.length > 0) await sql.batch(statements);
+    return true;
   };
 
+  const readUnleasedWindow = async (
+    queueId: string,
+  ): Promise<readonly Readonly<Record<string, unknown>>[]> =>
+    await sql.query(
+      `SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries
+       FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_ready
+       WHERE queue_id = ? AND lease_token IS NULL
+       ORDER BY visible_at_ms LIMIT ?`,
+      [queueId, MAX_CUSTODY_WINDOW_MESSAGES],
+    );
+
   /**
-   * Recover both final crashed leases and unleased backlog already over a new
-   * generation's retry cap. The latter is fenced into the active generation
-   * before sharing the same terminal lease transaction.
+   * Make one bounded page of retention/final-attempt progress from an already
+   * bounded unleased window. Every mutation rechecks the exact active
+   * generation and every observed message field; a concurrent claim or
+   * generation transition turns it into a no-op.
    */
-  const recoverActiveExhausted = async (
+  const progressActiveWindow = async (
     active: QueueCustodyConsumerGeneration,
     millis: number,
-  ): Promise<void> => {
-    await reapExpiredLeases(active, millis, MAX_REAP_MESSAGES, false);
-    const rows = await sql.query(
-      `SELECT message_id, deliveries
-       FROM selfhost_queue_messages
-       WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ?
-         AND lease_token IS NULL AND deliveries >= ?
-       ORDER BY visible_at_ms, message_id LIMIT ?`,
-      [active.queueId, millis, millis, 1 + active.policy.maxRetries, MAX_REAP_MESSAGES],
-    );
-    if (rows.length === 0) return;
+    rows: readonly Readonly<Record<string, unknown>>[],
+  ): Promise<boolean> => {
     const statements: SqlStatement[] = [];
     const target = active.policy.deadLetterQueue;
+    let maintenance = 0;
     for (const row of rows) {
+      if (maintenance >= MAX_REAP_MESSAGES) break;
       const id = messageId(row.message_id);
-      const deliveries = positiveStoredInteger(row.deliveries);
+      const enqueuedAt = positiveStoredInteger(row.enqueued_at_ms);
+      const visibleAt = positiveStoredInteger(row.visible_at_ms);
+      const expiresAt = positiveStoredInteger(row.expires_at_ms);
+      const deliveries = nonNegativeStoredInteger(row.deliveries);
+      if (expiresAt <= millis) {
+        maintenance += 1;
+        statements.push({
+          sql: `DELETE FROM selfhost_queue_messages
+             WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+               AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+               AND lease_token IS NULL AND expires_at_ms <= ?
+               AND EXISTS (
+                 SELECT 1 FROM queue_consumer_custody
+                 WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+                   AND state = 'active'
+               )`,
+          params: [
+            active.queueId,
+            id,
+            enqueuedAt,
+            visibleAt,
+            expiresAt,
+            deliveries,
+            millis,
+            active.queueId,
+            active.consumerId,
+            active.generation,
+          ],
+        });
+        continue;
+      }
+      if (visibleAt > millis || deliveries < 1 + active.policy.maxRetries) continue;
+      maintenance += 1;
       const leaseToken = randomId();
       token(leaseToken, 128, "queue custody lease token");
+      const leaseExpiresAt = safeFutureMillis(millis, MAX_LEASE_MILLIS);
       statements.push({
         sql: `UPDATE selfhost_queue_messages
            SET lease_token = ?, lease_expires_at_ms = ?, lease_consumer_id = ?,
@@ -406,8 +534,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                lease_retry_delay_seconds = ?, lease_dead_letter_queue_id = ?,
                lease_dead_letter_delivery_delay_seconds = ?,
                lease_dead_letter_retention_seconds = ?
-           WHERE queue_id = ? AND message_id = ? AND deliveries = ?
-             AND visible_at_ms <= ? AND expires_at_ms > ? AND lease_token IS NULL
+           WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+             AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+             AND lease_token IS NULL AND visible_at_ms <= ? AND expires_at_ms > ?
              AND EXISTS (
                SELECT 1 FROM queue_consumer_custody
                WHERE queue_id = ? AND consumer_id = ? AND generation = ?
@@ -415,7 +544,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
              )`,
         params: [
           leaseToken,
-          millis + MAX_LEASE_MILLIS,
+          leaseExpiresAt,
           active.consumerId,
           active.generation,
           active.policy.maxRetries,
@@ -425,6 +554,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
           target?.messageRetentionSeconds ?? null,
           active.queueId,
           id,
+          enqueuedAt,
+          visibleAt,
+          expiresAt,
           deliveries,
           millis,
           millis,
@@ -443,13 +575,17 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
             generation: active.generation,
             attempts: deliveries,
             maxRetries: active.policy.maxRetries,
+            retryDelaySeconds: active.policy.retryDelaySeconds,
             ...(target ? { target } : {}),
+            leaseExpiresAtMillis: leaseExpiresAt,
           },
           millis,
         ),
       );
     }
+    if (statements.length === 0) return false;
     await sql.batch(statements);
+    return true;
   };
 
   return {
@@ -552,6 +688,70 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       throw new QueueCustodyConflictError();
     },
 
+    async readiness(input) {
+      const selected = generationIdentity(input);
+      const maxBatchSize = positiveInteger(
+        input.maxBatchSize,
+        MAX_BATCH_MESSAGES,
+        "queue custody readiness batch size",
+      );
+      const maxBatchTimeoutSeconds = nonNegativeInteger(
+        input.maxBatchTimeoutSeconds,
+        MAX_BATCH_TIMEOUT_SECONDS,
+        "queue custody readiness batch timeout",
+      );
+      const current = await readGeneration(selected);
+      if (
+        current?.state !== "active" ||
+        current.consumerId !== selected.consumerId ||
+        current.generation !== selected.generation
+      ) {
+        return { state: "inactive" };
+      }
+
+      const millis = now();
+      const leaseRows = await sql.query(
+        `SELECT lease_expires_at_ms
+         FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
+         WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
+         ORDER BY lease_expires_at_ms LIMIT 1`,
+        [current.queueId, current.consumerId, current.generation],
+      );
+      const leaseWakeAt = nullableInteger(leaseRows[0]?.lease_expires_at_ms);
+      if (leaseWakeAt !== null && leaseWakeAt <= millis) return { state: "ready" };
+
+      // Observation only: claim owns every retention and terminal mutation.
+      const rows = await readUnleasedWindow(current.queueId);
+      let wakeAt = leaseWakeAt;
+      let firstEligibleAt: number | null = null;
+      let eligible = 0;
+      const deliveryCap = 1 + current.policy.maxRetries;
+      for (const row of rows) {
+        const visibleAt = positiveStoredInteger(row.visible_at_ms);
+        const expiresAt = positiveStoredInteger(row.expires_at_ms);
+        const deliveries = nonNegativeStoredInteger(row.deliveries);
+        if (expiresAt <= millis) return { state: "ready" };
+        wakeAt = earliest(wakeAt, expiresAt);
+        if (deliveries >= deliveryCap) {
+          if (visibleAt <= millis) return { state: "ready" };
+          wakeAt = earliest(wakeAt, visibleAt);
+          continue;
+        }
+        if (expiresAt <= visibleAt) continue;
+        firstEligibleAt ??= visibleAt;
+        eligible += 1;
+        if (eligible === maxBatchSize) wakeAt = earliest(wakeAt, visibleAt);
+      }
+      if (firstEligibleAt !== null) {
+        wakeAt = earliest(
+          wakeAt,
+          safeFutureMillis(firstEligibleAt, maxBatchTimeoutSeconds * 1_000),
+        );
+      }
+      if (wakeAt === null) return { state: "idle" };
+      return wakeAt <= millis ? { state: "ready" } : { state: "waiting", wakeAtMillis: wakeAt };
+    },
+
     async claim(input) {
       const selected = generationIdentity(input);
       const limit = positiveInteger(input.limit, MAX_BATCH_MESSAGES, "queue custody claim limit");
@@ -570,27 +770,43 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         return [];
       }
       const millis = now();
-      await recoverActiveExhausted(current, millis);
-      const rows = await sql.query(
-        `SELECT message_id, body, enqueued_at_ms, visible_at_ms, deliveries
-         FROM selfhost_queue_messages
-         WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ?
-           AND deliveries < ?
-           AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
-         ORDER BY visible_at_ms, message_id LIMIT ?`,
-        [current.queueId, millis, millis, 1 + current.policy.maxRetries, millis, limit],
-      );
-      if (rows.length === 0) return [];
+      if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES)) return [];
+      const rows = await readUnleasedWindow(current.queueId);
+      if (await progressActiveWindow(current, millis, rows)) return [];
+      const candidateMetadata = rows
+        .filter(
+          (row) =>
+            positiveStoredInteger(row.visible_at_ms) <= millis &&
+            positiveStoredInteger(row.expires_at_ms) > millis &&
+            nonNegativeStoredInteger(row.deliveries) < 1 + current.policy.maxRetries,
+        )
+        .slice(0, limit)
+        .map((row) => ({
+          messageId: messageId(row.message_id),
+          enqueuedAtMillis: positiveStoredInteger(row.enqueued_at_ms),
+          visibleAtMillis: positiveStoredInteger(row.visible_at_ms),
+          expiresAtMillis: positiveStoredInteger(row.expires_at_ms),
+          attempts: nonNegativeStoredInteger(row.deliveries) + 1,
+        }));
+      if (candidateMetadata.length === 0) return [];
+      const bodies = new Map<string, Uint8Array>();
+      for (let offset = 0; offset < candidateMetadata.length; offset += MAX_BODY_QUERY_MESSAGES) {
+        const chunk = candidateMetadata.slice(offset, offset + MAX_BODY_QUERY_MESSAGES);
+        const bodyRows = await sql.query(
+          `SELECT message_id, body FROM selfhost_queue_messages
+           WHERE queue_id = ? AND message_id IN (${chunk.map(() => "?").join(", ")})`,
+          [current.queueId, ...chunk.map(({ messageId }) => messageId)],
+        );
+        for (const row of bodyRows) bodies.set(messageId(row.message_id), bytes(row.body));
+      }
+      const candidates = candidateMetadata.flatMap((message) => {
+        const body = bodies.get(message.messageId);
+        return body === undefined ? [] : [{ ...message, body }];
+      });
+      if (candidates.length === 0) return [];
       const leaseToken = randomId();
       token(leaseToken, 128, "queue custody lease token");
       const target = current.policy.deadLetterQueue;
-      const candidates = rows.map((row) => ({
-        messageId: messageId(row.message_id),
-        body: bytes(row.body),
-        enqueuedAtMillis: positiveStoredInteger(row.enqueued_at_ms),
-        visibleAtMillis: positiveStoredInteger(row.visible_at_ms),
-        attempts: nonNegativeStoredInteger(row.deliveries) + 1,
-      }));
       const written = await sql.batch(
         candidates.map((message) => ({
           sql: `UPDATE selfhost_queue_messages
@@ -600,9 +816,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  lease_dead_letter_delivery_delay_seconds = ?,
                  lease_dead_letter_retention_seconds = ?
              WHERE queue_id = ? AND message_id = ? AND deliveries = ?
-               AND enqueued_at_ms = ? AND visible_at_ms = ?
+               AND enqueued_at_ms = ? AND visible_at_ms = ? AND expires_at_ms = ?
                AND visible_at_ms <= ? AND expires_at_ms > ?
-               AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)
+               AND lease_token IS NULL
                AND EXISTS (
                  SELECT 1 FROM queue_consumer_custody
                  WHERE queue_id = ? AND consumer_id = ? AND generation = ?
@@ -623,7 +839,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
             message.attempts - 1,
             message.enqueuedAtMillis,
             message.visibleAtMillis,
-            millis,
+            message.expiresAtMillis,
             millis,
             millis,
             current.queueId,
@@ -742,12 +958,57 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
           generation: message.generation,
           attempts: message.attempts,
           maxRetries: message.policy.maxRetries,
+          retryDelaySeconds: message.policy.retryDelaySeconds,
           ...(message.policy.deadLetterQueue ? { target: message.policy.deadLetterQueue } : {}),
         },
         millis,
       );
       const written = await sql.batch(statements);
       return written.at(-1)?.changes === 1;
+    },
+
+    async sweepExpired(limitValue = MAX_CUSTODY_WINDOW_MESSAGES) {
+      const limit = positiveInteger(
+        limitValue,
+        MAX_CUSTODY_WINDOW_MESSAGES,
+        "queue custody expiry sweep limit",
+      );
+      const millis = now();
+      const rows = await sql.query(
+        `SELECT queue_id, message_id, enqueued_at_ms, visible_at_ms, expires_at_ms,
+                deliveries, lease_token, lease_expires_at_ms
+         FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_expiry
+         WHERE expires_at_ms <= ?
+         ORDER BY expires_at_ms LIMIT ?`,
+        [millis, limit],
+      );
+      if (rows.length === 0) return 0;
+      const written = await sql.batch(
+        rows.map((row) => {
+          const leaseToken = row.lease_token;
+          if (leaseToken !== null) token(leaseToken, 128, "queue custody lease token");
+          const leaseExpiresAt = nullableInteger(row.lease_expires_at_ms);
+          return {
+            sql: `DELETE FROM selfhost_queue_messages
+               WHERE queue_id = ? AND message_id = ? AND enqueued_at_ms = ?
+                 AND visible_at_ms = ? AND expires_at_ms = ? AND deliveries = ?
+                 AND lease_token IS ? AND lease_expires_at_ms IS ?
+                 AND expires_at_ms <= ?`,
+            params: [
+              token(row.queue_id, 512, "queue custody queue id"),
+              messageId(row.message_id),
+              positiveStoredInteger(row.enqueued_at_ms),
+              positiveStoredInteger(row.visible_at_ms),
+              positiveStoredInteger(row.expires_at_ms),
+              nonNegativeStoredInteger(row.deliveries),
+              leaseToken as string | null,
+              leaseExpiresAt,
+              millis,
+            ],
+          };
+        }),
+      );
+      return written.reduce((total, result) => total + result.changes, 0);
     },
 
     async beginRetirement(input) {
@@ -789,7 +1050,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         MAX_REAP_MESSAGES,
         "queue custody reap limit",
       );
-      await reapExpiredLeases(current, millis, limit, true);
+      await reapExpiredLeases(current, millis, limit);
       return await retirementStatus(current, millis);
     },
 
@@ -1149,6 +1410,14 @@ function nonNegativeStoredInteger(value: unknown): number {
 
 function nullableInteger(value: unknown): number | null {
   return value === null || value === undefined ? null : positiveStoredInteger(value);
+}
+
+function earliest(left: number | null, right: number): number {
+  return left === null ? right : Math.min(left, right);
+}
+
+function safeFutureMillis(base: number, delta: number): number {
+  return Math.min(base + delta, MAX_SAFE_GENERATION);
 }
 
 function stringValue(value: unknown): string {

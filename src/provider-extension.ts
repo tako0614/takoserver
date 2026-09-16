@@ -169,6 +169,7 @@ export {
   type QueueCustodyConsumerGeneration,
   type QueueCustodyDeadLetterTarget,
   type QueueCustodyOptions,
+  type QueueCustodyReadiness,
   type QueueCustodyRetirementCompletion,
   type QueueCustodyRetirementStatus,
   type QueueCustodyRetryPolicy,
