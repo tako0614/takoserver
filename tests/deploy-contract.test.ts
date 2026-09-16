@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 
 const REPOSITORY = `${import.meta.dir}/..`;
 
@@ -14,6 +15,29 @@ async function deploy(args: readonly string[]): Promise<{
     stderr: "pipe",
     env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
   });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+async function deployThroughPipe(): Promise<{
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}> {
+  const child = Bun.spawn(
+    ["bash", "-o", "pipefail", "-c", "bun run --silent deploy -- --contract | cat"],
+    {
+      cwd: REPOSITORY,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    },
+  );
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -53,6 +77,13 @@ const SURFACES = [
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
+  test("flushes the complete contract before exiting through a piped stdout", async () => {
+    const probe = await deployThroughPipe();
+    expect(probe.exitCode).toBe(0);
+    expect(probe.stderr).toBe("");
+    expect(JSON.parse(probe.stdout)).toEqual(DEPLOY_CONTRACT);
+  });
+
   test("declares truthful split surfaces and no mixed API controller", async () => {
     const probe = await deploy(["--contract"]);
     expect(probe.exitCode).toBe(0);

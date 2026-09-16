@@ -990,7 +990,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
 
 const argv = process.argv.slice(2);
 if (argv.length === 1 && argv[0] === "--contract") {
-  process.stdout.write(`${JSON.stringify(DEPLOY_CONTRACT, null, 2)}\n`);
+  const contract = `${JSON.stringify(DEPLOY_CONTRACT, null, 2)}\n`;
+  await new Promise<void>((resolve, reject) => {
+    process.stdout.write(contract, (error?: Error | null) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
   process.exit(0);
 }
 
