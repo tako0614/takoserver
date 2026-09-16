@@ -68,7 +68,7 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
     if (request.method === "POST" && url.pathname === `${PREFIX}chat/completions`) {
       let body: JsonObject;
       try {
-        const parsed = parseStrictJson(new Uint8Array(await request.arrayBuffer()), MAX_BODY_BYTES);
+        const parsed = parseStrictJson(await readRequestBodyLimited(request), MAX_BODY_BYTES);
         if (!isJsonObject(parsed)) throw new StrictJsonError();
         body = parsed;
       } catch (error) {
@@ -396,6 +396,41 @@ function validMessages(value: unknown): boolean {
     if (typeof entry.content === "string") return entry.content.length <= 256 * 1024;
     return Array.isArray(entry.content) && entry.content.length <= 64;
   });
+}
+
+/**
+ * Buffer at most the existing JSON ingress limit and stop reading as soon as
+ * an untrusted chunk would cross it. The public error remains `invalid_request`
+ * (the same response produced by parseStrictJson for an oversized body).
+ */
+async function readRequestBodyLimited(request: Request): Promise<Uint8Array> {
+  if (!request.body) throw new StrictJsonError();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      const chunk = part.value;
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength > MAX_BODY_BYTES - total) {
+        await reader.cancel().catch(() => undefined);
+        throw new StrictJsonError();
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (total < 1) throw new StrictJsonError();
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function parseCompletion(
