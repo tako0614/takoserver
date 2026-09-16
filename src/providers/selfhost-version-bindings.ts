@@ -66,14 +66,25 @@ const FORMAT_V4 = "takoserver.selfhost-version-bindings@v4";
  * prove the exact slot set without resolving current operator integrations.
  */
 const FORMAT_V5 = "takoserver.selfhost-version-bindings@v5";
+/**
+ * Adds an explicitly scoped Vector binding. The generic target field is not
+ * reused: a Vector index is addressed by the tenant and Resource UID together,
+ * and the immutable record must retain both values.
+ */
+const FORMAT_V6 = "takoserver.selfhost-version-bindings@v6";
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
   "edge.kv",
   "edge.objects",
   "edge.queue",
   "edge.sql",
+  "edge.vector",
 ] as const;
 export type SelfhostVersionDataBindingKind = (typeof SELFHOST_VERSION_DATA_BINDING_KINDS)[number];
+type SelfhostVersionNonVectorDataBindingKind = Exclude<
+  SelfhostVersionDataBindingKind,
+  "edge.vector"
+>;
 
 export const SELFHOST_WORKER_HANDLER_NAMES = ["fetch", "queue", "scheduled"] as const;
 export type SelfhostWorkerHandlerName = (typeof SELFHOST_WORKER_HANDLER_NAMES)[number];
@@ -101,22 +112,32 @@ export interface SelfhostVersionBinding {
  * resolves the name through this record, so a Worker cannot reach a namespace
  * its Version did not declare.
  */
-export interface SelfhostVersionDataBinding {
-  readonly kind: SelfhostVersionDataBindingKind;
-  readonly name: string;
-  readonly target: string;
-  /**
-   * Only for `edge.queue`: the retention and default delay the queue itself
-   * promises, recorded with the binding because the plane has to apply them at
-   * the moment a message is accepted.
-   *
-   * Recorded rather than looked up, for the same reason `vars` are: a
-   * publication projects exactly what its apply resolved. The cost is that
-   * raising a queue's retention reaches a Worker on its next published Version,
-   * not immediately.
-   */
-  readonly queue?: SelfhostVersionQueueSettings;
-}
+export type SelfhostVersionDataBinding =
+  | {
+      readonly kind: SelfhostVersionNonVectorDataBindingKind;
+      readonly name: string;
+      readonly target: string;
+      /**
+       * Only for `edge.queue`: the retention and default delay the queue itself
+       * promises, recorded with the binding because the plane has to apply them at
+       * the moment a message is accepted.
+       *
+       * Recorded rather than looked up, for the same reason `vars` are: a
+       * publication projects exactly what its apply resolved. The cost is that
+       * raising a queue's retention reaches a Worker on its next published Version,
+       * not immediately.
+       */
+      readonly queue?: SelfhostVersionQueueSettings;
+    }
+  | {
+      /** A Vector index is addressed by its complete tenant/Resource scope. */
+      readonly kind: "edge.vector";
+      readonly name: string;
+      readonly scope: {
+        readonly tenantId: string;
+        readonly resourceUid: string;
+      };
+    };
 
 export interface SelfhostVersionQueueSettings {
   readonly messageRetentionSeconds: number;
@@ -327,7 +348,7 @@ export function createSelfhostVersionBindingStore(options: {
         ) {
           throw new SelfhostVersionBindingStoreError("unavailable");
         }
-        const format = normalized.externalServices ? FORMAT_V5 : FORMAT_V4;
+        const format = formatForSet(normalized);
         const raw = canonicalRecord(format, salt, normalized, planeToken, eventToken);
         const bytes = new TextEncoder().encode(raw);
         if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
@@ -442,7 +463,7 @@ export function normalizeSelfhostVersionBindingSet(
   // dispatch, not only in write(). Tokens and salt have fixed encoded lengths.
   const placeholder = "A".repeat(43);
   const raw = canonicalRecord(
-    normalized.externalServices ? FORMAT_V5 : FORMAT_V4,
+    formatForSet(normalized),
     placeholder,
     normalized,
     normalized.dataPlane ? placeholder : undefined,
@@ -651,14 +672,28 @@ function normalizeDataPlane(plane: SelfhostVersionDataPlane): SelfhostVersionDat
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   for (const binding of bindings) {
+    if (typeof binding !== "object" || binding === null || Array.isArray(binding)) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
     if (
-      typeof binding?.name !== "string" ||
+      typeof binding.name !== "string" ||
       binding.name.length === 0 ||
       binding.name.length > 64 ||
+      !(SELFHOST_VERSION_DATA_BINDING_KINDS as readonly string[]).includes(binding.kind)
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    if (binding.kind === "edge.vector") {
+      if (Object.keys(binding).sort().join(",") !== "kind,name,scope") {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      normalizeVectorScope(binding.scope);
+      continue;
+    }
+    if (
       typeof binding.target !== "string" ||
       binding.target.length === 0 ||
-      binding.target.length > 512 ||
-      !(SELFHOST_VERSION_DATA_BINDING_KINDS as readonly string[]).includes(binding.kind)
+      binding.target.length > 512
     ) {
       throw new SelfhostVersionBindingStoreError("corrupt");
     }
@@ -670,12 +705,62 @@ function normalizeDataPlane(plane: SelfhostVersionDataPlane): SelfhostVersionDat
   }
   return {
     bindings: bindings.map((binding) => ({
-      kind: binding.kind,
-      name: binding.name,
-      target: binding.target,
-      ...(binding.queue ? { queue: normalizeQueueSettings(binding.queue) } : {}),
+      ...(binding.kind === "edge.vector"
+        ? {
+            kind: binding.kind,
+            name: binding.name,
+            scope: normalizeVectorScope(binding.scope),
+          }
+        : {
+            kind: binding.kind,
+            name: binding.name,
+            target: binding.target,
+            ...(binding.queue ? { queue: normalizeQueueSettings(binding.queue) } : {}),
+          }),
     })),
   };
+}
+
+interface SelfhostVectorScope {
+  readonly tenantId: string;
+  readonly resourceUid: string;
+}
+
+const MAX_VECTOR_TENANT_ID_LENGTH = 255;
+const MAX_VECTOR_RESOURCE_UID_LENGTH = 128;
+
+/**
+ * Vector storage scopes use the same bounded opaque strings as
+ * `VectorIndexStore`. They are not parsed as script names or native IDs.
+ */
+function normalizeVectorScope(value: unknown): SelfhostVectorScope {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "resourceUid,tenantId"
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const scope = value as Record<string, unknown>;
+  const tenantId = scope.tenantId;
+  const resourceUid = scope.resourceUid;
+  if (
+    typeof tenantId !== "string" ||
+    typeof resourceUid !== "string" ||
+    !boundedCodePointString(tenantId, 1, MAX_VECTOR_TENANT_ID_LENGTH) ||
+    !boundedCodePointString(resourceUid, 3, MAX_VECTOR_RESOURCE_UID_LENGTH) ||
+    tenantId.includes("\u0000") ||
+    resourceUid.includes("\u0000")
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return { tenantId, resourceUid };
+}
+
+function boundedCodePointString(value: string, minimum: number, maximum: number): boolean {
+  const length = [...value].length;
+  return length >= minimum && length <= maximum;
 }
 
 function normalizeQueueSettings(
@@ -785,6 +870,25 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
   });
 }
 
+type SelfhostVersionBindingFormat =
+  | typeof FORMAT_V1
+  | typeof FORMAT_V2
+  | typeof FORMAT_V3
+  | typeof FORMAT_V4
+  | typeof FORMAT_V5
+  | typeof FORMAT_V6;
+
+function formatForSet(
+  set: SelfhostVersionBindingSet,
+): typeof FORMAT_V4 | typeof FORMAT_V5 | typeof FORMAT_V6 {
+  if (hasVectorDataBinding(set)) return FORMAT_V6;
+  return set.externalServices ? FORMAT_V5 : FORMAT_V4;
+}
+
+function hasVectorDataBinding(set: LegacySet | SelfhostVersionBindingSet): boolean {
+  return set.dataPlane?.bindings.some((binding) => binding.kind === "edge.vector") ?? false;
+}
+
 /**
  * The exact bytes on disk, in one place, so `parseStored` can prove a record it
  * read back is the record this function would have written.
@@ -792,16 +896,11 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
  * Every format this Host has ever written is reproducible here, because that
  * proof is what tells a torn or tampered file from a good one. `@v1` and `@v2`
  * are read, never written: a machine published by an earlier build keeps
- * serving, and the next Version it publishes is written at `@v4` or `@v5`
- * depending on whether it declares external services.
+ * serving, and the next Version it publishes is written at `@v4`, `@v5`, or
+ * `@v6` depending on whether it declares external services or a Vector scope.
  */
 function canonicalRecord(
-  format:
-    | typeof FORMAT_V1
-    | typeof FORMAT_V2
-    | typeof FORMAT_V3
-    | typeof FORMAT_V4
-    | typeof FORMAT_V5,
+  format: SelfhostVersionBindingFormat,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -809,19 +908,34 @@ function canonicalRecord(
 ): string {
   const plane = set.dataPlane
     ? {
-        bindings: set.dataPlane.bindings.map((binding) => ({
-          kind: binding.kind,
-          name: binding.name,
-          target: binding.target,
-          ...(binding.queue
-            ? {
-                queue: {
-                  messageRetentionSeconds: binding.queue.messageRetentionSeconds,
-                  deliveryDelaySeconds: binding.queue.deliveryDelaySeconds,
-                },
-              }
-            : {}),
-        })),
+        bindings: set.dataPlane.bindings.map((binding) => {
+          if (binding.kind === "edge.vector") {
+            if (format !== FORMAT_V6) {
+              throw new SelfhostVersionBindingStoreError("corrupt");
+            }
+            return {
+              kind: binding.kind,
+              name: binding.name,
+              scope: {
+                tenantId: binding.scope.tenantId,
+                resourceUid: binding.scope.resourceUid,
+              },
+            };
+          }
+          return {
+            kind: binding.kind,
+            name: binding.name,
+            target: binding.target,
+            ...(binding.queue
+              ? {
+                  queue: {
+                    messageRetentionSeconds: binding.queue.messageRetentionSeconds,
+                    deliveryDelaySeconds: binding.queue.deliveryDelaySeconds,
+                  },
+                }
+              : {}),
+          };
+        }),
       }
     : undefined;
   if (format === FORMAT_V1) {
@@ -869,15 +983,30 @@ function canonicalRecord(
       eventToken,
     });
   }
+  if (format === FORMAT_V5) {
+    return JSON.stringify({
+      format: FORMAT_V5,
+      salt,
+      workerResourceUid: current.workerResourceUid,
+      handlers: current.handlers,
+      vars: current.vars,
+      sensitiveVars: current.sensitiveVars,
+      serviceBindings: current.serviceBindings,
+      externalServices: current.externalServices,
+      ...(plane ? { dataPlane: plane } : {}),
+      ...(planeToken === undefined ? {} : { planeToken }),
+      eventToken,
+    });
+  }
   return JSON.stringify({
-    format: FORMAT_V5,
+    format: FORMAT_V6,
     salt,
     workerResourceUid: current.workerResourceUid,
     handlers: current.handlers,
     vars: current.vars,
     sensitiveVars: current.sensitiveVars,
     serviceBindings: current.serviceBindings,
-    externalServices: current.externalServices,
+    externalServices: current.externalServices ?? [],
     ...(plane ? { dataPlane: plane } : {}),
     ...(planeToken === undefined ? {} : { planeToken }),
     eventToken,
@@ -902,12 +1031,7 @@ interface LegacySet {
  * generation string is not a place to put one.
  */
 function digestOf(
-  format:
-    | typeof FORMAT_V1
-    | typeof FORMAT_V2
-    | typeof FORMAT_V3
-    | typeof FORMAT_V4
-    | typeof FORMAT_V5,
+  format: SelfhostVersionBindingFormat,
   salt: string,
   set: SelfhostVersionBindingSet | LegacySet,
   planeToken: string | undefined,
@@ -941,7 +1065,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
             ? FORMAT_V4
             : record.format === FORMAT_V5 && isVersion5Keys(keys)
               ? FORMAT_V5
-              : null;
+              : record.format === FORMAT_V6 && isVersion6Keys(keys)
+                ? FORMAT_V6
+                : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -951,7 +1077,10 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   }
   const hasPlane =
     format === FORMAT_V2 ||
-    ((format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5) &&
+    ((format === FORMAT_V3 ||
+      format === FORMAT_V4 ||
+      format === FORMAT_V5 ||
+      format === FORMAT_V6) &&
       "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
@@ -961,11 +1090,14 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const eventToken =
-    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5
+    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
       ? record.eventToken
       : undefined;
   if (
-    (format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5) &&
+    (format === FORMAT_V3 ||
+      format === FORMAT_V4 ||
+      format === FORMAT_V5 ||
+      format === FORMAT_V6) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -974,13 +1106,13 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   // because a Version with no binding declares them too.
   const legacyPlane = format === FORMAT_V2 ? parsedLegacyDataPlane(record.dataPlane) : null;
   const handlers =
-    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5
+    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
         : undefined;
   const set = normalizeSetOrLegacy({
-    ...(format === FORMAT_V4 || format === FORMAT_V5
+    ...(format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
       ? {
           workerResourceUid: parsedResourceUid(record.workerResourceUid),
           serviceBindings: parsedServiceBindings(record.serviceBindings),
@@ -990,12 +1122,22 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
     ...(hasPlane
-      ? { dataPlane: parsedDataPlane(format === FORMAT_V2 ? legacyPlane : record.dataPlane) }
+      ? {
+          dataPlane: parsedDataPlane(
+            format === FORMAT_V2 ? { bindings: legacyPlane?.bindings } : record.dataPlane,
+            format === FORMAT_V6,
+          ),
+        }
       : {}),
-    ...(format === FORMAT_V5
+    ...(format === FORMAT_V5 || format === FORMAT_V6
       ? { externalServices: parsedExternalServices(record.externalServices) }
       : {}),
   });
+  // `@v6` is reserved for the new scoped Vector entry. A record that claims
+  // the format without one is neither a v5 record nor a valid v6 record.
+  if (format === FORMAT_V6 && !hasVectorDataBinding(set)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   if (
     canonicalRecord(
       format,
@@ -1041,6 +1183,16 @@ function isVersion4Keys(keys: string): boolean {
 
 /** A `@v5` record always carries at least one external service declaration. */
 function isVersion5Keys(keys: string): boolean {
+  return (
+    keys ===
+      "eventToken,externalServices,format,handlers,salt,sensitiveVars,serviceBindings,vars,workerResourceUid" ||
+    keys ===
+      "dataPlane,eventToken,externalServices,format,handlers,planeToken,salt,sensitiveVars,serviceBindings,vars,workerResourceUid"
+  );
+}
+
+/** A `@v6` record carries the v5 fields and always serializes services as an array. */
+function isVersion6Keys(keys: string): boolean {
   return (
     keys ===
       "eventToken,externalServices,format,handlers,salt,sensitiveVars,serviceBindings,vars,workerResourceUid" ||
@@ -1143,7 +1295,7 @@ function decodeUtf8(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
 }
 
-function parsedDataPlane(value: unknown): SelfhostVersionDataPlane {
+function parsedDataPlane(value: unknown, allowVector = false): SelfhostVersionDataPlane {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
@@ -1159,7 +1311,9 @@ function parsedDataPlane(value: unknown): SelfhostVersionDataPlane {
     const keys = Object.keys(entry as Record<string, unknown>)
       .sort()
       .join(",");
-    if (keys !== "kind,name,target" && keys !== "kind,name,queue,target") {
+    const isLegacyEntry = keys === "kind,name,target" || keys === "kind,name,queue,target";
+    const isVectorEntry = allowVector && keys === "kind,name,scope" && entry.kind === "edge.vector";
+    if (!isLegacyEntry && !isVectorEntry) {
       throw new SelfhostVersionBindingStoreError("corrupt");
     }
   }
