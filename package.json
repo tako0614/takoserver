@@ -24,6 +24,7 @@
     "typecheck:form-authority-worker": "tsc --noEmit -p tsconfig.form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-operator-worker.json && tsc --noEmit -p tsconfig.form-authority-identity-probe.json",
     "typecheck:exact-artifact-recovery-worker": "tsc --noEmit -p tsconfig.exact-artifact-recovery-worker.json",
     "test": "bun test",
+    "test:selfhost-opentofu": "bun --no-env-file scripts/selfhost-opentofu-e2e.ts",
     "check:provider": "cd provider && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
     "check:core-verifier": "cd services/takoform-core-verifier && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
     "check:workflow-execution-guard": "cd services/workflow-execution-guard && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",

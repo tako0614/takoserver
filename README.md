@@ -610,6 +610,35 @@ bun run fmt       # the only thing that rewrites source
 
 `bun run check` is the gate. It is read-only and it does not skip.
 
+### Self-host and OpenTofu interoperability
+
+`bun run test:selfhost-opentofu` is a separate native integration journey. It
+starts the real Bun Host, signs in with a fresh local operator key, creates an
+organization API key, and admits the signed Form closure through the real Core
+verifier. OpenTofu then creates an EdgeKVNamespace and SQLiteDatabase, checks a
+no-change plan, compares exact Form identities and UIDs with the Host, and
+destroys both resources. Success requires empty state and Host absence.
+
+Prepare OpenTofu **1.12.5**, an unpacked filesystem mirror containing
+`registry.terraform.io/tako0614/takoform` **4.0.0**, and a verifier binary built
+from this checkout's `services/takoform-core-verifier`. Verify those artifacts
+before use; the verifier's reported build-context digest is not a binary hash.
+From a disposable Linux network namespace with only loopback enabled, run:
+
+```sh
+bun --no-env-file run test:selfhost-opentofu \
+  --tofu /absolute/path/to/tofu \
+  --provider-mirror /absolute/path/to/provider-mirror \
+  --core-verifier /absolute/path/to/takoform-core-verifier
+```
+
+Ports 8787 and 8080 must be free in that namespace. The command refuses external
+network interfaces, uses only fresh temporary state, and neither downloads
+tools nor reads existing operator credentials. It prints phase names and a
+sanitized result, stops its children and removes temporary state on exit.
+Failed mutations are not retried. This verifies local storage interoperability;
+it does not qualify Cloudflare, Workers, Containers or a production deployment.
+
 ## Licence
 
 [GNU Affero General Public License v3.0](LICENSE).
