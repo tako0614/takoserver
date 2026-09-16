@@ -32,7 +32,7 @@ function requiredMethods(base: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
-function completePrototype(Actor: Function): void {
+function completePrototype(Actor: { readonly prototype: object }): void {
   const methods = requiredMethods();
   for (const name of ["fetch", "alarm", "socketMessage", "socketClose", "socketError"]) {
     if (Object.getOwnPropertyDescriptor(Actor.prototype, name) !== undefined) continue;
@@ -59,7 +59,12 @@ describe("private Actor ordinary-class execution seam", () => {
         receivers.push(this);
         seen.push({ kind: "alarm", args: [receivedTurn] });
       },
-      socketMessage(this: unknown, socket: object, data: string | Uint8Array, receivedTurn: object) {
+      socketMessage(
+        this: unknown,
+        socket: object,
+        data: string | Uint8Array,
+        receivedTurn: object,
+      ) {
         receivers.push(this);
         seen.push({ kind: "socketMessage", args: [socket, data, receivedTurn] });
       },
@@ -101,10 +106,7 @@ describe("private Actor ordinary-class execution seam", () => {
       Response,
     );
     await execution.dispatch({ kind: "alarm" }, currentTurn);
-    await execution.dispatch(
-      { kind: "socketMessage", socket, data: "message" },
-      currentTurn,
-    );
+    await execution.dispatch({ kind: "socketMessage", socket, data: "message" }, currentTurn);
     await execution.dispatch({ kind: "socketClose", socket, event: closeEvent }, currentTurn);
     await execution.dispatch({ kind: "socketError", socket, event: errorEvent }, currentTurn);
 
@@ -145,7 +147,10 @@ describe("private Actor ordinary-class execution seam", () => {
   });
 
   test("constructability probe remains a static inert source invariant", () => {
-    const source = readFileSync(new URL("../src/actor-class-execution.ts", import.meta.url), "utf8");
+    const source = readFileSync(
+      new URL("../src/actor-class-execution.ts", import.meta.url),
+      "utf8",
+    );
     expect(source).toContain("function inertConstructTarget()");
     expect(source).toContain("SafeReflectConstruct(inertConstructTarget, [], exported)");
     expect(source).not.toMatch(/(?:const|let|var)\s+\w+\s*=\s*Function\b/);
@@ -235,10 +240,14 @@ describe("private Actor ordinary-class execution seam", () => {
       env: {},
       context: context(),
     });
-    expect((await execution.dispatch(
-      { kind: "fetch", request: new Request("https://actor.invalid/") },
-      turn(),
-    ))?.status).toBe(200);
+    expect(
+      (
+        await execution.dispatch(
+          { kind: "fetch", request: new Request("https://actor.invalid/") },
+          turn(),
+        )
+      )?.status,
+    ).toBe(200);
     expect(calls).toBe(1);
   });
 
@@ -401,10 +410,9 @@ describe("private Actor ordinary-class execution seam", () => {
       context: context(),
     });
     await expect(
-      execution.dispatch(
-        { kind: "fetch", request: new Request("https://actor.invalid/") },
-        { signal: {} } as never,
-      ),
+      execution.dispatch({ kind: "fetch", request: new Request("https://actor.invalid/") }, {
+        signal: {},
+      } as never),
     ).rejects.toMatchObject({ name: "backend_unavailable", code: "backend_unavailable" });
     expect(constructions).toBe(0);
   });

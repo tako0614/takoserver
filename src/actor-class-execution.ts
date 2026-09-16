@@ -75,11 +75,7 @@ function dataDescriptor(
 }
 
 function defineFixed(target: object, key: PropertyKey, value: unknown, enumerable = true): void {
-  SafeObjectDefineProperty(
-    target,
-    key,
-    dataDescriptor(value, enumerable, false, false),
-  );
+  SafeObjectDefineProperty(target, key, dataDescriptor(value, enumerable, false, false));
 }
 
 function isObject(value: unknown): value is object {
@@ -235,10 +231,11 @@ export interface ActorInstance {
 
 type HandlerName = "fetch" | "alarm" | "socketMessage" | "socketClose" | "socketError";
 type Handler = (...args: never[]) => unknown;
+type ActorConstructor = new (...args: never[]) => object;
 
 export interface ActorClassInspection {
   readonly exportName: string;
-  readonly constructor: Function;
+  readonly constructor: ActorConstructor;
   readonly prototype: object;
   readonly handlers: Readonly<{
     readonly fetch: Handler;
@@ -263,10 +260,7 @@ const REQUIRED_HANDLERS: readonly HandlerName[] = [
  * constructor, a method, or an accessor. Inherited prototype data methods are
  * accepted; accessors and non-callable replacements are refused.
  */
-export function inspectActorClass(
-  namespace: unknown,
-  exportName: string,
-): ActorClassInspection {
+export function inspectActorClass(namespace: unknown, exportName: string): ActorClassInspection {
   try {
     if (!isObject(namespace) || SafeArrayIsArray(namespace)) {
       throw new SafeTypeError("Actor namespace is unavailable");
@@ -275,10 +269,7 @@ export function inspectActorClass(
       throw new SafeTypeError("Actor export name is invalid");
     }
     const namespaceDescriptor = SafeObjectGetOwnPropertyDescriptor(namespace, exportName);
-    if (
-      namespaceDescriptor === undefined ||
-      !SafeObjectHasOwn(namespaceDescriptor, "value")
-    ) {
+    if (namespaceDescriptor === undefined || !SafeObjectHasOwn(namespaceDescriptor, "value")) {
       throw new SafeTypeError("Actor export is missing or accessor-backed");
     }
     const exported = namespaceDescriptor.value;
@@ -318,12 +309,12 @@ export function inspectActorClass(
 
     const inspection = SafeObjectCreate(null) as {
       exportName: string;
-      constructor: Function;
+      constructor: ActorConstructor;
       prototype: object;
       handlers: typeof handlers;
     };
     defineFixed(inspection, "exportName", exportName);
-    defineFixed(inspection, "constructor", exported);
+    defineFixed(inspection, "constructor", exported as ActorConstructor);
     defineFixed(inspection, "prototype", prototype);
     defineFixed(inspection, "handlers", handlers);
     SafeObjectFreeze(inspection);
@@ -411,11 +402,7 @@ export function createActorClassExecution(
 
     const args = eventArguments(normalizedEvent, turn);
     try {
-      const result = await SafeReflectApply(
-        inspection.handlers[handlerName],
-        instance,
-        args,
-      );
+      const result = await SafeReflectApply(inspection.handlers[handlerName], instance, args);
       if (handlerName === "fetch") {
         if (!(result instanceof SafeResponse)) {
           throw new SafeTypeError("Actor fetch must return a Response");
@@ -511,7 +498,11 @@ export class ActorExecutionError extends SafeError {
 
   constructor(phase: string, cause: unknown) {
     super("actor execution failed");
-    SafeObjectDefineProperty(this, "name", dataDescriptor("ActorExecutionError", false, false, false));
+    SafeObjectDefineProperty(
+      this,
+      "name",
+      dataDescriptor("ActorExecutionError", false, false, false),
+    );
     SafeObjectDefineProperty(this, "phase", dataDescriptor(phase, false, false, false));
     SafeObjectDefineProperty(this, "cause", dataDescriptor(cause, false, false, false));
   }
@@ -547,7 +538,6 @@ function normalizeTurn(value: unknown): ActorTurn {
 
 function normalizeEvent(value: unknown): ActorEvent {
   try {
-    const raw = value as Record<string, unknown>;
     if (!isObject(value) || SafeArrayIsArray(value)) throw new SafeTypeError("Actor event invalid");
     const kindDescriptor = SafeObjectGetOwnPropertyDescriptor(value, "kind");
     if (kindDescriptor === undefined || !SafeObjectHasOwn(kindDescriptor, "value")) {
@@ -556,7 +546,8 @@ function normalizeEvent(value: unknown): ActorEvent {
     switch (kindDescriptor.value) {
       case "fetch": {
         const record = closedRecord(value, ["kind", "request"], "Actor fetch event");
-        if (!(record.request instanceof SafeRequest)) throw new SafeTypeError("Actor request invalid");
+        if (!(record.request instanceof SafeRequest))
+          throw new SafeTypeError("Actor request invalid");
         return { kind: "fetch", request: record.request };
       }
       case "alarm":
@@ -631,10 +622,7 @@ function normalizeCloseEvent(value: unknown): ActorSocketCloseEvent {
   return value as ActorSocketCloseEvent;
 }
 
-function eventArguments(
-  event: ActorEvent,
-  turn: ActorTurn,
-): readonly unknown[] {
+function eventArguments(event: ActorEvent, turn: ActorTurn): readonly unknown[] {
   switch (event.kind) {
     case "fetch":
       return [event.request, turn];
@@ -657,7 +645,11 @@ function normalizeEnvironment(value: unknown): Readonly<Record<string, unknown>>
     for (const key of keys) {
       if (typeof key !== "string") throw new SafeTypeError("Actor env has a symbol property");
       const descriptor = SafeObjectGetOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined || !SafeObjectHasOwn(descriptor, "value") || !descriptor.enumerable) {
+      if (
+        descriptor === undefined ||
+        !SafeObjectHasOwn(descriptor, "value") ||
+        !descriptor.enumerable
+      ) {
         throw new SafeTypeError("Actor env contains an accessor or hidden property");
       }
       defineFixed(env, key, descriptor.value);
@@ -675,11 +667,13 @@ function closedRecord(
   expected: readonly string[],
   label: string,
 ): Record<string, unknown> {
-  if (!isObject(value) || SafeArrayIsArray(value)) throw new SafeTypeError(`${label} is not an object`);
+  if (!isObject(value) || SafeArrayIsArray(value))
+    throw new SafeTypeError(`${label} is not an object`);
   const names = SafeObjectGetOwnPropertyNames(value);
   const ownKeys = SafeReflectOwnKeys(value);
   if (ownKeys.length !== names.length) throw new SafeTypeError(`${label} has a symbol property`);
-  if (names.length !== expected.length) throw new SafeTypeError(`${label} has unexpected properties`);
+  if (names.length !== expected.length)
+    throw new SafeTypeError(`${label} has unexpected properties`);
   const record = SafeObjectCreate(null) as Record<string, unknown>;
   for (const name of names) {
     let allowed = false;
