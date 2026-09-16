@@ -8,6 +8,10 @@ import type {
   VectorIndexStore,
 } from "@takoserver/core/provider-extension";
 import * as providerExtension from "@takoserver/core/provider-extension";
+import {
+  cloudflareProviderKind as expectedCloudflareProviderKind,
+  createCloudflareNativeReadbackDescriptor as expectedCreateCloudflareNativeReadbackDescriptor,
+} from "../src/providers/cloudflare-readback-descriptor.ts";
 import type { EdgeVectorWorkerFacadeSafeIntrinsic as ExpectedEdgeVectorWorkerFacadeSafeIntrinsic } from "../src/providers/edge-vector-worker-facade-source.ts";
 import {
   EDGE_VECTOR_WORKER_FACADE_KIND as expectedEdgeVectorFacadeKind,
@@ -110,4 +114,11 @@ test("provider-extension VectorIndex type imports resolve", () => {
 
   expect(sourceTypes.scope).toEqual(scope);
   expect(sourceTypes.index).toEqual(index);
+});
+
+test("provider-extension shares canonical Cloudflare readback construction", () => {
+  expect(providerExtension.cloudflareProviderKind).toBe(expectedCloudflareProviderKind);
+  expect(providerExtension.createCloudflareNativeReadbackDescriptor).toBe(
+    expectedCreateCloudflareNativeReadbackDescriptor,
+  );
 });

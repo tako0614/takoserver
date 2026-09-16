@@ -68,6 +68,7 @@ export {
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
   type ProviderOffering,
+  type ProviderReadAuthorityTarget,
   ProviderReadbackDescriptorError,
   type ProviderRelation,
   type ProviderSqliteMigration,
@@ -129,7 +130,9 @@ export {
 export { createCloudflareR2MeterSource } from "./providers/cloudflare-r2-meter.ts";
 export {
   cloudflareExecutorDirectOwnsOffering,
+  cloudflareProviderKind,
   cloudflareWfpOwnsOffering,
+  createCloudflareNativeReadbackDescriptor,
   validateCloudflareNativeReadbackDescriptor,
 } from "./providers/cloudflare-readback-descriptor.ts";
 export {
