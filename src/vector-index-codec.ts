@@ -83,6 +83,13 @@ export type VectorIndexInput =
   | VectorIndexDeleteInput
   | VectorIndexQueryInput;
 
+type VectorIndexInputForOperation = {
+  readonly upsert: VectorIndexUpsertInput;
+  readonly get: VectorIndexGetInput;
+  readonly delete: VectorIndexDeleteInput;
+  readonly query: VectorIndexQueryInput;
+};
+
 /** Stable codec failure. Runtime operation failures such as quota are outside this module. */
 export class VectorIndexInvalidSpecError extends Error {
   readonly code = "invalid_spec" as const;
@@ -156,6 +163,11 @@ export function parseVectorIndexInput(
   input: unknown,
   config: VectorIndexConfig | VectorIndexConfigInput,
 ): VectorIndexQueryInput;
+export function parseVectorIndexInput<TOperation extends VectorIndexOperation>(
+  operation: TOperation,
+  input: unknown,
+  config: VectorIndexConfig | VectorIndexConfigInput,
+): VectorIndexInputForOperation[TOperation];
 export function parseVectorIndexInput(
   operation: VectorIndexOperation,
   input: unknown,
