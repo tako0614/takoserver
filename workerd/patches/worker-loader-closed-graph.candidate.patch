@@ -1,14 +1,7 @@
 diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
 --- a/src/workerd/api/worker-loader.h
 +++ b/src/workerd/api/worker-loader.h
-@@ -62,19 +62,27 @@ class WorkerLoader: public jsg::Object {
-   struct Module {
-     // Exactly one must be filled in.
-     jsg::Optional<kj::String> js;               // ES module
-     jsg::Optional<kj::String> cjs;              // Common JS module
-     jsg::Optional<kj::String> text;             // text blob, imports as a string
-     jsg::Optional<kj::Array<const byte>> data;  // byte blob, imports as ArrayBuffer
-     jsg::Optional<jsg::Value> json;             // arbitrary JS value, will be serialized to JSON
+@@ -69,14 +69,22 @@ class WorkerLoader: public jsg::Object {
                                                  // and then parsed again when imported
      jsg::Optional<kj::String> py;               // Python module
      jsg::Optional<kj::Array<const byte>> wasm;  // compiled WASM module
@@ -30,7 +23,9 @@ diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
 +  };
 +
    struct WorkerCode {
-@@ -85,5 +93,10 @@ class WorkerLoader: public jsg::Object {
+     kj::String compatibilityDate;
+     jsg::Optional<kj::Array<kj::String>> compatibilityFlags;
+@@ -85,6 +93,11 @@ class WorkerLoader: public jsg::Object {
      jsg::Optional<ResourceLimits> limits;
  
      kj::String mainModule;
@@ -41,7 +36,8 @@ diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
 +    jsg::Optional<ModulePolicy> modulePolicy;
  
      // Modules are specified as an object mapping names to content. If the content is just a
-@@ -112,9 +125,11 @@ class WorkerLoader: public jsg::Object {
+     // string, an ES module is assumed for '.js' files and a Python module for '.py' files. For
+@@ -112,10 +125,12 @@ class WorkerLoader: public jsg::Object {
      JSG_STRUCT(compatibilityDate,
          compatibilityFlags,
          allowExperimental,
@@ -53,22 +49,19 @@ diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
          env,
          globalOutbound,
          tails,
-@@ -153,5 +168,6 @@ class WorkerLoader: public jsg::Object {
- 
+         streamingTails);
+@@ -154,5 +169,6 @@ class WorkerLoader: public jsg::Object {
  #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
    api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
 -      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
 +      api::WorkerLoader::Module, api::WorkerLoader::ModulePolicy, api::WorkerLoader::WorkerCode,   \
 +      workerd::ResourceLimits
  
+ }  // namespace workerd::api
 diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
 --- a/src/workerd/api/worker-loader.c++
 +++ b/src/workerd/api/worker-loader.c++
-@@ -17,10 +17,25 @@ namespace {
- // mirrors the documented paid Worker uncompressed size limit (64 MB)
- constexpr size_t MAX_DYNAMIC_WORKER_CODE_SIZE = 64 * 1024 * 1024;
- 
- // Maximum serialized size of the `env` object passed to a dynamically-loaded Worker. This is
+@@ -21,6 +21,21 @@ namespace {
  // roughly the paid Worker analog of 128 environment variables at 5 KB each
  constexpr size_t MAX_DYNAMIC_WORKER_ENV_SIZE = 1 * 1024 * 1024;
  
@@ -90,12 +83,7 @@ diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c
  }  // namespace
  
  jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
-@@ -231,10 +246,11 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
-   return {.source = kj::mv(extractedSource),
-     .compatibilityFlags = compatFlags,
-     .limits = code.limits,
-     .env = kj::mv(env),
-     .globalOutbound = kj::mv(globalOutbound),
+@@ -236,5 +251,6 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
      .tails = kj::mv(tailChannels),
      .streamingTails = kj::mv(streamingTailChannels),
 -    .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),

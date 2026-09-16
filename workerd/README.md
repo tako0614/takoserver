@@ -79,10 +79,11 @@ is not performed by this build script.
 overlay, applied **after** the active `closed-module-graph.patch`. It adds
 WorkerLoader module roles and an explicit application-main policy using the
 same native module boundary as static services. Its SHA-256 is
-`c62aef8d245417b83a80b63486d46f457d41d96aafc2eb62cc3a367b9982df01`.
+`0a1fdc30856db1ab021575cf09e9d55580c2f48884d5b251afb268b878f8aa54`.
 
-Static patch application and JS syntax checks, plus independent source review,
-have passed. Native compilation and WorkerLoader/closed-graph tests have not.
+Static patch application (`git apply --check` and GNU `patch --dry-run --fuzz=0`)
+and JS syntax checks, plus independent source review, have passed. Native
+compilation and WorkerLoader/closed-graph tests have not.
 The normal build script does not apply this candidate, and the active patch,
 source and binary pins remain unchanged. Do not claim Workflow execution
 support or configure a candidate binary from these static checks.
