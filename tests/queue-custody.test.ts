@@ -68,7 +68,7 @@ test("retirement fences new claims and reaps an expired generation with its snap
   millis = 101_001;
   expect(await custody.finishRetirement({ ...FIRST, replacement: SECOND })).toEqual({
     state: "reap",
-    remaining: 1,
+    remainingAtLeast: 1,
   });
   expect(await custody.reapRetired(FIRST)).toEqual({ state: "ready" });
   expect(await custody.finishRetirement({ ...FIRST, replacement: SECOND })).toEqual({
@@ -249,6 +249,14 @@ test("a replacement with a lower retry cap terminalizes over-budget released bac
     state: "activated",
     generation: 2,
   });
+  expect(
+    await custody.readiness({
+      ...lowerCap,
+      maxBatchSize: 1,
+      maxBatchTimeoutSeconds: 0,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 504_000 });
+  millis = 504_000;
   expect(await custody.claim({ ...lowerCap, limit: 1 })).toEqual([]);
   expect(
     await sql.query(
@@ -432,4 +440,276 @@ test("readiness remains ready while bounded active terminal recovery has more wo
       maxBatchTimeoutSeconds: 5,
     }),
   ).toEqual({ state: "idle" });
+});
+
+test("claim makes bounded progress through more than one page of expired unleased rows", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_200_000;
+  const custody = createQueueCustody({ sql, clock: () => new Date(millis) });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-expired-page",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0 },
+  } as const;
+  await custody.admitBatch(
+    SOURCE,
+    Array.from({ length: 100 }, (_, index) => ({
+      messageId: `expired-${index.toString().padStart(3, "0")}`,
+      body: new Uint8Array([index]),
+    })),
+  );
+  await custody.admit(SOURCE, {
+    messageId: "expired-100",
+    body: new Uint8Array([100]),
+  });
+  await custody.activateConsumer(generation);
+  millis += SOURCE.messageRetentionSeconds * 1_000 + 1;
+
+  const readiness = () =>
+    custody.readiness({
+      ...generation,
+      maxBatchSize: 100,
+      maxBatchTimeoutSeconds: 5,
+    });
+  const remaining = async () =>
+    Number(
+      (
+        await sql.query(
+          "SELECT COUNT(*) AS remaining FROM selfhost_queue_messages WHERE queue_id = ?",
+          [SOURCE.queueId],
+        )
+      )[0]?.remaining,
+    );
+
+  expect(await readiness()).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...generation, limit: 100 })).toEqual([]);
+  expect(await remaining()).toBe(51);
+  expect(await readiness()).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...generation, limit: 100 })).toEqual([]);
+  expect(await remaining()).toBe(1);
+  expect(await readiness()).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...generation, limit: 100 })).toEqual([]);
+  expect(await remaining()).toBe(0);
+  expect(await readiness()).toEqual({ state: "idle" });
+});
+
+test("expired non-final leases retry from their observed expiry with snapshotted delay", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_300_000;
+  const ids = ["expired-non-final-one", "expired-non-final-two"];
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => ids.shift() ?? "unused-id",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-expired-non-final",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  } as const;
+  await custody.admit(SOURCE, { messageId: "expired-non-final", body: new Uint8Array([1]) });
+  await custody.activateConsumer(generation);
+  const [first] = await custody.claim({ ...generation, limit: 1, leaseMillis: 1_000 });
+  if (!first) throw new Error("expired non-final first claim is missing");
+
+  millis = 1_301_001;
+  expect(await custody.claim({ ...generation, limit: 1 })).toEqual([]);
+  expect(
+    await sql.query(
+      `SELECT visible_at_ms, deliveries, lease_token
+       FROM selfhost_queue_messages WHERE queue_id = ?`,
+      [SOURCE.queueId],
+    ),
+  ).toEqual([{ visible_at_ms: 1_306_000, deliveries: 1, lease_token: null }]);
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 1,
+      maxBatchTimeoutSeconds: 0,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 1_306_000 });
+  expect(await custody.settle(first, { outcome: "ack" })).toBe(false);
+
+  millis = 1_306_000;
+  const [second] = await custody.claim({ ...generation, limit: 1 });
+  expect(second).toMatchObject({ messageId: "expired-non-final", attempts: 2 });
+});
+
+test("over-cap maintenance preceding a retained future row cannot strand that row", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_400_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "over-cap-maintenance-lease",
+  });
+  const oldGeneration = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-over-cap-window",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 1 },
+  } as const;
+  const lowerCap = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-over-cap-window",
+    generation: 2,
+    policy: { maxRetries: 0, retryDelaySeconds: 1 },
+  } as const;
+  await custody.admitBatch(SOURCE, [
+    { messageId: "a-over-cap", body: new Uint8Array([1]) },
+    { messageId: "b-retained-future", body: new Uint8Array([2]), delaySeconds: 20 },
+  ]);
+  await custody.activateConsumer(oldGeneration);
+  const [overCap] = await custody.claim({ ...oldGeneration, limit: 1 });
+  if (!overCap) throw new Error("over-cap setup claim is missing");
+  expect(await custody.settle(overCap, { outcome: "retry", delaySeconds: 10 })).toBe(true);
+  expect(await custody.beginRetirement(oldGeneration)).toEqual({ state: "ready" });
+  expect(await custody.finishRetirement({ ...oldGeneration, replacement: lowerCap })).toEqual({
+    state: "activated",
+    generation: 2,
+  });
+
+  const readiness = () =>
+    custody.readiness({
+      ...lowerCap,
+      maxBatchSize: 1,
+      maxBatchTimeoutSeconds: 0,
+    });
+  expect(await readiness()).toEqual({ state: "waiting", wakeAtMillis: 1_410_000 });
+  millis = 1_410_000;
+  expect(await readiness()).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...lowerCap, limit: 1 })).toEqual([]);
+  expect(await readiness()).toEqual({ state: "waiting", wakeAtMillis: 1_420_000 });
+  expect(
+    await sql.query(
+      "SELECT message_id FROM selfhost_queue_messages WHERE queue_id = ? ORDER BY message_id",
+      [SOURCE.queueId],
+    ),
+  ).toEqual([{ message_id: "b-retained-future" }]);
+
+  millis = 1_420_000;
+  const [retained] = await custody.claim({ ...lowerCap, limit: 1 });
+  expect(retained).toMatchObject({ messageId: "b-retained-future", attempts: 1 });
+});
+
+test("retirement observes the earliest exact lease without counting the backlog", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_500_000;
+  const ids = ["retirement-earliest-one", "retirement-earliest-two"];
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => ids.shift() ?? "unused-id",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-retirement-earliest",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  } as const;
+  await custody.admitBatch(SOURCE, [
+    { messageId: "retirement-one", body: new Uint8Array([1]) },
+    { messageId: "retirement-two", body: new Uint8Array([2]) },
+  ]);
+  await custody.activateConsumer(generation);
+  expect(await custody.claim({ ...generation, limit: 1, leaseMillis: 1_000 })).toHaveLength(1);
+  expect(await custody.claim({ ...generation, limit: 1, leaseMillis: 5_000 })).toHaveLength(1);
+  expect(await custody.beginRetirement(generation)).toEqual({
+    state: "waiting",
+    waitUntilMillis: 1_501_000,
+  });
+
+  millis = 1_501_001;
+  expect(await custody.finishRetirement(generation)).toEqual({
+    state: "reap",
+    remainingAtLeast: 1,
+  });
+  expect(await custody.reapRetired({ ...generation, limit: 1 })).toEqual({
+    state: "waiting",
+    waitUntilMillis: 1_505_000,
+  });
+});
+
+test("bounded retention sweep also reclaims queues without an active Consumer", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_600_000;
+  const custody = createQueueCustody({ sql, clock: () => new Date(millis) });
+  const shortRetention = { ...SOURCE, messageRetentionSeconds: 60 } as const;
+  await custody.admitBatch(shortRetention, [
+    { messageId: "inactive-expired-one", body: new Uint8Array([1]) },
+    { messageId: "inactive-expired-two", body: new Uint8Array([2]) },
+  ]);
+  expect(await custody.sweepExpired(1)).toBe(0);
+  millis += 60_000;
+  expect(await custody.sweepExpired(1)).toBe(1);
+  expect(await custody.sweepExpired(1)).toBe(1);
+  expect(await custody.sweepExpired(1)).toBe(0);
+});
+
+test("retention sweep fences an expired leased row and makes stale settlement a no-op", async () => {
+  const sql = createEphemeralSql();
+  let millis = 1_700_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "retention-expired-lease",
+  });
+  const target = { ...SOURCE, messageRetentionSeconds: 60 } as const;
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-retention-expired-lease",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  } as const;
+  await custody.admit(target, {
+    messageId: "retention-expired-lease",
+    body: new Uint8Array([1]),
+  });
+  await custody.activateConsumer(generation);
+  const [claimed] = await custody.claim({ ...generation, limit: 1, leaseMillis: 120_000 });
+  if (!claimed) throw new Error("retention expiry claim is missing");
+
+  millis += 60_000;
+  expect(await custody.sweepExpired(1)).toBe(1);
+  expect(await custody.settle(claimed, { outcome: "ack" })).toBe(false);
+});
+
+test("readiness and lease recovery plans use their exact ordered indexes", async () => {
+  const sql = createEphemeralSql();
+  const unleased = await sql.query(
+    `EXPLAIN QUERY PLAN
+     SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries
+     FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_ready
+     WHERE queue_id = ? AND lease_token IS NULL
+     ORDER BY visible_at_ms LIMIT ?`,
+    [SOURCE.queueId, 100],
+  );
+  const leases = await sql.query(
+    `EXPLAIN QUERY PLAN
+     SELECT lease_expires_at_ms
+     FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
+     WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
+       AND lease_expires_at_ms <= ?
+     ORDER BY lease_expires_at_ms LIMIT ?`,
+    [SOURCE.queueId, FIRST.consumerId, FIRST.generation, 1, 50],
+  );
+  const expiry = await sql.query(
+    `EXPLAIN QUERY PLAN
+     SELECT queue_id, message_id
+     FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_expiry
+     WHERE expires_at_ms <= ?
+     ORDER BY expires_at_ms LIMIT ?`,
+    [1, 100],
+  );
+  expect(unleased.map((row) => String(row.detail)).join("\n")).toContain(
+    "selfhost_queue_messages_custody_ready (queue_id=? AND lease_token=?)",
+  );
+  expect(leases.map((row) => String(row.detail)).join("\n")).toContain(
+    "selfhost_queue_messages_custody_lease (queue_id=? AND lease_consumer_id=? AND lease_generation=? AND lease_expires_at_ms<?)",
+  );
+  expect(expiry.map((row) => String(row.detail)).join("\n")).toContain(
+    "selfhost_queue_messages_expiry (expires_at_ms<?)",
+  );
 });
