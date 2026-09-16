@@ -209,4 +209,16 @@ export {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export {
+  parseVectorIndexConfig,
+  type VectorIndexConfig,
+  VectorIndexInvalidSpecError,
+} from "./vector-index-codec.ts";
+export {
+  createVectorIndexStore,
+  type VectorIndexIndex,
+  type VectorIndexScope,
+  type VectorIndexStore,
+  VectorIndexStoreError,
+} from "./vector-index-store.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";

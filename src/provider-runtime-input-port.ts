@@ -71,9 +71,12 @@ export interface ProviderRuntimeInputPreparationIdentity {
 }
 
 /**
- * A claimed in-memory lease. Values never cross a provider result, Output, or
- * durable provider state. `dispatch` erases the durable ciphertext before the
- * adapter sends these values to its backend.
+ * A claimed in-memory lease. Values never enter provider results, Outputs,
+ * portable Resource state, observations or logs. `dispatch` erases this
+ * handoff's durable ciphertext before the adapter sends values to its backend.
+ * Backend-native runtime material has a separate provider-owned persistence,
+ * access and deletion lifecycle; this one-shot lease is not its storage or
+ * recovery interface.
  */
 export interface ProviderRuntimeInputLease {
   readonly bindings: Readonly<Record<string, string>>;
@@ -83,12 +86,15 @@ export interface ProviderRuntimeInputLease {
   dispatch(): Promise<ProviderRuntimeInputDispatchedLease>;
 }
 
-/** The only operation available after durable secret bytes have been erased. */
+/** The only operation available after this handoff's durable ciphertext is erased. */
 export interface ProviderRuntimeInputDispatchedLease {
   settle(receiptDigest: `sha256:${string}`): Promise<void>;
 }
 
-/** Readback-only recovery view. Secret values are already erased and never return here. */
+/**
+ * Readback-only recovery view. This handoff's durable ciphertext is erased;
+ * values never return through recovery.
+ */
 export interface ProviderRuntimeInputRecoveryLease {
   readonly preparation: ProviderRuntimeInputPreparationIdentity;
   readonly bindingNames: readonly string[];
