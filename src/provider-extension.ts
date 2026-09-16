@@ -149,6 +149,12 @@ export type {
   CloudflareWorkersForPlatformsBackendFactoryOptions,
 } from "./providers/cloudflare-worker-backend.ts";
 export {
+  EDGE_VECTOR_WORKER_FACADE_KIND,
+  EDGE_VECTOR_WORKER_FACADE_SAFE_INTRINSICS,
+  type EdgeVectorWorkerFacadeSafeIntrinsic,
+  renderEdgeVectorWorkerFacadeSource,
+} from "./providers/edge-vector-worker-facade-source.ts";
+export {
   createHttpRevisionServing,
   type HttpRevisionBackendObservation,
   type HttpRevisionServingBackend,
@@ -209,4 +215,16 @@ export {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export {
+  parseVectorIndexConfig,
+  type VectorIndexConfig,
+  VectorIndexInvalidSpecError,
+} from "./vector-index-codec.ts";
+export {
+  createVectorIndexStore,
+  type VectorIndexIndex,
+  type VectorIndexScope,
+  type VectorIndexStore,
+  VectorIndexStoreError,
+} from "./vector-index-store.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";
