@@ -494,7 +494,7 @@ function applicationFailure(error: unknown, phase: string): unknown {
 export class ActorExecutionError extends SafeError {
   declare readonly name: "ActorExecutionError";
   declare readonly phase: string;
-  readonly cause: unknown;
+  override readonly cause: unknown;
 
   constructor(phase: string, cause: unknown) {
     super("actor execution failed");
