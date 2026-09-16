@@ -72,3 +72,22 @@ adapter and fixtures portably; tests given `TAKOSERVER_WORKERD_BINARY` also run
 the exact binary's capability probe and real serving E2E. Publishing or
 replacing an operator's binary is a separate release/deployment authority and
 is not performed by this build script.
+
+## Unqualified WorkerLoader closed-graph candidate
+
+`patches/worker-loader-closed-graph.candidate.patch` is a separate development
+overlay, applied **after** the active `closed-module-graph.patch`. It adds
+WorkerLoader module roles and an explicit application-main policy using the
+same native module boundary as static services. Its SHA-256 is
+`c62aef8d245417b83a80b63486d46f457d41d96aafc2eb62cc3a367b9982df01`.
+
+Static patch application and JS syntax checks, plus independent source review,
+have passed. Native compilation and WorkerLoader/closed-graph tests have not.
+The normal build script does not apply this candidate, and the active patch,
+source and binary pins remain unchanged. Do not claim Workflow execution
+support or configure a candidate binary from these static checks.
+
+Promotion requires a separately qualified combined overlay and new artifact
+identity, then outer/tenant-isolate runtime wiring and native RPC, lifecycle and
+isolation acceptance. The existing one-process guard and its physical-stop
+barrier are not replaced by this candidate.
