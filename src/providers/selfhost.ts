@@ -18,6 +18,7 @@ import {
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
   type ProviderOffering,
+  type ProviderReadAuthorityTarget,
   ProviderReadbackDescriptorError,
   type ProviderRelation,
   type ProviderRuntimeBinding,
@@ -56,6 +57,17 @@ import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "../takoform/limits.ts";
+import {
+  parseVectorIndexConfig,
+  type VectorIndexConfig,
+  VectorIndexInvalidSpecError,
+} from "../vector-index-codec.ts";
+import {
+  type VectorIndexIndex,
+  type VectorIndexScope,
+  type VectorIndexStore,
+  VectorIndexStoreError,
+} from "../vector-index-store.ts";
 import {
   internalHostname,
   readWorkerdActiveDeployment,
@@ -186,6 +198,8 @@ const WORKER_VERSION_VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
 const MAX_WORKER_VERSION_DATA_BINDINGS = 64;
 const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
+const VECTOR_NATIVE_PREFIX = "selfhost-vector";
+const VECTOR_NATIVE_SEGMENT = /^tvi-[0-9a-f]{64}$/u;
 const SELFHOST_SERVICE_BINDING_REF = Object.freeze({
   apiVersion: "bindings.takoform.com/v1alpha2",
   name: "module-worker.service",
@@ -254,6 +268,8 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** Explicit, host-private VectorIndex SQL lifecycle service. */
+  readonly vectorIndexStore?: VectorIndexStore;
   /** Exact technical relation authorities for post-delete native readback. */
   readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
   /** Where databases, materialized versions, and script state live. */
@@ -2982,6 +2998,177 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
+   * VectorIndex is intentionally opt-in on self-host.  The offering must be a
+   * member of this provider's explicitly composed offering set and the
+   * host-private SQL service must be present; a caller cannot turn on a
+   * candidate Form merely by spelling its kind in an operation.
+   */
+  const isConfiguredVectorIndexOffering = (offering: ProviderOffering): boolean =>
+    options.vectorIndexStore !== undefined &&
+    offering.form.kind === "VectorIndex" &&
+    options.offerings.some(
+      (candidate) =>
+        candidate.id === offering.id &&
+        candidate.form.kind === "VectorIndex" &&
+        canonicalJson(candidate.form) === canonicalJson(offering.form),
+    );
+
+  const vectorIndexKind = (offering: ProviderOffering): string =>
+    isConfiguredVectorIndexOffering(offering) ? "VectorIndex" : dispatchKind(offering);
+
+  const vectorIndexFailure = (error: unknown): ProviderTicket => selfhostVectorStoreFailure(error);
+
+  const vectorApply = async (input: ApplyInput): Promise<ProviderTicket> => {
+    const scope = selfhostVectorScope(input.identity);
+    if (!scope) {
+      return failed("invalid_spec", "the VectorIndex requires a valid Resource UID");
+    }
+    const expectedNativeId = selfhostVectorNativeId(scope);
+    if (input.previous && input.previous.nativeId !== expectedNativeId) {
+      return failed("conflict", "the VectorIndex Resource identity has changed");
+    }
+    let config: VectorIndexConfig;
+    try {
+      config = parseVectorIndexConfig(input.spec);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+    const store = options.vectorIndexStore;
+    if (!store) return failed("invalid_spec", "the VectorIndex offering is not configured");
+    try {
+      await store.ensureIndex({ ...scope, config });
+      const index = await store.readIndex(scope);
+      if (!index) {
+        return failed("unavailable", "the VectorIndex index is not durable", true);
+      }
+      if (!sameSelfhostVectorConfig(index.config, config)) {
+        return failed("conflict", "the VectorIndex configuration is immutable");
+      }
+      const count = await store.readCount(scope);
+      return selfhostVectorSucceeded(expectedNativeId, index, count);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+  };
+
+  const vectorObserve = async (input: {
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+    readonly spec: JsonObject;
+  }): Promise<ProviderTicket> => {
+    const scope = selfhostVectorScope(input.identity);
+    if (!scope) return failed("invalid_spec", "the VectorIndex requires a valid Resource UID");
+    const expectedNativeId = selfhostVectorNativeId(scope);
+    if (input.nativeId !== expectedNativeId) {
+      return failed("conflict", "the VectorIndex Resource identity has changed");
+    }
+    let config: VectorIndexConfig;
+    try {
+      config = parseVectorIndexConfig(input.spec);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+    const store = options.vectorIndexStore;
+    if (!store) return failed("invalid_spec", "the VectorIndex offering is not configured");
+    try {
+      const index = await store.readIndex(scope);
+      if (!index) return failed("not_found", "the VectorIndex index is absent");
+      if (!sameSelfhostVectorConfig(index.config, config)) {
+        return failed("conflict", "the VectorIndex configuration is immutable");
+      }
+      const count = await store.readCount(scope);
+      return selfhostVectorSucceeded(expectedNativeId, index, count);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+  };
+
+  const vectorDelete = async (input: {
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+  }): Promise<ProviderTicket> => {
+    const scope = selfhostVectorScope(input.identity);
+    if (!scope) return failed("invalid_spec", "the VectorIndex requires a valid Resource UID");
+    const expectedNativeId = selfhostVectorNativeId(scope);
+    if (input.nativeId !== expectedNativeId) {
+      return failed("conflict", "the VectorIndex Resource identity has changed");
+    }
+    const store = options.vectorIndexStore;
+    if (!store) return failed("invalid_spec", "the VectorIndex offering is not configured");
+    try {
+      await store.deleteIndex(scope);
+      // The lifecycle acknowledgement is not the SQL DELETE itself: prove the
+      // application-visible absence before telling the Host the Resource is
+      // gone.  This also makes an unknown/idempotent delete safe.
+      const remaining = await store.readIndex(scope);
+      if (remaining) {
+        return failed("unavailable", "the VectorIndex delete is not yet visible", true);
+      }
+      return succeeded({
+        nativeId: input.nativeId,
+        observed: { deleted: true },
+        outputs: {},
+        disposition: "deleted",
+      });
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+  };
+
+  const vectorRecoverApply = async (input: ApplyInput): Promise<ProviderTicket> => {
+    const scope = selfhostVectorScope(input.identity);
+    if (!scope) return failed("invalid_spec", "the VectorIndex requires a valid Resource UID");
+    const expectedNativeId = selfhostVectorNativeId(scope);
+    if (input.previous && input.previous.nativeId !== expectedNativeId) {
+      return failed("conflict", "the VectorIndex Resource identity has changed");
+    }
+    let config: VectorIndexConfig;
+    try {
+      config = parseVectorIndexConfig(input.spec);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+    const store = options.vectorIndexStore;
+    if (!store) return failed("invalid_spec", "the VectorIndex offering is not configured");
+    try {
+      const index = await store.readIndex(scope);
+      if (!index) {
+        return failed("unavailable", "the VectorIndex apply outcome is indeterminate", true);
+      }
+      if (!sameSelfhostVectorConfig(index.config, config)) {
+        return failed("conflict", "the VectorIndex configuration is immutable");
+      }
+      const count = await store.readCount(scope);
+      return selfhostVectorSucceeded(expectedNativeId, index, count);
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+  };
+
+  const vectorRecoverDelete = async (input: {
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+  }): Promise<ProviderTicket> => {
+    const scope = selfhostVectorScope(input.identity);
+    if (!scope) return failed("invalid_spec", "the VectorIndex requires a valid Resource UID");
+    const expectedNativeId = selfhostVectorNativeId(scope);
+    if (input.nativeId !== expectedNativeId) {
+      return failed("conflict", "the VectorIndex Resource identity has changed");
+    }
+    const store = options.vectorIndexStore;
+    if (!store) return failed("invalid_spec", "the VectorIndex offering is not configured");
+    try {
+      const remaining = await store.readIndex(scope);
+      if (remaining) {
+        return failed("unavailable", "the local VectorIndex delete outcome is not proven", true);
+      }
+      return succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
+    } catch (error) {
+      return vectorIndexFailure(error);
+    }
+  };
+
+  /**
    * The current ObjectBucket Form, as opposed to the retained v1beta1 drain.
    *
    * They are two Forms with one kind, and only one of them is a store: the
@@ -3118,7 +3305,25 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
-      const kind = dispatchKind(input.offering);
+      const kind = vectorIndexKind(input.offering);
+      if (kind === "VectorIndex") {
+        const scope = selfhostVectorScope(input.identity);
+        if (!scope || !options.vectorIndexStore) throw new ProviderReadbackDescriptorError();
+        const expectedNativeId = selfhostVectorNativeId(scope);
+        if (input.nativeId !== expectedNativeId) throw new ProviderReadbackDescriptorError();
+        const indexName = expectedNativeId.slice(`${VECTOR_NATIVE_PREFIX}:`.length);
+        return {
+          apiVersion: PROVIDER_READBACK_API_VERSION,
+          provider: id,
+          kind,
+          nativeId: input.nativeId,
+          data: {
+            indexName,
+            tenantId: scope.tenantId,
+            resourceUid: scope.resourceUid,
+          },
+        };
+      }
       const parsed = parseSelfhostNativeId(kind, input.nativeId, input.spec, input.relations);
       if (!parsed) throw new ProviderReadbackDescriptorError();
       const data =
@@ -3142,12 +3347,42 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     async verifyNativeAbsence(input: {
       offering: ProviderOffering;
       descriptor: ProviderNativeReadbackDescriptor;
+      target?: ProviderReadAuthorityTarget;
     }): Promise<ProviderNativeAbsence> {
-      const kind = dispatchKind(input.offering);
+      const kind = vectorIndexKind(input.offering);
       const parsed = validateSelfhostReadbackDescriptor(id, kind, input.descriptor);
       if (!parsed) return selfhostUnknown("malformed", false);
       try {
         switch (kind) {
+          case "VectorIndex": {
+            const target = input.target;
+            const store = options.vectorIndexStore;
+            if (!store || !target || !parsed.indexName || !parsed.tenantId || !parsed.resourceUid) {
+              return selfhostUnknown("authority_unavailable", true);
+            }
+            if (
+              parsed.tenantId !== target.tenantId ||
+              parsed.resourceUid !== target.resourceUid ||
+              input.descriptor.nativeId !==
+                selfhostVectorNativeId({
+                  tenantId: target.tenantId,
+                  resourceUid: target.resourceUid,
+                })
+            ) {
+              return selfhostUnknown("malformed", false);
+            }
+            const index = await store.readIndex({
+              tenantId: target.tenantId,
+              resourceUid: target.resourceUid,
+            });
+            return selfhostAbsence(
+              index ? "present" : "absent",
+              input.descriptor,
+              kind,
+              id,
+              parsed.data,
+            );
+          }
           case "ModuleWorker":
             if (!parsed.script) return selfhostUnknown("malformed", false);
             return await verifySelfhostWorkerAbsence(
@@ -3271,6 +3506,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async recoverApply(input): Promise<ProviderTicket> {
+      if (isConfiguredVectorIndexOffering(input.offering)) {
+        return await vectorRecoverApply(input);
+      }
       if (dispatchKind(input.offering) === "WorkerEndpoint") {
         try {
           const worker = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -3333,6 +3571,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         // dispatches on kind alone and the retained v1beta1 drain answers to
         // the same one with an address-derived name it must keep.
         if (currentObjectBucket(input.offering)) return await applyObjectBucket(input);
+        if (isConfiguredVectorIndexOffering(input.offering)) return await vectorApply(input);
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker":
             return await applyModuleWorker(input);
@@ -3376,6 +3615,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
 
     async observe(input): Promise<ProviderTicket> {
       try {
+        if (isConfiguredVectorIndexOffering(input.offering)) return await vectorObserve(input);
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
@@ -3665,6 +3905,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         // Host that can refuse. The retained v1beta1 drain falls through to the
         // default below: it never held anything here.
         if (currentObjectBucket(input.offering)) return await deleteObjectBucket(input);
+        if (isConfiguredVectorIndexOffering(input.offering)) return await vectorDelete(input);
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
@@ -3896,6 +4137,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           true,
         );
       try {
+        if (isConfiguredVectorIndexOffering(input.offering))
+          return await vectorRecoverDelete(input);
         // The current ObjectBucket is the one namespace with residual bytes, so
         // "is it gone" is a question this Host reads rather than asserts. A
         // completed destroy leaves no object and no upload receipt, so both
@@ -4270,6 +4513,82 @@ interface SelfhostReadbackParsed {
   readonly versionId?: string;
   readonly hostname?: string;
   readonly databaseName?: string;
+  readonly indexName?: string;
+  readonly tenantId?: string;
+  readonly resourceUid?: string;
+}
+
+function selfhostVectorScope(identity: ResourceIdentity): VectorIndexScope | null {
+  if (
+    typeof identity.tenantRef !== "string" ||
+    !boundedSelfhostVectorString(identity.tenantRef, 1, 255) ||
+    identity.tenantRef.includes("\u0000") ||
+    typeof identity.uid !== "string" ||
+    !RESOURCE_UID.test(identity.uid) ||
+    !boundedSelfhostVectorString(identity.uid, 3, 128)
+  ) {
+    return null;
+  }
+  return { tenantId: identity.tenantRef, resourceUid: identity.uid };
+}
+
+function selfhostVectorNativeId(scope: VectorIndexScope): string {
+  const digest = createHash("sha256")
+    .update(`${scope.tenantId}\u0000${scope.resourceUid}`, "utf8")
+    .digest("hex");
+  return `${VECTOR_NATIVE_PREFIX}:tvi-${digest}`;
+}
+
+function sameSelfhostVectorConfig(left: VectorIndexConfig, right: VectorIndexConfig): boolean {
+  return (
+    left.dimension === right.dimension &&
+    left.metric === right.metric &&
+    canonicalJson(left.filterKeys) === canonicalJson(right.filterKeys)
+  );
+}
+
+function selfhostVectorSucceeded(
+  nativeId: string,
+  index: VectorIndexIndex,
+  count: number,
+): ProviderTicket {
+  return succeeded({
+    nativeId,
+    observed: {
+      dimension: index.config.dimension,
+      metric: index.config.metric,
+      filterKeys: [...index.config.filterKeys],
+      count,
+    },
+    outputs: {},
+  });
+}
+
+function selfhostVectorStoreFailure(error: unknown): ProviderTicket {
+  const code =
+    error instanceof VectorIndexInvalidSpecError
+      ? "invalid_spec"
+      : error instanceof VectorIndexStoreError
+        ? error.code
+        : (() => {
+            const value = errorCode(error);
+            return value === "invalid_spec" || value === "quota" || value === "unavailable"
+              ? value
+              : "unavailable";
+          })();
+  switch (code) {
+    case "invalid_spec":
+      return failed("invalid_spec", "the VectorIndex declaration is invalid");
+    case "quota":
+      return failed("quota", "the VectorIndex record quota has been reached");
+    case "unavailable":
+      return failed("unavailable", "the VectorIndex storage is unavailable", true);
+  }
+}
+
+function boundedSelfhostVectorString(value: string, minimum: number, maximum: number): boolean {
+  const length = [...value].length;
+  return length >= minimum && length <= maximum;
 }
 
 /**
@@ -4377,6 +4696,25 @@ function parseSelfhostNativeId(
       return parts[0] === "selfhost-sqlite" && safeSegment(parts[1])
         ? { databaseName: parts[1] as string, data: { databaseName: parts[1] as string } }
         : null;
+    case "VectorIndex": {
+      const indexName =
+        parts[0] === VECTOR_NATIVE_PREFIX && VECTOR_NATIVE_SEGMENT.test(parts[1] ?? "")
+          ? (parts[1] as string)
+          : null;
+      if (!indexName) return null;
+      const tenantId = optionalVectorReadbackScope(spec?.tenantId);
+      const resourceUid = optionalVectorReadbackResourceUid(spec?.resourceUid);
+      return {
+        indexName,
+        ...(tenantId === undefined ? {} : { tenantId }),
+        ...(resourceUid === undefined ? {} : { resourceUid }),
+        data: {
+          indexName,
+          ...(tenantId === undefined ? {} : { tenantId }),
+          ...(resourceUid === undefined ? {} : { resourceUid }),
+        },
+      };
+    }
     default:
       return null;
   }
@@ -4468,7 +4806,9 @@ function validateSelfhostReadbackDescriptor(
   const matches =
     kind === "WorkerEndpoint"
       ? selfhostEndpointDataMatches(parsed, descriptor.data)
-      : selfhostDataMatches(parsed.data, descriptor.data);
+      : kind === "VectorIndex"
+        ? selfhostVectorDataMatches(parsed, descriptor.data)
+        : selfhostDataMatches(parsed.data, descriptor.data);
   if (!matches) return null;
   // The descriptor creator may include safe worker relation metadata. Reject
   // an incomplete relation tuple rather than allowing an ambiguous parent.
@@ -4482,6 +4822,16 @@ function validateSelfhostReadbackDescriptor(
     return null;
   }
   return parsed;
+}
+
+function selfhostVectorDataMatches(parsed: SelfhostReadbackParsed, actual: JsonObject): boolean {
+  if (!parsed.indexName || !parsed.tenantId || !parsed.resourceUid) return false;
+  const expected = {
+    indexName: parsed.indexName,
+    tenantId: parsed.tenantId,
+    resourceUid: parsed.resourceUid,
+  };
+  return selfhostDataMatches(expected, actual);
 }
 
 function selfhostEndpointDataMatches(parsed: SelfhostReadbackParsed, actual: JsonObject): boolean {
@@ -4825,6 +5175,22 @@ function safeSegment(value: unknown): value is string {
 
 function optionalSafeString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 && value.length <= 4_096 ? value : undefined;
+}
+
+function optionalVectorReadbackScope(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    boundedSelfhostVectorString(value, 1, 255) &&
+    !value.includes("\u0000")
+    ? value
+    : undefined;
+}
+
+function optionalVectorReadbackResourceUid(value: unknown): string | undefined {
+  return typeof value === "string" &&
+    RESOURCE_UID.test(value) &&
+    boundedSelfhostVectorString(value, 3, 128)
+    ? value
+    : undefined;
 }
 
 function normalizedHostname(value: unknown): string | undefined {
