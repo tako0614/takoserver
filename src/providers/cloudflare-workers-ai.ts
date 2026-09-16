@@ -10,6 +10,11 @@ const MAX_RESPONSE_CHARACTERS = 64 * 1024;
 const MAX_TOOL_CALLS = 16;
 const MAX_TOOL_ARGUMENT_CHARACTERS = 256 * 1024;
 
+/** Validate the native adapter's reference syntax, not live model availability. */
+export function isCloudflareWorkersAiModelReference(value: string): boolean {
+  return UPSTREAM_REFERENCE.test(value);
+}
+
 export interface CloudflareWorkersAiBinding {
   run(
     model: string,
@@ -42,7 +47,7 @@ export function createCloudflareWorkersAiGateway(options: CloudflareWorkersAiOpt
 
   const configured = new Map<string, OpenAiModelConfig>();
   for (const model of options.models) {
-    if (!UPSTREAM_REFERENCE.test(model.upstreamId) || configured.has(model.id)) {
+    if (!isCloudflareWorkersAiModelReference(model.upstreamId) || configured.has(model.id)) {
       throw new TypeError("invalid Workers AI model mapping");
     }
     configured.set(model.id, structuredClone(model));

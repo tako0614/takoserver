@@ -10,6 +10,7 @@ import {
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
+import { isCloudflareWorkersAiModelReference } from "../../src/providers/cloudflare-workers-ai.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
@@ -1070,7 +1071,10 @@ function zoneList(value: unknown): readonly Record<string, unknown>[] {
 
 function modelList(value: unknown): readonly Record<string, unknown>[] {
   try {
-    parseOpenAiModelConfig(JSON.stringify(value));
+    const models = parseOpenAiModelConfig(JSON.stringify(value));
+    if (models.some((model) => !isCloudflareWorkersAiModelReference(model.upstreamId))) {
+      throw new TypeError("non-Workers-AI upstream model reference");
+    }
   } catch {
     throw preflightError("deploy target `aiModels` is invalid");
   }

@@ -237,6 +237,20 @@ describe("private data service deploy configuration", () => {
     }
   });
 
+  test("rejects non-Workers-AI upstream mappings before a deploy can start", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
+    try {
+      const path = join(directory, "target.json");
+      writeFileSync(
+        path,
+        JSON.stringify({ ...BASE, aiModels: [{ ...MODEL, upstreamId: "openai/gpt-4o" }] }),
+      );
+      expect(() => loadTarget(path, "production")).toThrow("deploy target `aiModels` is invalid");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("realizes ObjectBucket supply without any public S3 credential configuration", () => {
     const directory = mkdtempSync(join(tmpdir(), "takoserver-target-"));
     try {
