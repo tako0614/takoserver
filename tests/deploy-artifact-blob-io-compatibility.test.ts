@@ -123,7 +123,7 @@ function receipt(path: string, overrides: Readonly<Record<string, unknown>> = {}
 }
 
 describe("0043 artifact blob I/O deployment compatibility", () => {
-  test("allows only the exact 0037-0043 lineage and contiguous later pending migrations through 0055", () => {
+  test("allows only the exact 0037-0043 lineage and contiguous later pending migrations through 0057", () => {
     const suffix = [
       "0037_worker_runtime_input_preparation_v2.sql",
       "0038_selfhost_edge_kv.sql",
@@ -156,6 +156,16 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(artifactBlobIoCompatibilityAllowsPending(target, through0054)).toBe(true);
     const through0055 = [...through0054, "0055_queue_custody_transfer_notices.sql"];
     expect(artifactBlobIoCompatibilityAllowsPending(target, through0055)).toBe(true);
+    const through0056 = [...through0055, "0056_vector_index_storage.sql"];
+    expect(artifactBlobIoCompatibilityAllowsPending(target, through0056)).toBe(true);
+    const through0057 = [
+      ...through0056,
+      "0057_cloudflare_managed_worker_version_execution_material.sql",
+    ];
+    expect(artifactBlobIoCompatibilityAllowsPending(target, through0057)).toBe(true);
+    expect(artifactBlobIoCompatibilityAllowsPending(target, through0057.slice(6))).toBe(true);
+    expect(artifactBlobIoCompatibilityAllowsPending(target, through0057.slice(13))).toBe(true);
+    expect(artifactBlobIoCompatibilityAllowsPending(target, [through0057.at(-1)!])).toBe(true);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
         ...through0051.slice(0, -1),
@@ -164,11 +174,11 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     ).toBe(false);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, ["0052_workflow_termination_intent.sql"]),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
-        ...through0055,
-        "0057_unreviewed_extension.sql",
+        ...through0057,
+        "0058_unreviewed_extension.sql",
       ]),
     ).toBe(false);
     expect(
@@ -177,13 +187,29 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
         "0043_artifact_blob_io_fences.sql",
-        "0044_artifact_consumer_resolution_receipts.sql",
+        ...through0057.slice(7),
       ]),
     ).toBe(true);
     expect(artifactBlobIoCompatibilityAllowsPending(target, [])).toBe(false);
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
         "0044_artifact_consumer_resolution_receipts.sql",
+      ]),
+    ).toBe(true);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0052_workflow_termination_intent.sql",
+        "0053_queue_custody.sql",
+        "0054_queue_custody_readiness.sql",
+        "0055_queue_custody_transfer_notices.sql",
+        "0056_vector_index_storage.sql",
+        "0057_cloudflare_managed_worker_version_execution_material.sql",
+      ]),
+    ).toBe(true);
+    expect(
+      artifactBlobIoCompatibilityAllowsPending(target, [
+        "0057_cloudflare_managed_worker_version_execution_material.sql",
+        "0058_unreviewed_extension.sql",
       ]),
     ).toBe(false);
     expect(

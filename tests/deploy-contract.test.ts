@@ -180,7 +180,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "exact pending lineage through 0043",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain(
-      "accepted contiguous 0044-0056 tail",
+      "accepted contiguous 0044-0057 tail",
     );
     expect(routineWorker?.obligations["failure-handling"]).toContain("all-traffic");
     expect(routineWorker?.obligations["failure-handling"]).toContain(
@@ -218,6 +218,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(schema?.obligations.provenance).toContain("0054");
     expect(schema?.obligations.provenance).toContain("0055");
     expect(schema?.obligations.provenance).toContain("0056");
+    expect(schema?.obligations.provenance).toContain("0057");
     expect(schema?.obligations["post-conditions"]).toContain(
       "exact artifact-recovery singleton and its receipt constraints",
     );
@@ -578,6 +579,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0054",
       "0055",
       "0056",
+      "0057",
     ] as const) {
       for (const environment of ["integration", "rehearsal", "production"] as const) {
         test(`accepts schema wave ${through} in ${environment}`, async () => {

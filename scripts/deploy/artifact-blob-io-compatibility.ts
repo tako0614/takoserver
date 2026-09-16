@@ -49,6 +49,8 @@ const COMPATIBILITY_PENDING_SUFFIX = [
   "0053_queue_custody.sql",
   "0054_queue_custody_readiness.sql",
   "0055_queue_custody_transfer_notices.sql",
+  "0056_vector_index_storage.sql",
+  "0057_cloudflare_managed_worker_version_execution_material.sql",
 ] as const;
 const COMPATIBILITY_BOUNDARY_INDEX = COMPATIBILITY_PENDING_SUFFIX.indexOf(
   "0043_artifact_blob_io_fences.sql",
@@ -96,10 +98,11 @@ export function artifactBlobIoCompatibilityAllowsPending(
 ): boolean {
   if (target.artifactBlobIoMode !== QUIESCED_MODE || pending.length === 0) return false;
   return COMPATIBILITY_PENDING_SUFFIX.some((_name, index) => {
-    if (index > COMPATIBILITY_BOUNDARY_INDEX) return false;
-    const minimumLength = COMPATIBILITY_BOUNDARY_INDEX - index + 1;
+    const minimumLength =
+      index <= COMPATIBILITY_BOUNDARY_INDEX ? COMPATIBILITY_BOUNDARY_INDEX - index + 1 : 1;
     return (
       pending.length >= minimumLength &&
+      pending.length <= COMPATIBILITY_PENDING_SUFFIX.length - index &&
       pending.every((name, offset) => COMPATIBILITY_PENDING_SUFFIX[index + offset] === name)
     );
   });
