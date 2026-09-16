@@ -19,11 +19,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
 
 /** Current audited source, including the additive 0050/0051 workflow tables,
  * 0052 termination intent, 0053 Queue custody state, its 0054 bounded
- * readiness index, its 0055 durable transfer notices, and the 0056 bounded
- * VectorIndex SQL store. */
+ * readiness index, its 0055 durable transfer notices, the 0056 bounded
+ * VectorIndex SQL store, and the reviewed 0057 execution-material tables. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 56 || MIGRATIONS.at(-1)?.name !== "0056_vector_index_storage.sql") {
-    throw new Error("current schema fixture requires the audited 0001-0056 lineage");
+  if (
+    MIGRATIONS.length !== 57 ||
+    MIGRATIONS.at(-1)?.name !== "0057_cloudflare_managed_worker_version_execution_material.sql"
+  ) {
+    throw new Error("current schema fixture requires the audited 0001-0057 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {
