@@ -264,3 +264,172 @@ test("a replacement with a lower retry cap terminalizes over-budget released bac
   ]);
   expect(await custody.settle(claimed, { outcome: "ack" })).toBe(false);
 });
+
+test("readiness fences the generation and schedules visibility, timeout, and a full batch", async () => {
+  const sql = createEphemeralSql();
+  let millis = 600_000;
+  const custody = createQueueCustody({ sql, clock: () => new Date(millis) });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-readiness",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 3 },
+  } as const;
+  await custody.activateConsumer(generation);
+
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 2,
+      maxBatchTimeoutSeconds: 60,
+    }),
+  ).toEqual({ state: "idle" });
+  expect(
+    custody.readiness({
+      ...generation,
+      maxBatchSize: 2,
+      maxBatchTimeoutSeconds: 61,
+    }),
+  ).rejects.toThrow("queue custody readiness batch timeout is invalid");
+  await custody.admitBatch(SOURCE, [
+    { messageId: "visible-at-ten", body: new Uint8Array([1]), delaySeconds: 10 },
+    { messageId: "visible-at-twelve", body: new Uint8Array([2]), delaySeconds: 12 },
+  ]);
+
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 2,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 612_000 });
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 3,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 615_000 });
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 3,
+      maxBatchTimeoutSeconds: 0,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 610_000 });
+
+  millis = 610_000;
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 3,
+      maxBatchTimeoutSeconds: 0,
+    }),
+  ).toEqual({ state: "ready" });
+  expect(
+    await custody.readiness({
+      ...generation,
+      consumerId: "stale-consumer",
+      maxBatchSize: 3,
+      maxBatchTimeoutSeconds: 0,
+    }),
+  ).toEqual({ state: "inactive" });
+});
+
+test("readiness schedules future over-cap recovery after a lower-cap replacement", async () => {
+  const sql = createEphemeralSql();
+  let millis = 700_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "future-over-cap-lease",
+  });
+  const oldGeneration = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-future-cap",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 1 },
+  } as const;
+  const lowerCap = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-future-cap",
+    generation: 2,
+    policy: { maxRetries: 0, retryDelaySeconds: 1 },
+  } as const;
+  await custody.admit(SOURCE, { messageId: "future-over-cap", body: new Uint8Array([1]) });
+  await custody.activateConsumer(oldGeneration);
+  const [claimed] = await custody.claim({ ...oldGeneration, limit: 1 });
+  if (!claimed) throw new Error("future over-cap claim is missing");
+  expect(await custody.settle(claimed, { outcome: "retry", delaySeconds: 10 })).toBe(true);
+  expect(await custody.beginRetirement(oldGeneration)).toEqual({ state: "ready" });
+  expect(await custody.finishRetirement({ ...oldGeneration, replacement: lowerCap })).toEqual({
+    state: "activated",
+    generation: 2,
+  });
+
+  expect(
+    await custody.readiness({
+      ...lowerCap,
+      maxBatchSize: 1,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "waiting", wakeAtMillis: 710_000 });
+  millis = 710_000;
+  expect(
+    await custody.readiness({
+      ...lowerCap,
+      maxBatchSize: 1,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "ready" });
+});
+
+test("readiness remains ready while bounded active terminal recovery has more work", async () => {
+  const sql = createEphemeralSql();
+  let millis = 800_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "bounded-recovery-lease",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-bounded-recovery",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0 },
+  } as const;
+  await custody.admitBatch(
+    SOURCE,
+    Array.from({ length: 51 }, (_, index) => ({
+      messageId: `terminal-${index.toString().padStart(2, "0")}`,
+      body: new Uint8Array([index]),
+    })),
+  );
+  await custody.activateConsumer(generation);
+  expect(await custody.claim({ ...generation, limit: 51, leaseMillis: 1_000 })).toHaveLength(51);
+
+  millis = 801_000;
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 100,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...generation, limit: 100 })).toEqual([]);
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 100,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "ready" });
+  expect(await custody.claim({ ...generation, limit: 100 })).toEqual([]);
+  expect(
+    await custody.readiness({
+      ...generation,
+      maxBatchSize: 100,
+      maxBatchTimeoutSeconds: 5,
+    }),
+  ).toEqual({ state: "idle" });
+});

@@ -8,6 +8,7 @@ const MAX_RETENTION_SECONDS = 1_209_600;
 const MAX_RETRIES = 100;
 const MAX_LEASE_MILLIS = 120_000;
 const MAX_REAP_MESSAGES = 50;
+const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
@@ -63,6 +64,17 @@ export type QueueCustodyRetirementCompletion =
   | { readonly state: "waiting"; readonly waitUntilMillis: number }
   | { readonly state: "reap"; readonly remaining: number };
 
+/**
+ * A transport-neutral scheduling observation, never authority to deliver or
+ * settle. The caller must still use `claim`, whose generation and lease
+ * predicates arbitrate concurrent lifecycle changes.
+ */
+export type QueueCustodyReadiness =
+  | { readonly state: "inactive" }
+  | { readonly state: "idle" }
+  | { readonly state: "ready" }
+  | { readonly state: "waiting"; readonly wakeAtMillis: number };
+
 export class QueueCustodyConflictError extends Error {
   constructor(message = "queue custody generation conflicts") {
     super(message);
@@ -74,6 +86,13 @@ export interface QueueCustody {
   admit(target: QueueCustodyTarget, message: QueueCustodyAdmission): Promise<void>;
   admitBatch(target: QueueCustodyTarget, messages: readonly QueueCustodyAdmission[]): Promise<void>;
   activateConsumer(generation: QueueCustodyConsumerGeneration): Promise<void>;
+  readiness(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly maxBatchSize: number;
+    readonly maxBatchTimeoutSeconds: number;
+  }): Promise<QueueCustodyReadiness>;
   claim(input: {
     readonly queueId: string;
     readonly consumerId: string;
@@ -550,6 +569,77 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         return;
       }
       throw new QueueCustodyConflictError();
+    },
+
+    async readiness(input) {
+      const selected = generationIdentity(input);
+      const maxBatchSize = positiveInteger(
+        input.maxBatchSize,
+        MAX_BATCH_MESSAGES,
+        "queue custody readiness batch size",
+      );
+      const maxBatchTimeoutSeconds = nonNegativeInteger(
+        input.maxBatchTimeoutSeconds,
+        MAX_BATCH_TIMEOUT_SECONDS,
+        "queue custody readiness batch timeout",
+      );
+      const current = await readGeneration(selected);
+      if (
+        current?.state !== "active" ||
+        current.consumerId !== selected.consumerId ||
+        current.generation !== selected.generation
+      ) {
+        return { state: "inactive" };
+      }
+
+      const millis = now();
+      const leaseRows = await sql.query(
+        `SELECT lease_expires_at_ms
+         FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_lease
+         WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
+           AND lease_expires_at_ms IS NOT NULL AND lease_token IS NOT NULL
+         ORDER BY lease_expires_at_ms LIMIT 1`,
+        [current.queueId, current.consumerId, current.generation],
+      );
+      const leaseWakeAt = nullableInteger(leaseRows[0]?.lease_expires_at_ms);
+      if (leaseWakeAt !== null && leaseWakeAt <= millis) return { state: "ready" };
+
+      /*
+       * This is an observation over the existing ready index, not a second
+       * queue ledger. At-cap rows deliberately stay in the bounded window:
+       * once visible, `claim` must run its bounded terminal recovery even
+       * though none of those rows can be delivered in a user batch.
+       */
+      const rows = await sql.query(
+        `SELECT visible_at_ms, deliveries
+         FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_ready
+         WHERE queue_id = ? AND expires_at_ms > ? AND lease_token IS NULL
+         ORDER BY visible_at_ms LIMIT ?`,
+        [current.queueId, millis, maxBatchSize],
+      );
+      let wakeAt = leaseWakeAt;
+      let firstEligibleAt: number | null = null;
+      let eligible = 0;
+      const deliveryCap = 1 + current.policy.maxRetries;
+      for (const row of rows) {
+        const visibleAt = positiveStoredInteger(row.visible_at_ms);
+        const deliveries = nonNegativeStoredInteger(row.deliveries);
+        if (deliveries >= deliveryCap) {
+          wakeAt = earliest(wakeAt, visibleAt);
+          continue;
+        }
+        firstEligibleAt ??= visibleAt;
+        eligible += 1;
+        if (eligible === maxBatchSize) wakeAt = earliest(wakeAt, visibleAt);
+      }
+      if (firstEligibleAt !== null) {
+        wakeAt = earliest(
+          wakeAt,
+          safeFutureMillis(firstEligibleAt, maxBatchTimeoutSeconds * 1_000),
+        );
+      }
+      if (wakeAt === null) return { state: "idle" };
+      return wakeAt <= millis ? { state: "ready" } : { state: "waiting", wakeAtMillis: wakeAt };
     },
 
     async claim(input) {
@@ -1149,6 +1239,14 @@ function nonNegativeStoredInteger(value: unknown): number {
 
 function nullableInteger(value: unknown): number | null {
   return value === null || value === undefined ? null : positiveStoredInteger(value);
+}
+
+function earliest(left: number | null, right: number): number {
+  return left === null ? right : Math.min(left, right);
+}
+
+function safeFutureMillis(base: number, delta: number): number {
+  return Math.min(base + delta, MAX_SAFE_GENERATION);
 }
 
 function stringValue(value: unknown): string {
