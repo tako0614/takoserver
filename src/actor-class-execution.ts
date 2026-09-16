@@ -340,14 +340,17 @@ export interface ActorClassExecution {
   readonly inspection: ActorClassInspection;
   readonly context: ActorContext;
   readonly env: Readonly<Record<string, unknown>>;
+  /** Initializes the constructor and optional `start` hook without an event. */
+  initialize(turn: ActorTurn): Promise<void>;
   /** Dispatches one Host-admitted event. The caller owns per-id serialization. */
   dispatch(event: ActorEvent, turn: ActorTurn): Promise<Response | undefined>;
 }
 
 /**
  * Creates one fresh class execution context. The constructor and optional
- * `start` run on the first dispatch only; a new session is required after
- * eviction. Every later handler uses the same instance receiver.
+ * `start` run on the first explicit initialization or dispatch only; a new
+ * session is required after eviction. Every later handler uses the same
+ * instance receiver.
  */
 export function createActorClassExecution(
   options: ActorClassExecutionOptions,
@@ -361,7 +364,7 @@ export function createActorClassExecution(
   let initializationFailure: unknown;
   let failed = false;
 
-  async function initialize(turn: ActorTurn): Promise<void> {
+  async function initializeActor(turn: ActorTurn): Promise<void> {
     // The constructor call and start invocation occur before this function's
     // first await, preserving the synchronous construction requirement.
     let created: unknown;
@@ -380,19 +383,30 @@ export function createActorClassExecution(
     }
   }
 
+  function ensureInitialized(turn: ActorTurn): Promise<void> {
+    if (initialization === undefined) {
+      // Assignment happens before initializeActor's first await. The owner
+      // must serialize calls; this helper does not provide an admission gate.
+      initialization = initializeActor(turn);
+    }
+    return initialization;
+  }
+
+  async function initialize(turnInput: ActorTurn): Promise<void> {
+    const turn = normalizeTurn(turnInput);
+    if (failed) throw initializationFailure;
+    await ensureInitialized(turn);
+    if (failed) throw initializationFailure;
+  }
+
   async function dispatch(event: ActorEvent, turnInput: ActorTurn): Promise<Response | undefined> {
     const normalizedEvent = normalizeEvent(event);
     const turn = normalizeTurn(turnInput);
     const handlerName = normalizedEvent.kind;
 
     if (failed) return failureResult(handlerName, initializationFailure);
-    if (initialization === undefined) {
-      // Assignment happens before initialize's first await. The owner must
-      // serialize calls; this helper does not provide an admission gate.
-      initialization = initialize(turn);
-    }
     try {
-      await initialization;
+      await ensureInitialized(turn);
     } catch (error) {
       return failureResult(handlerName, error);
     }
@@ -422,6 +436,7 @@ export function createActorClassExecution(
   defineFixed(execution, "inspection", inspection);
   defineFixed(execution, "context", context);
   defineFixed(execution, "env", env);
+  defineFixed(execution, "initialize", initialize);
   defineFixed(execution, "dispatch", dispatch);
   SafeObjectFreeze(execution);
   return execution;
