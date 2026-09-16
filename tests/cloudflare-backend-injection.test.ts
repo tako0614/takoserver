@@ -166,6 +166,98 @@ test("CloudflareProvider honors one synchronous managed backend factory and its 
   expect(applyCalls).toBe(1);
 });
 
+test("CloudflareProvider forwards managed delete and readback authority objects unchanged", async () => {
+  type DeleteInput = Parameters<CloudflareWorkerBackend["delete"]>[0];
+  type VerifyNativeAbsenceInput = Parameters<CloudflareWorkerBackend["verifyNativeAbsence"]>[0];
+
+  let deleteInput: DeleteInput | undefined;
+  let recoverDeleteInput: DeleteInput | undefined;
+  let verifyNativeAbsenceInput: VerifyNativeAbsenceInput | undefined;
+  const injectedBackend: CloudflareWorkerBackend = {
+    ...backend,
+    delete: async (input) => {
+      deleteInput = input;
+      return await backend.delete(input);
+    },
+    recoverDelete: async (input) => {
+      recoverDeleteInput = input;
+      return await backend.recoverDelete(input);
+    },
+    verifyNativeAbsence: async (input) => {
+      verifyNativeAbsenceInput = input;
+      return await backend.verifyNativeAbsence(input);
+    },
+  };
+  const provider = new CloudflareProvider({
+    ...baseOptions(),
+    workerBackend: {
+      kind: "workers-for-platforms",
+      create: () => injectedBackend,
+    },
+  });
+  const executionAuthority = {
+    tenantId: "tenant-injected",
+    resourceUid: "resource-injected",
+    leaseToken: "lease-injected",
+    fingerprint: "fingerprint-injected",
+  };
+  const identity = {
+    tenantRef: "tenant-injected",
+    space: "default",
+    name: "worker",
+    uid: "resource-injected",
+    incarnationId: "incarnation-injected",
+    generation: "7",
+  };
+  const deleteInputValue = {
+    operationId: "delete-operation",
+    operationMode: "initial" as const,
+    executionAuthority,
+    offering,
+    nativeId: "injected-native",
+    identity,
+    spec: {},
+    relations: [],
+  };
+  const recoverDeleteInputValue = {
+    ...deleteInputValue,
+    operationId: "recover-delete-operation",
+    operationMode: "recovery" as const,
+  };
+
+  await expect(provider.delete(deleteInputValue)).resolves.toMatchObject({ phase: "succeeded" });
+  await expect(provider.recoverDelete(recoverDeleteInputValue)).resolves.toMatchObject({
+    phase: "succeeded",
+  });
+
+  expect(deleteInput).toBe(deleteInputValue);
+  expect(deleteInput?.executionAuthority).toBe(executionAuthority);
+  expect(recoverDeleteInput).toBe(recoverDeleteInputValue);
+  expect(recoverDeleteInput?.executionAuthority).toBe(executionAuthority);
+
+  const descriptor = {
+    apiVersion: "providers.takoserver.com/readback/v1" as const,
+    provider: "cloudflare.injected",
+    kind: "ModuleWorker",
+    nativeId: "injected-native",
+    data: { marker: "descriptor-marker" },
+  };
+  const target = {
+    tenantId: "tenant-injected",
+    resourceUid: "resource-injected",
+    incarnationId: "incarnation-injected",
+    generation: "7",
+  };
+  const verifyNativeAbsenceInputValue = { offering, descriptor, target };
+
+  await expect(provider.verifyNativeAbsence(verifyNativeAbsenceInputValue)).resolves.toMatchObject({
+    outcome: "absent",
+  });
+  expect(verifyNativeAbsenceInput).toBe(verifyNativeAbsenceInputValue);
+  expect(verifyNativeAbsenceInput?.descriptor).toBe(descriptor);
+  expect(verifyNativeAbsenceInput?.target).toBe(target);
+});
+
 test("CloudflareProvider rejects invalid managed factories without ordinary fallback", () => {
   const partial = { ...backend } as Partial<CloudflareWorkerBackend>;
   delete partial.recoverApply;

@@ -3,10 +3,12 @@ import type {
   ApplyInput,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
+  ProviderExecutionAuthority,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
   ProviderOffering,
+  ProviderReadAuthorityTarget,
   ProviderSqliteMigration,
   ProviderSqliteMigrationIdentity,
   ProviderTicket,
@@ -84,6 +86,7 @@ export interface CloudflareWorkerDeleteInput {
   readonly operationId: string;
   readonly operationMode?: "initial" | "recovery";
   readonly providerHandle?: string;
+  readonly executionAuthority?: ProviderExecutionAuthority;
   readonly offering: ProviderOffering;
   readonly nativeId: string;
   readonly identity: ResourceIdentity;
@@ -118,6 +121,8 @@ export interface CloudflareWorkerBackend {
   verifyNativeAbsence(input: {
     readonly offering: ProviderOffering;
     readonly descriptor: ProviderNativeReadbackDescriptor;
+    /** Route-less read authority; adapters must not reconstruct it from descriptor data. */
+    readonly target?: ProviderReadAuthorityTarget;
   }): Promise<ProviderNativeAbsence>;
   verifyArtifactConsumption(
     input: ProviderArtifactConsumptionInput,

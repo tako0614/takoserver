@@ -13,11 +13,13 @@ import {
   type Provider,
   type ProviderArtifactConsumption,
   type ProviderArtifactConsumptionInput,
+  type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
   type ProviderNativeAbsenceUnknownReason,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
   type ProviderOffering,
+  type ProviderReadAuthorityTarget,
   type ProviderSqliteMigration,
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
@@ -641,6 +643,7 @@ export class CloudflareProvider implements Provider {
   async verifyNativeAbsence(input: {
     offering: ProviderOffering;
     descriptor: ProviderNativeReadbackDescriptor;
+    target?: ProviderReadAuthorityTarget;
   }): Promise<ProviderNativeAbsence> {
     if (this.#workerBackend?.owns(input.offering)) {
       return await this.#workerBackend.verifyNativeAbsence(input);
@@ -1001,6 +1004,7 @@ export class CloudflareProvider implements Provider {
     operationId: string;
     operationMode?: "initial" | "recovery";
     providerHandle?: string;
+    executionAuthority?: ProviderExecutionAuthority;
     offering: ProviderOffering;
     nativeId: string;
     identity: import("../provider-port.ts").ResourceIdentity;
@@ -1158,6 +1162,7 @@ export class CloudflareProvider implements Provider {
     operationId: string;
     operationMode?: "initial" | "recovery";
     providerHandle?: string;
+    executionAuthority?: ProviderExecutionAuthority;
     offering: ProviderOffering;
     nativeId: string;
     identity: import("../provider-port.ts").ResourceIdentity;
