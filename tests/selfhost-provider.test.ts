@@ -5469,6 +5469,83 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       ],
     });
 
+  const consumerInput = (
+    operationId: string,
+    workerName: string,
+    queueName: string,
+    queueId: string,
+    spec: Record<string, unknown> = {},
+    relations: readonly ProviderRelation[] = [],
+  ) => ({
+    operationId,
+    offering: offering("QueueConsumer"),
+    identity: identity("hello-consumer"),
+    spec: {
+      ...consumerSpec,
+      worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: workerName },
+      queue: { apiVersion: EDGE_API, kind: "AtLeastOnceQueue", name: queueName },
+      ...spec,
+    },
+    relations: [
+      relation("/worker", "ModuleWorker", workerName),
+      queueRelation("/queue", queueName, queueId),
+      ...relations,
+    ],
+  });
+
+  const publishNamedWorker = async (
+    local: ReturnType<typeof provider>,
+    workerName: string,
+  ): Promise<string> => {
+    const versionName = `${workerName}-v1`;
+    const deploymentName = `${workerName}-live`;
+    const worker = await local.apply({
+      operationId: `op_${workerName}_worker`,
+      offering: offering("ModuleWorker"),
+      identity: identity(workerName),
+      spec: {},
+    });
+    if (worker.phase !== "succeeded") throw new Error("the named Worker did not apply");
+    const script = worker.result.outputs.scriptName;
+    if (typeof script !== "string") throw new Error("the named Worker script is missing");
+    const version = await local.apply({
+      operationId: `op_${workerName}_version`,
+      offering: offering("WorkerVersion"),
+      identity: identity(versionName),
+      spec: {
+        bundle: { apiVersion: EDGE_API, kind: "WorkerBundle", name: "bundle" },
+        handlers: ["fetch", "queue"],
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: workerName },
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", workerName),
+        relation("/bundle", "WorkerBundle", "bundle", { manifestDigest: "sha256:worker" }),
+      ],
+    });
+    if (version.phase !== "succeeded") throw new Error("the named Worker Version did not apply");
+    const deployment = await local.apply({
+      operationId: `op_${workerName}_deployment`,
+      offering: offering("WorkerDeployment"),
+      identity: identity(deploymentName),
+      spec: {
+        worker: { apiVersion: EDGE_API, kind: "ModuleWorker", name: workerName },
+        versions: [
+          {
+            workerVersion: { apiVersion: EDGE_API, kind: "WorkerVersion", name: versionName },
+            weight: 10_000,
+          },
+        ],
+      },
+      relations: [
+        relation("/worker", "ModuleWorker", workerName),
+        relation("/versions/0/workerVersion", "WorkerVersion", versionName),
+      ],
+    });
+    if (deployment.phase !== "succeeded")
+      throw new Error("the named Worker Deployment did not apply");
+    return script;
+  };
+
   const applyCron = (local: ReturnType<typeof provider>, cron: string) =>
     local.apply({
       operationId: "op_cron",
@@ -5519,6 +5596,119 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     expect((await createSelfhostEventTargets(root).list())[0]?.consumers).toEqual(
       expectedConsumers,
     );
+  });
+
+  test("refuses an in-place Queue Consumer queue target change", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ events: EVENTS, runtime: runtime.runtime });
+    const script = await publish(local);
+    const firstInput = consumerInput("op_consumer_a", "hello", "delivery", QUEUE_ID);
+    const first = await local.apply(firstInput);
+    if (first.phase !== "succeeded") throw new Error("the source Queue Consumer did not attach");
+    const path = join(root, "selfhost", "scripts", `${script}.json`);
+    const beforeState = readFileSync(path, "utf8");
+    const beforeLog = [...runtime.state.log];
+
+    const updated = await local.apply({
+      ...consumerInput("op_consumer_b", "hello", "replacement", "tsq-replacement"),
+      previous: { nativeId: first.result.nativeId, spec: firstInput.spec },
+    });
+
+    expect(updated).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(readFileSync(path, "utf8")).toBe(beforeState);
+    expect(runtime.state.log).toEqual(beforeLog);
+  });
+
+  test("refuses an in-place Queue Consumer Worker target change", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ events: EVENTS, runtime: runtime.runtime });
+    const sourceScript = await publish(local);
+    const targetScript = await publishNamedWorker(local, "other");
+    const firstInput = consumerInput("op_consumer_worker_a", "hello", "delivery", QUEUE_ID);
+    const first = await local.apply(firstInput);
+    if (first.phase !== "succeeded") throw new Error("the source Queue Consumer did not attach");
+    const path = join(root, "selfhost", "scripts", `${sourceScript}.json`);
+    const targetPath = join(root, "selfhost", "scripts", `${targetScript}.json`);
+    const beforeState = readFileSync(path, "utf8");
+    const beforeTargetState = readFileSync(targetPath, "utf8");
+    const beforeLog = [...runtime.state.log];
+
+    const updated = await local.apply({
+      ...consumerInput("op_consumer_worker_b", "other", "delivery", QUEUE_ID),
+      previous: { nativeId: first.result.nativeId, spec: firstInput.spec },
+    });
+
+    expect(updated).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(readFileSync(path, "utf8")).toBe(beforeState);
+    expect(readFileSync(targetPath, "utf8")).toBe(beforeTargetState);
+    expect(runtime.state.log).toEqual(beforeLog);
+  });
+
+  test("updates Queue Consumer settings and dead-letter target on the same attachment", async () => {
+    const local = provider({ events: EVENTS });
+    const script = await publish(local);
+    const firstInput = consumerInput("op_consumer_settings_a", "hello", "delivery", QUEUE_ID);
+    const first = await local.apply(firstInput);
+    if (first.phase !== "succeeded") throw new Error("the source Queue Consumer did not attach");
+    const updated = await local.apply({
+      ...consumerInput(
+        "op_consumer_settings_b",
+        "hello",
+        "delivery",
+        QUEUE_ID,
+        {
+          maxRetries: 4,
+          deadLetterQueue: {
+            apiVersion: EDGE_API,
+            kind: "AtLeastOnceQueue",
+            name: DLQ_NAME,
+          },
+        },
+        [queueRelation("/deadLetterQueue", DLQ_NAME, DLQ_ID)],
+      ),
+      previous: { nativeId: first.result.nativeId, spec: firstInput.spec },
+    });
+
+    expect(updated).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: first.result.nativeId },
+    });
+    const persisted = JSON.parse(
+      readFileSync(join(root, "selfhost", "scripts", `${script}.json`), "utf8"),
+    ) as { consumers: readonly Record<string, unknown>[] };
+    expect(persisted.consumers).toHaveLength(1);
+    expect(persisted.consumers[0]).toMatchObject({
+      queue: QUEUE_ID,
+      maxRetries: 4,
+      deadLetterQueue: { queue: DLQ_ID, queueName: DLQ_NAME },
+    });
+  });
+
+  test("does not adopt an invalid prior Queue Consumer native identity", async () => {
+    const runtime = servingRuntime();
+    const local = provider({ events: EVENTS, runtime: runtime.runtime });
+    const script = await publish(local);
+    const input = consumerInput("op_consumer_invalid_previous", "hello", "delivery", QUEUE_ID);
+    const path = join(root, "selfhost", "scripts", `${script}.json`);
+    const beforeState = readFileSync(path, "utf8");
+    const beforeLog = [...runtime.state.log];
+    const updated = await local.apply({
+      ...input,
+      previous: { nativeId: "selfhost-consumer:malformed", spec: input.spec },
+    });
+
+    expect(updated).toMatchObject({
+      phase: "failed",
+      failure: { code: "invalid_spec" },
+    });
+    expect(readFileSync(path, "utf8")).toBe(beforeState);
+    expect(runtime.state.log).toEqual(beforeLog);
   });
 
   test("requires authoritative reapply for a legacy attachment before delivery resumes", async () => {

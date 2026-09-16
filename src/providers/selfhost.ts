@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { bytesDigest } from "../json.ts";
+import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
   type ApplyInput,
@@ -2781,6 +2781,44 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const worker = relationResource(input.relations, "/worker", "ModuleWorker");
     const queue = attachedQueue(input, "/queue");
     if (!worker || !queue) return failed("invalid_spec", "the Queue Consumer is incomplete");
+    const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+    if (input.previous !== undefined) {
+      if (!isJsonObject(input.previous) || typeof input.previous.nativeId !== "string") {
+        return failed("invalid_spec", "the previous Queue Consumer native identity is malformed");
+      }
+      const previousSpec = isJsonObject(input.previous.spec) ? input.previous.spec : undefined;
+      const previousNative = parseSelfhostNativeId(
+        "QueueConsumer",
+        input.previous.nativeId,
+        previousSpec,
+      );
+      const previousWorker = isJsonObject(previousSpec?.worker) ? previousSpec.worker : null;
+      const previousQueue = isJsonObject(previousSpec?.queue) ? previousSpec.queue : null;
+      const desiredWorker = isJsonObject(input.spec.worker) ? input.spec.worker : null;
+      const desiredQueue = isJsonObject(input.spec.queue) ? input.spec.queue : null;
+      if (
+        !previousNative ||
+        !previousWorker ||
+        !previousQueue ||
+        !desiredWorker ||
+        !desiredQueue ||
+        previousNative.script === undefined ||
+        previousNative.data.queueName === undefined
+      ) {
+        return failed("invalid_spec", "the previous Queue Consumer identity is unusable");
+      }
+      if (
+        canonicalJson(previousWorker) !== canonicalJson(desiredWorker) ||
+        canonicalJson(previousQueue) !== canonicalJson(desiredQueue) ||
+        previousNative.script !== script ||
+        previousNative.data.queueName !== queue.queue
+      ) {
+        return failed(
+          "invalid_spec",
+          "the Queue Consumer's Worker and queue targets are immutable; replace the attachment",
+        );
+      }
+    }
     const declaredDeadLetter = input.spec.deadLetterQueue !== undefined;
     const deadLetterQueue = declaredDeadLetter ? attachedQueue(input, "/deadLetterQueue") : null;
     if (declaredDeadLetter && !deadLetterQueue) {
@@ -2796,7 +2834,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       retryDelaySeconds: consumerLimit(input.spec, "retryDelaySeconds", 0, 43_200),
       ...(deadLetterQueue ? { deadLetterQueue } : {}),
     };
-    const script = await scriptOf(input.identity.tenantRef, worker.metadata);
     await rewriteAttachments(script, (state) => ({
       ...state,
       consumers: [

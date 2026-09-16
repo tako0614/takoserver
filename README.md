@@ -250,6 +250,12 @@ says which of the two remedies to apply: at boot, and again in the refusal a
 is included: `http://<script>.localhost` is exactly as unpublishable as any
 other plain-HTTP address.
 
+For a self-host `QueueConsumer`, changing the source queue or receiving Worker
+requires replacing the attachment, as its Form declares. In-place updates may
+change delivery settings or the dead-letter destination, but must retain the
+same native source queue and Worker. A target change is refused before any
+attachment is written; it must not leave both the old and new consumers active.
+
 A restarted deployment brings its published Workers back by itself. The runtime
 is started at boot for whatever this machine had already published, before the
 API begins answering; a machine that has published nothing starts no runtime.
@@ -636,8 +642,38 @@ Ports 8787 and 8080 must be free in that namespace. The command refuses external
 network interfaces, uses only fresh temporary state, and neither downloads
 tools nor reads existing operator credentials. It prints phase names and a
 sanitized result, stops its children and removes temporary state on exit.
-Failed mutations are not retried. This verifies local storage interoperability;
-it does not qualify Cloudflare, Workers, Containers or a production deployment.
+Failed mutations are not retried.
+
+To include actual Worker execution, supply both `--workerd` and `--openssl`:
+
+```sh
+bun --no-env-file run test:selfhost-opentofu \
+  --tofu /absolute/path/to/tofu \
+  --provider-mirror /absolute/path/to/provider-mirror \
+  --core-verifier /absolute/path/to/takoform-core-verifier \
+  --workerd /absolute/path/to/closed-graph-workerd \
+  --openssl /absolute/path/to/openssl
+```
+
+Use the exact closed-graph workerd artifact accepted by this checkout, not the
+npm development binary. This mode also needs port 443 and permission to bind it
+inside the disposable namespace. It generates a temporary `*.app.localhost`
+certificate, configures the real Host's Worker TLS socket, and creates ModuleWorker, WorkerBundle,
+WorkerVersion, WorkerDeployment and WorkerEndpoint through the same Provider.
+The bundle is uploaded by the Provider, not installed directly into the runtime.
+SQLiteMigrationSet and SQLiteMigrationApplication create the application table
+through their normal lifecycle before the Worker is activated; the command does
+not seed the database directly or let runtime bindings execute schema DDL.
+The HTTPS request checks actual KV and SQLite operations through the declared
+bindings. The client trusts only the generated certificate and connects to
+loopback with the Host-assigned hostname; it changes no machine trust or DNS.
+Ready checks use the no-change plan's refreshed `prior_state` and a separate
+Host read, not the potentially stale state saved before dependent resources existed.
+All nine resources must then be removed through OpenTofu, with empty state and
+Host absence. The former endpoint must no longer serve the application.
+
+Without the two extra arguments, the command retains the storage-only journey.
+Neither mode qualifies Cloudflare, Containers or a production deployment.
 
 ## Licence
 
