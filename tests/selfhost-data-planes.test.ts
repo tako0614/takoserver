@@ -26,11 +26,13 @@ import {
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_DATA_PLANE_VECTOR_PATH,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
   createSelfhostDataPlanes,
   type SelfhostDataPlaneGrant,
 } from "../src/selfhost-data-planes.ts";
+import { createVectorIndexStore } from "../src/vector-index-store.ts";
 
 /**
  * The backend half of a self-hosted Worker's storage.
@@ -61,6 +63,9 @@ const GRANTS: Record<string, SelfhostDataPlaneGrant> = {
   "alpha\u0000v1": ALPHA,
   "beta\u0000v1": BETA,
 };
+
+const VECTOR_ALPHA_SCOPE = { tenantId: "tenant-alpha", resourceUid: "resource-alpha" } as const;
+const VECTOR_BETA_SCOPE = { tenantId: "tenant-beta", resourceUid: "resource-beta" } as const;
 
 let root: string;
 let sql: Sql;
@@ -138,6 +143,12 @@ const db = (body: Record<string, unknown>, token?: string) =>
   post(SELFHOST_DATA_PLANE_SQL_PATH, { binding: "DB", ...body }, token);
 const queue = (body: Record<string, unknown>, token?: string) =>
   post(SELFHOST_DATA_PLANE_QUEUE_PATH, { binding: "DELIVERY", ...body }, token);
+const vector = (
+  operation: string,
+  input: Record<string, unknown>,
+  binding = "SEARCH",
+  token?: string,
+) => post(SELFHOST_DATA_PLANE_VECTOR_PATH, { binding, op: operation, input }, token);
 const encode = (text: string) => btoa(text);
 
 function value(envelope: Record<string, unknown>): Record<string, unknown> {
@@ -192,6 +203,181 @@ test("a request that is not a POST is refused", async () => {
   const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`, { method: "GET" });
   const response = await planes.routes(request, new URL(request.url));
   expect(response?.status).toBe(405);
+});
+
+test("a vector binding resolves the authenticated name to its tenant/resource scope", async () => {
+  const store = createVectorIndexStore({ sql });
+  await store.createIndex({
+    ...VECTOR_ALPHA_SCOPE,
+    config: { dimension: 3, metric: "cosine" },
+  });
+  await store.createIndex({
+    ...VECTOR_BETA_SCOPE,
+    config: { dimension: 3, metric: "cosine" },
+  });
+  const grants: Record<string, SelfhostDataPlaneGrant> = {
+    "alpha\u0000v1": { ...ALPHA, vectors: { SEARCH: VECTOR_ALPHA_SCOPE } },
+    "beta\u0000v1": { ...BETA, vectors: { SEARCH: VECTOR_BETA_SCOPE } },
+  };
+  planes = createSelfhostDataPlanes({
+    sql,
+    grant: async (script, versionId) => grants[`${script}\u0000${versionId}`] ?? null,
+    databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+    clock: () => now,
+    vectorIndexStore: store,
+  });
+
+  expect(
+    value(
+      (
+        await vector("upsert", {
+          namespace: "docs",
+          vectors: [{ id: "shared", values: [1, 0, 0], metadata: { owner: "alpha" } }],
+        })
+      ).envelope,
+    ),
+  ).toEqual({ ids: ["shared"], count: 1 });
+  expect(
+    value(
+      (
+        await vector(
+          "upsert",
+          {
+            namespace: "docs",
+            vectors: [{ id: "shared", values: [0, 1, 0], metadata: { owner: "beta" } }],
+          },
+          "SEARCH",
+          `beta.v1.${BETA.secret}`,
+        )
+      ).envelope,
+    ),
+  ).toEqual({ ids: ["shared"], count: 1 });
+
+  expect(value((await vector("get", { namespace: "docs", ids: ["shared"] })).envelope)).toEqual({
+    vectors: [
+      {
+        id: "shared",
+        namespace: "docs",
+        values: [1, 0, 0],
+        metadata: { owner: "alpha" },
+      },
+    ],
+  });
+  expect(
+    value(
+      (
+        await vector(
+          "get",
+          { namespace: "docs", ids: ["shared"] },
+          "SEARCH",
+          `beta.v1.${BETA.secret}`,
+        )
+      ).envelope,
+    ),
+  ).toEqual({
+    vectors: [
+      {
+        id: "shared",
+        namespace: "docs",
+        values: [0, 1, 0],
+        metadata: { owner: "beta" },
+      },
+    ],
+  });
+
+  const queried = value(
+    (
+      await vector("query", {
+        namespace: "docs",
+        values: [1, 0, 0],
+        topK: 1,
+        returnMetadata: true,
+        returnValues: true,
+      })
+    ).envelope,
+  );
+  expect(queried).toEqual({
+    matches: [
+      {
+        id: "shared",
+        namespace: "docs",
+        score: 1,
+        metadata: { owner: "alpha" },
+        values: [1, 0, 0],
+      },
+    ],
+    count: 1,
+  });
+});
+
+test("vector malformed and unknown operations stay in the three-code error vocabulary", async () => {
+  const store = createVectorIndexStore({ sql });
+  await store.createIndex({
+    ...VECTOR_ALPHA_SCOPE,
+    config: { dimension: 3, metric: "cosine" },
+    recordLimit: 1,
+  });
+  const grant: SelfhostDataPlaneGrant = { ...ALPHA, vectors: { SEARCH: VECTOR_ALPHA_SCOPE } };
+  planes = createSelfhostDataPlanes({
+    sql,
+    grant: async () => grant,
+    databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+    clock: () => now,
+    vectorIndexStore: store,
+  });
+
+  const malformed = await post(SELFHOST_DATA_PLANE_VECTOR_PATH, {
+    binding: "SEARCH",
+    op: "get",
+    input: { ids: ["one"] },
+    unexpected: true,
+  });
+  expect(malformed.status).toBe(400);
+  expect(malformed.envelope).toEqual({ ok: false, error: { code: "invalid_spec" } });
+
+  const unknown = await vector("scan", { ids: ["one"] });
+  expect(unknown.status).toBe(200);
+  expect(unknown.envelope).toEqual({ ok: false, error: { code: "invalid_spec" } });
+
+  const invalidInput = await vector("upsert", {
+    vectors: [{ id: "bad", values: [1, 0] }],
+  });
+  expect(invalidInput.envelope).toEqual({ ok: false, error: { code: "invalid_spec" } });
+
+  expect(
+    (
+      await vector("upsert", {
+        vectors: [{ id: "one", values: [1, 0, 0] }],
+      })
+    ).envelope,
+  ).toEqual({ ok: true, value: { ids: ["one"], count: 1 } });
+  const quota = await vector("upsert", {
+    vectors: [{ id: "two", values: [1, 0, 0] }],
+  });
+  expect(quota.status).toBe(200);
+  expect(quota.envelope).toEqual({ ok: false, error: { code: "quota" } });
+
+  expect(await store.deleteIndex(VECTOR_ALPHA_SCOPE)).toBe(true);
+  const unavailable = await vector("get", { ids: ["one"] });
+  expect(unavailable.status).toBe(200);
+  expect(unavailable.envelope).toEqual({ ok: false, error: { code: "unavailable" } });
+  expect(await store.readIndex(VECTOR_ALPHA_SCOPE)).toBeNull();
+});
+
+test("vector storage is explicitly unavailable without a supplied store and never auto-created", async () => {
+  const grant: SelfhostDataPlaneGrant = { ...ALPHA, vectors: { SEARCH: VECTOR_ALPHA_SCOPE } };
+  planes = createSelfhostDataPlanes({
+    sql,
+    grant: async () => grant,
+    databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+    clock: () => now,
+  });
+  const answer = await vector("get", { ids: ["missing"] });
+  expect(answer.status).toBe(503);
+  expect(answer.envelope).toEqual({ ok: false, error: { code: "unavailable" } });
 });
 
 // ---------------------------------------------------------------------------

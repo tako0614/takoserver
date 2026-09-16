@@ -20,6 +20,7 @@ import {
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_DATA_PLANE_VECTOR_PATH,
 } from "./providers/selfhost-worker-wrapper.ts";
 import { createQueueCustody, type QueueCustody } from "./queue-custody.ts";
 import {
@@ -29,6 +30,12 @@ import {
   SelfhostObjectError,
   type SelfhostObjectStore,
 } from "./selfhost-object-store.ts";
+import { VectorIndexInvalidSpecError } from "./vector-index-codec.ts";
+import {
+  type VectorIndexScope,
+  type VectorIndexStore,
+  VectorIndexStoreError,
+} from "./vector-index-store.ts";
 
 /**
  * What a self-hosted Worker's KV and SQL bindings actually talk to.
@@ -72,6 +79,7 @@ export const SELFHOST_DATA_PLANE_PATHS = [
   SELFHOST_DATA_PLANE_OBJECTS_PATH,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_DATA_PLANE_VECTOR_PATH,
 ] as const;
 
 /** What one running Worker Version is allowed to reach. */
@@ -86,6 +94,8 @@ export interface SelfhostDataPlaneGrant {
   readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
   /** Public binding name to the bucket incarnation this Host derived. */
   readonly objects: Readonly<Record<string, string>>;
+  /** Public binding name to the Host-resolved tenant/Resource VectorIndex scope. */
+  readonly vectors?: Readonly<Record<string, VectorIndexScope>>;
 }
 
 export interface SelfhostDataPlaneOptions {
@@ -100,6 +110,8 @@ export interface SelfhostDataPlaneOptions {
   readonly databasePath: (name: string) => string;
   /** Directory holding one subdirectory per bucket incarnation. */
   readonly objectRoot: string;
+  /** Explicitly supplied VectorIndex storage; absence is unavailable, never auto-created. */
+  readonly vectorIndexStore?: VectorIndexStore;
   readonly clock?: () => Date;
   /** The acceptance identity of one message; injected so a test can name them. */
   readonly messageId?: () => string;
@@ -231,6 +243,58 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   };
 
   const routes: SelfhostDataPlaneRoutes = async (request, url) => {
+    if (url.pathname === SELFHOST_DATA_PLANE_VECTOR_PATH) {
+      const rejectVector = (code: "invalid_spec" | "quota" | "unavailable", status: number) =>
+        Response.json({ ok: false, error: { code } }, { status });
+      if (request.method !== "POST") return rejectVector("unavailable", 405);
+      const grant = await authorize(request, options.grant);
+      if (!grant) return rejectVector("unavailable", 401);
+      // This dependency is intentionally optional. A self-host installation
+      // that did not compose VectorIndex storage must answer unavailable; it
+      // must never create an index as a side effect of a Worker call.
+      if (!options.vectorIndexStore) return rejectVector("unavailable", 503);
+      try {
+        const body = await boundedVectorText(request);
+        let decoded: unknown;
+        try {
+          decoded = JSON.parse(body);
+        } catch {
+          return rejectVector("invalid_spec", 400);
+        }
+        const payload = record(decoded);
+        if (
+          !payload ||
+          Object.keys(payload).sort().join(",") !== "binding,input,op,protocol" ||
+          payload.protocol !== SELFHOST_DATA_PLANE_PROTOCOL ||
+          !text(payload.binding, 64) ||
+          !text(payload.op, 32) ||
+          !record(payload.input)
+        ) {
+          return rejectVector("invalid_spec", 400);
+        }
+        const input = record(payload.input);
+        if (!input) return rejectVector("invalid_spec", 400);
+        const binding = payload.binding as string;
+        const scope = grant.vectors?.[binding];
+        if (!grant.vectors || !Object.hasOwn(grant.vectors, binding) || !scope) {
+          return rejectVector("unavailable", 404);
+        }
+        return answer(
+          await vectorOperation(options.vectorIndexStore, scope, payload.op as string, input),
+        );
+      } catch (error) {
+        const code =
+          error instanceof VectorIndexInvalidSpecError
+            ? "invalid_spec"
+            : error instanceof VectorIndexStoreError &&
+                (error.code === "invalid_spec" ||
+                  error.code === "quota" ||
+                  error.code === "unavailable")
+              ? error.code
+              : "unavailable";
+        return rejectVector(code, 200);
+      }
+    }
     if (url.pathname === SELFHOST_DATA_PLANE_OBJECTS_PATH) {
       if (request.method !== "POST") return objectRefusal("backend_unavailable", 405);
       const grant = await authorize(request, options.grant);
@@ -564,6 +628,99 @@ async function boundedText(request: Request): Promise<string> {
   const raw = await request.text();
   if (utf8Length(raw) > Number(declared)) throw new PlaneError("backend_unavailable");
   return raw;
+}
+
+/** The vector envelope is JSON; keep malformed/oversized bodies in its own error vocabulary. */
+async function boundedVectorText(request: Request): Promise<string> {
+  const limit = 8 * 1024 * 1024;
+  const declared = request.headers.get("content-length");
+  if (
+    declared === null ||
+    !/^\d+$/u.test(declared) ||
+    Number(declared) > limit ||
+    request.body === null
+  ) {
+    throw new VectorIndexStoreError("invalid_spec");
+  }
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > Number(declared) || size > limit) {
+        await reader.cancel().catch(() => undefined);
+        throw new VectorIndexStoreError("invalid_spec");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (size !== Number(declared)) throw new VectorIndexStoreError("invalid_spec");
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks, size));
+  } catch {
+    throw new VectorIndexStoreError("invalid_spec");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VectorIndex
+// ---------------------------------------------------------------------------
+
+/**
+ * Dispatch the four candidate Interface operations against the already
+ * resolved scope. The store owns codec/config/quota semantics; this route owns
+ * only the operation switch and the output projection needed by the Interface.
+ */
+async function vectorOperation(
+  store: VectorIndexStore,
+  scope: VectorIndexScope,
+  operation: string,
+  input: Readonly<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  switch (operation) {
+    case "upsert":
+      return (await store.upsert(scope, input)) as unknown as Record<string, unknown>;
+    case "get": {
+      const result = await store.get(scope, input);
+      const namespace = vectorRequestNamespace(input);
+      return {
+        vectors: result.vectors.map((vector) => ({
+          id: vector.id,
+          namespace,
+          values: vector.values,
+          metadata: vector.metadata,
+        })),
+      };
+    }
+    case "delete":
+      return (await store.delete(scope, input)) as unknown as Record<string, unknown>;
+    case "query": {
+      const result = await store.query(scope, input);
+      const namespace = vectorRequestNamespace(input);
+      return {
+        matches: result.matches.map((match) => ({
+          id: match.id,
+          namespace,
+          score: match.score,
+          ...(match.metadata === undefined ? {} : { metadata: match.metadata }),
+          ...(match.values === undefined ? {} : { values: match.values }),
+        })),
+        count: result.count,
+      };
+    }
+    default:
+      throw new VectorIndexStoreError("invalid_spec");
+  }
+}
+
+/** The store has already validated this request; omission means empty namespace. */
+function vectorRequestNamespace(input: Readonly<Record<string, unknown>>): string {
+  return input.namespace === undefined ? "" : (input.namespace as string);
 }
 
 // ---------------------------------------------------------------------------
