@@ -15,6 +15,7 @@ import {
   readWorkerdSelectedActiveVersion,
   type WorkerdBinding,
   type WorkerdDeploymentPublication,
+  writeWorkerdPrivateExecution,
 } from "../src/workerd-runtime.ts";
 
 /**
@@ -273,6 +274,31 @@ test("renders separate application and Host-private identities even under the sa
   expect([
     ...(await readFile(join(root, "workers", "site", "host-private", "module-00000"))),
   ]).toEqual([...hostSource]);
+});
+
+test("legacy private writer preserves its Host entrypoint without the loader", async () => {
+  const configPath = await writeWorkerdPrivateExecution({
+    root,
+    site: {
+      directory: "site",
+      mainModule: "index.js",
+      hostEntrypoint: HOST_ENTRYPOINT,
+      hostnames: [],
+    },
+    modules: MODULES,
+    hostModules: new Map([
+      [HOST_ENTRYPOINT, new TextEncoder().encode('export { default } from "./index.js";')],
+    ]),
+    companionAddress: "127.0.0.1:4666",
+    runSocketPath: join(root, "workflow.sock"),
+  });
+  const config = await readFile(configPath, "utf8");
+  expect(config).toContain(
+    `(name = "${HOST_ENTRYPOINT}", esModule = embed "./host-private/module-00000", role = hostPrivate)`,
+  );
+  expect(config).toContain(
+    '(name = "index.js", esModule = embed "./application/module-00000", role = application)',
+  );
 });
 
 test("renders retained scalar readiness as one private Host capability route", async () => {

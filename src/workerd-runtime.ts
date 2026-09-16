@@ -2148,6 +2148,17 @@ export async function writeWorkerdPrivateExecution(options: {
   readonly dataPlaneAddress?: string;
   /** Exact child-local guard listeners, not shared sockets or public endpoints. */
   readonly serviceBindings?: readonly { readonly name: string; readonly socketPath: string }[];
+  /**
+   * Dynamic Workflow loader graph. When present, only these trusted outer
+   * modules are installed statically; selected tenant modules stay inert data
+   * embedded in the outer entry and are supplied to WorkerLoader on RUN.
+   */
+  readonly workflowLoader?: {
+    readonly outerEntrypoint: string;
+    readonly outerModules: ReadonlyMap<string, Uint8Array>;
+    readonly outerModuleMediaTypes: Readonly<Record<string, WorkerdModuleMediaType>>;
+    readonly staticHostModules: ReadonlyMap<string, Uint8Array>;
+  };
 }): Promise<string> {
   const { root, site, runSocketPath } = options;
   if (
@@ -2159,7 +2170,10 @@ export async function writeWorkerdPrivateExecution(options: {
   ) {
     throw new Error("unusable private execution directory or socket");
   }
-  if (!site.hostEntrypoint || site.hostEntrypoint === site.mainModule) {
+  if (
+    !options.workflowLoader &&
+    (!site.hostEntrypoint || site.hostEntrypoint === site.mainModule)
+  ) {
     throw new Error("private execution requires a distinct Host entrypoint");
   }
   const declaredServices = validServiceBindings(site.serviceBindings ?? []);
@@ -2194,21 +2208,42 @@ export async function writeWorkerdPrivateExecution(options: {
   // ingress into a guarded class process. Their Host-private module bytes can
   // remain in the exact closed graph without installing their routing services.
   const { assets: _assets, events: _events, ...classSite } = site;
-  const prepared = await prepareWorkerdSite(
-    { ...classSite, hostnames: [] },
-    options.modules,
-    undefined,
-    options.hostModules,
-  );
+  const { hostEntrypoint: _workflowHostEntrypoint, ...workflowClassSite } = classSite;
+  const prepared = options.workflowLoader
+    ? await prepareWorkerdSite(
+        {
+          ...workflowClassSite,
+          mainModule: options.workflowLoader.outerEntrypoint,
+          hostModules: [...options.workflowLoader.staticHostModules.keys()].filter(
+            (name) => name !== classSite.dataPlane?.module,
+          ),
+          modules: [...options.workflowLoader.outerModules.keys()].filter(
+            (name) => name !== options.workflowLoader?.outerEntrypoint,
+          ),
+          moduleMediaTypes: options.workflowLoader.outerModuleMediaTypes,
+          hostnames: [],
+        },
+        options.workflowLoader.outerModules,
+        undefined,
+        options.workflowLoader.staticHostModules,
+      )
+    : await prepareWorkerdSite(
+        { ...classSite, hostnames: [] },
+        options.modules,
+        undefined,
+        options.hostModules,
+      );
   const bindings = validBindings(prepared.manifest.vars ?? []).map(
     (binding) =>
       `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
   );
   const companionBinding = "__TAKOSERVER_WORKFLOW_COMPANION";
+  const loaderBinding = "__TAKOSERVER_WORKFLOW_LOADER";
   if (
     prepared.manifest.vars?.some(
       (binding) =>
         binding.name === companionBinding ||
+        (options.workflowLoader && binding.name === loaderBinding) ||
         declaredServices.some((service) => service.name === binding.name) ||
         (prepared.manifest.dataPlane && binding.name === DATA_SERVICE_BINDING),
     )
@@ -2216,6 +2251,9 @@ export async function writeWorkerdPrivateExecution(options: {
     throw new Error("private execution internal binding collision");
   }
   bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
+  if (options.workflowLoader) {
+    bindings.push(`(name = ${capnpText(loaderBinding)}, workerLoader = ())`);
+  }
   const serviceExternals = serviceMappings
     .map((mapping, index) => {
       const name = `service-${index}`;
@@ -2250,7 +2288,12 @@ const config :Workerd.Config = (
     bindings = [${bindings.join(", ")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01",
-    compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
+    compatibilityFlags = [${[
+      ...APPLICATION_COMPATIBILITY_FLAGS,
+      ...(options.workflowLoader ? ["enable_ctx_exports"] : []),
+    ]
+      .map(capnpText)
+      .join(", ")}],
     globalOutbound = "deny"
   )),
   (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}${serviceExternals}

@@ -208,7 +208,8 @@ test("package preparation materializes a selected graph privately without app ev
     expect(config).toContain('DATA_TOKEN", text = "data-original"');
     expect(config).toContain(`address = "${CURRENT_DATA_PLANE}"`);
     expect(config).not.toContain(PERSISTED_DATA_PLANE);
-    expect(hostPrivate).toContain("wrapper-original");
+    expect(application).toContain("wrapper-original");
+    expect(hostPrivate).not.toContain("wrapper-original");
     expect(hostPrivate).toContain("data-original");
     for (const forbidden of [
       "active.json",
@@ -260,15 +261,17 @@ test("preparation snapshots maps, nested site vars, and input before caller muta
     const hostPrivate = await preparedSources(rootPath, "host-private");
     expect(application).toContain("aux-original");
     expect(application).not.toContain("aux-mutated");
-    expect(hostPrivate).toContain("wrapper-original");
+    expect(application).toContain("wrapper-original");
+    expect(application).not.toContain("wrapper-mutated");
+    expect(hostPrivate).not.toContain("wrapper-original");
     expect(hostPrivate).not.toContain("wrapper-mutated");
     expect(config).toContain('APP_VALUE", text = "app-original"');
     expect(config).not.toContain("app-mutated");
     expect(config).toContain('DATA_TOKEN", text = "data-original"');
     expect(config).not.toContain("data-mutated");
     expect(config).not.toContain("mutated.invalid:9");
-    expect(hostPrivate).toContain("input-original");
-    expect(hostPrivate).not.toContain("input-mutated");
+    expect(application).toContain("input-original");
+    expect(application).not.toContain("input-mutated");
   } finally {
     await disposePrepared(prepared);
   }
