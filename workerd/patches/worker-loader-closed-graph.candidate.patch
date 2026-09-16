@@ -1,0 +1,386 @@
+diff --git a/src/workerd/api/worker-loader.h b/src/workerd/api/worker-loader.h
+--- a/src/workerd/api/worker-loader.h
++++ b/src/workerd/api/worker-loader.h
+@@ -77,6 +77,12 @@ class WorkerLoader: public jsg::Object {
+     kj::Maybe<kj::String> serializedJson;
+   };
+ 
++  struct ModulePolicy {
++    kj::String applicationMain;
++
++    JSG_STRUCT(applicationMain);
++  };
++
+   struct WorkerCode {
+     kj::String compatibilityDate;
+     jsg::Optional<kj::Array<kj::String>> compatibilityFlags;
+@@ -85,6 +91,11 @@ class WorkerLoader: public jsg::Object {
+     jsg::Optional<ResourceLimits> limits;
+ 
+     kj::String mainModule;
++    // Selects the provenance namespace containing mainModule. Defaults to application.
++    jsg::Optional<kj::String> mainModuleRole;
++
++    // Enables provenance-aware closed-graph resolution.
++    jsg::Optional<ModulePolicy> modulePolicy;
+ 
+     // Modules are specified as an object mapping names to content. If the content is just a
+     // string, an ES module is assumed for '.js' files and a Python module for '.py' files. For
+@@ -93,5 +104,8 @@ class WorkerLoader: public jsg::Object {
+     // determined based on which property is set.
+     jsg::Dict<kj::OneOf<Module, kj::String>> modules;
+-
++    // Modules in the trusted host-private namespace. Names may overlap with application
++    // modules; a non-empty dictionary is rejected unless modulePolicy is configured.
++    jsg::Optional<jsg::Dict<kj::OneOf<Module, kj::String>>> hostPrivateModules;
++
+     // Any RPC-serializable value!
+     jsg::Optional<jsg::JsRef<jsg::JsObject>> env;
+@@ -113,9 +127,12 @@ class WorkerLoader: public jsg::Object {
+         compatibilityFlags,
+         allowExperimental,
+         limits,
+         mainModule,
++        mainModuleRole,
++        modulePolicy,
+         modules,
++        hostPrivateModules,
+         env,
+         globalOutbound,
+         tails,
+         streamingTails);
+@@ -154,5 +171,6 @@ class WorkerLoader: public jsg::Object {
+ #define EW_WORKER_LOADER_ISOLATE_TYPES                                                             \
+   api::WorkerStub, api::WorkerStub::EntrypointOptions, api::WorkerLoader,                          \
+-      api::WorkerLoader::Module, api::WorkerLoader::WorkerCode, workerd::ResourceLimits
++      api::WorkerLoader::Module, api::WorkerLoader::ModulePolicy, api::WorkerLoader::WorkerCode,   \
++      workerd::ResourceLimits
+ 
+ }  // namespace workerd::api
+diff --git a/src/workerd/api/worker-loader.c++ b/src/workerd/api/worker-loader.c++
+--- a/src/workerd/api/worker-loader.c++
++++ b/src/workerd/api/worker-loader.c++
+@@ -21,6 +21,21 @@ namespace {
+ // roughly the paid Worker analog of 128 environment variables at 5 KB each
+ constexpr size_t MAX_DYNAMIC_WORKER_ENV_SIZE = 1 * 1024 * 1024;
+ 
++Worker::Script::ModuleRole parseModuleRole(
++    const jsg::Optional<kj::String>& maybeRole, kj::StringPtr fieldName) {
++  KJ_IF_SOME(role, maybeRole) {
++    if (role == "application"_kj) {
++      return Worker::Script::ModuleRole::APPLICATION;
++    }
++    if (role == "hostPrivate"_kj) {
++      return Worker::Script::ModuleRole::HOST_PRIVATE;
++    }
++    JSG_FAIL_REQUIRE(TypeError, fieldName,
++        " must be either 'application' or 'hostPrivate'. Got: ", role);
++  }
++  return Worker::Script::ModuleRole::APPLICATION;
++}
++
+ }  // namespace
+ 
+ jsg::Ref<Fetcher> WorkerStub::getEntrypoint(jsg::Lock& js,
+@@ -236,5 +251,6 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
+     .tails = kj::mv(tailChannels),
+     .streamingTails = kj::mv(streamingTailChannels),
+-    .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.mainModule)),
++    .ownContent = ownCompatFlags.attach(kj::mv(code.modules), kj::mv(code.hostPrivateModules),
++        kj::mv(code.mainModule), kj::mv(code.modulePolicy)),
+     .ownContentIsRpcResponse = false};
+ }
+@@ -242,8 +258,14 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
+ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& code) {
+   JSG_REQUIRE(code.modules.fields.size() > 0, TypeError,
+       "Dynamic Worker code must contain at least one module.");
+-
++
+-  auto modules = KJ_MAP(entry, code.modules.fields) -> Worker::Script::Module {
++  size_t hostPrivateModuleCount = 0;
++  KJ_IF_SOME(hostPrivateModules, code.hostPrivateModules) {
++    hostPrivateModuleCount = hostPrivateModules.fields.size();
++  }
++
++  auto extractModules = [&](auto& moduleDict, Worker::Script::ModuleRole role) {
++    auto modules = KJ_MAP(entry, moduleDict.fields) -> Worker::Script::Module {
+     KJ_SWITCH_ONEOF(entry.value) {
+       KJ_CASE_ONEOF(text, kj::String) {
+         if (entry.name.endsWith(".py"_kj)) {
+@@ -330,4 +352,84 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
+   };
+ 
++    for (auto& module: modules) {
++      module.role = role;
++    }
++    return modules;
++  };
++
++  // The separate dictionaries provide namespace-local identity. In particular,
++  // one logical name may be present once in each role.
++  kj::Vector<Worker::Script::Module> allModules(
++      code.modules.fields.size() + hostPrivateModuleCount);
++  auto appendModules = [&](auto& moduleDict, Worker::Script::ModuleRole role) {
++    auto extractedModules = extractModules(moduleDict, role);
++    for (auto& module: extractedModules) {
++      allModules.add(kj::mv(module));
++    }
++  };
++
++  appendModules(code.modules, Worker::Script::ModuleRole::APPLICATION);
++  KJ_IF_SOME(hostPrivateModules, code.hostPrivateModules) {
++    appendModules(hostPrivateModules, Worker::Script::ModuleRole::HOST_PRIVATE);
++  }
++  auto modules = allModules.releaseAsArray();
++
++  auto mainModuleRole = parseModuleRole(code.mainModuleRole, "mainModuleRole"_kj);
++
++  kj::Maybe<Worker::Script::ModulesSource::ModulePolicy> modulePolicy;
++  KJ_IF_SOME(policy, code.modulePolicy) {
++    JSG_REQUIRE(policy.applicationMain.size() > 0, TypeError,
++        "modulePolicy.applicationMain must name an application module.");
++    modulePolicy = Worker::Script::ModulesSource::ModulePolicy{
++      .applicationMain = policy.applicationMain,
++    };
++  }
++
++  JSG_REQUIRE(mainModuleRole != Worker::Script::ModuleRole::HOST_PRIVATE ||
++          modulePolicy != kj::none,
++      TypeError, "mainModuleRole is hostPrivate but modulePolicy is not configured.");
++
++  JSG_REQUIRE(hostPrivateModuleCount == 0 || modulePolicy != kj::none, TypeError,
++      "hostPrivateModules requires modulePolicy when it contains modules.");
++
++  KJ_IF_SOME(policy, modulePolicy) {
++    bool foundApplicationMain = false;
++    for (auto& module: modules) {
++      if (module.role == Worker::Script::ModuleRole::APPLICATION &&
++          module.name == policy.applicationMain) {
++        foundApplicationMain = true;
++        break;
++      }
++    }
++    JSG_REQUIRE(foundApplicationMain, TypeError, "modulePolicy.applicationMain \"",
++        policy.applicationMain, "\" does not name a declared application module.");
++  }
++
++  bool foundMainModule = false;
++  bool foundMainModuleInOtherRole = false;
++  for (auto& module: modules) {
++    if (module.name == code.mainModule) {
++      if (module.role == mainModuleRole) {
++        foundMainModule = true;
++      } else {
++        foundMainModuleInOtherRole = true;
++      }
++    }
++  }
++  auto mainRoleName =
++      mainModuleRole == Worker::Script::ModuleRole::APPLICATION ? "application"_kj
++                                                                : "hostPrivate"_kj;
++  auto mainDictionaryName =
++      mainModuleRole == Worker::Script::ModuleRole::APPLICATION ? "modules"_kj
++                                                                : "hostPrivateModules"_kj;
++  auto otherDictionaryName =
++      mainModuleRole == Worker::Script::ModuleRole::APPLICATION ? "hostPrivateModules"_kj
++                                                                : "modules"_kj;
++  JSG_REQUIRE(!foundMainModuleInOtherRole || foundMainModule, TypeError, "mainModuleRole \"",
++      mainRoleName, "\" selects ", mainDictionaryName, ", but mainModule \"", code.mainModule,
++      "\" is only declared in ", otherDictionaryName, ".");
++  JSG_REQUIRE(foundMainModule, TypeError, "mainModule \"", code.mainModule,
++      "\" does not name a declared ", mainRoleName, " module in ", mainDictionaryName, ".");
++
+   bool isPython = code.mainModule.endsWith(".py"_kj);
+   // Disallow Python modules when the main module is a JS module. Also tally up the
+@@ -376,5 +478,7 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
+   return Worker::Script::ModulesSource{
+     .mainModule = code.mainModule,
++    .mainModuleRole = mainModuleRole,
+     .modules = kj::mv(modules),
++    .modulePolicy = modulePolicy,
+     .isPython = isPython,
+   };
+diff --git a/src/workerd/api/tests/worker-loader-test.js b/src/workerd/api/tests/worker-loader-test.js
+--- a/src/workerd/api/tests/worker-loader-test.js
++++ b/src/workerd/api/tests/worker-loader-test.js
+@@ -1454,3 +1454,180 @@ export let minimalPythonPackage = {
+     }
+   },
+ };
++
++export let closedGraphModulePolicy = {
++  async test(ctrl, env, ctx) {
++    const appOnlyWorker = env.loader.load({
++      compatibilityDate: '2026-01-01',
++      mainModule: 'legacy-app.js',
++      modules: {
++        'legacy-app.js': `
++          export default { read() { return 'legacy-application'; } };
++        `,
++      },
++    });
++    assert.strictEqual(await appOnlyWorker.getEntrypoint().read(), 'legacy-application');
++
++    const registryOptions = [
++      {},
++      {
++        compatibilityFlags: ['new_module_registry'],
++        allowExperimental: true,
++      },
++    ];
++    for (const options of registryOptions) {
++      const worker = env.loader.load({
++        ...options,
++        compatibilityDate: '2026-01-01',
++        mainModule: 'host.js',
++        mainModuleRole: 'hostPrivate',
++        modulePolicy: { applicationMain: 'app.js' },
++        modules: {
++          'app.js': `
++            import { identity } from './shared.js';
++            export const applicationSharedIdentity = identity;
++            export async function rejectsHostPrivateImport() {
++              try {
++                await import('./private.js');
++                return false;
++              } catch (error) {
++                return /^(No such module|Module not found)/.test(error.message);
++              }
++            }
++          `,
++          'shared.js': `export const identity = 'application-shared';`,
++        },
++        hostPrivateModules: {
++          'host.js': `
++            import {
++              applicationSharedIdentity,
++              rejectsHostPrivateImport,
++            } from './app.js';
++            import { identity as hostPrivateSharedIdentity } from './shared.js';
++            import { privateValue } from './private.js';
++
++            export default {
++              async inspect() {
++                return {
++                  applicationSharedIdentity,
++                  hostPrivateSharedIdentity,
++                  privateValue,
++                  applicationRejectedPrivate: await rejectsHostPrivateImport(),
++                };
++              },
++            };
++          `,
++          'shared.js': `export const identity = 'host-private-shared';`,
++          'private.js': `export const privateValue = 'host-private';`,
++        },
++      });
++
++      assert.deepStrictEqual(await worker.getEntrypoint().inspect(), {
++        applicationSharedIdentity: 'application-shared',
++        hostPrivateSharedIdentity: 'host-private-shared',
++        privateValue: 'host-private',
++        applicationRejectedPrivate: true,
++      });
++    }
++  },
++};
++
++export let closedGraphModulePolicyValidation = {
++  test(ctrl, env, ctx) {
++    const base = {
++      compatibilityDate: '2026-01-01',
++      mainModule: 'app.js',
++      modules: {
++        'app.js': `export default {};`,
++      },
++    };
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          hostPrivateModules: {
++            'private.js': `export const value = 'private';`,
++          },
++        }),
++      {
++        name: 'TypeError',
++        message:
++          'hostPrivateModules requires modulePolicy when it contains modules.',
++      }
++    );
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          modulePolicy: { applicationMain: '' },
++        }),
++      {
++        name: 'TypeError',
++        message: 'modulePolicy.applicationMain must name an application module.',
++      }
++    );
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          modulePolicy: { applicationMain: 'private.js' },
++          hostPrivateModules: {
++            'private.js': `export const value = 'private';`,
++          },
++        }),
++      {
++        name: 'TypeError',
++        message:
++          'modulePolicy.applicationMain "private.js" does not name a declared application module.',
++      }
++    );
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          mainModule: 'host.js',
++          mainModuleRole: 'application',
++          modulePolicy: { applicationMain: 'app.js' },
++          hostPrivateModules: {
++            'host.js': `export default {};`,
++          },
++        }),
++      {
++        name: 'TypeError',
++        message:
++          'mainModuleRole "application" selects modules, but mainModule "host.js" ' +
++          'is only declared in hostPrivateModules.',
++      }
++    );
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          mainModuleRole: 'hostPrivate',
++        }),
++      {
++        name: 'TypeError',
++        message:
++          'mainModuleRole is hostPrivate but modulePolicy is not configured.',
++      }
++    );
++
++    assert.throws(
++      () =>
++        env.loader.load({
++          ...base,
++          mainModuleRole: 'host-private',
++        }),
++      {
++        name: 'TypeError',
++        message:
++          "mainModuleRole must be either 'application' or 'hostPrivate'. Got: host-private",
++      }
++    );
++  },
++};
