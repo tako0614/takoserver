@@ -33,6 +33,7 @@ const SafeReflect = Reflect;
 const SafeReflectGet = Reflect.get;
 const SafeOwnKeys = Reflect.ownKeys;
 const SafeArrayIsArray = Array.isArray;
+const SafeArrayPrototype = Array.prototype;
 const SafeArrayBufferIsView = ArrayBuffer.isView;
 const SafeArrayBufferSlice = ArrayBuffer.prototype.slice;
 const SafeAtob = atob;
@@ -47,6 +48,7 @@ const SafeMapHas = Map.prototype.has;
 const SafeMapSet = Map.prototype.set;
 const SafeMapDelete = Map.prototype.delete;
 const SafeMathAbs = Math.abs;
+const SafeMathFround = Math.fround;
 const SafeMathMin = Math.min;
 const SafeNumberIsFinite = Number.isFinite;
 const SafeNumberIsSafeInteger = Number.isSafeInteger;
@@ -59,6 +61,7 @@ const SafeObjectGetPrototypeOf = Object.getPrototypeOf;
 const SafeObjectHasOwn = Object.hasOwn;
 const SafeObjectKeys = Object.keys;
 const SafeObjectPrototype = Object.prototype;
+const SafeObjectDefineProperty = Object.defineProperty;
 const SafeObjectSetPrototypeOf = Object.setPrototypeOf;
 const SafePromise = Promise;
 const SafePromiseResolve = Promise.resolve;
@@ -113,6 +116,7 @@ export {
   SafeReflectGet,
   SafeOwnKeys,
   SafeArrayIsArray,
+  SafeArrayPrototype,
   SafeArrayBufferIsView,
   SafeArrayBufferSlice,
   SafeAtob,
@@ -127,6 +131,7 @@ export {
   SafeMapSet,
   SafeMapDelete,
   SafeMathAbs,
+  SafeMathFround,
   SafeMathMin,
   SafeNumberIsFinite,
   SafeNumberIsSafeInteger,
@@ -139,6 +144,7 @@ export {
   SafeObjectHasOwn,
   SafeObjectKeys,
   SafeObjectPrototype,
+  SafeObjectDefineProperty,
   SafeObjectSetPrototypeOf,
   SafePromise,
   SafePromiseResolve,

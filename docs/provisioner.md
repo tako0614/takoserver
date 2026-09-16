@@ -233,7 +233,24 @@ current invocation, never an older operation's uncertain side effects.
 The [Workflow implementation note](workflow-runtime.md) separates the internal
 instance store from the execution and binding work still required for support.
 
-The ordinary Cloudflare provider also refuses these WorkerVersion declarations
+Vector has an explicit development-only self-host integration. It requires a
+matching VectorIndex Offering, the exact candidate Interface and Binding, and
+an injected `vectorIndexStore` for both provisioning and the data plane. The
+ordinary Bun entry does not activate it or admit its unpublished Forms. An
+application binding exposes only `upsert`, `get`, `delete`, and `query`; its
+tenant and Resource UID come from the Host-resolved relation, never from the
+application's operation input. A missing store or deleted index is unavailable,
+not permission to create an index implicitly. Managed WfP support is separate.
+
+A Version with Vector bindings retains their exact tenant/Resource scope in
+the internal v6 binding record. Versions without Vector keep v4/v5 writes, and
+v1-v5 records remain readable without rewriting their bytes. This is a private
+persistence format, not a public API or Form version. Older binaries reject
+v6 records; these development records must not be activated on an installation
+whose rollback binary cannot read them. Recovery uses the retained binding
+scope rather than resolving today's Offering or selecting a different index.
+
+The ordinary Cloudflare provider also refuses Actor/Workflow WorkerVersion declarations
 before upload or sensitive-input acquisition, including apply recovery and
 convergence. Observation refuses them before native readback. Omitted or empty
 arrays remain valid; malformed declarations are `invalid_spec`. Existing
@@ -455,8 +472,8 @@ and workerd hands every one of them to every module that service runs —
 including through `import { env } from "cloudflare:workers"` — so a value left
 out of a projected `env` was never hidden. The tenant's service therefore
 declares no token and no address. The facade rewrites every request it is
-handed into a fixed method, one of four fixed URLs, and a fixed header set, so a
-service binding that leaked into tenant code reaches those four routes and
+handed into a fixed method, an explicitly allowlisted URL, and a fixed header set, so a
+service binding that leaked into tenant code reaches only those data-plane routes and
 nothing else on this machine. Exactly one header crosses it unchanged — the
 opaque object-operation document — and the plane behind parses that field by
 field before it resolves a binding name. `disallow_importable_env` is set on the tenant's

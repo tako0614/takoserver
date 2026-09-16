@@ -127,6 +127,7 @@ import {
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
   SELFHOST_WORKER_INTERNAL_BINDING_PREFIX,
   SELFHOST_WORKER_READINESS_HEADER,
   SELFHOST_WORKER_READINESS_PATH,
@@ -200,6 +201,20 @@ const DATA_BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
 const VECTOR_NATIVE_PREFIX = "selfhost-vector";
 const VECTOR_NATIVE_SEGMENT = /^tvi-[0-9a-f]{64}$/u;
+/** Exact candidate Binding accepted by the forward WorkerVersion Form. */
+const SELFHOST_VECTOR_BINDING_REF = Object.freeze({
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.edge-vector",
+  version: "1.0.0",
+  schemaDigest: "sha256:bc367a665405e405ac99091fb7f1908a382123d63c4acbd807de97c10184a809",
+});
+/** Exact candidate Interface the VectorIndex Offering must provide. */
+const SELFHOST_VECTOR_INTERFACE_REF = Object.freeze({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "edge.vector",
+  version: "0.1.0",
+  schemaDigest: "sha256:6df8b7680b0ff278cb8fcb6f56c602ec5d6bb9b4ec115a6172e70e6b54d6cada",
+});
 const SELFHOST_SERVICE_BINDING_REF = Object.freeze({
   apiVersion: "bindings.takoform.com/v1alpha2",
   name: "module-worker.service",
@@ -428,6 +443,8 @@ export interface SelfhostVersionDataGrant {
   readonly queue: Readonly<Record<string, SelfhostGrantedQueue>>;
   /** Bucket bindings, resolved to the incarnation this Host derived. */
   readonly objects: Readonly<Record<string, string>>;
+  /** Vector bindings, retaining the immutable tenant/Resource scope. Omitted when none exist. */
+  readonly vectors?: Readonly<Record<string, VectorIndexScope>>;
 }
 
 export interface SelfhostGrantedQueue {
@@ -607,10 +624,15 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
         SelfhostGrantedQueue
       >;
       const objects: Record<string, string> = Object.create(null) as Record<string, string>;
+      const vectors: Record<string, VectorIndexScope> = Object.create(null) as Record<
+        string,
+        VectorIndexScope
+      >;
       for (const binding of plane.bindings) {
         if (binding.kind === "edge.kv") kv[binding.name] = binding.target;
         else if (binding.kind === "edge.sql") sql[binding.name] = binding.target;
         else if (binding.kind === "edge.objects") objects[binding.name] = binding.target;
+        else if (binding.kind === "edge.vector") vectors[binding.name] = { ...binding.scope };
         else if (binding.queue) {
           queue[binding.name] = {
             queueId: binding.target,
@@ -619,7 +641,14 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
           };
         }
       }
-      return { secret: stored.planeToken, kv, sql, queue, objects };
+      return {
+        secret: stored.planeToken,
+        kv,
+        sql,
+        queue,
+        objects,
+        ...(Object.keys(vectors).length > 0 ? { vectors } : {}),
+      };
     },
   };
 }
@@ -1259,7 +1288,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
                         ? SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND
                         : binding.kind === "edge.queue"
                           ? SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND
-                          : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+                          : binding.kind === "edge.vector"
+                            ? SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND
+                            : SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
                   publicName: binding.name,
                 })),
               },
@@ -1721,6 +1752,190 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   };
 
   /**
+   * The forward candidate's Vector bindings are projected from one exact
+   * relation, never from a provider-native material object. The relation is
+   * already Host-resolved, but this is still the last trusted projection
+   * barrier: every identity, placement, Form, Interface, and Binding reference
+   * must agree before a scope reaches the immutable Version record.
+   */
+  const declaredVectorBindings = (
+    input: WorkerVersionDeclarationInput & Pick<ApplyInput, "offering">,
+    reserved: ReadonlySet<string>,
+  ): readonly SelfhostVersionDataBinding[] => {
+    const invalid = (): never => {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version vector bindings are invalid"),
+      );
+    };
+    const rawValue = input.spec.vectorBindings;
+    if (rawValue === undefined) return [];
+    if (Array.isArray(rawValue) && rawValue.length === 0) return [];
+    if (
+      !Array.isArray(rawValue) ||
+      rawValue.length > MAX_WORKER_VERSION_DATA_BINDINGS ||
+      input.offering.bindingRefs.filter(isExactSelfhostVectorBindingRef).length !== 1 ||
+      !options.vectorIndexStore
+    ) {
+      invalid();
+    }
+    const raw = rawValue as readonly JsonValue[];
+    const workerRelation = input.relations?.find((candidate) => candidate.pointer === "/worker");
+    if (!workerRelation) invalid();
+    const resolvedWorkerRelation = workerRelation as NonNullable<typeof workerRelation>;
+    const workerDeployment = resolvedWorkerRelation.deployment;
+    if (
+      resolvedWorkerRelation.resource.kind !== "ModuleWorker" ||
+      resolvedWorkerRelation.targetUid !== resolvedWorkerRelation.resource.metadata.uid ||
+      resolvedWorkerRelation.resource.metadata.space !== input.identity.space ||
+      !workerDeployment ||
+      workerDeployment.state !== "active" ||
+      workerDeployment.tenantId !== input.identity.tenantRef ||
+      workerDeployment.resourceUid !== resolvedWorkerRelation.targetUid
+    ) {
+      invalid();
+    }
+    const resolvedWorkerDeployment = workerDeployment as NonNullable<typeof workerDeployment>;
+    const names = new Set(reserved);
+    const bindings: SelfhostVersionDataBinding[] = [];
+    for (let index = 0; index < raw.length; index += 1) {
+      const declaration = isJsonObject(raw[index]) ? (raw[index] as JsonObject) : null;
+      const resource = isJsonObject(declaration?.resource) ? declaration.resource : null;
+      const name = typeof declaration?.name === "string" ? declaration.name : null;
+      const relations =
+        input.relations?.filter(
+          (candidate) => candidate.pointer === `/vectorBindings/${index}/resource`,
+        ) ?? [];
+      const relation = relations.length === 1 ? relations[0] : undefined;
+      const deployment = relation?.deployment;
+      const configured = deployment
+        ? options.offerings.find((candidate) => candidate.id === deployment.offeringId)
+        : undefined;
+      const scope =
+        relation && deployment
+          ? { tenantId: deployment.tenantId, resourceUid: relation.targetUid }
+          : null;
+      if (
+        !name ||
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        !resource ||
+        !relation ||
+        relation.relation !== "/vectorBindings/*/resource" ||
+        relation.resource.kind !== "VectorIndex" ||
+        relation.resource.metadata.space !== input.identity.space ||
+        relation.targetUid !== relation.resource.metadata.uid ||
+        !RESOURCE_UID.test(relation.targetUid) ||
+        resource.apiVersion !== relation.resource.apiVersion ||
+        resource.kind !== relation.resource.kind ||
+        resource.name !== relation.resource.metadata.name ||
+        !deployment ||
+        deployment.state !== "active" ||
+        deployment.tenantId !== input.identity.tenantRef ||
+        !boundedSelfhostVectorString(deployment.tenantId, 1, 255) ||
+        deployment.tenantId.includes("\u0000") ||
+        deployment.resourceUid !== relation.targetUid ||
+        deployment.providerPackRef !== resolvedWorkerDeployment.providerPackRef ||
+        deployment.providerInstallationRef !== resolvedWorkerDeployment.providerInstallationRef ||
+        !scope ||
+        deployment.nativeId !== selfhostVectorNativeId(scope) ||
+        !configured ||
+        configured.form.kind !== "VectorIndex" ||
+        !sameSelfhostFormRef(configured.form, relation.resource.form.formRef) ||
+        configured.providedInterfaces.length !== 1 ||
+        !configured.providedInterfaces.every(isExactSelfhostVectorInterfaceRef) ||
+        !isExactSelfhostVectorBindingRef(relation.bindingRef)
+      ) {
+        invalid();
+      }
+      names.add(name as string);
+      bindings.push({
+        kind: "edge.vector",
+        name: name as string,
+        scope: scope as VectorIndexScope,
+      });
+    }
+    return bindings;
+  };
+
+  /**
+   * Recovery must not resolve a Vector target against today's relation or
+   * Offering state. The v6 record is the immutable authority created by the
+   * original apply; only the portable declaration's names are checked here.
+   */
+  const persistedVectorBindings = (
+    input: WorkerVersionDeclarationInput & Pick<ApplyInput, "offering">,
+    reserved: ReadonlySet<string>,
+    recorded: StoredSelfhostVersionBindings | null,
+  ): readonly SelfhostVersionDataBinding[] => {
+    const rawValue = input.spec.vectorBindings;
+    if (rawValue === undefined) return [];
+    if (Array.isArray(rawValue) && rawValue.length === 0) return [];
+    if (
+      !Array.isArray(rawValue) ||
+      rawValue.length > MAX_WORKER_VERSION_DATA_BINDINGS ||
+      input.offering.bindingRefs.filter(isExactSelfhostVectorBindingRef).length !== 1
+    ) {
+      throw new SelfhostFailure(
+        failed("invalid_spec", "the Worker Version vector bindings are invalid"),
+      );
+    }
+    const raw = rawValue as readonly JsonValue[];
+    const names = new Set(reserved);
+    const declarations: { readonly name: string; readonly resource: JsonObject }[] = [];
+    for (const value of raw) {
+      const declaration = isJsonObject(value) ? (value as JsonObject) : null;
+      const resource = isJsonObject(declaration?.resource)
+        ? (declaration.resource as JsonObject)
+        : null;
+      const name = typeof declaration?.name === "string" ? declaration.name : null;
+      if (
+        !name ||
+        name.length > 64 ||
+        !DATA_BINDING_NAME.test(name) ||
+        name.startsWith(SELFHOST_WORKER_INTERNAL_BINDING_PREFIX) ||
+        names.has(name) ||
+        !resource ||
+        resource.kind !== "VectorIndex" ||
+        typeof resource.name !== "string"
+      ) {
+        throw new SelfhostFailure(
+          failed("invalid_spec", "the Worker Version vector bindings are invalid"),
+        );
+      }
+      names.add(name);
+      declarations.push({ name, resource });
+    }
+    const persisted = (recorded?.dataPlane?.bindings ?? []).filter(
+      (binding): binding is Extract<SelfhostVersionDataBinding, { readonly kind: "edge.vector" }> =>
+        binding.kind === "edge.vector",
+    );
+    if (persisted.length !== raw.length) {
+      // A missing record is handled by recoverWorkerVersionApply's existing
+      // one-shot lease-abandon path. A present record with a different vector
+      // slot count is a durable declaration mismatch and must never be treated
+      // as an empty projection.
+      if (recorded === null) return [];
+      throw new SelfhostFailure(
+        failed("not_found", "the Worker Version vector bindings were not recorded"),
+      );
+    }
+    const byName = new Map(persisted.map((binding) => [binding.name, binding]));
+    const bindings: SelfhostVersionDataBinding[] = [];
+    for (const { name } of declarations) {
+      const stored = name ? byName.get(name) : undefined;
+      if (!stored) {
+        throw new SelfhostFailure(
+          failed("invalid_spec", "the Worker Version vector bindings are invalid"),
+        );
+      }
+      bindings.push(stored);
+    }
+    return bindings;
+  };
+
+  /**
    * What a queue promises about the messages put into it, read from the exact
    * Resource the relation names.
    *
@@ -1761,6 +1976,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     input: ApplyInput,
     vars: readonly SelfhostVersionBinding[],
     requiredSensitive: readonly string[],
+    recorded?: StoredSelfhostVersionBindings | null,
   ): readonly SelfhostVersionDataBinding[] => {
     const reserved = new Set([...vars.map((binding) => binding.name), ...requiredSensitive]);
     const namespaces = declaredDataBindings(input, reserved);
@@ -1768,7 +1984,16 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       input,
       new Set([...reserved, ...namespaces.map((binding) => binding.name)]),
     );
-    return [...namespaces, ...buckets];
+    const vectorReserved = new Set([
+      ...reserved,
+      ...namespaces.map((binding) => binding.name),
+      ...buckets.map((binding) => binding.name),
+    ]);
+    const vectors =
+      recorded === undefined
+        ? declaredVectorBindings(input, vectorReserved)
+        : persistedVectorBindings(input, vectorReserved, recorded);
+    return [...namespaces, ...buckets, ...vectors];
   };
 
   /**
@@ -2309,10 +2534,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       name: input.identity.name,
     });
     const vars = declaredVars(input.spec);
+    const recorded = await readVersionBindings(script, versionId);
     // Resolved before the lease is acquired, because everything here is a
     // declarative refusal and a refusal after dispatch would strand the
     // operation key with its ciphertext already erased.
-    const dataBindings = declaredVersionBindings(input, vars, requiredSensitive);
+    const dataBindings = declaredVersionBindings(input, vars, requiredSensitive, recorded);
     const serviceBindings = await declaredServiceBindings(
       input,
       script,
@@ -2344,7 +2570,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       throw error;
     }
     const materialized = await readVersionSnapshot(script, versionId);
-    const recorded = await readVersionBindings(script, versionId);
     if (materialized.state === "present") {
       const failure = assetContractFailure(materialized.prepared);
       if (failure) return failure;
@@ -2405,6 +2630,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         "conflict",
         "the committed Worker Version materialization conflicts with this recovery",
       );
+    }
+    if (
+      dataBindings.some((binding) => binding.kind === "edge.vector") &&
+      !options.vectorIndexStore
+    ) {
+      return failed("unavailable", "the VectorIndex data plane is unavailable", true);
     }
     if (
       !sameVersionDeclaration(
@@ -4532,6 +4763,52 @@ function selfhostVectorScope(identity: ResourceIdentity): VectorIndexScope | nul
   return { tenantId: identity.tenantRef, resourceUid: identity.uid };
 }
 
+function isExactSelfhostVectorBindingRef(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const ref = value as Record<string, unknown>;
+  return (
+    Object.keys(ref).sort().join(",") === "apiVersion,name,schemaDigest,version" &&
+    ref.apiVersion === SELFHOST_VECTOR_BINDING_REF.apiVersion &&
+    ref.name === SELFHOST_VECTOR_BINDING_REF.name &&
+    ref.version === SELFHOST_VECTOR_BINDING_REF.version &&
+    ref.schemaDigest === SELFHOST_VECTOR_BINDING_REF.schemaDigest
+  );
+}
+
+function isExactSelfhostVectorInterfaceRef(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const ref = value as Record<string, unknown>;
+  return (
+    Object.keys(ref).sort().join(",") === "apiVersion,name,schemaDigest,version" &&
+    ref.apiVersion === SELFHOST_VECTOR_INTERFACE_REF.apiVersion &&
+    ref.name === SELFHOST_VECTOR_INTERFACE_REF.name &&
+    ref.version === SELFHOST_VECTOR_INTERFACE_REF.version &&
+    ref.schemaDigest === SELFHOST_VECTOR_INTERFACE_REF.schemaDigest
+  );
+}
+
+function sameSelfhostFormRef(
+  left: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly definitionVersion: string;
+    readonly schemaDigest: string;
+  },
+  right: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly definitionVersion: string;
+    readonly schemaDigest: string;
+  },
+): boolean {
+  return (
+    left.apiVersion === right.apiVersion &&
+    left.kind === right.kind &&
+    left.definitionVersion === right.definitionVersion &&
+    left.schemaDigest === right.schemaDigest
+  );
+}
+
 function selfhostVectorNativeId(scope: VectorIndexScope): string {
   const digest = createHash("sha256")
     .update(`${scope.tenantId}\u0000${scope.resourceUid}`, "utf8")
@@ -5356,13 +5633,17 @@ function sameVersionDeclaration(
     JSON.stringify(
       [...bindings]
         .sort((left, right) => (left.name < right.name ? -1 : 1))
-        .map((binding) => [
-          binding.kind,
-          binding.name,
-          binding.target,
-          binding.queue?.messageRetentionSeconds ?? null,
-          binding.queue?.deliveryDelaySeconds ?? null,
-        ]),
+        .map((binding) =>
+          binding.kind === "edge.vector"
+            ? [binding.kind, binding.name, binding.scope.tenantId, binding.scope.resourceUid]
+            : [
+                binding.kind,
+                binding.name,
+                binding.target,
+                binding.queue?.messageRetentionSeconds ?? null,
+                binding.queue?.deliveryDelaySeconds ?? null,
+              ],
+        ),
     );
   return (
     canonicalVars(vars) === canonicalVars(recorded.vars) &&

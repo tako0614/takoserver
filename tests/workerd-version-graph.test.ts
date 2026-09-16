@@ -18,6 +18,7 @@ import {
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_SERVICE_BINDING_KIND,
   type SelfhostWorkerBindingDescriptor,
@@ -264,6 +265,39 @@ test("compiles data, service, event, and asset projections with explicit publica
   expect(source(graph.hostModules.get(SELFHOST_WORKER_ENTRYPOINT_MODULE))).toContain(
     "weighted-publication",
   );
+});
+
+test("projects the opt-in edge.vector descriptor into the generated entrypoint", () => {
+  const input = graphInput({
+    dataPlane: {
+      address: "127.0.0.1:4667",
+      token: DATA_TOKEN,
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  });
+  const graph = compileWorkerdVersionGraph(input);
+  const entrypoint = source(graph.hostModules.get(SELFHOST_WORKER_ENTRYPOINT_MODULE));
+  expect(entrypoint).toBe(
+    selfhostWorkerEntrypointSource({
+      originalMainModule: input.mainModule,
+      declaredHandlers: input.declaredHandlers,
+      bindings: [
+        { name: "PLAIN", type: "plain_text" },
+        { name: "JSON_VALUE", type: "json" },
+        { name: "SECRET", type: "secret_text" },
+        {
+          kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
+          publicName: "SEARCH",
+        },
+      ],
+      publication: input.readiness.publication,
+      probeHostname: input.readiness.probeHostname,
+    }),
+  );
+  expect(entrypoint).toContain('const VECTOR_KIND = "edge.vector@0.1.0";');
+  expect(graph.site.dataPlane?.vars).toEqual([
+    { name: SELFHOST_WORKER_DATA_TOKEN_BINDING, value: DATA_TOKEN, kind: "text" },
+  ]);
 });
 
 test("copies every caller-owned map, byte array, and nested declaration", () => {

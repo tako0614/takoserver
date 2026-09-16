@@ -10,6 +10,7 @@ import {
   SELFHOST_DATA_PLANE_ORIGIN,
   SELFHOST_DATA_PLANE_QUEUE_PATH,
   SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_DATA_PLANE_VECTOR_PATH,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
 } from "./selfhost-worker-wrapper.ts";
 
@@ -28,9 +29,10 @@ import {
  * nothing else: no token, no address, and no way to name a destination. What
  * crosses that binding is a request this module rewrites completely — fixed
  * method, fixed URL, fixed headers, the tenant's JSON body and nothing more —
- * so a binding that leaked into tenant code would still reach exactly three
- * routes and could not be turned on the control API, the provisioner, or any
- * other address this machine listens on.
+ * so a binding that leaked into tenant code would still reach only the
+ * explicitly allowlisted KV, SQL, queue, object, and Vector routes and could
+ * not be turned on the control API, the provisioner, or any other address this
+ * machine listens on.
  *
  * The source is a constant. Nothing a tenant declares reaches it, which is what
  * makes it safe for this module to be the one holding the secret.
@@ -67,13 +69,16 @@ const OBJECT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_CONTENT_
 const MAX_OBJECT_DOCUMENT_BYTES = ${MAX_SELFHOST_OBJECT_DOCUMENT_BYTES};
 const SQL_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_SQL_PATH)};
 const QUEUE_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_QUEUE_PATH)};
+const VECTOR_PATH = ${JSON.stringify(SELFHOST_DATA_PLANE_VECTOR_PATH)};
 const KV_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_KV_PATH}`)};
 const SQL_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`)};
 const QUEUE_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_QUEUE_PATH}`)};
+const VECTOR_URL = ${JSON.stringify(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_VECTOR_PATH}`)};
 const CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_CONTENT_TYPE)};
 const TOKEN = ${JSON.stringify(SELFHOST_WORKER_DATA_TOKEN_BINDING)};
 const PLANE = ${JSON.stringify(SELFHOST_WORKER_DATA_PLANE_BINDING)};
 const MAX_BYTES = ${SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES};
+const MAX_VECTOR_BYTES = ${8 * 1024 * 1024};
 
 // Every refusal is the same closed envelope the planes themselves answer with,
 // so a caller cannot tell "this Host is misconfigured" from "that is not a
@@ -151,6 +156,56 @@ async function objects(request, env) {
   return new Response(response.body, { status: response.status, headers: answer });
 }
 
+/**
+ * Vector envelopes are small JSON requests. Check the declared length before
+ * touching the stream, then keep the actual read bounded as well: a caller
+ * must not be able to claim a small body and stream a larger one through this
+ * isolate. The returned buffer has exactly the bytes declared by the request.
+ */
+async function readVectorBody(request) {
+  const declaredText = request.headers.get("content-length");
+  if (declaredText === null || !/^\\d+$/u.test(declaredText)) return null;
+  const declared = Number(declaredText);
+  if (!Number.isSafeInteger(declared) || declared > MAX_VECTOR_BYTES) return null;
+  if (request.body === null) return declared === 0 ? new ArrayBuffer(0) : null;
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const read = await reader.read();
+      if (read.done) break;
+      const chunk = read.value;
+      if (!(chunk instanceof Uint8Array)) {
+        try {
+          await reader.cancel();
+        } catch {}
+        return null;
+      }
+      size += chunk.byteLength;
+      if (!Number.isSafeInteger(size) || size > declared || size > MAX_VECTOR_BYTES) {
+        try {
+          await reader.cancel();
+        } catch {}
+        return null;
+      }
+      chunks.push(chunk);
+    }
+  } catch {
+    return null;
+  } finally {
+    reader.releaseLock();
+  }
+  if (size !== declared) return null;
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes.buffer;
+}
+
 export default {
   async fetch(request, env) {
     let pathname = null;
@@ -169,6 +224,8 @@ export default {
             ? SQL_URL
             : pathname === QUEUE_PATH
               ? QUEUE_URL
+              : pathname === VECTOR_PATH
+                ? VECTOR_URL
               : null;
     } catch {
       return refuse(404);
@@ -178,19 +235,26 @@ export default {
     const plane = env[PLANE];
     if (typeof token !== "string" || token.length === 0 || !plane) return refuse(503);
     let body;
-    try {
-      body = await request.arrayBuffer();
-    } catch {
-      return refuse(400);
+    if (pathname === VECTOR_PATH) {
+      body = await readVectorBody(request);
+      if (body === null) return refuse(413);
+    } else {
+      try {
+        body = await request.arrayBuffer();
+      } catch {
+        return refuse(400);
+      }
+      if (body.byteLength > MAX_BYTES) return refuse(413);
     }
-    if (body.byteLength > MAX_BYTES) return refuse(413);
     // Rebuilt, never forwarded. The tenant chose the bytes below and nothing
     // else: not the destination, not the method, not one header.
     let response;
     try {
+      const headers = { authorization: "Bearer " + token, "content-type": CONTENT_TYPE };
+      if (pathname === VECTOR_PATH) headers["content-length"] = String(body.byteLength);
       response = await plane.fetch(target, {
         method: "POST",
-        headers: { authorization: "Bearer " + token, "content-type": CONTENT_TYPE },
+        headers,
         body,
       });
     } catch {

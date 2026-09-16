@@ -74,6 +74,19 @@ const EXTERNAL_SERVICES = [
   },
 ] as const;
 
+const VECTOR_SET = {
+  ...SET,
+  dataPlane: {
+    bindings: [
+      {
+        kind: "edge.vector" as const,
+        name: "EMBEDDINGS",
+        scope: { tenantId: "tenant-a", resourceUid: "resource-a" },
+      },
+    ],
+  },
+};
+
 test("stores and returns one version's bindings", async () => {
   expect(await store.read("sw-a", "v-1")).toBeNull();
   const written = await store.write("sw-a", "v-1", SET);
@@ -99,6 +112,126 @@ test("stores v5 external declarations, optional omission, and JSON runtime value
   );
   expect((await stat(join(root, "sw-a", "v-1.json"))).mode & 0o777).toBe(0o600);
   expect(await store.read("sw-a", "v-1")).toEqual(written);
+});
+
+test("stores a scoped Vector binding in v6 and round-trips its digest", async () => {
+  const written = await store.write("sw-a", "v-1", VECTOR_SET);
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    format: string;
+    externalServices: unknown;
+    dataPlane: { bindings: Array<Record<string, unknown>> };
+  };
+  expect(raw.format).toBe("takoserver.selfhost-version-bindings@v6");
+  expect(raw.externalServices).toEqual([]);
+  expect(raw.dataPlane.bindings).toEqual([
+    {
+      kind: "edge.vector",
+      name: "EMBEDDINGS",
+      scope: VECTOR_SET.dataPlane.bindings[0]?.scope,
+    },
+  ]);
+  expect(raw.dataPlane.bindings[0]).not.toHaveProperty("target");
+  expect(raw.dataPlane.bindings[0]).not.toHaveProperty("nativeId");
+  expect(written.digest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+  expect(await store.read("sw-a", "v-1")).toEqual(written);
+});
+
+test("changes the v6 digest when a Vector scope changes", async () => {
+  const first = await store.write("sw-a", "v-1", VECTOR_SET);
+  const changed = await store.write("sw-a", "v-1", {
+    ...VECTOR_SET,
+    dataPlane: {
+      bindings: [
+        {
+          kind: "edge.vector",
+          name: "EMBEDDINGS",
+          scope: { tenantId: "tenant-b", resourceUid: "resource-a" },
+        },
+      ],
+    },
+  });
+  expect(changed.digest).not.toBe(first.digest);
+  expect(changed.dataPlane?.bindings[0]).toEqual({
+    kind: "edge.vector",
+    name: "EMBEDDINGS",
+    scope: { tenantId: "tenant-b", resourceUid: "resource-a" },
+  });
+});
+
+test("rejects a v6 record with a missing Vector scope", async () => {
+  await store.write("sw-a", "v-1", VECTOR_SET);
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    dataPlane: { bindings: Array<Record<string, unknown>> };
+  };
+  const binding = raw.dataPlane.bindings[0];
+  if (!binding) throw new Error("stored Vector binding is missing");
+  delete binding.scope;
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("rejects unknown fields on a v6 Vector binding", async () => {
+  await store.write("sw-a", "v-1", VECTOR_SET);
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as {
+    dataPlane: { bindings: Array<Record<string, unknown>> };
+  };
+  const binding = raw.dataPlane.bindings[0];
+  if (!binding) throw new Error("stored Vector binding is missing");
+  binding.nativeId = "provider-private-id";
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("rejects a v6 record that omits its Vector binding", async () => {
+  const path = join(root, "sw-a", "v-1.json");
+  await store.write("sw-a", "v-1", SET);
+  const raw = {
+    format: "takoserver.selfhost-version-bindings@v6",
+    salt: "A".repeat(43),
+    workerResourceUid: SET.workerResourceUid,
+    handlers: SET.handlers,
+    vars: SET.vars,
+    sensitiveVars: SET.sensitiveVars,
+    serviceBindings: [],
+    externalServices: [],
+    planeToken: "B".repeat(43),
+    eventToken: "C".repeat(43),
+  };
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("rejects a Vector entry when an older format claims it", async () => {
+  await store.write("sw-a", "v-1", VECTOR_SET);
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+  raw.format = "takoserver.selfhost-version-bindings@v5";
+  await writeFile(path, JSON.stringify(raw), "utf8");
+  await expect(store.read("sw-a", "v-1")).rejects.toMatchObject({ code: "corrupt" });
+});
+
+test("rejects forged or out-of-bounds Vector scopes", async () => {
+  const invalidScopes = [
+    { tenantId: "", resourceUid: "resource-a" },
+    { tenantId: "tenant\u0000a", resourceUid: "resource-a" },
+    { tenantId: "tenant-a", resourceUid: "ab" },
+    { tenantId: "tenant-a", resourceUid: "resource\u0000a" },
+    { tenantId: "t".repeat(256), resourceUid: "resource-a" },
+    { tenantId: "tenant-a", resourceUid: "r".repeat(129) },
+  ];
+  for (const scope of invalidScopes) {
+    await expect(
+      store.write("sw-a", "v-1", {
+        ...VECTOR_SET,
+        dataPlane: {
+          bindings: [{ kind: "edge.vector", name: "EMBEDDINGS", scope }],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "corrupt" });
+  }
 });
 
 test("replays a v5 record byte-for-byte without minting new secrets", async () => {
@@ -269,6 +402,93 @@ test("preserves historical v4 bytes when external services are absent or empty",
   const after = await readFile(join(root, "sw-a", "v-1.json"));
   expect(replay).toEqual(first);
   expect(after).toEqual(before);
+});
+
+test("reads every historical v1-v5 record with its original bytes and digest", async () => {
+  // Seed the directory so these hand-authored historical records can be read
+  // without exercising the current writer for their format.
+  await store.write("legacy", "seed", SET);
+  const salt = "A".repeat(43);
+  const planeToken = "B".repeat(43);
+  const eventToken = "C".repeat(43);
+  const dataPlane = {
+    bindings: [{ kind: "edge.kv", name: "KV", target: "kv-target" }],
+  };
+  const records = [
+    [
+      "v1",
+      JSON.stringify({
+        format: "takoserver.selfhost-version-bindings@v1",
+        salt,
+        vars: SET.vars,
+        sensitiveVars: SET.sensitiveVars,
+      }),
+    ],
+    [
+      "v2",
+      JSON.stringify({
+        format: "takoserver.selfhost-version-bindings@v2",
+        salt,
+        vars: SET.vars,
+        sensitiveVars: SET.sensitiveVars,
+        dataPlane: { handlers: SET.handlers, bindings: dataPlane.bindings },
+        planeToken,
+      }),
+    ],
+    [
+      "v3",
+      JSON.stringify({
+        format: "takoserver.selfhost-version-bindings@v3",
+        salt,
+        handlers: SET.handlers,
+        vars: SET.vars,
+        sensitiveVars: SET.sensitiveVars,
+        dataPlane,
+        planeToken,
+        eventToken,
+      }),
+    ],
+    [
+      "v4",
+      JSON.stringify({
+        format: "takoserver.selfhost-version-bindings@v4",
+        salt,
+        workerResourceUid: SET.workerResourceUid,
+        handlers: SET.handlers,
+        vars: SET.vars,
+        sensitiveVars: SET.sensitiveVars,
+        serviceBindings: [],
+        dataPlane,
+        planeToken,
+        eventToken,
+      }),
+    ],
+    [
+      "v5",
+      JSON.stringify({
+        format: "takoserver.selfhost-version-bindings@v5",
+        salt,
+        workerResourceUid: SET.workerResourceUid,
+        handlers: SET.handlers,
+        vars: SET.vars,
+        sensitiveVars: SET.sensitiveVars,
+        serviceBindings: [],
+        externalServices: EXTERNAL_SERVICES,
+        dataPlane,
+        planeToken,
+        eventToken,
+      }),
+    ],
+  ] as const;
+  for (const [versionId, raw] of records) {
+    const path = join(root, "legacy", `${versionId}.json`);
+    await writeFile(path, raw, "utf8");
+    const read = await store.read("legacy", versionId);
+    expect(read).not.toBeNull();
+    const digest = new Bun.CryptoHasher("sha256").update(raw).digest("hex");
+    expect(read?.digest).toBe(`sha256:${digest}`);
+    expect(await readFile(path, "utf8")).toBe(raw);
+  }
 });
 
 test("a record an earlier build wrote is still read, and carries no handlers", async () => {

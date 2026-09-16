@@ -16,13 +16,16 @@ import {
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
   SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
   SELFHOST_DATA_PLANE_OBJECTS_PATH,
+  SELFHOST_DATA_PLANE_ORIGIN,
   SELFHOST_DATA_PLANE_PROTOCOL,
   SELFHOST_DATA_PLANE_SQL_PATH,
+  SELFHOST_DATA_PLANE_VECTOR_PATH,
   SELFHOST_WORKER_DATA_SERVICE_BINDING,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
   SELFHOST_WORKER_EDGE_KV_BINDING_KIND,
   SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
   SELFHOST_WORKER_EDGE_SQL_BINDING_KIND,
+  SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND,
   SELFHOST_WORKER_ENTRYPOINT_MODULE,
   SELFHOST_WORKER_PROJECT_ENV_EXPORT,
   SELFHOST_WORKER_READINESS_HEADER,
@@ -206,6 +209,383 @@ test("the edge.sql facade offers exactly execute, query, and transaction", async
       context,
     );
     expect(await response.json()).toEqual(["execute", "query", "transaction"]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("the edge.vector facade exposes four one-argument methods and exact outputs", async () => {
+  const { service, calls } = plane([
+    { ok: true, value: { ids: ["one"], count: 1 } },
+    {
+      ok: true,
+      value: {
+        vectors: [{ id: "one", namespace: "docs", values: [1, 0, 0], metadata: { kind: "a" } }],
+      },
+    },
+    { ok: true, value: { ids: ["one"], count: 1 } },
+    {
+      ok: true,
+      value: { matches: [{ id: "one", namespace: "docs", score: 1 }], count: 1 },
+    },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const upsert = await env.SEARCH.upsert({
+         namespace: "docs",
+         vectors: [{ id: "one", values: [1, 0, 0], metadata: { kind: "a" } }],
+       });
+       const get = await env.SEARCH.get({ namespace: "docs", ids: ["one"] });
+       const deleted = await env.SEARCH.delete({ namespace: "docs", ids: ["one"] });
+       const query = await env.SEARCH.query({
+         namespace: "docs",
+         values: [1, 0, 0],
+         topK: 1,
+       });
+       return Response.json({
+         methods: Object.keys(env.SEARCH).sort(),
+         arities: [env.SEARCH.upsert.length, env.SEARCH.get.length, env.SEARCH.delete.length, env.SEARCH.query.length],
+         outputs: { upsert, get, deleted, query },
+       });
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      methods: ["delete", "get", "query", "upsert"],
+      arities: [1, 1, 1, 1],
+      outputs: {
+        upsert: { ids: ["one"], count: 1 },
+        get: {
+          vectors: [{ id: "one", namespace: "docs", values: [1, 0, 0], metadata: { kind: "a" } }],
+        },
+        deleted: { ids: ["one"], count: 1 },
+        query: { matches: [{ id: "one", namespace: "docs", score: 1 }], count: 1 },
+      },
+    });
+    expect(calls).toHaveLength(4);
+    expect(calls.map((call) => call.url)).toEqual([
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_VECTOR_PATH}`,
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_VECTOR_PATH}`,
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_VECTOR_PATH}`,
+      `${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_VECTOR_PATH}`,
+    ]);
+    expect(calls.map((call) => call.body.op)).toEqual(["upsert", "get", "delete", "query"]);
+    expect(calls[0]?.body).toEqual({
+      protocol: SELFHOST_DATA_PLANE_PROTOCOL,
+      binding: "SEARCH",
+      op: "upsert",
+      input: {
+        namespace: "docs",
+        vectors: [{ id: "one", values: [1, 0, 0], metadata: { kind: "a" } }],
+      },
+    });
+    // The generated entrypoint never receives a plane bearer token.
+    expect(calls.every((call) => call.authorization === null)).toBe(true);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector methods reject extra positional arguments as invalid_spec", async () => {
+  const { service, calls } = plane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const input = { values: [1, 0, 0], topK: 1 };
+       const errors = [];
+       for (const method of [env.SEARCH.upsert, env.SEARCH.get, env.SEARCH.delete, env.SEARCH.query]) {
+         try {
+           await method.call(env.SEARCH, input, "extra");
+         } catch (error) {
+           errors.push(error.name);
+         }
+       }
+       return Response.json({ errors });
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-arity.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      errors: ["invalid_spec", "invalid_spec", "invalid_spec", "invalid_spec"],
+    });
+    expect(calls).toEqual([]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector rejects outputs that violate the request context and canonical shape", async () => {
+  const { service, calls } = plane([
+    { ok: true, value: { ids: ["other"], count: 1 } },
+    {
+      ok: true,
+      value: {
+        vectors: [{ id: "one", namespace: "other", values: [1, 0, 0], metadata: {} }],
+      },
+    },
+    {
+      ok: true,
+      value: {
+        matches: [
+          { id: "one", namespace: "docs", score: 0.2, metadata: {} },
+          { id: "two", namespace: "docs", score: 0.8 },
+        ],
+        count: 2,
+      },
+    },
+    {
+      ok: true,
+      value: {
+        matches: [{ id: "one", namespace: "docs", score: 0.8, values: [1, 0] }],
+        count: 1,
+      },
+    },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const errors = [];
+       try { await env.SEARCH.upsert({ vectors: [{ id: "one", values: [1, 0, 0] }] }); }
+       catch (error) { errors.push(error.name); }
+       try { await env.SEARCH.get({ namespace: "docs", ids: ["one"] }); }
+       catch (error) { errors.push(error.name); }
+       try { await env.SEARCH.query({ namespace: "docs", values: [1, 0, 0], topK: 1 }); }
+       catch (error) { errors.push(error.name); }
+       try {
+         await env.SEARCH.query({
+           namespace: "docs",
+           values: [1, 0, 0],
+           topK: 1,
+           returnValues: true,
+         });
+       } catch (error) { errors.push(error.name); }
+       return Response.json({ errors });
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-output.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      errors: ["unavailable", "unavailable", "unavailable", "unavailable"],
+    });
+    expect(calls).toHaveLength(4);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector keeps construction and error names safe under poisoned tenant prototypes", async () => {
+  let callCount = 0;
+  const service = {
+    async fetch() {
+      callCount += 1;
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          value: {
+            vectors: [{ id: "one", namespace: "docs", values: [1, 0, 0], metadata: {} }],
+          },
+        }),
+      );
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const arrayZero = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+       const iterator = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator);
+       const errorName = Object.getOwnPropertyDescriptor(Error.prototype, "name");
+       Object.defineProperty(Array.prototype, "0", { configurable: true, get() { throw new Error("poison"); }, set() { throw new Error("poison"); } });
+       Object.defineProperty(Array.prototype, Symbol.iterator, { configurable: true, get() { throw new Error("poison"); } });
+       Object.defineProperty(Error.prototype, "name", { configurable: true, get() { throw new Error("poison"); }, set() { throw new Error("poison"); } });
+       try {
+         const result = await env.SEARCH.get({ namespace: "docs", ids: ["one"] });
+         return Response.json({ id: result.vectors[0].id, namespace: result.vectors[0].namespace, values: [result.vectors[0].values[0], result.vectors[0].values[1], result.vectors[0].values[2]] });
+       } catch (error) {
+         return Response.json({ error: error.name });
+       } finally {
+         if (arrayZero) Object.defineProperty(Array.prototype, "0", arrayZero); else delete Array.prototype["0"];
+         if (iterator) Object.defineProperty(Array.prototype, Symbol.iterator, iterator); else delete Array.prototype[Symbol.iterator];
+         if (errorName) Object.defineProperty(Error.prototype, "name", errorName); else delete Error.prototype.name;
+       }
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-poison.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({ id: "one", namespace: "docs", values: [1, 0, 0] });
+    expect(callCount).toBe(1);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector rejects non-scalar strings and non-canonical binary32 outputs", async () => {
+  const { service, calls } = plane([
+    {
+      ok: true,
+      value: {
+        vectors: [{ id: "one", namespace: "docs", values: [1.337, 0, 0], metadata: {} }],
+      },
+    },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const errors = [];
+       try { await env.SEARCH.get({ namespace: String.fromCharCode(0xd800), ids: ["one"] }); }
+       catch (error) { errors.push(error.name); }
+       try { await env.SEARCH.get({ namespace: "docs", ids: ["one"] }); }
+       catch (error) { errors.push(error.name); }
+       return Response.json({ errors });
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-f32.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({ errors: ["invalid_spec", "unavailable"] });
+    expect(calls).toHaveLength(1);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector validates a plane answer before async thenable assimilation", async () => {
+  const { service } = plane([
+    {
+      ok: true,
+      value: {
+        vectors: [{ id: "one", namespace: "docs", values: [1, 0, 0], metadata: {} }],
+      },
+    },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const original = Object.getOwnPropertyDescriptor(Object.prototype, "then");
+       let touched = false;
+       Object.defineProperty(Object.prototype, "then", {
+         configurable: true,
+         get() {
+           if (this instanceof Response) return undefined;
+           touched = true;
+           throw new Error("thenable must not be observed");
+         },
+       });
+       try {
+         const result = await env.SEARCH.get({ namespace: "docs", ids: ["one"] });
+         return Response.json({ id: result.vectors[0].id, touched });
+       } finally {
+         if (original) Object.defineProperty(Object.prototype, "then", original);
+         else delete Object.prototype.then;
+       }
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-thenable.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({ id: "one", touched: false });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("edge.vector does not read inherited envelope fields from a malformed answer", async () => {
+  const { service } = plane([{}]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const original = Object.getOwnPropertyDescriptor(Object.prototype, "ok");
+       let touched = false;
+       Object.defineProperty(Object.prototype, "ok", {
+         configurable: true,
+         get() {
+           touched = true;
+           throw new Error("inherited envelope field must not be read");
+         },
+       });
+       try {
+         await env.SEARCH.get({ namespace: "docs", ids: ["one"] });
+         return Response.json({ error: null, touched });
+       } catch (error) {
+         return Response.json({ error: error.name, touched });
+       } finally {
+         if (original) Object.defineProperty(Object.prototype, "ok", original);
+         else delete Object.prototype.ok;
+       }
+     } };`,
+    {
+      originalMainModule: "index.js",
+      publication: "sw-vector-envelope.v1",
+      probeHostname: PROBE_HOSTNAME,
+      declaredHandlers: ["fetch"],
+      bindings: [{ kind: SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND, publicName: "SEARCH" }],
+    },
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({ error: "unavailable", touched: false });
   } finally {
     await generated.dispose();
   }
