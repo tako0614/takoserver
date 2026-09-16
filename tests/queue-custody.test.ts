@@ -128,8 +128,8 @@ test("Consumer delete tombstones claims while producers and unspent backlog rema
   } as const;
 
   await custody.admitBatch(SOURCE, [
-    { messageId: "in-flight", body: new Uint8Array([1]) },
-    { messageId: "backlog", body: new Uint8Array([2]) },
+    { messageId: "a-in-flight", body: new Uint8Array([1]) },
+    { messageId: "b-backlog", body: new Uint8Array([2]) },
   ]);
   await custody.activateConsumer(generation);
   expect(await custody.claim({ ...generation, limit: 1, leaseMillis: 1_000 })).toHaveLength(1);
@@ -149,9 +149,9 @@ test("Consumer delete tombstones claims while producers and unspent backlog rema
       [SOURCE.queueId],
     ),
   ).toEqual([
+    { message_id: "a-in-flight", deliveries: 1, lease_token: null },
     { message_id: "accepted-while-retiring", deliveries: 0, lease_token: null },
-    { message_id: "backlog", deliveries: 0, lease_token: null },
-    { message_id: "in-flight", deliveries: 1, lease_token: null },
+    { message_id: "b-backlog", deliveries: 0, lease_token: null },
   ]);
 });
 
