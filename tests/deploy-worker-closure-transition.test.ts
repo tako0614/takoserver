@@ -521,7 +521,10 @@ describe("reviewed Worker closure transition", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect((failure as DeployError).message).toContain("changed pending D1 migrations");
+      expect((failure as DeployError).message).toContain(
+        "D1 migration lineage changed before the closure transition upload",
+      );
+      expect(parts.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(1);
       expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
       expect(trafficMutations).toBe(0);
     });
