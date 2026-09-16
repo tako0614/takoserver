@@ -174,6 +174,7 @@ export {
   type QueueCustodyRetirementStatus,
   type QueueCustodyRetryPolicy,
   type QueueCustodyTarget,
+  type QueueCustodyTransferNotice,
 } from "./queue-custody.ts";
 export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";

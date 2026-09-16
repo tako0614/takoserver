@@ -33,16 +33,16 @@ afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 // ambient worktree migrations that are absent from a clean historical commit.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0055_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0055_container_runtime_input_custody (id TEXT);\n",
+    "0056_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0056_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0056_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0056_container_runtime_input_rewrap (id TEXT);\n",
+    "0057_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0057_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0057_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0057_container_runtime_input_acceptance (id TEXT);\n",
+    "0058_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0058_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -145,7 +145,7 @@ function migrationStateThrough(count: number, marker: string): D1SchemaState {
 function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
   return {
     applied: [
-      ...MIGRATIONS.slice(0, 54).map(({ name }) => name),
+      ...MIGRATIONS.slice(0, 55).map(({ name }) => name),
       ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
     ],
     shape: `${marker}\n`,
@@ -506,9 +506,10 @@ describe("forward-only D1 schema surface", () => {
           "0052_workflow_termination_intent.sql",
           "0053_queue_custody.sql",
           "0054_queue_custody_readiness.sql",
-          "0055_container_runtime_input_custody.sql",
-          "0056_container_runtime_input_rewrap.sql",
-          "0057_container_runtime_input_acceptance.sql",
+          "0055_queue_custody_transfer_notices.sql",
+          "0056_container_runtime_input_custody.sql",
+          "0057_container_runtime_input_rewrap.sql",
+          "0058_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);

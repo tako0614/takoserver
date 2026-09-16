@@ -10,6 +10,7 @@ const MAX_LEASE_MILLIS = 120_000;
 const MAX_REAP_MESSAGES = 50;
 const MAX_CUSTODY_WINDOW_MESSAGES = MAX_BATCH_MESSAGES;
 const MAX_BODY_QUERY_MESSAGES = 99;
+const MAX_TRANSFER_NOTICE_LIST = 100;
 const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -54,17 +55,33 @@ export interface QueueCustodyClaimedMessage {
   readonly policy: QueueCustodyRetryPolicy;
 }
 
+/**
+ * A durable marker that a terminal delivery created one message in a
+ * dead-letter Queue. The marker carries no body or transport address: a
+ * private caller resolves the target Queue through its own authority, wakes
+ * it, then acknowledges this exact token.
+ */
+export interface QueueCustodyTransferNotice {
+  readonly sourceQueueId: string;
+  readonly sourceConsumerId: string;
+  readonly sourceGeneration: number;
+  readonly targetQueueId: string;
+  readonly noticeToken: string;
+}
+
 export type QueueCustodyRetirementStatus =
   | { readonly state: "ready" }
   | { readonly state: "waiting"; readonly waitUntilMillis: number }
   | { readonly state: "reap"; readonly remainingAtLeast: 1 }
+  | { readonly state: "notify"; readonly remainingAtLeast: 1 }
   | { readonly state: "tombstone" };
 
 export type QueueCustodyRetirementCompletion =
   | { readonly state: "activated"; readonly generation: number }
   | { readonly state: "tombstone" }
   | { readonly state: "waiting"; readonly waitUntilMillis: number }
-  | { readonly state: "reap"; readonly remainingAtLeast: 1 };
+  | { readonly state: "reap"; readonly remainingAtLeast: 1 }
+  | { readonly state: "notify"; readonly remainingAtLeast: 1 };
 
 /**
  * A transport-neutral scheduling observation, never authority to deliver or
@@ -107,6 +124,19 @@ export interface QueueCustody {
     message: QueueCustodyClaimedMessage,
     decision: { readonly outcome: "ack" | "retry"; readonly delaySeconds?: number },
   ): Promise<boolean>;
+  listTransferNotices(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly limit?: number;
+  }): Promise<readonly QueueCustodyTransferNotice[]>;
+  acknowledgeTransferNotice(input: {
+    readonly queueId: string;
+    readonly consumerId: string;
+    readonly generation: number;
+    readonly targetQueueId: string;
+    readonly noticeToken: string;
+  }): Promise<boolean>;
   sweepExpired(limit?: number): Promise<number>;
   beginRetirement(input: {
     readonly queueId: string;
@@ -244,10 +274,20 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       [identity.queueId, identity.consumerId, identity.generation],
     );
     const wait = nullableInteger(rows[0]?.lease_expires_at_ms);
-    if (wait === null) return { state: "ready" };
-    return wait <= millis
-      ? { state: "reap", remainingAtLeast: 1 }
-      : { state: "waiting", waitUntilMillis: wait };
+    if (wait !== null) {
+      return wait <= millis
+        ? { state: "reap", remainingAtLeast: 1 }
+        : { state: "waiting", waitUntilMillis: wait };
+    }
+    const notices = await sql.query(
+      `SELECT target_queue_id, notice_token
+       FROM queue_custody_transfer_notices
+       WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?
+       ORDER BY target_queue_id LIMIT 1`,
+      [identity.queueId, identity.consumerId, identity.generation],
+    );
+    if (notices.length > 0) return { state: "notify", remainingAtLeast: 1 };
+    return { state: "ready" };
   };
 
   /**
@@ -332,6 +372,29 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  AND state IN ('active', 'retiring')
              )`,
         params: [deadLetterId, millis, millis, millis, ...sourceParams],
+      },
+      {
+        sql: `INSERT INTO queue_custody_transfer_notices
+             (source_queue_id, source_consumer_id, source_generation,
+              target_queue_id, notice_token)
+           SELECT queue_id, lease_consumer_id, lease_generation,
+                  lease_dead_letter_queue_id, ?
+           FROM selfhost_queue_messages
+           WHERE queue_id = ? AND message_id = ? AND lease_token = ?
+             AND lease_consumer_id = ? AND lease_generation = ?
+             AND deliveries = ? AND lease_max_retries = ?
+             AND lease_retry_delay_seconds = ?
+             AND lease_dead_letter_queue_id IS ?
+             AND lease_dead_letter_delivery_delay_seconds IS ?
+             AND lease_dead_letter_retention_seconds IS ?${expirySql}
+             AND EXISTS (
+               SELECT 1 FROM queue_consumer_custody
+               WHERE queue_id = ? AND consumer_id = ? AND generation = ?
+                 AND state IN ('active', 'retiring')
+             )
+           ON CONFLICT (source_queue_id, source_consumer_id, source_generation, target_queue_id)
+           DO UPDATE SET notice_token = excluded.notice_token`,
+        params: [deadLetterId, ...sourceParams],
       },
       removal,
     ];
@@ -967,6 +1030,37 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       return written.at(-1)?.changes === 1;
     },
 
+    async listTransferNotices(input) {
+      const selected = generationIdentity(input);
+      const limit = positiveInteger(
+        input.limit ?? MAX_TRANSFER_NOTICE_LIST,
+        MAX_TRANSFER_NOTICE_LIST,
+        "queue custody transfer notice limit",
+      );
+      const rows = await sql.query(
+        `SELECT source_queue_id, source_consumer_id, source_generation,
+                target_queue_id, notice_token
+         FROM queue_custody_transfer_notices
+         WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?
+         ORDER BY target_queue_id LIMIT ?`,
+        [selected.queueId, selected.consumerId, selected.generation, limit],
+      );
+      return rows.map(transferNoticeFromRow);
+    },
+
+    async acknowledgeTransferNotice(input) {
+      const selected = generationIdentity(input);
+      const targetQueueId = token(input.targetQueueId, 512, "queue custody target queue id");
+      const noticeToken = messageId(input.noticeToken);
+      const deleted = await sql.run(
+        `DELETE FROM queue_custody_transfer_notices
+         WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?
+           AND target_queue_id = ? AND notice_token = ?`,
+        [selected.queueId, selected.consumerId, selected.generation, targetQueueId, noticeToken],
+      );
+      return deleted.changes === 1;
+    },
+
     async sweepExpired(limitValue = MAX_CUSTODY_WINDOW_MESSAGES) {
       const limit = positiveInteger(
         limitValue,
@@ -1082,6 +1176,10 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  SELECT 1 FROM selfhost_queue_messages
                  WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
                    AND lease_token IS NOT NULL
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM queue_custody_transfer_notices
+                 WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?
                )`,
             [
               replacement.consumerId,
@@ -1091,6 +1189,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
               target?.queueId ?? null,
               target?.deliveryDelaySeconds ?? null,
               target?.messageRetentionSeconds ?? null,
+              selected.queueId,
+              selected.consumerId,
+              selected.generation,
               selected.queueId,
               selected.consumerId,
               selected.generation,
@@ -1111,8 +1212,15 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
                  SELECT 1 FROM selfhost_queue_messages
                  WHERE queue_id = ? AND lease_consumer_id = ? AND lease_generation = ?
                    AND lease_token IS NOT NULL
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM queue_custody_transfer_notices
+                 WHERE source_queue_id = ? AND source_consumer_id = ? AND source_generation = ?
                )`,
             [
+              selected.queueId,
+              selected.consumerId,
+              selected.generation,
               selected.queueId,
               selected.consumerId,
               selected.generation,
@@ -1151,7 +1259,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         },
         millis,
       );
-      if (status.state === "waiting" || status.state === "reap") return status;
+      if (status.state === "waiting" || status.state === "reap" || status.state === "notify") {
+        return status;
+      }
       throw new QueueCustodyConflictError();
     },
   };
@@ -1315,6 +1425,16 @@ function leaseTargetFromRow(
     queueId: stringValue(queueId),
     deliveryDelaySeconds: nonNegativeStoredInteger(row.lease_dead_letter_delivery_delay_seconds),
     messageRetentionSeconds: positiveStoredInteger(row.lease_dead_letter_retention_seconds),
+  });
+}
+
+function transferNoticeFromRow(row: Readonly<Record<string, unknown>>): QueueCustodyTransferNotice {
+  return Object.freeze({
+    sourceQueueId: token(row.source_queue_id, 512, "queue custody source queue id"),
+    sourceConsumerId: token(row.source_consumer_id, 512, "queue custody source consumer id"),
+    sourceGeneration: positiveStoredInteger(row.source_generation),
+    targetQueueId: token(row.target_queue_id, 512, "queue custody target queue id"),
+    noticeToken: messageId(row.notice_token),
   });
 }
 

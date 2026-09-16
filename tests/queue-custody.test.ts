@@ -71,7 +71,30 @@ test("retirement fences new claims and reaps an expired generation with its snap
     state: "reap",
     remainingAtLeast: 1,
   });
-  expect(await custody.reapRetired(FIRST)).toEqual({ state: "ready" });
+  expect(await custody.reapRetired(FIRST)).toEqual({
+    state: "notify",
+    remainingAtLeast: 1,
+  });
+  const [notice] = await custody.listTransferNotices(FIRST);
+  expect(notice).toMatchObject({
+    sourceQueueId: SOURCE.queueId,
+    sourceConsumerId: FIRST.consumerId,
+    sourceGeneration: FIRST.generation,
+    targetQueueId: OLD_DLQ.queueId,
+    noticeToken: "old-dead-letter",
+  });
+  if (!notice) throw new Error("retirement transfer notice is missing");
+  expect(await custody.finishRetirement({ ...FIRST, replacement: SECOND })).toEqual({
+    state: "notify",
+    remainingAtLeast: 1,
+  });
+  expect(
+    await custody.acknowledgeTransferNotice({
+      ...FIRST,
+      targetQueueId: notice.targetQueueId,
+      noticeToken: notice.noticeToken,
+    }),
+  ).toBe(true);
   expect(await custody.finishRetirement({ ...FIRST, replacement: SECOND })).toEqual({
     state: "activated",
     generation: 2,
@@ -183,6 +206,23 @@ test("dead-letter copy and source removal are one fenced settlement", async () =
       deliveries: 0,
     },
   ]);
+  expect(await custody.listTransferNotices(FIRST)).toEqual([
+    {
+      sourceQueueId: SOURCE.queueId,
+      sourceConsumerId: FIRST.consumerId,
+      sourceGeneration: FIRST.generation,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "settled-dead-letter",
+    },
+  ]);
+  expect(
+    await custody.acknowledgeTransferNotice({
+      ...FIRST,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "settled-dead-letter",
+    }),
+  ).toBe(true);
+  expect(await custody.listTransferNotices(FIRST)).toEqual([]);
   expect(await custody.settle(claimed, { outcome: "retry" })).toBe(false);
 });
 
@@ -214,7 +254,307 @@ test("an expired final active lease is recovered instead of stranding its messag
       deliveries: 0,
     },
   ]);
+  expect(await custody.listTransferNotices(FIRST)).toEqual([
+    {
+      sourceQueueId: SOURCE.queueId,
+      sourceConsumerId: FIRST.consumerId,
+      sourceGeneration: FIRST.generation,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "active-recovered-dead-letter",
+    },
+  ]);
   expect(await custody.settle(claimed, { outcome: "ack" })).toBe(false);
+});
+
+test("a stale terminal lease cannot create or replace a transfer notice", async () => {
+  const sql = createEphemeralSql();
+  let millis = 450_000;
+  const ids = ["stale-lease", "fresh-dead-letter"];
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => ids.shift() ?? "unused-id",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-stale-notice",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0, deadLetterQueue: OLD_DLQ },
+  } as const;
+  await custody.admit(SOURCE, { messageId: "stale-notice-source", body: new Uint8Array([1]) });
+  await custody.activateConsumer(generation);
+  const [claimed] = await custody.claim({ ...generation, limit: 1, leaseMillis: 1_000 });
+  if (!claimed) throw new Error("stale notice claim is missing");
+
+  millis = 451_001;
+  expect(await custody.claim({ ...generation, limit: 1 })).toEqual([]);
+  expect(await custody.listTransferNotices(generation)).toEqual([
+    {
+      sourceQueueId: SOURCE.queueId,
+      sourceConsumerId: generation.consumerId,
+      sourceGeneration: generation.generation,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "fresh-dead-letter",
+    },
+  ]);
+  expect(await custody.settle(claimed, { outcome: "retry" })).toBe(false);
+  expect(await custody.listTransferNotices(generation)).toEqual([
+    {
+      sourceQueueId: SOURCE.queueId,
+      sourceConsumerId: generation.consumerId,
+      sourceGeneration: generation.generation,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "fresh-dead-letter",
+    },
+  ]);
+});
+
+test("a stale transfer acknowledgement cannot remove a coalesced newer notice", async () => {
+  const sql = createEphemeralSql();
+  let millis = 455_000;
+  const ids = [
+    "coalesce-lease-one",
+    "coalesce-dead-letter-one",
+    "coalesce-lease-two",
+    "coalesce-dead-letter-two",
+  ];
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => ids.shift() ?? "unused-id",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-notice-coalesce",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0, deadLetterQueue: OLD_DLQ },
+  } as const;
+  await custody.admitBatch(SOURCE, [
+    { messageId: "coalesce-source-one", body: new Uint8Array([6]) },
+    { messageId: "coalesce-source-two", body: new Uint8Array([7]) },
+  ]);
+  await custody.activateConsumer(generation);
+
+  const [first] = await custody.claim({ ...generation, limit: 1 });
+  if (!first) throw new Error("first coalesced claim is missing");
+  expect(await custody.settle(first, { outcome: "retry" })).toBe(true);
+  const [oldNotice] = await custody.listTransferNotices(generation);
+  if (!oldNotice) throw new Error("first coalesced notice is missing");
+
+  const [second] = await custody.claim({ ...generation, limit: 1 });
+  if (!second) throw new Error("second coalesced claim is missing");
+  expect(await custody.settle(second, { outcome: "retry" })).toBe(true);
+  const [newNotice] = await custody.listTransferNotices(generation);
+  expect(newNotice).toMatchObject({
+    targetQueueId: OLD_DLQ.queueId,
+    noticeToken: "coalesce-dead-letter-two",
+  });
+  if (!newNotice) throw new Error("new coalesced notice is missing");
+
+  expect(
+    await custody.acknowledgeTransferNotice({
+      ...generation,
+      targetQueueId: oldNotice.targetQueueId,
+      noticeToken: oldNotice.noticeToken,
+    }),
+  ).toBe(false);
+  expect(
+    await custody.acknowledgeTransferNotice({
+      ...generation,
+      targetQueueId: newNotice.targetQueueId,
+      noticeToken: newNotice.noticeToken,
+    }),
+  ).toBe(true);
+  expect(await custody.listTransferNotices(generation)).toEqual([]);
+});
+
+test("dead-letter transfer notice and source removal roll back together on batch failure", async () => {
+  const database = createEphemeralSql();
+  let failNoticeBatch = false;
+  const sql: Sql = {
+    async query(text, params) {
+      return await database.query(text, params);
+    },
+    async run(text, params) {
+      return await database.run(text, params);
+    },
+    async batch(statements) {
+      if (
+        !failNoticeBatch ||
+        !statements.some(({ sql: text }) => text.includes("transfer_notices"))
+      ) {
+        return await database.batch(statements);
+      }
+      return await database.batch(
+        statements.map((statement, index) =>
+          index === 1 ? { ...statement, sql: `${statement.sql}\nNOT VALID SQL` } : statement,
+        ),
+      );
+    },
+  };
+  let millis = 460_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => (millis === 460_000 ? "atomic-lease" : "atomic-dead-letter"),
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-atomic-notice",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0, deadLetterQueue: OLD_DLQ },
+  } as const;
+  await custody.admit(SOURCE, { messageId: "atomic-source", body: new Uint8Array([2]) });
+  await custody.activateConsumer(generation);
+  const [claimed] = await custody.claim({ ...generation, limit: 1 });
+  if (!claimed) throw new Error("atomic notice claim is missing");
+
+  millis = 460_001;
+  failNoticeBatch = true;
+  await expect(custody.settle(claimed, { outcome: "retry" })).rejects.toThrow();
+  failNoticeBatch = false;
+  expect(
+    await sql.query(
+      "SELECT queue_id, message_id, lease_token FROM selfhost_queue_messages ORDER BY queue_id, message_id",
+    ),
+  ).toEqual([
+    {
+      queue_id: SOURCE.queueId,
+      message_id: "atomic-source",
+      lease_token: "atomic-lease",
+    },
+  ]);
+  expect(await custody.listTransferNotices(generation)).toEqual([]);
+});
+
+test("tombstone retirement waits for a pending transfer notice before completion", async () => {
+  const sql = createEphemeralSql();
+  let millis = 470_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => (millis === 470_000 ? "tombstone-lease" : "tombstone-dead-letter"),
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-tombstone-notice",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0, deadLetterQueue: OLD_DLQ },
+  } as const;
+  await custody.admit(SOURCE, { messageId: "tombstone-source", body: new Uint8Array([3]) });
+  await custody.activateConsumer(generation);
+  expect(await custody.claim({ ...generation, limit: 1, leaseMillis: 1_000 })).toHaveLength(1);
+  expect(await custody.beginRetirement(generation)).toEqual({
+    state: "waiting",
+    waitUntilMillis: 471_000,
+  });
+
+  millis = 471_001;
+  expect(await custody.reapRetired(generation)).toEqual({
+    state: "notify",
+    remainingAtLeast: 1,
+  });
+  expect(await custody.finishRetirement(generation)).toEqual({
+    state: "notify",
+    remainingAtLeast: 1,
+  });
+  const [notice] = await custody.listTransferNotices(generation);
+  if (!notice) throw new Error("tombstone transfer notice is missing");
+  expect(
+    await custody.acknowledgeTransferNotice({
+      ...generation,
+      targetQueueId: notice.targetQueueId,
+      noticeToken: notice.noticeToken,
+    }),
+  ).toBe(true);
+  expect(await custody.finishRetirement(generation)).toEqual({ state: "tombstone" });
+});
+
+test("source expiry sweep preserves retained DLQ data and its unacknowledged notice", async () => {
+  const sql = createEphemeralSql();
+  let millis = 480_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => (millis === 480_000 ? "expiry-lease" : "expiry-dead-letter"),
+  });
+  const shortSource = { ...SOURCE, messageRetentionSeconds: 60 } as const;
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-expiry-notice",
+    generation: 1,
+    policy: { maxRetries: 0, retryDelaySeconds: 0, deadLetterQueue: OLD_DLQ },
+  } as const;
+  await custody.admitBatch(shortSource, [
+    { messageId: "expiry-terminal", body: new Uint8Array([4]) },
+    { messageId: "expiry-retained-source", body: new Uint8Array([5]) },
+  ]);
+  await custody.activateConsumer(generation);
+  const [claimed] = await custody.claim({ ...generation, limit: 1 });
+  if (!claimed) throw new Error("expiry notice claim is missing");
+  millis += 1;
+  expect(await custody.settle(claimed, { outcome: "retry" })).toBe(true);
+
+  millis += 60_000;
+  expect(await custody.sweepExpired()).toBe(1);
+  expect(
+    await sql.query(
+      "SELECT queue_id, message_id FROM selfhost_queue_messages ORDER BY queue_id, message_id",
+    ),
+  ).toEqual([{ queue_id: OLD_DLQ.queueId, message_id: "expiry-dead-letter" }]);
+  expect(await custody.listTransferNotices(generation)).toEqual([
+    {
+      sourceQueueId: SOURCE.queueId,
+      sourceConsumerId: generation.consumerId,
+      sourceGeneration: generation.generation,
+      targetQueueId: OLD_DLQ.queueId,
+      noticeToken: "expiry-dead-letter",
+    },
+  ]);
+});
+
+test("transfer notice listing is bounded and stays under D1's parameter limit", async () => {
+  const database = createEphemeralSql();
+  const reads: { readonly text: string; readonly parameters: number }[] = [];
+  const sql: Sql = {
+    async query(text, params) {
+      reads.push({ text, parameters: params?.length ?? 0 });
+      return await database.query(text, params);
+    },
+    async run(text, params) {
+      return await database.run(text, params);
+    },
+    async batch(statements) {
+      return await database.batch(statements);
+    },
+  };
+  const identity = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-notice-list",
+    generation: 1,
+  } as const;
+  await sql.batch(
+    Array.from({ length: 101 }, (_, index) => ({
+      sql: `INSERT INTO queue_custody_transfer_notices
+            (source_queue_id, source_consumer_id, source_generation, target_queue_id, notice_token)
+            VALUES (?, ?, ?, ?, ?)`,
+      params: [
+        identity.queueId,
+        identity.consumerId,
+        identity.generation,
+        `target-${String(index).padStart(3, "0")}`,
+        `notice-${String(index).padStart(3, "0")}`,
+      ],
+    })),
+  );
+  const custody = createQueueCustody({ sql, clock: () => new Date(490_000) });
+  const notices = await custody.listTransferNotices({ ...identity, limit: 100 });
+  expect(notices).toHaveLength(100);
+  expect(reads.at(-1)?.parameters).toBe(4);
+  expect(reads.every(({ parameters }) => parameters <= 100)).toBe(true);
+  await expect(custody.listTransferNotices({ ...identity, limit: 101 })).rejects.toThrow(
+    "queue custody transfer notice limit is invalid",
+  );
 });
 
 test("a replacement with a lower retry cap terminalizes over-budget released backlog", async () => {

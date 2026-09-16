@@ -222,5 +222,9 @@ export const MIGRATIONS: readonly Migration[] = [
   {
     "name": "0054_queue_custody_readiness.sql",
     "sql": "-- Bounded scheduling and maintenance lookup for shared Queue custody.\n--\n-- Equality on queue identity plus NULL lease ownership selects only unleased\n-- rows. Visibility is the ordered suffix, so a fixed LIMIT bounds index entries\n-- visited instead of filtering retention, retry count or lease state after an\n-- older queue-wide visibility scan.\n\nCREATE INDEX selfhost_queue_messages_custody_ready\n  ON selfhost_queue_messages (queue_id, lease_token, visible_at_ms);\n"
+  },
+  {
+    "name": "0055_queue_custody_transfer_notices.sql",
+    "sql": "-- Durable wake markers for Queue custody dead-letter transfers.\n--\n-- A marker records only the exact source Consumer generation, destination\n-- Queue identity and the new DLQ message id. It carries no payload or\n-- transport endpoint: a private caller resolves the destination through its\n-- own authority, wakes it, then acknowledges this marker by CAS on the token.\n-- One row per source generation and target coalesces repeated transfers while\n-- retaining the newest token. There are intentionally no foreign keys to\n-- Queue rows, so source expiry or Queue housekeeping cannot erase an\n-- unacknowledged destination wake.\n\nCREATE TABLE queue_custody_transfer_notices (\n  source_queue_id TEXT NOT NULL CHECK (length(source_queue_id) BETWEEN 1 AND 512),\n  source_consumer_id TEXT NOT NULL CHECK (length(source_consumer_id) BETWEEN 1 AND 512),\n  source_generation INTEGER NOT NULL CHECK (source_generation BETWEEN 1 AND 9007199254740991),\n  target_queue_id TEXT NOT NULL CHECK (length(target_queue_id) BETWEEN 1 AND 512),\n  notice_token TEXT NOT NULL CHECK (length(notice_token) BETWEEN 1 AND 128),\n  PRIMARY KEY (source_queue_id, source_consumer_id, source_generation, target_queue_id)\n);\n"
   }
 ];

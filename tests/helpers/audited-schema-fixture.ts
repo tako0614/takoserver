@@ -18,11 +18,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
 }
 
 /** Current audited source, including the additive 0050/0051 workflow tables,
- * 0052 termination intent, 0053 Queue custody state, and its 0054 bounded
- * readiness index. */
+ * 0052 termination intent, 0053 Queue custody state, its 0054 bounded
+ * readiness index, and its 0055 durable transfer notices. */
 export function copyCurrentSchemaFixture(directory: string): string {
-  if (MIGRATIONS.length !== 54 || MIGRATIONS.at(-1)?.name !== "0054_queue_custody_readiness.sql") {
-    throw new Error("current schema fixture requires the audited 0001-0054 lineage");
+  if (
+    MIGRATIONS.length !== 55 ||
+    MIGRATIONS.at(-1)?.name !== "0055_queue_custody_transfer_notices.sql"
+  ) {
+    throw new Error("current schema fixture requires the audited 0001-0055 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {
