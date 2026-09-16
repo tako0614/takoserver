@@ -33,6 +33,8 @@ const QUEUE_CUSTODY = "0053_queue_custody.sql";
 const QUEUE_CUSTODY_READINESS = "0054_queue_custody_readiness.sql";
 const QUEUE_CUSTODY_TRANSFER_NOTICES = "0055_queue_custody_transfer_notices.sql";
 const VECTOR_INDEX_STORAGE = "0056_vector_index_storage.sql";
+const WORKER_VERSION_EXECUTION_MATERIAL =
+  "0057_cloudflare_managed_worker_version_execution_material.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -58,6 +60,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   QUEUE_CUSTODY_READINESS,
   QUEUE_CUSTODY_TRANSFER_NOTICES,
   VECTOR_INDEX_STORAGE,
+  WORKER_VERSION_EXECUTION_MATERIAL,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -393,6 +396,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 10]?.name).toBe(QUEUE_CUSTODY_READINESS);
     expect(MIGRATIONS[receiptMigrationIndex + 11]?.name).toBe(QUEUE_CUSTODY_TRANSFER_NOTICES);
     expect(MIGRATIONS[receiptMigrationIndex + 12]?.name).toBe(VECTOR_INDEX_STORAGE);
+    expect(MIGRATIONS[receiptMigrationIndex + 13]?.name).toBe(WORKER_VERSION_EXECUTION_MATERIAL);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -419,6 +423,7 @@ describe("bringing a local database up to date", () => {
       QUEUE_CUSTODY_READINESS,
       QUEUE_CUSTODY_TRANSFER_NOTICES,
       VECTOR_INDEX_STORAGE,
+      WORKER_VERSION_EXECUTION_MATERIAL,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -686,6 +691,7 @@ describe("bringing a local database up to date", () => {
         QUEUE_CUSTODY_READINESS,
         QUEUE_CUSTODY_TRANSFER_NOTICES,
         VECTOR_INDEX_STORAGE,
+        WORKER_VERSION_EXECUTION_MATERIAL,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1246,6 +1252,7 @@ describe("bringing a local database up to date", () => {
       QUEUE_CUSTODY_READINESS,
       QUEUE_CUSTODY_TRANSFER_NOTICES,
       VECTOR_INDEX_STORAGE,
+      WORKER_VERSION_EXECUTION_MATERIAL,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1383,6 +1390,7 @@ describe("bringing a local database up to date", () => {
       QUEUE_CUSTODY_READINESS,
       QUEUE_CUSTODY_TRANSFER_NOTICES,
       VECTOR_INDEX_STORAGE,
+      WORKER_VERSION_EXECUTION_MATERIAL,
     ]);
     expect(
       database
@@ -2327,6 +2335,7 @@ describe("bringing a local database up to date", () => {
       QUEUE_CUSTODY_READINESS,
       QUEUE_CUSTODY_TRANSFER_NOTICES,
       VECTOR_INDEX_STORAGE,
+      WORKER_VERSION_EXECUTION_MATERIAL,
     ]);
     expect(
       database
