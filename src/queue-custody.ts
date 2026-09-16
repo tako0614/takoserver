@@ -9,6 +9,7 @@ const MAX_RETRIES = 100;
 const MAX_LEASE_MILLIS = 120_000;
 const MAX_REAP_MESSAGES = 50;
 const MAX_CUSTODY_WINDOW_MESSAGES = MAX_BATCH_MESSAGES;
+const MAX_BODY_QUERY_MESSAGES = 99;
 const MAX_BATCH_TIMEOUT_SECONDS = 60;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const MESSAGE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -464,11 +465,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
 
   const readUnleasedWindow = async (
     queueId: string,
-    includeBody: boolean,
   ): Promise<readonly Readonly<Record<string, unknown>>[]> =>
     await sql.query(
-      `SELECT message_id, ${includeBody ? "body, " : ""}enqueued_at_ms, visible_at_ms,
-              expires_at_ms, deliveries
+      `SELECT message_id, enqueued_at_ms, visible_at_ms, expires_at_ms, deliveries
        FROM selfhost_queue_messages INDEXED BY selfhost_queue_messages_custody_ready
        WHERE queue_id = ? AND lease_token IS NULL
        ORDER BY visible_at_ms LIMIT ?`,
@@ -722,7 +721,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       if (leaseWakeAt !== null && leaseWakeAt <= millis) return { state: "ready" };
 
       // Observation only: claim owns every retention and terminal mutation.
-      const rows = await readUnleasedWindow(current.queueId, false);
+      const rows = await readUnleasedWindow(current.queueId);
       let wakeAt = leaseWakeAt;
       let firstEligibleAt: number | null = null;
       let eligible = 0;
@@ -772,9 +771,9 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       }
       const millis = now();
       if (await reapExpiredLeases(current, millis, MAX_REAP_MESSAGES)) return [];
-      const rows = await readUnleasedWindow(current.queueId, true);
+      const rows = await readUnleasedWindow(current.queueId);
       if (await progressActiveWindow(current, millis, rows)) return [];
-      const candidates = rows
+      const candidateMetadata = rows
         .filter(
           (row) =>
             positiveStoredInteger(row.visible_at_ms) <= millis &&
@@ -784,12 +783,26 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
         .slice(0, limit)
         .map((row) => ({
           messageId: messageId(row.message_id),
-          body: bytes(row.body),
           enqueuedAtMillis: positiveStoredInteger(row.enqueued_at_ms),
           visibleAtMillis: positiveStoredInteger(row.visible_at_ms),
           expiresAtMillis: positiveStoredInteger(row.expires_at_ms),
           attempts: nonNegativeStoredInteger(row.deliveries) + 1,
         }));
+      if (candidateMetadata.length === 0) return [];
+      const bodies = new Map<string, Uint8Array>();
+      for (let offset = 0; offset < candidateMetadata.length; offset += MAX_BODY_QUERY_MESSAGES) {
+        const chunk = candidateMetadata.slice(offset, offset + MAX_BODY_QUERY_MESSAGES);
+        const bodyRows = await sql.query(
+          `SELECT message_id, body FROM selfhost_queue_messages
+           WHERE queue_id = ? AND message_id IN (${chunk.map(() => "?").join(", ")})`,
+          [current.queueId, ...chunk.map(({ messageId }) => messageId)],
+        );
+        for (const row of bodyRows) bodies.set(messageId(row.message_id), bytes(row.body));
+      }
+      const candidates = candidateMetadata.flatMap((message) => {
+        const body = bodies.get(message.messageId);
+        return body === undefined ? [] : [{ ...message, body }];
+      });
       if (candidates.length === 0) return [];
       const leaseToken = randomId();
       token(leaseToken, 128, "queue custody lease token");

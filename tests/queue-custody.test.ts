@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
+import type { Sql } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 
 const SOURCE = {
@@ -676,6 +677,103 @@ test("retention sweep fences an expired leased row and makes stale settlement a 
   expect(await custody.settle(claimed, { outcome: "ack" })).toBe(false);
 });
 
+test("a small claim reads payloads only for its exact bounded candidates", async () => {
+  const database = createEphemeralSql();
+  const reads: { readonly text: string; readonly parameters: number }[] = [];
+  const sql: Sql = {
+    async query(text, params) {
+      reads.push({ text, parameters: params?.length ?? 0 });
+      return await database.query(text, params);
+    },
+    async run(text, params) {
+      return await database.run(text, params);
+    },
+    async batch(statements) {
+      return await database.batch(statements);
+    },
+  };
+  const millis = 1_800_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "bounded-payload-lease",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-bounded-payload",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  } as const;
+  await custody.admitBatch(
+    SOURCE,
+    Array.from({ length: 100 }, (_, index) => ({
+      messageId: `bounded-payload-${String(index).padStart(3, "0")}`,
+      body: new Uint8Array([index]),
+      ...(index === 0 ? {} : { delaySeconds: 60 }),
+    })),
+  );
+  await custody.activateConsumer(generation);
+
+  expect(await custody.claim({ ...generation, limit: 1 })).toHaveLength(1);
+  const maintenanceReads = reads.filter((read) =>
+    read.text.includes("selfhost_queue_messages_custody_ready"),
+  );
+  expect(maintenanceReads).toHaveLength(1);
+  expect(maintenanceReads[0]?.text).not.toContain("body");
+  const payloadReads = reads.filter((read) =>
+    read.text.includes("SELECT message_id, body FROM selfhost_queue_messages"),
+  );
+  expect(payloadReads).toEqual([
+    expect.objectContaining({
+      parameters: 2,
+    }),
+  ]);
+});
+
+test("a full claim keeps every payload lookup within D1's parameter bound", async () => {
+  const database = createEphemeralSql();
+  const reads: { readonly text: string; readonly parameters: number }[] = [];
+  const sql: Sql = {
+    async query(text, params) {
+      reads.push({ text, parameters: params?.length ?? 0 });
+      return await database.query(text, params);
+    },
+    async run(text, params) {
+      return await database.run(text, params);
+    },
+    async batch(statements) {
+      return await database.batch(statements);
+    },
+  };
+  const millis = 1_900_000;
+  const custody = createQueueCustody({
+    sql,
+    clock: () => new Date(millis),
+    randomId: () => "full-payload-lease",
+  });
+  const generation = {
+    queueId: SOURCE.queueId,
+    consumerId: "consumer-full-payload",
+    generation: 1,
+    policy: { maxRetries: 2, retryDelaySeconds: 5 },
+  } as const;
+  await custody.admitBatch(
+    SOURCE,
+    Array.from({ length: 100 }, (_, index) => ({
+      messageId: `full-payload-${String(index).padStart(3, "0")}`,
+      body: new Uint8Array([index]),
+    })),
+  );
+  await custody.activateConsumer(generation);
+
+  expect(await custody.claim({ ...generation, limit: 100 })).toHaveLength(100);
+  const payloadReads = reads.filter((read) =>
+    read.text.includes("SELECT message_id, body FROM selfhost_queue_messages"),
+  );
+  expect(payloadReads.map(({ parameters }) => parameters)).toEqual([100, 2]);
+  expect(reads.every(({ parameters }) => parameters <= 100)).toBe(true);
+});
+
 test("readiness and lease recovery plans use their exact ordered indexes", async () => {
   const sql = createEphemeralSql();
   const unleased = await sql.query(
@@ -703,6 +801,12 @@ test("readiness and lease recovery plans use their exact ordered indexes", async
      ORDER BY expires_at_ms LIMIT ?`,
     [1, 100],
   );
+  const payloads = await sql.query(
+    `EXPLAIN QUERY PLAN
+     SELECT message_id, body FROM selfhost_queue_messages
+     WHERE queue_id = ? AND message_id IN (?, ?)`,
+    [SOURCE.queueId, "message-one", "message-two"],
+  );
   expect(unleased.map((row) => String(row.detail)).join("\n")).toContain(
     "selfhost_queue_messages_custody_ready (queue_id=? AND lease_token=?)",
   );
@@ -711,5 +815,8 @@ test("readiness and lease recovery plans use their exact ordered indexes", async
   );
   expect(expiry.map((row) => String(row.detail)).join("\n")).toContain(
     "selfhost_queue_messages_expiry (expires_at_ms<?)",
+  );
+  expect(payloads.map((row) => String(row.detail)).join("\n")).toContain(
+    "sqlite_autoindex_selfhost_queue_messages_1 (queue_id=? AND message_id=?)",
   );
 });
