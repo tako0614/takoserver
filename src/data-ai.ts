@@ -444,6 +444,12 @@ function parseCompletion(
     return null;
   if (typeof value.id !== "string" || !Number.isSafeInteger(value.created)) return null;
   if (!Array.isArray(value.choices) || value.choices.length < 1) return null;
+  for (const choice of value.choices) {
+    if (!isJsonObject(choice) || !isJsonObject(choice.message)) return null;
+    if (choice.message.role !== "assistant") return null;
+    const content = choice.message.content;
+    if (content !== undefined && content !== null && typeof content !== "string") return null;
+  }
   const usage = value.usage;
   if (!isJsonObject(usage)) return null;
   const inputTokens = usage.prompt_tokens;

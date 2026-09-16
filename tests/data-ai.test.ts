@@ -16,7 +16,7 @@ const identity: ExternalIdentityVerifier = {
   },
 };
 
-async function fixture(funds = 1_000, failFirstUsageRecord = false) {
+async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOverride?: unknown) {
   const sql = createEphemeralSql();
   const clock = () => new Date("2026-08-18T12:00:00.000Z");
   let identityCounter = 0;
@@ -62,6 +62,7 @@ async function fixture(funds = 1_000, failFirstUsageRecord = false) {
     ],
     async chat(request) {
       calls.push(request);
+      if (responseOverride !== undefined) return responseOverride;
       return {
         id: "chatcmpl_1",
         object: "chat.completion",
@@ -180,6 +181,132 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(await sql.query("SELECT meter, quantity, amount_micros FROM usage_events")).toEqual([
       { meter: "ai.tokens.takoserver-text", quantity: 5, amount_micros: 0 },
     ]);
+  });
+
+  test("rejects malformed upstream choices before billing and replays the same refusal", async () => {
+    const base = {
+      id: "chatcmpl_1",
+      object: "chat.completion",
+      created: 1_787_054_400,
+      model: "takoserver-text",
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    };
+    const sparseChoices = new Array<unknown>(1);
+    const malformed: readonly [string, unknown][] = [
+      ["null-choice", { ...base, choices: [null] }],
+      ["sparse-choice", { ...base, choices: sparseChoices }],
+      ["primitive-choice", { ...base, choices: ["choice"] }],
+      ["missing-message", { ...base, choices: [{ index: 0, finish_reason: "stop" }] }],
+      ["null-message", { ...base, choices: [{ index: 0, message: null, finish_reason: "stop" }] }],
+      [
+        "wrong-role",
+        {
+          ...base,
+          choices: [
+            {
+              index: 0,
+              message: { role: "user", content: "hello" },
+              finish_reason: "stop",
+            },
+          ],
+        },
+      ],
+      [
+        "wrong-content",
+        {
+          ...base,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: { text: "hello" } },
+              finish_reason: "stop",
+            },
+          ],
+        },
+      ],
+    ];
+
+    for (const [key, responseOverride] of malformed) {
+      const { call, calls, scoped, ledger, organization, sql } = await fixture(
+        1_000,
+        false,
+        responseOverride,
+      );
+      const request = {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": `chat-${key}` },
+        body: JSON.stringify({
+          model: "takoserver-text",
+          messages: [{ role: "user", content: "hello" }],
+          max_tokens: 10,
+        }),
+      } satisfies RequestInit;
+
+      const first = await call("/v1/ai/chat/completions", scoped.secret, request);
+      const firstBody = await first?.json();
+      const second = await call("/v1/ai/chat/completions", scoped.secret, request);
+      const secondBody = await second?.json();
+
+      expect(first?.status).toBe(502);
+      expect(firstBody).toMatchObject({ error: { code: "invalid_upstream_response" } });
+      expect(second?.status).toBe(502);
+      expect(secondBody).toEqual(firstBody);
+      expect(calls).toHaveLength(1);
+      expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
+      expect(await sql.query("SELECT request_id FROM usage_events")).toEqual([]);
+    }
+  });
+
+  test("accepts multiple assistant choices with tool calls and refusal content", async () => {
+    const responseOverride = {
+      id: "chatcmpl_1",
+      object: "chat.completion",
+      created: 1_787_054_400,
+      model: "takoserver-text",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: { name: "lookup", arguments: "{}" },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+        {
+          index: 1,
+          message: { role: "assistant", content: null, refusal: "cannot comply" },
+          finish_reason: "content_filter",
+        },
+      ],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    };
+    const { call, calls, scoped, ledger, organization, sql } = await fixture(
+      1_000,
+      false,
+      responseOverride,
+    );
+    const response = await call("/v1/ai/chat/completions", scoped.secret, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "chat-tool-refusal" },
+      body: JSON.stringify({
+        model: "takoserver-text",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 10,
+      }),
+    });
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual(responseOverride);
+    expect(calls).toHaveLength(1);
+    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect(await sql.query("SELECT request_id FROM usage_events")).toHaveLength(1);
   });
 
   test("cancels a chunked request as soon as it exceeds the one MiB ingress bound", async () => {

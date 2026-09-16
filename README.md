@@ -146,6 +146,8 @@ the part that owns accounts, money, and the machines.
   charge before inference, captures reported token use, and releases the rest.
   Paid inference requires `Idempotency-Key`; a settled result is replayed from
   durable state without calling the upstream or charging again.
+  See [qualifying one public AI inference](docs/ai-live-qualification.md) for
+  the explicit opt-in completion/replay check and its limits.
 
 ## Self-hosting
 
