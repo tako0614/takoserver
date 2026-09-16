@@ -191,8 +191,10 @@ describe("OpenAI-compatible AI data plane", () => {
       model: "takoserver-text",
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     };
+    const sparseChoices = new Array<unknown>(1);
     const malformed: readonly [string, unknown][] = [
       ["null-choice", { ...base, choices: [null] }],
+      ["sparse-choice", { ...base, choices: sparseChoices }],
       ["primitive-choice", { ...base, choices: ["choice"] }],
       ["missing-message", { ...base, choices: [{ index: 0, finish_reason: "stop" }] }],
       ["null-message", { ...base, choices: [{ index: 0, message: null, finish_reason: "stop" }] }],
