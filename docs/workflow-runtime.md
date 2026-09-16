@@ -324,14 +324,23 @@ public Workflow activation is enabled by this module.
 
 ### Private HTTP class transport
 
-`workflow-http-worker` is a host-private bootstrap: canonical data/class
-helpers are statically initialized before a dynamic application import on
-RUN. The generated self-host wrapper exposes its existing `projectEnv` under
-a fixed private export, so the class receives the same declared environment
-as ordinary handlers. The wrapper is imported before retrieving the tenant
-namespace. Neither controller nor preparation evaluates tenant code. The
-closed-graph module policy and `disallow_importable_env` remain required; the
-companion binding and journal nonce are not application env.
+This forward candidate requires the two-dictionary WorkerLoader native
+candidate documented in [workerd/README.md](../workerd/README.md). The active
+accepted native artifact does not implement that API. These TS changes must
+not be merged or served independently of native qualification and promotion.
+Portable tests do not establish native RPC, isolation or termination behavior.
+
+`workflow-loader-outer-worker` owns READY/RUN admission, the one-run latch,
+journal ordering and companion transport. Application modules are inert
+payloads until RUN loads a separate child through WorkerLoader. Its sole Host
+RPC capability, `WorkflowHost.exchange`, refuses calls outside the live RUN.
+`workflow-loader-tenant-worker` initializes canonical data/class helpers before
+dynamically importing the wrapper and application in that child. The generated
+self-host wrapper exposes its existing `projectEnv` under a fixed private
+export, so the class receives the same declared environment as ordinary
+handlers. Neither controller nor preparation evaluates tenant code. The
+two-dictionary closed-graph module policy and `disallow_importable_env` remain
+required; loader, companion binding and journal nonce are not application env.
 
 `workflow-http-controller` implements one concrete request/response turn
 protocol. A call first lets the durable driver request its name, then requests

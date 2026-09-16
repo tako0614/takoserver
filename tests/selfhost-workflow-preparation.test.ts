@@ -76,10 +76,10 @@ function publication(options: PublicationOptions = {}): WorkerdDeploymentPublica
     "host-helper.js",
     ...(options.collisionNames
       ? [
-          "__workflow_entry.js",
-          "__workflow_entry-1.js",
-          "__workflow_bootstrap.js",
-          "__workflow_bootstrap-1.js",
+          "__workflow_outer.js",
+          "__workflow_outer-1.js",
+          "__workflow_outer_helper.js",
+          "__workflow_outer_helper-1.js",
         ]
       : []),
   ].filter((name, index, names) => name !== hostEntrypoint && names.indexOf(name) === index);
@@ -101,12 +101,15 @@ function publication(options: PublicationOptions = {}): WorkerdDeploymentPublica
       ["host-helper.js", encoder.encode(`export const helperVersion = "${suffix}";`)],
       ...(options.collisionNames
         ? ([
-            ["__workflow_entry.js", encoder.encode("export const occupiedEntry = true;")],
-            ["__workflow_entry-1.js", encoder.encode("export const occupiedEntryOne = true;")],
-            ["__workflow_bootstrap.js", encoder.encode("export const occupiedBootstrap = true;")],
+            ["__workflow_outer.js", encoder.encode("export const occupiedOuter = true;")],
+            ["__workflow_outer-1.js", encoder.encode("export const occupiedOuterOne = true;")],
             [
-              "__workflow_bootstrap-1.js",
-              encoder.encode("export const occupiedBootstrapOne = true;"),
+              "__workflow_outer_helper.js",
+              encoder.encode("export const occupiedOuterHelper = true;"),
+            ],
+            [
+              "__workflow_outer_helper-1.js",
+              encoder.encode("export const occupiedOuterHelperOne = true;"),
             ],
           ] as const)
         : []),
@@ -252,8 +255,13 @@ test("materializes the selected graph privately without evaluating or exposing p
       config.indexOf('(name = "data-origin"'),
     );
     expect(resolvedIdentities).toEqual([identity]);
-    expect(config).toContain('(name = "module.txt", text = embed "./application/module-00001"');
-    expect(config).toContain('(name = "module.bin", data = embed "./application/module-00002"');
+    expect(config).toContain('(name = "__workflow_outer.js", esModule = embed');
+    expect(config).toContain('(name = "__workflow_outer_helper.js", esModule = embed');
+    expect(config).toContain('(name = "__workflow_payload_00000", text = embed');
+    expect(config).toContain('(name = "__workflow_payload_00002", data = embed');
+    expect(config).not.toContain('(name = "index.js",');
+    expect(config).not.toContain('(name = "module.txt",');
+    expect(config).not.toContain('(name = "module.bin",');
     expect(applicationSection).toContain('(name = "APP_VALUE", text = "app-a")');
     expect(applicationSection).not.toContain("DATA_TOKEN");
     expect(dataSection).toContain('(name = "DATA_TOKEN", text = "facade-only-token")');
@@ -275,7 +283,8 @@ test("materializes the selected graph privately without evaluating or exposing p
     const hostRoot = join(preparedRoot, "host-private");
     const applicationFiles = (await readdir(applicationRoot)).sort();
     const hostFiles = (await readdir(hostRoot)).sort();
-    expect(applicationFiles).toEqual(["module-00000", "module-00001", "module-00002"]);
+    expect(applicationFiles.length).toBe(10);
+    expect(applicationFiles[0]).toBe("module-00000");
     const applicationSources = await Promise.all(
       applicationFiles.map(async (name) =>
         new TextDecoder().decode(await readFile(join(applicationRoot, name))),
@@ -285,13 +294,24 @@ test("materializes the selected graph privately without evaluating or exposing p
     const hostSources = await Promise.all(
       hostFiles.map(async (name) => new TextDecoder().decode(await readFile(join(hostRoot, name)))),
     );
-    expect(hostSources).toContain('export const hostVersion = "a";');
-    expect(hostSources).toContain('export const sharedHostModule = "a";');
+    expect(hostSources).toContain('export const dataVersion = "a";');
+    expect(hostSources).not.toContain('export const hostVersion = "a";');
+    expect(hostSources).not.toContain('export const sharedHostModule = "a";');
 
-    const entry = hostSources.find((source) => source.includes("createWorkflowHttpBootstrap"));
+    const entry = applicationSources.find((source) =>
+      source.includes("createWorkflowLoaderOuterBootstrap"),
+    );
     if (!entry) throw new Error("generated workflow entrypoint is unavailable");
-    const encodedOptions = /createWorkflowHttpBootstrap\(JSON\.parse\((.+)\)\);/u.exec(entry)?.[1];
-    if (!encodedOptions) throw new Error("generated workflow options are unavailable");
+    expect(entry).toContain("hostPrivateModules");
+    expect(entry).toContain('"index.js"');
+    const tenantEntry = applicationSources.find((source) =>
+      source.includes("export default createWorkflowLoaderTenantBootstrap"),
+    );
+    if (!tenantEntry) throw new Error("generated tenant entrypoint is unavailable");
+    const encodedOptions = /createWorkflowLoaderTenantBootstrap\(JSON\.parse\((.+)\)\);/u.exec(
+      tenantEntry,
+    )?.[1];
+    if (!encodedOptions) throw new Error("generated tenant options are unavailable");
     const bootstrapOptions = JSON.parse(JSON.parse(encodedOptions)) as {
       readonly className: string;
       readonly applicationModule: string;
@@ -328,14 +348,21 @@ test("keeps application and Host namespaces distinct while suffixing generated m
   })(identity, undefined, new AbortController().signal, channel());
   try {
     const config = await readFile(prepared.configPath, "utf8");
-    expect(config).toContain('(name = "__workflow_entry-2.js"');
-    expect(config).toContain('(name = "__workflow_bootstrap-2.js"');
-    expect(config).toMatch(
-      /\(name = "index\.js", esModule = embed "\.\/host-private\/[^"\n]+", role = hostPrivate\)/u,
+    const preparedRoot = dirname(prepared.configPath);
+    const applicationSources = await Promise.all(
+      (await readdir(join(preparedRoot, "application"))).map(async (name) =>
+        new TextDecoder().decode(await readFile(join(preparedRoot, "application", name))),
+      ),
     );
-    expect(config).toMatch(
-      /\(name = "index\.js", esModule = embed "\.\/application\/[^"\n]+", role = application\)/u,
+    const outerEntry = applicationSources.find((source) =>
+      source.includes("const runtime = createWorkflowLoaderOuterBootstrap"),
     );
+    if (!outerEntry) throw new Error("generated outer entrypoint is unavailable");
+    expect(config).toContain('(name = "__workflow_outer-2.js",');
+    expect(config).toContain('(name = "__workflow_outer_helper-2.js",');
+    expect(config).not.toContain('(name = "index.js",');
+    expect(outerEntry).toContain('mainModule:"__workflow_tenant.js"');
+    expect(outerEntry).toContain('"index.js"');
   } finally {
     await disposePrepared(prepared);
   }

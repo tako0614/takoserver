@@ -10,31 +10,17 @@ import {
   WorkflowStepError,
 } from "./workflow-driver.ts";
 
-// This module is bundled into the host-private bootstrap, evaluated BEFORE
-// the dynamic application import. None of these capabilities are app env.
+// This module is bundled into the dynamic tenant bootstrap. It is evaluated
+// before the tenant application module, but all Host authority remains behind
+// the one-method WorkflowHost RPC passed by the outer worker.
 const apply = Reflect.apply;
 const get = Reflect.get;
 const keys = Object.keys;
 const hasOwn = Object.hasOwn;
-const create = Object.create;
-const define = Object.defineProperty;
 const jsonParse = JSON.parse;
 const quote = JSON.stringify;
 const isArray = Array.isArray;
 const isInteger = Number.isSafeInteger;
-const NativeResponse = Response;
-const NativeURL = URL;
-const responseStatus = captureNativeGetter(Response.prototype, "status");
-const responseBody = captureNativeGetter(Response.prototype, "body");
-const getReader = ReadableStream.prototype.getReader;
-const read = ReadableStreamDefaultReader.prototype.read;
-const cancel = ReadableStreamDefaultReader.prototype.cancel;
-const NativeTextDecoder = TextDecoder;
-const decode = TextDecoder.prototype.decode;
-const typedArrayByteLength = Object.getOwnPropertyDescriptor(
-  Object.getPrototypeOf(Uint8Array.prototype),
-  "byteLength",
-)?.get;
 const NativeTypeError = TypeError;
 const NativeWeakMap = WeakMap;
 const weakGet = WeakMap.prototype.get;
@@ -42,39 +28,8 @@ const weakSet = WeakMap.prototype.set;
 const NativeMap = Map;
 const mapGet = Map.prototype.get;
 const mapSet = Map.prototype.set;
-const logReceiver = console;
-const log = console.error;
 
 const trusted = adoptTrustedWorkflowPromise;
-
-/** Called only during trusted bootstrap, before any application evaluation. */
-function captureNativeGetter(prototype: object, name: string): (() => unknown) | undefined {
-  // workerd exposes Body's accessors on an inherited native prototype, unlike
-  // runtimes that flatten its mixin onto Response.prototype. Capture the
-  // original getter now; never fall back to tenant-mutable property lookup.
-  let current: object | null = prototype;
-  while (current !== null) {
-    const descriptor = Object.getOwnPropertyDescriptor(current, name);
-    if (descriptor) return descriptor.get;
-    current = Object.getPrototypeOf(current);
-  }
-  return undefined;
-}
-
-function response(body: string | null, status = 200): Response {
-  const init = create(null) as ResponseInit;
-  init.status = status;
-  const result = new NativeResponse(body, init);
-  // This fresh native object is private transport, never a data document.
-  // Prevent async return assimilation through a poisoned Object.prototype.
-  const descriptor = create(null) as PropertyDescriptor;
-  descriptor.value = undefined;
-  descriptor.enumerable = false;
-  descriptor.writable = false;
-  descriptor.configurable = false;
-  define(result, "then", descriptor);
-  return result;
-}
 
 function closed(value: unknown, allowed: readonly string[]): Record<string, unknown> {
   if (typeof value !== "object" || value === null || isArray(value)) throw unavailable();
@@ -104,36 +59,6 @@ function commandFrom(text: string): Record<string, unknown> {
   return value;
 }
 
-async function readCommand(response: Response): Promise<Record<string, unknown>> {
-  if (!responseBody) throw unavailable();
-  const body = apply(responseBody, response, []) as ReadableStream<Uint8Array> | null;
-  if (!body) throw unavailable();
-  const reader = apply(getReader, body, []) as ReadableStreamDefaultReader<Uint8Array>;
-  const decoderOptions = create(null) as TextDecoderOptions;
-  decoderOptions.fatal = true;
-  const decoder = new NativeTextDecoder("utf-8", decoderOptions);
-  const streamOptions = create(null) as TextDecodeOptions;
-  streamOptions.stream = true;
-  let size = 0;
-  let text = "";
-  try {
-    for (;;) {
-      const part = (
-        await trusted(apply(read, reader, []) as Promise<ReadableStreamReadResult<Uint8Array>>)
-      ).value;
-      if (part.done) break;
-      if (!typedArrayByteLength) throw unavailable();
-      size += apply(typedArrayByteLength, part.value, []) as number;
-      if (size > 2 * 1024 * 1024) throw unavailable();
-      text += apply(decode, decoder, [part.value, streamOptions]);
-    }
-    text += apply(decode, decoder, []);
-    return commandFrom(text);
-  } finally {
-    await trusted(apply(cancel, reader, []) as Promise<void>);
-  }
-}
-
 function unavailable(): WorkflowRuntimeError {
   return new WorkflowRuntimeError("host_unavailable");
 }
@@ -144,59 +69,39 @@ function valueEnvelope(value: JsonObject | undefined): string {
     : `"present":true,"value":${encodeDocument(value)}`;
 }
 
-/** Host-private bootstrap inputs, never serialized as application bindings. */
-export interface WorkflowHttpWorkerOptions {
-  readonly token: string;
+/** Dynamic tenant bootstrap inputs, never serialized as outer bindings. */
+export interface WorkflowLoaderTenantWorkerOptions {
   readonly className: string;
   readonly instanceId: string;
   readonly params?: JsonObject;
-  /** Dynamic closed-graph import; the generated env wrapper must load first. */
-  readonly load: () => Promise<{
-    readonly namespace: Readonly<Record<string, unknown>>;
-    readonly projectEnv: (raw: Readonly<Record<string, unknown>>) => Record<string, unknown>;
-  }>;
+  /** Complete relative module specifier for the Host-generated env wrapper. */
+  readonly wrapperModule: string;
+  /** Complete relative module specifier for the tenant application module. */
+  readonly applicationModule: string;
 }
 
 /**
- * Concrete private HTTP callee for the dormant Workflow candidate. Export only
- * its default fetch object from a host-private entry, with importable env
- * disabled. The companion service is a private controller capability, not a
- * public fetch handler or a user-supplied endpoint.
+ * Runs one dynamically loaded tenant class. HTTP routing and the companion
+ * socket belong to the outer worker; this child sees only a one-method RPC.
  */
-export function createWorkflowHttpWorker(options: WorkflowHttpWorkerOptions): {
-  fetch(request: Request, rawEnv: Readonly<Record<string, unknown>>): Promise<Response>;
+export function createWorkflowLoaderTenantWorker(options: WorkflowLoaderTenantWorkerOptions): {
+  run(rawEnv: Readonly<Record<string, unknown>>): Promise<string>;
 } {
-  const { token, className, instanceId, load } = options;
-  // workerd lazily loads its native console formatter on the first call.
-  // Initialize that backing module before tenant startup as well as capturing
-  // the entry function. This ordinary empty line is discarded by the guard.
-  apply(log, logReceiver, [""]);
+  const { className, instanceId, wrapperModule, applicationModule } = options;
   const params =
     options.params === undefined ? undefined : parseDocument(encodeDocument(options.params));
-  let started = false;
-  let sequence = 0;
   let callCounter = 0;
   const originals = new NativeMap<string, WorkflowStepError>();
   const originTokens = new NativeWeakMap<object, string>();
-  let companion: unknown;
-  let companionFetch: unknown;
+  let hostExchange: ((payload: string) => Promise<string>) | undefined;
+  let started = false;
 
   async function exchange(payload: string): Promise<Record<string, unknown>> {
-    sequence += 1;
-    if (!isInteger(sequence)) throw unavailable();
-    // Marker emission MUST remain synchronous and precede the network enqueue.
-    apply(log, logReceiver, [`TAKOSERVER_WORKFLOW_JOURNAL:${token}:${sequence}`]);
+    if (!hostExchange || typeof payload !== "string") throw unavailable();
+    const reply = await trusted(hostExchange(payload));
+    if (typeof reply.value !== "string") throw unavailable();
     try {
-      const init = create(null) as RequestInit;
-      init.method = "POST";
-      init.body = payload;
-      const request = apply(companionFetch as (...args: never[]) => unknown, companion, [
-        `http://workflow-companion/${token}/${sequence}`,
-        init,
-      ]) as Promise<Response>;
-      const response = (await trusted(request)).value;
-      if (!responseStatus || apply(responseStatus, response, []) !== 200) throw unavailable();
-      return (await trusted(readCommand(response))).value;
+      return commandFrom(reply.value);
     } catch {
       throw unavailable();
     }
@@ -311,48 +216,53 @@ export function createWorkflowHttpWorker(options: WorkflowHttpWorkerOptions): {
   };
 
   return {
-    fetch(request, rawEnv) {
-      return (async () => {
-        // All request inspection precedes tenant import. Subsequent requests
-        // cannot run a second class or expose raw bindings.
-        if (started) return response(null, 409);
-        const path = new NativeURL(request.url).pathname;
-        if (request.method === "GET" && path === `/${token}/ready`) {
-          return response("ready");
-        }
-        if (request.method !== "POST" || path !== `/${token}/run`) {
-          return response(null, 404);
-        }
-        started = true;
-        companion = rawEnv.__TAKOSERVER_WORKFLOW_COMPANION;
-        if (!companion || typeof companion !== "object") throw unavailable();
-        companionFetch = get(companion, "fetch");
-        if (typeof companionFetch !== "function") throw unavailable();
-        // Never move this import to module scope or the controller process.
-        const loaded = (await trusted(load())).value;
-        const env = loaded.projectEnv(rawEnv);
-        const outcome = (
-          await trusted(
-            executeWorkflowClass({
-              namespace: loaded.namespace,
-              className,
-              env,
-              instanceId,
-              ...(params === undefined ? {} : { params }),
-              driver,
-            }),
-          )
-        ).value;
-        let payload: string;
-        if (outcome.kind === "complete") {
-          payload = `{"kind":"complete",${valueEnvelope(outcome.output)}}`;
-        } else if (outcome.reason === "step_failed") {
-          const origin = apply(weakGet, originTokens, [outcome.error]) as string | undefined;
-          if (origin === undefined) throw unavailable();
-          payload = `{"kind":"failed","reason":"step_failed","token":${quote(origin)}}`;
-        } else payload = '{"kind":"failed","reason":"run_threw"}';
-        return response(payload);
-      })();
+    async run(rawEnv) {
+      if (started) throw unavailable();
+      started = true;
+      if (!rawEnv || (typeof rawEnv !== "object" && typeof rawEnv !== "function")) {
+        throw unavailable();
+      }
+      const host = get(rawEnv, "__TAKOSERVER_WORKFLOW_HOST");
+      if (!host || (typeof host !== "object" && typeof host !== "function")) {
+        throw unavailable();
+      }
+      const exchangeMethod = get(host, "exchange");
+      if (typeof exchangeMethod !== "function") throw unavailable();
+      hostExchange = (payload) => apply(exchangeMethod, host, [payload]) as Promise<string>;
+
+      // The wrapper is loaded before the tenant namespace. Both imports happen
+      // in this child only after the outer worker's one-shot RUN latch.
+      const wrapper = (await trusted(import(wrapperModule))).value as Record<string, unknown>;
+      const projectEnv = get(wrapper, "__takoserverSelfhostProjectEnv");
+      if (typeof projectEnv !== "function") {
+        throw new Error("workflow loader project environment export is invalid");
+      }
+      const namespace = (await trusted(import(applicationModule))).value;
+      if (typeof namespace !== "object" || namespace === null || isArray(namespace)) {
+        throw new Error("workflow loader application namespace is invalid");
+      }
+      const env = apply(projectEnv, wrapper, [rawEnv]) as Record<string, unknown>;
+      const outcome = (
+        await trusted(
+          executeWorkflowClass({
+            namespace: namespace as Readonly<Record<string, unknown>>,
+            className,
+            env,
+            instanceId,
+            ...(params === undefined ? {} : { params }),
+            driver,
+          }),
+        )
+      ).value;
+      if (outcome.kind === "complete") {
+        return `{"kind":"complete",${valueEnvelope(outcome.output)}}`;
+      }
+      if (outcome.reason === "step_failed") {
+        const origin = apply(weakGet, originTokens, [outcome.error]) as string | undefined;
+        if (origin === undefined) throw unavailable();
+        return `{"kind":"failed","reason":"step_failed","token":${quote(origin)}}`;
+      }
+      return '{"kind":"failed","reason":"run_threw"}';
     },
   };
 }
