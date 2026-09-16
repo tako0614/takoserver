@@ -735,6 +735,26 @@ queue identifiers, managed gateway routes, or private service bindings. Consult
 the private deployment runbook for operator qualification and recovery; the
 portable Worker contract remains the authority for application behavior.
 
+Queue message custody itself is public Host infrastructure rather than private
+transport authority. Migration 0053 forward-extends the existing migration-0040
+`selfhost_queue_messages` ledger and adds Consumer-generation state. Admission
+does not depend on a Consumer, so a Consumer update or deletion leaves producers
+and backlog in place. A claim snapshots the exact generation, retry budget and
+dead-letter target beside its lease. Retirement first stops new claims, waits
+until the bounded old-generation leases expire, then reaps each expired claim
+under that snapshot before a replacement generation or tombstone can commit.
+Dead-letter copy and source removal remain one SQL batch.
+
+The self-host producer now uses this shared admission engine. Its existing pump
+and settlement loop remain the legacy transport only: both candidate reads and
+lease compare-and-swaps refuse every Queue that has a Consumer-custody row, and
+initial custody activation refuses a Queue with an outstanding legacy lease.
+The custody engine is therefore the sole state machine for an activated Queue,
+not another pump stacked behind the old one. A private managed producer
+entrypoint is its first external caller, but no current deployment selects that
+binding or its managed pump. Existing provider-native messages are not adopted,
+migrated or deleted by this source slice.
+
 ### Cloudflare Queue settings updates
 
 For an existing Cloudflare-backed `AtLeastOnceQueue`, an update succeeds only

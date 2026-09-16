@@ -29,6 +29,7 @@ const ARTIFACT_CONSUMER_ACTIVE_RESOLUTION = "0049_artifact_consumer_active_resol
 const WORKFLOW_INSTANCES = "0050_workflow_instances.sql";
 const WORKFLOW_EXECUTION = "0051_workflow_execution.sql";
 const WORKFLOW_TERMINATION_INTENT = "0052_workflow_termination_intent.sql";
+const QUEUE_CUSTODY = "0053_queue_custody.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -50,6 +51,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   WORKFLOW_INSTANCES,
   WORKFLOW_EXECUTION,
   WORKFLOW_TERMINATION_INTENT,
+  QUEUE_CUSTODY,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -381,6 +383,7 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 6]?.name).toBe(WORKFLOW_INSTANCES);
     expect(MIGRATIONS[receiptMigrationIndex + 7]?.name).toBe(WORKFLOW_EXECUTION);
     expect(MIGRATIONS[receiptMigrationIndex + 8]?.name).toBe(WORKFLOW_TERMINATION_INTENT);
+    expect(MIGRATIONS[receiptMigrationIndex + 9]?.name).toBe(QUEUE_CUSTODY);
 
     const database = new Database(":memory:");
     database.exec(`
@@ -403,6 +406,7 @@ describe("bringing a local database up to date", () => {
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
       WORKFLOW_TERMINATION_INTENT,
+      QUEUE_CUSTODY,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -666,6 +670,7 @@ describe("bringing a local database up to date", () => {
         WORKFLOW_INSTANCES,
         WORKFLOW_EXECUTION,
         WORKFLOW_TERMINATION_INTENT,
+        QUEUE_CUSTODY,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1222,6 +1227,7 @@ describe("bringing a local database up to date", () => {
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
       WORKFLOW_TERMINATION_INTENT,
+      QUEUE_CUSTODY,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1355,6 +1361,7 @@ describe("bringing a local database up to date", () => {
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
       WORKFLOW_TERMINATION_INTENT,
+      QUEUE_CUSTODY,
     ]);
     expect(
       database
@@ -2295,6 +2302,7 @@ describe("bringing a local database up to date", () => {
       WORKFLOW_INSTANCES,
       WORKFLOW_EXECUTION,
       WORKFLOW_TERMINATION_INTENT,
+      QUEUE_CUSTODY,
     ]);
     expect(
       database

@@ -160,6 +160,20 @@ export {
   WORKER_MODULE_IMPORTABLE_MEDIA_TYPES,
   type WorkerModuleMediaType,
 } from "./providers/worker-module-semantic-inspection.ts";
+export {
+  createQueueCustody,
+  type QueueCustody,
+  type QueueCustodyAdmission,
+  type QueueCustodyClaimedMessage,
+  QueueCustodyConflictError,
+  type QueueCustodyConsumerGeneration,
+  type QueueCustodyDeadLetterTarget,
+  type QueueCustodyOptions,
+  type QueueCustodyRetirementCompletion,
+  type QueueCustodyRetirementStatus,
+  type QueueCustodyRetryPolicy,
+  type QueueCustodyTarget,
+} from "./queue-custody.ts";
 export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 export { createD1Sql } from "./sql-d1.ts";

@@ -1155,6 +1155,48 @@ describe("released edge Form placement", () => {
     return { provider, calls };
   }
 
+  test("delegates readback identity to the backend that owns the selected Queue", () => {
+    const offering = technical("AtLeastOnceQueue");
+    const input = { offering, nativeId: "queue:logical-queue", identity: IDENTITY };
+    const descriptor = {
+      apiVersion: "providers.takoserver.com/readback/v1" as const,
+      provider: "cloudflare",
+      kind: "AtLeastOnceQueue",
+      nativeId: input.nativeId,
+      data: { queueId: "logical-queue" },
+    };
+    let delegated = 0;
+    const { provider, calls } = queueProvider([], {
+      ...managedBackendThatDoesNotOwnQueues(),
+      owns: (candidate) => candidate.form.kind === "AtLeastOnceQueue",
+      createNativeReadbackDescriptor: (readback) => {
+        delegated += 1;
+        expect(readback).toBe(input);
+        return descriptor;
+      },
+    });
+    expect(provider.createNativeReadbackDescriptor(input)).toBe(descriptor);
+    expect(delegated).toBe(1);
+    expect(calls).toEqual([]);
+  });
+
+  test("retains ordinary Queue readback when the managed backend does not own it", () => {
+    const { provider, calls } = queueProvider([], {
+      ...managedBackendThatDoesNotOwnQueues(),
+      createNativeReadbackDescriptor: () => {
+        throw new Error("an unowned Queue must not reach the managed backend");
+      },
+    });
+    expect(
+      provider.createNativeReadbackDescriptor({
+        offering: technical("AtLeastOnceQueue"),
+        nativeId: "queue:queue-id",
+        identity: IDENTITY,
+      }),
+    ).toMatchObject({ nativeId: "queue:queue-id", data: { queueId: "queue-id" } });
+    expect(calls).toEqual([]);
+  });
+
   function queueUpdateInput(
     offering: ProviderOffering,
     spec: JsonObject,

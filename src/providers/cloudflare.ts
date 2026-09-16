@@ -623,11 +623,12 @@ export class CloudflareProvider implements Provider {
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor {
+    if (this.#workerBackend?.owns(input.offering)) {
+      return this.#workerBackend.createNativeReadbackDescriptor(input);
+    }
     return createCloudflareNativeReadbackDescriptor({
       providerId: this.id,
-      placement: this.#workerBackend?.owns(input.offering)
-        ? "workers-for-platforms"
-        : "ordinary-workers",
+      placement: "ordinary-workers",
       readback: input,
     });
   }

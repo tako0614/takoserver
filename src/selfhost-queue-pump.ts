@@ -254,12 +254,14 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           "FROM selfhost_queue_messages " +
           "WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ? " +
           "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "AND NOT EXISTS (SELECT 1 FROM queue_consumer_custody WHERE queue_id = ?) " +
           "ORDER BY visible_at_ms, message_id LIMIT ?",
         [
           consumer.queue,
           millis,
           millis,
           millis,
+          consumer.queue,
           Math.min(consumer.maxBatchSize, MAX_SELFHOST_QUEUE_MESSAGES),
         ],
       )
@@ -306,7 +308,8 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           "WHERE queue_id = ? AND message_id = ? " +
           "AND deliveries = ? AND enqueued_at_ms = ? AND visible_at_ms = ? " +
           "AND visible_at_ms <= ? AND expires_at_ms > ? " +
-          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)",
+          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "AND NOT EXISTS (SELECT 1 FROM queue_consumer_custody WHERE queue_id = ?)",
         params: [
           token,
           claimMillis + leaseMillis,
@@ -318,6 +321,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           claimMillis,
           claimMillis,
           claimMillis,
+          consumer.queue,
         ] as readonly SqlParam[],
       })),
     );
@@ -561,12 +565,14 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           "lease_token, lease_expires_at_ms FROM selfhost_queue_messages " +
           "WHERE queue_id = ? AND visible_at_ms <= ? AND expires_at_ms > ? " +
           "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "AND NOT EXISTS (SELECT 1 FROM queue_consumer_custody WHERE queue_id = ?) " +
           "ORDER BY visible_at_ms, message_id LIMIT ?",
         [
           consumer.queue,
           millis,
           millis,
           millis,
+          consumer.queue,
           Math.min(consumer.maxBatchSize, MAX_SELFHOST_QUEUE_MESSAGES),
         ],
       )
@@ -585,7 +591,8 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           "AND deliveries = ? AND enqueued_at_ms = ? AND visible_at_ms = ? " +
           "AND lease_token IS ? AND lease_expires_at_ms IS ? " +
           "AND visible_at_ms <= ? AND expires_at_ms > ? " +
-          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?)",
+          "AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?) " +
+          "AND NOT EXISTS (SELECT 1 FROM queue_consumer_custody WHERE queue_id = ?)",
         params: [
           token,
           claimMillis + leaseMillis,
@@ -599,6 +606,7 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
           claimMillis,
           claimMillis,
           claimMillis,
+          consumer.queue,
         ],
       });
       // Claim, copy and removal are one transaction. A lost claim makes both

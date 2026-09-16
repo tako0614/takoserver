@@ -675,11 +675,15 @@ Migration `0050_workflow_instances.sql` adds the instance and event tables.
 `0051_workflow_execution.sql` adds run ownership, wake state and the step
 journal without replacing the existing tables. `0052_workflow_termination_intent.sql`
 adds the private `termination_requested` bit, defaulting to zero, so controller
-loss cannot lose a pending consumer termination. Earlier migration bytes are
+loss cannot lose a pending consumer termination. `0053_queue_custody.sql` extends
+the existing self-host message ledger with Queue Consumer generations, retirement
+state and snapshotted retry/dead-letter lease policy; it preserves producers and
+backlog while fencing claims to the exact generation, without adopting provider-
+native backlog or changing the public Queue contract. Earlier migration bytes are
 unchanged. The generated schema must come from the owning `schema:write`
-command. The owning deployment inventory, exact migration hashes, 0050-to-0051
-and 0051-to-0052 waves and schema tests move with these migrations; adding a file alone is not a
-deployable schema change.
+command. The owning deployment inventory, exact migration hashes, 0050-to-0051,
+0051-to-0052 and 0052-to-0053 waves and schema tests move with these migrations;
+adding a file alone is not a deployable schema change.
 
 No live database is changed by adding this implementation. Shared, unknown and
 production databases remain protected. A managed rollout requires the owning
@@ -687,7 +691,7 @@ schema transition, its predecessor evidence and exact readback. Old deployment
 evidence remains tied to its old source and cannot stand in for the new schema.
 Self-host startup applies known forward migrations and refuses a database from
 a newer build: after migration, downgrading to a binary that does not know
-0052 is not a rollback plan. Preserve the data and repair forward.
+0053 is not a rollback plan. Preserve the data and repair forward.
 
 ## Remaining runtime integration
 
