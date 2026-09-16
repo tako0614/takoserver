@@ -168,7 +168,7 @@ describe("0043 artifact blob I/O deployment compatibility", () => {
     expect(
       artifactBlobIoCompatibilityAllowsPending(target, [
         ...through0055,
-        "0056_unreviewed_extension.sql",
+        "0057_unreviewed_extension.sql",
       ]),
     ).toBe(false);
     expect(

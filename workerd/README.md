@@ -76,10 +76,14 @@ is not performed by this build script.
 ## Unqualified WorkerLoader closed-graph candidate
 
 `patches/worker-loader-closed-graph.candidate.patch` is a separate development
-overlay, applied **after** the active `closed-module-graph.patch`. It adds
-WorkerLoader module roles and an explicit application-main policy using the
-same native module boundary as static services. Its SHA-256 is
-`0a1fdc30856db1ab021575cf09e9d55580c2f48884d5b251afb268b878f8aa54`.
+overlay, applied **after** the active `closed-module-graph.patch`. It keeps the
+existing WorkerLoader `modules` dictionary application-only, adds a separate
+optional `hostPrivateModules` dictionary, and adds `mainModuleRole` plus an
+explicit application-main policy using the same native module boundary as
+static services. Separate dictionaries let the same logical module name exist
+once in each provenance namespace without adding a second role authority to a
+module entry. Its SHA-256 is
+`5a65dc6c02b1b444513e670b3b44eaf6cf4ea419a1590c73a39a72cbdc15b7d7`.
 
 Static patch application (`git apply --check` and GNU `patch --dry-run --fuzz=0`)
 and JS syntax checks, plus independent source review, have passed. Native
