@@ -182,6 +182,38 @@ describe("OpenAI-compatible AI data plane", () => {
     ]);
   });
 
+  test("cancels a chunked request as soon as it exceeds the one MiB ingress bound", async () => {
+    const { call, calls, scoped } = await fixture();
+    let pulls = 0;
+    let cancelled = false;
+    const chunk = new Uint8Array(600 * 1024).fill(0x20);
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          pulls += 1;
+          controller.enqueue(chunk);
+          if (pulls >= 3) controller.close();
+        },
+        cancel() {
+          cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const response = await call("/v1/ai/chat/completions", scoped.secret, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "chat-oversized" },
+      body,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+
+    expect(response?.status).toBe(400);
+    expect(await response?.json()).toMatchObject({ error: { code: "invalid_request" } });
+    expect(cancelled).toBe(true);
+    expect(pulls).toBeLessThan(3);
+    expect(calls).toEqual([]);
+  });
+
   test("refuses before upstream inference when prepaid funds cannot cover the ceiling", async () => {
     const { call, calls, scoped } = await fixture(1);
     const response = await call("/v1/ai/chat/completions", scoped.secret, {
