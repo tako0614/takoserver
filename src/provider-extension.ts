@@ -149,6 +149,12 @@ export type {
   CloudflareWorkersForPlatformsBackendFactoryOptions,
 } from "./providers/cloudflare-worker-backend.ts";
 export {
+  EDGE_VECTOR_WORKER_FACADE_KIND,
+  EDGE_VECTOR_WORKER_FACADE_SAFE_INTRINSICS,
+  type EdgeVectorWorkerFacadeSafeIntrinsic,
+  renderEdgeVectorWorkerFacadeSource,
+} from "./providers/edge-vector-worker-facade-source.ts";
+export {
   createHttpRevisionServing,
   type HttpRevisionBackendObservation,
   type HttpRevisionServingBackend,

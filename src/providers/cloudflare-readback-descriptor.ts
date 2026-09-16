@@ -23,7 +23,7 @@ export type CloudflareNativeReadbackAddress =
     };
 
 type CloudflareManagedNativeReadbackAddress =
-  | { readonly kind: "worker" | "endpoint" | "sqlite"; readonly name: string }
+  | { readonly kind: "worker" | "endpoint" | "sqlite" | "vector"; readonly name: string }
   | {
       readonly kind: "version" | "deployment" | "cron" | "consumer";
       readonly parent: string;
@@ -49,6 +49,7 @@ const MANAGED_FORM_NATIVE_KINDS = {
   WorkerCronTrigger: "cron",
   QueueConsumer: "consumer",
   SQLiteDatabase: "sqlite",
+  VectorIndex: "vector",
 } as const satisfies Readonly<Record<string, CloudflareManagedNativeReadbackAddress["kind"]>>;
 
 /** Provider kind projection shared by construction and readback validation. */
@@ -58,7 +59,12 @@ export function cloudflareProviderKind(offering: ProviderOffering): string {
     : offering.kind;
 }
 
-/** Mirrors the WfP backend's fail-closed ownership boundary without credentials. */
+/**
+ * Fail-closed WfP routing classification without credentials or catalog state.
+ *
+ * This selects the managed route only; it does not activate an Offering or
+ * prove that the private backend has configured its exact Offering/store.
+ */
 export function cloudflareWfpOwnsOffering(offering: ProviderOffering): boolean {
   return (
     offering.kind === "worker_script" ||
@@ -214,7 +220,7 @@ function parseManagedNativeId(value: string): CloudflareManagedNativeReadbackAdd
   const parts = value.split(":");
   const kind = parts[0];
   if (
-    (kind === "worker" || kind === "endpoint" || kind === "sqlite") &&
+    (kind === "worker" || kind === "endpoint" || kind === "sqlite" || kind === "vector") &&
     parts.length === 2 &&
     nativeSegment(parts[1])
   ) {
