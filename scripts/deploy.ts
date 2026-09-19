@@ -9,6 +9,7 @@ import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
 import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-transition.ts";
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
+import { runIntegrationHostRetirement } from "./deploy/integration-host-retirement.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
@@ -46,6 +47,9 @@ const USAGE = `takoserver deploy
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
+  bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
+    --retired-target=/absolute/old-target.json --retired-deployment=<uuid> --retired-version=<uuid>
+    (one replaced public Host only; never deletes storage or forces associated binding removal)
   bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
     (first public Host publication only; existing Workers use their normal lifecycle)
   bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
@@ -90,8 +94,9 @@ const USAGE = `takoserver deploy
   Worker has no Version at all, together with
   --bootstrap-probe-predecessor-version=<uuid>. The pinned identity-probe Version must already be
   the exact predecessor missing only FORM_AUTHORITY; it is checked again at the mutation fence.
-The target descriptor is selected only by the exact environment. There is no
-deploy-plan flag, ledger, target override or mixed mutation controller.
+The current target descriptor is selected only by the exact environment.
+Host retirement additionally requires an explicit historical descriptor.
+There is no deploy-plan flag, ledger, current-target override or mixed mutation controller.
 `;
 
 type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
@@ -99,9 +104,14 @@ type CredentialSurface = "takoserver-integration-e2e-credentials";
 type OrgApiKeySurface = "takoserver-org-api-key";
 type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
+type HostRetirementSurface = "takoserver-integration-host-retirement";
 type StandardSurface = Exclude<
   Surface,
-  CredentialSurface | OrgApiKeySurface | StorageGenerationSurface | StorageDisposalSurface
+  | CredentialSurface
+  | OrgApiKeySurface
+  | StorageGenerationSurface
+  | StorageDisposalSurface
+  | HostRetirementSurface
 >;
 
 interface InvocationBase {
@@ -130,6 +140,13 @@ type Invocation =
   | (InvocationBase & {
       readonly surface: StorageDisposalSurface;
       readonly action: "status" | "apply";
+    })
+  | (InvocationBase & {
+      readonly surface: HostRetirementSurface;
+      readonly action: "status" | "apply";
+      readonly retiredTargetPath: string;
+      readonly retiredDeploymentId: string;
+      readonly retiredVersionId: string;
     })
   | (InvocationBase & {
       readonly surface: StandardSurface;
@@ -230,6 +247,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
+  let retiredTargetPath: string | null = null;
+  let retiredDeploymentId: string | null = null;
+  let retiredVersionId: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
   let closurePredecessorVersionId: string | null = null;
@@ -255,6 +275,24 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let apiKeyId: string | null = null;
   let reverse = false;
   for (const flag of flags) {
+    if (flag.startsWith("--retired-target=")) {
+      const value = flag.slice("--retired-target=".length);
+      if (retiredTargetPath !== null || !isAbsolute(value) || /[\0\r\n]/u.test(value)) return null;
+      retiredTargetPath = value;
+      continue;
+    }
+    if (flag.startsWith("--retired-deployment=")) {
+      const value = flag.slice("--retired-deployment=".length);
+      if (retiredDeploymentId !== null || !isWorkerVersionId(value)) return null;
+      retiredDeploymentId = value;
+      continue;
+    }
+    if (flag.startsWith("--retired-version=")) {
+      const value = flag.slice("--retired-version=".length);
+      if (retiredVersionId !== null || !isWorkerVersionId(value)) return null;
+      retiredVersionId = value;
+      continue;
+    }
     if (
       flag === "--status" ||
       flag === "--apply" ||
@@ -446,6 +484,37 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  const hostRetirement = surfaceValue === "takoserver-integration-host-retirement";
+  const retirementOperands = [retiredTargetPath, retiredDeploymentId, retiredVersionId].filter(
+    (value) => value !== null,
+  ).length;
+  if (
+    hostRetirement
+      ? retirementOperands !== 3 ||
+        environment !== "integration" ||
+        args.length !== 7 ||
+        (action !== "status" && action !== "apply")
+      : retirementOperands !== 0
+  ) {
+    return null;
+  }
+  if (
+    hostRetirement &&
+    retiredTargetPath !== null &&
+    retiredDeploymentId !== null &&
+    retiredVersionId !== null &&
+    (action === "status" || action === "apply")
+  ) {
+    return {
+      surface: "takoserver-integration-host-retirement",
+      action,
+      environment,
+      commit,
+      retiredTargetPath,
+      retiredDeploymentId,
+      retiredVersionId,
+    };
+  }
   if (
     (surfaceValue === "takoserver-integration-worker-bootstrap" ||
       surfaceValue === "takoserver-integration-organization-bootstrap") &&
@@ -860,6 +929,8 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runIntegrationStorageGeneration(invocation, target);
     case "takoserver-integration-storage-disposal":
       return await runIntegrationStorageDisposal(invocation, target);
+    case "takoserver-integration-host-retirement":
+      return await runIntegrationHostRetirement(invocation, target);
     case "takoserver-integration-worker-bootstrap":
       return await runIntegrationWorkerBootstrap(
         { ...invocation, surface: "takoserver-integration-worker-bootstrap" },

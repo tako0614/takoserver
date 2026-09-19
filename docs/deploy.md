@@ -159,6 +159,55 @@ Successful output is only a candidate storage projection. It does not publish
 a Host or WfP Worker, register signing keys, change a route or switch the
 current target. Those steps retain their separate owning deploy surfaces.
 
+### Retire a replaced integration Host
+
+After a disposable rebuild, the public Host has its own retirement operation.
+It does not retire the private executor, delete storage, or move a route.
+Select the **successor** with `TAKOSERVER_DEPLOY_TARGET_INTEGRATION`, and pass
+the old Host's separate operator-private descriptor and observed identities:
+
+```sh
+bun run deploy -- takoserver-integration-host-retirement --status --environment=integration --commit=<tool-head-sha> --retired-target=/absolute/retired-target.json --retired-deployment=<deployment-uuid> --retired-version=<version-uuid>
+bun run deploy -- takoserver-integration-host-retirement --apply --environment=integration --commit=<tool-head-sha> --retired-target=/absolute/retired-target.json --retired-deployment=<deployment-uuid> --retired-version=<version-uuid>
+```
+
+Status is read-only; apply requires `TAKOSERVER_INDEPENDENT_REVIEW`. Both
+descriptors must belong to the same integration account. The old Host cannot
+be the successor or any other Worker named by the successor target. Do not
+construct the retired descriptor from a name alone: its old D1/R2, origin and
+account settings must match the pinned live Host. The two Hosts may share
+storage; neither database nor bucket is changed by this operation.
+
+The retired descriptor is read only as historical evidence, not as a
+deployable current target. The retirement-only profile recognizes the old
+Host's exact binding types and legacy secret names. Selector-derived values
+must match; the full observed binding/settings projection must remain unchanged
+at the deletion fence. Unrelated historical authoring fields are not used to
+configure or authorize anything. This does not relax the binding or secret
+requirements for normal publication, adoption, or updates.
+
+The operation checks the old Host's exact deployment/Version, Host binding
+and secret-name closure, settings, cron, and absence of routes, custom domains
+and owned Durable Object namespaces. The successor must retain its observed
+deployment/Version and exact target bindings and answer
+`/.well-known/takoserver` with its own product and origin. These checks repeat
+at the deletion fence. They are not a provider-side Version compare-and-swap;
+do not concurrently deploy to either selected Host during retirement.
+
+One DELETE is sent for the old Worker, with no `force` query or override.
+[Cloudflare's associated-binding protection](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/delete/)
+remains active; a referenced Worker is refused instead of forcibly removing
+its references or durable resources. This does not preserve external clients
+calling the retired workers.dev or preview URLs. Use this only for the explicitly
+disposable, replaced integration Host.
+
+Success requires old script/deployment absence plus the unchanged successor
+and its HTTP identity. A rejected or uncertain DELETE is never retried:
+inspect the same exact selection with `--status` before deciding the next
+action. Deletion also removes the old Worker's secret store, with no rollback
+to its retained Versions. Any recreation uses the separate owning bootstrap
+surface under a new identity. This operation never generates or rotates keys.
+
 ### First integration Host publication
 
 Once storage is ready, register the signing public key through
@@ -721,6 +770,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-integration-storage-disposal` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Exact target-selected storage names only; complete current regular + dispatch Worker binding inventory required. |
+| `takoserver-integration-host-retirement` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The current target selects the successor; exact `--retired-target`, `--retired-deployment`, and `--retired-version` select the replaced Host. No force or storage deletion. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |

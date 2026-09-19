@@ -1015,6 +1015,56 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-host-retirement",
+      target: "cloudflare-worker:exact-replaced-integration-public-host-only",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-host-retirement.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/worker-state.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. TAKOSERVER_DEPLOY_TARGET_INTEGRATION selects the ` +
+          "current Host; --retired-target selects a separate absolute operator-private historical Host descriptor. " +
+          "Both targets must name the same integration account and distinct Host identities. " +
+          "--retired-deployment and --retired-version pin the old live incarnation. No arbitrary " +
+          "Worker-name operand or old-source rebuild is accepted.",
+        "post-conditions":
+          "Readback proves the old script and deployment are absent, while the successor retains " +
+          "its exact deployment, Version and target binding closure and answers its own public " +
+          "product discovery. Storage, namespaces, routes and keys are never mutated.",
+        reversal:
+          "There is no rollback of the deleted Worker or its secret store. Recreate through the " +
+          "owning bootstrap surface under a new exact identity if needed. Existing storage is retained.",
+        "failure-handling":
+          highRiskFailure +
+          " Exactly one DELETE is sent without the force query; Cloudflare's associated-binding " +
+          "protection remains active. Explicit rejection stops. Transport failure, malformed " +
+          "acknowledgement or server error is indeterminate and requires --status; no retry, " +
+          "forced deletion, namespace cleanup or storage fallback is attempted." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "The retired Host must not be any current target Worker identity. Its pinned deployment, " +
+          "Version, exact Host binding/secret-name/settings/cron profile, absence of routes, custom " +
+          "domains and owned Durable Object namespaces are rechecked at the deletion fence. " +
+          "The successor must retain its current exact deployment/Version and target closure and " +
+          "answer /.well-known/takoserver with its own identity. The provider, not a duplicated " +
+          "account-wide reference scanner, enforces associated-binding refusal at DELETE time. " +
+          "No Version CAS or preservation of callers using retired workers.dev or preview URLs is claimed.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-d1-schema-rehearsal-baseline",
       target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],

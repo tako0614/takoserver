@@ -64,6 +64,7 @@ const SURFACES = [
   ["takoserver-console", []],
   ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
   ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
+  ["takoserver-integration-host-retirement", ["irreversible", "authority"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
@@ -607,6 +608,56 @@ describe("Takoserver split deploy entrypoint", () => {
       [surface, "--issue", "--environment=integration", commit],
       [surface, "--apply", "--environment=integration", commit, `--generation=${"b".repeat(32)}`],
       [surface, "--apply", "--environment=integration", commit, "--reverse"],
+    ]) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("routes Host retirement only with a complete integration predecessor selection", async () => {
+    const surface = "takoserver-integration-host-retirement";
+    const commit = `--commit=${"a".repeat(40)}`;
+    const operands = [
+      "--retired-target=/operator-private/retired-target.json",
+      "--retired-deployment=00000000-0000-4000-8000-000000000001",
+      "--retired-version=00000000-0000-4000-8000-000000000002",
+    ];
+    for (const action of ["--status", "--apply"]) {
+      const accepted = await deploy([
+        surface,
+        action,
+        "--environment=integration",
+        commit,
+        ...operands,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+    const base = [surface, "--status", "--environment=integration", commit];
+    for (const args of [
+      ...["rehearsal", "production"].map((environment) => [
+        surface,
+        "--status",
+        `--environment=${environment}`,
+        commit,
+        ...operands,
+      ]),
+      ...operands.map((_, missing) => [
+        ...base,
+        ...operands.filter((_, index) => index !== missing),
+      ]),
+      [...base, ...operands, "--reverse"],
+      [...base, ...operands, "--force"],
+      [...base, ...operands, operands[0] as string],
+      [...base, "--retired-target=relative.json", ...operands.slice(1)],
+      [...base, ...operands.slice(0, 2), "--retired-version=not-a-uuid"],
+      [...base, operands[0] as string, "--retired-deployment=not-a-uuid", operands[2] as string],
+      [surface, "--issue", "--environment=integration", commit, ...operands],
+      ["takoserver-integration-storage-disposal", ...base.slice(1), ...operands],
     ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
