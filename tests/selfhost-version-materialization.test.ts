@@ -138,6 +138,58 @@ async function assetMaterializerFixture(
 }
 
 describe("self-host Worker Version materialization", () => {
+  test.each(["mainModule", "module declaration"] as const)(
+    "rejects dot-prefixed WorkerBundle %s paths before materialization",
+    async (invalidPath) => {
+      const bytes = new TextEncoder().encode("export default {};");
+      const digest = await bytesDigest(bytes);
+      const manifest = {
+        apiVersion: "artifacts.takoform.com/v1alpha1",
+        kind: "WorkerBundle",
+        mainModule: invalidPath === "mainModule" ? ".index.js" : "index.js",
+        modules: [
+          {
+            name: "index.js",
+            mediaType: "application/javascript+module",
+            size: bytes.byteLength,
+            digest,
+          },
+          ...(invalidPath === "module declaration"
+            ? [
+                {
+                  name: ".helper.js",
+                  mediaType: "application/javascript+module",
+                  size: bytes.byteLength,
+                  digest,
+                },
+              ]
+            : []),
+        ],
+      } satisfies SelfhostVersionArtifactManifest;
+      const manifestDigest = await canonicalDigest(manifest);
+      const materializer = createSelfhostVersionMaterializer({
+        root,
+        artifacts: {
+          async manifest() {
+            return manifest;
+          },
+          async blob() {
+            return bytes;
+          },
+        },
+      });
+      const input = {
+        tenantRef: "tenant-a",
+        script: "script-a",
+        versionId: "version-a",
+        manifestDigest,
+      } as const;
+
+      await expect(materializer.materialize(input)).rejects.toMatchObject({ code: "invalid_spec" });
+      expect((await materializer.inspect(input)).state).toBe("absent");
+    },
+  );
+
   test("a missing blob preserves an existing complete version", async () => {
     const { fixture, materializer, input } = await materializerFixture();
     await materializer.materialize(input);
@@ -324,8 +376,8 @@ describe("self-host Worker Version materialization", () => {
     expect(physical.every((entry) => entry.isFile())).toBe(true);
   });
 
-  test("materializes explicit dot-prefixed asset paths in flat storage", async () => {
-    const paths = [".env", "dir/.x", ".well-known/info", "a/.hidden/main.js"] as const;
+  test("materializes underscore-prefixed and internal-dot asset paths in flat storage", async () => {
+    const paths = ["_env", "dir/_x", "_well-known/info.v1.json", "a/_hidden/main.js"] as const;
     const { materializer, input, assetManifestDigest } = await assetMaterializerFixture(paths);
     await materializer.materialize({
       ...input,
@@ -338,7 +390,7 @@ describe("self-host Worker Version materialization", () => {
 
     const retained = await materializer.readSnapshot(input);
     expect(retained.state).toBe("present");
-    if (retained.state !== "present") throw new Error("dot-prefixed assets were not retained");
+    if (retained.state !== "present") throw new Error("valid asset paths were not retained");
     expect([...(retained.prepared.assets as ReadonlyMap<string, Uint8Array>).keys()]).toEqual([
       ...paths,
     ]);
@@ -353,6 +405,24 @@ describe("self-host Worker Version materialization", () => {
     ]);
     expect(physical.every((entry) => entry.isFile())).toBe(true);
   });
+
+  test.each([".env", "dir/.x", ".well-known/info", "a/.hidden/main.js"])(
+    "rejects dot-prefixed static artifact path %s before materialization",
+    async (path) => {
+      const { materializer, input, assetManifestDigest } = await assetMaterializerFixture([path]);
+      await expect(
+        materializer.materialize({
+          ...input,
+          assets: {
+            manifestDigest: assetManifestDigest,
+            notFoundHandling: "none",
+            runWorkerFirst: false,
+          },
+        }),
+      ).rejects.toMatchObject({ code: "invalid_spec" });
+      expect((await materializer.inspect(input)).state).toBe("absent");
+    },
+  );
 
   test.each([".", "..", "dir/./x", "dir/../x"])(
     "rejects traversal asset path %s before materialization",

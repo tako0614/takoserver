@@ -444,15 +444,28 @@ asset stage also misses. A Version without assets goes straight to the Worker.
 
 Asset lookup starts from the runtime URL `pathname`, ignores query and fragment,
 strictly decodes percent escapes once, and strips exactly one leading slash.
-The decoded logical path is at most 240 characters, and each nonempty segment
-starts with an ASCII letter, digit, or underscore, as required by the frozen
-artifact manifest grammar. The root pathname remains the canonical empty miss.
-Encoded separators, repeated or empty segments, dot segments, backslashes,
-controls, Unicode noncharacters, malformed escapes, and invalid UTF-8 fail
-closed when asset lookup occurs and never enter SPA fallback. The declared
-asset-first or Worker-first ordering still decides when that lookup occurs. SPA
+The artifact manifest's filename grammar and 240-character limit constrain
+declared files, not application URLs. Each declared file segment starts with
+an ASCII letter, digit, or underscore; dot-prefixed files cannot enter an
+artifact manifest. Valid URL misses, including dot-prefixed paths, Unicode
+paths, trailing or repeated slashes, and paths
+longer than a manifest filename, follow the selected none/SPA fallback policy;
+they never become filesystem paths. The root pathname is an empty miss.
+Encoded separators, literal or encoded dot/dotdot segments still visible at
+the asset lookup boundary, backslashes, controls, Unicode noncharacters,
+malformed escapes, and invalid UTF-8 fail closed and never enter SPA fallback.
+HTTP ingress can already have canonicalized a dot segment; the asset layer
+does not recover a spelling that the runtime no longer exposes. The declared
+asset-first or Worker-first ordering still decides when lookup occurs. SPA
 publication is refused before materialization and before any sensitive-input
 lease when the manifest has no exact `index.html`.
+
+Previously accepted manifests with dot-prefixed filenames are outside the
+frozen artifact schema. Stored artifacts are not rewritten, but new consumption
+and materialization reject them. A retained self-host snapshot containing such
+paths is unavailable on inspection or restart; republish the affected Version
+with valid filenames before upgrading. This is not a backward-compatible
+reinterpretation of those manifests or an automatic data migration.
 
 The immutable Version materialization persists `runWorkerFirst`, every declared
 media type, and its flat physical-layout discriminator, and includes all of

@@ -2852,15 +2852,35 @@ test.skipIf(WORKERD === null)(
 );
 
 test.skipIf(WORKERD === null)(
-  "SPA fallback accepts only a valid runtime pathname and invalid pathnames fail closed",
+  "SPA fallback accepts valid URL misses while malformed runtime pathnames fail closed",
   async () => {
     const { origin } = await bootEventsOnly({
       module: `export default { fetch() { return new Response("worker", { status: 418 }); } };`,
       handlers: ["fetch"],
       notFoundHandling: "single_page_application",
     });
-    expect(await (await served(origin, "/valid-route")).text()).toBe(SITE_INDEX);
-    expect(await (await served(origin, `/${"a".repeat(240)}`)).text()).toBe(SITE_INDEX);
+    // Manifest filename restrictions do not turn valid application URLs into
+    // malformed paths. None of these misses selects an undeclared disk file.
+    for (const target of [
+      "/valid-route",
+      "/.env",
+      "/dir/.x",
+      "/%2Eenv",
+      "/dir/%2Ex",
+      "/%E6%97%A5%E6%9C%AC%E8%AA%9E/",
+      `/${"a".repeat(240)}`,
+      `/${"a".repeat(241)}`,
+      "/nested//path",
+      "/trailing/",
+      "/asset.txt%3Fcache=one",
+    ]) {
+      const response = await rawAsk(origin, target);
+      expect({ target, status: response.status, body: response.body }).toEqual({
+        target,
+        status: 200,
+        body: SITE_INDEX,
+      });
+    }
     // Query never becomes part of the asset key.
     expect(await (await served(origin, "/asset.txt?cache=one")).text()).toBe(SITE_ASSET);
     // The contract begins at the runtime URL pathname. workerd applies URL
@@ -2869,19 +2889,11 @@ test.skipIf(WORKERD === null)(
     expect((await rawAsk(origin, "/nested/../index.html")).body).toBe(SITE_INDEX);
 
     for (const target of [
-      "/.env",
-      "/dir/.x",
-      "/%2Eenv",
-      "/dir/%2Ex",
-      `/${"a".repeat(241)}`,
-      "/nested//path",
       "/nested%2Findex.html",
       "/nested%5Cindex.html",
-      // An encoded question mark is pathname data after the one strict decode,
-      // and cannot match the manifest's relative-path grammar.
-      "/asset.txt%3Fcache=one",
-      "/trailing/",
       "/%00",
+      "/%7F",
+      "/%C2%80",
       "/%EF%B7%90",
       "/%C0%AF",
       "/%ZZ",

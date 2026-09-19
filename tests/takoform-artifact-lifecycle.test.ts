@@ -224,6 +224,96 @@ describe("Takoform artifact lifecycle", () => {
     expect(await sql.query("SELECT * FROM tf_artifact_blob_io_leases")).toEqual([]);
   });
 
+  test("rejects dot-prefixed upload paths before persisting any artifact state", async () => {
+    const target = fixture();
+    const bytes = new TextEncoder().encode("artifact path admission");
+    const digest = (await bytesDigest(bytes)) as `sha256:${string}`;
+    const worker = await workerManifest(bytes);
+    const invalidManifests: readonly TakoformArtifactManifest[] = [
+      {
+        ...worker,
+        mainModule: ".worker.mjs",
+        modules: [
+          {
+            name: ".worker.mjs",
+            mediaType: "application/javascript+module",
+            size: bytes.byteLength,
+            digest,
+          },
+        ],
+      },
+      {
+        ...worker,
+        modules: [
+          ...(worker.modules ?? []),
+          {
+            name: ".helper.mjs",
+            mediaType: "application/javascript+module",
+            size: bytes.byteLength,
+            digest,
+          },
+        ],
+      },
+      {
+        apiVersion: "artifacts.takoform.com/v1alpha1",
+        kind: "StaticAssetBundle",
+        files: [
+          {
+            path: ".well-known/nodeinfo.json",
+            mediaType: "application/json",
+            size: bytes.byteLength,
+            digest,
+          },
+        ],
+      },
+      {
+        apiVersion: "artifacts.takoform.com/v1alpha1",
+        kind: "MigrationBundle",
+        files: [
+          { path: ".migration.sql", mediaType: "text/plain", size: bytes.byteLength, digest },
+        ],
+      },
+    ];
+
+    for (const [index, manifest] of invalidManifests.entries()) {
+      await expect(
+        target.call("uploads", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": `dot-path-upload-${index}`,
+          },
+          body: JSON.stringify({ manifest }),
+        }),
+      ).rejects.toMatchObject({ name: "ArtifactInputError" });
+    }
+
+    for (const table of [
+      "tf_artifact_uploads",
+      "tf_artifact_manifest_members",
+      "tf_artifact_manifests",
+      "tf_artifact_roots",
+      "tf_artifact_replays",
+    ]) {
+      expect(await target.sql.query(`SELECT * FROM ${table}`)).toEqual([]);
+    }
+
+    const validManifest: TakoformArtifactManifest = {
+      apiVersion: "artifacts.takoform.com/v1alpha1",
+      kind: "StaticAssetBundle",
+      files: [
+        {
+          path: "_well-known/nodeinfo.v1.json",
+          mediaType: "application/json",
+          size: bytes.byteLength,
+          digest,
+        },
+      ],
+    };
+    const accepted = await startUpload(target, validManifest, "underscore-internal-dot-path");
+    expect(accepted.response.status).toBe(201);
+  });
+
   test("a committed upload cannot be abandoned through the public DELETE", async () => {
     const target = fixture();
     const bytes = new TextEncoder().encode(

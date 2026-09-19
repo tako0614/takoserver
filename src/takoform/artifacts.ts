@@ -22,10 +22,9 @@ import {
  */
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
-// A leading dot is allowed because `.well-known` is a standard web path and
-// refusing it would make a whole class of real sites undeployable. Traversal is
-// blocked separately: `.` and `..` segments are rejected by name.
-const PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
+// Frozen artifacts.takoform.com/v1alpha1 artifactPath grammar; public URL
+// routing is separate and does not make a leading dot valid here.
+const PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 const MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const DEFAULT_ARTIFACT_PREFIX = "/apis/forms.takoform.com/v1/artifacts";
 const REPLAY_TTL_MILLISECONDS = 24 * 60 * 60_000;
