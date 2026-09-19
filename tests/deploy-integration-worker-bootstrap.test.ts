@@ -52,6 +52,25 @@ const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
 const PUBLIC_ORIGIN = `https://${WORKER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev`;
 const SCHEDULES = ["*/5 * * * *"] as const;
+const EXPECTED_BOOTSTRAP_TEST_COMMAND = [
+  "bun",
+  "test",
+  "tests/deploy-integration-worker-bootstrap.test.ts",
+  "tests/deploy-integration-storage-generation.test.ts",
+  "tests/deploy-signing.test.ts",
+  "tests/deploy-realized-config-v2.test.ts",
+  "tests/deploy-worker-artifact.test.ts",
+  "tests/deploy-worker-composition.test.ts",
+  "tests/deploy-worker-state.test.ts",
+  "tests/deploy-wrangler-state.test.ts",
+  "tests/deploy-cloudflare-state.test.ts",
+  "tests/deploy-worker.test.ts",
+  "tests/entry-worker-origin.test.ts",
+  "tests/entry-worker-operator-authority.test.ts",
+  "tests/entry-worker-startup.test.ts",
+  "tests/runtime-input-seal-keyring.test.ts",
+  "tests/worker-production-composition.test.ts",
+] as const;
 
 const fixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-worker-bootstrap-tests-"));
 const sourceRoot = join(fixtureRoot, "source");
@@ -196,11 +215,7 @@ describe("Takoserver integration Worker bootstrap", () => {
     const applyFixture = bootstrapFixture({ target });
     const secretDirectory = writeSecretDirectory(target);
     try {
-      const applied = await apply(
-        applyFixture,
-        { wranglerPath, secretDirectory },
-        true,
-      );
+      const applied = await apply(applyFixture, { wranglerPath, secretDirectory }, true);
       expect(applied).toMatchObject({ mutationApplied: true, versionId: VERSION_ID });
       expectDefaultSigningReaderPath(applyFixture.commands, wranglerPath);
     } finally {
@@ -288,24 +303,36 @@ describe("Takoserver integration Worker bootstrap", () => {
     rmSync(wrongKeyringDirectory, { recursive: true, force: true });
   });
 
-  test("owner gate failure preserves exit status and diagnostics before publication", async () => {
-    const fixture = bootstrapFixture({
-      target,
-      gateFailure: {
-        exitCode: 17,
-        stdout: "gate stdout\n",
-        stderr: "gate stderr\n",
-      },
-    });
-    const error = await rejectedError(apply(fixture));
-    expect(error).toBeInstanceOf(DeployError);
-    expect(error).toMatchObject({
-      phase: "preflight",
-      message: "scoped owner gate `bun run check` failed (exit 17)",
-      detail: "gate stdout\ngate stderr",
-    });
-    expect(fixture.lifecycleCalls).toHaveLength(0);
-    expect(fixture.uploaded).toBe(false);
+  test("each scoped gate failure preserves diagnostics and stops before artifact build or upload", async () => {
+    for (const gateFailureAt of ["typecheck", "tests"] as const) {
+      const fixture = bootstrapFixture({
+        target,
+        gateFailureAt,
+        gateFailure: {
+          exitCode: 17,
+          stdout: "gate stdout\n",
+          stderr: "gate stderr\n",
+        },
+      });
+      const error = await rejectedError(apply(fixture));
+      expect(error).toBeInstanceOf(DeployError);
+      expect(error).toMatchObject({
+        phase: "preflight",
+        message:
+          gateFailureAt === "typecheck"
+            ? "scoped Host bootstrap typecheck `bun run typecheck:worker` failed (exit 17)"
+            : "scoped Host bootstrap tests `bun test <fixed Host bootstrap test set>` failed (exit 17)",
+        detail: "gate stdout\ngate stderr",
+      });
+      expect(fixture.commands).toContainEqual(["bun", "run", "typecheck:worker"]);
+      expect(fixture.commands).not.toContainEqual(["bun", "run", "check"]);
+      expect(
+        fixture.commands.some((command) => sameCommand(command, EXPECTED_BOOTSTRAP_TEST_COMMAND)),
+      ).toBe(gateFailureAt === "tests");
+      expect(fixture.commands.some((command) => command.includes("--dry-run"))).toBe(false);
+      expect(fixture.lifecycleCalls).toHaveLength(0);
+      expect(fixture.uploaded).toBe(false);
+    }
   });
 
   test("publishes one genuine first Version with Ed25519 proof and exact temporary secret closure", async () => {
@@ -337,6 +364,7 @@ describe("Takoserver integration Worker bootstrap", () => {
     expect(existsSync(fixture.secretFileSeen ?? "")).toBe(false);
     expect(fixture.buildEnvironments).toEqual([{}]);
     expect(fixture.commands.some((command) => command.includes("--no-bundle"))).toBe(false);
+    expectHostBootstrapGateBeforeArtifact(fixture.commands);
     expect(fixture.commands.flat().join(" ")).not.toContain(keyMaterial.privateRaw);
     expect(JSON.stringify(result)).not.toContain(keyMaterial.privateRaw);
     rmSync(secretDirectory, { recursive: true, force: true });
@@ -441,6 +469,7 @@ interface FixtureOptions {
   readonly signingMode?: "valid" | "revoked" | "malformed";
   readonly provider?: WorkerProviderExecutorQualification;
   readonly gateFailure?: CommandResult;
+  readonly gateFailureAt?: "typecheck" | "tests";
   readonly postAckDrift?: "schema" | "signing" | "schedule";
   readonly finalNativeRace?: boolean;
   readonly lostAcknowledgement?: boolean;
@@ -499,9 +528,8 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     if (command.join(" ") === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (command.join(" ") === "git branch --show-current") return ok("integration-worker\n");
     if (command.join(" ") === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-    if (command.join(" ") === "bun run check") {
-      return options.gateFailure ?? ok("green\n");
-    }
+    if (command.join(" ") === "bun run typecheck:worker") return gateResult(options, "typecheck");
+    if (sameCommand(command, EXPECTED_BOOTSTRAP_TEST_COMMAND)) return gateResult(options, "tests");
     if (command[1] === "d1" && command[2] === "execute" && command.includes("--command")) {
       return ok(
         JSON.stringify([
@@ -758,6 +786,31 @@ function expectDefaultSigningReaderPath(commands: readonly string[][], wranglerP
   );
   expect(signingReads.length).toBeGreaterThan(0);
   for (const command of signingReads) expect(command[0]).toBe(wranglerPath);
+}
+
+function expectHostBootstrapGateBeforeArtifact(commands: readonly string[][]): void {
+  const typecheckIndex = commands.findIndex(
+    (command) => command.join(" ") === "bun run typecheck:worker",
+  );
+  const testsIndex = commands.findIndex((command) =>
+    sameCommand(command, EXPECTED_BOOTSTRAP_TEST_COMMAND),
+  );
+  const artifactIndex = commands.findIndex((command) => command.includes("--dry-run"));
+  expect(typecheckIndex).toBeGreaterThanOrEqual(0);
+  expect(testsIndex).toBeGreaterThan(typecheckIndex);
+  expect(sameCommand(commands[typecheckIndex] ?? [], ["bun", "run", "typecheck:worker"])).toBe(
+    true,
+  );
+  expect(sameCommand(commands[testsIndex] ?? [], EXPECTED_BOOTSTRAP_TEST_COMMAND)).toBe(true);
+  expect(artifactIndex).toBeGreaterThan(testsIndex);
+}
+
+function gateResult(options: FixtureOptions, gate: "typecheck" | "tests"): CommandResult {
+  return options.gateFailureAt === gate ? (options.gateFailure ?? ok("green\n")) : ok("green\n");
+}
+
+function sameCommand(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function makeKeyMaterial(): { readonly publicX: string; readonly privateRaw: string } {

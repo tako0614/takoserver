@@ -82,6 +82,33 @@ const COMMIT = /^[0-9a-f]{40}$/u;
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
+const INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS = [
+  "tests/deploy-integration-worker-bootstrap.test.ts",
+  "tests/deploy-integration-storage-generation.test.ts",
+  "tests/deploy-signing.test.ts",
+  "tests/deploy-realized-config-v2.test.ts",
+  "tests/deploy-worker-artifact.test.ts",
+  "tests/deploy-worker-composition.test.ts",
+  "tests/deploy-worker-state.test.ts",
+  "tests/deploy-wrangler-state.test.ts",
+  "tests/deploy-cloudflare-state.test.ts",
+  "tests/deploy-worker.test.ts",
+  "tests/entry-worker-origin.test.ts",
+  "tests/entry-worker-operator-authority.test.ts",
+  "tests/entry-worker-startup.test.ts",
+  "tests/runtime-input-seal-keyring.test.ts",
+  "tests/worker-production-composition.test.ts",
+] as const;
+const INTEGRATION_WORKER_BOOTSTRAP_GATES = [
+  {
+    label: "Host bootstrap typecheck `bun run typecheck:worker`",
+    command: ["bun", "run", "typecheck:worker"],
+  },
+  {
+    label: "Host bootstrap tests `bun test <fixed Host bootstrap test set>`",
+    command: ["bun", "test", ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS],
+  },
+] as const;
 
 export interface IntegrationWorkerBootstrapInvocation {
   readonly surface?: typeof INTEGRATION_WORKER_BOOTSTRAP_SURFACE;
@@ -1445,17 +1472,19 @@ function assertSecretSeal(phase: DeployPhase, seal: SealedArtifact): void {
 }
 
 async function checkedGate(run: WorkerProcess): Promise<void> {
-  let result: CommandResult;
-  try {
-    result = await run(["bun", "run", "check"]);
-  } catch {
-    throw preflightError("scoped owner gate `bun run check` could not be started");
-  }
-  if (result.exitCode !== 0) {
-    throw preflightError(
-      `scoped owner gate \`bun run check\` failed (exit ${result.exitCode})`,
-      `${result.stdout}${result.stderr}`.trim(),
-    );
+  for (const gate of INTEGRATION_WORKER_BOOTSTRAP_GATES) {
+    let result: CommandResult;
+    try {
+      result = await run(gate.command);
+    } catch {
+      throw preflightError(`scoped ${gate.label} could not be started`);
+    }
+    if (result.exitCode !== 0) {
+      throw preflightError(
+        `scoped ${gate.label} failed (exit ${result.exitCode})`,
+        `${result.stdout}${result.stderr}`.trim(),
+      );
+    }
   }
 }
 
