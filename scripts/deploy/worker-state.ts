@@ -325,6 +325,15 @@ export interface WorkerClosureDelta {
   readonly addedSecrets: readonly string[];
   /** Secrets carried by both sides whose value this one upload replaces. */
   readonly rotatedSecrets: readonly string[];
+  /**
+   * Integration-only replacement of the immutable STATE_DB and OBJECTS
+   * bindings. The successor identities remain target-derived; these values
+   * name only the exact storage identities the pinned predecessor must serve.
+   */
+  readonly storageRebind?: {
+    readonly predecessorStateDatabaseId: string;
+    readonly predecessorObjectBucketName: string;
+  };
 }
 
 /** A selector without any declared change is an ordinary publication, not a transition. */
@@ -335,7 +344,8 @@ export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
     delta.refreshedVars.length === 0 &&
     delta.addedBindings.length === 0 &&
     delta.addedSecrets.length === 0 &&
-    delta.rotatedSecrets.length === 0
+    delta.rotatedSecrets.length === 0 &&
+    delta.storageRebind === undefined
   );
 }
 

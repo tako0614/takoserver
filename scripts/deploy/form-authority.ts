@@ -38,6 +38,10 @@ import {
   type LoadedFormAuthorityScopeTransition,
 } from "./form-authority-scope-transition.ts";
 import {
+  type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyIntegrationStorageGenerationTarget,
+} from "./integration-storage-generation.ts";
+import {
   type CommandResult,
   REPOSITORY,
   requireEnvironment,
@@ -69,8 +73,10 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
+  assertStorageRebindIntegrationOnly,
   type BindingDifference,
   describeBindingDrift,
+  normalizedWorkerClosureDelta,
   surfaceTransitionAdmits,
   type WorkerBindingDrift,
   type WorkerSurfaceTransition,
@@ -168,6 +174,11 @@ export interface FormAuthorityDeployOptions {
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
   /** Operator-private descriptor path adoption re-reads; defaults to the selected target path. */
   readonly targetDescriptorPath?: string;
+  /** Read-only generated-storage verifier seam for focused portable tests. */
+  readonly integrationStorageVerification?: Omit<
+    IntegrationStorageGenerationTargetVerificationOptions,
+    "run" | "cloudflareEnvironment"
+  >;
 }
 
 export interface FormAuthorityCoreVerifierReadbackExpectation {
@@ -265,6 +276,22 @@ export async function runFormAuthority(
   if (target.environment !== invocation.environment) {
     throw preflightError("Form authority invocation and target environments differ");
   }
+  const transitionDelta =
+    invocation.transition === undefined
+      ? null
+      : normalizedWorkerClosureDelta(invocation.transition.delta);
+  if (transitionDelta !== null) {
+    assertStorageRebindIntegrationOnly("preflight", invocation.environment, transitionDelta);
+  }
+  if (
+    transitionDelta?.storageRebind !== undefined &&
+    invocation.surface !== "takoserver-form-authority-worker" &&
+    invocation.surface !== "takoserver-integration-form-authority-worker"
+  ) {
+    throw preflightError(
+      "Form authority storage rebind is supported only by the two route-less authority Workers",
+    );
+  }
   assertPublicFormCapabilityTarget(target);
   if (invocation.scopeTransition) {
     if (
@@ -324,6 +351,14 @@ export async function runFormAuthority(
           run,
         });
   const environment = credential?.childEnvironment ?? {};
+  const initialStorageProof =
+    transitionDelta?.storageRebind === undefined
+      ? null
+      : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
+          run,
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...options.integrationStorageVerification,
+        });
   const state =
     options.state ??
     new CloudflareState({
@@ -632,7 +667,23 @@ export async function runFormAuthority(
       "served integration Form authority Worker differs from the operator gateway source commit",
     );
   }
-  await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+  if (transitionDelta?.storageRebind !== undefined) {
+    await checked(run, "integration Form authority storage-rebind typecheck", [
+      "bun",
+      "run",
+      "typecheck:form-authority-worker",
+    ]);
+    await checked(run, "focused integration Form authority storage-rebind deploy tests", [
+      "bun",
+      "test",
+      "--test-name-pattern=storage rebind",
+      "tests/deploy-form-authority.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-integration-storage-generation.test.ts",
+    ]);
+  } else {
+    await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+  }
 
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-form-authority-"));
@@ -724,6 +775,22 @@ export async function runFormAuthority(
       "--message",
       message(invocation.surface, source.commit, authorityArtifactDigest),
     ]);
+    if (initialStorageProof !== null) {
+      const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
+        target,
+        invocation.environment,
+        {
+          run,
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...options.integrationStorageVerification,
+        },
+      );
+      if (JSON.stringify(initialStorageProof) !== JSON.stringify(finalStorageProof)) {
+        throw preflightError(
+          "generated integration storage target or schema changed before publication",
+        );
+      }
+    }
     mutationPhase = "mutation";
     const upload = await run(uploadCommand, { env: environment });
     if (upload.exitCode !== 0) {
@@ -1240,6 +1307,7 @@ async function classifyPublicWorkerBinding(
     declared.predecessorVersionId === authorityVersionId &&
     surfaceTransitionAdmits(phase, authorityVersionId, authorityVersion, {
       delta: declared.delta,
+      environment: invocation.environment,
       targetClosure: targetExpected,
     })
   ) {

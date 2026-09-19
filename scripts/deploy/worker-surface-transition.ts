@@ -6,6 +6,7 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import type { DeployEnvironment } from "./qualification.ts";
 import {
   assertExactVersionBindingClosure,
   type ExpectedBinding,
@@ -46,6 +47,8 @@ export const EMPTY_WORKER_CLOSURE_DELTA: WorkerClosureDelta = {
 };
 
 const DELTA_NAME = /^[A-Z][A-Z0-9_]{0,63}$/u;
+const STORAGE_DATABASE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const STORAGE_BUCKET_NAME = /^[a-z0-9][a-z0-9-]{2,62}$/u;
 
 /** Longest value echoed verbatim in a difference report; longer ones are digested. */
 const MAX_REPORTED_VALUE_BYTES = 200;
@@ -62,6 +65,8 @@ export interface WorkerSurfaceTransition {
 
 export interface SurfaceTransitionAdmission {
   readonly delta: WorkerClosureDelta;
+  /** A storage rebind without an explicit environment is never admitted. */
+  readonly environment?: DeployEnvironment;
   /** Exact closure a fresh publication of this surface would realize. */
   readonly targetClosure: ExpectedBindingClosure;
   /** Secret names the current target requires. Empty for secret-free Workers. */
@@ -92,6 +97,7 @@ export function normalizedWorkerClosureDelta(delta: WorkerClosureDelta): WorkerC
       throw preflightError("transition delta contains an invalid binding name");
     }
   }
+  const storageRebind = normalizeStorageRebind(delta.storageRebind);
   return {
     retiredVars: [...delta.retiredVars].sort(),
     addedVars: [...delta.addedVars].sort(),
@@ -99,7 +105,19 @@ export function normalizedWorkerClosureDelta(delta: WorkerClosureDelta): WorkerC
     addedBindings: [...delta.addedBindings].sort(),
     addedSecrets: [...delta.addedSecrets].sort(),
     rotatedSecrets: [...delta.rotatedSecrets].sort(),
+    ...(storageRebind === undefined ? {} : { storageRebind }),
   };
+}
+
+/** Refuses a storage transition unless its caller explicitly names integration. */
+export function assertStorageRebindIntegrationOnly(
+  phase: DeployPhase,
+  environment: DeployEnvironment | undefined,
+  delta: WorkerClosureDelta,
+): void {
+  if (delta.storageRebind !== undefined && environment !== "integration") {
+    throw phaseError(phase, "Worker storage rebind is integration-only");
+  }
 }
 
 /**
@@ -130,6 +148,16 @@ export function transitionPredecessorClosure(
   for (const name of [...input.delta.retiredVars, ...input.delta.refreshedVars]) {
     closure[name] = { type: "plain_text", fields: {} };
   }
+  if (input.delta.storageRebind !== undefined) {
+    closure.STATE_DB = {
+      type: "d1",
+      fields: { id: input.delta.storageRebind.predecessorStateDatabaseId },
+    };
+    closure.OBJECTS = {
+      type: "r2_bucket",
+      fields: { bucket_name: input.delta.storageRebind.predecessorObjectBucketName },
+    };
+  }
   return closure;
 }
 
@@ -148,6 +176,7 @@ export function assertSurfaceTransitionPredecessor(
   admission: SurfaceTransitionAdmission,
 ): void {
   const delta = normalizedWorkerClosureDelta(admission.delta);
+  assertStorageRebindIntegrationOnly(phase, admission.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw phaseError(
       phase,
@@ -219,6 +248,30 @@ function assertDeltaNamesTarget(
   for (const name of delta.rotatedSecrets) {
     if (!targetSecrets.includes(name)) offences.push(`rotated-secret-not-a-target-secret:${name}`);
   }
+  if (delta.storageRebind !== undefined) {
+    const targetDatabase = targetClosure.STATE_DB;
+    const targetBucket = targetClosure.OBJECTS;
+    if (
+      !present(targetDatabase) ||
+      targetDatabase.type !== "d1" ||
+      typeof targetDatabase.fields.id !== "string"
+    ) {
+      offences.push("storage-rebind-requires-target-d1-binding:STATE_DB");
+    } else if (delta.storageRebind.predecessorStateDatabaseId === targetDatabase.fields.id) {
+      offences.push("storage-rebind-predecessor-d1-matches-target:STATE_DB");
+    }
+    if (
+      !present(targetBucket) ||
+      targetBucket.type !== "r2_bucket" ||
+      typeof targetBucket.fields.bucket_name !== "string"
+    ) {
+      offences.push("storage-rebind-requires-target-r2-binding:OBJECTS");
+    } else if (
+      delta.storageRebind.predecessorObjectBucketName === targetBucket.fields.bucket_name
+    ) {
+      offences.push("storage-rebind-predecessor-r2-matches-target:OBJECTS");
+    }
+  }
   if (offences.length > 0) {
     throw phaseError(
       phase,
@@ -226,6 +279,35 @@ function assertDeltaNamesTarget(
       JSON.stringify(offences.sort()),
     );
   }
+}
+
+function normalizeStorageRebind(
+  value: WorkerClosureDelta["storageRebind"] | unknown,
+): WorkerClosureDelta["storageRebind"] {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw preflightError("transition storage rebind must name both exact predecessor bindings");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    JSON.stringify(keys) !==
+    JSON.stringify(["predecessorObjectBucketName", "predecessorStateDatabaseId"])
+  ) {
+    throw preflightError("transition storage rebind must name both exact predecessor bindings");
+  }
+  if (
+    typeof record.predecessorStateDatabaseId !== "string" ||
+    !STORAGE_DATABASE_UUID.test(record.predecessorStateDatabaseId) ||
+    typeof record.predecessorObjectBucketName !== "string" ||
+    !STORAGE_BUCKET_NAME.test(record.predecessorObjectBucketName)
+  ) {
+    throw preflightError("transition storage rebind contains a malformed predecessor identity");
+  }
+  return {
+    predecessorStateDatabaseId: record.predecessorStateDatabaseId,
+    predecessorObjectBucketName: record.predecessorObjectBucketName,
+  };
 }
 
 /**

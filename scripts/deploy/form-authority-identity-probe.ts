@@ -135,6 +135,9 @@ export async function runFormAuthorityIdentityProbe(
   target: DeployTarget,
   options: FormAuthorityIdentityProbeOptions = {},
 ): Promise<Record<string, unknown>> {
+  if (invocation.transition?.delta.storageRebind !== undefined) {
+    throw preflightError("Form authority identity probe does not bind STATE_DB or OBJECTS");
+  }
   assertPublicFormCapabilityTarget(target);
   if (target.environment !== invocation.environment) {
     throw preflightError("Form authority identity probe invocation and target differ");
@@ -634,6 +637,7 @@ async function inspectProbe(
     transition.predecessorVersionId === history.versionId &&
     surfaceTransitionAdmits(phase, history.versionId, version, {
       delta: transition.delta,
+      environment: invocation.environment,
       targetClosure: expected,
     })
   ) {

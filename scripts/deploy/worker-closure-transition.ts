@@ -8,6 +8,11 @@ import {
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
+import {
+  type IntegrationStorageGenerationTargetProof,
+  type IntegrationStorageGenerationTargetVerificationOptions,
+  verifyIntegrationStorageGenerationTarget,
+} from "./integration-storage-generation.ts";
 import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
@@ -55,6 +60,7 @@ import {
   workerTransitionSecretInventory,
 } from "./worker-state.ts";
 import {
+  assertStorageRebindIntegrationOnly,
   assertSurfaceTransitionPredecessor,
   normalizedWorkerClosureDelta,
 } from "./worker-surface-transition.ts";
@@ -98,6 +104,11 @@ export interface WorkerClosureTransitionOptions {
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
   /** Exact private-executor qualification seam; injectable only for portable tests. */
   readonly providerExecutorQualification?: WorkerProviderExecutorQualification;
+  /** Read-only generated-storage verifier seam for focused portable tests. */
+  readonly integrationStorageVerification?: Omit<
+    IntegrationStorageGenerationTargetVerificationOptions,
+    "run" | "cloudflareEnvironment" | "wranglerPath"
+  >;
 }
 
 interface ClosurePredecessor {
@@ -138,6 +149,7 @@ export async function runWorkerClosureTransition(
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
+  assertStorageRebindIntegrationOnly("preflight", invocation.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw preflightError(
       "closure transition requires a non-empty declared delta; use the routine surface instead",
@@ -159,6 +171,15 @@ export async function runWorkerClosureTransition(
   // A transition exists to publish a corrected target. Prove that the
   // correction composes before it can be uploaded.
   await assertTargetComposes("preflight", target);
+  const initialStorageProof =
+    delta.storageRebind === undefined
+      ? null
+      : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
+          ...options.integrationStorageVerification,
+          run,
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+        });
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-worker-closure-transition-"));
@@ -221,7 +242,14 @@ export async function runWorkerClosureTransition(
         `expected=${selector} actual=${history.versionId}`,
       );
     }
-    const before = await admitClosurePredecessor("preflight", target, state, history, delta);
+    const before = await admitClosurePredecessor(
+      "preflight",
+      target,
+      state,
+      history,
+      delta,
+      invocation.environment,
+    );
     const migrationState = await migrations.read();
     const pending = pendingMigrations(migrationState.local, migrationState.applied);
 
@@ -276,12 +304,39 @@ export async function runWorkerClosureTransition(
       commit: invocation.commit,
       run,
     });
-    const gate = await run(["bun", "run", "check"]);
-    if (gate.exitCode !== 0) {
-      throw preflightError(
-        `scoped owner gate \`bun run check\` failed (exit ${gate.exitCode})`,
-        `${gate.stdout}${gate.stderr}`.trim(),
-      );
+    const gates =
+      delta.storageRebind === undefined
+        ? [
+            {
+              label: "scoped owner gate `bun run check`",
+              command: ["bun", "run", "check"],
+            },
+          ]
+        : [
+            {
+              label: "integration storage-rebind Worker typecheck",
+              command: ["bun", "run", "typecheck:worker"],
+            },
+            {
+              label: "focused integration storage-rebind deploy tests",
+              command: [
+                "bun",
+                "test",
+                "--test-name-pattern=storage rebind",
+                "tests/deploy-worker-closure-transition.test.ts",
+                "tests/deploy-worker-state.test.ts",
+                "tests/deploy-integration-storage-generation.test.ts",
+              ],
+            },
+          ];
+    for (const gate of gates) {
+      const result = await run(gate.command);
+      if (result.exitCode !== 0) {
+        throw preflightError(
+          `${gate.label} failed (exit ${result.exitCode})`,
+          `${result.stdout}${result.stderr}`.trim(),
+        );
+      }
     }
     const prepared = await prepareWorkerArtifact({
       root,
@@ -339,6 +394,7 @@ export async function runWorkerClosureTransition(
       state,
       requalifiedHistory,
       delta,
+      invocation.environment,
     );
     if (
       requalified.commit !== before.commit ||
@@ -368,6 +424,19 @@ export async function runWorkerClosureTransition(
       JSON.stringify(finalPending) !== JSON.stringify(pending)
     ) {
       throw preflightError("D1 migration lineage changed before the closure transition upload");
+    }
+    if (initialStorageProof !== null) {
+      const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
+        target,
+        invocation.environment,
+        {
+          ...options.integrationStorageVerification,
+          run,
+          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+        },
+      );
+      assertIntegrationStorageProofUnchanged(initialStorageProof, finalStorageProof);
     }
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
     const upload = await run(
@@ -562,6 +631,7 @@ async function admitClosurePredecessor(
   state: WorkerState,
   history: WorkerDeploymentHistory,
   delta: WorkerClosureDelta,
+  environment: DeployEnvironment,
 ): Promise<ClosurePredecessor> {
   const versionId = history.versionId;
   const version = await state.workerVersion(target.workerName, versionId);
@@ -609,6 +679,7 @@ async function admitClosurePredecessor(
   // rest of the closure exactly as strict as the routine path.
   assertSurfaceTransitionPredecessor(phase, versionId, version, {
     delta,
+    environment,
     targetClosure,
     targetSecrets,
     carriedStoreSecrets: secrets.carriedStoreSecrets,
@@ -633,6 +704,17 @@ async function admitClosurePredecessor(
     carriedStoreSecrets: secrets.carriedStoreSecrets,
     expectedSecrets: targetSecrets,
   };
+}
+
+function assertIntegrationStorageProofUnchanged(
+  before: IntegrationStorageGenerationTargetProof,
+  after: IntegrationStorageGenerationTargetProof,
+): void {
+  if (JSON.stringify(before) !== JSON.stringify(after)) {
+    throw preflightError(
+      "generated integration storage target or schema changed before publication",
+    );
+  }
 }
 
 function expectedClosureTransitionSecrets(

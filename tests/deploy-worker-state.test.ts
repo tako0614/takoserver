@@ -10,8 +10,14 @@ import {
   expectedLegacyPreVersionMetadataBindingClosure,
   parseWorkerDeploymentChain,
   parseWorkerDeploymentHistory,
+  type WorkerClosureDelta,
+  workerClosureDeltaIsEmpty,
   workerVersionMetadataBindingProfile,
 } from "../scripts/deploy/worker-state.ts";
+import {
+  assertSurfaceTransitionPredecessor,
+  normalizedWorkerClosureDelta,
+} from "../scripts/deploy/worker-surface-transition.ts";
 import {
   cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
@@ -36,6 +42,137 @@ const EXPECTED = {
 } as const;
 
 describe("immutable Worker Version binding closure", () => {
+  test("storage rebind names both changed data bindings while every unrelated field stays exact", () => {
+    const newDatabaseId = "00000000-0000-4000-8000-0000000000a5";
+    const oldDatabaseId = "00000000-0000-4000-8000-0000000000a4";
+    const newBucket = `takoserver-i-${"f".repeat(32)}`;
+    const oldBucket = `takoserver-i-${"e".repeat(32)}`;
+    const delta: WorkerClosureDelta = {
+      retiredVars: [],
+      addedVars: [],
+      refreshedVars: [],
+      addedBindings: [],
+      addedSecrets: [],
+      rotatedSecrets: [],
+      storageRebind: {
+        predecessorStateDatabaseId: oldDatabaseId,
+        predecessorObjectBucketName: oldBucket,
+      },
+    };
+    const targetClosure = {
+      STATE_DB: { type: "d1", fields: { id: newDatabaseId } },
+      OBJECTS: { type: "r2_bucket", fields: { bucket_name: newBucket } },
+      EXACT_VAR: { type: "plain_text", fields: { text: "unchanged" } },
+    } as const;
+    const predecessor = {
+      resources: {
+        bindings: [
+          { name: "STATE_DB", type: "d1", id: oldDatabaseId },
+          { name: "OBJECTS", type: "r2_bucket", bucket_name: oldBucket },
+          { name: "EXACT_VAR", type: "plain_text", text: "unchanged" },
+        ],
+      },
+    };
+    expect(
+      normalizedWorkerClosureDelta({
+        retiredVars: [],
+        addedVars: [],
+        refreshedVars: [],
+        addedBindings: [],
+        addedSecrets: [],
+        rotatedSecrets: [],
+      }),
+    ).not.toHaveProperty("storageRebind");
+    expect(workerClosureDeltaIsEmpty(delta)).toBe(false);
+    expect(() =>
+      assertSurfaceTransitionPredecessor("preflight", "predecessor", predecessor, {
+        delta,
+        environment: "integration",
+        targetClosure,
+      }),
+    ).not.toThrow();
+
+    const unrelatedDrift = {
+      resources: {
+        bindings: [
+          ...predecessor.resources.bindings,
+          { name: "FOREIGN", type: "plain_text", text: "x" },
+        ],
+      },
+    };
+    expect(() =>
+      assertSurfaceTransitionPredecessor("preflight", "predecessor", unrelatedDrift, {
+        delta,
+        environment: "integration",
+        targetClosure,
+      }),
+    ).toThrow("outside the declared delta");
+    expect(() =>
+      assertSurfaceTransitionPredecessor("preflight", "predecessor", predecessor, {
+        delta: {
+          ...delta,
+          storageRebind: {
+            predecessorStateDatabaseId: newDatabaseId,
+            predecessorObjectBucketName: newBucket,
+          },
+        },
+        environment: "integration",
+        targetClosure,
+      }),
+    ).toThrow("does not describe the closure");
+  });
+
+  test("storage rebind normalization refuses partial, malformed and unscoped declarations", () => {
+    const base = {
+      retiredVars: [],
+      addedVars: [],
+      refreshedVars: [],
+      addedBindings: [],
+      addedSecrets: [],
+      rotatedSecrets: [],
+    } as const;
+    for (const storageRebind of [
+      { predecessorStateDatabaseId: "00000000-0000-4000-8000-0000000000a4" },
+      {
+        predecessorStateDatabaseId: "NOT-A-UUID",
+        predecessorObjectBucketName: "invalid_bucket",
+      },
+    ]) {
+      expect(() =>
+        normalizedWorkerClosureDelta({ ...base, storageRebind } as unknown as WorkerClosureDelta),
+      ).toThrow("storage rebind");
+    }
+    const valid: WorkerClosureDelta = {
+      ...base,
+      storageRebind: {
+        predecessorStateDatabaseId: "00000000-0000-4000-8000-0000000000a4",
+        predecessorObjectBucketName: `takoserver-i-${"e".repeat(32)}`,
+      },
+    };
+    const closure = {
+      STATE_DB: { type: "d1", fields: { id: "00000000-0000-4000-8000-0000000000a5" } },
+      OBJECTS: { type: "r2_bucket", fields: { bucket_name: `takoserver-i-${"f".repeat(32)}` } },
+    } as const;
+    const predecessor = {
+      resources: {
+        bindings: [
+          { name: "STATE_DB", type: "d1", id: valid.storageRebind.predecessorStateDatabaseId },
+          {
+            name: "OBJECTS",
+            type: "r2_bucket",
+            bucket_name: valid.storageRebind.predecessorObjectBucketName,
+          },
+        ],
+      },
+    };
+    expect(() =>
+      assertSurfaceTransitionPredecessor("preflight", "predecessor", predecessor, {
+        delta: valid,
+        targetClosure: closure,
+      }),
+    ).toThrow("integration-only");
+  });
+
   test("derives the independent data-binding closure from the realized target", () => {
     expect(
       expectedBindingClosureForTarget({

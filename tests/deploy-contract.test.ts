@@ -63,6 +63,7 @@ const SURFACES = [
   ["takoserver-site", []],
   ["takoserver-console", []],
   ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
+  ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
@@ -536,6 +537,34 @@ describe("Takoserver split deploy entrypoint", () => {
         generation,
       ],
       [surface, "--issue", "--environment=integration", commit, generation],
+    ]) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("routes storage disposal only with exact integration status/apply arguments", async () => {
+    const surface = "takoserver-integration-storage-disposal";
+    const commit = `--commit=${"a".repeat(40)}`;
+    for (const action of ["--status", "--apply"]) {
+      const accepted = await deploy([surface, action, "--environment=integration", commit]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+    for (const args of [
+      ...["rehearsal", "production"].map((environment) => [
+        surface,
+        "--status",
+        `--environment=${environment}`,
+        commit,
+      ]),
+      [surface, "--issue", "--environment=integration", commit],
+      [surface, "--apply", "--environment=integration", commit, `--generation=${"b".repeat(32)}`],
+      [surface, "--apply", "--environment=integration", commit, "--reverse"],
     ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
@@ -1405,6 +1434,95 @@ describe("Takoserver split deploy entrypoint", () => {
         "--add-binding=form_authority",
       ],
     ] as const) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("parses the paired generated-storage predecessor selector only on its three integration Workers", async () => {
+    const sha = "a".repeat(40);
+    const predecessor = "00000000-0000-4000-8000-0000000000a1";
+    const oldDatabase = "00000000-0000-4000-8000-0000000000a2";
+    const oldBucket = `takoserver-i-${"e".repeat(32)}`;
+    const rebindFlags = [
+      `--rebind-state-database-from=${oldDatabase}`,
+      `--rebind-object-bucket-from=${oldBucket}`,
+    ];
+    for (const surface of [
+      "takoserver-worker-authority-cutover",
+      "takoserver-form-authority-worker",
+      "takoserver-integration-form-authority-worker",
+    ]) {
+      const accepted = await deploy([
+        surface,
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        ...rebindFlags,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    for (const args of [
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        `--rebind-state-database-from=${oldDatabase}`,
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        `--rebind-state-database-from=${oldDatabase.toUpperCase()}`,
+        `--rebind-object-bucket-from=${oldBucket}`,
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        `--rebind-state-database-from=${oldDatabase}`,
+        "--rebind-object-bucket-from=Invalid_Bucket",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        ...rebindFlags,
+      ],
+      ...["production", "rehearsal"].map((environment) => [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        ...rebindFlags,
+      ]),
+      ...[
+        "takoserver-form-authority-identity-probe",
+        "takoserver-integration-form-authority-operator-worker",
+      ].map((surface) => [
+        surface,
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        ...rebindFlags,
+      ]),
+    ]) {
       const refused = await deploy(args);
       expect(refused.exitCode).toBe(2);
       expect(refused.stdout).toBe("");

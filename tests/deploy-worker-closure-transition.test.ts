@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +29,10 @@ import {
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
+import {
+  completeIntegrationStorageState,
+  integrationStorageVerificationOptions,
+} from "./helpers/integration-storage-generation-verification.ts";
 
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
@@ -36,6 +41,11 @@ const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const PREDECESSOR = "00000000-0000-4000-8000-0000000000a1";
 const SUCCESSOR = "00000000-0000-4000-8000-0000000000a2";
 const UNRELATED = "00000000-0000-4000-8000-0000000000a3";
+const PREDECESSOR_STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a4";
+const STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a5";
+const STORAGE_GENERATION = "f".repeat(32);
+const PREDECESSOR_STORAGE_BUCKET = `takoserver-i-${"e".repeat(32)}`;
+const STORAGE_NAME = `takoserver-i-${STORAGE_GENERATION}`;
 
 const RETIRED_VAR = "TAKOSERVER_STANDARD_SERVICE_SUPPLIES";
 const ADDED_VAR = "TAKOSERVER_OBJECT_BUCKET_SUPPLIES";
@@ -92,6 +102,17 @@ const compatibilityRollbackTarget = {
   artifactBlobIoMode: "pre-0043-quiesced" as const,
 } satisfies DeployTarget;
 
+const storageRebindTarget = {
+  ...target,
+  d1: { databaseName: STORAGE_NAME, databaseId: STORAGE_DATABASE_ID },
+  r2: { bucketName: STORAGE_NAME },
+} satisfies DeployTarget;
+
+const STORAGE_REBIND: NonNullable<WorkerClosureDelta["storageRebind"]> = {
+  predecessorStateDatabaseId: PREDECESSOR_STORAGE_DATABASE_ID,
+  predecessorObjectBucketName: PREDECESSOR_STORAGE_BUCKET,
+};
+
 const INTEGRATION_DELTA: WorkerClosureDelta = {
   retiredVars: [RETIRED_VAR],
   addedVars: [ADDED_VAR],
@@ -128,9 +149,23 @@ function predecessorVersion(
     readonly versionExtraSecrets?: readonly string[];
     /** Values this Version binds that differ from the ones the target derives. */
     readonly staleVars?: Readonly<Record<string, string>>;
+    readonly storagePredecessor?: NonNullable<WorkerClosureDelta["storageRebind"]>;
   } = {},
 ) {
   const bindings = targetBindings(overrides.selected)
+    .map((binding) => {
+      if (overrides.storagePredecessor === undefined) return binding;
+      if (binding.name === "STATE_DB") {
+        return { ...binding, id: overrides.storagePredecessor.predecessorStateDatabaseId };
+      }
+      if (binding.name === "OBJECTS") {
+        return {
+          ...binding,
+          bucket_name: overrides.storagePredecessor.predecessorObjectBucketName,
+        };
+      }
+      return binding;
+    })
     .filter(({ name }) => name !== ADDED_BINDING)
     .filter(
       ({ name }) =>
@@ -222,7 +257,9 @@ function fixture(
     if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (key === "git branch --show-current") return ok("fix/closure-transition\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-    if (key === "bun run check") return ok("green\n");
+    if (key === "bun run check" || key === "bun run typecheck:worker") return ok("green\n");
+    if (command[0] === "bun" && command[1] === "test")
+      return ok("focused storage-rebind tests passed\n");
     if (command.includes("--dry-run")) {
       const out = command[command.indexOf("--outdir") + 1];
       if (!out) throw new Error("dry-run output missing");
@@ -581,6 +618,332 @@ describe("reviewed Worker closure transition", () => {
       // Status never builds, never uploads and never reads a secret input.
       expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
       expect(parts.calls.some((call) => call.includes("--dry-run"))).toBe(false);
+    });
+  });
+
+  test("storage rebind keeps the exact old predecessor values and publishes target-derived successors", async () => {
+    await withRoot("takoserver-closure-storage-rebind-", async (root) => {
+      const parts = fixture(root, {
+        selected: storageRebindTarget,
+        predecessor: { storagePredecessor: STORAGE_REBIND },
+      });
+      const observed: { versionId: string; version: unknown }[] = [];
+      const state: WorkerState = {
+        ...parts.state,
+        async workerVersion(workerName, versionId) {
+          const version = await parts.state.workerVersion(workerName, versionId);
+          observed.push({ versionId, version });
+          return version;
+        },
+      };
+      const fenceEvents: string[] = [];
+      const run: ClosureTransitionProcess = async (command, options) => {
+        if (command.includes("--no-bundle")) fenceEvents.push("upload");
+        return await parts.run(command, options);
+      };
+      const migrations: WorkerMigrationReader = {
+        async read() {
+          fenceEvents.push("worker-migration-lineage");
+          return await parts.migrations.read();
+        },
+      };
+      const result = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+        },
+        storageRebindTarget,
+        {
+          run,
+          state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          migrations,
+          integrationStorageVerification: integrationStorageVerificationOptions(
+            storageRebindTarget,
+            {
+              readState: async () => {
+                fenceEvents.push("generated-storage-schema");
+                return completeIntegrationStorageState();
+              },
+            },
+          ),
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: publishedProductFetcher(),
+          outputDirectory: join(root, "work"),
+        },
+      );
+
+      expect(result).toMatchObject({ state: "closure-transition-applied", versionId: SUCCESSOR });
+      const binding = (versionId: string, name: string, field: string) => {
+        const record = observed.find((entry) => entry.versionId === versionId)?.version as {
+          resources: { bindings: Record<string, string>[] };
+        };
+        return record.resources.bindings.find((entry) => entry.name === name)?.[field];
+      };
+      expect(binding(PREDECESSOR, "STATE_DB", "id")).toBe(PREDECESSOR_STORAGE_DATABASE_ID);
+      expect(binding(PREDECESSOR, "OBJECTS", "bucket_name")).toBe(PREDECESSOR_STORAGE_BUCKET);
+      expect(binding(SUCCESSOR, "STATE_DB", "id")).toBe(STORAGE_DATABASE_ID);
+      expect(binding(SUCCESSOR, "OBJECTS", "bucket_name")).toBe(STORAGE_NAME);
+      const typecheck = parts.calls.findIndex(
+        (call) => call.join(" ") === "bun run typecheck:worker",
+      );
+      const focusedTests = parts.calls.findIndex((call) => call[1] === "test");
+      const dryRun = parts.calls.findIndex((call) => call.includes("--dry-run"));
+      expect(typecheck).toBeGreaterThanOrEqual(0);
+      expect(focusedTests).toBeGreaterThan(typecheck);
+      expect(dryRun).toBeGreaterThan(focusedTests);
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      const uploadIndex = fenceEvents.indexOf("upload");
+      expect(fenceEvents.slice(uploadIndex - 2, uploadIndex + 1)).toEqual([
+        "worker-migration-lineage",
+        "generated-storage-schema",
+        "upload",
+      ]);
+    });
+  });
+
+  test("storage rebind refuses wrong or extra predecessor drift and unchanged identities", async () => {
+    await withRoot("takoserver-closure-storage-rebind-refusal-", async (root) => {
+      const invalid = [
+        {
+          name: "wrong predecessor storage values",
+          predecessor: {
+            storagePredecessor: {
+              predecessorStateDatabaseId: UNRELATED,
+              predecessorObjectBucketName: PREDECESSOR_STORAGE_BUCKET,
+            },
+          },
+          delta: STORAGE_REBIND,
+        },
+        {
+          name: "unrelated predecessor binding drift",
+          predecessor: { storagePredecessor: STORAGE_REBIND, extraVar: "FOREIGN_BINDING" },
+          delta: STORAGE_REBIND,
+        },
+        {
+          name: "unchanged storage identity",
+          predecessor: { storagePredecessor: STORAGE_REBIND },
+          delta: {
+            predecessorStateDatabaseId: STORAGE_DATABASE_ID,
+            predecessorObjectBucketName: STORAGE_NAME,
+          },
+        },
+      ];
+      for (const candidate of invalid) {
+        const parts = fixture(root, {
+          selected: storageRebindTarget,
+          predecessor: candidate.predecessor,
+        });
+        const failure = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: { ...INTEGRATION_DELTA, storageRebind: candidate.delta },
+          },
+          storageRebindTarget,
+          {
+            run: parts.run,
+            state: parts.state,
+            providerExecutorQualification: parts.providerExecutorQualification,
+            migrations: parts.migrations,
+            integrationStorageVerification:
+              integrationStorageVerificationOptions(storageRebindTarget),
+            outputDirectory: join(root, candidate.name.replaceAll(" ", "-")),
+          },
+        ).catch((error: unknown) => error);
+        expect(failure, candidate.name).toBeInstanceOf(DeployError);
+        expect(
+          parts.calls.some((call) => call.includes("--no-bundle")),
+          candidate.name,
+        ).toBe(false);
+      }
+    });
+  });
+
+  test("storage rebind refuses production and rehearsal before provider or Worker reads", async () => {
+    for (const environment of ["production", "rehearsal"] as const) {
+      let processCalls = 0;
+      const parts = await withRoot(
+        `takoserver-closure-storage-rebind-${environment}-`,
+        async (root) => {
+          const selected = { ...storageRebindTarget, environment } satisfies DeployTarget;
+          const base = fixture(root, { selected });
+          return { selected, base };
+        },
+      );
+      const failure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment,
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+        },
+        parts.selected,
+        {
+          run: async () => {
+            processCalls += 1;
+            throw new Error("provider/process call must not happen");
+          },
+          state: parts.base.state,
+          providerExecutorQualification: parts.base.providerExecutorQualification,
+          migrations: parts.base.migrations,
+          integrationStorageVerification: integrationStorageVerificationOptions(parts.selected),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).message).toContain("storage rebind is integration-only");
+      expect(processCalls).toBe(0);
+      expect(parts.base.stateCalls).toEqual([]);
+    }
+  });
+
+  test("storage rebind stops at the immediate schema fence and on a failed gate before upload", async () => {
+    await withRoot("takoserver-closure-storage-rebind-fence-", async (root) => {
+      const complete = completeIntegrationStorageState();
+      const changedShape = "[]\n";
+      const changed = {
+        ...complete,
+        shape: changedShape,
+        shapeDigest: `sha256:${createHash("sha256").update(changedShape).digest("hex")}`,
+      };
+      let reads = 0;
+      const parts = fixture(root, {
+        selected: storageRebindTarget,
+        predecessor: { storagePredecessor: STORAGE_REBIND },
+      });
+      const failure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+        },
+        storageRebindTarget,
+        {
+          run: parts.run,
+          state: parts.state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          migrations: parts.migrations,
+          integrationStorageVerification: integrationStorageVerificationOptions(
+            storageRebindTarget,
+            { readState: async () => (reads++ === 0 ? complete : changed) },
+          ),
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "schema-race"),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).message).toContain(
+        "D1 migration readback differs from the exact audited application schema",
+      );
+      expect(parts.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(1);
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+
+      const targetRace = fixture(root, {
+        selected: storageRebindTarget,
+        predecessor: { storagePredecessor: STORAGE_REBIND },
+      });
+      let d1Reads = 0;
+      const targetRaceOptions = integrationStorageVerificationOptions(storageRebindTarget, {
+        provider: {
+          async getD1(databaseId) {
+            d1Reads += 1;
+            return {
+              uuid: databaseId,
+              name: d1Reads === 1 ? STORAGE_NAME : `${STORAGE_NAME}-changed`,
+            };
+          },
+          async getR2(name) {
+            return { name };
+          },
+        },
+      });
+      const targetFailure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+        },
+        storageRebindTarget,
+        {
+          run: targetRace.run,
+          state: targetRace.state,
+          providerExecutorQualification: targetRace.providerExecutorQualification,
+          migrations: targetRace.migrations,
+          integrationStorageVerification: targetRaceOptions,
+          review: "reviewer@example.test",
+          secretDirectory: targetRace.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "target-race"),
+        },
+      ).catch((error: unknown) => error);
+      expect(targetFailure).toBeInstanceOf(DeployError);
+      expect((targetFailure as DeployError).message).toContain(
+        "generated target D1 identity readback does not match",
+      );
+      expect(d1Reads).toBe(2);
+      expect(targetRace.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+
+      const failedGate = fixture(root, {
+        selected: storageRebindTarget,
+        predecessor: { storagePredecessor: STORAGE_REBIND },
+      });
+      const gateCalls: string[][] = [];
+      const run: ClosureTransitionProcess = async (command, options) => {
+        gateCalls.push([...command]);
+        if (command.join(" ") === "bun run typecheck:worker") {
+          return { exitCode: 1, stdout: "typecheck failed", stderr: "" };
+        }
+        return await failedGate.run(command, options);
+      };
+      const gateFailure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+        },
+        storageRebindTarget,
+        {
+          run,
+          state: failedGate.state,
+          providerExecutorQualification: failedGate.providerExecutorQualification,
+          migrations: failedGate.migrations,
+          integrationStorageVerification:
+            integrationStorageVerificationOptions(storageRebindTarget),
+          review: "reviewer@example.test",
+          secretDirectory: failedGate.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "gate-failure"),
+        },
+      ).catch((error: unknown) => error);
+      expect(gateFailure).toBeInstanceOf(DeployError);
+      expect((gateFailure as DeployError).message).toContain(
+        "integration storage-rebind Worker typecheck failed",
+      );
+      expect(gateCalls).toContainEqual(["bun", "run", "typecheck:worker"]);
+      expect(gateCalls.some((call) => call.includes("--dry-run"))).toBe(false);
+      expect(gateCalls.some((call) => call.includes("--no-bundle"))).toBe(false);
     });
   });
 

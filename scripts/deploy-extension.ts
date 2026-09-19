@@ -31,6 +31,12 @@ export {
   planExactArtifactRecoveryDeployment,
   runExactArtifactRecoveryDeployment,
 } from "./deploy/exact-artifact-recovery.ts";
+export type {
+  IntegrationStorageGenerationTargetProof,
+  IntegrationStorageGenerationTargetVerificationOptions,
+  IntegrationStorageTargetReadProvider,
+} from "./deploy/integration-storage-generation.ts";
+export { verifyIntegrationStorageGenerationTarget } from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type {
   CloudflareCredential,

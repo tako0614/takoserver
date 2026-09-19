@@ -81,6 +81,46 @@ const integrationHostOnlyTarget = {
 } satisfies DeployTarget;
 
 describe("Form authority identity probe deploy surface", () => {
+  test("storage rebind is explicitly refused before identity-probe provider effects", async () => {
+    let processCalls = 0;
+    const failure = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PROBE_VERSION,
+          delta: {
+            retiredVars: [],
+            addedVars: [],
+            refreshedVars: [],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+            storageRebind: {
+              predecessorStateDatabaseId: "00000000-0000-4000-8000-0000000000a4",
+              predecessorObjectBucketName: "takoserver-i-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            },
+          },
+        },
+      },
+      target,
+      {
+        run: async () => {
+          processCalls += 1;
+          throw new Error("identity probe must refuse before credentials");
+        },
+        state: probeState(true),
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(
+      "Form authority identity probe does not bind STATE_DB or OBJECTS",
+    );
+    expect(processCalls).toBe(0);
+  });
+
   test("realizes only the two read-only identity RPC bindings and Host id", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-identity-config-"));
     try {

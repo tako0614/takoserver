@@ -108,6 +108,30 @@ audited 0001–0057 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
+Disposal is a separate, one-way operation for an exact target-selected pair:
+
+```sh
+bun run deploy -- takoserver-integration-storage-disposal --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-storage-disposal --apply --environment=integration --commit=<40-hex-sha>
+```
+
+The only accepted target pairs are `takoserver-runtime-staging` with
+`takoserver-objects-staging`, or a matching D1/R2 name
+`takoserver-i-<32-lowercase-hex>`. Status and apply inventory the D1 by both its
+exact id and name and the R2 by its exact name. Disposal refuses while any
+current regular Worker settings/current serving Version or any current
+Workers for Platforms dispatch-script binding references either selected
+resource. Namespace names and script counts must reconcile, and incomplete or
+failed reads stop before mutation. This coverage does not include historical
+Worker Versions or external API clients. Apply requires
+`TAKOSERVER_INDEPENDENT_REVIEW`, re-reads identities and bindings immediately
+before mutation, deletes only the exact R2 bucket first, then the exact D1 id,
+and succeeds only after authoritative absence readback. Cloudflare must accept
+the R2 delete (so a nonempty bucket halts before D1); the command never wipes
+objects, retries an unknown acknowledgement, rebinds a target, deletes Workers,
+or runs migrations. Use the separate generation surface to recreate storage;
+there is no rollback or adoption of same-name D1 resources.
+
 The fresh empty database uses one sealed `wrangler d1 execute --file` import,
 not the remote `migrations apply` query path. The import retains every audited
 SQL byte and adds only Wrangler's migration-ledger DDL and an ordered ledger
@@ -296,6 +320,37 @@ declaration is what says the current target either no longer derives them or
 derives them differently; every other binding name, type and plain-text value
 and the routing closure stay as strict as the routine path.
 The routine surfaces stay strict too and never accept such a predecessor.
+
+The public storage rebind is a separate, narrow delta available only in
+`integration` on `takoserver-worker-authority-cutover`,
+`takoserver-form-authority-worker` (the staging Form authority Worker), and
+`takoserver-integration-form-authority-worker`. It requires the pinned closure
+predecessor plus both flags:
+
+```sh
+--rebind-state-database-from=<predecessor-d1-uuid>
+--rebind-object-bucket-from=<predecessor-r2-name>
+```
+
+These flags name only the predecessor's old `STATE_DB` UUID and `OBJECTS`
+bucket name. Both must be strict lowercase identities and differ from the
+successor. The successor is never a CLI operand: it comes only from the selected
+target, whose D1 and R2 names must be the same exact
+`takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0057 migration lineage,
+and canonical migrated schema before preparation and immediately before upload.
+Every other binding name, type, and field must still match the target exactly;
+this does not alter migrations, runtime code, or the ordinary strict path.
+Production and rehearsal reject the rebind before provider effects. The
+operator gateway and storage-free identity probe do not accept it.
+Only this integration storage-rebind apply uses the bounded publication gate:
+the Host runs `bun run typecheck:worker`, then Bun tests matching
+`storage rebind` in the Host closure-transition, Worker binding-state and
+integration storage-generation test files; Form authority runs
+`bun run typecheck:form-authority-worker`, then the equivalent filtered Form
+transition, binding-state and storage-generation tests. Both gates finish
+before Wrangler dry-run. Status is read-only, and every other Host/Form apply
+retains its existing `bun run check` gate.
 
 Applying a transition still requires everything the surface required before it:
 the same independent reviewer, the same source qualification, the same single
@@ -625,9 +680,9 @@ The conservative `requiresEnv` union remains unchanged.
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. Managed-runtime supplies are private and are not accepted by this public surface. |
-| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
-| `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
-| `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. Storage rebind flags are integration-only. |
+| `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. `storageRebind` is refused because this Worker binds neither D1 nor R2. |
+| `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Storage rebind flags are integration-only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-operator-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority` | `--status`, `--apply` | integration only | Resolved Cloudflare credential and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both (OAuth fallback is integration-only); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -636,6 +691,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-integration-e2e-credentials` | `--issue`, `--status`, `--revoke` | integration only | Resolved Cloudflare credential, `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`, and `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` for all three; `TAKOSERVER_INDEPENDENT_REVIEW` for `--issue` and `--revoke` only. |
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
+| `takoserver-integration-storage-disposal` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Exact target-selected storage names only; complete current regular + dispatch Worker binding inventory required. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |

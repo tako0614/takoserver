@@ -10,6 +10,7 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
+import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
@@ -43,6 +44,8 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
+  bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
+    (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
     (first public Host publication only; existing Workers use their normal lifecycle)
   bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
@@ -64,7 +67,10 @@ const USAGE = `takoserver deploy
   Every Worker-publishing surface accepts the same reviewed forward transition:
   --closure-predecessor-version=<uuid> with an explicit delta of repeatable
   --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --add-binding=NAME, --add-secret=NAME
-  and --rotate-secret=NAME. --refresh-var publishes a changed value of a var both sides already
+  and --rotate-secret=NAME. On the Host and two Form-authority Workers in integration only, the
+  optional storage rebind is exactly the pair --rebind-state-database-from=<uuid> and
+  --rebind-object-bucket-from=<name>; both are required and successor identities come only from
+  the selected target after exact generated-storage/schema readback. --refresh-var publishes a changed value of a var both sides already
   declare, --add-binding publishes a binding the current code derives and the predecessor lacks,
   and added and rotated secret values come only from TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY.
   The Form-authority Worker surfaces and the identity probe accept
@@ -90,9 +96,10 @@ type Surface = (typeof DEPLOY_CONTRACT.surfaces)[number]["surface"];
 type CredentialSurface = "takoserver-integration-e2e-credentials";
 type OrgApiKeySurface = "takoserver-org-api-key";
 type StorageGenerationSurface = "takoserver-integration-storage-generation";
+type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type StandardSurface = Exclude<
   Surface,
-  CredentialSurface | OrgApiKeySurface | StorageGenerationSurface
+  CredentialSurface | OrgApiKeySurface | StorageGenerationSurface | StorageDisposalSurface
 >;
 
 interface InvocationBase {
@@ -117,6 +124,10 @@ type Invocation =
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
+    })
+  | (InvocationBase & {
+      readonly surface: StorageDisposalSurface;
+      readonly action: "status" | "apply";
     })
   | (InvocationBase & {
       readonly surface: StandardSurface;
@@ -195,9 +206,21 @@ const ADOPT_LIVE_SURFACES: readonly Surface[] = [
  */
 const MAX_CLOSURE_DELTA_FLAGS = 32;
 const CLOSURE_DELTA_NAME = /^[A-Z][A-Z0-9_]{0,63}$/u;
+const STORAGE_REBIND_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const STORAGE_REBIND_BUCKET = /^[a-z0-9][a-z0-9-]{2,62}$/u;
+const MAX_STORAGE_REBIND_FLAGS = 2;
+const STORAGE_REBIND_SURFACES: readonly Surface[] = [
+  "takoserver-worker-authority-cutover",
+  "takoserver-form-authority-worker",
+  "takoserver-integration-form-authority-worker",
+];
 
 function parseInvocation(args: readonly string[]): Invocation | null {
-  if (args.length < 4 || args.length > 7 + Math.max(MAX_CLOSURE_DELTA_FLAGS, MAX_ORG_API_KEY_FLAGS))
+  if (
+    args.length < 4 ||
+    args.length >
+      7 + Math.max(MAX_CLOSURE_DELTA_FLAGS + MAX_STORAGE_REBIND_FLAGS, MAX_ORG_API_KEY_FLAGS)
+  )
     return null;
   const [surfaceValue, ...flags] = args;
   if (!isSurface(surfaceValue)) return null;
@@ -208,6 +231,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let legacyPredecessorVersionId: string | null = null;
   let legacyHostRuntimePredecessorVersionId: string | null = null;
   let closurePredecessorVersionId: string | null = null;
+  let predecessorStateDatabaseId: string | null = null;
+  let predecessorObjectBucketName: string | null = null;
   const retireVars: string[] = [];
   const addVars: string[] = [];
   const refreshVars: string[] = [];
@@ -295,6 +320,20 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       const value = flag.slice("--generation=".length);
       if (!/^[0-9a-f]{32}$/u.test(value)) return null;
       generation = value;
+      continue;
+    }
+    if (flag.startsWith("--rebind-state-database-from=")) {
+      if (predecessorStateDatabaseId !== null) return null;
+      const value = flag.slice("--rebind-state-database-from=".length);
+      if (!STORAGE_REBIND_UUID.test(value)) return null;
+      predecessorStateDatabaseId = value;
+      continue;
+    }
+    if (flag.startsWith("--rebind-object-bucket-from=")) {
+      if (predecessorObjectBucketName !== null) return null;
+      const value = flag.slice("--rebind-object-bucket-from=".length);
+      if (!STORAGE_REBIND_BUCKET.test(value)) return null;
+      predecessorObjectBucketName = value;
       continue;
     }
     if (flag.startsWith("--legacy-predecessor-version=")) {
@@ -410,6 +449,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       (action !== "status" && action !== "apply"))
   )
     return null;
+  if (
+    surfaceValue === "takoserver-integration-storage-disposal" &&
+    (environment !== "integration" ||
+      args.length !== 4 ||
+      (action !== "status" && action !== "apply"))
+  ) {
+    return null;
+  }
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   if ((generation !== null) !== storageGeneration) return null;
   if (
@@ -428,6 +475,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...addSecrets,
     ...rotateSecrets,
   ];
+  const storageRebindFlagCount =
+    (predecessorStateDatabaseId === null ? 0 : 1) + (predecessorObjectBucketName === null ? 0 : 1);
+  if ((predecessorStateDatabaseId === null) !== (predecessorObjectBucketName === null)) {
+    return null;
+  }
+  const storageRebind = predecessorStateDatabaseId !== null;
+  const hasClosureDelta = closureDeltaNames.length > 0 || storageRebind;
   const orgApiKey = surfaceValue === "takoserver-org-api-key";
   const operatorIdentity =
     surfaceValue === "takoserver-operator-identity" ||
@@ -446,6 +500,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       organizationId === null ||
       orgApiKeyOperands > MAX_ORG_API_KEY_FLAGS ||
       closureDeltaNames.length > 0 ||
+      storageRebind ||
       closurePredecessorVersionId !== null ||
       legacyPredecessorVersionId !== null ||
       legacyHostRuntimePredecessorVersionId !== null ||
@@ -487,6 +542,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       expiresInDays !== null ||
       apiKeyId !== null ||
       closureDeltaNames.length > 0 ||
+      storageRebind ||
       closurePredecessorVersionId !== null ||
       legacyPredecessorVersionId !== null ||
       legacyHostRuntimePredecessorVersionId !== null ||
@@ -519,14 +575,21 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const budget = 6 + (adoptLivePath === null ? 0 : 1) + (bootstrapVerifierBridge ? 1 : 0);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
-    if (args.length > budget || closureDeltaNames.length > 0) return null;
+    if (args.length > budget || hasClosureDelta) return null;
   } else if (
     !TRANSITION_SURFACES.includes(surfaceValue) ||
     reverse ||
-    closureDeltaNames.length === 0 ||
+    !hasClosureDelta ||
     closureDeltaNames.length > MAX_CLOSURE_DELTA_FLAGS ||
-    args.length > budget + MAX_CLOSURE_DELTA_FLAGS ||
+    storageRebindFlagCount > MAX_STORAGE_REBIND_FLAGS ||
+    args.length > budget + MAX_CLOSURE_DELTA_FLAGS + MAX_STORAGE_REBIND_FLAGS ||
     new Set(closureDeltaNames).size !== closureDeltaNames.length
+  ) {
+    return null;
+  }
+  if (
+    storageRebind &&
+    (environment !== "integration" || !STORAGE_REBIND_SURFACES.includes(surfaceValue))
   ) {
     return null;
   }
@@ -679,6 +742,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
             addedBindings: [...addBindings].sort(),
             addedSecrets: [...addSecrets].sort(),
             rotatedSecrets: [...rotateSecrets].sort(),
+            ...(storageRebind
+              ? {
+                  storageRebind: {
+                    predecessorStateDatabaseId: predecessorStateDatabaseId as string,
+                    predecessorObjectBucketName: predecessorObjectBucketName as string,
+                  },
+                }
+              : {}),
           },
         }),
     ...(unattributedSuccessorVersionId === null ? {} : { unattributedSuccessorVersionId }),
@@ -775,6 +846,8 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runD1SchemaRehearsalBaseline(invocation, target);
     case "takoserver-integration-storage-generation":
       return await runIntegrationStorageGeneration(invocation, target);
+    case "takoserver-integration-storage-disposal":
+      return await runIntegrationStorageDisposal(invocation, target);
     case "takoserver-integration-worker-bootstrap":
       return await runIntegrationWorkerBootstrap(
         { ...invocation, surface: "takoserver-integration-worker-bootstrap" },

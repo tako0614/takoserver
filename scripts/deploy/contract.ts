@@ -277,9 +277,12 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/worker-state.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check", "deploy", "typecheck:worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -289,8 +292,12 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} The scoped owner gate runs once, then the exact link-free bundle and ` +
-          "realized configuration are sealed and requalified immediately before one upload.",
+          `${exactSource} Ordinary applies run the scoped owner gate once; only an integration ` +
+          "storage-rebind apply substitutes its component typecheck and filtered storage-rebind " +
+          "deploy tests. The exact link-free bundle and " +
+          "realized configuration are sealed and requalified immediately before one upload. " +
+          "An integration-only storage rebind derives its successor D1/R2 identities from the " +
+          "selected target; no resource identity is supplied as a successor selector.",
         "post-conditions":
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
@@ -343,7 +350,17 @@ export const DEPLOY_CONTRACT = {
           "surface produces them, every required secret, added and rotated values supplied only " +
           "through the owned 0700 secret-input directory as one ephemeral sealed Wrangler secrets " +
           "file, and every other held secret carried without being re-entered. The routine surfaces " +
-          "stay strict and never accept this predecessor." +
+          "stay strict and never accept this predecessor. The optional " +
+          "`--rebind-state-database-from=<uuid>` and `--rebind-object-bucket-from=<name>` pair is " +
+          "integration-only and accepted only on this Host surface and the two route-less Form " +
+          "authority Workers. Both exact predecessor values must differ from the selected target's " +
+          "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
+          "and all other closure names, types and fields remain exact. Before upload and again at the " +
+          "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
+          "R2 name, audited 0001-0057 lineage and canonical migrated schema. Production and rehearsal " +
+          "refuse this pair before provider effects. This one integration rebind branch runs " +
+          "`bun run typecheck:worker` and the focused closure-transition, binding-state and storage-generation " +
+          "tests before Wrangler dry-run; every other Host apply keeps `bun run check`." +
           inputContract(applyReviewInput, closureSecretDirectoryInput),
         "independent-review": review,
       },
@@ -448,7 +465,9 @@ export const DEPLOY_CONTRACT = {
           "requires complete integration formAuthority topology. Initial publication requires both " +
           "native Workers to remain absent; an existing-profile update requires the exact predecessor " +
           "to remain unchanged and Core to remain absent at the final fence. Drift is refused before upload; " +
-          "production and rehearsal retain the absence refusal." +
+          "production and rehearsal retain the absence refusal. This storage-free probe explicitly " +
+          "refuses `storageRebind`; only the public Host and the two route-less Form authority Workers " +
+          "can carry that integration-only declaration." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -472,8 +491,11 @@ export const DEPLOY_CONTRACT = {
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "docker", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -511,7 +533,14 @@ export const DEPLOY_CONTRACT = {
           "`verifierBridgePending` set. The run prints the two commands that finish the lane — the " +
           "probe's `--add-binding=FORM_AUTHORITY` transition, then this surface's `--status`, which " +
           "reports `coreVerifierRpcReady: true` only once the bridge is live. No binding to an " +
-          "absent script is ever published, and the steady-state post-condition is never relaxed." +
+          "absent script is ever published, and the steady-state post-condition is never relaxed. " +
+          "Integration storage rebind, when explicitly declared with both predecessor flags, is " +
+          "limited to this route-less Form authority Worker and the integration fixture Worker; its " +
+          "successor comes only from the selected target, and its exact generated D1/R2/schema proof " +
+          "is repeated immediately before upload. Production and rehearsal refuse it before provider effects. " +
+          "This one integration rebind branch runs `bun run typecheck:form-authority-worker` and focused " +
+          "Form-transition, binding-state and storage-generation tests before Wrangler dry-run; every " +
+          "other Form authority apply keeps `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -528,9 +557,12 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/form-authority.ts",
         "scripts/deploy/form-authority-scope-transition.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -556,7 +588,13 @@ export const DEPLOY_CONTRACT = {
           "that public Version's position in deployment history, and removes both identity pins in one upload. " +
           "A scope transition accepts only the exact configured predecessor, uploads target scope once, " +
           "refuses absent/bootstrap, stale-public, third-scope and already-target apply, and settles a lost " +
-          "acknowledgement through status without retry." +
+          "acknowledgement through status without retry. Its optional integration storage rebind requires " +
+          "both exact predecessor flags; the selected generated target alone supplies the successor, " +
+          "and D1 UUID/name, R2 existence, audited lineage and canonical schema are reverified at the " +
+          "immediate upload fence. This one integration rebind branch runs " +
+          "`bun run typecheck:form-authority-worker` and focused Form-transition, binding-state and " +
+          "storage-generation tests before Wrangler dry-run; every other Form authority apply keeps " +
+          "`bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -600,7 +638,9 @@ export const DEPLOY_CONTRACT = {
           "every RPC; the route-less authority independently rereads and verifies that same proof identity. " +
           "Foreign domain ownership and every script/domain partial topology are refused. " +
           "Transition status rejects stale-public, third-scope, absent/bootstrap and history-based roll-forward; " +
-          "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation." +
+          "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation. " +
+          "The operator gateway does not accept the public storageRebind declaration; only the route-less " +
+          "Host/Form authority Workers carry that integration-only transition." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -900,6 +940,48 @@ export const DEPLOY_CONTRACT = {
           "UUID/name and exact empty state are checked before migration. The R2 bucket must remain " +
           "absent until the complete schema is verified, so no older object operation can target it " +
           "during 0043. Existing database migration and rehearsal controls remain unchanged.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-storage-disposal",
+      target: "cloudflare-d1-and-r2:exact-selected-integration-target-only",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-storage-disposal.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: ["deploy"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. No resource-name selector is accepted: the exact selected ` +
+          "DeployTarget D1 id/name and R2 name must be the dedicated staging pair or one matching " +
+          "takoserver-i-<32-hex> pair. Apply requires the independent reviewer input.",
+        "post-conditions":
+          "The provider inventories the selected D1 by exact name and exact id and the R2 by exact " +
+          "name. Before deletion, current regular Worker settings and current serving Versions plus " +
+          "all current dispatch namespace scripts/bindings must be completely inventoried; namespace " +
+          "names and script counts reconcile. Any current selected-storage binding blocks disposal. " +
+          "Coverage excludes historical Versions and external API clients. The command rereads the " +
+          "identities and bindings immediately before mutation, deletes only the exact empty R2 bucket " +
+          "first, then the exact D1 id, and requires authoritative exact-identity absence readback.",
+        reversal:
+          "There is no rollback. Recreate forward through the separate storage-generation surface; " +
+          "this surface never wipes bucket objects, rebinds a target, deletes a Worker or runs migrations.",
+        "failure-handling":
+          highRiskFailure +
+          " A rejected/nonempty R2 deletion stops before D1; an unknown acknowledgement is never retried. " +
+          "After partial or indeterminate completion, use --status to read the exact selected identities." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "Before each deletion, the exact selected D1 id/name and R2 name are reread together with " +
+          "all current regular Worker settings/serving Versions and dispatch namespace scripts/bindings. " +
+          "Any selected-storage reference, incomplete inventory, identity collision or namespace count mismatch withholds mutation.",
         "independent-review": review,
       },
     },

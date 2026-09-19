@@ -13,7 +13,9 @@ import {
   type IntegrationStorageGenerationProcess,
   type IntegrationStorageGenerationProvider,
   type IntegrationStorageR2Bucket,
+  type IntegrationStorageTargetReadProvider,
   runIntegrationStorageGeneration,
+  verifyIntegrationStorageGenerationTarget,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -224,6 +226,214 @@ async function rejectedError(operation: Promise<unknown>): Promise<Error> {
 }
 
 describe("integration storage generation bootstrap", () => {
+  test("storage rebind verifier proves the exact generated D1/R2 target and audited schema read-only", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const calls: string[] = [];
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        calls.push(`getD1:${databaseId}`);
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        calls.push(`getR2:${name}`);
+        return { name };
+      },
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      provider,
+      reader: {
+        async read() {
+          return completeState;
+        },
+      },
+      migrationDirectory: currentMigrations,
+    });
+    expect(proof).toMatchObject({
+      generation: GENERATION,
+      d1: { databaseId: DATABASE_ID, databaseName: GENERATED_NAME },
+      r2: { bucketName: GENERATED_NAME },
+      appliedMigrations: MIGRATIONS.slice(0, 57).map(({ name }) => name),
+    });
+    expect(proof.migrationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(proof.schemaShapeDigest).toBe(completeState.shapeDigest);
+    expect(calls).toEqual([`getD1:${DATABASE_ID}`, `getR2:${GENERATED_NAME}`]);
+  });
+
+  test("storage rebind verifier uses the composing owner's Wrangler for OAuth and D1 readback", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const privateWrangler = "/private/runtime/node_modules/.bin/wrangler";
+    const commands: string[][] = [];
+    const requestPaths: string[] = [];
+    const applicationRows = JSON.parse(completeState.shape) as {
+      readonly type: string;
+      readonly name: string;
+      readonly table: string;
+      readonly sql: string;
+    }[];
+    const schemaRows = [
+      ...applicationRows.map(({ table, ...row }) => ({ ...row, tbl_name: table })),
+      {
+        type: "table",
+        name: "d1_migrations",
+        tbl_name: "d1_migrations",
+        sql: "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+      },
+    ].sort((left, right) =>
+      `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+    );
+    const run: IntegrationStorageGenerationProcess = async (command) => {
+      commands.push([...command]);
+      if (command[0] === privateWrangler && command[1] === "auth") {
+        return ok(JSON.stringify({ type: "oauth", token: "private-oauth-token" }));
+      }
+      if (command[0] !== privateWrangler) {
+        throw new Error(`unexpected Wrangler executable ${command[0] ?? "<missing>"}`);
+      }
+      const sql = command[command.indexOf("--command") + 1];
+      if (sql === undefined) throw new Error("D1 command omitted SQL");
+      const results = sql.startsWith("SELECT name FROM sqlite_schema")
+        ? schemaRows.filter(({ type }) => type === "table").map(({ name }) => ({ name }))
+        : sql.includes("FROM d1_migrations ORDER BY id")
+          ? MIGRATIONS.slice(0, 57).map(({ name }) => ({ name }))
+          : sql.startsWith("SELECT type, name, tbl_name, COALESCE(sql, '') AS sql")
+            ? schemaRows
+            : null;
+      if (results === null) throw new Error(`unexpected D1 query ${sql}`);
+      return ok(JSON.stringify([{ success: true, results }]));
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      run,
+      wranglerPath: privateWrangler,
+      cloudflareEnvironment: {},
+      migrationDirectory: currentMigrations,
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        requestPaths.push(url.pathname);
+        if (url.pathname.endsWith(`/d1/database/${DATABASE_ID}`)) {
+          return jsonResponse({
+            success: true,
+            result: { uuid: DATABASE_ID, name: GENERATED_NAME },
+          });
+        }
+        if (url.pathname.endsWith(`/r2/buckets/${GENERATED_NAME}`)) {
+          return jsonResponse({ success: true, result: { name: GENERATED_NAME } });
+        }
+        throw new Error(`unexpected Cloudflare request ${url.pathname}`);
+      },
+    });
+
+    expect(proof.d1).toEqual({ databaseId: DATABASE_ID, databaseName: GENERATED_NAME });
+    expect(commands[0]).toEqual([privateWrangler, "auth", "token", "--json"]);
+    expect(commands.length).toBe(4);
+    expect(
+      commands
+        .slice(1)
+        .every(
+          (command) =>
+            command[0] === privateWrangler && command[1] === "d1" && command[2] === "execute",
+        ),
+    ).toBe(true);
+    expect(requestPaths).toEqual([
+      `/client/v4/accounts/${target.accountId}/d1/database/${DATABASE_ID}`,
+      `/client/v4/accounts/${target.accountId}/r2/buckets/${GENERATED_NAME}`,
+    ]);
+  });
+
+  test("storage rebind verifier rejects arbitrary or mismatched generated targets before provider reads", async () => {
+    let reads = 0;
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        reads += 1;
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        reads += 1;
+        return { name };
+      },
+    };
+    for (const invalidTarget of [
+      {
+        ...target,
+        d1: { databaseName: TARGET_DATABASE, databaseId: DATABASE_ID },
+        r2: { bucketName: TARGET_BUCKET },
+      },
+      {
+        ...target,
+        d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+        r2: { bucketName: `${GENERATED_NAME}-other` },
+      },
+      {
+        ...target,
+        d1: { databaseName: GENERATED_NAME, databaseId: "not-a-uuid" },
+        r2: { bucketName: GENERATED_NAME },
+      },
+    ] as unknown as DeployTarget[]) {
+      await expect(
+        verifyIntegrationStorageGenerationTarget(invalidTarget, "integration", { provider }),
+      ).rejects.toThrow("exact matching generated D1/R2 storage pair");
+    }
+    expect(reads).toBe(0);
+  });
+
+  test("storage rebind verifier rejects wrong provider identity and non-canonical schema", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const wrongD1: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        return { uuid: DATABASE_ID, name: `${GENERATED_NAME}-other` };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    await expect(
+      verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+        provider: wrongD1,
+        reader: {
+          async read() {
+            return completeState;
+          },
+        },
+        migrationDirectory: currentMigrations,
+      }),
+    ).rejects.toThrow("D1 identity readback does not match");
+
+    const exactProvider: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const incomplete = state(
+      MIGRATIONS.slice(0, 56).map(({ name }) => name),
+      [],
+    );
+    await expect(
+      verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+        provider: exactProvider,
+        reader: {
+          async read() {
+            return incomplete;
+          },
+        },
+        migrationDirectory: currentMigrations,
+      }),
+    ).rejects.toThrow("exact audited 0001-0057 lineage");
+  });
+
   test("D1 filtered inventory ignores account-wide total_count and closes on a short page", async () => {
     const requests: Request[] = [];
     const provider = new CloudflareIntegrationStorageProvider(target.accountId, "bearer-secret", {
