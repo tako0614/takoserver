@@ -175,6 +175,39 @@ describe("Takoserver integration Worker bootstrap", () => {
     expect(fixture.lifecycleCalls).toHaveLength(0);
   });
 
+  test("default signing D1 reads use the bootstrap's selected Wrangler for status and apply", async () => {
+    const wranglerPath = "/private/runtime/node_modules/.bin/wrangler";
+    const statusFixture = bootstrapFixture({ target, initiallyPublished: true });
+    const status = await runIntegrationWorkerBootstrap(
+      { action: "status", environment: "integration", commit: COMMIT },
+      target,
+      {
+        state: statusFixture.state,
+        run: statusFixture.run,
+        sourceRepositoryRoot: sourceRoot,
+        schemaReader: statusFixture.schemaReader,
+        r2Identity: statusFixture.r2Identity,
+        wranglerPath,
+      },
+    );
+    expect(status).toMatchObject({ state: "complete", ready: true });
+    expectDefaultSigningReaderPath(statusFixture.commands, wranglerPath);
+
+    const applyFixture = bootstrapFixture({ target });
+    const secretDirectory = writeSecretDirectory(target);
+    try {
+      const applied = await apply(
+        applyFixture,
+        { wranglerPath, secretDirectory },
+        true,
+      );
+      expect(applied).toMatchObject({ mutationApplied: true, versionId: VERSION_ID });
+      expectDefaultSigningReaderPath(applyFixture.commands, wranglerPath);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
   test("apply refuses every existing or orphan native owner before lifecycle", async () => {
     const cases = [
       { label: "script", scripts: [WORKER_NAME] },
@@ -394,6 +427,7 @@ describe("Takoserver integration Worker bootstrap", () => {
 
 interface FixtureOptions {
   readonly target: DeployTarget;
+  readonly initiallyPublished?: boolean;
   readonly initialScripts?: readonly string[];
   readonly initialHistory?: readonly unknown[];
   readonly initialDomains?: readonly { readonly hostname: string; readonly service: string }[];
@@ -448,7 +482,7 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     NonNullable<IntegrationWorkerBootstrapOptions["deployLifecycle"]>
   >[0][] = [];
   const control = {
-    published: false,
+    published: options.initiallyPublished ?? false,
     raced: false,
     message: null as string | null,
     postAckDrift: options.postAckDrift,
@@ -467,6 +501,23 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     if (command.join(" ") === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (command.join(" ") === "bun run check") {
       return options.gateFailure ?? ok("green\n");
+    }
+    if (command[1] === "d1" && command[2] === "execute" && command.includes("--command")) {
+      return ok(
+        JSON.stringify([
+          {
+            success: true,
+            results: [
+              {
+                key_id: signingRow.keyId,
+                public_jwk: signingRow.publicJwk,
+                created_at_epoch_seconds: signingRow.createdAtEpochSeconds,
+                revoked_at_epoch_seconds: signingRow.revokedAtEpochSeconds,
+              },
+            ],
+          },
+        ]),
+      );
     }
     if (command.includes("--dry-run")) {
       const index = command.indexOf("--outdir");
@@ -676,6 +727,7 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
 async function apply(
   fixture: BootstrapFixture,
   extra: Partial<IntegrationWorkerBootstrapOptions> = {},
+  useDefaultSigningDatabase = false,
 ): Promise<Record<string, unknown>> {
   return await runIntegrationWorkerBootstrap(
     { action: "apply", environment: "integration", commit: COMMIT },
@@ -685,7 +737,7 @@ async function apply(
       state: fixture.state,
       sourceRepositoryRoot: sourceRoot,
       schemaReader: fixture.schemaReader,
-      signingDatabase: fixture.signingDatabase,
+      ...(useDefaultSigningDatabase ? {} : { signingDatabase: fixture.signingDatabase }),
       r2Identity: fixture.r2Identity,
       ...(fixture.provider === undefined
         ? {}
@@ -698,6 +750,14 @@ async function apply(
       ...extra,
     },
   );
+}
+
+function expectDefaultSigningReaderPath(commands: readonly string[][], wranglerPath: string): void {
+  const signingReads = commands.filter(
+    (command) => command[1] === "d1" && command[2] === "execute" && command.includes("--command"),
+  );
+  expect(signingReads.length).toBeGreaterThan(0);
+  for (const command of signingReads) expect(command[0]).toBe(wranglerPath);
 }
 
 function makeKeyMaterial(): { readonly publicX: string; readonly privateRaw: string } {

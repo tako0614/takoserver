@@ -965,8 +965,13 @@ export function createRemoteSigningDatabase(
   configPath: string,
   environment: Readonly<Record<string, string>>,
   run: SigningProcess,
+  wranglerCommand?: (args: readonly string[]) => readonly string[],
 ): SigningDatabase {
-  const database = new RemoteD1(configPath, { environment, run });
+  const database = new RemoteD1(configPath, {
+    environment,
+    run,
+    ...(wranglerCommand === undefined ? {} : { wranglerCommand }),
+  });
   return {
     async readKey(keyId, phase) {
       const rows = await database.query(

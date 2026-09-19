@@ -266,7 +266,13 @@ export async function runIntegrationWorkerBootstrap(
     }
 
     const signingDatabase =
-      options.signingDatabase ?? createRemoteSigningDatabase(inspectionConfig, environment, run);
+      options.signingDatabase ??
+      createRemoteSigningDatabase(
+        inspectionConfig,
+        environment,
+        run,
+        wranglerCommandForPath(options.wranglerPath),
+      );
     const signingBefore = await readSigning("preflight", target, signingDatabase);
     assertDistinctJit(target, signingBefore);
     const r2Identity = resolveR2IdentityReader(options, target, credential?.token);
@@ -522,7 +528,13 @@ async function statusExisting(
     });
     const providerInspection = provider === null ? null : await provider.read("preflight");
     const signingDatabase =
-      options.signingDatabase ?? createRemoteSigningDatabase(config, environment, run);
+      options.signingDatabase ??
+      createRemoteSigningDatabase(
+        config,
+        environment,
+        run,
+        wranglerCommandForPath(options.wranglerPath),
+      );
     const signing = await readSigning("preflight", target, signingDatabase);
     assertDistinctJit(target, signing);
     const r2Identity = resolveR2IdentityReader(options, target, cloudflareToken);
@@ -1445,6 +1457,12 @@ async function checkedGate(run: WorkerProcess): Promise<void> {
       `${result.stdout}${result.stderr}`.trim(),
     );
   }
+}
+
+function wranglerCommandForPath(
+  wranglerPath: string | undefined,
+): ((args: readonly string[]) => readonly string[]) | undefined {
+  return wranglerPath === undefined ? undefined : (args) => [wranglerPath, ...args];
 }
 
 function exactReviewer(value: string): string {
