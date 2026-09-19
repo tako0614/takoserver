@@ -66,8 +66,10 @@ const USAGE = `takoserver deploy
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
   Every Worker-publishing surface accepts the same reviewed forward transition:
   --closure-predecessor-version=<uuid> with an explicit delta of repeatable
-  --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --add-binding=NAME, --add-secret=NAME
-  and --rotate-secret=NAME. On the Host and two Form-authority Workers in integration only, the
+  --retire-var=NAME, --add-var=NAME, --refresh-var=NAME, --refresh-service-binding=NAME,
+  --add-binding=NAME, --add-secret=NAME and --rotate-secret=NAME. Service-binding refresh is
+  integration-only; its predecessor service/entrypoint must differ from the target-derived tuple.
+  On the Host and two Form-authority Workers in integration only, the
   optional storage rebind is exactly the pair --rebind-state-database-from=<uuid> and
   --rebind-object-bucket-from=<name>; both are required and successor identities come only from
   the selected target after exact generated-storage/schema readback. --refresh-var publishes a changed value of a var both sides already
@@ -236,6 +238,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const retireVars: string[] = [];
   const addVars: string[] = [];
   const refreshVars: string[] = [];
+  const refreshServiceBindings: string[] = [];
   const addBindings: string[] = [];
   const addSecrets: string[] = [];
   const rotateSecrets: string[] = [];
@@ -385,11 +388,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
             ? addVars
             : deltaFlag.kind === "refresh-var"
               ? refreshVars
-              : deltaFlag.kind === "add-binding"
-                ? addBindings
-                : deltaFlag.kind === "add-secret"
-                  ? addSecrets
-                  : rotateSecrets;
+              : deltaFlag.kind === "refresh-service-binding"
+                ? refreshServiceBindings
+                : deltaFlag.kind === "add-binding"
+                  ? addBindings
+                  : deltaFlag.kind === "add-secret"
+                    ? addSecrets
+                    : rotateSecrets;
       list.push(deltaFlag.name);
       continue;
     }
@@ -471,6 +476,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...retireVars,
     ...addVars,
     ...refreshVars,
+    ...refreshServiceBindings,
     ...addBindings,
     ...addSecrets,
     ...rotateSecrets,
@@ -593,6 +599,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   ) {
     return null;
   }
+  if (refreshServiceBindings.length > 0 && environment !== "integration") return null;
   // The candidate descriptor is a readback product; it never accompanies a
   // mutation, so the surface can never be asked to adopt and publish at once.
   if (
@@ -739,6 +746,9 @@ function parseInvocation(args: readonly string[]): Invocation | null {
             retiredVars: [...retireVars].sort(),
             addedVars: [...addVars].sort(),
             refreshedVars: [...refreshVars].sort(),
+            ...(refreshServiceBindings.length === 0
+              ? {}
+              : { refreshedServiceBindings: [...refreshServiceBindings].sort() }),
             addedBindings: [...addBindings].sort(),
             addedSecrets: [...addSecrets].sort(),
             rotatedSecrets: [...rotateSecrets].sort(),
@@ -767,6 +777,7 @@ type ClosureDeltaFlagKind =
   | "retire-var"
   | "add-var"
   | "refresh-var"
+  | "refresh-service-binding"
   | "add-binding"
   | "add-secret"
   | "rotate-secret";
@@ -778,6 +789,7 @@ function closureDeltaFlag(
     "retire-var",
     "add-var",
     "refresh-var",
+    "refresh-service-binding",
     "add-binding",
     "add-secret",
     "rotate-secret",

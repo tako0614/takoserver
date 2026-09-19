@@ -85,6 +85,7 @@ export function normalizedWorkerClosureDelta(delta: WorkerClosureDelta): WorkerC
     ...delta.retiredVars,
     ...delta.addedVars,
     ...delta.refreshedVars,
+    ...(delta.refreshedServiceBindings ?? []),
     ...delta.addedBindings,
     ...delta.addedSecrets,
     ...delta.rotatedSecrets,
@@ -102,6 +103,9 @@ export function normalizedWorkerClosureDelta(delta: WorkerClosureDelta): WorkerC
     retiredVars: [...delta.retiredVars].sort(),
     addedVars: [...delta.addedVars].sort(),
     refreshedVars: [...delta.refreshedVars].sort(),
+    ...(delta.refreshedServiceBindings === undefined
+      ? {}
+      : { refreshedServiceBindings: [...delta.refreshedServiceBindings].sort() }),
     addedBindings: [...delta.addedBindings].sort(),
     addedSecrets: [...delta.addedSecrets].sort(),
     rotatedSecrets: [...delta.rotatedSecrets].sort(),
@@ -117,6 +121,17 @@ export function assertStorageRebindIntegrationOnly(
 ): void {
   if (delta.storageRebind !== undefined && environment !== "integration") {
     throw phaseError(phase, "Worker storage rebind is integration-only");
+  }
+}
+
+/** Refuses a service-binding refresh unless its caller explicitly names integration. */
+export function assertServiceBindingRefreshIntegrationOnly(
+  phase: DeployPhase,
+  environment: DeployEnvironment | undefined,
+  delta: WorkerClosureDelta,
+): void {
+  if ((delta.refreshedServiceBindings?.length ?? 0) > 0 && environment !== "integration") {
+    throw phaseError(phase, "Worker service binding refresh is integration-only");
   }
 }
 
@@ -148,6 +163,9 @@ export function transitionPredecessorClosure(
   for (const name of [...input.delta.retiredVars, ...input.delta.refreshedVars]) {
     closure[name] = { type: "plain_text", fields: {} };
   }
+  for (const name of input.delta.refreshedServiceBindings ?? []) {
+    closure[name] = { type: "service", fields: {} };
+  }
   if (input.delta.storageRebind !== undefined) {
     closure.STATE_DB = {
       type: "d1",
@@ -177,6 +195,7 @@ export function assertSurfaceTransitionPredecessor(
 ): void {
   const delta = normalizedWorkerClosureDelta(admission.delta);
   assertStorageRebindIntegrationOnly(phase, admission.environment, delta);
+  assertServiceBindingRefreshIntegrationOnly(phase, admission.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw phaseError(
       phase,
@@ -195,6 +214,7 @@ export function assertSurfaceTransitionPredecessor(
     carriedStoreSecrets,
   );
   assertRefreshedVarsDiffer(phase, versionId, version, admission.targetClosure, delta);
+  assertRefreshedServiceBindingsDiffer(phase, versionId, version, admission.targetClosure, delta);
   assertExactVersionBindingClosure(
     phase,
     versionId,
@@ -235,6 +255,11 @@ function assertDeltaNamesTarget(
   }
   for (const name of delta.refreshedVars) {
     if (!isPlainText(targetClosure[name])) offences.push(`refreshed-var-not-a-target-var:${name}`);
+  }
+  for (const name of delta.refreshedServiceBindings ?? []) {
+    if (targetServiceBindingTuple(targetClosure[name]) === null) {
+      offences.push(`refreshed-service-binding-not-a-target-service:${name}`);
+    }
   }
   for (const name of delta.addedBindings) {
     const requirement = targetClosure[name];
@@ -345,6 +370,9 @@ function assertDeltaAccountsForDifference(
   );
   const retiredNotPresent = [...declaredRetired].filter((name) => !actual.has(name));
   const refreshedNotPresent = delta.refreshedVars.filter((name) => !actual.has(name));
+  const refreshedServiceNotPresent = (delta.refreshedServiceBindings ?? []).filter(
+    (name) => !actual.has(name),
+  );
   const addedAlreadyPresent = [...declaredAdded].filter((name) => actual.has(name));
   const rotatedNotPresent = delta.rotatedSecrets.filter((name) => !held.has(name));
   if (
@@ -352,6 +380,7 @@ function assertDeltaAccountsForDifference(
     undeclaredMissing.length > 0 ||
     retiredNotPresent.length > 0 ||
     refreshedNotPresent.length > 0 ||
+    refreshedServiceNotPresent.length > 0 ||
     addedAlreadyPresent.length > 0 ||
     rotatedNotPresent.length > 0
   ) {
@@ -363,6 +392,7 @@ function assertDeltaAccountsForDifference(
         undeclaredMissingBindings: undeclaredMissing.sort(),
         retiredVarsAbsentFromPredecessor: retiredNotPresent.sort(),
         refreshedVarsAbsentFromPredecessor: [...refreshedNotPresent].sort(),
+        refreshedServiceBindingsAbsentFromPredecessor: [...refreshedServiceNotPresent].sort(),
         addedBindingsAlreadyPresent: addedAlreadyPresent.sort(),
         rotatedSecretsAbsentFromPredecessor: [...rotatedNotPresent].sort(),
       }),
@@ -398,6 +428,80 @@ function assertRefreshedVarsDiffer(
       JSON.stringify([...unchanged].sort()),
     );
   }
+}
+
+/**
+ * A refreshed service binding must exist on both sides as a service binding,
+ * and its observed predecessor service/entrypoint tuple must actually differ.
+ * The target tuple is never supplied by the declaration; it stays target-derived.
+ */
+function assertRefreshedServiceBindingsDiffer(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  targetClosure: ExpectedBindingClosure,
+  delta: WorkerClosureDelta,
+): void {
+  const unchanged = (delta.refreshedServiceBindings ?? []).filter((name) => {
+    const expected = targetServiceBindingTuple(targetClosure[name]);
+    if (expected === null) return false;
+    const observed = exactObservedServiceBindingTuple(phase, versionId, version, name);
+    return observed.service === expected.service && observed.entrypoint === expected.entrypoint;
+  });
+  if (unchanged.length > 0) {
+    throw phaseError(
+      phase,
+      `version ${versionId} already binds a refreshed service binding with the exact target service and entrypoint`,
+      JSON.stringify([...unchanged].sort()),
+    );
+  }
+}
+
+function targetServiceBindingTuple(
+  requirement: ExpectedBinding | null | undefined,
+): { readonly service: string; readonly entrypoint: string } | null {
+  if (!present(requirement) || requirement.type !== "service") return null;
+  const fields = requirement.fields as Readonly<Record<string, unknown>> | undefined;
+  if (
+    typeof fields?.service !== "string" ||
+    fields.service.trim().length === 0 ||
+    typeof fields.entrypoint !== "string" ||
+    fields.entrypoint.trim().length === 0
+  ) {
+    return null;
+  }
+  return { service: fields.service, entrypoint: fields.entrypoint };
+}
+
+function exactObservedServiceBindingTuple(
+  phase: DeployPhase,
+  versionId: string,
+  version: unknown,
+  name: string,
+): { readonly service: string; readonly entrypoint: string } {
+  const matches = readVersionBindings(phase, versionId, version).filter(
+    (binding) => binding.name === name || binding.binding === name,
+  );
+  if (matches.length !== 1) {
+    throw phaseError(
+      phase,
+      `version ${versionId} must contain exactly one same-name ${name} service binding`,
+    );
+  }
+  const binding = matches[0] as Record<string, unknown>;
+  if (
+    binding.type !== "service" ||
+    typeof binding.service !== "string" ||
+    binding.service.trim().length === 0 ||
+    typeof binding.entrypoint !== "string" ||
+    binding.entrypoint.trim().length === 0
+  ) {
+    throw phaseError(
+      phase,
+      `version ${versionId} does not contain exactly one valid ${name} service binding`,
+    );
+  }
+  return { service: binding.service, entrypoint: binding.entrypoint };
 }
 
 /**

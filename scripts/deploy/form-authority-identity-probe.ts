@@ -35,6 +35,7 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
+  assertServiceBindingRefreshIntegrationOnly,
   type BindingDifference,
   describeBindingDrift,
   surfaceTransitionAdmits,
@@ -137,6 +138,13 @@ export async function runFormAuthorityIdentityProbe(
 ): Promise<Record<string, unknown>> {
   if (invocation.transition?.delta.storageRebind !== undefined) {
     throw preflightError("Form authority identity probe does not bind STATE_DB or OBJECTS");
+  }
+  if (invocation.transition !== undefined) {
+    assertServiceBindingRefreshIntegrationOnly(
+      "preflight",
+      invocation.environment,
+      invocation.transition.delta,
+    );
   }
   assertPublicFormCapabilityTarget(target);
   if (target.environment !== invocation.environment) {
@@ -637,7 +645,7 @@ async function inspectProbe(
     transition.predecessorVersionId === history.versionId &&
     surfaceTransitionAdmits(phase, history.versionId, version, {
       delta: transition.delta,
-      environment: invocation.environment,
+      environment: target.environment,
       targetClosure: expected,
     })
   ) {

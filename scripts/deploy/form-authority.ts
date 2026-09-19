@@ -73,6 +73,7 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
+  assertServiceBindingRefreshIntegrationOnly,
   assertStorageRebindIntegrationOnly,
   type BindingDifference,
   describeBindingDrift,
@@ -282,6 +283,11 @@ export async function runFormAuthority(
       : normalizedWorkerClosureDelta(invocation.transition.delta);
   if (transitionDelta !== null) {
     assertStorageRebindIntegrationOnly("preflight", invocation.environment, transitionDelta);
+    assertServiceBindingRefreshIntegrationOnly(
+      "preflight",
+      invocation.environment,
+      transitionDelta,
+    );
   }
   if (
     transitionDelta?.storageRebind !== undefined &&

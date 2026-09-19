@@ -1531,6 +1531,103 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 
+  test("parses service-binding refresh only on integration Worker transitions", async () => {
+    const sha = "a".repeat(40);
+    const predecessor = "00000000-0000-4000-8000-0000000000a1";
+    const contract = DEPLOY_CONTRACT.surfaces.find(
+      ({ surface }) => surface === "takoserver-worker-authority-cutover",
+    );
+    expect(contract?.obligations["failure-handling"]).toContain("--refresh-service-binding=NAME");
+    expect(contract?.obligations["failure-handling"]).toContain("integration-only");
+
+    for (const surface of [
+      "takoserver-worker-authority-cutover",
+      "takoserver-form-authority-worker",
+      "takoserver-integration-form-authority-worker",
+      "takoserver-integration-form-authority-operator-worker",
+      "takoserver-form-authority-identity-probe",
+    ]) {
+      const accepted = await deploy([
+        surface,
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      expect(accepted.stderr).not.toContain("no target was touched");
+    }
+
+    const refusedInvocations = [
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+        "--add-binding=PUBLIC_HOST_IDENTITY",
+      ],
+      [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=public_host_identity",
+      ],
+      [
+        "takoserver-worker",
+        "--status",
+        "--environment=integration",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ],
+      ...["production", "rehearsal"].map((environment) => [
+        "takoserver-worker-authority-cutover",
+        "--status",
+        `--environment=${environment}`,
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ]),
+      [
+        "takoserver-form-authority-identity-probe",
+        "--status",
+        "--environment=production",
+        `--commit=${sha}`,
+        `--closure-predecessor-version=${predecessor}`,
+        "--refresh-service-binding=PUBLIC_HOST_IDENTITY",
+      ],
+    ] as const;
+    for (const args of refusedInvocations) {
+      const refused = await deploy(args);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("no target was touched");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
   /**
    * The released-Core lane could not be started: its apply post-condition reads
    * a probe route the probe serves only through a binding it refuses to

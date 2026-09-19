@@ -65,6 +65,8 @@ const orgApiKeyInput =
   "read: this surface acts through the Host's own published organization API, not through the provider.";
 const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
+const integrationServiceBindingRefresh =
+  "The `--refresh-service-binding=NAME` delta is integration-only: the exact pinned predecessor must contain exactly one same-name service binding whose observed `service`/`entrypoint` pair differs from the selected target. The successor pair remains target-derived; D1, R2, Durable Object, plain-text and secret bindings cannot use this selector.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -334,7 +336,8 @@ export const DEPLOY_CONTRACT = {
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
           "cannot bypass the selector or carry the retired edge. " +
           "`--closure-predecessor-version=<uuid>` plus the repeatable `--retire-var=NAME`, " +
-          "`--add-var=NAME`, `--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` " +
+          "`--add-var=NAME`, `--refresh-var=NAME`, `--refresh-service-binding=NAME`, " +
+          "`--add-secret=NAME` and `--rotate-secret=NAME` " +
           "declaration is the only " +
           "path that brings a live Version forward when the operator-private target descriptor " +
           "legitimately changed shape. It is admitted only when the authoritative current Version " +
@@ -342,7 +345,9 @@ export const DEPLOY_CONTRACT = {
           "the entire difference between the predecessor closure and the target closure. " +
           "`--refresh-var` covers the difference that changes no binding name at all: the " +
           "predecessor must declare that var with a value different from the one the target derives, " +
-          "and the upload publishes the target's value. The secret inventory is the union of what " +
+          "and the upload publishes the target's value. " +
+          integrationServiceBindingRefresh +
+          " The secret inventory is the union of what " +
           "the pinned Version declares and what the script-level secret store holds, so a secret a " +
           "rollback left in the store is carried whether or not the declaration names it; naming it " +
           "under `--add-secret` only decides that its value is re-entered. One upload " +
@@ -358,7 +363,9 @@ export const DEPLOY_CONTRACT = {
           "and all other closure names, types and fields remain exact. Before upload and again at the " +
           "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
           "R2 name, audited 0001-0057 lineage and canonical migrated schema. Production and rehearsal " +
-          "refuse this pair before provider effects. This one integration rebind branch runs " +
+          "refuse this pair before provider effects. " +
+          integrationServiceBindingRefresh +
+          " This one integration rebind branch runs " +
           "`bun run typecheck:worker` and the focused closure-transition, binding-state and storage-generation " +
           "tests before Wrangler dry-run; every other Host apply keeps `bun run check`." +
           inputContract(applyReviewInput, closureSecretDirectoryInput),
@@ -467,7 +474,8 @@ export const DEPLOY_CONTRACT = {
           "to remain unchanged and Core to remain absent at the final fence. Drift is refused before upload; " +
           "production and rehearsal retain the absence refusal. This storage-free probe explicitly " +
           "refuses `storageRebind`; only the public Host and the two route-less Form authority Workers " +
-          "can carry that integration-only declaration." +
+          "can carry that integration-only declaration. " +
+          integrationServiceBindingRefresh +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -591,7 +599,9 @@ export const DEPLOY_CONTRACT = {
           "acknowledgement through status without retry. Its optional integration storage rebind requires " +
           "both exact predecessor flags; the selected generated target alone supplies the successor, " +
           "and D1 UUID/name, R2 existence, audited lineage and canonical schema are reverified at the " +
-          "immediate upload fence. This one integration rebind branch runs " +
+          "immediate upload fence. " +
+          integrationServiceBindingRefresh +
+          " This one integration rebind branch runs " +
           "`bun run typecheck:form-authority-worker` and focused Form-transition, binding-state and " +
           "storage-generation tests before Wrangler dry-run; every other Form authority apply keeps " +
           "`bun run check`." +
@@ -640,7 +650,8 @@ export const DEPLOY_CONTRACT = {
           "Transition status rejects stale-public, third-scope, absent/bootstrap and history-based roll-forward; " +
           "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation. " +
           "The operator gateway does not accept the public storageRebind declaration; only the route-less " +
-          "Host/Form authority Workers carry that integration-only transition." +
+          "Host/Form authority Workers carry that integration-only transition. " +
+          integrationServiceBindingRefresh +
           inputContract(applyReviewInput),
         "independent-review": review,
       },

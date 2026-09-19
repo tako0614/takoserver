@@ -60,6 +60,7 @@ import {
   workerTransitionSecretInventory,
 } from "./worker-state.ts";
 import {
+  assertServiceBindingRefreshIntegrationOnly,
   assertStorageRebindIntegrationOnly,
   assertSurfaceTransitionPredecessor,
   normalizedWorkerClosureDelta,
@@ -150,6 +151,7 @@ export async function runWorkerClosureTransition(
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
   assertStorageRebindIntegrationOnly("preflight", invocation.environment, delta);
+  assertServiceBindingRefreshIntegrationOnly("preflight", invocation.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw preflightError(
       "closure transition requires a non-empty declared delta; use the routine surface instead",

@@ -81,6 +81,42 @@ const integrationHostOnlyTarget = {
 } satisfies DeployTarget;
 
 describe("Form authority identity probe deploy surface", () => {
+  test("service binding refresh is refused outside integration before credentials", async () => {
+    let credentialCalls = 0;
+    const failure = await runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PROBE_VERSION,
+          delta: {
+            retiredVars: [],
+            addedVars: [],
+            refreshedVars: [],
+            refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+      },
+      target,
+      {
+        run: async () => {
+          credentialCalls += 1;
+          throw new Error("must refuse before credential resolution");
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain(
+      "Worker service binding refresh is integration-only",
+    );
+    expect(credentialCalls).toBe(0);
+  });
+
   test("storage rebind is explicitly refused before identity-probe provider effects", async () => {
     let processCalls = 0;
     const failure = await runFormAuthorityIdentityProbe(
@@ -1378,6 +1414,8 @@ describe("Form authority identity probe forward transition apply", () => {
     .digest("hex")}` as const;
   const PROBE_SUCCESSOR = "44444444-4444-4444-8444-444444444444";
   const APPLY_COMMIT = "b".repeat(40);
+  const PREDECESSOR_HOST_ID = "https://api.previous.integration.example.test";
+  const PREDECESSOR_PUBLIC_SERVICE = "takoserver-api-integration-previous";
 
   const applyTarget = {
     ...target,
@@ -1391,17 +1429,22 @@ describe("Form authority identity probe forward transition apply", () => {
     },
   } satisfies DeployTarget;
 
-  function probeVersion(bindings: readonly string[], commit: string, digest: `sha256:${string}`) {
+  function probeVersion(
+    bindings: readonly string[],
+    commit: string,
+    digest: `sha256:${string}`,
+    staleIdentity = false,
+  ) {
     const all = [
       {
         name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
         type: "plain_text",
-        text: applyTarget.formAuthority.hostId,
+        text: staleIdentity ? PREDECESSOR_HOST_ID : applyTarget.formAuthority.hostId,
       },
       {
         name: "PUBLIC_HOST_IDENTITY",
         type: "service",
-        service: applyTarget.workerName,
+        service: staleIdentity ? PREDECESSOR_PUBLIC_SERVICE : applyTarget.workerName,
         entrypoint: "PublicHostIdentityEntrypoint",
       },
       {
@@ -1420,7 +1463,10 @@ describe("Form authority identity probe forward transition apply", () => {
     };
   }
 
-  function applyState(isUploaded: () => boolean): FormAuthorityIdentityProbeState {
+  function applyState(
+    isUploaded: () => boolean,
+    input: { readonly stalePredecessorIdentity?: boolean } = {},
+  ): FormAuthorityIdentityProbeState {
     const expected = expectedExactBindingClosure(applyTarget, {
       workerArtifactDigest: PUBLIC_DIGEST,
     });
@@ -1491,6 +1537,7 @@ describe("Form authority identity probe forward transition apply", () => {
               ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY"],
               APPLY_COMMIT,
               PUBLIC_DIGEST,
+              input.stalePredecessorIdentity,
             );
       },
       async workerSecrets(workerName) {
@@ -1512,10 +1559,11 @@ describe("Form authority identity probe forward transition apply", () => {
 
   let uploadedProbeDigest: `sha256:${string}` | null = null;
 
-  test("publishes the added binding through the declaration in exactly one upload", async () => {
+  test("refreshes Host id and service binding from the target while adding authority in one upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-probe-transition-"));
     let uploaded = false;
     uploadedProbeDigest = null;
+    let uploadConfig: Record<string, unknown> | undefined;
     const calls: string[][] = [];
     try {
       const run = async (command: readonly string[]) => {
@@ -1539,6 +1587,9 @@ describe("Form authority identity probe forward transition apply", () => {
           uploadedProbeDigest = message.slice(
             message.indexOf(":sha256:") + 1,
           ) as `sha256:${string}`;
+          const configPath = command[command.indexOf("--config") + 1];
+          if (!configPath) throw new Error("upload config path missing");
+          uploadConfig = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
           uploaded = true;
           return ok("uploaded\n");
         }
@@ -1555,7 +1606,8 @@ describe("Form authority identity probe forward transition apply", () => {
             delta: {
               retiredVars: [],
               addedVars: [],
-              refreshedVars: [],
+              refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+              refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
               addedBindings: ["FORM_AUTHORITY"],
               addedSecrets: [],
               rotatedSecrets: [],
@@ -1565,7 +1617,7 @@ describe("Form authority identity probe forward transition apply", () => {
         applyTarget,
         {
           run,
-          state: applyState(() => uploaded),
+          state: applyState(() => uploaded, { stalePredecessorIdentity: true }),
           fetcher: applyFetcher(),
           review: "independent-reviewer",
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -1582,6 +1634,21 @@ describe("Form authority identity probe forward transition apply", () => {
         ready: true,
       });
       expect(calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      expect(uploadConfig).toMatchObject({
+        vars: { TAKOSERVER_FORM_AUTHORITY_HOST_ID: applyTarget.formAuthority.hostId },
+        services: [
+          {
+            binding: "PUBLIC_HOST_IDENTITY",
+            service: applyTarget.workerName,
+            entrypoint: "PublicHostIdentityEntrypoint",
+          },
+          {
+            binding: "FORM_AUTHORITY",
+            service: applyTarget.formAuthority.workerName,
+            entrypoint: "FormAuthorityEntrypoint",
+          },
+        ],
+      });
     } finally {
       uploadedProbeDigest = null;
       rmSync(root, { recursive: true, force: true });

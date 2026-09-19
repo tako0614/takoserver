@@ -311,6 +311,8 @@ export interface WorkerClosureDelta {
    * correction would be unpublishable by any surface.
    */
   readonly refreshedVars: readonly string[];
+  /** Existing service bindings whose target-derived service/entrypoint tuple changes. */
+  readonly refreshedServiceBindings?: readonly string[];
   /**
    * Non-plain-text bindings the current target declares and the predecessor
    * lacks.
@@ -342,6 +344,7 @@ export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
     delta.retiredVars.length === 0 &&
     delta.addedVars.length === 0 &&
     delta.refreshedVars.length === 0 &&
+    (delta.refreshedServiceBindings?.length ?? 0) === 0 &&
     delta.addedBindings.length === 0 &&
     delta.addedSecrets.length === 0 &&
     delta.rotatedSecrets.length === 0 &&

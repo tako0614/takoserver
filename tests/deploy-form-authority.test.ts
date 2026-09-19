@@ -42,6 +42,8 @@ const FORM_PREDECESSOR_STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000
 const FORM_STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a5";
 const FORM_STORAGE_NAME = `takoserver-i-${"f".repeat(32)}`;
 const FORM_PREDECESSOR_STORAGE_BUCKET = `takoserver-i-${"e".repeat(32)}`;
+const FORM_PREDECESSOR_HOST_ID = "https://api.previous.integration.example.test";
+const FORM_PREDECESSOR_PUBLIC_SERVICE = "takoserver-api-integration-previous";
 const BUNDLE = "export default class FormAuthorityEntrypoint {}\n";
 const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('public'); } };\n";
 const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex")}` as const;
@@ -288,7 +290,7 @@ function stateSequence(
 }
 
 function storageRebindingFormState(
-  input: { readonly isUploaded: () => boolean },
+  input: { readonly isUploaded: () => boolean; readonly refreshIdentity?: boolean },
   observed: { readonly versionId: string; readonly version: unknown }[] = [],
 ): FormAuthorityDeployState {
   const base = stateSequence({ isUploaded: input.isUploaded }, formStorageTarget);
@@ -318,6 +320,16 @@ function storageRebindingFormState(
             ...binding,
             bucket_name: successor ? FORM_STORAGE_NAME : FORM_PREDECESSOR_STORAGE_BUCKET,
           };
+        }
+        if (
+          !successor &&
+          input.refreshIdentity &&
+          binding.name === "TAKOSERVER_FORM_AUTHORITY_HOST_ID"
+        ) {
+          return { ...binding, text: FORM_PREDECESSOR_HOST_ID };
+        }
+        if (!successor && input.refreshIdentity && binding.name === "PUBLIC_HOST_IDENTITY") {
+          return { ...binding, service: FORM_PREDECESSOR_PUBLIC_SERVICE };
         }
         return binding;
       });
@@ -2420,6 +2432,46 @@ describe("route-less Form authority deploy surfaces", () => {
 });
 
 describe("Form authority integration storage rebind", () => {
+  test("service binding refresh is refused outside integration before credentials", async () => {
+    let credentialCalls = 0;
+    const productionTarget = {
+      ...formStorageTarget,
+      environment: "production",
+    } satisfies DeployTarget;
+    const failure = await runFormAuthorityImpl(
+      {
+        surface: "takoserver-form-authority-worker",
+        action: "apply",
+        environment: "production",
+        commit: COMMIT,
+        transition: {
+          predecessorVersionId: PREVIOUS_AUTHORITY_VERSION_ID,
+          delta: {
+            retiredVars: [],
+            addedVars: [],
+            refreshedVars: [],
+            refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+      },
+      productionTarget,
+      {
+        run: async () => {
+          credentialCalls += 1;
+          throw new Error("must refuse before credential resolution");
+        },
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).message).toContain(
+      "Worker service binding refresh is integration-only",
+    );
+    expect(credentialCalls).toBe(0);
+  });
+
   test("uses the current exact predecessor and target-derived successor on the fixture Worker", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-storage-rebind-"));
     let uploaded = false;
@@ -2441,7 +2493,8 @@ describe("Form authority integration storage rebind", () => {
             delta: {
               retiredVars: [],
               addedVars: [],
-              refreshedVars: [],
+              refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+              refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
               addedBindings: [],
               addedSecrets: [],
               rotatedSecrets: [],
@@ -2452,7 +2505,10 @@ describe("Form authority integration storage rebind", () => {
         formStorageTarget,
         {
           run: process.run,
-          state: storageRebindingFormState({ isUploaded: () => uploaded }, observed),
+          state: storageRebindingFormState(
+            { isUploaded: () => uploaded, refreshIdentity: true },
+            observed,
+          ),
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           review: "independent-reviewer",
@@ -2477,11 +2533,23 @@ describe("Form authority integration storage rebind", () => {
       expect(binding(PREVIOUS_AUTHORITY_VERSION_ID, "OBJECTS", "bucket_name")).toBe(
         FORM_PREDECESSOR_STORAGE_BUCKET,
       );
+      expect(
+        binding(PREVIOUS_AUTHORITY_VERSION_ID, "TAKOSERVER_FORM_AUTHORITY_HOST_ID", "text"),
+      ).toBe(FORM_PREDECESSOR_HOST_ID);
+      expect(binding(PREVIOUS_AUTHORITY_VERSION_ID, "PUBLIC_HOST_IDENTITY", "service")).toBe(
+        FORM_PREDECESSOR_PUBLIC_SERVICE,
+      );
       expect(binding(CURRENT_AUTHORITY_VERSION_ID, "STATE_DB", "id")).toBe(
         FORM_STORAGE_DATABASE_ID,
       );
       expect(binding(CURRENT_AUTHORITY_VERSION_ID, "OBJECTS", "bucket_name")).toBe(
         FORM_STORAGE_NAME,
+      );
+      expect(
+        binding(CURRENT_AUTHORITY_VERSION_ID, "TAKOSERVER_FORM_AUTHORITY_HOST_ID", "text"),
+      ).toBe(formStorageTarget.formAuthority.hostId);
+      expect(binding(CURRENT_AUTHORITY_VERSION_ID, "PUBLIC_HOST_IDENTITY", "service")).toBe(
+        formStorageTarget.workerName,
       );
       const typecheck = process.calls.findIndex(
         (call) => call.join(" ") === "bun run typecheck:form-authority-worker",

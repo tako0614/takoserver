@@ -149,6 +149,10 @@ function predecessorVersion(
     readonly versionExtraSecrets?: readonly string[];
     /** Values this Version binds that differ from the ones the target derives. */
     readonly staleVars?: Readonly<Record<string, string>>;
+    /** Service/entrypoint tuples this Version binds instead of target-derived ones. */
+    readonly staleServiceBindings?: Readonly<
+      Record<string, { readonly service: string; readonly entrypoint: string }>
+    >;
     readonly storagePredecessor?: NonNullable<WorkerClosureDelta["storageRebind"]>;
   } = {},
 ) {
@@ -166,7 +170,13 @@ function predecessorVersion(
       }
       return binding;
     })
-    .filter(({ name }) => name !== ADDED_BINDING)
+    .map((binding) => {
+      const staleService = overrides.staleServiceBindings?.[binding.name];
+      return staleService === undefined ? binding : { ...binding, ...staleService };
+    })
+    .filter(
+      ({ name }) => name !== ADDED_BINDING || overrides.staleServiceBindings?.[name] !== undefined,
+    )
     .filter(
       ({ name }) =>
         name !== ADDED_VAR &&
@@ -1688,6 +1698,180 @@ describe("reviewed Worker closure transition", () => {
         "already binds a refreshed var with the exact target value",
       );
       expect((noop as DeployError).detail).toContain(REFRESHED_VAR);
+    });
+  });
+
+  test("refreshes only a changed target service binding and keeps every other difference strict", async () => {
+    await withRoot("takoserver-closure-service-refresh-", async (root) => {
+      const targetRequirement = expectedExactBindingClosure(target)[ADDED_BINDING];
+      if (targetRequirement === null || targetRequirement?.type !== "service") {
+        throw new Error("fixture target service binding missing");
+      }
+      const targetService = {
+        service: targetRequirement.fields.service,
+        entrypoint: targetRequirement.fields.entrypoint,
+      };
+      const oldService = {
+        service: "takoserver-provider-executor-predecessor",
+        entrypoint: targetService.entrypoint,
+      };
+      const serviceDelta: WorkerClosureDelta = {
+        ...INTEGRATION_DELTA,
+        addedBindings: [],
+        refreshedServiceBindings: [ADDED_BINDING],
+      };
+      const work = join(root, "service-refresh-work");
+      const parts = fixture(root, {
+        predecessor: { staleServiceBindings: { [ADDED_BINDING]: oldService } },
+      });
+      const observed: { readonly versionId: string; readonly version: unknown }[] = [];
+      const state: WorkerState = {
+        ...parts.state,
+        async workerVersion(workerName, versionId) {
+          const version = await parts.state.workerVersion(workerName, versionId);
+          observed.push({ versionId, version });
+          return version;
+        },
+      };
+      const result = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: serviceDelta,
+        },
+        target,
+        {
+          run: parts.run,
+          state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          migrations: parts.migrations,
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: publishedProductFetcher(),
+          outputDirectory: work,
+        },
+      );
+
+      expect(result).toMatchObject({ state: "closure-transition-applied", versionId: SUCCESSOR });
+      expect(result.delta).toMatchObject({ refreshedServiceBindings: [ADDED_BINDING] });
+      const binding = (versionId: string) => {
+        const version = observed.find((entry) => entry.versionId === versionId)?.version as {
+          resources: { bindings: Record<string, string>[] };
+        };
+        return version.resources.bindings.find((entry) => entry.name === ADDED_BINDING);
+      };
+      expect(binding(PREDECESSOR)).toMatchObject({ type: "service", ...oldService });
+      expect(binding(SUCCESSOR)).toMatchObject({ type: "service", ...targetService });
+      const realized = JSON.parse(readFileSync(join(work, "release/wrangler.jsonc"), "utf8")) as {
+        services: Record<string, string>[];
+      };
+      expect(realized.services).toContainEqual({ binding: ADDED_BINDING, ...targetService });
+
+      const refusals = [
+        {
+          name: "unnamed drift",
+          predecessor: { extraVar: "UNNAMED_DRIFT" },
+          delta: serviceDelta,
+          expectedMessage: "differs from the target closure outside the declared delta",
+          expectedDetail: "UNNAMED_DRIFT",
+        },
+        {
+          name: "non-service target",
+          predecessor: {},
+          delta: { ...INTEGRATION_DELTA, refreshedServiceBindings: [REFRESHED_VAR] },
+          expectedMessage: "does not describe the closure this surface publishes",
+          expectedDetail: "refreshed-service-binding-not-a-target-service",
+        },
+        {
+          name: "no-op service tuple",
+          predecessor: { staleServiceBindings: { [ADDED_BINDING]: targetService } },
+          delta: serviceDelta,
+          expectedMessage: "already binds a refreshed service binding",
+          expectedDetail: ADDED_BINDING,
+        },
+      ] satisfies readonly {
+        readonly name: string;
+        readonly predecessor: Parameters<typeof predecessorVersion>[0];
+        readonly delta: WorkerClosureDelta;
+        readonly expectedMessage: string;
+        readonly expectedDetail: string;
+      }[];
+      for (const refusal of refusals) {
+        const candidate = fixture(root, { predecessor: refusal.predecessor });
+        const failure = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: refusal.delta,
+          },
+          target,
+          {
+            run: candidate.run,
+            state: candidate.state,
+            providerExecutorQualification: candidate.providerExecutorQualification,
+            migrations: candidate.migrations,
+            outputDirectory: join(root, refusal.name.replaceAll(" ", "-")),
+          },
+        ).catch((error: unknown) => error);
+        expect(failure, refusal.name).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).message, refusal.name).toContain(refusal.expectedMessage);
+        expect((failure as DeployError).detail, refusal.name).toContain(refusal.expectedDetail);
+        expect(
+          candidate.calls.some((call) => call.includes("--no-bundle")),
+          refusal.name,
+        ).toBe(false);
+      }
+
+      const duplicate = fixture(root);
+      const duplicateFailure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            ...serviceDelta,
+            refreshedVars: [REFRESHED_VAR],
+            refreshedServiceBindings: [REFRESHED_VAR],
+          },
+        },
+        target,
+        { run: duplicate.run, state: duplicate.state },
+      ).catch((error: unknown) => error);
+      expect(duplicateFailure).toBeInstanceOf(DeployError);
+      expect((duplicateFailure as DeployError).message).toContain(
+        "transition delta names one binding more than once",
+      );
+      expect(duplicate.stateCalls).toEqual([]);
+
+      const selected = { ...target, environment: "production" } satisfies DeployTarget;
+      const production = fixture(root, { selected });
+      const nonIntegrationFailure = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "production",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: serviceDelta,
+        },
+        selected,
+        { run: production.run, state: production.state },
+      ).catch((error: unknown) => error);
+      expect(nonIntegrationFailure).toBeInstanceOf(DeployError);
+      expect((nonIntegrationFailure as DeployError).message).toContain(
+        "service binding refresh is integration-only",
+      );
+      expect(production.calls).toEqual([]);
+      expect(production.stateCalls).toEqual([]);
     });
   });
 
