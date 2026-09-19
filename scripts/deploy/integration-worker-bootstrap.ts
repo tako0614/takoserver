@@ -803,6 +803,7 @@ async function inspectVersion(
     phase,
   );
   await assertLiveWorkerRoutingClosure(phase, target, state);
+  await assertWorkersDevSubdomainState(phase, target, state);
   const native = await readNativePresence(phase, target, state);
   assertNoTargetOwners(phase, target, native);
   assertWorkerSettings(phase, await state.workerSettings(target.workerName));
@@ -1355,8 +1356,11 @@ function assertWorkerSettings(phase: "preflight" | "verification", value: unknow
     throw phaseError(phase, "Worker settings are malformed");
   }
   const settings = value as Record<string, unknown>;
-  if (settings.workers_dev !== true || settings.preview_urls !== false) {
-    throw phaseError(phase, "Worker settings do not prove the exact workers.dev topology");
+  if (
+    (Object.hasOwn(settings, "workers_dev") && settings.workers_dev !== true) ||
+    (Object.hasOwn(settings, "preview_urls") && settings.preview_urls !== false)
+  ) {
+    throw phaseError(phase, "Worker settings contradict the exact workers.dev topology");
   }
   for (const key of ["routes", "custom_domains", "domains"] as const) {
     if (
@@ -1368,6 +1372,21 @@ function assertWorkerSettings(phase: "preflight" | "verification", value: unknow
         "Worker settings unexpectedly declare custom route or domain topology",
       );
     }
+  }
+}
+
+async function assertWorkersDevSubdomainState(
+  phase: "preflight" | "verification",
+  target: DeployTarget,
+  state: IntegrationWorkerBootstrapState,
+): Promise<void> {
+  if (!new URL(target.publicOrigin).hostname.endsWith(".workers.dev")) return;
+  const subdomain = await state.workerSubdomain?.(target.workerName);
+  if (subdomain?.enabled !== true || subdomain.previewsEnabled !== false) {
+    throw phaseError(
+      phase,
+      "Worker workers.dev subdomain must be enabled with preview URLs disabled",
+    );
   }
 }
 

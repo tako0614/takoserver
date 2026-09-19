@@ -223,6 +223,39 @@ describe("Takoserver integration Worker bootstrap", () => {
     }
   });
 
+  test("status accepts native Worker settings without config-only workers.dev flags", async () => {
+    const fixture = bootstrapFixture({ target, initiallyPublished: true });
+    const result = await readPublishedStatus(fixture);
+    expect(result).toMatchObject({ state: "complete", ready: true });
+    expect(fixture.stateCalls).toContain("workerSettings");
+  });
+
+  test("status still refuses disabled workers.dev or enabled previews from account subdomain readback", async () => {
+    for (const subdomain of [
+      { enabled: false, previewsEnabled: false },
+      { enabled: true, previewsEnabled: true },
+    ]) {
+      const fixture = bootstrapFixture({ target, initiallyPublished: true, subdomain });
+      const result = await readPublishedStatus(fixture);
+      expect(result).toMatchObject({ state: "drift", ready: false });
+      expect(fixture.stateCalls).toContain("workerSubdomain");
+      expect(fixture.stateCalls).not.toContain("workerSettings");
+    }
+  });
+
+  test("status rejects contradictory optional workers.dev settings when present", async () => {
+    for (const settingsOverrides of [{ workers_dev: false }, { preview_urls: true }]) {
+      const fixture = bootstrapFixture({
+        target,
+        initiallyPublished: true,
+        settingsOverrides,
+      });
+      const result = await readPublishedStatus(fixture);
+      expect(result).toMatchObject({ state: "drift", ready: false });
+      expect(fixture.stateCalls).toContain("workerSettings");
+    }
+  });
+
   test("apply refuses every existing or orphan native owner before lifecycle", async () => {
     const cases = [
       { label: "script", scripts: [WORKER_NAME] },
@@ -470,6 +503,8 @@ interface FixtureOptions {
   readonly provider?: WorkerProviderExecutorQualification;
   readonly gateFailure?: CommandResult;
   readonly gateFailureAt?: "typecheck" | "tests";
+  readonly subdomain?: { readonly enabled: boolean; readonly previewsEnabled: boolean };
+  readonly settingsOverrides?: Readonly<Record<string, unknown>>;
   readonly postAckDrift?: "schema" | "signing" | "schedule";
   readonly finalNativeRace?: boolean;
   readonly lostAcknowledgement?: boolean;
@@ -604,7 +639,7 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     },
     async workerSubdomain() {
       stateCalls.push("workerSubdomain");
-      return { enabled: true, previewsEnabled: false };
+      return options.subdomain ?? { enabled: true, previewsEnabled: false };
     },
     async workerAccountSubdomain() {
       stateCalls.push("workerAccountSubdomain");
@@ -617,11 +652,17 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     async workerSettings() {
       stateCalls.push("workerSettings");
       return {
-        workers_dev: true,
-        preview_urls: false,
-        routes: [],
-        custom_domains: [],
-        domains: [],
+        placement: { mode: "smart" },
+        compatibility_date: "2026-08-17",
+        compatibility_flags: ["nodejs_compat"],
+        usage_model: "standard",
+        tags: [],
+        tail_consumers: [],
+        logpush: false,
+        observability: { enabled: true },
+        annotations: {},
+        bindings: [],
+        ...options.settingsOverrides,
       };
     },
   };
@@ -776,6 +817,21 @@ async function apply(
       review: "independent-reviewer",
       fetcher: publishedProductFetcher(fixture.target),
       ...extra,
+    },
+  );
+}
+
+async function readPublishedStatus(fixture: BootstrapFixture): Promise<Record<string, unknown>> {
+  return await runIntegrationWorkerBootstrap(
+    { action: "status", environment: "integration", commit: COMMIT },
+    fixture.target,
+    {
+      run: fixture.run,
+      state: fixture.state,
+      sourceRepositoryRoot: sourceRoot,
+      schemaReader: fixture.schemaReader,
+      signingDatabase: fixture.signingDatabase,
+      r2Identity: fixture.r2Identity,
     },
   );
 }
