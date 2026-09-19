@@ -9,6 +9,7 @@ import type {
   ProviderNativeReadbackInput,
   ProviderOffering,
   ProviderReadAuthorityTarget,
+  ProviderRelation,
   ProviderSqliteMigration,
   ProviderSqliteMigrationIdentity,
   ProviderTicket,
@@ -16,6 +17,7 @@ import type {
   ResourceIdentity,
 } from "../provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../provider-runtime-input-port.ts";
+import type { CloudflareZone } from "./cloudflare.ts";
 
 export interface CloudflareOrdinaryWorkerBackendOptions {
   readonly kind: "ordinary-workers";
@@ -91,7 +93,19 @@ export interface CloudflareWorkerDeleteInput {
   readonly nativeId: string;
   readonly identity: ResourceIdentity;
   readonly spec?: JsonObject;
-  readonly relations?: readonly import("../provider-port.ts").ProviderRelation[];
+  readonly relations?: readonly ProviderRelation[];
+}
+
+/** Adoption identity shared by the Cloudflare provider and its Worker backend. */
+export interface CloudflareWorkerAdoptInput {
+  readonly operationId: string;
+  readonly operationMode?: "initial" | "recovery";
+  readonly providerHandle?: string;
+  readonly offering: ProviderOffering;
+  readonly nativeId: string;
+  readonly identity: ResourceIdentity;
+  readonly spec: JsonObject;
+  readonly relations?: readonly ProviderRelation[];
 }
 
 /** One complete Worker placement lifecycle behind the Cloudflare adapter. */
@@ -111,8 +125,12 @@ export interface CloudflareWorkerBackend {
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
     readonly spec: JsonObject;
-    readonly relations?: readonly import("../provider-port.ts").ProviderRelation[];
+    readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
+  /** Optional backend-owned adoption; omission refuses without ordinary fallback. */
+  adopt?(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket>;
+  /** Optional read-only adoption recovery; omission refuses without ordinary fallback. */
+  recoverAdopt?(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket>;
   delete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
   recoverDelete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
   createNativeReadbackDescriptor(
@@ -180,6 +198,7 @@ export interface CloudflareWorkerBackendFactoryContext {
   readonly offerings: readonly ProviderOffering[];
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly workerCompatibilityDate: string;
+  readonly zoneFor: (hostname: string, tenantRef: string) => CloudflareZone | undefined;
 }
 
 /** In-process managed backend composition; never a wire or public Form DTO. */

@@ -146,6 +146,7 @@ export type {
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackend,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerDeleteInput,

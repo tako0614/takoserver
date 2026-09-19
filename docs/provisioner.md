@@ -19,6 +19,13 @@ Most providers will not need this. One that reaches its backend by calling an
 HTTP API with a credential fits a Worker exactly, and adding it means adding a
 module rather than a machine.
 
+Local database upgrades use recorded, forward-only transactions. Migration
+0058 expands a private receipt kind while preserving existing receipts,
+version material and sealed values. Keep the usual database backup and allow
+space for the transaction's temporary copies; an older build refuses a database
+with this newer lineage. This local upgrade is not qualification for a
+protected Cloudflare D1 upgrade; see the [0058 deploy boundary](deploy.md#0058-domain-receipt-schema-protected-wave-unavailable).
+
 ## Ordinary stable mode
 
 The normal `bun src/entry-bun.ts` process uses the stable self-host Provider3

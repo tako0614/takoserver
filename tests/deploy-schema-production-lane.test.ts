@@ -46,16 +46,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0058_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0058_container_runtime_input_custody (id TEXT);\n",
+    "0059_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0059_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0059_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0059_container_runtime_input_rewrap (id TEXT);\n",
+    "0060_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0060_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0060_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0060_container_runtime_input_acceptance (id TEXT);\n",
+    "0061_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0061_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -68,7 +68,7 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0057 source. Historical 0001-0049 fixtures are passed explicitly by
+// 0001-0058 source. Historical 0001-0049 fixtures are passed explicitly by
 // tests that exercise frozen import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
   return runSchema(invocation, selectedTarget, {
@@ -695,7 +695,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0057");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0058");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1124,21 +1124,21 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0057");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0058");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0057 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0058 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(currentMigrations, migrationDirectory, { recursive: true });
       copyFileSync(
         join(migrationDirectory, "0052_workflow_termination_intent.sql"),
-        join(migrationDirectory, "0058_unreviewed_extension.sql"),
+        join(migrationDirectory, "0059_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -1158,6 +1158,45 @@ describe("production-shaped D1 migration lane", () => {
       expect(failure.message).toContain("exact audited source inventory");
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0058 remains unavailable as a rehearsal or production fixed-wave boundary", async () => {
+    for (const environment of ["rehearsal", "production"] as const) {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0058-${environment}-`));
+      try {
+        const fixture = processFixture(environment);
+        let d1Reads = 0;
+        const failure = await runD1Schema(
+          {
+            action: "status",
+            environment,
+            commit: COMMIT,
+            // Exercise the runtime guard even though 0058 is intentionally absent from the API type.
+            throughMigration: "0058" as never,
+          },
+          { ...target, environment },
+          {
+            run: fixture.run,
+            reader: {
+              async read() {
+                d1Reads += 1;
+                return EMPTY;
+              },
+            },
+            migrationDirectory: currentMigrations,
+            outputDirectory: join(root, "work"),
+          },
+        ).catch((error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(DeployError);
+        expect(String(failure)).toContain("not an approved fixed wave boundary");
+        expect(fixture.calls).toHaveLength(0);
+        expect(d1Reads).toBe(0);
+        expect(existsSync(join(root, "work"))).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1237,7 +1276,8 @@ describe("production-shaped D1 migration lane", () => {
 
       expect(receipted).toEqual(
         readMigrationArtifact(currentMigrations)
-          .files.slice(22)
+          // The approved protected receipt chain intentionally ends at 0057.
+          .files.slice(22, 57)
           .map(({ name, digest, bytes }) => ({
             name,
             digest,

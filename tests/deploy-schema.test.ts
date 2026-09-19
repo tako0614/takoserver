@@ -33,16 +33,16 @@ afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 // ambient worktree migrations that are absent from a clean historical commit.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0058_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0058_container_runtime_input_custody (id TEXT);\n",
+    "0059_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0059_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0059_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0059_container_runtime_input_rewrap (id TEXT);\n",
+    "0060_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0060_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0060_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0060_container_runtime_input_acceptance (id TEXT);\n",
+    "0061_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0061_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -145,7 +145,7 @@ function migrationStateThrough(count: number, marker: string): D1SchemaState {
 function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
   return {
     applied: [
-      ...MIGRATIONS.slice(0, 57).map(({ name }) => name),
+      ...MIGRATIONS.slice(0, 58).map(({ name }) => name),
       ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
     ],
     shape: `${marker}\n`,
@@ -509,9 +509,10 @@ describe("forward-only D1 schema surface", () => {
           "0055_queue_custody_transfer_notices.sql",
           "0056_vector_index_storage.sql",
           "0057_cloudflare_managed_worker_version_execution_material.sql",
-          "0058_container_runtime_input_custody.sql",
-          "0059_container_runtime_input_rewrap.sql",
-          "0060_container_runtime_input_acceptance.sql",
+          "0058_cloudflare_managed_worker_domain_receipts.sql",
+          "0059_container_runtime_input_custody.sql",
+          "0060_container_runtime_input_rewrap.sql",
+          "0061_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);

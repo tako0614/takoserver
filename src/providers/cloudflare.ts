@@ -56,6 +56,7 @@ import type {
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackend,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
@@ -68,6 +69,7 @@ export type {
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
   CloudflareWorkersForPlatformsBackendFactoryOptions,
@@ -287,6 +289,7 @@ export class CloudflareProvider implements Provider {
             offerings: structuredClone(this.offerings),
             ...(this.#runtimeInputs === undefined ? {} : { runtimeInputs: this.#runtimeInputs }),
             workerCompatibilityDate: this.#workerCompatibilityDate,
+            zoneFor: (hostname, tenantRef) => this.#zoneFor(hostname, tenantRef),
           })
         : undefined;
     this.workerEndpointOriginReservations = {
@@ -1195,16 +1198,13 @@ export class CloudflareProvider implements Provider {
     return observed;
   }
 
-  async adopt(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: ResourceIdentity;
-    spec: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  async adopt(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      if (!this.#workerBackend.adopt) {
+        return failed("unavailable", "the managed Worker backend does not support adoption");
+      }
+      return await this.#workerBackend.adopt(input);
+    }
     if (input.operationMode === "recovery" && !input.providerHandle) {
       return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
     }
@@ -1220,16 +1220,16 @@ export class CloudflareProvider implements Provider {
   }
 
   /** Read-only adoption recovery through the provider's observe path. */
-  async recoverAdopt(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: ResourceIdentity;
-    spec: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  async recoverAdopt(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      if (!this.#workerBackend.recoverAdopt) {
+        return failed(
+          "unavailable",
+          "the managed Worker backend does not support adoption recovery",
+        );
+      }
+      return await this.#workerBackend.recoverAdopt(input);
+    }
     if (input.providerHandle) {
       return failed("unavailable", "Cloudflare adoption recovery cannot poll this handle", true);
     }
@@ -2778,6 +2778,8 @@ const REQUIRED_WORKER_BACKEND_METHODS = [
 ] as const;
 
 const OPTIONAL_WORKER_BACKEND_METHODS = [
+  "adopt",
+  "recoverAdopt",
   "readSqliteMigrationLedger",
   "applySqliteMigrationSuffix",
   "managedScheduleReconciliationStatus",

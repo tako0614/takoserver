@@ -117,6 +117,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0055_queue_custody_transfer_notices.sql",
   "0056_vector_index_storage.sql",
   "0057_cloudflare_managed_worker_version_execution_material.sql",
+  "0058_cloudflare_managed_worker_domain_receipts.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -234,6 +235,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:08f4c00798d4c8d377ba73abcd8e063d6e3e896f2f4b2d89c7e3830e1e11442a",
   "0057_cloudflare_managed_worker_version_execution_material.sql":
     "sha256:37ed54cda2385be78cbcb288683c1ce5896a902e49a5d9abe9231a825a6869d3",
+  "0058_cloudflare_managed_worker_domain_receipts.sql":
+    "sha256:11460e5d365ba0c5021b8432220e20acbbfe0104af3ca8fc921d3e8fc3824412",
 };
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
@@ -1461,7 +1464,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0057",
+      "selected D1 wave requires the exact audited source inventory 0001-0058",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1516,7 +1519,7 @@ function assertAuditedMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0057 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0058 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1527,7 +1530,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0057",
+      "audited migration lineage must contain exactly 0001-0058",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
