@@ -93,6 +93,7 @@ describe("Takoserver split deploy entrypoint", () => {
       kind: string;
       surfaces: {
         surface: string;
+        requiresScripts: readonly string[];
         triggers: readonly string[];
         requiresEnv: readonly string[];
         requiresTools: readonly string[];
@@ -193,12 +194,23 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(routineWorker?.obligations["failure-handling"]).toContain("credential resolver");
     expect(identityProbe?.obligations.provenance).toContain("integration-host-only");
     expect(identityProbe?.obligations.provenance).toContain("no FORM_AUTHORITY");
+    expect(identityProbe?.requiresScripts).toEqual([
+      "check",
+      "deploy",
+      "typecheck:form-authority-worker",
+    ]);
     expect(identityProbe?.obligations["post-conditions"]).toContain("publicIdentityRpcReady: true");
     expect(identityProbe?.obligations["post-conditions"]).toContain(
       "coreVerifierConfigured: false",
     );
     expect(identityProbe?.obligations["failure-handling"]).toContain(
       "production and rehearsal retain the absence refusal",
+    );
+    expect(identityProbe?.obligations["failure-handling"]).toContain(
+      "Every other probe apply retains `bun run check`.",
+    );
+    expect(identityProbe?.obligations["failure-handling"]).toContain(
+      "`bun test tests/deploy-form-authority-identity-probe.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`",
     );
     expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(

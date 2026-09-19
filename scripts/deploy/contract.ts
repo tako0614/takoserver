@@ -444,7 +444,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-identity-probe.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -476,6 +476,12 @@ export const DEPLOY_CONTRACT = {
           "refuses `storageRebind`; only the public Host and the two route-less Form authority Workers " +
           "can carry that integration-only declaration. " +
           integrationServiceBindingRefresh +
+          " On this identity-probe surface only, an integration transition declaring " +
+          "`--refresh-service-binding` runs `bun run typecheck:form-authority-worker` followed by " +
+          "`bun test tests/deploy-form-authority-identity-probe.test.ts " +
+          "tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` before Wrangler dry-run " +
+          "or upload; either gate failure stops before dry-run and upload. Every other probe apply " +
+          "retains `bun run check`. " +
           inputContract(applyReviewInput),
         "independent-review": review,
       },

@@ -365,7 +365,25 @@ export async function runFormAuthorityIdentityProbe(
   if (publicBefore.commit !== source.commit) {
     throw preflightError("served public Worker differs from identity probe source commit");
   }
-  await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
+  const integrationServiceBindingRefresh =
+    invocation.environment === "integration" &&
+    (invocation.transition?.delta.refreshedServiceBindings?.length ?? 0) > 0;
+  if (integrationServiceBindingRefresh) {
+    await checked(
+      run,
+      "integration identity probe service-binding refresh typecheck `bun run typecheck:form-authority-worker`",
+      ["bun", "run", "typecheck:form-authority-worker"],
+    );
+    await checked(run, "integration identity probe service-binding refresh tests", [
+      "bun",
+      "test",
+      "tests/deploy-form-authority-identity-probe.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-contract.test.ts",
+    ]);
+  } else {
+    await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
+  }
 
   const temporary = options.outputDirectory === undefined;
   const root =

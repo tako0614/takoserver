@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { publicFormCapabilityManifest } from "../scripts/deploy/form-authority.ts";
 import {
+  type FormAuthorityIdentityProbeProcess,
   type FormAuthorityIdentityProbeState,
   runFormAuthorityIdentityProbe,
   writeProbeConfig,
@@ -1416,6 +1417,14 @@ describe("Form authority identity probe forward transition apply", () => {
   const APPLY_COMMIT = "b".repeat(40);
   const PREDECESSOR_HOST_ID = "https://api.previous.integration.example.test";
   const PREDECESSOR_PUBLIC_SERVICE = "takoserver-api-integration-previous";
+  const SERVICE_REFRESH_TYPECHECK = ["bun", "run", "typecheck:form-authority-worker"] as const;
+  const SERVICE_REFRESH_TESTS = [
+    "bun",
+    "test",
+    "tests/deploy-form-authority-identity-probe.test.ts",
+    "tests/deploy-worker-state.test.ts",
+    "tests/deploy-contract.test.ts",
+  ] as const;
 
   const applyTarget = {
     ...target,
@@ -1465,7 +1474,10 @@ describe("Form authority identity probe forward transition apply", () => {
 
   function applyState(
     isUploaded: () => boolean,
-    input: { readonly stalePredecessorIdentity?: boolean } = {},
+    input: {
+      readonly stalePredecessorIdentity?: boolean;
+      readonly predecessorHasAuthority?: boolean;
+    } = {},
   ): FormAuthorityIdentityProbeState {
     const expected = expectedExactBindingClosure(applyTarget, {
       workerArtifactDigest: PUBLIC_DIGEST,
@@ -1534,7 +1546,9 @@ describe("Form authority identity probe forward transition apply", () => {
               uploadedProbeDigest ?? PUBLIC_DIGEST,
             )
           : probeVersion(
-              ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY"],
+              input.predecessorHasAuthority
+                ? ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY", "FORM_AUTHORITY"]
+                : ["TAKOSERVER_FORM_AUTHORITY_HOST_ID", "PUBLIC_HOST_IDENTITY"],
               APPLY_COMMIT,
               PUBLIC_DIGEST,
               input.stalePredecessorIdentity,
@@ -1559,7 +1573,46 @@ describe("Form authority identity probe forward transition apply", () => {
 
   let uploadedProbeDigest: `sha256:${string}` | null = null;
 
-  test("refreshes Host id and service binding from the target while adding authority in one upload", async () => {
+  async function runServiceBindingRefreshApply(
+    run: FormAuthorityIdentityProbeProcess,
+    isUploaded: () => boolean,
+    outputDirectory: string,
+  ) {
+    return runFormAuthorityIdentityProbe(
+      {
+        surface: "takoserver-form-authority-identity-probe",
+        action: "apply",
+        environment: "integration",
+        commit: APPLY_COMMIT,
+        transition: {
+          predecessorVersionId: PROBE_VERSION,
+          delta: {
+            retiredVars: [],
+            addedVars: [],
+            refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
+            refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+      },
+      applyTarget,
+      {
+        run,
+        state: applyState(isUploaded, {
+          stalePredecessorIdentity: true,
+          predecessorHasAuthority: true,
+        }),
+        fetcher: applyFetcher(),
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        outputDirectory,
+      },
+    );
+  }
+
+  test("refreshes the Host id and service binding from the target in one upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-probe-transition-"));
     let uploaded = false;
     uploadedProbeDigest = null;
@@ -1572,6 +1625,8 @@ describe("Form authority identity probe forward transition apply", () => {
         if (key === "git rev-parse HEAD") return ok(`${APPLY_COMMIT}\n`);
         if (key === "git branch --show-current") return ok("fix/probe-transition\n");
         if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+        if (key === SERVICE_REFRESH_TYPECHECK.join(" ")) return ok("green\n");
+        if (key === SERVICE_REFRESH_TESTS.join(" ")) return ok("green\n");
         if (key === "bun run check") return ok("green\n");
         if (command.includes("--dry-run")) {
           const out = command[command.indexOf("--outdir") + 1];
@@ -1595,35 +1650,7 @@ describe("Form authority identity probe forward transition apply", () => {
         }
         throw new Error(`unexpected command: ${key}`);
       };
-      const result = await runFormAuthorityIdentityProbe(
-        {
-          surface: "takoserver-form-authority-identity-probe",
-          action: "apply",
-          environment: "integration",
-          commit: APPLY_COMMIT,
-          transition: {
-            predecessorVersionId: PROBE_VERSION,
-            delta: {
-              retiredVars: [],
-              addedVars: [],
-              refreshedVars: ["TAKOSERVER_FORM_AUTHORITY_HOST_ID"],
-              refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
-              addedBindings: ["FORM_AUTHORITY"],
-              addedSecrets: [],
-              rotatedSecrets: [],
-            },
-          },
-        },
-        applyTarget,
-        {
-          run,
-          state: applyState(() => uploaded, { stalePredecessorIdentity: true }),
-          fetcher: applyFetcher(),
-          review: "independent-reviewer",
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          outputDirectory: root,
-        },
-      );
+      const result = await runServiceBindingRefreshApply(run, () => uploaded, root);
       expect(result).toMatchObject({
         kind: "takoserver.form-authority-identity-probe-apply@v1",
         bindingTransitionProfile: "none",
@@ -1634,6 +1661,16 @@ describe("Form authority identity probe forward transition apply", () => {
         ready: true,
       });
       expect(calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      const joinedCalls = calls.map((call) => call.join(" "));
+      const typecheckIndex = joinedCalls.indexOf(SERVICE_REFRESH_TYPECHECK.join(" "));
+      const testsIndex = joinedCalls.indexOf(SERVICE_REFRESH_TESTS.join(" "));
+      const dryRunIndex = calls.findIndex((call) => call.includes("--dry-run"));
+      const uploadIndex = calls.findIndex((call) => call.includes("--no-bundle"));
+      expect(typecheckIndex).toBeGreaterThanOrEqual(0);
+      expect(testsIndex).toBeGreaterThan(typecheckIndex);
+      expect(dryRunIndex).toBeGreaterThan(testsIndex);
+      expect(uploadIndex).toBeGreaterThan(dryRunIndex);
+      expect(joinedCalls).not.toContain("bun run check");
       expect(uploadConfig).toMatchObject({
         vars: { TAKOSERVER_FORM_AUTHORITY_HOST_ID: applyTarget.formAuthority.hostId },
         services: [
@@ -1654,6 +1691,70 @@ describe("Form authority identity probe forward transition apply", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  for (const failedGate of ["typecheck", "focused tests"] as const) {
+    test(`does not dry-run or upload when ${failedGate} fails`, async () => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-probe-transition-gate-"));
+      let uploaded = false;
+      let dryRun = false;
+      uploadedProbeDigest = null;
+      const calls: string[][] = [];
+      const failedCommand =
+        failedGate === "typecheck"
+          ? SERVICE_REFRESH_TYPECHECK.join(" ")
+          : SERVICE_REFRESH_TESTS.join(" ");
+      try {
+        const run = async (command: readonly string[]) => {
+          calls.push([...command]);
+          const key = command.join(" ");
+          if (key === "git rev-parse HEAD") return ok(`${APPLY_COMMIT}\n`);
+          if (key === "git branch --show-current") return ok("fix/probe-transition\n");
+          if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+          if (key === SERVICE_REFRESH_TYPECHECK.join(" ")) {
+            return failedGate === "typecheck"
+              ? { exitCode: 1, stdout: "", stderr: "typecheck failed\n" }
+              : ok("green\n");
+          }
+          if (key === SERVICE_REFRESH_TESTS.join(" ")) {
+            return failedGate === "focused tests"
+              ? { exitCode: 1, stdout: "", stderr: "focused tests failed\n" }
+              : ok("green\n");
+          }
+          if (key === "bun run check") return ok("green\n");
+          if (command.includes("--dry-run")) {
+            dryRun = true;
+            throw new Error("owner gate must precede Wrangler dry-run");
+          }
+          if (command.includes("--no-bundle")) {
+            uploaded = true;
+            return ok("uploaded\n");
+          }
+          throw new Error(`unexpected command: ${key}`);
+        };
+        const failure = await runServiceBindingRefreshApply(run, () => uploaded, root).catch(
+          (error: unknown) => error,
+        );
+        expect(failure).toBeInstanceOf(Error);
+        expect(calls.map((call) => call.join(" "))).toContain(failedCommand);
+        expect(dryRun).toBe(false);
+        expect(uploaded).toBe(false);
+        expect(calls.some((call) => call.includes("--dry-run"))).toBe(false);
+        expect(calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+        if (failedGate === "focused tests") {
+          expect(
+            calls.map((call) => call.join(" ")).indexOf(SERVICE_REFRESH_TYPECHECK.join(" ")),
+          ).toBeLessThan(calls.map((call) => call.join(" ")).indexOf(failedCommand));
+        } else {
+          expect(calls.map((call) => call.join(" "))).not.toContain(
+            SERVICE_REFRESH_TESTS.join(" "),
+          );
+        }
+      } finally {
+        uploadedProbeDigest = null;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("rechecks the Form authority Worker at the mutation fence before uploading", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-probe-authority-fence-"));

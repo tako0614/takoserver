@@ -302,13 +302,23 @@ does not enter this public transition mechanism.
 
 Each accepts `--closure-predecessor-version=<uuid>` together with an explicit
 declaration built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
-`--refresh-var=NAME`, `--add-binding=NAME`, `--add-secret=NAME` and
-`--rotate-secret=NAME` flags. `--add-binding` names a binding that is not plain
-text — a service, D1, R2 or Durable Object binding the current code derives and
-the predecessor lacks. Code-derived values stay code-derived: the declaration
-names the binding, and the value still comes from the selected commit and
-target. Where nothing is declared, every surface stays exactly as strict as it
-is today.
+`--refresh-var=NAME`, `--refresh-service-binding=NAME`, `--add-binding=NAME`,
+`--add-secret=NAME` and `--rotate-secret=NAME` flags. `--add-binding` names a
+binding that is not plain text — a service, D1, R2 or Durable Object binding
+the current code derives and the predecessor lacks. Code-derived values stay
+code-derived: the declaration names the binding, and the value still comes
+from the selected commit and target. Where nothing is declared, every surface
+stays exactly as strict as it is today.
+
+`--refresh-service-binding=NAME` is integration-only and names an existing
+service binding whose exact service/entrypoint tuple changes. The pinned
+predecessor must contain that same-name service binding, and its tuple must
+differ from the target-derived successor tuple; a no-op declaration is
+refused. The public Takoserver deploy owner still derives the successor from
+the selected commit and target — this flag supplies only the binding name.
+It cannot refresh D1, R2, Durable Object, plain-text or secret bindings. Every
+unlisted binding and the routing closure remain exact. D1/R2 changes continue
+to use only the separate paired integration storage rebind below.
 
 The declaration is
 machine-checked: the profile admits the predecessor only when the authoritative
@@ -343,14 +353,22 @@ Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
 Production and rehearsal reject the rebind before provider effects. The
 operator gateway and storage-free identity probe do not accept it.
-Only this integration storage-rebind apply uses the bounded publication gate:
+This integration storage-rebind apply uses the bounded publication gate:
 the Host runs `bun run typecheck:worker`, then Bun tests matching
 `storage rebind` in the Host closure-transition, Worker binding-state and
 integration storage-generation test files; Form authority runs
 `bun run typecheck:form-authority-worker`, then the equivalent filtered Form
 transition, binding-state and storage-generation tests. Both gates finish
-before Wrangler dry-run. Status is read-only, and every other Host/Form apply
-retains its existing `bun run check` gate.
+before Wrangler dry-run. Status is read-only, and every other apply on these
+Host/Form storage-rebind Worker surfaces retains its existing `bun run check`
+gate.
+
+For the identity probe only, an integration transition declaring
+`--refresh-service-binding` runs `bun run typecheck:form-authority-worker`, then
+`bun test tests/deploy-form-authority-identity-probe.test.ts
+tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`, before any
+Wrangler dry-run or upload. Either gate failing prevents both; every other
+identity-probe apply retains `bun run check`.
 
 Applying a transition still requires everything the surface required before it:
 the same independent reviewer, the same source qualification, the same single
