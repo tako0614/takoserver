@@ -266,7 +266,14 @@ export async function verifyIntegrationStorageGenerationTarget(
       },
       providerContext.environment,
       options.run ?? runCommand,
-      options,
+      {
+        ...(options.readD1State === undefined ? {} : { readD1State: options.readD1State }),
+        ...(options.reader === undefined ? {} : { reader: options.reader }),
+        ...(options.wranglerCommand === undefined
+          ? {}
+          : { wranglerCommand: options.wranglerCommand }),
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      },
     );
     assertCompleteDatabase(
       migrationState,

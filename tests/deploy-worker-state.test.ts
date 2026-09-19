@@ -142,12 +142,13 @@ describe("immutable Worker Version binding closure", () => {
         normalizedWorkerClosureDelta({ ...base, storageRebind } as unknown as WorkerClosureDelta),
       ).toThrow("storage rebind");
     }
+    const validStorageRebind: NonNullable<WorkerClosureDelta["storageRebind"]> = {
+      predecessorStateDatabaseId: "00000000-0000-4000-8000-0000000000a4",
+      predecessorObjectBucketName: `takoserver-i-${"e".repeat(32)}`,
+    };
     const valid: WorkerClosureDelta = {
       ...base,
-      storageRebind: {
-        predecessorStateDatabaseId: "00000000-0000-4000-8000-0000000000a4",
-        predecessorObjectBucketName: `takoserver-i-${"e".repeat(32)}`,
-      },
+      storageRebind: validStorageRebind,
     };
     const closure = {
       STATE_DB: { type: "d1", fields: { id: "00000000-0000-4000-8000-0000000000a5" } },
@@ -156,11 +157,11 @@ describe("immutable Worker Version binding closure", () => {
     const predecessor = {
       resources: {
         bindings: [
-          { name: "STATE_DB", type: "d1", id: valid.storageRebind.predecessorStateDatabaseId },
+          { name: "STATE_DB", type: "d1", id: validStorageRebind.predecessorStateDatabaseId },
           {
             name: "OBJECTS",
             type: "r2_bucket",
-            bucket_name: valid.storageRebind.predecessorObjectBucketName,
+            bucket_name: validStorageRebind.predecessorObjectBucketName,
           },
         ],
       },

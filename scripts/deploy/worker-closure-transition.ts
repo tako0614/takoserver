@@ -179,7 +179,9 @@ export async function runWorkerClosureTransition(
       : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
           ...options.integrationStorageVerification,
           run,
-          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
           migrationDirectory:
             options.integrationStorageVerification?.migrationDirectory ??
             resolve(sourceRepositoryRoot, "migrations"),
@@ -437,7 +439,9 @@ export async function runWorkerClosureTransition(
         {
           ...options.integrationStorageVerification,
           run,
-          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
           migrationDirectory:
             options.integrationStorageVerification?.migrationDirectory ??
             resolve(sourceRepositoryRoot, "migrations"),

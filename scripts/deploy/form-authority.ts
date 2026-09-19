@@ -362,7 +362,9 @@ export async function runFormAuthority(
       ? null
       : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
           run,
-          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
           ...options.integrationStorageVerification,
         });
   const state =
@@ -787,7 +789,9 @@ export async function runFormAuthority(
         invocation.environment,
         {
           run,
-          cloudflareEnvironment: options.cloudflareEnvironment,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
           ...options.integrationStorageVerification,
         },
       );

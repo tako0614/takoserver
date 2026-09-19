@@ -1707,9 +1707,13 @@ describe("reviewed Worker closure transition", () => {
       if (targetRequirement === null || targetRequirement?.type !== "service") {
         throw new Error("fixture target service binding missing");
       }
+      const { service, entrypoint } = targetRequirement.fields;
+      if (typeof service !== "string" || typeof entrypoint !== "string") {
+        throw new Error("fixture target service binding is incomplete");
+      }
       const targetService = {
-        service: targetRequirement.fields.service,
-        entrypoint: targetRequirement.fields.entrypoint,
+        service,
+        entrypoint,
       };
       const oldService = {
         service: "takoserver-provider-executor-predecessor",
