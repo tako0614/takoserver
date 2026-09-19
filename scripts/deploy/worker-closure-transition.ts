@@ -178,6 +178,9 @@ export async function runWorkerClosureTransition(
           ...options.integrationStorageVerification,
           run,
           cloudflareEnvironment: options.cloudflareEnvironment,
+          migrationDirectory:
+            options.integrationStorageVerification?.migrationDirectory ??
+            resolve(sourceRepositoryRoot, "migrations"),
           ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         });
   const temporary = options.outputDirectory === undefined;
@@ -433,6 +436,9 @@ export async function runWorkerClosureTransition(
           ...options.integrationStorageVerification,
           run,
           cloudflareEnvironment: options.cloudflareEnvironment,
+          migrationDirectory:
+            options.integrationStorageVerification?.migrationDirectory ??
+            resolve(sourceRepositoryRoot, "migrations"),
           ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         },
       );
