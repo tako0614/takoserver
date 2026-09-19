@@ -1112,7 +1112,9 @@ function gatewayServiceBindingRefreshState(isUploaded: () => boolean): FormAutho
       ) {
         const predecessor = gatewayVersion();
         predecessor.resources.bindings = predecessor.resources.bindings.map((binding) =>
-          binding.name === "PUBLIC_HOST_IDENTITY"
+          binding.type === "service" &&
+          binding.name === "PUBLIC_HOST_IDENTITY" &&
+          typeof binding.entrypoint === "string"
             ? { ...binding, service: "takoserver-api-integration-previous" }
             : binding,
         );
@@ -2679,7 +2681,7 @@ describe("Form authority integration storage rebind", () => {
           gateCalls.filter(
             (call) => call.join(" ") === serviceRefreshTypecheck.join(" ") || call[1] === "test",
           ),
-        ).toEqual(expectedGateCalls);
+        ).toEqual(expectedGateCalls.map((command) => [...command]));
         expect(gateCalls.some((call) => call.includes("--dry-run"))).toBe(false);
         expect(gateCalls.some((call) => call.includes("--no-bundle"))).toBe(false);
         expect(uploaded).toBe(false);
