@@ -769,6 +769,82 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test("integration authority status uses the selected Wrangler for default remote D1 readers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-private-wrangler-"));
+    const authorityTarget = {
+      ...target,
+      integrationE2eCredentialAuthority: {
+        organizationId: INTEGRATION_E2E_ORGANIZATION_ID,
+        publicJwk: { kty: "OKP", crv: "Ed25519", x: "E".repeat(43) },
+      },
+    } satisfies DeployTarget;
+    const current = fixture();
+    const privateWrangler = join(root, "private", "node_modules", ".bin", "wrangler");
+    const d1Calls: string[][] = [];
+    const run: WorkerProcess = async (command) => {
+      d1Calls.push([...command]);
+      const sql = command[command.indexOf("--command") + 1];
+      if (sql === undefined) throw new Error("missing D1 command");
+      if (sql.includes("FROM runtime_grant_keys")) {
+        return ok(
+          JSON.stringify([
+            {
+              success: true,
+              results: [
+                {
+                  key_id: "key-current",
+                  public_jwk: JSON.stringify({
+                    kty: "OKP",
+                    crv: "Ed25519",
+                    x: `${"F".repeat(42)}A`,
+                  }),
+                  created_at_epoch_seconds: 1_700_000_000,
+                  revoked_at_epoch_seconds: null,
+                },
+              ],
+            },
+          ]),
+        );
+      }
+      if (sql.includes("SELECT name FROM sqlite_schema WHERE type = 'table'")) {
+        return ok(JSON.stringify([{ success: true, results: [] }]));
+      }
+      if (sql.includes("FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")) {
+        return ok(JSON.stringify([{ success: true, results: [] }]));
+      }
+      throw new Error(`unexpected D1 query: ${sql}`);
+    };
+
+    try {
+      await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          legacyPredecessorVersionId: VERSION_BEFORE,
+        },
+        authorityTarget,
+        {
+          state: current.state,
+          run,
+          wranglerPath: privateWrangler,
+          outputDirectory: root,
+        },
+      );
+
+      const migrationReads = d1Calls.filter((command) => command.at(-1)?.includes("sqlite_schema"));
+      const signingKeyRead = d1Calls.find((command) =>
+        command.at(-1)?.includes("runtime_grant_keys"),
+      );
+      expect(migrationReads).toHaveLength(2);
+      expect(migrationReads.every((command) => command[0] === privateWrangler)).toBe(true);
+      expect(signingKeyRead?.[0]).toBe(privateWrangler);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("only the integration authority cutover adds one complete provenance-bound JIT profile", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-jit-authority-"));
     const authorityTarget = {

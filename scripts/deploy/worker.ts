@@ -249,12 +249,20 @@ export async function runWorker(
     });
     const migrations =
       options.migrations ??
-      remoteMigrationReader(inspectionConfig, environment, run, sourceRepositoryRoot);
+      remoteMigrationReader(
+        inspectionConfig,
+        environment,
+        run,
+        sourceRepositoryRoot,
+        options.wranglerPath,
+      );
     const signingDatabase =
       target.integrationE2eCredentialAuthority === undefined
         ? undefined
         : (options.signingDatabase ??
-          createRemoteSigningDatabase(inspectionConfig, environment, run));
+          createRemoteSigningDatabase(inspectionConfig, environment, run, (args) =>
+            deployWranglerCommand(options.wranglerPath, args),
+          ));
     const signingIdentity =
       signingDatabase === undefined
         ? undefined
@@ -870,11 +878,18 @@ function remoteMigrationReader(
   environment: Readonly<Record<string, string>>,
   run: WorkerProcess,
   sourceRepositoryRoot = REPOSITORY,
+  wranglerPath?: string,
 ): WorkerMigrationReader {
   return {
     async read() {
       const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
-      const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
+      const remote = await readD1SchemaState(
+        new RemoteD1(configPath, {
+          environment,
+          run,
+          wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
+        }),
+      );
       return { local: local.names, applied: remote.applied };
     },
   };
