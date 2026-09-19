@@ -632,6 +632,30 @@ export async function runFormAuthority(
     }
   }
 
+  const coreVerifierReusePredecessorVersionId =
+    invocation.action === "apply" &&
+    invocation.environment === "integration" &&
+    selected.kind === "authority" &&
+    selected.verificationMode === "released-core" &&
+    before !== null &&
+    invocation.transition !== undefined &&
+    before.bindingTransitionProfile === "declared-delta-predecessor"
+      ? before.history.versionId
+      : null;
+  const initialCoreVerifierReadback =
+    coreVerifierReusePredecessorVersionId !== null
+      ? await readFormAuthorityCoreVerifierIdentityProbe(
+          {
+            probeOrigin: requiredIdentityProbeOrigin(target),
+            authorityWorkerVersionId: coreVerifierReusePredecessorVersionId,
+            artifactDigest: takoformCoreVerifierArtifactDigest(),
+          },
+          options.fetcher ?? fetch,
+        )
+      : null;
+  const reusableCoreVerifierIdentity =
+    initialCoreVerifierReadback?.ready === true ? initialCoreVerifierReadback.identity : null;
+
   if (invocation.scopeTransition) {
     if (before?.scopeBindingProfile === "exact-target") {
       throw preflightError(
@@ -736,6 +760,7 @@ export async function runFormAuthority(
       commit: source.commit,
       run,
       environment,
+      ...(reusableCoreVerifierIdentity === null ? {} : { containersRollout: "none" as const }),
       main: resolve(REPOSITORY, selected.main),
       writeConfig: ({ path, main }) =>
         writeFormAuthorityConfig({
@@ -798,7 +823,27 @@ export async function runFormAuthority(
       "--strict",
       "--message",
       message(invocation.surface, source.commit, authorityArtifactDigest),
+      ...(reusableCoreVerifierIdentity === null ? [] : ["--containers-rollout", "none"]),
     ]);
+    if (reusableCoreVerifierIdentity !== null && coreVerifierReusePredecessorVersionId !== null) {
+      const finalCoreVerifierReadback = await readFormAuthorityCoreVerifierIdentityProbe(
+        {
+          probeOrigin: requiredIdentityProbeOrigin(target),
+          authorityWorkerVersionId: coreVerifierReusePredecessorVersionId,
+          artifactDigest: takoformCoreVerifierArtifactDigest(),
+        },
+        options.fetcher ?? fetch,
+      );
+      if (
+        finalCoreVerifierReadback.ready !== true ||
+        canonicalJson(finalCoreVerifierReadback.identity) !==
+          canonicalJson(reusableCoreVerifierIdentity)
+      ) {
+        throw preflightError(
+          "released Core verifier identity changed before same-image Form authority publication",
+        );
+      }
+    }
     if (initialStorageProof !== null) {
       const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
         target,

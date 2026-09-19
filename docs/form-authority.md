@@ -47,6 +47,28 @@ protocol, Core tag, Core commit, and artifact digest. The portable
 `--containers-rollout none`; the native image build belongs to the deploy
 surface and requires Docker on the operator machine.
 
+An integration-only, explicitly declared closure transition may reuse the
+already-running verifier image when its live identity matches both the exact
+predecessor Worker Version and the current source-derived verifier digest.
+The deploy surface derives this choice internally and passes
+`--containers-rollout none` to both bundle preparation and publication. It
+rechecks the same identity immediately before upload and still requires the
+successor Version's verifier readback. A missing or mismatched initial proof
+keeps the normal image-build path; drift after reuse was selected stops before
+upload. Bootstrap, other environments, and undeclared transitions do not select
+this path.
+
+The verifier's Container name includes the Host id, while its application permits
+only one running instance. A Host-id transition can therefore hit native
+instance-capacity exhaustion while the old named instance is still active. The
+SDK stops an inactive instance after five minutes, but elapsed wall time or an
+aggregate health count alone does not prove that it stopped. If the upload was
+acknowledged and verifier readback failed, do not repeat the upload or treat a
+generic binding remedy as proof that a binding is missing. Inspect the native
+startup/stop evidence, then use the owner's `--status` readback after the state
+changes. Completion still requires the exact successor Version and verifier
+identity; this path does not raise capacity or stop instances automatically.
+
 Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned
 `identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
@@ -88,6 +110,12 @@ Workers. Each Worker independently rejects every signed plan, apply, or
 readback body whose activation is not that exact `kind: space`, tenant, and
 Space before reaching the RPC or storage boundary; caller input cannot widen
 that audience.
+
+This admission path uses its dedicated Form operator key, not a customer login
+session. Its tenant/Space audience is an exact identifier scope; admission does
+not look up or create organization or Space rows. It can therefore prepare Form
+state before first login, but does not provision an organization or authorize
+subsequent customer resource requests.
 
 The separate owner surface
 `takoserver-integration-form-authority-deactivation` has the same sealed

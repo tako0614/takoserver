@@ -3224,41 +3224,75 @@ describe("released-Core Form authority bootstrap", () => {
   const IDENTITY_PROBE_PREDECESSOR_VERSION_ID = "77777777-7777-4777-8777-777777777777";
   const RELEASED_CORE_VERSION_ID = "88888888-8888-4888-8888-888888888888";
   const RELEASED_CORE_SUCCESSOR_VERSION_ID = "99999999-9999-4999-8999-999999999999";
+  const currentCoreCapabilityManifest = publicFormCapabilityManifest();
+  const PREVIOUS_CORE_CAPABILITY_MANIFEST_JSON = canonicalJson({
+    ...currentCoreCapabilityManifest,
+    forms: Object.fromEntries(
+      Object.entries(currentCoreCapabilityManifest.forms).filter(
+        ([form]) => form !== "StaticAssetBundle",
+      ),
+    ),
+  });
+  const CORE_SERVICE_STORAGE_REFRESH_DELTA = {
+    retiredVars: [],
+    addedVars: [],
+    refreshedVars: [
+      "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+      "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+    ],
+    refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
+    addedBindings: [],
+    addedSecrets: [],
+    rotatedSecrets: [],
+    storageRebind: FORM_STORAGE_REBIND,
+  } as const;
 
-  function releasedCoreVersion(commit: string, artifactDigest: `sha256:${string}`) {
+  function releasedCoreVersion(
+    commit: string,
+    artifactDigest: `sha256:${string}`,
+    inspectedTarget: typeof target | typeof formStorageTarget = target,
+  ) {
     return {
       annotations: {
         "workers/message": `form-authority:takoserver-form-authority-worker:${commit}:${artifactDigest}`,
       },
       resources: {
         bindings: [
-          { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
-          { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
+          { type: "d1" as const, name: "STATE_DB", id: inspectedTarget.d1.databaseId },
           {
-            type: "service",
+            type: "r2_bucket" as const,
+            name: "OBJECTS",
+            bucket_name: inspectedTarget.r2.bucketName,
+          },
+          {
+            type: "service" as const,
             name: "PUBLIC_HOST_IDENTITY",
-            service: target.workerName,
+            service: inspectedTarget.workerName,
             entrypoint: "PublicHostIdentityEntrypoint",
           },
-          { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: "integration" },
           {
-            type: "plain_text",
-            name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
-            text: target.formAuthority.hostId,
+            type: "plain_text" as const,
+            name: "TAKOSERVER_ENVIRONMENT",
+            text: "integration",
           },
           {
-            type: "plain_text",
+            type: "plain_text" as const,
+            name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+            text: inspectedTarget.formAuthority.hostId,
+          },
+          {
+            type: "plain_text" as const,
             name: "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
             text: CAPABILITY_MANIFEST_JSON,
           },
-          { type: "version_metadata", name: "WORKER_VERSION" },
+          { type: "version_metadata" as const, name: "WORKER_VERSION" },
           {
-            type: "durable_object_namespace",
+            type: "durable_object_namespace" as const,
             name: "CORE_VERIFIER",
             class_name: "TakoformCoreVerifierContainer",
           },
           {
-            type: "plain_text",
+            type: "plain_text" as const,
             name: "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
             text: takoformCoreVerifierArtifactDigest(),
           },
@@ -3268,26 +3302,30 @@ describe("released-Core Form authority bootstrap", () => {
   }
 
   /** The account before the first upload, and after it once `uploaded` flips. */
-  function releasedCoreState(input: {
-    readonly present: boolean;
-    readonly isUploaded?: () => boolean;
-  }): FormAuthorityDeployState {
+  function releasedCoreState(
+    input: {
+      readonly present: boolean;
+      readonly isUploaded?: () => boolean;
+      readonly declaredTransitionPredecessor?: boolean;
+    },
+    inspectedTarget: typeof target | typeof formStorageTarget = target,
+  ): FormAuthorityDeployState {
     const live = () => input.present || (input.isUploaded?.() ?? false);
     return {
       async workerScripts() {
         return [
-          target.formAuthority.integrationWorkerName,
-          target.formAuthority.identityProbeWorkerName,
-          ...(live() ? [target.formAuthority.workerName] : []),
+          inspectedTarget.formAuthority.integrationWorkerName,
+          inspectedTarget.formAuthority.identityProbeWorkerName,
+          ...(live() ? [inspectedTarget.formAuthority.workerName] : []),
         ];
       },
       async workerDeployments(workerName) {
-        if (workerName === target.workerName) {
+        if (workerName === inspectedTarget.workerName) {
           return [
             deployment("public-deployment", PUBLIC_WORKER_VERSION_ID, "2026-08-28T00:00:00Z"),
           ];
         }
-        if (workerName === target.formAuthority.identityProbeWorkerName) {
+        if (workerName === inspectedTarget.formAuthority.identityProbeWorkerName) {
           return [
             deployment(
               "identity-probe-predecessor",
@@ -3315,12 +3353,13 @@ describe("released-Core Form authority bootstrap", () => {
           : [deployment("core-current", RELEASED_CORE_VERSION_ID, "2026-08-28T02:00:00Z")];
       },
       async workerVersion(workerName) {
-        if (workerName === target.workerName) {
+        if (workerName === inspectedTarget.workerName) {
           return publicVersion(
             `takoserver-worker:${PUBLIC_WORKER_COMMIT}:${PUBLIC_WORKER_DIGEST.slice("sha256:".length)}`,
+            inspectedTarget,
           );
         }
-        if (workerName === target.formAuthority.identityProbeWorkerName) {
+        if (workerName === inspectedTarget.formAuthority.identityProbeWorkerName) {
           return {
             annotations: {
               "workers/message": `form-authority-identity-probe:${COMMIT}:${BUNDLE_DIGEST}`,
@@ -3330,31 +3369,58 @@ describe("released-Core Form authority bootstrap", () => {
                 {
                   type: "plain_text",
                   name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
-                  text: target.formAuthority.hostId,
+                  text: inspectedTarget.formAuthority.hostId,
                 },
                 {
                   type: "service",
                   name: "PUBLIC_HOST_IDENTITY",
-                  service: target.workerName,
+                  service: inspectedTarget.workerName,
                   entrypoint: "PublicHostIdentityEntrypoint",
                 },
               ],
             },
           };
         }
-        return releasedCoreVersion(COMMIT, BUNDLE_DIGEST);
+        const version = releasedCoreVersion(COMMIT, BUNDLE_DIGEST, inspectedTarget);
+        if (input.declaredTransitionPredecessor === true && !(input.isUploaded?.() ?? false)) {
+          version.resources.bindings = version.resources.bindings.map((binding) => {
+            if (binding.type === "d1" && binding.name === "STATE_DB") {
+              return { ...binding, id: FORM_PREDECESSOR_STORAGE_DATABASE_ID };
+            }
+            if (binding.type === "r2_bucket" && binding.name === "OBJECTS") {
+              return { ...binding, bucket_name: FORM_PREDECESSOR_STORAGE_BUCKET };
+            }
+            if (binding.type === "service" && binding.name === "PUBLIC_HOST_IDENTITY") {
+              return { ...binding, service: FORM_PREDECESSOR_PUBLIC_SERVICE };
+            }
+            if (
+              binding.type === "plain_text" &&
+              binding.name === "TAKOSERVER_FORM_AUTHORITY_HOST_ID"
+            ) {
+              return { ...binding, text: FORM_PREDECESSOR_HOST_ID };
+            }
+            if (
+              binding.type === "plain_text" &&
+              binding.name === "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST"
+            ) {
+              return { ...binding, text: PREVIOUS_CORE_CAPABILITY_MANIFEST_JSON };
+            }
+            return binding;
+          });
+        }
+        return version;
       },
       async workerSecrets(workerName) {
-        return workerName === target.workerName
-          ? expectedWorkerSecrets(target).map((name) => ({ name, type: "secret_text" }))
+        return workerName === inspectedTarget.workerName
+          ? expectedWorkerSecrets(inspectedTarget).map((name) => ({ name, type: "secret_text" }))
           : [];
       },
       async workerDomains() {
-        return [{ hostname: "api.integration.example.test", service: target.workerName }];
+        return [{ hostname: "api.integration.example.test", service: inspectedTarget.workerName }];
       },
       async workerSubdomain(workerName) {
         return {
-          enabled: workerName === target.formAuthority.identityProbeWorkerName,
+          enabled: workerName === inspectedTarget.formAuthority.identityProbeWorkerName,
           previewsEnabled: false,
         };
       },
@@ -3406,11 +3472,70 @@ describe("released-Core Form authority bootstrap", () => {
     return { fetcher, paths };
   }
 
+  function releasedCoreProbeSequence(
+    replies: readonly ({
+      readonly authorityWorkerVersionId: string;
+      readonly artifactDigest?: string;
+    } | null)[],
+  ) {
+    const fallback = releasedCoreFetcher();
+    let coreProbeCount = 0;
+    const fetcher = async (url: string): Promise<Response> => {
+      const path = new URL(url).pathname;
+      if (path !== CORE_VERIFIER_PATH) return await fallback.fetcher(url);
+      fallback.paths.push(path);
+      const reply = replies[coreProbeCount] ?? null;
+      coreProbeCount += 1;
+      if (reply === null) {
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      }
+      return Response.json({
+        kind: "takoserver.form-authority-core-verifier-identity@v1",
+        authorityWorkerVersionId: reply.authorityWorkerVersionId,
+        verifier: {
+          protocol: "takoserver.takoform-core-verifier@v1",
+          coreVersion: "v1.1.0",
+          coreCommit: "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+          artifactDigest: reply.artifactDigest ?? takoformCoreVerifierArtifactDigest(),
+        },
+      });
+    };
+    return { fetcher, paths: fallback.paths, coreProbeCount: () => coreProbeCount };
+  }
+
   const invocation = {
     surface: "takoserver-form-authority-worker",
     environment: "integration",
     commit: COMMIT,
   } as const;
+
+  async function applyCoreServiceStorageTransition(input: {
+    readonly run: FormAuthorityProcess;
+    readonly state: FormAuthorityDeployState;
+    readonly fetcher: (url: string, init?: RequestInit) => Promise<Response>;
+    readonly outputDirectory: string;
+  }) {
+    return await runFormAuthorityImpl(
+      {
+        ...invocation,
+        action: "apply",
+        transition: {
+          predecessorVersionId: RELEASED_CORE_VERSION_ID,
+          delta: CORE_SERVICE_STORAGE_REFRESH_DELTA,
+        },
+      },
+      formStorageTarget,
+      {
+        run: input.run,
+        state: input.state,
+        fetcher: input.fetcher,
+        outputDirectory: input.outputDirectory,
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        integrationStorageVerification: integrationStorageVerificationOptions(formStorageTarget),
+      },
+    );
+  }
 
   test("publishes the first Version with its readback deferred, and names what finishes the lane", async () => {
     let uploaded = false;
@@ -3541,6 +3666,150 @@ describe("released-Core Form authority bootstrap", () => {
     expect(uploaded).toBe(false);
   });
 
+  test("reuses the exact Core verifier image for an admitted storage and binding transition", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-container-reuse-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
+      ]);
+      const result = await applyCoreServiceStorageTransition({
+        run: process.run,
+        state: releasedCoreState(
+          { present: true, isUploaded: () => uploaded, declaredTransitionPredecessor: true },
+          formStorageTarget,
+        ),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      });
+
+      const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+      const reuseDryRuns = dryRuns.filter((command) => command.includes("--containers-rollout"));
+      const upload = process.calls.find((command) => command.includes("--no-bundle"));
+      const finalDryRun = dryRuns.at(-1);
+      if (!finalDryRun || !upload) throw new Error("expected one final dry-run and upload command");
+      expect(reuseDryRuns).toEqual([finalDryRun]);
+      expect(finalDryRun.slice(-2)).toEqual(["--containers-rollout", "none"]);
+      expect(upload.slice(-2)).toEqual(["--containers-rollout", "none"]);
+      expect(probes.coreProbeCount()).toBe(3);
+      expect(result).toMatchObject({
+        verificationMode: "released-core",
+        previousVersionId: RELEASED_CORE_VERSION_ID,
+        versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+        coreVerifierRpcReady: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["unready", [null, { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID }]],
+    [
+      "mismatched",
+      [
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID, artifactDigest: PREVIOUS_DIGEST },
+        { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
+      ],
+    ],
+  ] as const)(
+    "uses the normal image path when the predecessor proof is %s",
+    async (_case, replies) => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-container-fallback-"));
+      let uploaded = false;
+      try {
+        const process = fakeProcess({ onUpload: () => (uploaded = true) });
+        const probes = releasedCoreProbeSequence(replies);
+        await applyCoreServiceStorageTransition({
+          run: process.run,
+          state: releasedCoreState(
+            { present: true, isUploaded: () => uploaded, declaredTransitionPredecessor: true },
+            formStorageTarget,
+          ),
+          fetcher: probes.fetcher,
+          outputDirectory: root,
+        });
+
+        const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+        const upload = process.calls.find((command) => command.includes("--no-bundle"));
+        expect(dryRuns.every((command) => !command.includes("--containers-rollout"))).toBe(true);
+        expect(upload).toBeDefined();
+        expect(upload ?? []).not.toContain("--containers-rollout");
+        expect(probes.coreProbeCount()).toBe(2);
+        expect(uploaded).toBe(true);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("refuses proof drift before uploading the same-image transition", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-container-drift-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        {
+          authorityWorkerVersionId: RELEASED_CORE_VERSION_ID,
+          artifactDigest: PREVIOUS_DIGEST,
+        },
+      ]);
+      const failure = await applyCoreServiceStorageTransition({
+        run: process.run,
+        state: releasedCoreState(
+          { present: true, isUploaded: () => uploaded, declaredTransitionPredecessor: true },
+          formStorageTarget,
+        ),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as DeployError).message).toContain("identity changed before same-image");
+      expect(probes.coreProbeCount()).toBe(2);
+      expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+      expect(uploaded).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("still requires the successor Core verifier readback after image reuse", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-container-successor-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        null,
+      ]);
+      const failure = await applyCoreServiceStorageTransition({
+        run: process.run,
+        state: releasedCoreState(
+          { present: true, isUploaded: () => uploaded, declaredTransitionPredecessor: true },
+          formStorageTarget,
+        ),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("verification");
+      expect((failure as DeployError).message).toContain("released Core verifier live identity");
+      expect(probes.coreProbeCount()).toBe(3);
+      expect(process.calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+      expect(uploaded).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("still refuses a steady-state upload whose Core verifier is not live", async () => {
     let uploaded = false;
     const process = fakeProcess({
@@ -3587,6 +3856,7 @@ describe("released-Core Form authority bootstrap", () => {
     });
     expect(result.verifierBridgePending).toBeUndefined();
     expect(String(result.rollback)).toContain(RELEASED_CORE_VERSION_ID);
+    expect(process.calls.some((command) => command.includes("--containers-rollout"))).toBe(false);
   });
 
   test("reads the bridge and reports it ready once the probe has been bound", async () => {

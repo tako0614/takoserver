@@ -59,6 +59,8 @@ export async function prepareWorkerArtifact(input: {
   readonly writeConfig?: WorkerArtifactConfigWriter;
   /** Use the version API for a non-mutating build when the caller will publish explicitly. */
   readonly dryRunCommand?: WorkerDryRunCommand;
+  /** Reuse the currently deployed Container image for this integration artifact. */
+  readonly containersRollout?: "none";
   /** Credential-scoped environment for Wrangler; OAuth passes only its log-suppression flag. */
   readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly run: WorkerArtifactProcess;
@@ -124,6 +126,9 @@ export async function prepareWorkerArtifact(input: {
       buildConfig,
       "--outdir",
       build,
+      ...(input.containersRollout === undefined
+        ? []
+        : ["--containers-rollout", input.containersRollout]),
     ],
     { env: input.environment ?? {} },
   );
