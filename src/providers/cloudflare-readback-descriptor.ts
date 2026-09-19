@@ -23,7 +23,10 @@ export type CloudflareNativeReadbackAddress =
     };
 
 type CloudflareManagedNativeReadbackAddress =
-  | { readonly kind: "worker" | "endpoint" | "sqlite" | "vector"; readonly name: string }
+  | {
+      readonly kind: "worker" | "endpoint" | "domain" | "sqlite" | "vector";
+      readonly name: string;
+    }
   | {
       readonly kind: "version" | "deployment" | "cron" | "consumer";
       readonly parent: string;
@@ -48,6 +51,7 @@ const MANAGED_FORM_NATIVE_KINDS = {
   WorkerEndpoint: "endpoint",
   WorkerCronTrigger: "cron",
   QueueConsumer: "consumer",
+  WorkerCustomDomain: "domain",
   SQLiteDatabase: "sqlite",
   VectorIndex: "vector",
 } as const satisfies Readonly<Record<string, CloudflareManagedNativeReadbackAddress["kind"]>>;
@@ -68,8 +72,7 @@ export function cloudflareProviderKind(offering: ProviderOffering): string {
 export function cloudflareWfpOwnsOffering(offering: ProviderOffering): boolean {
   return (
     offering.kind === "worker_script" ||
-    Object.hasOwn(MANAGED_FORM_NATIVE_KINDS, offering.form.kind) ||
-    offering.form.kind === "WorkerCustomDomain"
+    Object.hasOwn(MANAGED_FORM_NATIVE_KINDS, offering.form.kind)
   );
 }
 
@@ -220,7 +223,11 @@ function parseManagedNativeId(value: string): CloudflareManagedNativeReadbackAdd
   const parts = value.split(":");
   const kind = parts[0];
   if (
-    (kind === "worker" || kind === "endpoint" || kind === "sqlite" || kind === "vector") &&
+    (kind === "worker" ||
+      kind === "endpoint" ||
+      kind === "domain" ||
+      kind === "sqlite" ||
+      kind === "vector") &&
     parts.length === 2 &&
     nativeSegment(parts[1])
   ) {
