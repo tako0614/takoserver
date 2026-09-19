@@ -36,6 +36,8 @@ const PREVIOUS_PUBLIC_WORKER_VERSION_ID = "33333333-3333-4333-8333-333333333333"
 const DRIFTED_PUBLIC_WORKER_VERSION_ID = "22222222-2222-4222-8222-222222222222";
 const PREVIOUS_AUTHORITY_VERSION_ID = "44444444-4444-4444-8444-444444444444";
 const CURRENT_AUTHORITY_VERSION_ID = "55555555-5555-4555-8555-555555555555";
+const GATEWAY_PREVIOUS_VERSION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const GATEWAY_CURRENT_VERSION_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const ARBITRARY_PUBLIC_WORKER_VERSION_ID = "66666666-6666-4666-8666-666666666666";
 const TWO_HOP_PUBLIC_WORKER_VERSION_ID = "77777777-7777-4777-8777-777777777777";
 const FORM_PREDECESSOR_STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a4";
@@ -1084,6 +1086,39 @@ function gatewayTransitionState(input: {
           : input.gatewayBeforeScope,
         !isUploaded(),
       );
+    },
+  };
+}
+
+function gatewayServiceBindingRefreshState(isUploaded: () => boolean): FormAuthorityDeployState {
+  const current = gatewayState();
+  return {
+    ...current,
+    async workerDeployments(workerName) {
+      if (workerName !== target.formAuthority.integrationOperatorWorkerName) {
+        return await current.workerDeployments(workerName);
+      }
+      return isUploaded()
+        ? [
+            deployment("gateway-current", GATEWAY_CURRENT_VERSION_ID, "2026-08-28T03:00:00Z"),
+            deployment("gateway-predecessor", GATEWAY_PREVIOUS_VERSION_ID, "2026-08-28T02:00:00Z"),
+          ]
+        : [deployment("gateway-predecessor", GATEWAY_PREVIOUS_VERSION_ID, "2026-08-28T02:00:00Z")];
+    },
+    async workerVersion(workerName, versionId) {
+      if (
+        workerName === target.formAuthority.integrationOperatorWorkerName &&
+        versionId === GATEWAY_PREVIOUS_VERSION_ID
+      ) {
+        const predecessor = gatewayVersion();
+        predecessor.resources.bindings = predecessor.resources.bindings.map((binding) =>
+          binding.name === "PUBLIC_HOST_IDENTITY"
+            ? { ...binding, service: "takoserver-api-integration-previous" }
+            : binding,
+        );
+        return predecessor;
+      }
+      return await current.workerVersion(workerName, versionId);
     },
   };
 }
@@ -2558,12 +2593,101 @@ describe("Form authority integration storage rebind", () => {
       const dryRun = process.calls.findIndex((call) => call.includes("--dry-run"));
       expect(typecheck).toBeGreaterThanOrEqual(0);
       expect(focusedTests).toBeGreaterThan(typecheck);
+      expect(process.calls[focusedTests]).toEqual([
+        "bun",
+        "test",
+        "--test-name-pattern=storage rebind",
+        "tests/deploy-form-authority.test.ts",
+        "tests/deploy-worker-state.test.ts",
+        "tests/deploy-integration-storage-generation.test.ts",
+      ]);
       expect(dryRun).toBeGreaterThan(focusedTests);
       expect(process.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  const serviceRefreshTypecheck = ["bun", "run", "typecheck:form-authority-worker"];
+  const serviceRefreshTests = [
+    "bun",
+    "test",
+    "tests/deploy-form-authority.test.ts",
+    "tests/deploy-worker-state.test.ts",
+    "tests/deploy-contract.test.ts",
+  ];
+
+  test.each([
+    [
+      "typecheck",
+      serviceRefreshTypecheck,
+      [serviceRefreshTypecheck],
+      "integration Form authority service-binding-refresh typecheck failed",
+    ],
+    [
+      "focused tests",
+      serviceRefreshTests,
+      [serviceRefreshTypecheck, serviceRefreshTests],
+      "focused integration Form authority service-binding-refresh deploy tests failed",
+    ],
+  ] as const)(
+    "stops operator service-refresh before upload when the %s gate fails",
+    async (_gate, failedCommand, expectedGateCalls, expectedFailure) => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-form-gateway-service-refresh-gate-"));
+      let uploaded = false;
+      try {
+        const process = fakeProcess({ onUpload: () => (uploaded = true) });
+        const gateCalls: string[][] = [];
+        const run: FormAuthorityProcess = async (command, options) => {
+          gateCalls.push([...command]);
+          if (command.join(" ") === failedCommand.join(" ")) {
+            return { exitCode: 1, stdout: "gate failed", stderr: "" };
+          }
+          return await process.run(command, options);
+        };
+        const failure = await runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-operator-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+            transition: {
+              predecessorVersionId: GATEWAY_PREVIOUS_VERSION_ID,
+              delta: {
+                retiredVars: [],
+                addedVars: [],
+                refreshedVars: [],
+                refreshedServiceBindings: ["PUBLIC_HOST_IDENTITY"],
+                addedBindings: [],
+                addedSecrets: [],
+                rotatedSecrets: [],
+              },
+            },
+          },
+          target,
+          {
+            run,
+            state: gatewayServiceBindingRefreshState(() => uploaded),
+            outputDirectory: root,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+          },
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).message).toContain(expectedFailure);
+        expect(
+          gateCalls.filter(
+            (call) => call.join(" ") === serviceRefreshTypecheck.join(" ") || call[1] === "test",
+          ),
+        ).toEqual(expectedGateCalls);
+        expect(gateCalls.some((call) => call.includes("--dry-run"))).toBe(false);
+        expect(gateCalls.some((call) => call.includes("--no-bundle"))).toBe(false);
+        expect(uploaded).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("fails the focused typecheck before any Form authority build or upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-storage-rebind-gate-"));

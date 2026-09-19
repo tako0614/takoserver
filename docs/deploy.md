@@ -363,6 +363,17 @@ before Wrangler dry-run. Status is read-only, and every other apply on these
 Host/Form storage-rebind Worker surfaces retains its existing `bun run check`
 gate.
 
+On Form authority surfaces, an integration transition declaring
+`--refresh-service-binding=NAME` without storage rebind runs
+`bun run typecheck:form-authority-worker`, then
+`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts
+tests/deploy-contract.test.ts` before Wrangler dry-run or upload; either gate
+failure stops both. This includes the authenticated integration operator
+gateway. If the same transition also declares storage rebind on a route-less
+Form Worker, the storage-rebind gate above retains precedence and its filtered
+storage tests remain selected. The operator gateway does not accept storage
+rebind. Other Form authority applies retain `bun run check`.
+
 For the identity probe only, an integration transition declaring
 `--refresh-service-binding` runs `bun run typecheck:form-authority-worker`, then
 `bun test tests/deploy-form-authority-identity-probe.test.ts

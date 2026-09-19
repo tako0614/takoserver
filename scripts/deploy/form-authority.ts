@@ -689,6 +689,22 @@ export async function runFormAuthority(
       "tests/deploy-worker-state.test.ts",
       "tests/deploy-integration-storage-generation.test.ts",
     ]);
+  } else if (
+    invocation.environment === "integration" &&
+    (transitionDelta?.refreshedServiceBindings?.length ?? 0) > 0
+  ) {
+    await checked(run, "integration Form authority service-binding-refresh typecheck", [
+      "bun",
+      "run",
+      "typecheck:form-authority-worker",
+    ]);
+    await checked(run, "focused integration Form authority service-binding-refresh deploy tests", [
+      "bun",
+      "test",
+      "tests/deploy-form-authority.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-contract.test.ts",
+    ]);
   } else {
     await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
   }

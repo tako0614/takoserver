@@ -552,9 +552,13 @@ export const DEPLOY_CONTRACT = {
           "limited to this route-less Form authority Worker and the integration fixture Worker; its " +
           "successor comes only from the selected target, and its exact generated D1/R2/schema proof " +
           "is repeated immediately before upload. Production and rehearsal refuse it before provider effects. " +
-          "This one integration rebind branch runs `bun run typecheck:form-authority-worker` and focused " +
-          "Form-transition, binding-state and storage-generation tests before Wrangler dry-run; every " +
-          "other Form authority apply keeps `bun run check`." +
+          "This integration storage-rebind branch runs `bun run typecheck:form-authority-worker` and " +
+          "focused Form-transition, binding-state and storage-generation tests before Wrangler dry-run; " +
+          "it retains precedence when a service-binding refresh is declared too. With no storage rebind, " +
+          "an integration service-binding refresh runs `bun run typecheck:form-authority-worker` and " +
+          "`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
+          "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
+          "Every other Form authority apply keeps `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -607,10 +611,13 @@ export const DEPLOY_CONTRACT = {
           "and D1 UUID/name, R2 existence, audited lineage and canonical schema are reverified at the " +
           "immediate upload fence. " +
           integrationServiceBindingRefresh +
-          " This one integration rebind branch runs " +
-          "`bun run typecheck:form-authority-worker` and focused Form-transition, binding-state and " +
-          "storage-generation tests before Wrangler dry-run; every other Form authority apply keeps " +
-          "`bun run check`." +
+          " This integration storage-rebind branch runs `bun run typecheck:form-authority-worker` and " +
+          "focused Form-transition, binding-state and storage-generation tests before Wrangler dry-run; " +
+          "it retains precedence when a service-binding refresh is also declared. With no storage " +
+          "rebind, an integration service-binding refresh runs `bun run typecheck:form-authority-worker` " +
+          "and `bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
+          "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
+          "Every other Form authority apply keeps `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -628,7 +635,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-scope-transition.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -658,6 +665,11 @@ export const DEPLOY_CONTRACT = {
           "The operator gateway does not accept the public storageRebind declaration; only the route-less " +
           "Host/Form authority Workers carry that integration-only transition. " +
           integrationServiceBindingRefresh +
+          " An integration apply declaring this service refresh runs " +
+          "`bun run typecheck:form-authority-worker` and `bun test " +
+          "tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` " +
+          "before Wrangler dry-run or upload; either gate failure stops both. Every other operator " +
+          "gateway apply keeps `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },

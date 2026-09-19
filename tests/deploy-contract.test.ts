@@ -118,6 +118,9 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(contract.surfaces.some(({ surface }) => surface === privateSurface)).toBe(false);
     }
 
+    const formAuthority = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-form-authority-worker",
+    );
     const integrationAuthority = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-integration-form-authority-worker",
     );
@@ -211,6 +214,33 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(identityProbe?.obligations["failure-handling"]).toContain(
       "`bun test tests/deploy-form-authority-identity-probe.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`",
+    );
+    const serviceRefreshTests =
+      "`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`";
+    for (const surface of [formAuthority, integrationAuthority, gateway]) {
+      expect(surface?.requiresScripts).toContain("typecheck:form-authority-worker");
+      expect(surface?.obligations["failure-handling"]).toContain(serviceRefreshTests);
+      expect(surface?.obligations["failure-handling"]).toContain("`bun run check`");
+    }
+    expect(formAuthority?.obligations["failure-handling"]).toContain(
+      "Every other Form authority apply keeps `bun run check`.",
+    );
+    expect(integrationAuthority?.obligations["failure-handling"]).toContain(
+      "Every other Form authority apply keeps `bun run check`.",
+    );
+    expect(formAuthority?.obligations["failure-handling"]).toContain(
+      "it retains precedence when a service-binding refresh is declared too",
+    );
+    expect(integrationAuthority?.obligations["failure-handling"]).toContain(
+      "it retains precedence when a service-binding refresh is also declared",
+    );
+    expect(gateway?.requiresScripts).toEqual([
+      "check",
+      "deploy",
+      "typecheck:form-authority-worker",
+    ]);
+    expect(gateway?.obligations["failure-handling"]).toContain(
+      "Every other operator gateway apply keeps `bun run check`.",
     );
     expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(
