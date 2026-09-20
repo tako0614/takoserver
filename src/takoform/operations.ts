@@ -412,6 +412,9 @@ export function createDeferredOperations(input: {
       durableOperation: {
         id: operation.id,
         resourceUid: operation.resourceUid,
+        ...(operation.acceptedRevision !== undefined
+          ? { acceptedRevision: operation.acceptedRevision }
+          : {}),
         claimOwnerId: leaseToken,
         ...(operation.acceptedAuthority ? { acceptedAuthority: operation.acceptedAuthority } : {}),
         commit: async (mutation) => {

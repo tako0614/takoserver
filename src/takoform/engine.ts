@@ -121,6 +121,8 @@ export interface EngineContext {
   readonly durableOperation?: {
     readonly id: string;
     readonly resourceUid: string;
+    /** Immutable admission identity, not the latest status-rendering revision. */
+    readonly acceptedRevision?: string;
     /** Authority accepted before this deferred apply crossed the Host boundary. */
     readonly acceptedAuthority?: AcceptedAuthoritySummary;
     /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
@@ -2400,7 +2402,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         target: address,
         acceptedUid: current.metadata.uid,
         acceptedGeneration: current.metadata.generation,
-        acceptedRevision: current.metadata.revision,
+        acceptedRevision: context.durableOperation?.acceptedRevision ?? current.metadata.revision,
         ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
       });
       const deleteId = saga.operationId;
