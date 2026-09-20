@@ -47,6 +47,9 @@ const applySelection = {
   relations: [],
 } satisfies TakoformApplySelection;
 
+const UNFENCED_ACCEPTED_AUTHORITY =
+  '{"mode":"unfenced","protocolGeneration":1,"version":"takoserver.takoform-accepted-authority@v1"}';
+
 async function recordPlannedProviderEffect(
   store: ReturnType<typeof createTakoformStore>,
   mutationSaga: ProviderMutationSaga,
@@ -626,11 +629,12 @@ describe("provider mutation saga execution leases", () => {
            (id, protocol_generation, tenant_id, principal_id, operation, phase, request_path, request_query,
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
-            target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+            target_form_ref_json, accepted_authority_json,
+            accepted_uid, accepted_generation, accepted_revision,
             resource_uid, polls_remaining, lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
          VALUES (?, 1, ?, 'principal-a', 'apply', 'committing', '/', '', '{}', '{}', ?,
-                 'deferred-replay-execution-lease', ?, ?, ?, ?, '{}', NULL, NULL, NULL,
+                 'deferred-replay-execution-lease', ?, ?, ?, ?, '{}', ?, NULL, NULL, NULL,
                  ?, 0, 'outer_recovered', 3001, NULL, NULL,
                  '2026-08-28T00:00:00.000Z', ?, 9001)`,
       )
@@ -642,6 +646,7 @@ describe("provider mutation saga execution leases", () => {
         saga.target.apiVersion,
         saga.target.kind,
         saga.target.name,
+        UNFENCED_ACCEPTED_AUTHORITY,
         saga.resourceUid,
         now,
       );

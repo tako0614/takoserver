@@ -9,12 +9,20 @@ import type { CommandResult } from "../scripts/deploy/process.ts";
 import { runD1Schema, type SchemaProcess } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  copyCurrentSchemaFixture,
+  copyOperationGenerationSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 
 const migrationFixtureRoot = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-operation-generation-"),
 );
-const currentMigrations = copyCurrentSchemaFixture(join(migrationFixtureRoot, "migrations"));
+const currentMigrations = copyOperationGenerationSchemaFixture(
+  join(migrationFixtureRoot, "migrations"),
+);
+const fullCurrentMigrations = copyCurrentSchemaFixture(
+  join(migrationFixtureRoot, "current-migrations"),
+);
 afterAll(() => rmSync(migrationFixtureRoot, { recursive: true, force: true }));
 
 const COMMIT = "a".repeat(40);
@@ -328,7 +336,7 @@ describe("0060 operation-generation cutover", () => {
       );
       expect(result).toMatchObject({
         pendingMigrations: [OPERATION_GENERATION],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 60).map(({ name }) => name),
       });
       expect(resumed.migrationApplyCalls()).toBe(1);
       expect(legacySnapshot(database)).toEqual(before);
@@ -541,7 +549,7 @@ describe("0060 operation-generation cutover", () => {
         const status = await runD1Schema(
           { action: "status", environment, commit: COMMIT, throughMigration: "0057" },
           { ...integrationTarget, environment },
-          applyOptions(selectorRoot, fixture),
+          applyOptions(selectorRoot, fixture, fullCurrentMigrations),
         );
         expect(status).toMatchObject({
           throughMigration: "0057_cloudflare_managed_worker_version_execution_material.sql",

@@ -12,6 +12,13 @@ import {
   type ResourceExecutionEvidenceResponse,
 } from "../resource-execution-evidence.ts";
 import {
+  type AcceptedAuthoritySummary,
+  assertAcceptedAuthorityRecord,
+  encodeAcceptedAuthority,
+  parseAcceptedAuthority,
+  unfencedAcceptedAuthority,
+} from "./accepted-authority.ts";
+import {
   encodeTakoformApplySelection,
   parseTakoformApplySelection,
   type TakoformApplySelection,
@@ -164,6 +171,8 @@ export interface DeferredOperationRecord {
     readonly name: string;
     readonly formRef: TakoformV1Alpha3FormRef;
   };
+  /** Closed authority accepted with a future deferred apply; absent only on legacy rows. */
+  readonly acceptedAuthority?: AcceptedAuthoritySummary;
   readonly acceptedUid?: string;
   readonly acceptedGeneration?: string;
   readonly acceptedRevision?: string;
@@ -567,7 +576,10 @@ export interface TakoformStore {
     readonly mutation: ResourceMutationCommit;
   }): Promise<void>;
 
-  acceptDeferredOperation(record: DeferredOperationRecord): Promise<DeferredOperationRecord>;
+  acceptDeferredOperation(
+    record: DeferredOperationRecord,
+    authorityFence?: TakoformAuthorityFence,
+  ): Promise<DeferredOperationRecord>;
   readDeferredOperation(
     tenantId: string,
     principalId: string,
@@ -2853,7 +2865,28 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
     },
 
-    async acceptDeferredOperation(record): Promise<DeferredOperationRecord> {
+    async acceptDeferredOperation(record, authorityFence): Promise<DeferredOperationRecord> {
+      const acceptedAuthority =
+        record.operation === "apply"
+          ? (record.acceptedAuthority ?? unfencedAcceptedAuthority())
+          : undefined;
+      if (acceptedAuthority) {
+        assertAcceptedAuthorityRecord({
+          summary: acceptedAuthority,
+          operation: record.operation,
+          formRef: record.target.formRef,
+          ...(record.acceptedUid !== undefined ? { acceptedUid: record.acceptedUid } : {}),
+          ...(authorityFence !== undefined ? { fence: authorityFence } : {}),
+          requireFence: true,
+        });
+      } else if (authorityFence !== undefined) {
+        throw new TypeError("only an apply may carry an authority fence");
+      }
+      const storedRecord = acceptedAuthority ? { ...record, acceptedAuthority } : record;
+      const acceptedAuthorityJson = acceptedAuthority
+        ? encodeAcceptedAuthority(acceptedAuthority)
+        : null;
+      const authority = authorityFence ? await authorityFenceSql(authorityFence) : undefined;
       await sql.run(
         `DELETE FROM ${DEFERRED_OPERATION_TABLE} WHERE rowid IN (
            SELECT rowid FROM ${DEFERRED_OPERATION_TABLE}
@@ -2863,62 +2896,68 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         [now(), SWEEP_ROW_LIMIT],
       );
       const identity: OperationGenerationIdentity = {
-        operationId: record.id,
-        replayKey: record.replayKey,
-        tenantId: record.tenantId,
-        resourceUid: record.resourceUid,
-        target: { tenantId: record.tenantId, ...record.target },
+        operationId: storedRecord.id,
+        replayKey: storedRecord.replayKey,
+        tenantId: storedRecord.tenantId,
+        resourceUid: storedRecord.resourceUid,
+        target: { tenantId: storedRecord.tenantId, ...storedRecord.target },
       };
       const legacyFence = legacyOperationConflictFence(identity);
-      await sql.run(
+      const inserted = await sql.run(
         `INSERT OR IGNORE INTO ${DEFERRED_OPERATION_TABLE}
            (id, protocol_generation, tenant_id, principal_id, operation, phase,
             request_path, request_query,
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
-            target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+            target_form_ref_json, accepted_authority_json,
+            accepted_uid, accepted_generation, accepted_revision,
             resource_uid, worker_endpoint_origin_reservation_id, polls_remaining,
             lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
-         SELECT ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         SELECT ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 NULL, NULL, NULL, NULL, ?, ?, ?
-         WHERE NOT ${legacyFence.sql}`,
+         WHERE NOT ${legacyFence.sql}${authority ? ` AND (${authority.sql})` : ""}`,
         [
-          record.id,
+          storedRecord.id,
           OPERATION_PROTOCOL_GENERATION,
-          record.tenantId,
-          record.principalId,
-          record.operation,
-          record.requestPath,
-          record.requestQuery,
-          JSON.stringify(record.requestHeaders),
-          record.requestBody ?? null,
-          record.fingerprint,
-          record.replayKey,
-          record.target.space,
-          record.target.apiVersion,
-          record.target.kind,
-          record.target.name,
-          JSON.stringify(record.target.formRef),
-          record.acceptedUid ?? null,
-          record.acceptedGeneration ?? null,
-          record.acceptedRevision ?? null,
-          record.resourceUid,
-          record.workerEndpointOriginReservationId ?? null,
-          record.pollsRemaining,
-          record.createdAt,
+          storedRecord.tenantId,
+          storedRecord.principalId,
+          storedRecord.operation,
+          storedRecord.requestPath,
+          storedRecord.requestQuery,
+          JSON.stringify(storedRecord.requestHeaders),
+          storedRecord.requestBody ?? null,
+          storedRecord.fingerprint,
+          storedRecord.replayKey,
+          storedRecord.target.space,
+          storedRecord.target.apiVersion,
+          storedRecord.target.kind,
+          storedRecord.target.name,
+          JSON.stringify(storedRecord.target.formRef),
+          acceptedAuthorityJson,
+          storedRecord.acceptedUid ?? null,
+          storedRecord.acceptedGeneration ?? null,
+          storedRecord.acceptedRevision ?? null,
+          storedRecord.resourceUid,
+          storedRecord.workerEndpointOriginReservationId ?? null,
+          storedRecord.pollsRemaining,
+          storedRecord.createdAt,
           now(),
           253_402_300_799_999,
           ...legacyFence.params,
+          ...(authority?.params ?? []),
         ],
       );
       const rows = await sql.query(
         `SELECT * FROM ${DEFERRED_OPERATION_TABLE} WHERE replay_key = ? LIMIT 2`,
-        [record.replayKey],
+        [storedRecord.replayKey],
       );
       if (rows.length > 1) throw new Error("deferred_operation_ambiguous");
       if (rows[0]) return deferredOperation(rows[0]);
       if (await hasLegacyOperationConflict(identity)) throw legacyOperationConflictError();
+      if (authority && inserted.changes === 0) {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
       throw new SqlError("constraint", "deferred operation identity collision");
     },
 
@@ -5699,6 +5738,19 @@ function deferredOperation(row: Row): DeferredOperationRecord {
   if (operation !== "apply" && operation !== "import" && operation !== "delete") {
     throw new TypeError("invalid stored deferred operation kind");
   }
+  const acceptedAuthority =
+    typeof row.accepted_authority_json === "string"
+      ? parseAcceptedAuthority(row.accepted_authority_json)
+      : undefined;
+  const acceptedUid = typeof row.accepted_uid === "string" ? row.accepted_uid : undefined;
+  if (acceptedAuthority) {
+    assertAcceptedAuthorityRecord({
+      summary: acceptedAuthority,
+      operation,
+      formRef: formRef as unknown as TakoformV1Alpha3FormRef,
+      ...(acceptedUid !== undefined ? { acceptedUid } : {}),
+    });
+  }
   return {
     id: text(row.id),
     tenantId: text(row.tenant_id),
@@ -5718,7 +5770,8 @@ function deferredOperation(row: Row): DeferredOperationRecord {
       name: text(row.target_name),
       formRef: formRef as unknown as TakoformV1Alpha3FormRef,
     },
-    ...(typeof row.accepted_uid === "string" ? { acceptedUid: row.accepted_uid } : {}),
+    ...(acceptedAuthority ? { acceptedAuthority } : {}),
+    ...(acceptedUid !== undefined ? { acceptedUid } : {}),
     ...(typeof row.accepted_generation === "string"
       ? { acceptedGeneration: row.accepted_generation }
       : {}),

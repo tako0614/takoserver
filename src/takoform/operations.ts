@@ -1,6 +1,7 @@
 import { sanitizedMessage } from "../error-envelope.ts";
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
+import { acceptedAuthorityFromGrant } from "./accepted-authority.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
@@ -171,39 +172,52 @@ export function createDeferredOperations(input: {
       const url = new URL(context.request.url);
       const operationId = nextIdentifier("op", input.randomId);
       const resourceUid = accepted.current?.metadata.uid ?? nextIdentifier("uid", input.randomId);
-      const record = await input.store.acceptDeferredOperation({
-        id: operationId,
-        tenantId: context.tenantId,
-        principalId: context.principalId,
-        operation,
-        phase: "pending",
-        requestPath: url.pathname,
-        requestQuery: url.search,
-        requestHeaders: retainedLifecycleHeaders(context.request),
-        ...(accepted.body === undefined ? {} : { requestBody: accepted.body }),
-        fingerprint,
-        replayKey,
-        target: {
-          space: accepted.space,
-          apiVersion: path.apiVersion,
-          kind: path.kind,
-          name: path.name,
-          formRef: structuredClone(accepted.formRef),
+      const record = await input.store.acceptDeferredOperation(
+        {
+          id: operationId,
+          tenantId: context.tenantId,
+          principalId: context.principalId,
+          operation,
+          phase: "pending",
+          requestPath: url.pathname,
+          requestQuery: url.search,
+          requestHeaders: retainedLifecycleHeaders(context.request),
+          ...(accepted.body === undefined ? {} : { requestBody: accepted.body }),
+          fingerprint,
+          replayKey,
+          target: {
+            space: accepted.space,
+            apiVersion: path.apiVersion,
+            kind: path.kind,
+            name: path.name,
+            formRef: structuredClone(accepted.formRef),
+          },
+          ...(accepted.current
+            ? {
+                acceptedUid: accepted.current.metadata.uid,
+                acceptedGeneration: accepted.current.metadata.generation,
+                acceptedRevision: accepted.current.metadata.revision,
+              }
+            : {}),
+          ...(operation === "apply" && accepted.authority
+            ? {
+                acceptedAuthority: acceptedAuthorityFromGrant({
+                  lifecycleOperation:
+                    accepted.lifecycleOperation === "create" ? "create" : "update",
+                  formRef: accepted.formRef,
+                  ...(accepted.authority?.fence ? { fence: accepted.authority.fence } : {}),
+                }),
+              }
+            : {}),
+          resourceUid,
+          ...(context.workerEndpointOriginReservationId
+            ? { workerEndpointOriginReservationId: context.workerEndpointOriginReservationId }
+            : {}),
+          pollsRemaining: pollsBeforeCommit,
+          createdAt: input.clock().toISOString(),
         },
-        ...(accepted.current
-          ? {
-              acceptedUid: accepted.current.metadata.uid,
-              acceptedGeneration: accepted.current.metadata.generation,
-              acceptedRevision: accepted.current.metadata.revision,
-            }
-          : {}),
-        resourceUid,
-        ...(context.workerEndpointOriginReservationId
-          ? { workerEndpointOriginReservationId: context.workerEndpointOriginReservationId }
-          : {}),
-        pollsRemaining: pollsBeforeCommit,
-        createdAt: input.clock().toISOString(),
-      });
+        operation === "apply" && accepted.authority?.fence ? accepted.authority.fence : undefined,
+      );
       if (record.fingerprint !== fingerprint) throw new TakoformHostError();
       return input.configuration.executeOnAccept
         ? await executeAccepted(record, accepted.lifecycleOperation)
@@ -399,6 +413,7 @@ export function createDeferredOperations(input: {
         id: operation.id,
         resourceUid: operation.resourceUid,
         claimOwnerId: leaseToken,
+        ...(operation.acceptedAuthority ? { acceptedAuthority: operation.acceptedAuthority } : {}),
         commit: async (mutation) => {
           await input.store.commitDeferredMutation({
             operation,
@@ -618,6 +633,7 @@ async function acceptedMutation(
   readonly space: string;
   readonly current: Awaited<ReturnType<TakoformStore["readResource"]>>;
   readonly body?: string;
+  readonly authority?: Awaited<ReturnType<TakoformHostAuthority["authorizeMutation"]>>;
 }> {
   if (operation === "apply" || operation === "import") {
     const body = await context.request.clone().text();
@@ -640,8 +656,9 @@ async function acceptedMutation(
     if (current && !sameFormRef(current.form.formRef, parsed.form.formRef)) {
       throw new TakoformHostError("resource_not_found", 404);
     }
+    let authorityGrant: Awaited<ReturnType<TakoformHostAuthority["authorizeMutation"]>> | undefined;
     if (authority) {
-      await authority.authorizeMutation({
+      authorityGrant = await authority.authorizeMutation({
         operation: operation === "import" ? "import" : current ? "update" : "create",
         context: {
           tenantId: context.tenantId,
@@ -657,6 +674,7 @@ async function acceptedMutation(
       space: parsed.metadata.space,
       current,
       body,
+      ...(authorityGrant ? { authority: authorityGrant } : {}),
     };
   }
 

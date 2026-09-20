@@ -402,7 +402,7 @@ apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
 intersection of the package set with the code-owned implementation catalog.
-The public runtime catalog currently includes 14 of the 17 identities. A Form
+The public runtime catalog currently includes 15 of the 17 identities. A Form
 must have both its own key in the code-owned capability manifest and a concrete
 handler to enter that catalog. An explicitly declared empty operation list
 remains a supported-empty identity; an absent capability key is not one.
@@ -416,12 +416,13 @@ This is bundle lifecycle support, not qualification of every Worker backend's
 asset attachment. The current managed Workers-for-Platforms backend still
 refuses asset-bearing WorkerVersions until its upload and authoritative
 readback path is implemented and qualified.
-`WorkerCustomDomain` is not currently in the implementation catalog: its provider
-handler requires an exact tenant/hostname zone grant, and the code-owned
-capability manifest does not yet advertise that conditional capability. It
-remains installed but unsupported. `ActorNamespace` and `DurableWorkflow` have
-no handlers, so they also remain installed and discoverable only
-(`supported: false`). None may have an active activation head; retained inactive
+`WorkerCustomDomain` is in the implementation catalog with its declared
+`create`, `read`, `delete`, `import`, and `observe` operations. Its provider
+handler requires an exact tenant/hostname zone grant; integration qualification
+is allowed when that grant is realized, but this document does not establish
+production or full-lifecycle qualification. `ActorNamespace` and
+`DurableWorkflow` have no handlers, so they remain installed and discoverable only
+(`supported: false`). Neither may have an active activation head; retained inactive
 history is not discarded. Deactivate any existing active heads before deploying
 a catalog that removes their capability. No operation is advertised unless it
 is declared by the package, present in the
@@ -638,8 +639,11 @@ released-Core-verified public publisher set:
   `WorkerCustomDomain` at definition version `0.1.0`.
 
 The executable implementation catalog is a separate, derived support subset:
-it currently has 14 entries. The two actor/workflow identities have no concrete
-handlers, and custom-domain has no declared capability. StaticAssetBundle is
+it currently has 15 entries. `WorkerCustomDomain` support is conditional on an
+exact tenant/hostname zone grant; integration qualification is allowed with
+that grant, while production and full-lifecycle qualification remain
+unestablished. The two actor/workflow identities have no concrete handlers.
+StaticAssetBundle is
 intrinsic and exposes its declared lifecycle operations, as described above.
 The owning current-catalog importer derives package, schema, and payload digests directly
 from the verified source checkout; literals in the operator do not confer

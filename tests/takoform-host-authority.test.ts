@@ -1076,11 +1076,13 @@ describe("durable read-only Takoform Host authority", () => {
     const fixture = await committedAuthority();
     const memory = new InMemoryTakoformResourceDriver();
     let applyCalls = 0;
+    const applyModes: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
       selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applyCalls += 1;
+        applyModes.push(input.operationMode ?? "initial");
         if (applyCalls === 1) throw new ProviderMutationRecoveryError("indeterminate");
         return await memory.apply(input);
       },
@@ -1218,41 +1220,37 @@ describe("durable read-only Takoform Host authority", () => {
       expect(currentGrant.fence.headDigest).not.toBe(saga.authority_head_digest);
 
       const recoveredHost = createTakoformHost({ ...hostOptions, authority: currentAuthority });
-      const held = await recoveredHost.handle(
+      const recovered = await recoveredHost.handle(
         new Request(`https://host.invalid/apis/forms.takoform.com/v1/operations/${operationId}`, {
           headers: { authorization: "Bearer test" },
         }),
       );
-      expect(await held?.json()).toMatchObject({ id: operationId, done: false });
-      expect(applyCalls).toBe(1);
-      expect(
-        log.mock.calls.some(
-          ([entry]) =>
-            typeof entry === "string" &&
-            entry.includes('"event":"takoform.deferred_operation.repair_required"') &&
-            entry.includes('"errorCode":"resource_busy"'),
-        ),
-      ).toBe(true);
+      expect(recovered?.status).toBe(200);
+      expect(await recovered?.json()).toMatchObject({ id: operationId, done: true });
+      expect(applyCalls).toBe(2);
+      expect(applyModes).toEqual(["initial", "recovery"]);
       expect(
         await fixture.sql.query(
           "SELECT * FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
-      ).toEqual(sagaBefore);
-      expect(
-        await fixture.sql.query(
-          `SELECT * FROM tf_resource_provider_effects
-           WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
-          [CONTEXT.tenantId, resourceUid],
-        ),
-      ).toEqual(effectsBefore);
-      expect(
-        await fixture.sql.query(
-          `SELECT * FROM tf_resource_deletion_attestations
-           WHERE tenant_id = ? AND resource_uid = ?`,
-          [CONTEXT.tenantId, resourceUid],
-        ),
-      ).toEqual(incarnationBefore);
+      ).toHaveLength(0);
+      const effectsAfter = await fixture.sql.query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(effectsAfter).toHaveLength(effectsBefore.length + 1);
+      expect(effectsAfter.slice(0, effectsBefore.length).map((row) => row.operation_mode)).toEqual(
+        effectsBefore.map((row) => row.operation_mode),
+      );
+      expect(effectsAfter.at(-1)?.operation_mode).toBe("recovery");
+      const incarnationAfter = await fixture.sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ?`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(incarnationAfter).toHaveLength(incarnationBefore.length);
     } finally {
       log.mockRestore();
     }

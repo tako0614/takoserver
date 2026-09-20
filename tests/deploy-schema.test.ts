@@ -22,10 +22,16 @@ import {
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  copyCurrentSchemaFixture,
+  copyOperationGenerationSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 
 const currentFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-current-schema-surface-"));
 const currentMigrations = copyCurrentSchemaFixture(join(currentFixtureRoot, "migrations"));
+const operationGenerationMigrations = copyOperationGenerationSchemaFixture(
+  join(currentFixtureRoot, "operation-generation-migrations"),
+);
 afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 
 const COMMIT = "a".repeat(40);
@@ -191,6 +197,42 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
+  test("0061 pending authority continuity cannot use the ordinary integration apply lane", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-accepted-authority-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const dependencies = {
+        run: fixture.run,
+        reader: readerSequence([migrationStateThrough(60, "0060-post")]),
+        migrationDirectory: currentMigrations,
+        outputDirectory: join(root, "work"),
+        leaseRoot: join(root, "leases"),
+        review: "reviewer@example.test",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      };
+      const status = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        dependencies,
+      );
+      expect(status).toMatchObject({
+        pendingMigrations: ["0061_takoform_accepted_authority_continuity.sql"],
+        applyProviderSelectionCutover: { status: "accepted_authority_cutover_unqualified" },
+        readyForApply: false,
+      });
+      const error = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        { ...dependencies, reader: readerSequence([migrationStateThrough(60, "0060-post")]) },
+      ).catch((failure) => failure);
+      expect(error).toBeInstanceOf(DeployError);
+      expect(error.message).toContain("accepted_authority_cutover_unqualified");
+      expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("status marks pending 0059 provider-selection cutover as unavailable", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-status-"));
     try {
@@ -199,7 +241,7 @@ describe("forward-only D1 schema surface", () => {
         integrationTarget,
         {
           reader: readerSequence([migrationStateThrough(58, "0058-pre")]),
-          migrationDirectory: currentMigrations,
+          migrationDirectory: operationGenerationMigrations,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
@@ -229,7 +271,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: fixture.run,
           reader: readerSequence([migrationStateThrough(58, "0058-pre")]),
-          migrationDirectory: currentMigrations,
+          migrationDirectory: operationGenerationMigrations,
           outputDirectory: join(root, "work"),
           leaseRoot: join(root, "leases"),
           review: "reviewer@example.test",
@@ -254,7 +296,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: fixture.run,
           reader: readerSequence([migrationStateThrough(57, "0057-pre")]),
-          migrationDirectory: currentMigrations,
+          migrationDirectory: operationGenerationMigrations,
           outputDirectory: join(root, "pending-tail-work"),
           leaseRoot: join(root, "pending-tail-leases"),
           review: "reviewer@example.test",
@@ -291,7 +333,7 @@ describe("forward-only D1 schema surface", () => {
       const state = migrationStateThrough(59, "0059-post");
       const options = {
         reader: readerSequence([state]),
-        migrationDirectory: currentMigrations,
+        migrationDirectory: operationGenerationMigrations,
         outputDirectory: join(root, "status-work"),
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
       };
@@ -335,7 +377,7 @@ describe("forward-only D1 schema surface", () => {
         integrationTarget,
         {
           reader: readerSequence([state]),
-          migrationDirectory: currentMigrations,
+          migrationDirectory: operationGenerationMigrations,
           outputDirectory: join(root, "status-work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
@@ -352,7 +394,7 @@ describe("forward-only D1 schema surface", () => {
         {
           run: fixture.run,
           reader: readerSequence([state]),
-          migrationDirectory: currentMigrations,
+          migrationDirectory: operationGenerationMigrations,
           outputDirectory: join(root, "apply-work"),
           leaseRoot: join(root, "leases"),
           review: "reviewer@example.test",

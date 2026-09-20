@@ -254,12 +254,17 @@ through this explicit proof path; any priced hold stays reserved until the
 Host's existing atomic failure settlement releases it with the lifecycle.
 This internal recovery contract changes no Form, public API, or database schema.
 
-Known recovery limitation: an accepted, unresolved apply is not yet portable
-across semantic Host implementation changes. Explicitly reconciling admission
-to the new implementation restores fresh operations, but does not replace the
-accepted saga's authority head. A different head still refuses continuation and
-retains the uncertain attempt. The whole-operation proof above does not bypass
-that authority check.
+Accepted, unresolved applies are future-portable only when admission stored the
+closed accepted-authority summary introduced by migration 0061. A resume still
+requires a fresh current mutation grant for the same FormRef, package digest,
+and create/update lifecycle; the implementation digest may rotate. The saved
+accepted head remains the saga, review, and receipt identity, while the fresh
+current fence is checked immediately before provider work and again at the
+final commit. Deactivation, package drift, selection drift, or a changed Form
+keeps the operation held before provider effects. Explicit `unfenced` summaries
+used by no-authority fixtures never gain a mutation fence. Pre-0061 NULL rows
+remain on their exact-head-only behavior and are never inferred or backfilled;
+the whole-operation proof above does not bypass those checks.
 
 ### Accepted apply placement
 
@@ -286,19 +291,23 @@ neither execution lease and does not authorize a stale executor or a different
 selection. A database failure rolls back both updates; a lost response requires
 durable readback and never authorizes assuming that acceptance failed.
 
-The internal schema addition does not backfill older attempts. Planned and
+The internal schema additions do not backfill older attempts. Planned and
 dispatched effect records from those builds omit the destination, while a
 successful receipt can retain it. Today's catalog and a provider-specific
 intent record cannot replace missing Host-wide initial evidence. An unresolved
-historical apply without that evidence remains unavailable for automatic
-continuation. Do not rewrite its saga, relax the authority-head comparison, or
-settle it using a newly selected provider's absence proof.
+historical apply without its saved provider selection remains unavailable for
+automatic continuation, even if the authority head is unchanged. An operation
+with that saved selection but without the accepted-authority summary retains
+only its exact-head path; it cannot continue across an authority-head change.
+Do not rewrite either missing record, relax the applicable authority checks,
+or settle an operation using a newly selected provider's absence proof.
 
-This placement fence prevents new ambiguity; it does not implement continuation
-across semantic Host authority changes or repair historical unknown attempts.
-It changes no public API or Form. The database upgrade is forward-only. The
-0059 dispatch check alone cannot fence preparation callbacks in older binaries
-that run before dispatch; an older Worker is not a supported serving rollback.
+This placement fence prevents new ambiguity; migration 0061 adds only
+future accepted-authority provenance and a permanent guard against old apply
+inserts. It changes no public API or Form. The database upgrade is forward-only.
+The 0059 dispatch check alone cannot fence preparation callbacks in older
+binaries that run before dispatch; an older Worker is not a supported serving
+rollback.
 Previously accepted side effects remain subject to their existing recovery and
 whole-attempt-idle checks.
 

@@ -7,6 +7,10 @@ import {
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
+import {
+  type AcceptedAuthoritySummary,
+  assertAcceptedAuthorityGrant,
+} from "./accepted-authority.ts";
 import type { TakoformApplySelection } from "./apply-selection.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import { type BindingRegistry, installedBindings } from "./bindings.ts";
@@ -117,6 +121,8 @@ export interface EngineContext {
   readonly durableOperation?: {
     readonly id: string;
     readonly resourceUid: string;
+    /** Authority accepted before this deferred apply crossed the Host boundary. */
+    readonly acceptedAuthority?: AcceptedAuthoritySummary;
     /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
     readonly claimOwnerId: string;
     readonly commit: (mutation: EngineMutationCommit) => Promise<void>;
@@ -314,7 +320,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     /** Signals that an earlier attempt already crossed the provider boundary. */
     readonly onPreviouslyDispatched?: () => void;
     readonly onContention?: () => void;
-    readonly onDispatch?: () => void | Promise<void>;
+    readonly onDispatch?: (mode: "initial" | "recovery") => void | Promise<void>;
     readonly onReceiptReady?: () => void;
     /** The wallet hold and Host lifecycle settle through one store-owned batch. */
     readonly commitDefinitiveFailure?: (
@@ -338,6 +344,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       dependencies: ResourceDependencySet | undefined,
       mode: "initial" | "recovery",
       leaseToken: string,
+      acceptedSelection?: TakoformApplySelection,
     ) => Promise<void>;
     readonly settleDefinitiveImportFailure?: (
       leaseToken: string,
@@ -432,7 +439,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDependenciesAccepted?.(dependencySet);
       }
-      await input.prepare?.(dependencySet, execution.mode, leaseToken);
+      await input.prepare?.(dependencySet, execution.mode, leaseToken, execution.applySelection);
       const marked = await store.markProviderMutationDispatch({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -453,7 +460,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("resource_busy", 409);
       }
       providerDispatchMarked = true;
-      await input.onDispatch?.();
+      await input.onDispatch?.(execution.mode);
       executeEntered = true;
       const receipt = await input.execute(execution.mode, execution, leaseToken);
       input.onReceiptReady?.();
@@ -1156,12 +1163,24 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
-      const authority = await authorizeMutation(
+      let authority = await authorizeMutation(
         context,
         create ? "create" : "update",
         body.metadata.space,
         form.identity.formRef,
       );
+      if (context.durableOperation?.acceptedAuthority) {
+        try {
+          assertAcceptedAuthorityGrant({
+            summary: context.durableOperation.acceptedAuthority,
+            lifecycleOperation: create ? "create" : "update",
+            formRef: form.identity.formRef,
+            grant: authority,
+          });
+        } catch {
+          throw new TakoformHostError("form_unavailable", 503);
+        }
+      }
       form = authority.form;
       const createIntent = context.request.headers.get("if-none-match") === "*";
       const generationHeader = context.request.headers.get("takoform-expected-generation");
@@ -1210,6 +1229,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const proposedOperationId = context.durableOperation?.id ?? operationId();
       const proposedResourceUid =
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
+      const acceptedSagaAuthorityHeadDigest = sagaAuthorityHeadDigest(
+        context.durableOperation?.acceptedAuthority,
+        authority.fence,
+      );
       const proposedSaga = {
         operationId: proposedOperationId,
         operationKind: "apply" as const,
@@ -1217,7 +1240,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         tenantId: context.tenantId,
         fingerprint,
         resourceUid: proposedResourceUid,
-        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+        ...(acceptedSagaAuthorityHeadDigest
+          ? {
+              authorityHeadDigest: acceptedSagaAuthorityHeadDigest,
+            }
+          : {}),
         target: address,
         ...(current
           ? {
@@ -1236,12 +1263,16 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         (await store.establishedProviderMutationSaga(proposedSaga));
       if (!establishedSaga) {
         const review = await store.readPrepare(context.tenantId, body.review.prepareDigest);
+        const reviewAuthorityHeadDigest =
+          context.durableOperation?.acceptedAuthority?.mode === "mutation"
+            ? context.durableOperation.acceptedAuthority.headDigest
+            : authority.fence?.headDigest;
         if (
           !review ||
           review.fingerprint !== canonicalJson(stripApplyReview(body)) ||
           review.expectedGeneration !== (current?.metadata.generation ?? undefined) ||
           review.currentUid !== (current?.metadata.uid ?? undefined) ||
-          review.authorityHeadDigest !== authority.fence?.headDigest
+          review.authorityHeadDigest !== reviewAuthorityHeadDigest
         ) {
           throw new TakoformHostError();
         }
@@ -1446,6 +1477,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       let providerProvablyIdle = false;
       let providerPlanRecorded = false;
       let releaseClaimsOnFailure = true;
+      let providerOperationMode: "initial" | "recovery" = "initial";
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
         let acceptedRelations = relations;
@@ -1480,7 +1512,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             releaseClaimsOnFailure = true;
           },
           providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
-          onDispatch: async () => {
+          onDispatch: async (operationMode) => {
             if (
               !(await store.recordResourceEffect({
                 tenantId: context.tenantId,
@@ -1488,22 +1520,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 effectId: opId,
                 kind: "apply",
                 phase: "dispatched",
-                operationMode: "initial",
+                operationMode,
               }))
             ) {
               throw new TakoformHostError("resource_busy", 409);
             }
             providerDispatched = true;
           },
-          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies, executionMode, leaseToken) => {
+          ...(acceptedSagaAuthorityHeadDigest
+            ? {
+                authorityHeadDigest: acceptedSagaAuthorityHeadDigest,
+              }
+            : {}),
+          prepare: async (acceptedDependencies, executionMode, leaseToken, acceptedSelection) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
               body.metadata.space,
               acceptedRelations,
             );
-            const currentSelection = await driver.selectApply({
+            const resolvedSelection = await driver.selectApply({
               tenantId: context.tenantId,
               resourceUid: uid,
               form,
@@ -1516,6 +1552,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 : {}),
               ...(current ? { previous: structuredClone(current) } : {}),
             });
+            const currentSelection =
+              executionMode === "recovery"
+                ? acceptedSelection &&
+                  canonicalJson(resolvedSelection) === canonicalJson(acceptedSelection)
+                  ? acceptedSelection
+                  : undefined
+                : resolvedSelection;
+            if (!currentSelection) throw new TakoformHostError("resource_busy", 409);
             const boundSelection = await store.bindProviderMutationApplySelection({
               tenantId: context.tenantId,
               operationId: opId,
@@ -1534,7 +1578,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 effectId: opId,
                 kind: "apply",
                 phase: "planned",
-                operationMode: "initial",
+                operationMode: executionMode,
               }))
             ) {
               throw new TakoformHostError("resource_busy", 409);
@@ -1581,7 +1625,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 project: true,
               });
             }
-            await refreshMutation(
+            authority = await refreshMutation(
               context,
               create ? "create" : "update",
               body.metadata.space,
@@ -1619,6 +1663,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             });
           },
           execute: async (operationMode, execution, leaseToken) => {
+            providerOperationMode = operationMode;
             if (!applySelection) throw new TakoformHostError("backend_unavailable", 503);
             const executionAuthority = {
               tenantId: context.tenantId,
@@ -1717,7 +1762,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replayKey,
             replay: replayRecord,
             providerReceipt: receipt,
-            providerEffect: { effectId: opId, kind: "apply", operationMode: "initial" },
+            providerEffect: { effectId: opId, kind: "apply", operationMode: providerOperationMode },
             claimKeys,
             dependencySet,
             ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -1739,7 +1784,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               replayKey,
               replay: replayRecord,
               providerReceipt: receipt,
-              providerEffect: { effectId: opId, kind: "apply", operationMode: "initial" },
+              providerEffect: {
+                effectId: opId,
+                kind: "apply",
+                operationMode: providerOperationMode,
+              },
               ...(claimKeys.length > 0 ? { claimKeys } : {}),
               dependencySet,
               ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -2603,6 +2652,16 @@ function nextResourceUid(randomId: () => string): string {
     return `uid_${encoded}`;
   }
   return `uid_${raw.replace(/[^A-Za-z0-9._-]/gu, "")}`;
+}
+
+function sagaAuthorityHeadDigest(
+  accepted: AcceptedAuthoritySummary | undefined,
+  current: TakoformAuthorityFence | undefined,
+): `sha256:${string}` | undefined {
+  if (accepted !== undefined) {
+    return accepted.mode === "mutation" ? accepted.headDigest : undefined;
+  }
+  return current?.headDigest;
 }
 
 /** An observation that changed nothing must not mint a new revision. */

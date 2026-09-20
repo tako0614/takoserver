@@ -124,6 +124,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0058_cloudflare_managed_worker_domain_receipts.sql",
   "0059_takoform_apply_provider_selection.sql",
   "0060_takoform_operation_generation.sql",
+  "0061_takoform_accepted_authority_continuity.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -247,7 +248,16 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:c0af2dc82b77578496efe16e760d6a83727adf12385dda289637de142b3473eb",
   "0060_takoform_operation_generation.sql":
     "sha256:4d5c04322a3eee95669a8ad83186ad0bf4a69ca192110c6e05d07bebc5ca99c2",
+  "0061_takoform_accepted_authority_continuity.sql":
+    "sha256:63d2029fa680130f4af59fae2f1f613a7d9ea220816eb224576521b59943ad88",
 };
+const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
+const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(
+  OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.map((name) => [
+    name,
+    AUDITED_MIGRATION_SHA256[name],
+  ]),
+) as Readonly<Record<string, string>>;
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
   "0028",
@@ -409,6 +419,7 @@ const LIVE_NATIVE_CLAIM_MIGRATION = "0039_takoform_live_native_claim_across_tena
 const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
 const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
+const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -1543,7 +1554,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0060",
+      "selected D1 wave requires the exact audited source inventory 0001-0061",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1573,32 +1584,53 @@ function selectSchemaWave(
   };
 }
 
-function assertAuditedMigrationHashes(
+function assertMigrationHashes(
   files: readonly MigrationArtifactFile[],
-  count: number = AUDITED_MIGRATION_LINEAGE.length,
+  lineage: readonly string[],
+  hashes: Readonly<Record<string, string>>,
+  count: number = lineage.length,
 ): void {
-  for (const [index, name] of AUDITED_MIGRATION_LINEAGE.slice(0, count).entries()) {
+  for (const [index, name] of lineage.slice(0, count).entries()) {
     const file = files[index];
     const body = file === undefined ? null : readFileSync(file.path);
     const actualDigest = body === null ? "missing" : digestBytes(body);
     if (
       file?.name !== name ||
-      file.digest !== AUDITED_MIGRATION_SHA256[name] ||
-      actualDigest !== AUDITED_MIGRATION_SHA256[name] ||
+      file.digest !== hashes[name] ||
+      actualDigest !== hashes[name] ||
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
         `selected D1 wave requires the exact audited migration SHA-256 for every 0001-${String(
           count,
         ).padStart(4, "0")} file`,
-        `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
+        `position=${index + 1} name=${name} expected=${hashes[name]} actual=${actualDigest}`,
       );
     }
   }
 }
 
+function assertAuditedMigrationHashes(
+  files: readonly MigrationArtifactFile[],
+  count: number = AUDITED_MIGRATION_LINEAGE.length,
+): void {
+  assertMigrationHashes(files, AUDITED_MIGRATION_LINEAGE, AUDITED_MIGRATION_SHA256, count);
+}
+
+function assertOperationGenerationMigrationHashes(
+  files: readonly MigrationArtifactFile[],
+  count: number = OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.length,
+): void {
+  assertMigrationHashes(
+    files,
+    OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE,
+    OPERATION_GENERATION_AUDITED_MIGRATION_SHA256,
+    count,
+  );
+}
+
 /**
- * Reads the current audited 0001-0060 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0061 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1609,11 +1641,34 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0060",
+      "audited migration lineage must contain exactly 0001-0061",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
   assertAuditedMigrationHashes(artifact.files);
+  return artifact;
+}
+
+/**
+ * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
+ * intentionally separate from the current 0001-0061 source inventory: the
+ * operation-generation cutover is historical evidence, not a claim about the
+ * current migration tail.
+ */
+export function readOperationGenerationMigrationArtifact(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !==
+    JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE)
+  ) {
+    throw preflightError(
+      "operation-generation cutover requires the exact audited 0001-0060 inventory",
+      `actual=${JSON.stringify(artifact.names)}`,
+    );
+  }
+  assertOperationGenerationMigrationHashes(artifact.files);
   return artifact;
 }
 
@@ -1861,7 +1916,8 @@ interface ApplyProviderSelectionCutover {
     | "predecessor_schema_mismatch"
     | "orphan_open_effects_repair_required"
     | "old_apply_writers_quiescence_unproven"
-    | "operation_generation_cutover_unqualified";
+    | "operation_generation_cutover_unqualified"
+    | "accepted_authority_cutover_unqualified";
   readonly orphanOpenProviderEffectCount?: number;
 }
 
@@ -1958,6 +2014,12 @@ async function inspectApplyProviderSelectionCutover(input: {
   readonly injected: SchemaReader | undefined;
 }): Promise<ApplyProviderSelectionCutover> {
   const { pending } = input.wave;
+  // The local 0061 runtime work is not a qualified upgrade lane yet. In
+  // particular the ordinary integration suffix must not install its permanent
+  // old-writer fence while accepted operations still need the old Host.
+  if (pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
+    return { status: "accepted_authority_cutover_unqualified" };
+  }
   if (
     !pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION) &&
     !pending.includes(OPERATION_GENERATION_MIGRATION)
@@ -1971,7 +2033,8 @@ async function inspectApplyProviderSelectionCutover(input: {
     input.invocation.environment !== "integration" ||
     input.invocation.throughMigration !== undefined ||
     (count !== 58 && count !== 59) ||
-    JSON.stringify(pending) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE.slice(count))
+    JSON.stringify(pending) !==
+      JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.slice(count))
   ) {
     return {
       status: pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)
@@ -1979,12 +2042,15 @@ async function inspectApplyProviderSelectionCutover(input: {
         : "operation_generation_cutover_unqualified",
     };
   }
-  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+  if (
+    JSON.stringify(input.artifact.names) !==
+    JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE)
+  ) {
     throw preflightError(
       "operation-generation cutover requires the exact audited 0001-0060 inventory",
     );
   }
-  assertAuditedMigrationHashes(input.artifact.files);
+  assertOperationGenerationMigrationHashes(input.artifact.files);
   if (
     !applicationSchemaMatches(
       input.state,

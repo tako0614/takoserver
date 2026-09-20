@@ -12,11 +12,17 @@ import {
 import type { TakoformV1Alpha3FormRef } from "../src/takoform/types.ts";
 
 const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
+const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
 const generationIndex = MIGRATIONS.findIndex(({ name }) => name === OPERATION_GENERATION_MIGRATION);
 if (generationIndex < 0) throw new Error("operation generation migration is missing");
 const generationMigration = MIGRATIONS[generationIndex];
 if (!generationMigration) throw new Error("operation generation migration is missing");
 const generationSql = generationMigration.sql;
+const acceptedAuthorityMigration = MIGRATIONS.find(
+  ({ name }) => name === ACCEPTED_AUTHORITY_MIGRATION,
+);
+if (!acceptedAuthorityMigration) throw new Error("accepted authority migration is missing");
+const acceptedAuthoritySql = acceptedAuthorityMigration.sql;
 
 // These are the pinned legacy statement projections from both
 // 3b9a4e3036d943c6167d5e16f8eb04df04aa6985 and runtime 532 at 1d3d126; the
@@ -64,6 +70,11 @@ function applyBeforeGeneration(database: Database): void {
 
 function applyGeneration(database: Database): void {
   database.exec(generationSql);
+}
+
+function applyCurrentGeneration(database: Database): void {
+  applyGeneration(database);
+  database.exec(acceptedAuthoritySql);
 }
 
 function insertLegacySaga(
@@ -578,7 +589,7 @@ describe("Takoform paired operation generation compatibility", () => {
         targetName: "legacy-deferred",
         expiresAt: 1,
       });
-      applyGeneration(database);
+      applyCurrentGeneration(database);
       const store = createTakoformStore(createSqliteSql(database), () => new Date(10_000));
       const conflicts = [
         saga({
@@ -730,7 +741,7 @@ describe("Takoform paired operation generation compatibility", () => {
       expect(
         database.query("SELECT COUNT(*) AS count FROM tf_provider_mutation_sagas").get(),
       ).toEqual({ count: 0 });
-      applyGeneration(database);
+      applyCurrentGeneration(database);
 
       const store = createTakoformStore(createSqliteSql(database), () => new Date(10_000));
       const operationConflict = saga({
