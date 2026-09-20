@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import type { DeferredOperationsConfiguration } from "../src/takoform/operations.ts";
 import type {
   InstalledTakoformForm,
@@ -62,6 +63,9 @@ describe("stable StandardServiceRef", () => {
   test("does not publish service-retail discovery and required resolution fails closed", async () => {
     let mutations = 0;
     const host = stableHost({
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply() {
         mutations += 1;
         return {};
@@ -92,6 +96,9 @@ describe("stable StandardServiceRef", () => {
     let mutations = 0;
     const host = stableHost(
       {
+        async selectApply() {
+          return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+        },
         async apply() {
           mutations += 1;
           return {};
@@ -132,6 +139,9 @@ describe("stable StandardServiceRef", () => {
     };
     const host = stableHost(
       {
+        async selectApply() {
+          return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+        },
         async apply() {
           mutations += 1;
           return {};
@@ -167,6 +177,9 @@ describe("stable StandardServiceRef", () => {
   test("defaults required to true, omits unsupported optional slots, and keeps material sealed", async () => {
     const projected: unknown[] = [];
     const host = stableHost({
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         projected.push(input.standardServices);
         return { outputs: { hostname: "worker.example.invalid" } };
@@ -236,6 +249,9 @@ describe("stable StandardServiceRef", () => {
     };
     const host = stableHost(
       {
+        async selectApply() {
+          return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+        },
         async apply() {
           mutations += 1;
           return { outputs: { hostname: "worker.example.invalid" } };
@@ -301,6 +317,9 @@ describe("stable StandardServiceRef", () => {
     };
     const host = stableHost(
       {
+        async selectApply() {
+          return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+        },
         async apply(input) {
           mutations += 1;
           modes.push(input.operationMode);
@@ -361,6 +380,9 @@ describe("stable StandardServiceRef", () => {
 
   test("rejects portable endpoint, credential, FormRef, and Resource selector fields", async () => {
     const host = stableHost({
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply() {
         throw new Error("invalid portable state must not mutate");
       },

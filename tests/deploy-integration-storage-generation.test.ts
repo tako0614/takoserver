@@ -57,7 +57,7 @@ const invocation = {
 
 const emptyState = state([], []);
 const completeState = stateWithShape(
-  MIGRATIONS.slice(0, 58).map(({ name }) => name),
+  MIGRATIONS.slice(0, 59).map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -301,7 +301,7 @@ describe("integration storage generation bootstrap", () => {
       generation: GENERATION,
       d1: { databaseId: DATABASE_ID, databaseName: GENERATED_NAME },
       r2: { bucketName: GENERATED_NAME },
-      appliedMigrations: MIGRATIONS.slice(0, 58).map(({ name }) => name),
+      appliedMigrations: MIGRATIONS.slice(0, 59).map(({ name }) => name),
     });
     expect(proof.migrationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
     expect(proof.schemaShapeDigest).toBe(completeState.shapeDigest);
@@ -488,7 +488,7 @@ describe("integration storage generation bootstrap", () => {
       const results = sql.startsWith("SELECT name FROM sqlite_schema")
         ? schemaRows.filter(({ type }) => type === "table").map(({ name }) => ({ name }))
         : sql.includes("FROM d1_migrations ORDER BY id")
-          ? MIGRATIONS.slice(0, 58).map(({ name }) => ({ name }))
+          ? MIGRATIONS.slice(0, 59).map(({ name }) => ({ name }))
           : sql.startsWith("SELECT type, name, tbl_name, COALESCE(sql, '') AS sql")
             ? schemaRows
             : null;
@@ -625,7 +625,7 @@ describe("integration storage generation bootstrap", () => {
     expect(mismatch).toBeInstanceOf(DeployError);
     if (!(mismatch instanceof DeployError)) throw mismatch;
     expect(mismatch.phase).toBe("preflight");
-    expect(mismatch.message).toContain("exact audited 0001-0058 lineage");
+    expect(mismatch.message).toContain("exact audited 0001-0059 lineage");
     expect(mismatch.message).not.toContain("R2 creation is withheld");
     expect(reads).toEqual(["D1", "R2", "schema:preflight"]);
   });
@@ -883,7 +883,7 @@ describe("integration storage generation bootstrap", () => {
     expect(wrongError).toBeInstanceOf(DeployError);
     if (!(wrongError instanceof DeployError)) throw wrongError;
     expect(wrongError.phase).toBe("verification");
-    expect(wrongError.message).toContain("exact audited 0001-0058 lineage");
+    expect(wrongError.message).toContain("exact audited 0001-0059 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
@@ -894,7 +894,7 @@ describe("integration storage generation bootstrap", () => {
         options(wrongShape.provider, [
           emptyState,
           stateWithShape(
-            MIGRATIONS.slice(0, 58).map(({ name }) => name),
+            MIGRATIONS.slice(0, 59).map(({ name }) => name),
             "[]\n",
           ),
         ]),
@@ -955,7 +955,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0059_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0060_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -963,7 +963,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0058");
+      ).rejects.toThrow("exactly 0001-0059");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

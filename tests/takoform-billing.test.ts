@@ -26,6 +26,7 @@ import {
 } from "../src/provider-port.ts";
 import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const fakeReadback = {
@@ -309,7 +310,7 @@ describe("Takoform apply on a real backend", () => {
 
     let firstError: unknown;
     try {
-      await makeDriver().apply(input);
+      await applyWithSelection(makeDriver(), input);
     } catch (error) {
       firstError = error;
     }
@@ -329,7 +330,7 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.sideEffectCount).toBe(1);
 
     const restarted = makeDriver();
-    const settled = await restarted.apply({
+    const settled = await applyWithSelection(restarted, {
       ...input,
       operationMode: "recovery",
       providerHandle,
@@ -395,7 +396,7 @@ describe("Takoform apply on a real backend", () => {
       relations: [],
     } as const;
 
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "running",
       providerHandle: "handle_op_poll_lost",
     });
@@ -403,7 +404,7 @@ describe("Takoform apply on a real backend", () => {
     // executor can then carry it back through the recovery-only path.
     expect(pollCalls).toBe(0);
     failNextPoll = false;
-    const recovered = await makeDriver().apply({
+    const recovered = await applyWithSelection(makeDriver(), {
       ...input,
       operationMode: "recovery",
       providerHandle: "handle_op_poll_lost",
@@ -467,7 +468,7 @@ describe("Takoform apply on a real backend", () => {
       relations: [],
     } as const;
 
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "indeterminate",
     });
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
@@ -475,11 +476,11 @@ describe("Takoform apply on a real backend", () => {
       heldMinor: 500,
       availableMinor: 1_500,
     });
-    await expect(makeDriver().apply({ ...input, operationMode: "recovery" })).rejects.toMatchObject(
-      {
-        providerOutcome: "indeterminate",
-      },
-    );
+    await expect(
+      applyWithSelection(makeDriver(), { ...input, operationMode: "recovery" }),
+    ).rejects.toMatchObject({
+      providerOutcome: "indeterminate",
+    });
     expect(attempts).toBe(1);
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
       settledMinor: 2_000,
@@ -554,10 +555,13 @@ describe("Takoform apply on a real backend", () => {
       spec: { location: "apac" },
       relations: [],
     } as const;
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "indeterminate",
     });
-    const recovered = await makeDriver().apply({ ...input, operationMode: "recovery" });
+    const recovered = await applyWithSelection(makeDriver(), {
+      ...input,
+      operationMode: "recovery",
+    });
     expect(recovered.observed).toEqual(input.spec);
     expect(applyCalls).toBe(1);
     expect(readOnlyRecoverCalls).toBe(0);
@@ -1067,6 +1071,123 @@ describe("Takoform apply on a real backend", () => {
     });
   });
 
+  test("never reroutes an accepted apply to a different provider after restart", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    let initialCalls = 0;
+    const initialProvider: Provider = {
+      id: "fake-initial",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        initialCalls += 1;
+        throw new Error("initial provider acknowledgement lost");
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const initialOffering: Offering = {
+      ...SOLD,
+      providerPackRef: initialProvider.id,
+      providerInstallationRef: "fake-initial.primary",
+    };
+    const app = buildApp({
+      sql,
+      objects,
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [initialProvider],
+      offerings: [initialOffering],
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await applyBucket(
+      app.fetch,
+      auth,
+      "selection-restart",
+      {},
+      "selection-restart-0001",
+    );
+    expect(accepted.status).toBe(202);
+    expect(initialCalls).toBe(1);
+
+    let reroutedCalls = 0;
+    const reroutedProvider: Provider = {
+      id: "fake-rerouted",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("recovery must not issue an initial apply");
+      },
+      async convergeApply(input) {
+        reroutedCalls += 1;
+        return succeeded({
+          nativeId: `rerouted:${input.operationId}`,
+          observed: input.spec,
+          outputs: {},
+        });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const restarted = buildApp({
+      sql,
+      objects,
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [reroutedProvider],
+      offerings: [
+        {
+          ...SOLD,
+          providerPackRef: reroutedProvider.id,
+          providerInstallationRef: "fake-rerouted.primary",
+        },
+      ],
+    });
+
+    expect((await restarted.tick()).providerRepairs).toMatchObject({ pending: 1, settled: 0 });
+    expect(reroutedCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT phase, selection_json FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual([
+      {
+        phase: "planned",
+        selection_json: expect.stringContaining('"providerPackRef":"fake-initial"'),
+      },
+    ]);
+    expect(
+      await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects
+         WHERE tenant_id = ? ORDER BY phase`,
+        [organizationId],
+      ),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+    expect(
+      await sql.query(`SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ state: "live" }]);
+  });
+
   test("inherits one exact provider installation for a revision Form", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-19T00:00:00.000Z");
@@ -1101,7 +1222,7 @@ describe("Takoform apply on a real backend", () => {
       observed: { allocated: true },
       outputs: { scriptName: "script-name" },
     });
-    const result = await driver.apply({
+    const result = await applyWithSelection(driver, {
       operationId: "op_version",
       operationKey: "key_version",
       tenantId: "org_inherited",
@@ -1217,7 +1338,7 @@ describe("Takoform apply on a real backend", () => {
       outputs: { scriptName: "incapable-worker" },
     });
 
-    const capableResult = await driver.apply({
+    const capableResult = await applyWithSelection(driver, {
       operationId: "op_runtime_capable",
       operationKey: "key_runtime_capable",
       tenantId,
@@ -1244,7 +1365,7 @@ describe("Takoform apply on a real backend", () => {
     });
 
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op_runtime_incapable",
         operationKey: "key_runtime_incapable",
         tenantId,
@@ -1279,7 +1400,7 @@ describe("Takoform apply on a real backend", () => {
     });
     await ledger.fund({ organizationId: "org_reseller", fundingRef: "paid", amountMinor: 2_000 });
 
-    await driver.apply({
+    await applyWithSelection(driver, {
       operationId: "op_reseller_create",
       operationKey: "key_reseller_create",
       tenantId: "org_reseller",
@@ -1365,7 +1486,7 @@ describe("Takoform apply on a real backend", () => {
       deployments,
     });
 
-    await driver.apply({
+    await applyWithSelection(driver, {
       operationId: "op-update-target",
       operationKey: "key-update-target",
       operationMode: "initial",
@@ -1879,7 +2000,7 @@ describe("Takoform apply on a real backend", () => {
       spec: {},
       relations: [],
     } as const;
-    await driver.apply(input);
+    await applyWithSelection(driver, input);
     await deletions.prepareResourceDeletion({
       tenantId: input.tenantId,
       resourceUid: input.resourceUid,
@@ -2376,7 +2497,7 @@ describe("Takoform apply on a real backend", () => {
     } as const;
 
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op_retained_authoring",
         operationKey: "key_retained_authoring",
         tenantId,

@@ -12,6 +12,11 @@ import {
   type ResourceExecutionEvidenceResponse,
 } from "../resource-execution-evidence.ts";
 import {
+  encodeTakoformApplySelection,
+  parseTakoformApplySelection,
+  type TakoformApplySelection,
+} from "./apply-selection.ts";
+import {
   decodeResourceDependencySet,
   isResourceDependencyClaimKey,
   RESOURCE_DEPENDENCY_PRIVATE_HOLDER,
@@ -232,6 +237,8 @@ export type ProviderMutationExecution =
   | {
       readonly kind: "acquired";
       readonly mode: "initial" | "recovery";
+      /** Immutable selection retained before this apply first crossed dispatch. */
+      readonly applySelection?: TakoformApplySelection;
       /** Opaque provider handle from the last accepted dispatch, if any. */
       readonly providerHandle?: string;
       /** Whether the accepted dispatch is still running or indeterminate. */
@@ -443,6 +450,20 @@ export interface TakoformStore {
     readonly leaseToken: string;
     readonly leaseUntil: number;
   }): Promise<ProviderMutationExecution>;
+  /**
+   * Binds or re-verifies one immutable apply selection under the exact current
+   * saga lease. Initial retries may repeat the same value; recovery may never
+   * fill a historical NULL or replace an accepted value.
+   */
+  bindProviderMutationApplySelection(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly fingerprint: string;
+    readonly leaseToken: string;
+    readonly mode: "initial" | "recovery";
+    readonly selection: TakoformApplySelection;
+  }): Promise<TakoformApplySelection | null>;
   markProviderMutationDispatch(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -1736,7 +1757,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           timestamp,
         ],
       );
-      if (initial.changes === 1) return { kind: "acquired", mode: "initial" };
+      if (initial.changes === 1) {
+        const stateRows = await sql.query(
+          `SELECT selection_json
+           FROM tf_provider_mutation_sagas
+           WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+             AND execution_lease_token = ? LIMIT 1`,
+          [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
+        );
+        return {
+          kind: "acquired",
+          mode: "initial",
+          ...providerMutationApplySelectionState(stateRows[0]),
+        };
+      }
 
       const recovery = await sql.run(
         `UPDATE tf_provider_mutation_sagas
@@ -1758,7 +1792,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       if (recovery.changes === 1) {
         const stateRows = await sql.query(
-          `SELECT provider_handle, provider_outcome
+          `SELECT provider_handle, provider_outcome, selection_json
            FROM tf_provider_mutation_sagas
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
@@ -1783,6 +1817,47 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         return { kind: "executed", receipt: providerReceipt(row.receipt_json) };
       }
       return { kind: "busy" };
+    },
+
+    async bindProviderMutationApplySelection(input) {
+      const timestamp = now();
+      const selectionJson = encodeTakoformApplySelection(input.selection);
+      const bound = await sql.run(
+        `UPDATE tf_provider_mutation_sagas
+         SET selection_json = COALESCE(selection_json, ?),
+             selection_verified_lease_token = ?, updated_at = ?
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND phase = 'planned' AND receipt_json IS NULL
+           AND expires_at > ? AND execution_lease_token = ? AND execution_lease_until > ?
+           AND execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+           AND ${
+             input.mode === "initial"
+               ? "(selection_json IS NULL OR selection_json = ?)"
+               : "selection_json = ?"
+}`,
+        [
+          selectionJson,
+          input.leaseToken,
+          timestamp,
+          input.tenantId,
+          input.operationId,
+          input.resourceUid,
+          input.fingerprint,
+          timestamp,
+          input.leaseToken,
+          timestamp,
+          selectionJson,
+        ],
+      );
+      if (bound.changes !== 1) return null;
+      const rows = await sql.query(
+        `SELECT selection_json FROM tf_provider_mutation_sagas
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND execution_lease_token = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.fingerprint, input.leaseToken],
+      );
+      if (rows.length !== 1 || typeof rows[0]?.selection_json !== "string") return null;
+      return parseTakoformApplySelection(rows[0].selection_json);
     },
 
     async markProviderMutationDispatch(input) {
@@ -4294,6 +4369,7 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
 }
 
 function providerMutationExecutionState(row: Row | undefined): {
+  readonly applySelection?: TakoformApplySelection;
   readonly providerHandle?: string;
   readonly providerOutcome?: "running" | "indeterminate";
 } {
@@ -4304,11 +4380,23 @@ function providerMutationExecutionState(row: Row | undefined): {
       ? row.provider_outcome
       : undefined;
   return {
+    ...providerMutationApplySelectionState(row),
     ...(providerHandle ? { providerHandle } : {}),
     ...(providerOutcome === "indeterminate" || (providerOutcome === "running" && providerHandle)
       ? { providerOutcome }
       : {}),
   };
+}
+
+function providerMutationApplySelectionState(row: Row | undefined): {
+  readonly applySelection?: TakoformApplySelection;
+} {
+  if (!row) throw new Error("provider_mutation_saga_missing_after_lease");
+  if (row.selection_json === null || row.selection_json === undefined) return {};
+  if (typeof row.selection_json !== "string") {
+    throw new Error("provider_mutation_apply_selection_invalid");
+  }
+  return { applySelection: parseTakoformApplySelection(row.selection_json) };
 }
 
 function sameProviderMutationSaga(

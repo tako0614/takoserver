@@ -7,6 +7,7 @@ import {
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
+import type { TakoformApplySelection } from "./apply-selection.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import { createResourceDependencySet, type ResourceDependencySet } from "./dependency-fence.ts";
@@ -336,6 +337,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly prepare?: (
       dependencies: ResourceDependencySet | undefined,
       mode: "initial" | "recovery",
+      leaseToken: string,
     ) => Promise<void>;
     readonly settleDefinitiveImportFailure?: (
       leaseToken: string,
@@ -430,7 +432,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDependenciesAccepted?.(dependencySet);
       }
-      await input.prepare?.(dependencySet, execution.mode);
+      await input.prepare?.(dependencySet, execution.mode, leaseToken);
       const marked = await store.markProviderMutationDispatch({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -1437,27 +1439,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw new TakoformHostError("resource_busy", 409);
       }
-      if (
-        !(await store.recordResourceEffect({
-          tenantId: context.tenantId,
-          resourceUid: uid,
-          effectId: opId,
-          kind: "apply",
-          phase: "planned",
-          operationMode: "initial",
-        }))
-      ) {
-        throw new TakoformHostError("resource_busy", 409);
-      }
       let persisted = false;
       let providerSettled = false;
       let providerDispatched = false;
       let providerProvablyIdle = false;
+      let providerPlanRecorded = false;
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
         let acceptedRelations = relations;
         let preparedMigration: PreparedSqliteMigrationApplication | null = null;
+        let applySelection: TakoformApplySelection | undefined;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: opId,
@@ -1471,6 +1463,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onPreviouslyDispatched: () => {
             providerDispatched = true;
+            releaseClaimsOnFailure = false;
           },
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -1483,6 +1476,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onProvablyIdle: () => {
             providerProvablyIdle = true;
+            releaseClaimsOnFailure = true;
           },
           providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
           onDispatch: async () => {
@@ -1501,13 +1495,50 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerDispatched = true;
           },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies, executionMode) => {
+          prepare: async (acceptedDependencies, executionMode, leaseToken) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
               body.metadata.space,
               acceptedRelations,
             );
+            const currentSelection = await driver.selectApply({
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              relations: preparedDriverRelations,
+              ...(context.commercialAuthority
+                ? { commercialAuthority: context.commercialAuthority }
+                : {}),
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+            const boundSelection = await store.bindProviderMutationApplySelection({
+              tenantId: context.tenantId,
+              operationId: opId,
+              resourceUid: uid,
+              fingerprint,
+              leaseToken,
+              mode: executionMode,
+              selection: currentSelection,
+            });
+            if (!boundSelection) throw new TakoformHostError("resource_busy", 409);
+            applySelection = boundSelection;
+            if (
+              !(await store.recordResourceEffect({
+                tenantId: context.tenantId,
+                resourceUid: uid,
+                effectId: opId,
+                kind: "apply",
+                phase: "planned",
+                operationMode: "initial",
+              }))
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
+            providerPlanRecorded = true;
             preparedMigration = await prepareSqliteMigrationApplication({
               tenantId: context.tenantId,
               space: body.metadata.space,
@@ -1587,6 +1618,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             });
           },
           execute: async (operationMode, execution, leaseToken) => {
+            if (!applySelection) throw new TakoformHostError("backend_unavailable", 503);
             const executionAuthority = {
               tenantId: context.tenantId,
               resourceUid: uid,
@@ -1600,6 +1632,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               executionAuthority,
               prepared: preparedMigration,
               driver,
+              selection: applySelection,
             });
             return await driver.apply({
               operationId: opId,
@@ -1625,6 +1658,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               spec: structuredClone(body.spec),
               desiredGeneration: incomingDesiredGeneration(body, current),
               relations: preparedDriverRelations,
+              selection: applySelection,
               atomicDeploymentCommit: true,
               ...(context.commercialAuthority
                 ? { commercialAuthority: context.commercialAuthority }
@@ -1725,7 +1759,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             });
           }
           if (!providerDispatched || providerProvablyIdle) {
-            await settleIdleAttempt(context.tenantId, uid, opId, "apply");
+            if (providerPlanRecorded) {
+              await settleIdleAttempt(context.tenantId, uid, opId, "apply");
+            } else {
+              await store.releaseUncommittedResourceIncarnation({
+                tenantId: context.tenantId,
+                resourceUid: uid,
+                effectId: opId,
+              });
+            }
           }
         }
         throw error;
@@ -2015,6 +2057,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onPreviouslyDispatched: () => {
             providerDispatched = true;
+            releaseClaimsOnFailure = false;
           },
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -2024,6 +2067,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onProvablyIdle: () => {
             providerProvablyIdle = true;
+            releaseClaimsOnFailure = true;
           },
           providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
           onDispatch: async () => {

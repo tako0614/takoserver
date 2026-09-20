@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Miniflare } from "miniflare";
 import { createStaticTestTakoformHost as createTakoformHost } from "./app.ts";
+import { canonicalDigest, canonicalJson } from "./json.ts";
 import { migrateSqlite } from "./migrate-sqlite.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
 import type {
@@ -16,6 +17,13 @@ import type {
 } from "./provider-port.ts";
 import { CloudflareProvider } from "./providers/cloudflare.ts";
 import { createSqliteSql } from "./sql-sqlite.ts";
+import {
+  sameTakoformApplySelection,
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+  type TakoformApplySelectionDeployment,
+  type TakoformApplySelectionRelation,
+} from "./takoform/apply-selection.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import type {
   InstalledTakoformForm,
@@ -225,8 +233,106 @@ function localProviderDriver(
   };
   const intrinsic = (form: InstalledTakoformForm) => INTRINSIC.has(form.identity.formRef.kind);
 
+  const selectedDeployment = async (
+    deployment: NonNullable<ProviderRelation["deployment"]>,
+  ): Promise<TakoformApplySelectionDeployment> => ({
+    id: deployment.id,
+    resourceUid: deployment.resourceUid,
+    offeringId: deployment.offeringId,
+    providerPackRef: deployment.providerPackRef,
+    providerInstallationRef: deployment.providerInstallationRef,
+    nativeId: deployment.nativeId,
+    state: deployment.state,
+    projectionDigest: await canonicalDigest({
+      observed: deployment.observed,
+      outputs: deployment.outputs,
+    }),
+  });
+  const selectedRelations = async (
+    values: readonly TakoformDriverRelation[],
+  ): Promise<readonly TakoformApplySelectionRelation[]> =>
+    await Promise.all(
+      relations(values).map(async (value) => ({
+        pointer: value.pointer,
+        relation: value.relation,
+        targetUid: value.targetUid,
+        resource: {
+          apiVersion: value.resource.apiVersion,
+          kind: value.resource.kind,
+          formRef: structuredClone(value.resource.form.formRef),
+          name: value.resource.metadata.name,
+          space: value.resource.metadata.space,
+          uid: value.resource.metadata.uid,
+          generation: value.resource.metadata.generation,
+          revision: value.resource.metadata.revision,
+        },
+        ...(value.bindingRef ? { bindingRef: structuredClone(value.bindingRef) } : {}),
+        ...(value.deployment ? { deployment: await selectedDeployment(value.deployment) } : {}),
+      })),
+    );
+  const selectApply = async (
+    value: Parameters<TakoformResourceDriver["selectApply"]>[0],
+  ): Promise<TakoformApplySelection> => {
+    if (intrinsic(value.form)) {
+      if (value.form.identity.formRef.kind !== "SQLiteMigrationApplication") {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" };
+      }
+      const selected = await selectedRelations(value.relations);
+      if (
+        selected.filter(
+          (relation) => relation.relation === "/database" && relation.deployment !== undefined,
+        ).length !== 1
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      return {
+        version: TAKOFORM_APPLY_SELECTION_VERSION,
+        kind: "sqlite-migration",
+        relations: selected,
+      };
+    }
+    const technicalOffering = offering(value.form);
+    const current = deployments.get(value.resourceUid);
+    return {
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "provider",
+      providerPackRef: provider.id,
+      providerInstallationRef: current?.providerInstallationRef ?? "cloudflare.stable-local",
+      technicalOffering: structuredClone(technicalOffering),
+      ...(current ? { incumbent: await selectedDeployment(current) } : {}),
+      relations: await selectedRelations(value.relations),
+    };
+  };
+  const selectedDatabase = async (
+    database: Parameters<
+      NonNullable<TakoformResourceDriver["sqliteMigrations"]>["readLedger"]
+    >[0]["database"],
+    selection?: TakoformApplySelection,
+  ) => {
+    const current = deployments.get(database.metadata.uid);
+    if (!current) throw new TakoformHostError("resource_not_found", 404);
+    if (selection) {
+      const retained =
+        selection.kind === "sqlite-migration"
+          ? selection.relations.find((relation) => relation.relation === "/database")?.deployment
+          : undefined;
+      if (
+        !retained ||
+        canonicalJson(await selectedDeployment(current)) !== canonicalJson(retained)
+      ) {
+        throw new TakoformHostError("backend_unavailable", 503);
+      }
+      return retained;
+    }
+    return current;
+  };
+
   const driver: TakoformResourceDriver = {
+    selectApply,
     async apply(value) {
+      if (!sameTakoformApplySelection(await selectApply(value), value.selection)) {
+        throw new TakoformHostError("resource_busy", 409);
+      }
       if (intrinsic(value.form)) return { observed: structuredClone(value.spec) };
       const selected = offering(value.form);
       const current = deployments.get(value.resourceUid);
@@ -329,9 +435,8 @@ function localProviderDriver(
       deployments.delete(value.resourceUid);
     },
     sqliteMigrations: {
-      async readLedger({ tenantId, database }) {
-        const current = deployments.get(database.metadata.uid);
-        if (!current) throw new TakoformHostError("resource_not_found", 404);
+      async readLedger({ tenantId, database, selection }) {
+        const current = await selectedDatabase(database, selection);
         const result = await sqliteMigrations.readLedger({
           nativeId: current.nativeId,
           target: {
@@ -349,12 +454,12 @@ function localProviderDriver(
         operationMode,
         executionAuthority,
         database,
+        selection,
         desired,
         expectedPrefix,
         migrations,
       }) {
-        const current = deployments.get(database.metadata.uid);
-        if (!current) throw new TakoformHostError("resource_not_found", 404);
+        const current = await selectedDatabase(database, selection);
         const result = await sqliteMigrations.applySuffix({
           operationId,
           operationMode,

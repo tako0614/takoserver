@@ -18,6 +18,7 @@ import { FakeProvider } from "../src/providers/fake.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import { createWorkerEndpointOriginReservationBindingHandle } from "../src/worker-endpoint-origin-reservations.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const FORM = (() => {
   const form = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
@@ -443,7 +444,7 @@ test("creates a WorkerEndpoint on a self-host that terminates TLS on the default
     originReservations: harness.authority,
   });
 
-  const receipt = await driver.apply({
+  const receipt = await applyWithSelection(driver, {
     operationId: "op-endpoint-http",
     operationKey: "key-endpoint-http",
     tenantId: "org_01",
@@ -2136,7 +2137,7 @@ for (const { label, space, supplied } of [
       originReservations: harness.authority,
     });
 
-    const receipt = await driver.apply({
+    const receipt = await applyWithSelection(driver, {
       operationId: "op-endpoint-hostmint",
       operationKey: "key-endpoint-hostmint",
       tenantId: "org_01",
@@ -2251,7 +2252,7 @@ test("re-binds after a WorkerEndpoint create the provider refused", async () => 
     originReservations: harness.authority,
   });
   const create = (uid: string) =>
-    driver.apply({
+    applyWithSelection(driver, {
       operationId: `op-endpoint-${uid}`,
       operationKey: `key-endpoint-${uid}`,
       tenantId: "org_01",

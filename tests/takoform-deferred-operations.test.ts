@@ -8,6 +8,7 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type {
   InstalledTakoformForm,
@@ -133,6 +134,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         entered.resolve();
@@ -183,6 +185,7 @@ describe("durable deferred Takoform operations", () => {
     const providerOperationIds: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         providerOperationIds.push(input.operationId);
@@ -378,6 +381,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const harness = persistentHarness(undefined, {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.name === "cancel-too-late") {
           providerEntered.resolve();
@@ -522,6 +526,7 @@ describe("durable deferred Takoform operations", () => {
     let attempts = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       async apply(input) {
         operationIds.push(input.operationId);
         operationModes.push(input.operationMode);
@@ -607,6 +612,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async () => {
         providerCalls += 1;
         throw new TakoformHostError("resource_busy", 409);
@@ -661,6 +667,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.previous) {
           providerCalls += 1;
@@ -743,6 +750,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       import: async () => {
         providerCalls += 1;
@@ -799,6 +807,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async () => {
@@ -854,6 +863,7 @@ describe("durable deferred Takoform operations", () => {
     let refusing = false;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -902,6 +912,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (!database) throw new Error("test database is unavailable");
         const terminalJson = JSON.stringify({
@@ -972,6 +983,7 @@ describe("durable deferred Takoform operations", () => {
     const modes: Array<"initial" | "recovery" | undefined> = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       async apply(input) {
         operationIds.push(input.operationId);
         modes.push(input.operationMode);
@@ -1111,6 +1123,9 @@ describe("durable deferred Takoform operations", () => {
     const released = [deferred(), deferred()];
     let calls = 0;
     const driver: TakoformResourceDriver = {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         const call = calls++;
         entered[call]?.resolve();
@@ -1290,6 +1305,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const harness = persistentHarness(undefined, {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         return await memory.apply(input);
@@ -1340,6 +1356,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.previous) {
           providerCalls += 1;
@@ -1480,6 +1497,7 @@ describe("durable deferred Takoform operations", () => {
     let providerDeleteCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1564,6 +1582,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1763,6 +1782,7 @@ describe("durable deferred Takoform operations", () => {
     let refusing = true;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1862,6 +1882,7 @@ describe("durable deferred Takoform operations", () => {
     const applies: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applies.push(input.name);
         if (!capable) {
@@ -2004,6 +2025,7 @@ describe("durable deferred Takoform operations", () => {
     let published = "https://ported.invalid:28988/";
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => ({
         ...(await memory.apply(input)),
         outputs: { url: published },
@@ -2086,6 +2108,7 @@ describe("durable deferred Takoform operations", () => {
     let refuse = true;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         // The shape a self-host's endpoint mint refuses with: a statement about
         // this Host, raised after the Host marked its own dispatch and before
@@ -2135,6 +2158,7 @@ describe("durable deferred Takoform operations", () => {
     const writes: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         writes.push(input.operationId);
         await memory.apply(input);

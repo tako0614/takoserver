@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { DEFAULT_TAKOFORM_ROUTES } from "../src/takoform/routes.ts";
 import type { TakoformResourceDriver } from "../src/takoform/types.ts";
 import { createHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
@@ -40,6 +41,10 @@ const RESOURCE_PATH = `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}
 
 class ObservationDriver implements TakoformResourceDriver {
   observations = 0;
+
+  async selectApply() {
+    return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+  }
 
   async apply(): Promise<{ observed: { observation: number } }> {
     return { observed: { observation: 0 } };

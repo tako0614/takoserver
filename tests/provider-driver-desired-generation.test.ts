@@ -6,6 +6,7 @@ import { createProviderDriver } from "../src/provider-driver.ts";
 import { type Provider, type ProviderOffering, succeeded } from "../src/provider-port.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const formRef = {
   apiVersion: "example.forms.invalid",
@@ -128,13 +129,13 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
     relations: [],
   };
 
-  await driver.apply({ ...baseInput, desiredGeneration: "9223372036854775807" });
-  await driver.apply({
+  await applyWithSelection(driver, { ...baseInput, desiredGeneration: "9223372036854775807" });
+  await applyWithSelection(driver, {
     ...baseInput,
     operationMode: "recovery",
     desiredGeneration: "9223372036854775807",
   });
-  await driver.apply({
+  await applyWithSelection(driver, {
     ...baseInput,
     operationId: "generation-driver-0002",
     operationKey: "generation-driver-key-0002",

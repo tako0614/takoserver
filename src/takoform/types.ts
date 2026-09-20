@@ -4,6 +4,7 @@ import type { JsonObject } from "../ports.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "../standard-service-port.ts";
+import type { TakoformApplySelection } from "./apply-selection.ts";
 
 export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
 
@@ -237,6 +238,22 @@ export interface TakoformStandardServiceResolver {
 
 export interface TakoformResourceDriver {
   readonly runtimeInputPolicy?: TakoformRuntimeInputPolicy;
+  /**
+   * Pure, bounded placement decision persisted by the Host before callbacks or
+   * provider effects. Recovery may verify current availability against it but
+   * must never replace it with a newly selected destination.
+   */
+  selectApply(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+    readonly previous?: TakoformStoredResource;
+  }): Promise<TakoformApplySelection>;
   apply(input: {
     readonly operationId: string;
     /** Caller-chosen Host idempotency identity, retained across operation recovery. */
@@ -256,6 +273,8 @@ export interface TakoformResourceDriver {
     /** Host-selected incoming desired generation, not the current/precondition generation. */
     readonly desiredGeneration?: string;
     readonly relations: readonly TakoformDriverRelation[];
+    /** Immutable Host-retained selection accepted before the initial dispatch. */
+    readonly selection: TakoformApplySelection;
     readonly commercialAuthority?: TakoformCommercialAuthority;
     /** Private Host context. The driver resolves it before provider dispatch. */
     readonly workerEndpointOriginReservationId?: string;
@@ -334,6 +353,8 @@ export interface TakoformResourceDriver {
     readLedger(input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      /** Present while an accepted apply is executing; ordinary observation has no selection. */
+      readonly selection?: TakoformApplySelection;
     }): Promise<readonly TakoformSqliteMigrationIdentity[]>;
     applySuffix(input: {
       /** Stable application Resource saga identity, never a portable migration-ledger field. */
@@ -344,6 +365,8 @@ export interface TakoformResourceDriver {
       readonly executionAuthority: TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      /** Apply pins this; legacy import keeps its distinct current-target path. */
+      readonly selection?: TakoformApplySelection;
       /** Stable full desired history; recovery derives a fresh suffix from this exact intent. */
       readonly desired: readonly TakoformSqliteMigration[];
       readonly expectedPrefix: readonly TakoformSqliteMigrationIdentity[];

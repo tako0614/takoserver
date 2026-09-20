@@ -30,6 +30,13 @@ import {
   materializeProviderRuntimeBindings,
 } from "./provider-runtime-bindings.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import {
+  sameTakoformApplySelection,
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+  type TakoformApplySelectionDeployment,
+  type TakoformApplySelectionRelation,
+} from "./takoform/apply-selection.ts";
 import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
 import { receiptProjectable } from "./takoform/receipt-projection.ts";
 import { validateStandardServiceSlots } from "./takoform/standard-services.ts";
@@ -426,6 +433,163 @@ export function createProviderDriver(
     const offering = soldSelection?.offering ?? inheritedSelection?.offering;
     if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
     return { provider, offering, soldSelection, inheritedSelection };
+  };
+
+  const selectedDeployment = async (
+    deployment: Pick<
+      ResourceDeployment,
+      | "id"
+      | "resourceUid"
+      | "offeringId"
+      | "providerPackRef"
+      | "providerInstallationRef"
+      | "nativeId"
+      | "state"
+      | "observed"
+      | "outputs"
+    >,
+  ): Promise<TakoformApplySelectionDeployment> => ({
+    id: deployment.id,
+    resourceUid: deployment.resourceUid,
+    offeringId: deployment.offeringId,
+    providerPackRef: deployment.providerPackRef,
+    providerInstallationRef: deployment.providerInstallationRef,
+    nativeId: deployment.nativeId,
+    state: deployment.state,
+    projectionDigest: await canonicalDigest({
+      observed: deployment.observed,
+      outputs: deployment.outputs,
+    }),
+  });
+
+  const selectedRelations = async (
+    relations: readonly ProviderRelation[],
+  ): Promise<readonly TakoformApplySelectionRelation[]> =>
+    await Promise.all(
+      relations.map(async (relation) => ({
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid: relation.targetUid,
+        resource: {
+          apiVersion: relation.resource.apiVersion,
+          kind: relation.resource.kind,
+          formRef: structuredClone(relation.resource.form.formRef),
+          name: relation.resource.metadata.name,
+          space: relation.resource.metadata.space,
+          uid: relation.resource.metadata.uid,
+          generation: relation.resource.metadata.generation,
+          revision: relation.resource.metadata.revision,
+        },
+        ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+        ...(relation.deployment
+          ? { deployment: await selectedDeployment(relation.deployment) }
+          : {}),
+      })),
+    );
+
+  const resolveApplySelection = async (input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly commercialAuthority?: Parameters<
+      TakoformResourceDriver["selectApply"]
+    >[0]["commercialAuthority"];
+  }) => {
+    const current = await deployments.active(input.tenantId, input.resourceUid);
+    if (intrinsicForm(input.form)) {
+      if (input.form.identity.formRef.kind !== "SQLiteMigrationApplication") {
+        return {
+          current,
+          selection: {
+            version: TAKOFORM_APPLY_SELECTION_VERSION,
+            kind: "intrinsic",
+          } satisfies TakoformApplySelection,
+        } as const;
+      }
+      const database = input.relations.find(
+        (relation) => relation.relation === "/database",
+      )?.resource;
+      if (!database) throw new TakoformHostError("resource_not_found", 404);
+      await sqliteProvider(input.tenantId, database);
+      const relationTargets = await providerRelations(input.tenantId, input.relations);
+      const relations = await selectedRelations(relationTargets);
+      if (
+        relations.filter(
+          (relation) => relation.relation === "/database" && relation.deployment !== undefined,
+        ).length !== 1
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      return {
+        current,
+        relationTargets,
+        selection: {
+          version: TAKOFORM_APPLY_SELECTION_VERSION,
+          kind: "sqlite-migration",
+          relations,
+        } satisfies TakoformApplySelection,
+      } as const;
+    }
+    const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
+      tenantId: input.tenantId,
+      form: input.form,
+      relations: input.relations,
+      ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+    });
+    assertProviderRuntimeInputs(provider, input.spec);
+    const sold = soldSelection?.sold;
+    const offeringDigest = sold ? await catalog.digest(sold) : undefined;
+    if (
+      sold &&
+      input.commercialAuthority &&
+      (input.commercialAuthority.offeringId !== sold.id ||
+        (!current && input.commercialAuthority.offeringDigest !== offeringDigest))
+    ) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const providerInstallationRef =
+      sold?.providerInstallationRef ??
+      inheritedSelection?.providerInstallationRef ??
+      (() => {
+        throw new TakoformHostError("backend_unavailable", 503);
+      })();
+    if (
+      current &&
+      (current.offeringId !== offering.id ||
+        current.providerPackRef !== provider.id ||
+        current.providerInstallationRef !== providerInstallationRef)
+    ) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const relationTargets =
+      inheritedSelection?.relations ?? (await providerRelations(input.tenantId, input.relations));
+    const selection = {
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "provider",
+      providerPackRef: provider.id,
+      providerInstallationRef,
+      technicalOffering: structuredClone(offering),
+      ...(sold && offeringDigest
+        ? {
+            sold: {
+              offeringId: sold.id,
+              offeringDigest,
+              pricePlanRef: sold.pricePlanRef,
+              pricePlan: structuredClone(sold.pricePlan),
+            },
+          }
+        : {}),
+      ...(current ? { incumbent: await selectedDeployment(current) } : {}),
+      relations: await selectedRelations(relationTargets),
+    } satisfies TakoformApplySelection;
+    return {
+      current,
+      provider,
+      relationTargets,
+      selection,
+    } as const;
   };
 
   const assertProviderRuntimeInputs = (provider: Provider, spec: JsonObject): void => {
@@ -956,6 +1120,44 @@ export function createProviderDriver(
     return { provider, deployment, port: provider.sqliteMigrations };
   };
 
+  const sqliteProviderFromSelection = async (
+    tenantId: string,
+    database: TakoformStoredResource,
+    selection: TakoformApplySelection,
+  ): Promise<{
+    deployment: TakoformApplySelectionDeployment;
+    port: NonNullable<Provider["sqliteMigrations"]>;
+  }> => {
+    if (selection.kind !== "sqlite-migration") {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const databaseRelation = selection.relations.find(
+      (relation) => relation.relation === "/database",
+    );
+    const deployment = databaseRelation?.deployment;
+    if (
+      !databaseRelation ||
+      !deployment ||
+      databaseRelation.targetUid !== database.metadata.uid ||
+      databaseRelation.resource.uid !== database.metadata.uid ||
+      databaseRelation.resource.generation !== database.metadata.generation ||
+      databaseRelation.resource.revision !== database.metadata.revision ||
+      !sameForm(databaseRelation.resource.formRef, database.form.formRef)
+    ) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const current = await deployments.active(tenantId, database.metadata.uid);
+    if (
+      !current ||
+      canonicalJson(await selectedDeployment(current)) !== canonicalJson(deployment)
+    ) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const { provider } = installed(current, database.form.formRef);
+    if (!provider.sqliteMigrations) throw new TakoformHostError("backend_unavailable", 503);
+    return { deployment, port: provider.sqliteMigrations };
+  };
+
   const providerValue = <T>(result: ProviderValue<T>): T => {
     if (result.ok) return result.value as T;
     throw new TakoformHostError(...failureToWire(result.failure.code));
@@ -963,6 +1165,9 @@ export function createProviderDriver(
 
   return {
     runtimeInputPolicy,
+    async selectApply(input) {
+      return structuredClone((await resolveApplySelection(input)).selection);
+    },
     artifactConsumerRepair: {
       async verifyNativeAbsence(input) {
         const selected = repairInstalled(input.deployment, input.formRef);
@@ -1081,7 +1286,9 @@ export function createProviderDriver(
     },
     sqliteMigrations: {
       async readLedger(input) {
-        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        const { deployment, port } = input.selection
+          ? await sqliteProviderFromSelection(input.tenantId, input.database, input.selection)
+          : await sqliteProvider(input.tenantId, input.database);
         return providerValue(
           await port.readLedger({
             nativeId: deployment.nativeId,
@@ -1095,7 +1302,9 @@ export function createProviderDriver(
         );
       },
       async applySuffix(input) {
-        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        const { deployment, port } = input.selection
+          ? await sqliteProviderFromSelection(input.tenantId, input.database, input.selection)
+          : await sqliteProvider(input.tenantId, input.database);
         providerValue(
           await port.applySuffix({
             operationId: input.operationId,
@@ -1115,25 +1324,32 @@ export function createProviderDriver(
       },
     },
     async apply(input): Promise<TakoformDriverReceipt> {
-      const current = await definitiveProviderPreflight(() =>
-        deployments.active(input.tenantId, input.resourceUid),
-      );
       if (intrinsicForm(input.form)) {
+        const current = await definitiveProviderPreflight(() =>
+          deployments.active(input.tenantId, input.resourceUid),
+        );
         if (current) {
           throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
         }
+        if (
+          (input.form.identity.formRef.kind === "SQLiteMigrationApplication") !==
+          (input.selection.kind === "sqlite-migration")
+        ) {
+          throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+        }
         return { observed: structuredClone(input.spec) };
       }
+      const resolved = await definitiveProviderPreflight(() => resolveApplySelection(input));
+      if (!sameTakoformApplySelection(resolved.selection, input.selection)) {
+        throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+      }
+      const current = resolved.current;
       const preflight = await definitiveProviderPreflight(async () => {
-        const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
-          tenantId: input.tenantId,
-          form: input.form,
-          relations: input.relations,
-          ...(input.commercialAuthority
-            ? { offeringId: input.commercialAuthority.offeringId }
-            : {}),
-        });
-        assertProviderRuntimeInputs(provider, input.spec);
+        if (resolved.selection.kind !== "provider" || !resolved.provider) {
+          throw new TakoformHostError("backend_unavailable", 503);
+        }
+        const provider = resolved.provider;
+        const offering = structuredClone(resolved.selection.technicalOffering);
         // Recovery adopts the retained runtime binding, not today's integration
         // registry. Initial delivery is fenced before placement or native work.
         if (input.standardServices?.length && input.operationMode === undefined) {
@@ -1143,41 +1359,15 @@ export function createProviderDriver(
           input.operationMode === "initial"
             ? selectStandardServiceProjections(provider, input)
             : [];
-        const sold = soldSelection?.sold;
-        const priceMinor = soldSelection?.priceMinor ?? 0;
-        const relationTargets =
-          inheritedSelection?.relations ??
-          (await providerRelations(input.tenantId, input.relations));
-        if (
-          sold &&
-          input.commercialAuthority &&
-          (input.commercialAuthority.offeringId !== sold.id ||
-            (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
-        ) {
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
-        if (
-          current &&
-          (current.offeringId !== offering.id ||
-            current.providerPackRef !== provider.id ||
-            current.providerInstallationRef !==
-              (sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef))
-        ) {
-          // Moving supply is a Migration, never an ordinary Resource update.
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
+        const priceMinor = resolved.selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+        const relationTargets = resolved.relationTargets;
         const previous = current
           ? {
               nativeId: current.nativeId,
               spec: input.previous?.spec ?? input.spec,
             }
           : undefined;
-        const providerInstallationRef =
-          sold?.providerInstallationRef ??
-          inheritedSelection?.providerInstallationRef ??
-          (() => {
-            throw new TakoformHostError("backend_unavailable", 503);
-          })();
+        const providerInstallationRef = resolved.selection.providerInstallationRef;
         const providerIdentity = {
           tenantRef: input.tenantId,
           space: input.space,

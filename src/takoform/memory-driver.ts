@@ -1,3 +1,5 @@
+import { canonicalDigest } from "../json.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "./apply-selection.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
@@ -34,6 +36,7 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     readLedger: async (input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      readonly selection?: import("./apply-selection.ts").TakoformApplySelection;
     }) =>
       structuredClone(
         this.#migrationLedgers.get(`${input.tenantId}\0${input.database.metadata.uid}`) ?? [],
@@ -44,6 +47,7 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
       readonly executionAuthority: import("./types.ts").TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      readonly selection?: import("./apply-selection.ts").TakoformApplySelection;
       readonly desired: readonly {
         readonly path: string;
         readonly digest: `sha256:${string}`;
@@ -73,6 +77,53 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
       ]);
     },
   };
+
+  async selectApply(
+    input: Parameters<TakoformResourceDriver["selectApply"]>[0],
+  ): Promise<Awaited<ReturnType<TakoformResourceDriver["selectApply"]>>> {
+    if (input.form.identity.formRef.kind === "SQLiteMigrationApplication") {
+      return {
+        version: TAKOFORM_APPLY_SELECTION_VERSION,
+        kind: "sqlite-migration",
+        relations: await Promise.all(
+          input.relations.map(async (relation) => ({
+            pointer: relation.pointer,
+            relation: relation.relation,
+            targetUid: relation.targetUid,
+            resource: {
+              apiVersion: relation.resource.apiVersion,
+              kind: relation.resource.kind,
+              formRef: structuredClone(relation.resource.form.formRef),
+              name: relation.resource.metadata.name,
+              space: relation.resource.metadata.space,
+              uid: relation.resource.metadata.uid,
+              generation: relation.resource.metadata.generation,
+              revision: relation.resource.metadata.revision,
+            },
+            ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+            ...(relation.relation === "/database"
+              ? {
+                  deployment: {
+                    id: `memory:${relation.resource.metadata.uid}`,
+                    resourceUid: relation.resource.metadata.uid,
+                    offeringId: "memory.sqlite",
+                    providerPackRef: "memory.intrinsic",
+                    providerInstallationRef: "memory.intrinsic",
+                    nativeId: `memory:${relation.resource.metadata.uid}`,
+                    state: "active" as const,
+                    projectionDigest: await canonicalDigest({
+                      observed: relation.resource.status.observed ?? {},
+                      outputs: relation.resource.status.outputs ?? {},
+                    }),
+                  },
+                }
+              : {}),
+          })),
+        ),
+      };
+    }
+    return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" };
+  }
 
   async apply(
     input: Parameters<TakoformResourceDriver["apply"]>[0],

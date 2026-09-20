@@ -267,6 +267,7 @@ function countingDriver() {
   const memory = new InMemoryTakoformResourceDriver();
   const calls = { apply: 0, observe: 0, delete: 0, import: 0 };
   const driver: TakoformResourceDriver = {
+    selectApply: (input) => memory.selectApply(input),
     apply: async (input) => {
       calls.apply += 1;
       return memory.apply(input);
@@ -1069,6 +1070,7 @@ describe("durable read-only Takoform Host authority", () => {
     let applyCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applyCalls += 1;
         if (applyCalls === 1) throw new ProviderMutationRecoveryError("indeterminate");
@@ -1252,6 +1254,7 @@ describe("durable read-only Takoform Host authority", () => {
     const memory = new InMemoryTakoformResourceDriver();
     let applyCalls = 0;
     const driver: TakoformResourceDriver = {
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applyCalls += 1;
         const receipt = await memory.apply(input);

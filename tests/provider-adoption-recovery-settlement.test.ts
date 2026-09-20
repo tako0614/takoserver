@@ -23,6 +23,7 @@ import {
   succeeded,
 } from "../src/provider-port.ts";
 import type { InstalledTakoformForm, TakoformResourceDriver } from "../src/takoform/types.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 import { createConfiguredHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1beta4";
@@ -414,7 +415,7 @@ async function rejectedApply(
 ): Promise<unknown> {
   const { driver } = providerDriver(provider);
   return await rejected(
-    driver.apply({
+    applyWithSelection(driver, {
       operationId: "operation-1",
       operationKey: "operation-key-1",
       operationMode: "recovery",

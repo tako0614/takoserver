@@ -1,4 +1,5 @@
 import { bytesDigest } from "../json.ts";
+import type { TakoformApplySelection } from "./apply-selection.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import type { ArtifactResolver } from "./engine.ts";
 import type { TakoformStoredRelation } from "./relations.ts";
@@ -80,6 +81,8 @@ export async function applySqliteMigrationApplication(input: {
   readonly executionAuthority: TakoformProviderExecutionAuthority;
   readonly prepared: PreparedSqliteMigrationApplication | null;
   readonly driver: TakoformResourceDriver;
+  /** Present only for apply; import does not share the accepted apply snapshot. */
+  readonly selection?: TakoformApplySelection;
 }): Promise<void> {
   if (!input.prepared) return;
   const executor = input.driver.sqliteMigrations;
@@ -88,6 +91,7 @@ export async function applySqliteMigrationApplication(input: {
   const applied = await executor.readLedger({
     tenantId: input.tenantId,
     database: input.prepared.database,
+    ...(input.selection ? { selection: input.selection } : {}),
   });
   requirePrefix(applied, desired);
   const migrations = input.prepared.desired.slice(applied.length);
@@ -98,6 +102,7 @@ export async function applySqliteMigrationApplication(input: {
       executionAuthority: input.executionAuthority,
       tenantId: input.tenantId,
       database: input.prepared.database,
+      ...(input.selection ? { selection: input.selection } : {}),
       desired: input.prepared.desired,
       expectedPrefix: applied,
       migrations,
@@ -106,6 +111,7 @@ export async function applySqliteMigrationApplication(input: {
   const settled = await executor.readLedger({
     tenantId: input.tenantId,
     database: input.prepared.database,
+    ...(input.selection ? { selection: input.selection } : {}),
   });
   if (!sameLedger(settled, desired)) throw new TakoformHostError("backend_unavailable", 503);
 }

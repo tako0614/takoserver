@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import type { InstalledTakoformForm, TakoformResourceDriver } from "../src/takoform/types.ts";
 import {
   createConfiguredHistoricalTakoformHost,
@@ -40,6 +41,9 @@ const form: InstalledTakoformForm = {
 
 test("validate and prepare reject a desired document that violates its declared sum", async () => {
   const driver: TakoformResourceDriver = {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply() {
       throw new Error("review must fail before provider apply");
     },
@@ -84,6 +88,9 @@ test("validate and prepare reject a desired document that violates its declared 
 test("stable v1 rejects a schema-valid invalid sum during prepare before mutation", async () => {
   let applyCalls = 0;
   const driver: TakoformResourceDriver = {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       applyCalls += 1;
       return { observed: input.spec };

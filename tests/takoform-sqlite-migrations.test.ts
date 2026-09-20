@@ -109,6 +109,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
   let loseFirstAcknowledgement = true;
   const calls: Array<Parameters<typeof memory.sqliteMigrations.applySuffix>[0]> = [];
   const driver: TakoformResourceDriver = {
+    selectApply: (input) => memory.selectApply(input),
     apply: (input) => memory.apply(input),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),
@@ -253,14 +254,31 @@ test("the Provider driver binds ledger IO to the exact active database realizati
     fingerprint: "application-a-fingerprint",
   };
   const desired = [{ path: "0001.sql", digest: firstSql, sql: firstSqlBytes }];
+  const selection = await driver.selectApply({
+    tenantId: "tenant-a",
+    resourceUid: "uid-application-a",
+    form: applicationForm,
+    name: "application-a",
+    space: "conformance",
+    spec: {},
+    relations: [
+      {
+        pointer: "/database",
+        relation: "/database",
+        targetUid: database.metadata.uid,
+        resource: database,
+      },
+    ],
+  });
 
-  expect(await sqlite.readLedger({ tenantId: "tenant-a", database })).toEqual([]);
+  expect(await sqlite.readLedger({ tenantId: "tenant-a", database, selection })).toEqual([]);
   await sqlite.applySuffix({
     operationId: "op-application-a",
     operationMode: "recovery",
     executionAuthority,
     tenantId: "tenant-a",
     database,
+    selection,
     desired,
     expectedPrefix: [],
     migrations: desired,
@@ -293,6 +311,41 @@ test("the Provider driver binds ledger IO to the exact active database realizati
       migrations: desired,
     },
   ]);
+
+  await deployments.create({
+    tenantId: "tenant-a",
+    id: "dep-database-b",
+    resourceUid: database.metadata.uid,
+    offeringId: "provider-a.sqlite",
+    providerPackRef: "provider-a",
+    providerInstallationRef: "provider-a.primary",
+    nativeId: "sqlite:database-b",
+    state: "candidate",
+    observed: {},
+    outputs: {},
+  });
+  expect(
+    await deployments.cutover(
+      "tenant-a",
+      database.metadata.uid,
+      "dep-database-a",
+      "dep-database-b",
+    ),
+  ).toBe(true);
+  await expect(
+    sqlite.applySuffix({
+      operationId: "op-application-a",
+      operationMode: "recovery",
+      executionAuthority: { ...executionAuthority, leaseToken: "pmlease-application-a-retry" },
+      tenantId: "tenant-a",
+      database,
+      selection,
+      desired,
+      expectedPrefix: [],
+      migrations: desired,
+    }),
+  ).rejects.toMatchObject({ code: "backend_unavailable", status: 503 });
+  expect(applyCalls).toHaveLength(1);
 });
 
 async function execute(

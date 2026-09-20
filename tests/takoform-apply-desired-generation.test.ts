@@ -41,6 +41,7 @@ function fixture() {
     authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
     forms: [form],
     driver: {
+      selectApply: (input) => driver.selectApply(input),
       async apply(input) {
         calls.push(structuredClone(input));
         return driver.apply(input);

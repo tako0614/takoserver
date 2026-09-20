@@ -2,6 +2,10 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+} from "../src/takoform/apply-selection.ts";
 import { createTakoformStore, type ProviderMutationSaga } from "../src/takoform/store.ts";
 
 const saga: ProviderMutationSaga = {
@@ -19,7 +23,196 @@ const saga: ProviderMutationSaga = {
   },
 };
 
+const applySelection: TakoformApplySelection = {
+  version: TAKOFORM_APPLY_SELECTION_VERSION,
+  kind: "provider",
+  providerPackRef: "provider-a",
+  providerInstallationRef: "provider-a.primary",
+  technicalOffering: {
+    id: "provider-a.thing",
+    kind: "Thing",
+    displayName: "Thing",
+    form: {
+      apiVersion: "example.forms.invalid",
+      kind: "Thing",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"a".repeat(64)}`,
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    capabilities: ["create", "update"],
+  },
+  relations: [],
+};
+
 describe("provider mutation saga execution leases", () => {
+  test("binds one immutable apply selection and requires each recovery lease to verify it", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const selectedSaga = {
+      ...saga,
+      operationId: "op_selected_apply",
+      replayKey: "replay-selected-apply",
+      resourceUid: "uid_selected_apply",
+      target: { ...saga.target, name: "selected-apply" },
+    };
+    const identity = {
+      tenantId: selectedSaga.tenantId,
+      operationId: selectedSaga.operationId,
+      resourceUid: selectedSaga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(selectedSaga);
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_initial",
+        leaseUntil: 2_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_initial",
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_stale",
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toBeNull();
+    expect(
+      await store.markProviderMutationDispatch({ ...identity, leaseToken: "lease_initial" }),
+    ).toBe(true);
+
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_recovery",
+        leaseUntil: 3_000,
+      }),
+    ).toEqual({
+      kind: "acquired",
+      mode: "recovery",
+      applySelection,
+    });
+    expect(
+      await store.markProviderMutationDispatch({
+        ...identity,
+        leaseToken: "lease_recovery",
+        mode: "recovery",
+      }),
+    ).toBe(false);
+    expect(
+      await store.releaseProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_recovery",
+      }),
+    ).toBe(true);
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_verified_recovery",
+        leaseUntil: 3_000,
+      }),
+    ).toMatchObject({ kind: "acquired", mode: "recovery", applySelection });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+        selection: { ...applySelection, providerPackRef: "provider-b" },
+      }),
+    ).toBeNull();
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    expect(
+      database
+        .query(
+          `SELECT execution_lease_token, selection_verified_lease_token,
+                  execution_started_at, execution_lease_until
+           FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+        )
+        .get(selectedSaga.operationId),
+    ).toEqual({
+      execution_lease_token: "lease_verified_recovery",
+      selection_verified_lease_token: "lease_verified_recovery",
+      execution_started_at: 1_000,
+      execution_lease_until: 3_000,
+    });
+    expect(
+      await store.markProviderMutationDispatch({
+        ...identity,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+      }),
+    ).toBe(true);
+    database.close();
+  });
+
+  test("keeps a historical dispatched saga without a selection unresolved", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const historicalSaga = {
+      ...saga,
+      operationId: "op_historical_unselected_apply",
+      replayKey: "replay-historical-unselected-apply",
+      resourceUid: "uid_historical_unselected_apply",
+      target: { ...saga.target, name: "historical-unselected-apply" },
+    };
+    const identity = {
+      tenantId: historicalSaga.tenantId,
+      operationId: historicalSaga.operationId,
+      resourceUid: historicalSaga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(historicalSaga);
+    await store.acquireProviderMutationExecution({
+      ...identity,
+      leaseToken: "lease_old_binary",
+      leaseUntil: 2_000,
+    });
+    expect(
+      await store.markProviderMutationDispatch({ ...identity, leaseToken: "lease_old_binary" }),
+    ).toBe(true);
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_current_binary",
+        leaseUntil: 3_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "recovery" });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: historicalSaga.fingerprint,
+        leaseToken: "lease_current_binary",
+        mode: "recovery",
+        selection: applySelection,
+      }),
+    ).toBeNull();
+    database.close();
+  });
+
   test("only explicit whole-operation apply proof and the current lease retire an indeterminate create", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);

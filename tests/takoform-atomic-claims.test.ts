@@ -2,6 +2,9 @@ import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
+import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
+import type { TakoformApplySelection } from "../src/takoform/apply-selection.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import type {
@@ -47,6 +50,9 @@ test("a create reserves a Definition claim atomically across provider await and 
   let importCalls = 0;
   const receipt = (spec: JsonObject): TakoformDriverReceipt => ({ observed: spec });
   const driver: TakoformResourceDriver = {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       applyCalls += 1;
       enteredFirst();
@@ -309,6 +315,9 @@ test("an expired reservation can be recovered but its stale provider winner cann
   });
   const receipt = (spec: JsonObject): TakoformDriverReceipt => ({ observed: spec });
   const driver: TakoformResourceDriver = {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       enteredFirst();
       await blocked;
@@ -514,6 +523,137 @@ test("a failed same-claim update cannot release the live Resource's committed cl
     ),
   ).rejects.toThrow();
 });
+
+test("a recovery selection mismatch preserves the accepted claim and blocks a contender", async () => {
+  const sql = createEphemeralSql();
+  let firstApplyCalls = 0;
+  let recoveredApplyCalls = 0;
+  const selectionA = providerSelection("claim-provider-a");
+  const selectionB = providerSelection("claim-provider-b");
+  const driverA: TakoformResourceDriver = {
+    selectApply: async () => selectionA,
+    async apply() {
+      firstApplyCalls += 1;
+      throw new ProviderMutationRecoveryError("indeterminate", "claim-provider-handle");
+    },
+    async observe() {
+      return {};
+    },
+    async delete() {},
+  };
+  const hostOptions = (
+    driver: TakoformResourceDriver,
+  ): Parameters<typeof createConfiguredHistoricalTakoformHost>[0] => ({
+    sql,
+    objects: createMemoryObjectStore(),
+    authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+    forms: [form],
+    driver,
+    routes: {
+      hostApiVersion: "forms.takoform.com/v1beta4" as const,
+      apiPath: lane,
+      supportProfileApiVersion: "support.takoform.com/v1alpha2" as const,
+      reviewSpecDigest: true,
+    },
+    deferredOperations: {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      retryAfterSeconds: 0,
+      leaseMilliseconds: 1_000,
+      executeOnAccept: true,
+    },
+  });
+  const hostA = createConfiguredHistoricalTakoformHost(hostOptions(driverA));
+  const desired = resource("selection-holder");
+  const prepared = await hostA.handle(jsonRequest(`${lane}/resources/prepare`, "POST", desired));
+  if (!prepared?.ok) throw new Error(`prepare failed: ${prepared?.status}`);
+  const review = ((await prepared.json()) as { review: Record<string, string> }).review;
+  const accepted = await hostA.handle(
+    jsonRequest(
+      `${lane}/resources/example.forms.invalid/ClaimedName/selection-holder`,
+      "PUT",
+      { ...desired, review },
+      { "idempotency-key": "selection-claim-create-0001", "if-none-match": "*" },
+    ),
+  );
+  expect(accepted?.status).toBe(202);
+  if (!accepted) throw new Error("accepted operation response missing");
+  const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+  expect(firstApplyCalls).toBe(1);
+  const acceptedClaims = await sql.query(
+    `SELECT claim_key, state, owner_operation_id, holder_uid
+     FROM tf_resource_claims
+     WHERE state = 'reserved'`,
+  );
+  expect(acceptedClaims.length).toBeGreaterThan(0);
+
+  const driverB: TakoformResourceDriver = {
+    selectApply: async () => selectionB,
+    async apply() {
+      recoveredApplyCalls += 1;
+      throw new Error("provider must not be re-entered after selection mismatch");
+    },
+    async observe() {
+      return {};
+    },
+    async delete() {},
+  };
+  const hostB = createConfiguredHistoricalTakoformHost(hostOptions(driverB));
+  const recovered = await hostB.handle(
+    new Request(`https://candidate.invalid${lane}/operations/${operationId}`, {
+      headers: { authorization: "Bearer primary" },
+    }),
+  );
+  expect(recovered?.status).toBe(200);
+  expect(recoveredApplyCalls).toBe(0);
+
+  const claims = await sql.query(
+    `SELECT claim_key, state, owner_operation_id, holder_uid
+     FROM tf_resource_claims`,
+  );
+  for (const acceptedClaim of acceptedClaims) {
+    expect(claims).toContainEqual(acceptedClaim);
+  }
+  expect(claims.some((row) => row.owner_operation_id === operationId)).toBe(true);
+
+  const contenderDesired = resource("selection-contender");
+  const contenderPrepared = await hostB.handle(
+    jsonRequest(`${lane}/resources/prepare`, "POST", contenderDesired),
+  );
+  if (!contenderPrepared?.ok)
+    throw new Error(`contender prepare failed: ${contenderPrepared?.status}`);
+  const contenderReview = ((await contenderPrepared.json()) as { review: Record<string, string> })
+    .review;
+  const contender = await hostB.handle(
+    jsonRequest(
+      `${lane}/resources/example.forms.invalid/ClaimedName/selection-contender`,
+      "PUT",
+      { ...contenderDesired, review: contenderReview },
+      { "idempotency-key": "selection-claim-contender-0001", "if-none-match": "*" },
+    ),
+  );
+  expect(contender?.status).toBe(400);
+  expect(await contender?.json()).toMatchObject({ error: { code: "invalid_argument" } });
+});
+
+function providerSelection(providerPackRef: string): TakoformApplySelection {
+  return {
+    version: TAKOFORM_APPLY_SELECTION_VERSION,
+    kind: "provider",
+    providerPackRef,
+    providerInstallationRef: `${providerPackRef}.primary`,
+    technicalOffering: {
+      id: `${providerPackRef}.offering`,
+      kind: form.identity.formRef.kind,
+      displayName: "Claimed name",
+      form: form.identity.formRef,
+      providedInterfaces: [],
+      bindingRefs: [],
+      capabilities: ["create", "update", "delete", "import", "observe"],
+    },
+    relations: [],
+  };
+}
 
 function resource(name: string) {
   return {

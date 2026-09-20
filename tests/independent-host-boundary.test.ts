@@ -37,6 +37,7 @@ describe("independent Takoserver Host boundary", () => {
     const memory = new InMemoryTakoformResourceDriver();
     let providerApplyCalls = 0;
     const driver: TakoformResourceDriver = {
+      selectApply: (input) => memory.selectApply(input),
       async apply(input) {
         providerApplyCalls += 1;
         return await memory.apply(input);

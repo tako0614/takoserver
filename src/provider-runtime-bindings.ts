@@ -82,19 +82,21 @@ export async function materializeProviderRuntimeBindings(input: {
     const exactRelation = relation as ProviderRelation & {
       readonly deployment: ResourceDeployment;
     };
+    // Each extension receives its own identity projection. A callback must not
+    // rewrite the accepted destination used by the next callback or provider.
     const exported = await exporter.exportTarget({
       tenantId: input.tenantId,
-      relation: exactRelation,
-      route,
+      relation: structuredClone(exactRelation),
+      route: structuredClone(route),
     });
     if (exported === null || exported === undefined) unsupported();
     const material = await importer.importBinding({
       tenantId: input.tenantId,
-      source: input.source,
-      sourceSpec: input.sourceSpec,
+      source: structuredClone(input.source),
+      sourceSpec: structuredClone(input.sourceSpec),
       name,
-      relation: exactRelation,
-      route,
+      relation: structuredClone(exactRelation),
+      route: structuredClone(route),
       exported: {
         providerPackRef: deployment.providerPackRef,
         materialKind: route.materialKind,

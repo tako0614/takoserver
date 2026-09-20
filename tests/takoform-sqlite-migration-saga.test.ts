@@ -64,6 +64,59 @@ afterEach(() => {
 });
 
 describe("SQLiteMigrationApplication provider saga", () => {
+  test("does not cross any callback or SQLite boundary when selection persistence fails", async () => {
+    const events: string[] = [];
+    const memory = new InMemoryTakoformResourceDriver();
+    const driver = migrationDriver(memory, {
+      async selectApply(input) {
+        if (input.form.identity.formRef.kind === "SQLiteMigrationApplication") {
+          events.push("selectApply");
+        }
+        return await memory.selectApply(input);
+      },
+      async applySuffix(input) {
+        events.push("applySuffix");
+        await memory.sqliteMigrations.applySuffix(input);
+      },
+    });
+    const { host, database } = harness(driver, async (token) =>
+      token === "Bearer provision"
+        ? {
+            tenantId: TENANT_ID,
+            principalId: PRINCIPAL_ID,
+            scope: {
+              space: "main",
+              formRef: applicationForm.identity.formRef,
+              resourceName: "selection-persistence",
+              mode: "provision" as const,
+              claimCreate: async () => {
+                events.push("beforeCreate");
+              },
+            },
+          }
+        : principal(token),
+    );
+    await seedDatabaseAndSet(host);
+    const desired = applicationDesired("selection-persistence");
+    const review = await prepare(host, desired, "admin");
+    database.exec(`
+      CREATE TRIGGER test_reject_apply_selection
+      BEFORE UPDATE OF selection_json ON tf_provider_mutation_sagas
+      WHEN NEW.selection_json IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'test_reject_apply_selection');
+      END;
+    `);
+
+    const response = await apply(host, desired, review, "selection-persistence", "provision");
+
+    expect(response?.status).toBeGreaterThanOrEqual(400);
+    expect(events).toEqual(["selectApply"]);
+    expect(database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas").get()).toEqual({
+      n: 0,
+    });
+  });
+
   test("consumes final create authority before dispatching a migration suffix", async () => {
     const events: string[] = [];
     const memory = new InMemoryTakoformResourceDriver();
@@ -572,6 +625,7 @@ function harness(
 function migrationDriver(
   memory: InMemoryTakoformResourceDriver,
   overrides: {
+    readonly selectApply?: TakoformResourceDriver["selectApply"];
     readonly readLedger?: typeof memory.sqliteMigrations.readLedger;
     readonly applySuffix?: MigrationSuffix;
     readonly apply?: TakoformResourceDriver["apply"];
@@ -579,6 +633,7 @@ function migrationDriver(
   },
 ): TakoformResourceDriver {
   return {
+    selectApply: overrides.selectApply ?? ((input) => memory.selectApply(input)),
     apply: overrides.apply ?? ((input) => memory.apply(input)),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),

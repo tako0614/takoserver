@@ -24,6 +24,7 @@ import {
 import { createRemoteProvider } from "../src/providers/remote.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "../src/selfhost-runtime-binding-materializer.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const TEST_MATERIAL_KIND = "test.target-object-capability@v1";
 /** The three Bindings no Provider Pack publishes a materializer route for. */
@@ -148,6 +149,80 @@ const baseInput = {
 } as const;
 
 describe("provider-private runtime Binding materialization", () => {
+  test("callback mutations cannot rewrite the accepted relation or the next callback's identity", async () => {
+    const source = structuredClone(baseInput.source);
+    const spec = structuredClone(sourceSpec);
+    const target = structuredClone(relation("target"));
+    const before = structuredClone({ source, spec, target });
+    const imported: unknown[] = [];
+    const capability = Object.freeze({ invoke: () => "opaque-capability" });
+    const exporter = pack("target", {
+      id: "target-isolated-inputs",
+      exporter: {
+        routes: [route()],
+        async exportTarget(input) {
+          Object.assign(input.relation, { targetUid: "uid-replaced-by-exporter" });
+          Object.assign(input.relation.deployment, {
+            providerPackRef: "replacement-pack",
+            nativeId: "native:replacement",
+          });
+          Object.assign(input.relation.resource.metadata, { uid: "uid-replacement" });
+          Object.assign(input.route, { materialKind: "replacement-material" });
+          Object.assign(input.route.bindingRef, { name: "replacement-binding" });
+          return capability;
+        },
+      },
+    });
+    const importer = pack("consumer", {
+      id: "consumer-isolated-inputs",
+      importer: {
+        routes: [route()],
+        async importBinding(input) {
+          imported.push(
+            structuredClone({
+              source: input.source,
+              spec: input.sourceSpec,
+              target: input.relation,
+              route: input.route,
+              providerPackRef: input.exported.providerPackRef,
+              materialKind: input.exported.materialKind,
+            }),
+          );
+          expect(input.exported.material).toBe(capability);
+          Object.assign(input.source, { uid: "uid-replaced-by-importer" });
+          Object.assign(input.sourceSpec, { bucketBindings: [] });
+          Object.assign(input.relation, { targetUid: "uid-replaced-by-importer" });
+          Object.assign(input.relation.bindingRef ?? {}, { name: "replacement-binding" });
+          return capability;
+        },
+      },
+    });
+    const bindings = await materializeProviderRuntimeBindings({
+      tenantId: baseInput.tenantId,
+      source,
+      sourceSpec: spec,
+      consumerPack: importer,
+      packs: new Map([
+        [exporter.id, exporter],
+        [importer.id, importer],
+      ]),
+      relations: [target],
+    });
+
+    expect(imported).toEqual([
+      { ...before, route: route(), providerPackRef: "target", materialKind: TEST_MATERIAL_KIND },
+    ]);
+    expect({ source, spec, target }).toEqual(before);
+    expect(bindings).toEqual([
+      {
+        name: "OBJECTS",
+        targetUid: before.target.targetUid,
+        bindingRef: EDGE_OBJECTS_BINDING_REF,
+        material: capability,
+      },
+    ]);
+  });
+
   test("requires matching exporter and importer routes even inside one Provider Pack", async () => {
     const calls: string[] = [];
     const complete = pack("complete", completeMaterializer("complete", calls));
@@ -544,7 +619,7 @@ describe("provider-private runtime Binding materialization", () => {
 
     let rejection: unknown;
     try {
-      await driver.apply({
+      await applyWithSelection(driver, {
         operationId,
         operationKey: "key-runtime-binding-refusal",
         operationMode: "initial",
@@ -703,7 +778,7 @@ describe("provider-private runtime Binding materialization", () => {
     });
 
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op-remote-version",
         operationKey: "key-remote-version",
         tenantId: "org-remote",
@@ -831,7 +906,7 @@ describe("provider-private runtime Binding materialization", () => {
     // The adapter is reached and answers for itself. What matters is that the
     // refusal is the provider's own, not a 422 from the materialization seam.
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op-remote-kv-version",
         operationKey: "key-remote-kv-version",
         tenantId: "org-remote",
@@ -1020,7 +1095,7 @@ describe("provider-private runtime Binding materialization", () => {
       deployments,
     });
 
-    const applied = await driver.apply({
+    const applied = await applyWithSelection(driver, {
       operationId: "op-chain-version",
       operationKey: "key-chain-version",
       operationMode: "initial",

@@ -261,15 +261,44 @@ accepted saga's authority head. A different head still refuses continuation and
 retains the uncertain attempt. The whole-operation proof above does not bypass
 that authority check.
 
-There is also no generic persisted initial provider selection for such an
-attempt: planned/dispatched effect records omit the selected pack, installation
-and Offering, while successful receipts retain provider identity. Today's
-catalog cannot prove yesterday's dispatch destination. A provider-specific
-intent record is not a substitute for that missing Host-wide evidence. Until
-the initial selection is durably recorded before effects, do not relax the
-head comparison, rewrite historical saga evidence, or settle an old attempt
-using a newly selected provider's absence proof. This is an implementation gap,
-not a new public API/Form contract or a supported recovery procedure.
+### Accepted apply placement
+
+The Host retains the initial apply selection on its mutation saga before
+effectful preparation or provider dispatch. The driver's side-effect-free
+selection step identifies the provider pack and installation, exact technical
+Offering, applicable sale and price terms, and participating relation
+Deployments and Bindings. This includes the target of a SQLite migration,
+whose database effects run before the ordinary Resource apply. Credentials and
+materialized runtime values do not belong to this snapshot.
+
+Acceptance is fenced by the current execution lease and operation identity.
+Once accepted, the selection cannot be replaced. Recovery uses that record;
+current configuration may verify equality and availability but cannot supply a
+different destination. An unavailable or changed selection stops before
+effectful extension callbacks or native effects. A persistence
+error does not authorize continuing without confirmed durable acceptance.
+Uncertainty retains the selection alongside the existing operation, claims and
+any priced hold; recording a destination is not proof that its effect happened.
+
+The internal schema addition does not backfill older attempts. Planned and
+dispatched effect records from those builds omit the destination, while a
+successful receipt can retain it. Today's catalog and a provider-specific
+intent record cannot replace missing Host-wide initial evidence. An unresolved
+historical apply without that evidence remains unavailable for automatic
+continuation. Do not rewrite its saga, relax the authority-head comparison, or
+settle it using a newly selected provider's absence proof.
+
+This placement fence prevents new ambiguity; it does not implement continuation
+across semantic Host authority changes or repair historical unknown attempts.
+It changes no public API or Form. The database upgrade is forward-only. Quiesce
+older apply writers for the cutover and use a compatible Host build afterward;
+an older Worker version is not a supported schema rollback. The database's
+dispatch check protects a retained selection under its validated execution
+lease, but cannot fence arbitrary preparation callbacks in older binaries that
+run before dispatch. Previously accepted side effects remain subject to their
+existing recovery and whole-attempt-idle checks.
+
+### Runtime-specific support
 
 Vector has an explicit development-only self-host integration. It requires a
 matching VectorIndex Offering, the exact candidate Interface and Binding, and

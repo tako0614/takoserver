@@ -14,6 +14,7 @@ import {
   type TakoformHost,
   type TakoformResourceDriver,
 } from "../src/index.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import {
   createHistoricalInMemoryTakoformHost as createInMemoryTakoformHost,
   createStaticStableTestTakoformHost,
@@ -436,6 +437,9 @@ describe("historical Takoform Host engine regression", () => {
     let sourceMutations = 0;
     let resolvedTargetUid: string | undefined;
     const driver: TakoformResourceDriver = {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         if (input.form.identity.formRef.kind === sourceFormRef.kind) {
           sourceMutations += 1;
@@ -678,6 +682,7 @@ describe("historical Takoform Host engine regression", () => {
     };
     const memory = new InMemoryTakoformResourceDriver();
     const driver: TakoformResourceDriver = {
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       import: (input) => memory.import(input),
       delete: (input) => memory.delete(input),
@@ -875,6 +880,9 @@ describe("historical Takoform Host engine regression", () => {
       schemaDigest: `sha256:${"8".repeat(64)}` as const,
     };
     const driver: TakoformResourceDriver = {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply() {
         throw new Error("provider secret must never escape");
       },

@@ -3,6 +3,7 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject, Row, Sql } from "../src/ports.ts";
 import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import {
   createResourceDependencySet,
   decodeResourceDependencySet,
@@ -79,6 +80,9 @@ test("a WorkerVersion delete armed after deployment validation fences provider d
     signalDeleteEntered = resolve;
   });
   const host = stableHost(acceptance.sql, {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (input.form.identity.formRef.kind === "WorkerDeployment") deploymentApplyCalls += 1;
       return { observed: input.spec };
@@ -124,6 +128,9 @@ test("a deployment dependency hold refuses a racing WorkerVersion delete until c
     signalApplyEntered = resolve;
   });
   const host = stableHost(createEphemeralSql(), {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (input.form.identity.formRef.kind === "WorkerDeployment") {
         deploymentApplyCalls += 1;
@@ -160,6 +167,9 @@ test("a same-UID readiness revision change after validation fences provider disp
   let deploymentApplyCalls = 0;
   let reportVersionUnready = false;
   const host = stableHost(acceptance.sql, {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (input.form.identity.formRef.kind === "WorkerDeployment") deploymentApplyCalls += 1;
       return { observed: input.spec };
@@ -302,6 +312,9 @@ test("dependency reservation and dispatch keep a constant D1 statement budget", 
     },
   };
   const host = stableHost(sql, {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       return { observed: input.spec };
     },
@@ -336,6 +349,9 @@ test("replacement keeps old and new WorkerVersions fenced until the source commi
     signalUpdateEntered = resolve;
   });
   const host = stableHost(createEphemeralSql(), {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (holdDeploymentUpdate && input.form.identity.formRef.kind === "WorkerDeployment") {
         signalUpdateEntered();
@@ -412,6 +428,9 @@ test("a proven-idle dispatch callback failure releases only new dependency holds
   };
   let deploymentProviderCalls = 0;
   const host = stableHost(sql, {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (input.form.identity.formRef.kind === "WorkerDeployment") {
         deploymentProviderCalls += 1;
@@ -470,6 +489,9 @@ test("a dispatched dependency set survives ordinary TTL and deferred recovery co
   const host = stableHost(
     sql,
     {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         if (input.form.identity.formRef.kind === "WorkerDeployment") {
           deploymentAttempts += 1;
@@ -611,6 +633,9 @@ test("receipted recovery commits the accepted dependency set after target revisi
   const host = stableHost(
     sql,
     {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         if (input.form.identity.formRef.kind === "WorkerDeployment") providerCalls += 1;
         return { observed: input.spec };
@@ -713,6 +738,9 @@ test("post-dispatch recovery never rebinds the accepted dependency to a recreate
   const host = stableHost(
     sql,
     {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         if (input.form.identity.formRef.kind === "WorkerDeployment") {
           const version = input.relations.find(

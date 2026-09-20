@@ -11,6 +11,7 @@ import {
 } from "../src/provider-port.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import type { InstalledTakoformForm } from "../src/takoform/types.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const service = {
   apiVersion: "standards.takoform.com/v1",
@@ -147,7 +148,7 @@ function fixture(supported: boolean) {
 
 test("standard service handoff reaches only initial provider input, never deployment state", async () => {
   const { driver, input, deployments, calls, provider } = fixture(true);
-  await driver.apply(input);
+  await applyWithSelection(driver, input);
   expect(calls[0]?.standardServices).toEqual(input.standardServices);
   expect(calls[0]?.standardServices).not.toBe(input.standardServices);
   expect(JSON.stringify(await deployments.active(input.tenantId, input.resourceUid))).not.toContain(
@@ -156,13 +157,15 @@ test("standard service handoff reaches only initial provider input, never deploy
   // A removed integration cannot stop recovery of material retained by the provider.
   Object.assign(provider, { standardServiceProtocols: [] });
   const { standardServices: _material, ...recovery } = input;
-  await driver.apply({ ...recovery, operationMode: "recovery" });
+  await applyWithSelection(driver, { ...recovery, operationMode: "recovery" });
   expect(calls[1]?.standardServices).toBeUndefined();
 });
 
 test("a provider without an exact integration cannot silently discard required material", async () => {
   const { driver, input, calls, deployments } = fixture(false);
-  await expect(driver.apply(input)).rejects.toMatchObject({ code: "unsupported_capability" });
+  await expect(applyWithSelection(driver, input)).rejects.toMatchObject({
+    code: "unsupported_capability",
+  });
   expect(calls).toHaveLength(0);
   expect(await deployments.active(input.tenantId, input.resourceUid)).toBeNull();
 });
@@ -170,7 +173,7 @@ test("a provider without an exact integration cannot silently discard required m
 test("optional unsupported slots do not forward credential material", async () => {
   const { driver, input, calls } = fixture(false);
   const optional = { ...slot, required: false };
-  await driver.apply({
+  await applyWithSelection(driver, {
     ...input,
     spec: { externalServices: [optional] },
     standardServices: [
@@ -187,7 +190,7 @@ test("optional unsupported slots do not forward credential material", async () =
 test("untagged legacy calls cannot silently discard supplied standard services", async () => {
   const { driver, input, calls } = fixture(true);
   const { operationMode: _mode, ...untagged } = input;
-  await expect(driver.apply(untagged)).rejects.toMatchObject({
+  await expect(applyWithSelection(driver, untagged)).rejects.toMatchObject({
     code: "unsupported_capability",
   });
   expect(calls).toHaveLength(0);

@@ -4,6 +4,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { canonicalDigest } from "./json.ts";
 import type { JsonObject } from "./ports.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "./takoform/apply-selection.ts";
 import {
   type InstalledTakoformBinding,
   type InstalledTakoformForm,
@@ -271,7 +272,13 @@ export function createStableLocalWorkerComposition(input: {
   };
 
   const driver: TakoformResourceDriver = {
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" };
+    },
     async apply(value) {
+      if (value.selection.kind !== "intrinsic") {
+        throw new TakoformHostError("resource_busy", 409);
+      }
       switch (value.form.identity.formRef.kind) {
         case "ModuleWorker":
           workers.set(value.resourceUid, value.resourceUid);
