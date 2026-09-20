@@ -5,6 +5,8 @@ import type {
   Provider,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
+  ProviderExecutionAuthority,
+  ProviderFailure,
   ProviderNativeAbsence,
   ProviderOffering,
   ProviderSqliteMigrationIdentity,
@@ -12,6 +14,27 @@ import type {
   ProviderValue,
 } from "../provider-port.ts";
 import type { ProviderMeterError } from "./provider-meter.ts";
+
+export const CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA =
+  "takoserver.cloudflare-provider-executor-no-mutation@v1" as const;
+
+/** Wire evidence that one initial executor call refused before mutation. */
+export interface CloudflareProviderExecutorNoMutationEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA;
+  readonly action: "apply" | "delete" | "adopt";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only initial apply/delete/adopt RPCs may carry this cross-isolate proof. */
+export type CloudflareProviderInitialMutationResult =
+  | ProviderTicket
+  | {
+      readonly phase: "failed";
+      readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
+      readonly executorNoMutation: CloudflareProviderExecutorNoMutationEvidence;
+    };
 
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
 export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
@@ -61,14 +84,14 @@ export type CloudflareProviderMeterReadResult =
  * bridge and no general provider escape hatch.
  */
 export interface CloudflareProviderExecutorRpc {
-  apply(input: ApplyInput): Promise<ProviderTicket>;
+  apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<ProviderTicket>;
   poll(input: CloudflareProviderPollInput): Promise<ProviderTicket>;
   observe(input: CloudflareProviderObserveInput): Promise<ProviderTicket>;
-  delete(input: CloudflareProviderDeleteInput): Promise<ProviderTicket>;
+  delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverDelete(input: CloudflareProviderRecoverDeleteInput): Promise<ProviderTicket>;
-  adopt(input: CloudflareProviderAdoptInput): Promise<ProviderTicket>;
+  adopt(input: CloudflareProviderAdoptInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverAdopt(input: CloudflareProviderRecoverAdoptInput): Promise<ProviderTicket>;
   verifyNativeAbsence(
     input: CloudflareProviderVerifyNativeAbsenceInput,

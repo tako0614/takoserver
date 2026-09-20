@@ -75,6 +75,7 @@ export {
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
   type ProviderValue,
+  providerFailureProvesNoMutation,
   type ResourceIdentity,
   succeeded,
 } from "./provider-port.ts";
@@ -114,7 +115,9 @@ export {
 export type {
   CloudflareProviderAdoptInput,
   CloudflareProviderDeleteInput,
+  CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
+  CloudflareProviderInitialMutationResult,
   CloudflareProviderMeterReadInput,
   CloudflareProviderObserveInput,
   CloudflareProviderPollInput,
@@ -123,6 +126,7 @@ export type {
   CloudflareProviderVerifyArtifactConsumptionInput,
   CloudflareProviderVerifyNativeAbsenceInput,
 } from "./providers/cloudflare-provider-executor-port.ts";
+export { CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA } from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CloudflareProviderProxy,
   createCloudflareProviderMeterProxySources,

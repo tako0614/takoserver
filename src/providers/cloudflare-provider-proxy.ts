@@ -4,6 +4,8 @@ import type {
   ApplyInput,
   Provider,
   ProviderArtifactConsumption,
+  ProviderExecutionAuthority,
+  ProviderFailure,
   ProviderNativeAbsence,
   ProviderNativeReadbackAuthority,
   ProviderNativeReadbackDescriptor,
@@ -11,7 +13,9 @@ import type {
   ProviderOffering,
   ProviderRelation,
   ProviderTicket,
+  ResourceIdentity,
 } from "../provider-port.ts";
+import { failed, failedWithoutProviderMutation } from "../provider-port.ts";
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
   canonicalWorkerEndpointOrigin,
@@ -21,8 +25,15 @@ import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
 } from "./cloudflare-edge-meter-contract.ts";
-import { isCloudflareProviderArtifactConsumption } from "./cloudflare-provider-executor-codec.ts";
-import type { CloudflareProviderExecutorRpc } from "./cloudflare-provider-executor-port.ts";
+import {
+  boundedString,
+  isCloudflareProviderArtifactConsumption,
+  maybeExactRecord,
+} from "./cloudflare-provider-executor-codec.ts";
+import {
+  CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  type CloudflareProviderExecutorRpc,
+} from "./cloudflare-provider-executor-port.ts";
 import {
   cloudflareWfpOwnsOffering,
   createCloudflareNativeReadbackDescriptor,
@@ -31,6 +42,7 @@ import { ProviderMeterError } from "./provider-meter.ts";
 
 export interface CloudflareProviderProxyOptions {
   readonly id?: string;
+  readonly providerInstallationId: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
@@ -57,6 +69,7 @@ export class CloudflareProviderProxy implements Provider {
     Provider["workerEndpointOriginReservations"]
   >;
   readonly #binding: CloudflareProviderExecutorRpc;
+  readonly #providerInstallationId: string;
 
   constructor(options: CloudflareProviderProxyOptions) {
     this.id = options.id ?? "cloudflare";
@@ -73,6 +86,7 @@ export class CloudflareProviderProxy implements Provider {
       };
     }
     this.#binding = options.binding;
+    this.#providerInstallationId = options.providerInstallationId;
     const managedBaseDomain = normalizeManagedBaseDomain(options.managedBaseDomain);
     this.workerEndpointOriginReservations = {
       derive: async ({ requestedSubdomain }) => {
@@ -95,8 +109,9 @@ export class CloudflareProviderProxy implements Provider {
     };
   }
 
-  apply(input: ApplyInput): Promise<ProviderTicket> {
-    return this.#binding.apply(input);
+  async apply(input: ApplyInput): Promise<ProviderTicket> {
+    const context = snapshotInitialMutationContext("apply", input, this.#providerInstallationId);
+    return restoreInitialMutationResult(await this.#binding.apply(input), context);
   }
 
   recoverApply(input: ApplyInput): Promise<ProviderTicket> {
@@ -121,8 +136,9 @@ export class CloudflareProviderProxy implements Provider {
     return this.#binding.observe(input);
   }
 
-  delete(input: Parameters<Provider["delete"]>[0]): Promise<ProviderTicket> {
-    return this.#binding.delete(input);
+  async delete(input: Parameters<Provider["delete"]>[0]): Promise<ProviderTicket> {
+    const context = snapshotInitialMutationContext("delete", input, this.#providerInstallationId);
+    return restoreInitialMutationResult(await this.#binding.delete(input), context);
   }
 
   recoverDelete(
@@ -131,8 +147,9 @@ export class CloudflareProviderProxy implements Provider {
     return this.#binding.recoverDelete(input);
   }
 
-  adopt(input: Parameters<NonNullable<Provider["adopt"]>>[0]): Promise<ProviderTicket> {
-    return this.#binding.adopt(input);
+  async adopt(input: Parameters<NonNullable<Provider["adopt"]>>[0]): Promise<ProviderTicket> {
+    const context = snapshotInitialMutationContext("adopt", input, this.#providerInstallationId);
+    return restoreInitialMutationResult(await this.#binding.adopt(input), context);
   }
 
   recoverAdopt(
@@ -247,4 +264,130 @@ function normalizeManagedBaseDomain(value: string): string {
     throw new TypeError("invalid Cloudflare managed base domain");
   }
   return normalized;
+}
+
+interface InitialMutationContext {
+  readonly action: "apply" | "delete" | "adopt";
+  readonly operationId: string;
+  readonly operationMode: "initial" | "recovery" | undefined;
+  readonly providerInstallationId: string;
+  readonly tenantId: string;
+  readonly resourceUid: string | undefined;
+  readonly executionAuthority: ProviderExecutionAuthority | undefined;
+}
+
+interface InitialMutationInput {
+  readonly operationId: string;
+  readonly operationMode?: "initial" | "recovery";
+  readonly executionAuthority?: ProviderExecutionAuthority;
+  readonly identity: ResourceIdentity;
+}
+
+const EXECUTION_AUTHORITY_KEYS = ["tenantId", "resourceUid", "leaseToken", "fingerprint"] as const;
+
+function snapshotInitialMutationContext(
+  action: InitialMutationContext["action"],
+  input: InitialMutationInput,
+  providerInstallationId: string,
+): InitialMutationContext {
+  return {
+    action,
+    operationId: input.operationId,
+    operationMode: input.operationMode,
+    providerInstallationId,
+    tenantId: input.identity.tenantRef,
+    resourceUid: input.identity.uid,
+    executionAuthority: snapshotExecutionAuthority(input.executionAuthority),
+  };
+}
+
+function snapshotExecutionAuthority(value: unknown): ProviderExecutionAuthority | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const authority = value as Record<string, unknown>;
+  if (
+    !Object.hasOwn(authority, "tenantId") ||
+    typeof authority.tenantId !== "string" ||
+    !Object.hasOwn(authority, "resourceUid") ||
+    typeof authority.resourceUid !== "string" ||
+    !Object.hasOwn(authority, "leaseToken") ||
+    typeof authority.leaseToken !== "string" ||
+    !Object.hasOwn(authority, "fingerprint") ||
+    typeof authority.fingerprint !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    tenantId: authority.tenantId,
+    resourceUid: authority.resourceUid,
+    leaseToken: authority.leaseToken,
+    fingerprint: authority.fingerprint,
+  };
+}
+
+function restoreInitialMutationResult(
+  value: unknown,
+  context: InitialMutationContext,
+): ProviderTicket {
+  if (typeof value !== "object" || value === null || !Object.hasOwn(value, "executorNoMutation")) {
+    return value as ProviderTicket;
+  }
+
+  const ticket = maybeExactRecord(value, ["phase", "failure", "executorNoMutation"]);
+  const failure = ticket
+    ? maybeExactRecord(ticket.failure, ["code", "message", "retryable"])
+    : null;
+  const evidence = ticket
+    ? maybeExactRecord(ticket.executorNoMutation, [
+        "schema",
+        "action",
+        "operationId",
+        "providerInstallationRef",
+        "executionAuthority",
+      ])
+    : null;
+  const authority = evidence
+    ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+    : null;
+
+  if (
+    ticket?.phase !== "failed" ||
+    !failure ||
+    !isProviderFailureCode(failure.code) ||
+    !boundedString(failure.message, 1, 1_024) ||
+    failure.retryable !== false ||
+    !evidence ||
+    evidence.schema !== CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA ||
+    evidence.action !== context.action ||
+    evidence.operationId !== context.operationId ||
+    evidence.providerInstallationRef !== context.providerInstallationId ||
+    context.operationMode !== "initial" ||
+    !context.executionAuthority ||
+    typeof context.tenantId !== "string" ||
+    typeof context.resourceUid !== "string" ||
+    context.executionAuthority.tenantId !== context.tenantId ||
+    context.executionAuthority.resourceUid !== context.resourceUid ||
+    !authority ||
+    authority.tenantId !== context.executionAuthority.tenantId ||
+    authority.resourceUid !== context.executionAuthority.resourceUid ||
+    authority.leaseToken !== context.executionAuthority.leaseToken ||
+    authority.fingerprint !== context.executionAuthority.fingerprint
+  ) {
+    return failed("unavailable", "Provider executor returned invalid no-mutation evidence", true);
+  }
+
+  return failedWithoutProviderMutation(context.operationId, failure.code, failure.message);
+}
+
+function isProviderFailureCode(value: unknown): value is ProviderFailure["code"] {
+  return (
+    value === "invalid_spec" ||
+    value === "conflict" ||
+    value === "occupied" ||
+    value === "not_found" ||
+    value === "denied" ||
+    value === "unavailable" ||
+    value === "quota" ||
+    value === "provider_error" ||
+    value === "timeout"
+  );
 }

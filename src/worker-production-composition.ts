@@ -107,6 +107,7 @@ export function createWorkerProductionComposition(input: {
   });
   if (!surface) throw new TypeError("Cloudflare provider executor surface is unavailable");
   const provider = new CloudflareProviderProxy({
+    providerInstallationId: surface.providerInstallationId,
     offerings: surface.offerings,
     recoveryOfferings: surface.recoveryOfferings,
     nativeReadbackAuthorities: surface.nativeReadbackAuthorities,
