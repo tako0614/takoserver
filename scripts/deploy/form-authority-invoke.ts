@@ -758,7 +758,9 @@ function readbackConverged(readback: FormAuthorityReadback): boolean {
       const entry = implementationEntry({ formRef, packageDigest });
       if (!entry) {
         return (
-          operations.length === 0 && !supported && !activationHead.present && !activationHead.active
+          operations.length === 0 &&
+          !supported &&
+          (!activationHead.present || !activationHead.active)
         );
       }
       return (
@@ -823,8 +825,7 @@ function formReady(
     return (
       form.installed === true &&
       form.supported === false &&
-      activationHead.present === false &&
-      activationHead.active === false
+      (!activationHead.present || !activationHead.active)
     );
   }
   return (

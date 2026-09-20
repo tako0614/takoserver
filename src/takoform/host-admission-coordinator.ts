@@ -332,15 +332,11 @@ export function createHostAdmissionCoordinator(options: {
               "support_key",
             )
           : null;
-        const activation = implementationEntry
-          ? exactHead(
-              activations.filter((row) => row.activation_key === activationKey),
-              "activation_key",
-            )
-          : null;
-        const activationHead = implementationEntry
-          ? await activationFacts(activation, implementationEntry, audience)
-          : emptyActivationHead();
+        const activation = exactHead(
+          activations.filter((row) => row.activation_key === activationKey),
+          "activation_key",
+        );
+        const activationHead = await activationFacts(activation, entry, audience);
         // Deactivation is deliberately independent of package/R2 availability:
         // the durable activation head is the only state it may change. The
         // install-chain identity is enough to report the retained boolean
@@ -396,7 +392,7 @@ export function createHostAdmissionCoordinator(options: {
         head(
           "activation",
           `${formKey}\0${form.entry.packageDigest}\0${audience.value}`,
-          form.implementationEntry ? form.activation : null,
+          form.activation,
         ),
       );
     }
@@ -462,6 +458,17 @@ export function createHostAdmissionCoordinator(options: {
       activationHead,
       installCurrent,
     } of state.forms) {
+      if (
+        desiredActive &&
+        !implementationEntry &&
+        activationHead.present &&
+        activationHead.active
+      ) {
+        throw new HostAdmissionCoordinatorError(
+          "authority_state_conflict",
+          "active Form package has no current implementation entry; explicitly deactivate it before removal",
+        );
+      }
       if (!desiredActive) {
         if (activationHead.present && activationHead.active) {
           if (!activationHead.implementationDigest || !activationHead.eventDigest) {
@@ -1127,15 +1134,6 @@ function normalizePackageSet(
     canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
   );
   return normalized;
-}
-
-function emptyActivationHead(): FormAuthorityActivationHead {
-  return {
-    present: false,
-    active: false,
-    implementationDigest: null,
-    eventDigest: null,
-  };
 }
 
 function head(

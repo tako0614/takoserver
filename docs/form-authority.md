@@ -203,6 +203,13 @@ inactive successor only for a present active head, carrying that head's exact
 durable implementation digest and predecessor. Missing or already-inactive
 heads are no-op. Malformed, multiple, or drifted heads fail closed.
 
+Activation history is read and validated for every exact package identity,
+including identities no longer present in the implementation catalog. An active
+head for such an identity makes normal activation planning refuse before any
+mutation. Use the separate deactivation surface first; normal activation never
+silently revokes an activation. Retained inactive heads remain visible in readback and
+the current-head digest, and are valid state for an unsupported package.
+
 New support events use `takoserver.form-support@v2` and contain only the
 semantic `implementationDigest`. A Worker Version change alone does not make
 an installed Form unsupported. An unrelated route/UI change may rotate the
@@ -360,10 +367,10 @@ inactive, plus a zero-command next plan. The v2 readback exposes each head as
 `activationHead` with `present`, `active`, `implementationDigest`, and
 `eventDigest`; it never hides a stale active head behind installed or effective
 booleans. Normal activation readiness still requires every package to be
-installed; Forms with a concrete handler additionally require support and a
+installed; Forms in the implementation catalog additionally require support and a
 present active head whose implementation digest equals the current code
-identity. A package with no handler remains installed but unsupported with no
-activation head.
+identity. A package outside that catalog remains installed but unsupported with
+an absent or retained inactive activation head.
 
 ## Exact publisher-set import
 
@@ -395,7 +402,10 @@ apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
 intersection of the package set with the code-owned implementation catalog.
-That catalog has concrete handlers for 15 of the 17 identities.
+The public runtime catalog currently includes 14 of the 17 identities. A Form
+must have both its own key in the code-owned capability manifest and a concrete
+handler to enter that catalog. An explicitly declared empty operation list
+remains a supported-empty identity; an absent capability key is not one.
 `StaticAssetBundle@0.1.0` is an intrinsic artifact resource: the Host resolves
 and verifies its committed manifest and blobs in the caller's tenant, without
 requiring a provider identity supply or a custom-domain zone grant. It exposes
@@ -406,13 +416,15 @@ This is bundle lifecycle support, not qualification of every Worker backend's
 asset attachment. The current managed Workers-for-Platforms backend still
 refuses asset-bearing WorkerVersions until its upload and authoritative
 readback path is implemented and qualified.
-`WorkerCustomDomain` still has an empty operation intersection: its provider
+`WorkerCustomDomain` is not currently in the implementation catalog: its provider
 handler requires an exact tenant/hostname zone grant, and the code-owned
 capability manifest does not yet advertise that conditional capability. It
-remains supported and activatable with no executable operations. `ActorNamespace`
-and `DurableWorkflow` have no handlers, so they remain installed and
-discoverable only (`supported: false`) with an absent activation head. No
-operation is advertised unless it is declared by the package, present in the
+remains installed but unsupported. `ActorNamespace` and `DurableWorkflow` have
+no handlers, so they also remain installed and discoverable only
+(`supported: false`). None may have an active activation head; retained inactive
+history is not discarded. Deactivate any existing active heads before deploying
+a catalog that removes their capability. No operation is advertised unless it
+is declared by the package, present in the
 Host capability manifest, and handled by the runtime.
 
 `ObjectBucket` left that list in
@@ -626,10 +638,10 @@ released-Core-verified public publisher set:
   `WorkerCustomDomain` at definition version `0.1.0`.
 
 The executable implementation catalog is a separate, derived support subset:
-it currently has 15 entries (the two actor/workflow identities have no concrete
-handlers), while the static-asset and custom-domain entries are supported with
-empty operations until a target supplies their backends. The owning
-current-catalog importer derives package, schema, and payload digests directly
+it currently has 14 entries. The two actor/workflow identities have no concrete
+handlers, and custom-domain has no declared capability. StaticAssetBundle is
+intrinsic and exposes its declared lifecycle operations, as described above.
+The owning current-catalog importer derives package, schema, and payload digests directly
 from the verified source checkout; literals in the operator do not confer
 trust. The portable gate then rechecks the embedded manifest and every payload
 against those exact current identities. The integration verifier accepts only

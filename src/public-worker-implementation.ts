@@ -86,14 +86,20 @@ export async function deriveRuntimeImplementationCatalog(
     apiVersion: "takoserver.form-handlers@v1",
     artifact: implementationPayloadDigest,
     forms: Object.fromEntries(
-      forms.map(({ identity }) => [
-        identity.formRef.kind,
-        intrinsicKinds.has(identity.formRef.kind)
-          ? RESOURCE_OPERATION_ORDER
-          : cloudflareKinds.has(identity.formRef.kind)
-            ? providerOperations
-            : [],
-      ]),
+      forms
+        // A handler's presence does not admit an undeclared runtime capability.
+        // An own key with [] remains an explicit supported-empty declaration.
+        .filter(({ identity }) =>
+          Object.hasOwn(configuration.capabilities.forms, identity.formRef.kind),
+        )
+        .map(({ identity }) => [
+          identity.formRef.kind,
+          intrinsicKinds.has(identity.formRef.kind)
+            ? RESOURCE_OPERATION_ORDER
+            : cloudflareKinds.has(identity.formRef.kind)
+              ? providerOperations
+              : [],
+        ]),
     ),
   };
   return await deriveImplementationCatalog({
