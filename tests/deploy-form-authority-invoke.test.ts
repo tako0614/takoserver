@@ -843,11 +843,12 @@ async function invocationFixture(
       };
     }
     if (action === "readback" && tamperReadback) {
-      const readback = result as {
-        forms: readonly Record<string, unknown>[];
-        currentHeads: readonly Record<string, unknown>[];
-      };
-      const first = readback.forms[0] ?? {};
+      if (result.kind !== "takoserver.form-authority-readback@v2") {
+        throw new Error("readback action did not return a Form authority readback");
+      }
+      const readback = result;
+      const first = readback.forms[0];
+      if (!first) throw new Error("Form authority readback contains no packages");
       if (
         tamperReadback === "retained-inactive" ||
         tamperReadback === "retained-active" ||
