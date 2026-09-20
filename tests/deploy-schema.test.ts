@@ -197,7 +197,7 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
-  test("0061 pending authority continuity cannot use the ordinary integration apply lane", async () => {
+  test("0061 pending authority continuity refuses a noncanonical integration predecessor", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-accepted-authority-"));
     try {
       const fixture = processFixture("rehearsal");
@@ -217,7 +217,7 @@ describe("forward-only D1 schema surface", () => {
       );
       expect(status).toMatchObject({
         pendingMigrations: ["0061_takoform_accepted_authority_continuity.sql"],
-        applyProviderSelectionCutover: { status: "accepted_authority_cutover_unqualified" },
+        applyProviderSelectionCutover: { status: "predecessor_schema_mismatch" },
         readyForApply: false,
       });
       const error = await runD1Schema(
@@ -226,7 +226,7 @@ describe("forward-only D1 schema surface", () => {
         { ...dependencies, reader: readerSequence([migrationStateThrough(60, "0060-post")]) },
       ).catch((failure) => failure);
       expect(error).toBeInstanceOf(DeployError);
-      expect(error.message).toContain("accepted_authority_cutover_unqualified");
+      expect(error.message).toContain("predecessor_schema_mismatch");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

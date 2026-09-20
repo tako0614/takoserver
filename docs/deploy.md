@@ -104,7 +104,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0060 lineage and verifies its canonical schema, then creates the
+audited 0001–0061 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
@@ -396,7 +396,7 @@ bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
 `takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0060 migration lineage,
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0061 migration lineage,
 and canonical migrated schema before preparation and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
@@ -1153,14 +1153,15 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0060 names and SHA-256 inventory, so a checkout with unreviewed 0061+
+  0001–0061 names and SHA-256 inventory, so a checkout with unreviewed 0062+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
   `integration-protected-wave` result is never accepted by rehearsal or
   production. The no-selector integration lane additionally permits only the
-  exact existing-data 0058/0059 to 0060 transition described below. Earlier
+  exact existing-data 0058/0059 to 0060 and separate 0060 to 0061 transitions
+  described below. Earlier
   predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
   protocol below. Keep its maintenance projection while the selected 0044–0057
@@ -1171,10 +1172,11 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes audited 0058–0060 for fresh, explicitly
+The current source includes audited 0058–0061 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
-`--through-migration=0059`, or `--through-migration=0060`.
+`--through-migration=0059`, `--through-migration=0060`, or
+`--through-migration=0061`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1234,6 +1236,43 @@ An isolated fresh database is not a recovery alternative for protected existing
 data. A successful cutover must still be followed by apply/recovery checks on
 the exact deployed Host/executor pair; local tests alone do not claim that live
 cutover or application operation has completed.
+
+### 0061: accepted-apply authority continuity integration cutover
+
+The same no-selector `takoserver-d1-schema` surface accepts one additional,
+separate integration transition: exact audited 0060 to 0061. It requires the
+current 0001–0061 source names and hashes, the canonical 0060 application
+schema, and zero orphan open provider effects at every pre-mutation fence.
+It refuses an earlier predecessor or a bundled 0059/0060/0061 suffix. Protected
+rehearsal and production selectors still stop at 0057.
+
+0061 adds an immutable, nullable admission summary to the current deferred
+operation table. Existing rows remain unchanged with `NULL` summaries; their
+recovery still requires the historical exact authority head. No migration or
+runtime path guesses or backfills missing provenance. New apply insertions
+from pre-0061 binaries are rejected by a database trigger, while historical
+recovery and import/delete admission keep their existing behavior.
+
+Prepare the matching Host before applying: the new runtime cannot accept work
+on a pre-0061 database, and the old runtime cannot accept new applies after
+0061. This is a forward-only availability boundary, not a zero-downtime claim.
+The lane runs its focused transition/preservation tests and the existing local
+D1 migration gate, then applies the one sealed migration and ledger insert.
+Success requires authoritative exact 0061 lineage, canonical schema including
+both guards, and retained-effect integrity. A lost acknowledgement is resolved
+by readback, not another apply. An already complete wave is status-only;
+publication failure after migration is repaired forward without a down
+migration, reset, or old-binary rollback.
+
+After schema readback, publish the compatible Host through its owning surface
+and reconcile its current Form authority if the semantic implementation changed.
+Private provider composition still verifies its own dependency closure; 0061
+does not change the executor protocol generation. Do not republish unrelated
+components merely to align source labels. The new continuation behavior applies
+only to new accepts: exact Form/package and provider selection remain fixed,
+fresh permission is checked before execution, and the final commit checks the
+current authority again. A real apply/recovery check on the deployed target is
+still needed; local migration success is not live lifecycle completion.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

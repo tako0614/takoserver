@@ -1141,8 +1141,8 @@ export const DEPLOY_CONTRACT = {
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
           "forward-only apply. The current source inventory is exactly 0001-0061; unreviewed 0062+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
-          "Integration may retain its no-selector disposable cadence or select " +
-          "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
+          "Integration may select one audited wave or a separately qualified existing-data additive " +
+          "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
           "catch-up and never permits arbitrary migration-prefix adoption. The selected 0047 wave " +
           "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
@@ -1192,14 +1192,23 @@ export const DEPLOY_CONTRACT = {
           "Exact 0060 schema and lineage plus retained-effect integrity must read back before " +
           "publishing the matching executor then Host. After 0060 the old binaries cannot restore " +
           "service: repair forward. Protected selectors remain capped at 0057, and fresh generation " +
-          "initialization is not a recovery alternative for protected data.",
+          "initialization is not a recovery alternative for protected data. A separate exact 0060 " +
+          "to 0061 integration transition preserves historical NULL accepted-authority summaries " +
+          "without backfill and fences new pre-0061 apply admissions. It requires audited 0001-0061 " +
+          "source bytes, canonical predecessor/post schemas and retained-effect integrity. Never " +
+          "bundle it with the 0059/0060 transition. Have the compatible Host ready before migration; " +
+          "publish it only after schema readback, then reconcile current Form authority as needed. " +
+          "The executor protocol generation is unchanged; unrelated components need not be republished. " +
+          "This forward-only availability boundary is not a zero-downtime or historical recovery claim.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
           "native claim, plus the 0043 active-root/deleting-candidate conflict count. The additive " +
           "integration 0058/0059 to 0060 transition also requires exact canonical schema and no " +
-          "orphan open provider effects; identified unresolved effects need not be drained. Rehearsal writes " +
+          "orphan open provider effects; identified unresolved effects need not be drained. The separate " +
+          "0060 to 0061 integration transition additionally runs focused transition/preservation tests " +
+          "before the local D1 migration gate. Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
           "bytes, pre-shape and expected post-shape. Before 0037, one monotonic single-statement " +

@@ -929,6 +929,14 @@ export async function runD1Schema(
     if (rehearsalReceiptAlreadyExists && wave.pending.length > 0) {
       throw preflightError("rehearsal receipt already exists and will not be overwritten");
     }
+    if (wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
+      await checked(run, "preflight", "accepted-authority transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-accepted-authority.test.ts",
+        "tests/takoform-accepted-authority-migration.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -951,7 +959,7 @@ export async function runD1Schema(
     ) {
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
-    const operationGenerationPostShape =
+    const additiveCutoverPostShape =
       applyProviderSelectionCutover.status === "ready"
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
@@ -1369,10 +1377,14 @@ export async function runD1Schema(
         "D1 post-readback still has migrations pending within the selected wave",
       );
     }
-    if (operationGenerationPostShape !== null) {
-      if (!applicationSchemaMatches(post, operationGenerationPostShape)) {
+    if (additiveCutoverPostShape !== null) {
+      const cutoverName = wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+        ? "accepted-authority"
+        : "operation-generation";
+      const cutoverBoundary = wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION) ? "0061" : "0060";
+      if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
-          "operation-generation cutover post-shape differs from the exact audited 0060 schema; repair forward",
+          `${cutoverName} cutover post-shape differs from the exact audited ${cutoverBoundary} schema; repair forward`,
         );
       }
       const orphanCount = await readOrphanOpenProviderEffectCount({
@@ -1384,7 +1396,7 @@ export async function runD1Schema(
       });
       if (orphanCount !== 0) {
         throw verificationError(
-          "operation-generation cutover has orphan open provider effects after migration; repair forward",
+          `${cutoverName} cutover has orphan open provider effects after migration; repair forward`,
           JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
         );
       }
@@ -2014,11 +2026,37 @@ async function inspectApplyProviderSelectionCutover(input: {
   readonly injected: SchemaReader | undefined;
 }): Promise<ApplyProviderSelectionCutover> {
   const { pending } = input.wave;
-  // The local 0061 runtime work is not a qualified upgrade lane yet. In
-  // particular the ordinary integration suffix must not install its permanent
-  // old-writer fence while accepted operations still need the old Host.
+  // This additive transition fences new old-writer apply admission, not the
+  // recovery of historical rows. It is intentionally separate from the frozen
+  // 0058/0059 -> 0060 lane: never bundle the two availability boundaries.
   if (pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
-    return { status: "accepted_authority_cutover_unqualified" };
+    if (
+      input.invocation.environment !== "integration" ||
+      input.invocation.throughMigration !== undefined ||
+      input.state.applied.length !== 60 ||
+      JSON.stringify(pending) !== JSON.stringify([ACCEPTED_AUTHORITY_MIGRATION])
+    ) {
+      return { status: "accepted_authority_cutover_unqualified" };
+    }
+    if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+      throw preflightError(
+        "accepted-authority cutover requires the exact audited 0001-0061 inventory",
+      );
+    }
+    assertAuditedMigrationHashes(input.artifact.files);
+    if (
+      !applicationSchemaMatches(
+        input.state,
+        deriveExpectedApplicationShape(input.artifact.files.slice(0, 60)),
+      )
+    ) {
+      return { status: "predecessor_schema_mismatch" };
+    }
+    const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+    return {
+      status: orphanOpenProviderEffectCount === 0 ? "ready" : "orphan_open_effects_repair_required",
+      orphanOpenProviderEffectCount,
+    };
   }
   if (
     !pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION) &&
