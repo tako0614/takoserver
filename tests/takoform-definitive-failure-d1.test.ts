@@ -118,12 +118,14 @@ test("native D1 settles whole-operation apply abort with an atomic exact hold re
         });
         expect(
           await sql.query(
-            "SELECT provider_outcome FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+            "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
             [operationId],
           ),
         ).toEqual(injectReleaseConstraint ? [{ provider_outcome: "indeterminate" }] : []);
         expect(
-          await sql.query("SELECT phase FROM tf_deferred_operations WHERE id = ?", [operationId]),
+          await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+            operationId,
+          ]),
         ).toEqual([{ phase: injectReleaseConstraint ? "committing" : "failed" }]);
         expect(observe.releaseIntercepts).toBe(1);
         expect(observe.maxBindParams).toBeLessThanOrEqual(100);
@@ -173,7 +175,7 @@ test("native D1 terminalizes a definitive refusal and releases its exact hold", 
 
     expect(
       await sql.query(
-        "SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
         [operationId],
       ),
     ).toEqual([]);
@@ -182,7 +184,7 @@ test("native D1 terminalizes a definitive refusal and releases its exact hold", 
     ).toEqual([{ operation: "apply", state: "failed" }]);
     expect(
       await sql.query(
-        "SELECT phase, terminal_json, lease_token FROM tf_deferred_operations WHERE id = ?",
+        "SELECT phase, terminal_json, lease_token FROM tf_deferred_operations_selection_v1 WHERE id = ?",
         [operationId],
       ),
     ).toEqual([{ phase: "failed", terminal_json: expect.any(String), lease_token: null }]);
@@ -243,14 +245,14 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
 
       expect(
         await sql.query(
-          "SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
       ).toEqual([{ operation_id: operationId }]);
       expect(
         await sql.query(
           "SELECT phase, receipt_json, provider_outcome " +
-            "FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+            "FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
       ).toEqual([
@@ -263,7 +265,7 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
       expect(
         await sql.query(
           "SELECT phase, terminal_json, lease_token, lease_until " +
-            "FROM tf_deferred_operations WHERE id = ?",
+            "FROM tf_deferred_operations_selection_v1 WHERE id = ?",
           [operationId],
         ),
       ).toEqual([
@@ -525,7 +527,7 @@ async function walletAt(
 
 async function latestDeferredOperationId(sql: Sql, tenantId: string): Promise<string> {
   const rows = await sql.query(
-    "SELECT id FROM tf_deferred_operations " +
+    "SELECT id FROM tf_deferred_operations_selection_v1 " +
       "WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
     [tenantId],
   );
@@ -536,7 +538,7 @@ async function latestDeferredOperationId(sql: Sql, tenantId: string): Promise<st
 
 async function resourceUidFor(sql: Sql, operationId: string): Promise<string> {
   const rows = await sql.query(
-    "SELECT resource_uid FROM tf_deferred_operations WHERE id = ? LIMIT 1",
+    "SELECT resource_uid FROM tf_deferred_operations_selection_v1 WHERE id = ? LIMIT 1",
     [operationId],
   );
   const uid = rows[0]?.resource_uid;

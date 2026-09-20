@@ -364,7 +364,7 @@ export const DEPLOY_CONTRACT = {
           "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
           "and all other closure names, types and fields remain exact. Before upload and again at the " +
           "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
-          "R2 name, audited 0001-0059 lineage and canonical migrated schema. Production and rehearsal " +
+          "R2 name, audited 0001-0060 lineage and canonical migrated schema. Production and rehearsal " +
           "refuse this pair before provider effects. " +
           integrationServiceBindingRefresh +
           " This one integration rebind branch runs " +
@@ -970,11 +970,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0059 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0060 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0059 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0060 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1138,7 +1138,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0059; unreviewed 0060+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0060; unreviewed 0061+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
           "Integration may retain its no-selector disposable cadence or select " +
           "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1185,8 +1185,11 @@ export const DEPLOY_CONTRACT = {
           "refuses apply before source qualification, the migration gate, or provider mutation: this " +
           "surface has no supported quiescence or never-served proof for current existing data. Counts, " +
           "lease expiry, 503/time waits, and reviewer strings do not substitute, and historical NULL " +
-          "selection rows are not backfilled. Only the separate fresh integration-storage-generation " +
-          "surface may initialize an absent 0001-0059 generation; it is not a recovery alternative " +
+          "selection rows are not backfilled. A pending 0060 after 0059 returns " +
+          "operation_generation_cutover_unqualified and also refuses apply before mutation; local " +
+          "generation-isolation tests do not qualify an existing-data D1 transition. " +
+          "Only the separate fresh integration-storage-generation " +
+          "surface may initialize an absent 0001-0060 generation; it is not a recovery alternative " +
           "for protected data.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +

@@ -985,7 +985,11 @@ describe("durable read-only Takoform Host authority", () => {
     );
     expect(
       Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+        (
+          await fixture.sql.query(
+            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
+          )
+        )[0]?.n,
       ),
     ).toBe(0);
   });
@@ -1059,7 +1063,11 @@ describe("durable read-only Takoform Host authority", () => {
     expect(counted.calls.apply).toBe(0);
     expect(
       Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+        (
+          await fixture.sql.query(
+            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
+          )
+        )[0]?.n,
       ),
     ).toBe(0);
   });
@@ -1121,7 +1129,7 @@ describe("durable read-only Takoform Host authority", () => {
       expect(applyCalls).toBe(1);
 
       const sagaBefore = await fixture.sql.query(
-        "SELECT * FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+        "SELECT * FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
         [operationId],
       );
       const saga = first(sagaBefore, "accepted provider mutation saga");
@@ -1226,9 +1234,10 @@ describe("durable read-only Takoform Host authority", () => {
         ),
       ).toBe(true);
       expect(
-        await fixture.sql.query("SELECT * FROM tf_provider_mutation_sagas WHERE operation_id = ?", [
-          operationId,
-        ]),
+        await fixture.sql.query(
+          "SELECT * FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+          [operationId],
+        ),
       ).toEqual(sagaBefore);
       expect(
         await fixture.sql.query(
@@ -1309,7 +1318,11 @@ describe("durable read-only Takoform Host authority", () => {
     );
     expect(
       Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+        (
+          await fixture.sql.query(
+            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
+          )
+        )[0]?.n,
       ),
     ).toBe(1);
   });

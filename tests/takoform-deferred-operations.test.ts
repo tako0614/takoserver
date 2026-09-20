@@ -231,7 +231,9 @@ describe("durable deferred Takoform operations", () => {
     expect(new Set(providerOperationIds).size).toBe(1);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE target_name = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE target_name = ?",
+        )
         .all("renewed-authority"),
     ).toEqual([]);
     expect(
@@ -484,7 +486,7 @@ describe("durable deferred Takoform operations", () => {
     });
     opened.database
       .query(
-        `UPDATE tf_deferred_operations
+        `UPDATE tf_deferred_operations_selection_v1
          SET phase = 'committing', polls_remaining = 0,
              lease_token = 'lease_dead_process', lease_until = ?
          WHERE id = ?`,
@@ -493,7 +495,7 @@ describe("durable deferred Takoform operations", () => {
     const stored = opened.database
       .query(
         `SELECT request_headers_json, request_body_json
-         FROM tf_deferred_operations WHERE id = ?`,
+         FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
       )
       .get(operationId) as {
       request_headers_json: string;
@@ -556,7 +558,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT phase, lease_token, lease_until, terminal_json
-           FROM tf_deferred_operations WHERE id = ?`,
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
         )
         .get(operationId),
     ).toEqual({
@@ -568,7 +570,7 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database
         .query(
-          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
            WHERE operation_id = ?`,
         )
         .get(operationId),
@@ -577,7 +579,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT provider_handle, provider_outcome
-           FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+           FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
         )
         .get(operationId),
     ).toEqual({ provider_handle: "opaque-provider-handle", provider_outcome: "running" });
@@ -586,7 +588,7 @@ describe("durable deferred Takoform operations", () => {
     // recovery must still carry the durable handle and never dispatch again.
     opened.database
       .query(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE tf_provider_mutation_sagas_selection_v1
          SET execution_lease_until = 0 WHERE operation_id = ?`,
       )
       .run(operationId);
@@ -601,7 +603,9 @@ describe("durable deferred Takoform operations", () => {
     expect(providerHandles).toEqual([undefined, "opaque-provider-handle"]);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .all(operationId),
     ).toEqual([]);
     opened.close();
@@ -655,7 +659,9 @@ describe("durable deferred Takoform operations", () => {
     });
     expect(providerCalls).toBe(1);
     expect(
-      opened.database.query("SELECT phase, terminal_json FROM tf_deferred_operations").all(),
+      opened.database
+        .query("SELECT phase, terminal_json FROM tf_deferred_operations_selection_v1")
+        .all(),
     ).toEqual([{ phase: "committing", terminal_json: null }]);
     opened.close();
   });
@@ -740,7 +746,9 @@ describe("durable deferred Takoform operations", () => {
     });
     expect(providerCalls).toBe(1);
     expect(
-      opened.database.query("SELECT phase, receipt_json FROM tf_provider_mutation_sagas").all(),
+      opened.database
+        .query("SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1")
+        .all(),
     ).toEqual([{ phase: "executed", receipt_json: expect.any(String) }]);
     opened.close();
   });
@@ -929,7 +937,7 @@ describe("durable deferred Takoform operations", () => {
         });
         database
           .query(
-            `UPDATE tf_deferred_operations
+            `UPDATE tf_deferred_operations_selection_v1
              SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL
              WHERE id = ? AND phase = 'committing'`,
           )
@@ -1014,8 +1022,8 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT operation.expires_at AS operation_expiry, saga.expires_at AS saga_expiry
-           FROM tf_deferred_operations AS operation
-           INNER JOIN tf_provider_mutation_sagas AS saga ON saga.operation_id = operation.id
+           FROM tf_deferred_operations_selection_v1 AS operation
+           INNER JOIN tf_provider_mutation_sagas_selection_v1 AS saga ON saga.operation_id = operation.id
            WHERE operation.id = ?`,
         )
         .get(operationId),
@@ -1088,7 +1096,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT phase, worker_endpoint_origin_reservation_id AS reservation
-           FROM tf_deferred_operations WHERE id = ?`,
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
         )
         .get(operationId),
     ).toEqual({ phase: "pending", reservation: "endpoint-reservation-01" });
@@ -1424,7 +1432,9 @@ describe("durable deferred Takoform operations", () => {
     ).toEqual({ revision: "99" });
     expect(
       opened.database
-        .query("SELECT phase, expires_at FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT phase, expires_at FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .get(operationId),
     ).toEqual({ phase: "executed", expires_at: null });
 
@@ -1472,7 +1482,9 @@ describe("durable deferred Takoform operations", () => {
     expect(providerCalls).toBe(1);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .all(operationId),
     ).toEqual([]);
     opened.close();
@@ -1844,7 +1856,9 @@ describe("durable deferred Takoform operations", () => {
       pending: 0,
     });
     expect(
-      opened.database.query("SELECT operation_id FROM tf_provider_mutation_sagas").all(),
+      opened.database
+        .query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1")
+        .all(),
     ).toEqual([]);
 
     // And once the operator has done what the refusal asked, the same destroy
@@ -2066,12 +2080,14 @@ describe("durable deferred Takoform operations", () => {
     // Settled, not held: the command has a terminal answer and its executed
     // saga is gone, so a fresh attempt plans rather than adopting it.
     expect(
-      opened.database.query("SELECT phase FROM tf_deferred_operations").all() as {
+      opened.database.query("SELECT phase FROM tf_deferred_operations_selection_v1").all() as {
         phase: string;
       }[],
     ).toEqual([{ phase: "failed" }]);
     expect(
-      opened.database.query("SELECT count(*) AS rows FROM tf_provider_mutation_sagas").get(),
+      opened.database
+        .query("SELECT count(*) AS rows FROM tf_provider_mutation_sagas_selection_v1")
+        .get(),
     ).toEqual({ rows: 0 });
     // The refusal is about this Host, so the operation ledger keeps the record
     // a later repair reads.
@@ -2198,7 +2214,7 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database
         .query(
-          `SELECT phase, terminal_json FROM tf_deferred_operations
+          `SELECT phase, terminal_json FROM tf_deferred_operations_selection_v1
            WHERE id = ?`,
         )
         .get(operationId),
@@ -2207,7 +2223,7 @@ describe("durable deferred Takoform operations", () => {
     const saga = opened.database
       .query(
         `SELECT operation_id, resource_uid, phase, provider_outcome, receipt_json
-         FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+         FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
       )
       .get(operationId) as {
       operation_id: string;

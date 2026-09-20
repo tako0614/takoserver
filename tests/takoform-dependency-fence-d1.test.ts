@@ -3,6 +3,10 @@ import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import {
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+} from "../src/takoform/apply-selection.ts";
+import {
   createResourceDependencySet,
   resourceDependencyClaimKeys,
 } from "../src/takoform/dependency-fence.ts";
@@ -24,6 +28,22 @@ const SOURCE_FORM_REF: TakoformV1Alpha3FormRef = {
   kind: "DependencyHolder",
   definitionVersion: "1.0.0",
   schemaDigest: `sha256:${"b".repeat(64)}`,
+};
+const APPLY_SELECTION: TakoformApplySelection = {
+  version: TAKOFORM_APPLY_SELECTION_VERSION,
+  kind: "provider",
+  providerPackRef: "provider-dependency-fence",
+  providerInstallationRef: "provider-dependency-fence.primary",
+  technicalOffering: {
+    id: "provider-dependency-fence.holder",
+    kind: SOURCE_FORM_REF.kind,
+    displayName: "Dependency holder",
+    form: SOURCE_FORM_REF,
+    bindingRefs: [],
+    providedInterfaces: [],
+    capabilities: ["create", "update"],
+  },
+  relations: [],
 };
 
 test("native D1 keeps a two-target dependency fence atomic through dispatch and commit", async () => {
@@ -197,6 +217,7 @@ test("native D1 keeps a two-target dependency fence atomic through dispatch and 
 
     const saga: ProviderMutationSaga = {
       operationId: dependencies.operationId,
+      operationKind: "apply",
       replayKey: "replay_dependency_commit",
       tenantId: TENANT_ID,
       fingerprint: "fingerprint_dependency_commit",
@@ -219,6 +240,17 @@ test("native D1 keeps a two-target dependency fence atomic through dispatch and 
         leaseUntil: NOW + 60_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        tenantId: TENANT_ID,
+        operationId: saga.operationId,
+        resourceUid: sourceUid,
+        fingerprint: saga.fingerprint,
+        leaseToken: "lease_dependency_commit",
+        mode: "initial",
+        selection: APPLY_SELECTION,
+      }),
+    ).toEqual(APPLY_SELECTION);
     expect(
       await store.markProviderMutationDispatch({
         tenantId: TENANT_ID,

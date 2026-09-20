@@ -38,6 +38,7 @@ const WORKER_VERSION_EXECUTION_MATERIAL =
 const CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS =
   "0058_cloudflare_managed_worker_domain_receipts.sql";
 const TAKOFORM_APPLY_PROVIDER_SELECTION = "0059_takoform_apply_provider_selection.sql";
+const TAKOFORM_OPERATION_GENERATION = "0060_takoform_operation_generation.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -66,6 +67,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   WORKER_VERSION_EXECUTION_MATERIAL,
   CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
   TAKOFORM_APPLY_PROVIDER_SELECTION,
+  TAKOFORM_OPERATION_GENERATION,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -434,6 +436,7 @@ describe("bringing a local database up to date", () => {
       WORKER_VERSION_EXECUTION_MATERIAL,
       CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
       TAKOFORM_APPLY_PROVIDER_SELECTION,
+      TAKOFORM_OPERATION_GENERATION,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -704,6 +707,7 @@ describe("bringing a local database up to date", () => {
         WORKER_VERSION_EXECUTION_MATERIAL,
         CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
         TAKOFORM_APPLY_PROVIDER_SELECTION,
+        TAKOFORM_OPERATION_GENERATION,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1267,6 +1271,7 @@ describe("bringing a local database up to date", () => {
       WORKER_VERSION_EXECUTION_MATERIAL,
       CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
       TAKOFORM_APPLY_PROVIDER_SELECTION,
+      TAKOFORM_OPERATION_GENERATION,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1407,6 +1412,7 @@ describe("bringing a local database up to date", () => {
       WORKER_VERSION_EXECUTION_MATERIAL,
       CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
       TAKOFORM_APPLY_PROVIDER_SELECTION,
+      TAKOFORM_OPERATION_GENERATION,
     ]);
     expect(
       database
@@ -2354,6 +2360,7 @@ describe("bringing a local database up to date", () => {
       WORKER_VERSION_EXECUTION_MATERIAL,
       CLOUDFLARE_MANAGED_WORKER_DOMAIN_RECEIPTS,
       TAKOFORM_APPLY_PROVIDER_SELECTION,
+      TAKOFORM_OPERATION_GENERATION,
     ]);
     expect(
       database

@@ -510,8 +510,9 @@ export class TakoformHostError extends Error {
      * `STABLE_ERROR_HTTP_STATUS` is read by the provider as an opaque
      * rejection carrying no classification at all. `hostCode` is the seam the
      * released contract already leaves for a Host that knows something the
-     * taxonomy cannot say, and `CROSS_RESOURCE_PRECONDITION` is the one value
-     * this Host uses it for.
+     * taxonomy cannot say. This Host uses it for cross-resource refusals and
+     * for a temporary operation-generation quarantine; neither invents a new
+     * portable error code or mutation authority.
      */
     readonly hostCode?: string,
   ) {

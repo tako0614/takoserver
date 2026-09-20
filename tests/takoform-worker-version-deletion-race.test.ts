@@ -529,7 +529,7 @@ test("a dispatched dependency set survives ordinary TTL and deferred recovery co
   expect(initial.status).toBe(202);
   const operationRow = onlyRow(
     await sql.query(
-      `SELECT id, resource_uid FROM tf_deferred_operations
+      `SELECT id, resource_uid FROM tf_deferred_operations_selection_v1
        WHERE target_kind = 'WorkerDeployment'`,
     ),
   );
@@ -680,7 +680,7 @@ test("receipted recovery commits the accepted dependency set after target revisi
   expect(providerCalls).toBe(1);
   const operationRow = onlyRow(
     await sql.query(
-      `SELECT id, resource_uid FROM tf_deferred_operations
+      `SELECT id, resource_uid FROM tf_deferred_operations_selection_v1
        WHERE target_kind = 'WorkerDeployment'`,
     ),
   );
@@ -770,7 +770,7 @@ test("post-dispatch recovery never rebinds the accepted dependency to a recreate
   expect(initial.status).toBe(202);
   const operationRow = onlyRow(
     await sql.query(
-      `SELECT id, resource_uid FROM tf_deferred_operations
+      `SELECT id, resource_uid FROM tf_deferred_operations_selection_v1
        WHERE target_kind = 'WorkerDeployment'`,
     ),
   );
@@ -979,8 +979,8 @@ function pauseDeploymentSagaAcceptance(durable: Sql): {
       async run(statement, params) {
         if (
           !paused &&
-          statement.includes("INSERT OR IGNORE INTO tf_provider_mutation_sagas") &&
-          params?.[7] === "WorkerDeployment"
+          statement.includes("INSERT OR IGNORE INTO tf_provider_mutation_sagas_selection_v1") &&
+          params?.some((param) => param === "WorkerDeployment")
         ) {
           paused = true;
           signalEntered();

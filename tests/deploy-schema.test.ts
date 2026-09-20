@@ -205,7 +205,10 @@ describe("forward-only D1 schema surface", () => {
         },
       );
       expect(result).toMatchObject({
-        pendingMigrations: ["0059_takoform_apply_provider_selection.sql"],
+        pendingMigrations: [
+          "0059_takoform_apply_provider_selection.sql",
+          "0060_takoform_operation_generation.sql",
+        ],
         applyProviderSelectionCutover: {
           status: "old_apply_writers_quiescence_unproven",
         },
@@ -281,11 +284,52 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
-  test("a completed 0059 lineage keeps the existing no-op apply refusal", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-complete-"));
+  test("a pending 0060 cutover remains unavailable even after 0059 was applied", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-operation-generation-"));
     try {
       const fixture = processFixture("rehearsal");
       const state = migrationStateThrough(59, "0059-post");
+      const options = {
+        reader: readerSequence([state]),
+        migrationDirectory: currentMigrations,
+        outputDirectory: join(root, "status-work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+      };
+      const status = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        options,
+      );
+      expect(status).toMatchObject({
+        pendingMigrations: ["0060_takoform_operation_generation.sql"],
+        applyProviderSelectionCutover: { status: "operation_generation_cutover_unqualified" },
+        readyForApply: false,
+      });
+      const failure = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          ...options,
+          reader: readerSequence([state]),
+          run: fixture.run,
+          outputDirectory: join(root, "apply-work"),
+          leaseRoot: join(root, "leases"),
+          review: "reviewer@example.test",
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("operation_generation_cutover_unqualified");
+      expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a completed 0060 lineage keeps the existing no-op apply refusal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-complete-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const state = migrationStateThrough(60, "0060-post");
       const status = await runD1Schema(
         { action: "status", environment: "integration", commit: COMMIT },
         integrationTarget,

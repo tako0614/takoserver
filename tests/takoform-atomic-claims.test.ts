@@ -467,7 +467,9 @@ test("a definitive wrong-native import does not block a same-native re-import", 
     )?.status,
   ).toBe(200);
   expect(
-    Number((await sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n),
+    Number(
+      (await sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1"))[0]?.n,
+    ),
   ).toBe(0);
 });
 

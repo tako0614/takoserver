@@ -41,6 +41,15 @@ import {
   type TakoformV1Alpha3FormRef,
 } from "./types.ts";
 
+const OPERATION_PROTOCOL_GENERATION = 1;
+const PROVIDER_MUTATION_SAGA_TABLE = "tf_provider_mutation_sagas_selection_v1";
+const DEFERRED_OPERATION_TABLE = "tf_deferred_operations_selection_v1";
+const LEGACY_PROVIDER_MUTATION_SAGA_TABLE = "tf_provider_mutation_sagas";
+const LEGACY_DEFERRED_OPERATION_TABLE = "tf_deferred_operations";
+
+/** Internal classification used to retain a new command behind legacy evidence. */
+export const LEGACY_OPERATION_GENERATION_CONFLICT = "LEGACY_OPERATION_GENERATION_CONFLICT";
+
 /**
  * Durable Takoform state.
  *
@@ -202,6 +211,7 @@ export interface DeferredResourceCommit extends ResourceMutationCommit {
 
 export interface ProviderMutationSaga {
   readonly operationId: string;
+  readonly operationKind: "apply" | "import" | "delete";
   readonly replayKey: string;
   readonly tenantId: string;
   readonly fingerprint: string;
@@ -212,6 +222,14 @@ export interface ProviderMutationSaga {
   readonly acceptedGeneration?: string;
   readonly acceptedRevision?: string;
   readonly receipt?: TakoformDriverReceipt;
+}
+
+interface OperationGenerationIdentity {
+  readonly operationId: string;
+  readonly replayKey: string;
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly target: ResourceAddress;
 }
 
 /** One no-effect provider refusal committed with its exact priced hold. */
@@ -708,6 +726,65 @@ export interface TakoformStore {
   deleteReplay(key: string): Promise<void>;
 }
 
+function legacyOperationConflictFence(input: OperationGenerationIdentity): {
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+} {
+  return {
+    sql: `(
+      EXISTS (
+        SELECT 1 FROM ${LEGACY_PROVIDER_MUTATION_SAGA_TABLE} AS legacy_saga
+        WHERE legacy_saga.operation_id = ? OR legacy_saga.replay_key = ?
+          OR (legacy_saga.tenant_id = ? AND (
+            legacy_saga.resource_uid = ? OR (
+              legacy_saga.target_space = ? AND legacy_saga.target_api_version = ?
+              AND legacy_saga.target_kind = ? AND legacy_saga.target_name = ?
+            )
+          ))
+      ) OR EXISTS (
+        SELECT 1 FROM ${LEGACY_DEFERRED_OPERATION_TABLE} AS legacy_operation
+        WHERE legacy_operation.phase IN ('pending', 'committing') AND (
+          legacy_operation.id = ? OR legacy_operation.replay_key = ?
+          OR (legacy_operation.tenant_id = ? AND (
+            legacy_operation.resource_uid = ? OR (
+              legacy_operation.target_space = ? AND legacy_operation.target_api_version = ?
+              AND legacy_operation.target_kind = ? AND legacy_operation.target_name = ?
+            )
+          ))
+        )
+      )
+    )`,
+    params: [
+      input.operationId,
+      input.replayKey,
+      input.tenantId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+      input.operationId,
+      input.replayKey,
+      input.tenantId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+    ],
+  };
+}
+
+function legacyOperationConflictError(): TakoformHostError {
+  return new TakoformHostError(
+    "resource_busy",
+    409,
+    undefined,
+    undefined,
+    LEGACY_OPERATION_GENERATION_CONFLICT,
+  );
+}
+
 export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   const now = (): number => clock().getTime();
 
@@ -715,11 +792,29 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     column: "replay_key",
     value: string,
   ): Promise<DeferredOperationRecord | null> => {
-    const rows = await sql.query(
-      `SELECT * FROM tf_deferred_operations WHERE ${column} = ? AND expires_at > ?`,
+    const current = await sql.query(
+      `SELECT * FROM ${DEFERRED_OPERATION_TABLE}
+       WHERE ${column} = ? AND (phase IN ('pending', 'committing') OR expires_at > ?) LIMIT 2`,
       [value, now()],
     );
-    return rows[0] ? deferredOperation(rows[0]) : null;
+    if (current.length > 1) throw new Error("deferred_operation_ambiguous");
+    if (current[0]) return deferredOperation(current[0]);
+    const legacy = await sql.query(
+      `SELECT * FROM ${LEGACY_DEFERRED_OPERATION_TABLE} WHERE ${column} = ? LIMIT 2`,
+      [value],
+    );
+    if (legacy.length > 1) throw new Error("legacy_deferred_operation_ambiguous");
+    return legacy[0] ? deferredOperation(legacy[0]) : null;
+  };
+
+  const hasLegacyOperationConflict = async (
+    identity: OperationGenerationIdentity,
+  ): Promise<boolean> => {
+    const fence = legacyOperationConflictFence(identity);
+    const rows = await sql.query(`SELECT CASE WHEN ${fence.sql} THEN 1 ELSE 0 END AS conflict`, [
+      ...fence.params,
+    ]);
+    return Number(rows[0]?.conflict ?? 0) === 1;
   };
 
   /**
@@ -753,9 +848,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     leaseToken: string,
   ): Promise<TakoformHostError> => {
     const liveOperation = await sql.query(
-      `SELECT phase, lease_token FROM tf_deferred_operations
-       WHERE id = ? AND tenant_id = ? AND principal_id = ? AND expires_at > ?`,
-      [operation.id, operation.tenantId, operation.principalId, now()],
+      `SELECT phase, lease_token FROM ${DEFERRED_OPERATION_TABLE}
+       WHERE id = ? AND tenant_id = ? AND principal_id = ?`,
+      [operation.id, operation.tenantId, operation.principalId],
     );
     if (
       liveOperation.length !== 1 ||
@@ -1633,22 +1728,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async acceptProviderMutationSaga(record) {
       const timestamp = now();
+      const legacyFence = legacyOperationConflictFence(record);
       await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas WHERE rowid IN (
-           SELECT rowid FROM tf_provider_mutation_sagas
-           WHERE phase = 'planned' AND expires_at <= ? ORDER BY expires_at LIMIT ?
-         )`,
-        [timestamp, SWEEP_ROW_LIMIT],
-      );
-      await sql.run(
-        `INSERT OR IGNORE INTO tf_provider_mutation_sagas
-           (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
+        `INSERT OR IGNORE INTO ${PROVIDER_MUTATION_SAGA_TABLE}
+           (operation_id, protocol_generation, operation_kind, replay_key,
+            tenant_id, fingerprint, resource_uid,
             target_space, target_api_version, target_kind, target_name,
             accepted_uid, accepted_generation, accepted_revision, phase,
             receipt_json, authority_head_digest, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?
+         WHERE NOT ${legacyFence.sql}`,
         [
           record.operationId,
+          OPERATION_PROTOCOL_GENERATION,
+          record.operationKind,
           record.replayKey,
           record.tenantId,
           record.fingerprint,
@@ -1663,17 +1756,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.authorityHeadDigest ?? null,
           timestamp,
           timestamp,
-          timestamp + OPERATION_TTL_MILLISECONDS,
+          253_402_300_799_999,
+          ...legacyFence.params,
         ],
       );
       const rows = await sql.query(
-        `SELECT * FROM tf_provider_mutation_sagas
+        `SELECT * FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE (
              replay_key = ? OR
              (tenant_id = ? AND target_space = ? AND target_api_version = ?
                AND target_kind = ? AND target_name = ?)
-           )
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 3`,
+           ) LIMIT 3`,
         [
           record.replayKey,
           record.tenantId,
@@ -1681,7 +1774,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.target.apiVersion,
           record.target.kind,
           record.target.name,
-          timestamp,
         ],
       );
       const stored = rows[0] ? providerMutationSaga(rows[0]) : null;
@@ -1692,15 +1784,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ? sameProviderMutationSaga(record, stored)
           : sameProviderMutationTarget(record, stored))
       ) {
+        if (!stored && (await hasLegacyOperationConflict(record))) {
+          throw legacyOperationConflictError();
+        }
         throw new TakoformHostError("resource_busy", 409);
       }
       if (stored.replayKey === record.replayKey) return stored;
       const rotated = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET replay_key = ?, updated_at = ?
          WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
-           AND fingerprint = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?)`,
+           AND fingerprint = ? AND resource_uid = ?`,
         [
           record.replayKey,
           timestamp,
@@ -1709,7 +1803,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           stored.tenantId,
           stored.fingerprint,
           stored.resourceUid,
-          timestamp,
         ],
       );
       if (rotated.changes !== 1) throw new TakoformHostError("resource_busy", 409);
@@ -1718,10 +1811,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async establishedProviderMutationSaga(record) {
       const rows = await sql.query(
-        `SELECT * FROM tf_provider_mutation_sagas
-         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
-        [record.operationId, record.tenantId, record.resourceUid, now()],
+        `SELECT * FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [record.operationId, record.tenantId, record.resourceUid],
       );
       if (rows.length === 0) return false;
       if (rows.length !== 1) throw new TakoformHostError("resource_busy", 409);
@@ -1739,11 +1831,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       if (input.leaseUntil <= timestamp)
         throw new TypeError("provider lease must be in the future");
       const initial = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = ?, execution_lease_until = ?,
              updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND phase = 'planned' AND receipt_json IS NULL
            AND execution_started_at IS NULL
            AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
         [
@@ -1754,13 +1846,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.operationId,
           input.resourceUid,
           timestamp,
-          timestamp,
         ],
       );
       if (initial.changes === 1) {
         const stateRows = await sql.query(
           `SELECT selection_json
-           FROM tf_provider_mutation_sagas
+           FROM ${PROVIDER_MUTATION_SAGA_TABLE}
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
           [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
@@ -1773,10 +1864,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
 
       const recovery = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = ?, execution_lease_until = ?, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND phase = 'planned' AND receipt_json IS NULL
            AND execution_started_at IS NOT NULL
            AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
         [
@@ -1787,13 +1878,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.operationId,
           input.resourceUid,
           timestamp,
-          timestamp,
         ],
       );
       if (recovery.changes === 1) {
         const stateRows = await sql.query(
           `SELECT provider_handle, provider_outcome, selection_json
-           FROM tf_provider_mutation_sagas
+           FROM ${PROVIDER_MUTATION_SAGA_TABLE}
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
           [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
@@ -1806,10 +1896,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
 
       const rows = await sql.query(
-        `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
-         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
-        [input.tenantId, input.operationId, input.resourceUid, timestamp],
+        `SELECT phase, receipt_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid],
       );
       if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
       const row = rows[0];
@@ -1822,36 +1911,68 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     async bindProviderMutationApplySelection(input) {
       const timestamp = now();
       const selectionJson = encodeTakoformApplySelection(input.selection);
-      const bound = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+      // Preparation can already cross effectful extension boundaries after
+      // this acceptance. Keep its exact destination and deferred command as
+      // one repair unit even if the invocation never reaches dispatch.
+      const [bound] = await sql.batch([
+        {
+          sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET selection_json = COALESCE(selection_json, ?),
-             selection_verified_lease_token = ?, updated_at = ?
+             selection_verified_lease_token = ?, updated_at = ?, expires_at = 253402300799999
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND fingerprint = ? AND phase = 'planned' AND receipt_json IS NULL
-           AND expires_at > ? AND execution_lease_token = ? AND execution_lease_until > ?
+           AND fingerprint = ? AND operation_kind = 'apply'
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?
            AND execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
            AND ${
              input.mode === "initial"
                ? "(selection_json IS NULL OR selection_json = ?)"
                : "selection_json = ?"
 }`,
-        [
-          selectionJson,
-          input.leaseToken,
-          timestamp,
-          input.tenantId,
-          input.operationId,
-          input.resourceUid,
-          input.fingerprint,
-          timestamp,
-          input.leaseToken,
-          timestamp,
-          selectionJson,
-        ],
-      );
-      if (bound.changes !== 1) return null;
+          params: [
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            input.fingerprint,
+            input.leaseToken,
+            timestamp,
+            selectionJson,
+          ],
+        },
+        {
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND operation = 'apply' AND phase = 'committing'
+                  AND EXISTS (
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                    WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                      AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                      AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
+                      AND saga.fingerprint = ? AND saga.selection_json = ?
+                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                      AND saga.execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                      AND saga.execution_lease_token = ? AND saga.execution_lease_until > ?
+                      AND saga.selection_verified_lease_token = saga.execution_lease_token
+                  )`,
+          params: [
+            timestamp,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            input.fingerprint,
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+      ]);
+      if (bound?.changes !== 1) return null;
       const rows = await sql.query(
-        `SELECT selection_json FROM tf_provider_mutation_sagas
+        `SELECT selection_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND fingerprint = ? AND execution_lease_token = ? LIMIT 2`,
         [input.tenantId, input.operationId, input.resourceUid, input.fingerprint, input.leaseToken],
@@ -1886,9 +2007,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         {
           sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                 SELECT ?, CASE WHEN EXISTS (
-                  SELECT 1 FROM tf_provider_mutation_sagas
+                  SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                   WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND phase = 'planned' AND receipt_json IS NULL
                     AND execution_lease_token = ? AND execution_lease_until > ?
                     AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}
                 )${
@@ -1915,7 +2036,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             input.tenantId,
             input.operationId,
             input.resourceUid,
-            timestamp,
             input.leaseToken,
             timestamp,
             ...(dependencies
@@ -1983,7 +2103,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const sagaStatementIndex = statements.length;
       statements.push({
-        sql: `UPDATE tf_provider_mutation_sagas
+        sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
               SET execution_started_at = COALESCE(execution_started_at, ?),
                   provider_outcome = CASE
                     WHEN execution_started_at IS NULL THEN 'running'
@@ -1991,7 +2111,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   END,
                   updated_at = ?, expires_at = 253402300799999
               WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                AND phase = 'planned' AND receipt_json IS NULL
                 AND execution_lease_token = ? AND execution_lease_until > ?
                 AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}`,
         params: [
@@ -2000,7 +2120,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.tenantId,
           input.operationId,
           input.resourceUid,
-          timestamp,
           input.leaseToken,
           timestamp,
         ],
@@ -2037,15 +2156,15 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         // A deferred Host command and its dispatched provider saga become one
         // non-expiring repair unit in this transactional batch. An immediate
         // mutation simply matches no Host row.
-        sql: `UPDATE tf_deferred_operations
+        sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
               SET expires_at = 253402300799999, updated_at = ?
               WHERE id = ? AND tenant_id = ? AND resource_uid = ?
                 AND phase = 'committing'
                 AND EXISTS (
-                  SELECT 1 FROM tf_provider_mutation_sagas AS saga
-                  WHERE saga.operation_id = tf_deferred_operations.id
-                    AND saga.tenant_id = tf_deferred_operations.tenant_id
-                    AND saga.resource_uid = tf_deferred_operations.resource_uid
+                  SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                  WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                    AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                    AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
                     AND saga.phase = 'planned' AND saga.receipt_json IS NULL
                     AND saga.execution_started_at IS NOT NULL
                     AND saga.execution_lease_token = ?
@@ -2095,7 +2214,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const timestamp = now();
       const recorded = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET provider_handle = ?, provider_outcome = ?, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
@@ -2120,7 +2239,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         throw new TypeError("invalid provider refusal recovery action");
       }
       const settled = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
            AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
@@ -2247,7 +2366,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...(hostOperation.kind === "deferred"
           ? [
               {
-                sql: `UPDATE tf_deferred_operations
+                sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                       SET phase = 'failed', terminal_json = ?, committed_uid = NULL,
                           lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
                       WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -2278,7 +2397,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ],
         },
         {
-          sql: `DELETE FROM tf_provider_mutation_sagas
+          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                 WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                   AND phase = 'planned' AND receipt_json IS NULL
                   AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
@@ -2314,7 +2433,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async releaseProviderMutationExecution(input) {
       const released = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = NULL, execution_lease_until = NULL, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
@@ -2326,7 +2445,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async readProviderMutationReceipt(tenantId, operationId, resourceUid) {
       const rows = await sql.query(
-        `SELECT receipt_json FROM tf_provider_mutation_sagas
+        `SELECT receipt_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'executed' LIMIT 2`,
         [tenantId, operationId, resourceUid],
@@ -2337,10 +2456,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async providerMutationPlanExists(tenantId, operationId, resourceUid) {
       const rows = await sql.query(
-        `SELECT 1 AS found FROM tf_provider_mutation_sagas
+        `SELECT 1 AS found FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ? LIMIT 2`,
-        [tenantId, operationId, resourceUid, now()],
+           AND phase = 'planned' AND receipt_json IS NULL LIMIT 2`,
+        [tenantId, operationId, resourceUid],
       );
       if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
       return rows.length === 1;
@@ -2348,8 +2467,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async abandonProviderMutationPlan(input) {
       const removed = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND protocol_generation = 1
            AND phase = 'planned' AND receipt_json IS NULL
            AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
@@ -2363,8 +2483,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const timestamp = now();
       const removed = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND protocol_generation = 1 AND operation_kind = 'import'
            AND phase = 'planned' AND receipt_json IS NULL
            AND execution_lease_token = ? AND execution_lease_until > ?
            AND execution_started_at IS NOT NULL`,
@@ -2390,10 +2511,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           {
             sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                   SELECT ?, CASE WHEN EXISTS (
-                    SELECT 1 FROM tf_provider_mutation_sagas
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                     WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                       AND authority_head_digest IS ?
-                      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                      AND phase = 'planned' AND receipt_json IS NULL
                       AND execution_lease_token = ? AND execution_lease_until > ?
                       AND execution_started_at IS NOT NULL
                   ) THEN 1 ELSE 0 END`,
@@ -2403,19 +2524,18 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               input.operationId,
               input.resourceUid,
               input.authorityHeadDigest ?? null,
-              timestamp,
               input.leaseToken,
               timestamp,
             ],
           },
           {
-            sql: `UPDATE tf_provider_mutation_sagas
+            sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
                   SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL,
                       execution_lease_token = NULL, execution_lease_until = NULL,
                       provider_handle = NULL, provider_outcome = 'planned'
                   WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                     AND authority_head_digest IS ?
-                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND phase = 'planned' AND receipt_json IS NULL
                     AND execution_lease_token = ? AND execution_lease_until > ?
                     AND execution_started_at IS NOT NULL`,
             params: [
@@ -2425,7 +2545,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               input.operationId,
               input.resourceUid,
               input.authorityHeadDigest ?? null,
-              timestamp,
               input.leaseToken,
               timestamp,
             ],
@@ -2448,7 +2567,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   ],
                 },
                 {
-                  sql: `UPDATE tf_deferred_operations
+                  sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                         SET expires_at = 253402300799999, updated_at = ?
                         WHERE id = ? AND tenant_id = ? AND resource_uid = ?
                           AND phase = 'committing' AND lease_token = ?`,
@@ -2514,7 +2633,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ? (Number.isFinite(accepted) ? accepted : now()) + PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS
           : 253_402_300_799_999;
       const held = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET lease_token = NULL, lease_until = NULL,
              expires_at = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -2584,26 +2703,37 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async acceptDeferredOperation(record): Promise<DeferredOperationRecord> {
       await sql.run(
-        `DELETE FROM tf_deferred_operations WHERE rowid IN (
-           SELECT rowid FROM tf_deferred_operations
-           WHERE expires_at <= ?
+        `DELETE FROM ${DEFERRED_OPERATION_TABLE} WHERE rowid IN (
+           SELECT rowid FROM ${DEFERRED_OPERATION_TABLE}
+           WHERE phase IN ('succeeded', 'failed', 'cancelled') AND expires_at <= ?
            ORDER BY expires_at LIMIT ?
          )`,
         [now(), SWEEP_ROW_LIMIT],
       );
+      const identity: OperationGenerationIdentity = {
+        operationId: record.id,
+        replayKey: record.replayKey,
+        tenantId: record.tenantId,
+        resourceUid: record.resourceUid,
+        target: { tenantId: record.tenantId, ...record.target },
+      };
+      const legacyFence = legacyOperationConflictFence(identity);
       await sql.run(
-        `INSERT OR IGNORE INTO tf_deferred_operations
-           (id, tenant_id, principal_id, operation, phase, request_path, request_query,
+        `INSERT OR IGNORE INTO ${DEFERRED_OPERATION_TABLE}
+           (id, protocol_generation, tenant_id, principal_id, operation, phase,
+            request_path, request_query,
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
             target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
             resource_uid, worker_endpoint_origin_reservation_id, polls_remaining,
             lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 NULL, NULL, NULL, NULL, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                NULL, NULL, NULL, NULL, ?, ?, ?
+         WHERE NOT ${legacyFence.sql}`,
         [
           record.id,
+          OPERATION_PROTOCOL_GENERATION,
           record.tenantId,
           record.principalId,
           record.operation,
@@ -2626,29 +2756,48 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.pollsRemaining,
           record.createdAt,
           now(),
-          now() + OPERATION_TTL_MILLISECONDS,
+          253_402_300_799_999,
+          ...legacyFence.params,
         ],
       );
-      const stored = await readDeferredBy("replay_key", record.replayKey);
-      if (!stored) throw new SqlError("constraint", "deferred operation identity collision");
-      return stored;
+      const rows = await sql.query(
+        `SELECT * FROM ${DEFERRED_OPERATION_TABLE} WHERE replay_key = ? LIMIT 2`,
+        [record.replayKey],
+      );
+      if (rows.length > 1) throw new Error("deferred_operation_ambiguous");
+      if (rows[0]) return deferredOperation(rows[0]);
+      if (await hasLegacyOperationConflict(identity)) throw legacyOperationConflictError();
+      throw new SqlError("constraint", "deferred operation identity collision");
     },
 
     async readDeferredOperation(tenantId, principalId, id) {
-      const rows = await sql.query(
-        `SELECT * FROM tf_deferred_operations
-         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?`,
+      const current = await sql.query(
+        `SELECT * FROM ${DEFERRED_OPERATION_TABLE}
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
+           AND (phase IN ('pending', 'committing') OR expires_at > ?) LIMIT 2`,
         [tenantId, principalId, id, now()],
       );
-      return rows[0] ? deferredOperation(rows[0]) : null;
+      if (current.length > 1) throw new Error("deferred_operation_ambiguous");
+      if (current[0]) return deferredOperation(current[0]);
+      const legacy = await sql.query(
+        `SELECT * FROM ${LEGACY_DEFERRED_OPERATION_TABLE}
+         WHERE tenant_id = ? AND principal_id = ? AND id = ? LIMIT 2`,
+        [tenantId, principalId, id],
+      );
+      if (legacy.length > 1) throw new Error("legacy_deferred_operation_ambiguous");
+      return legacy[0] ? deferredOperation(legacy[0]) : null;
     },
 
     async deferredOperationExists(id) {
       const rows = await sql.query(
-        "SELECT 1 AS found FROM tf_deferred_operations WHERE id = ? AND expires_at > ? LIMIT 1",
-        [id, now()],
+        `SELECT 1 AS found FROM ${DEFERRED_OPERATION_TABLE}
+         WHERE id = ? AND (phase IN ('pending', 'committing') OR expires_at > ?)
+         UNION ALL
+         SELECT 1 AS found FROM ${LEGACY_DEFERRED_OPERATION_TABLE} WHERE id = ?
+         LIMIT 2`,
+        [id, now(), id],
       );
-      return rows.length === 1;
+      return rows.length > 0;
     },
 
     async readDeferredOperationByReplay(replayKey) {
@@ -2657,7 +2806,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async retireDeferredOperation(id, replayKey) {
       const removed = await sql.run(
-        `DELETE FROM tf_deferred_operations
+        `DELETE FROM ${DEFERRED_OPERATION_TABLE}
          WHERE id = ? AND replay_key = ? AND phase IN ('succeeded', 'failed', 'cancelled')`,
         [id, replayKey],
       );
@@ -2666,11 +2815,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async advanceDeferredOperation(input) {
       const decremented = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET polls_remaining = polls_remaining - 1, updated_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND polls_remaining > 1 AND expires_at > ?`,
-        [now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending' AND polls_remaining > 1`,
+        [now(), input.tenantId, input.principalId, input.id],
       );
       if (decremented.changes === 1) {
         return {
@@ -2683,12 +2832,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       // the durable commit intent, and a restarted process can resume that
       // intent without guessing whether cancellation was still possible.
       const armed = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'committing', polls_remaining = 0,
              lease_token = NULL, lease_until = NULL, updated_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND polls_remaining <= 1 AND expires_at > ?`,
-        [now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending' AND polls_remaining <= 1`,
+        [now(), input.tenantId, input.principalId, input.id],
       );
       if (armed.changes === 1) {
         return {
@@ -2697,9 +2846,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         };
       }
       const acquired = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET lease_token = ?, lease_until = ?, updated_at = ?
-         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
            AND phase = 'committing' AND (lease_until IS NULL OR lease_until <= ?)`,
         [
           input.leaseToken,
@@ -2708,7 +2857,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.tenantId,
           input.principalId,
           input.id,
-          now(),
           now(),
         ],
       );
@@ -2725,14 +2873,24 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const timestamp = now();
       const rows = await sql.query(
         `SELECT operation.*
-         FROM tf_deferred_operations AS operation
-         INNER JOIN tf_provider_mutation_sagas AS saga
+         FROM ${DEFERRED_OPERATION_TABLE} AS operation
+         INNER JOIN ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
            ON saga.operation_id = operation.id
+          AND saga.protocol_generation = operation.protocol_generation
+          AND saga.operation_kind = operation.operation
           AND saga.tenant_id = operation.tenant_id
+          AND saga.fingerprint = operation.fingerprint
           AND saga.resource_uid = operation.resource_uid
+          AND saga.target_space = operation.target_space
+          AND saga.target_api_version = operation.target_api_version
+          AND saga.target_kind = operation.target_kind
+          AND saga.target_name = operation.target_name
+          AND saga.accepted_uid IS operation.accepted_uid
+          AND saga.accepted_generation IS operation.accepted_generation
+          AND saga.accepted_revision IS operation.accepted_revision
          WHERE operation.phase = 'committing'
+           AND operation.protocol_generation = 1
            AND operation.terminal_json IS NULL
-           AND operation.expires_at > ?
            AND (operation.lease_until IS NULL OR operation.lease_until <= ?)
            AND saga.phase = 'planned'
            AND saga.receipt_json IS NULL
@@ -2740,19 +2898,26 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            AND (saga.execution_lease_until IS NULL OR saga.execution_lease_until <= ?)
          ORDER BY operation.updated_at, operation.id
          LIMIT ?`,
-        [timestamp, timestamp, timestamp, limit],
+        [timestamp, timestamp, limit],
       );
       return rows.map(deferredOperation);
     },
 
     async cancelDeferredOperation(input) {
       const cancelled = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'cancelled', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-             updated_at = ?
+             updated_at = ?, expires_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND expires_at > ?`,
-        [input.terminalJson, now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending'`,
+        [
+          input.terminalJson,
+          now(),
+          now() + OPERATION_TTL_MILLISECONDS,
+          input.tenantId,
+          input.principalId,
+          input.id,
+        ],
       );
       if (cancelled.changes === 1) {
         await this.putOperation(input.tenantId, {
@@ -2772,11 +2937,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const timestamp = now();
       const [settled] = await sql.batch([
         {
-          sql: `UPDATE tf_deferred_operations
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                 SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
                     expires_at = ?, updated_at = ?
                 WHERE id = ? AND tenant_id = ? AND principal_id = ?
-                  AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
+                  AND phase = 'committing' AND lease_token = ?`,
           params: [
             input.terminalJson,
             timestamp + OPERATION_TTL_MILLISECONDS,
@@ -2785,15 +2950,14 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             input.operation.tenantId,
             input.operation.principalId,
             input.leaseToken,
-            timestamp,
           ],
         },
         {
-          sql: `DELETE FROM tf_provider_mutation_sagas
+          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                 WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
                   AND phase = 'executed'
                   AND EXISTS (
-                    SELECT 1 FROM tf_deferred_operations
+                    SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
                     WHERE id = ? AND tenant_id = ? AND phase = 'failed'
                   )`,
           params: [
@@ -2820,19 +2984,19 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async settleDeferredFailure(input) {
       const settled = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-             updated_at = ?
+             updated_at = ?, expires_at = ?
          WHERE id = ? AND tenant_id = ? AND principal_id = ?
-           AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
+           AND phase = 'committing' AND lease_token = ?`,
         [
           input.terminalJson,
           now(),
+          now() + OPERATION_TTL_MILLISECONDS,
           input.operation.id,
           input.operation.tenantId,
           input.operation.principalId,
           input.leaseToken,
-          now(),
         ],
       );
       if (settled.changes === 1) {
@@ -2867,9 +3031,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         target.name,
       ];
       const operationFence = `EXISTS (
-        SELECT 1 FROM tf_deferred_operations
+        SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
         WHERE id = ? AND tenant_id = ? AND principal_id = ?
-          AND phase = 'committing' AND lease_token = ? AND expires_at > ?
+          AND phase = 'committing' AND lease_token = ?
       )`;
       // A delete is fenced by incarnation and generation, never by revision.
       // See `deleteFencesRevision`.
@@ -2935,9 +3099,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
       const providerSagaFence = receiptJson
         ? `EXISTS (
-        SELECT 1 FROM tf_provider_mutation_sagas
+        SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
         WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
-          AND fingerprint = ? AND resource_uid = ? AND phase = 'executed'
+          AND fingerprint = ? AND resource_uid = ?
+          AND protocol_generation = 1 AND operation_kind = ? AND phase = 'executed'
           AND receipt_json = ?
       )`
         : "1 = 1";
@@ -2957,7 +3122,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             operation.tenantId,
             operation.principalId,
             leaseToken,
-            timestamp,
             ...resourceFenceParameters,
             ...(claimKeys.length === 0
               ? []
@@ -2975,6 +3139,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   operation.tenantId,
                   mutation.replay.fingerprint,
                   mutation.resourceUid,
+                  operation.operation,
                   receiptJson,
                 ]
               : []),
@@ -3078,7 +3243,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           timestamp,
         }),
         {
-          sql: `UPDATE tf_deferred_operations
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                 SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
                     lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
                 WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -3110,7 +3275,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...(receiptJson
           ? [
               {
-                sql: `DELETE FROM tf_provider_mutation_sagas
+                sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                       WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
                 params: [operation.id, operation.tenantId, receiptJson],
               },
@@ -3927,6 +4092,9 @@ function assertDefinitiveProviderMutationFailure(
   input: DefinitiveProviderMutationFailureCommit,
 ): void {
   const { saga } = input;
+  if (saga.operationKind !== "apply") {
+    throw new TypeError("provider failure has the wrong mutation kind");
+  }
   if (
     input.recoveryAction !== undefined &&
     (input.recoveryAction !== "convergeApply" ||
@@ -3982,12 +4150,13 @@ function definitiveProviderFailureInitialFence(
 ): StoreSqlFence {
   const { saga } = input;
   const sagaFence = `EXISTS (
-    SELECT 1 FROM tf_provider_mutation_sagas
+    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
     WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
       AND fingerprint = ? AND resource_uid = ? AND authority_head_digest IS ?
       AND target_space = ? AND target_api_version = ? AND target_kind = ? AND target_name = ?
       AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
-      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+      AND protocol_generation = 1 AND operation_kind = 'apply'
+      AND phase = 'planned' AND receipt_json IS NULL
       AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
       AND execution_started_at IS NOT NULL
       AND execution_lease_token = ? AND execution_lease_until > ?
@@ -4006,7 +4175,6 @@ function definitiveProviderFailureInitialFence(
     saga.acceptedUid ?? null,
     saga.acceptedGeneration ?? null,
     saga.acceptedRevision ?? null,
-    timestamp,
     input.providerLeaseToken,
     timestamp,
   ];
@@ -4014,18 +4182,18 @@ function definitiveProviderFailureInitialFence(
   const hostFence =
     hostOperation.kind === "deferred"
       ? `EXISTS (
-          SELECT 1 FROM tf_deferred_operations
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
           WHERE id = ? AND tenant_id = ? AND principal_id = ?
-            AND operation = 'apply' AND phase = 'committing'
+            AND protocol_generation = 1 AND operation = 'apply' AND phase = 'committing'
             AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
             AND target_space = ? AND target_api_version = ?
             AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
             AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
             AND terminal_json IS NULL AND committed_uid IS NULL
-            AND lease_token = ? AND lease_until > ? AND expires_at > ?
+            AND lease_token = ? AND lease_until > ?
         )`
       : `NOT EXISTS (
-          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE} WHERE id = ?
         )`;
   const hostParams: readonly SqlParam[] =
     hostOperation.kind === "deferred"
@@ -4045,7 +4213,6 @@ function definitiveProviderFailureInitialFence(
           hostOperation.operation.acceptedGeneration ?? null,
           hostOperation.operation.acceptedRevision ?? null,
           hostOperation.leaseToken,
-          timestamp,
           timestamp,
         ]
       : [saga.operationId];
@@ -4153,9 +4320,9 @@ function definitiveProviderFailureCommittedFence(
   const hostFence =
     input.hostOperation.kind === "deferred"
       ? `EXISTS (
-          SELECT 1 FROM tf_deferred_operations
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
           WHERE id = ? AND tenant_id = ? AND principal_id = ?
-            AND operation = 'apply' AND phase = 'failed'
+            AND protocol_generation = 1 AND operation = 'apply' AND phase = 'failed'
             AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
             AND target_space = ? AND target_api_version = ?
             AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
@@ -4164,7 +4331,7 @@ function definitiveProviderFailureCommittedFence(
             AND lease_token IS NULL AND lease_until IS NULL
         )`
       : `NOT EXISTS (
-          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE} WHERE id = ?
         )`;
   const hostParams: readonly SqlParam[] =
     input.hostOperation.kind === "deferred"
@@ -4313,7 +4480,7 @@ function definitiveProviderFailureCommittedFence(
           AND resource_json IS NULL AND created_at = ?
       )
       AND NOT EXISTS (
-        SELECT 1 FROM tf_provider_mutation_sagas WHERE operation_id = ?
+        SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} WHERE operation_id = ?
       )
       AND ${hostFence}
       AND ${claimFence}
@@ -4343,6 +4510,7 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
     typeof row.receipt_json === "string" ? providerReceipt(row.receipt_json) : undefined;
   return {
     operationId: text(row.operation_id),
+    operationKind: providerMutationOperationKind(row.operation_kind),
     replayKey: text(row.replay_key),
     tenantId: text(row.tenant_id),
     fingerprint: text(row.fingerprint),
@@ -4417,6 +4585,7 @@ function sameProviderMutationTarget(
   right: ProviderMutationSaga,
 ): boolean {
   return (
+    left.operationKind === right.operationKind &&
     left.tenantId === right.tenantId &&
     left.fingerprint === right.fingerprint &&
     left.authorityHeadDigest === right.authorityHeadDigest &&
@@ -4429,6 +4598,11 @@ function sameProviderMutationTarget(
     left.acceptedGeneration === right.acceptedGeneration &&
     left.acceptedRevision === right.acceptedRevision
   );
+}
+
+function providerMutationOperationKind(value: unknown): ProviderMutationSaga["operationKind"] {
+  if (value === "apply" || value === "import" || value === "delete") return value;
+  throw new TypeError("invalid provider mutation operation kind");
 }
 
 function providerReceipt(value: unknown): TakoformDriverReceipt {
@@ -4834,6 +5008,8 @@ function providerMutationCommitStatements(input: {
   const receiptJson = mutation.providerReceipt
     ? canonicalJson(mutation.providerReceipt)
     : undefined;
+  const sagaOperationKind =
+    input.operation === "import" || input.operation === "delete" ? input.operation : "apply";
   const claimKeys = mutation.claimKeys ?? [];
   const claimFence =
     claimKeys.length === 0
@@ -4861,9 +5037,10 @@ function providerMutationCommitStatements(input: {
   });
   const sagaFence = receiptJson
     ? `EXISTS (
-    SELECT 1 FROM tf_provider_mutation_sagas AS saga
+    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
     WHERE saga.operation_id = ? AND saga.replay_key = ? AND saga.tenant_id = ?
       AND saga.fingerprint = ? AND saga.resource_uid = ?
+      AND saga.protocol_generation = 1 AND saga.operation_kind = ?
       AND saga.target_space = ? AND saga.target_api_version = ?
       AND saga.target_kind = ? AND saga.target_name = ?
       AND saga.accepted_revision IS ?
@@ -4905,6 +5082,7 @@ function providerMutationCommitStatements(input: {
               input.tenantId,
               mutation.replay.fingerprint,
               mutation.resourceUid,
+              sagaOperationKind,
               address.space,
               address.apiVersion,
               address.kind,
@@ -5039,7 +5217,7 @@ function providerMutationCommitStatements(input: {
     ...(receiptJson
       ? [
           {
-            sql: `DELETE FROM tf_provider_mutation_sagas
+            sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                   WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
             params: [input.operationId, input.tenantId, receiptJson],
           },

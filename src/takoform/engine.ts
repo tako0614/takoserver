@@ -1212,6 +1212,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
       const proposedSaga = {
         operationId: proposedOperationId,
+        operationKind: "apply" as const,
         replayKey,
         tenantId: context.tenantId,
         fingerprint,
@@ -1959,6 +1960,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
       const saga = await store.acceptProviderMutationSaga({
         operationId: proposedImportId,
+        operationKind: "import",
         replayKey,
         tenantId: context.tenantId,
         fingerprint,
@@ -2341,6 +2343,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
       const saga = await store.acceptProviderMutationSaga({
         operationId: context.durableOperation?.id ?? operationId(),
+        operationKind: "delete",
         replayKey,
         tenantId: context.tenantId,
         fingerprint,

@@ -906,10 +906,17 @@ export function createWorkerEndpointOriginReservations(options: {
                        AND terminal_effect.phase IN ('succeeded', 'cancelled')
                    )
                    AND NOT EXISTS (
-                     SELECT 1 FROM tf_deferred_operations AS refused_command
+                     SELECT 1
+                     FROM tf_deferred_operations_selection_v1 AS refused_command
                      WHERE refused_command.id = open_effect.effect_id
                        AND refused_command.tenant_id = open_effect.tenant_id
                        AND refused_command.phase IN ('failed', 'cancelled')
+                     UNION ALL
+                     SELECT 1
+                     FROM tf_deferred_operations AS legacy_refused_command
+                     WHERE legacy_refused_command.id = open_effect.effect_id
+                       AND legacy_refused_command.tenant_id = open_effect.tenant_id
+                       AND legacy_refused_command.phase IN ('failed', 'cancelled')
                    )
                    AND NOT EXISTS (
                      SELECT 1 FROM tf_operations AS refused_operation

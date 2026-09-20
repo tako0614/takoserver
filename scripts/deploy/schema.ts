@@ -119,6 +119,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0057_cloudflare_managed_worker_version_execution_material.sql",
   "0058_cloudflare_managed_worker_domain_receipts.sql",
   "0059_takoform_apply_provider_selection.sql",
+  "0060_takoform_operation_generation.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -240,6 +241,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:11460e5d365ba0c5021b8432220e20acbbfe0104af3ca8fc921d3e8fc3824412",
   "0059_takoform_apply_provider_selection.sql":
     "sha256:c0af2dc82b77578496efe16e760d6a83727adf12385dda289637de142b3473eb",
+  "0060_takoform_operation_generation.sql":
+    "sha256:4d5c04322a3eee95669a8ad83186ad0bf4a69ca192110c6e05d07bebc5ca99c2",
 };
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
@@ -401,6 +404,7 @@ const RUNTIME_INPUT_PREPARATION_V2_MIGRATION = "0037_worker_runtime_input_prepar
 const LIVE_NATIVE_CLAIM_MIGRATION = "0039_takoform_live_native_claim_across_tenants.sql";
 const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
+const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -1475,7 +1479,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0059",
+      "selected D1 wave requires the exact audited source inventory 0001-0060",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1530,7 +1534,7 @@ function assertAuditedMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0059 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0060 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1541,7 +1545,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0059",
+      "audited migration lineage must contain exactly 0001-0060",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -1787,7 +1791,10 @@ interface ArtifactBlobIoFencePreflight {
 }
 
 interface ApplyProviderSelectionCutover {
-  readonly status: "not_pending" | "old_apply_writers_quiescence_unproven";
+  readonly status:
+    | "not_pending"
+    | "old_apply_writers_quiescence_unproven"
+    | "operation_generation_cutover_unqualified";
 }
 
 interface DataPreflights {
@@ -1874,15 +1881,18 @@ function assertArtifactBlobIoCompatibilityReady(
 function inspectApplyProviderSelectionCutover(
   pending: readonly string[],
 ): ApplyProviderSelectionCutover {
-  return pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)
-    ? { status: "old_apply_writers_quiescence_unproven" }
+  if (pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)) {
+    return { status: "old_apply_writers_quiescence_unproven" };
+  }
+  return pending.includes(OPERATION_GENERATION_MIGRATION)
+    ? { status: "operation_generation_cutover_unqualified" }
     : { status: "not_pending" };
 }
 
 function assertApplyProviderSelectionCutoverReady(cutover: ApplyProviderSelectionCutover): void {
   if (cutover.status !== "not_pending") {
     throw preflightError(
-      "0059 apply-provider-selection cutover is unavailable: old_apply_writers_quiescence_unproven",
+      `apply-provider-selection cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
     );
   }

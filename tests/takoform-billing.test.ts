@@ -618,7 +618,7 @@ describe("Takoform apply on a real backend", () => {
     expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'tick-repair'`,
         [organizationId],
       ),
@@ -761,14 +761,14 @@ describe("Takoform apply on a real backend", () => {
       });
       expect(
         await sql.query(
-          `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas
+          `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
            WHERE tenant_id = ? AND operation_id = ?`,
           [organizationId, operationId],
         ),
       ).toEqual([{ phase: "planned", provider_outcome: scenario.initialOutcome }]);
       expect(
         await sql.query(
-          `SELECT id, phase FROM tf_deferred_operations
+          `SELECT id, phase FROM tf_deferred_operations_selection_v1
            WHERE tenant_id = ? AND id = ?`,
           [organizationId, operationId],
         ),
@@ -783,7 +783,7 @@ describe("Takoform apply on a real backend", () => {
         expect(pollCalls).toBe(1);
         expect(
           await sql.query(
-            `SELECT phase, provider_handle, provider_outcome FROM tf_provider_mutation_sagas
+            `SELECT phase, provider_handle, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
              WHERE tenant_id = ? AND operation_id = ?`,
             [organizationId, operationId],
           ),
@@ -807,7 +807,7 @@ describe("Takoform apply on a real backend", () => {
         expect(pollCalls).toBe(2);
         expect(
           await sql.query(
-            `SELECT provider_handle, provider_outcome FROM tf_provider_mutation_sagas
+            `SELECT provider_handle, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
              WHERE tenant_id = ? AND operation_id = ?`,
             [organizationId, operationId],
           ),
@@ -933,7 +933,7 @@ describe("Takoform apply on a real backend", () => {
         ).toEqual([]);
         expect(
           await sql.query(
-            "SELECT provider_outcome FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+            "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
             [operationId],
           ),
         ).toEqual([{ provider_outcome: "indeterminate" }]);
@@ -947,7 +947,7 @@ describe("Takoform apply on a real backend", () => {
       });
       expect(
         await sql.query(
-          "SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
       ).toEqual([]);
@@ -955,7 +955,9 @@ describe("Takoform apply on a real backend", () => {
         await sql.query("SELECT uid FROM tf_resources WHERE tenant_id = ?", [organizationId]),
       ).toEqual([]);
       expect(
-        await sql.query("SELECT phase FROM tf_deferred_operations WHERE id = ?", [operationId]),
+        await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+          operationId,
+        ]),
       ).toEqual([{ phase: "failed" }]);
       expect(
         await sql.query(
@@ -979,7 +981,9 @@ describe("Takoform apply on a real backend", () => {
         }),
       ).rejects.toMatchObject({ code: "resource_busy" });
       expect(
-        await sql.query("SELECT phase FROM tf_deferred_operations WHERE id = ?", [operationId]),
+        await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+          operationId,
+        ]),
       ).toEqual([{ phase: "failed" }]);
     }
   });
@@ -1053,7 +1057,7 @@ describe("Takoform apply on a real backend", () => {
     expect(convergeCalls).toBe(1);
     expect(
       await sql.query(
-        `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas
+        `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
          WHERE tenant_id = ? AND operation_id = ?`,
         [organizationId, operationId],
       ),
@@ -1164,7 +1168,7 @@ describe("Takoform apply on a real backend", () => {
     expect(reroutedCalls).toBe(0);
     expect(
       await sql.query(
-        `SELECT phase, selection_json FROM tf_provider_mutation_sagas
+        `SELECT phase, selection_json FROM tf_provider_mutation_sagas_selection_v1
          WHERE tenant_id = ?`,
         [organizationId],
       ),
@@ -1704,9 +1708,10 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([]);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
   });
 
@@ -1720,7 +1725,7 @@ describe("Takoform apply on a real backend", () => {
         if (
           failFinalBatch &&
           statements.some((statement) =>
-            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1"),
           )
         ) {
           failFinalBatch = false;
@@ -1753,7 +1758,7 @@ describe("Takoform apply on a real backend", () => {
     expect(first.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'lost-ack'`,
         [organizationId],
       ),
@@ -1761,9 +1766,10 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
     expect(provider.sideEffectCount).toBe(1);
     expect(
-      await sql.query("SELECT phase FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT phase FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([{ phase: "executed" }]);
     expect(
       await sql.query("SELECT id FROM tf_resource_deployments WHERE tenant_id = ?", [
@@ -1776,9 +1782,10 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
     expect(provider.sideEffectCount).toBe(1);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query(
@@ -1798,7 +1805,7 @@ describe("Takoform apply on a real backend", () => {
         if (
           failFinalBatch &&
           statements.some((statement) =>
-            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1"),
           )
         ) {
           failFinalBatch = false;
@@ -1853,7 +1860,7 @@ describe("Takoform apply on a real backend", () => {
     expect(first.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE target_name = 'delete-lost' AND operation = 'delete'`,
       ),
     ).toEqual([{ id: operationId, phase: "committing" }]);
@@ -1868,7 +1875,9 @@ describe("Takoform apply on a real backend", () => {
     expect(await sql.query("SELECT state FROM tf_resource_deployments")).toEqual([
       { state: "deleted" },
     ]);
-    expect(await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas")).toEqual([]);
+    expect(
+      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1"),
+    ).toEqual([]);
   });
 
   test("proves native absence through a read-only scoped residual receipt", async () => {
@@ -3111,15 +3120,16 @@ describe("Takoform apply on a real backend", () => {
     expect(read.status).toBe(404);
     expect(
       await sql.query(
-        `SELECT phase FROM tf_deferred_operations
+        `SELECT phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'doomed'`,
         [organizationId],
       ),
     ).toEqual([{ phase: "failed" }]);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query("SELECT claim_key FROM tf_resource_claims WHERE tenant_id = ?", [
@@ -3150,7 +3160,7 @@ describe("Takoform apply on a real backend", () => {
         async batch(statements) {
           const retirement = statements.find(
             ({ sql: statement }) =>
-              statement.includes("DELETE FROM tf_provider_mutation_sagas") &&
+              statement.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1") &&
               statement.includes("provider_handle IS NULL AND provider_outcome = 'running'") &&
               statement.includes("execution_lease_token = ? AND execution_lease_until > ?"),
           );
@@ -3161,7 +3171,7 @@ describe("Takoform apply on a real backend", () => {
             // Lose the actual lease before the batch. The original saga and
             // wallet must survive the failed transaction's stale start fence.
             const stolen = await durable.run(
-              `UPDATE tf_provider_mutation_sagas SET execution_lease_token = 'stolen-lease'
+              `UPDATE tf_provider_mutation_sagas_selection_v1 SET execution_lease_token = 'stolen-lease'
                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?`,
               retirement.params?.slice(0, 3),
             );
@@ -3247,14 +3257,14 @@ describe("Takoform apply on a real backend", () => {
       expect(convergeCalls).toBe(0);
       expect(
         await sql.query(
-          `SELECT id, phase FROM tf_deferred_operations
+          `SELECT id, phase FROM tf_deferred_operations_selection_v1
            WHERE tenant_id = ? AND target_name = ?`,
           [organizationId, `retirement-${settlementFailure}`],
         ),
       ).toEqual([{ id: operationId, phase: "committing" }]);
       expect(
         await sql.query(
-          `SELECT operation_id, phase, provider_outcome FROM tf_provider_mutation_sagas
+          `SELECT operation_id, phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
            WHERE tenant_id = ? AND operation_id = ?`,
           [organizationId, operationId],
         ),
@@ -3303,7 +3313,7 @@ describe("Takoform apply on a real backend", () => {
       async batch(statements) {
         const refusal = statements.some(
           ({ sql: statement }) =>
-            statement.includes("DELETE FROM tf_provider_mutation_sagas") &&
+            statement.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1") &&
             statement.includes("provider_handle IS NULL AND provider_outcome = 'running'") &&
             statement.includes("execution_lease_token = ? AND execution_lease_until > ?"),
         );
@@ -3349,7 +3359,7 @@ describe("Takoform apply on a real backend", () => {
     expect(applyCalls).toBe(1);
     expect(provider.sideEffectCount).toBe(0);
     const [operation] = await sql.query(
-      `SELECT id, resource_uid, phase, terminal_json FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase, terminal_json FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'refusal-lost-ack'`,
       [organizationId],
     );
@@ -3385,7 +3395,7 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([{ ref: operationId, settled_delta: 0, held_delta: -500 }]);
     for (const [table, identityColumn] of [
-      ["tf_provider_mutation_sagas", "operation_id"],
+      ["tf_provider_mutation_sagas_selection_v1", "operation_id"],
       ["tf_resource_claims", "holder_uid"],
       ["tf_resource_provider_effects", "resource_uid"],
       ["tf_resource_deletion_attestations", "resource_uid"],
@@ -3393,7 +3403,9 @@ describe("Takoform apply on a real backend", () => {
       expect(
         await sql.query(`SELECT 1 FROM ${table} WHERE tenant_id = ? AND ${identityColumn} = ?`, [
           organizationId,
-          table === "tf_provider_mutation_sagas" ? operationId : String(operation.resource_uid),
+          table === "tf_provider_mutation_sagas_selection_v1"
+            ? operationId
+            : String(operation.resource_uid),
         ]),
       ).toEqual([]);
     }
@@ -3421,7 +3433,7 @@ describe("Takoform apply on a real backend", () => {
     expect(denied.body).toMatchObject({ error: { code: "insufficient_funds" } });
     expect(provider.listResources()).toHaveLength(4);
     const [failedOperation] = await sql.query(
-      `SELECT id, resource_uid, phase FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'five'`,
       [organizationId],
     );
@@ -3430,9 +3442,10 @@ describe("Takoform apply on a real backend", () => {
     const failedOperationId = String(failedOperation.id);
     const failedResourceUid = String(failedOperation.resource_uid);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query(
@@ -3465,7 +3478,7 @@ describe("Takoform apply on a real backend", () => {
     expect(fundedRetry.status).toBe(201);
     expect(provider.listResources()).toHaveLength(5);
     const [succeededOperation] = await sql.query(
-      `SELECT id, resource_uid, phase FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'five'`,
       [organizationId],
     );

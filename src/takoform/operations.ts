@@ -5,7 +5,12 @@ import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engi
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
 import { receiptProjectable } from "./receipt-projection.ts";
-import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
+import {
+  type DeferredOperationRecord,
+  LEGACY_OPERATION_GENERATION_CONFLICT,
+  type ResourceAddress,
+  type TakoformStore,
+} from "./store.ts";
 import {
   CROSS_RESOURCE_PRECONDITION,
   TakoformHostError,
@@ -147,10 +152,15 @@ export function createDeferredOperations(input: {
       if (replay) {
         if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
         if (await replayRetired(replay, input.store)) {
+          const retired = await input.store.retireDeferredOperation(replay.id, replay.replayKey);
+          if (!retired) {
+            return input.configuration.executeOnAccept
+              ? await executeAccepted(replay, accepted.lifecycleOperation)
+              : acceptedResponse(replay.id, retryAfterSeconds);
+          }
           if (replay.committedUid) {
             await input.store.releaseCommittedResourceClaims(replay.tenantId, replay.committedUid);
           }
-          await input.store.retireDeferredOperation(replay.id, replay.replayKey);
         } else {
           return input.configuration.executeOnAccept
             ? await executeAccepted(replay, accepted.lifecycleOperation)
@@ -501,6 +511,10 @@ export function createDeferredOperations(input: {
       }
       const hostError =
         error instanceof TakoformHostError ? error : new TakoformHostError("internal_error", 500);
+      if (hostError.hostCode === LEGACY_OPERATION_GENERATION_CONFLICT) {
+        await input.store.holdDeferredProviderRepair({ operation, leaseToken });
+        return { kind: "repair", error: hostError };
+      }
       if (!(error instanceof TakoformHostError)) {
         console.error(
           canonicalJson({

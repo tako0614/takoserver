@@ -279,6 +279,12 @@ effectful extension callbacks or native effects. A persistence
 error does not authorize continuing without confirmed durable acceptance.
 Uncertainty retains the selection alongside the existing operation, claims and
 any priced hold; recording a destination is not proof that its effect happened.
+Accepting the selection atomically gives the saga and its matching committing
+deferred apply the non-expiring repair horizon, before preparation callbacks.
+Ordinary plan expiry is not evidence that a callback never acted. This extends
+neither execution lease and does not authorize a stale executor or a different
+selection. A database failure rolls back both updates; a lost response requires
+durable readback and never authorizes assuming that acceptance failed.
 
 The internal schema addition does not backfill older attempts. Planned and
 dispatched effect records from those builds omit the destination, while a
@@ -290,13 +296,34 @@ settle it using a newly selected provider's absence proof.
 
 This placement fence prevents new ambiguity; it does not implement continuation
 across semantic Host authority changes or repair historical unknown attempts.
-It changes no public API or Form. The database upgrade is forward-only. Quiesce
-older apply writers for the cutover and use a compatible Host build afterward;
-an older Worker version is not a supported schema rollback. The database's
-dispatch check protects a retained selection under its validated execution
-lease, but cannot fence arbitrary preparation callbacks in older binaries that
-run before dispatch. Previously accepted side effects remain subject to their
-existing recovery and whole-attempt-idle checks.
+It changes no public API or Form. The database upgrade is forward-only. The
+0059 dispatch check alone cannot fence preparation callbacks in older binaries
+that run before dispatch; an older Worker is not a supported serving rollback.
+Previously accepted side effects remain subject to their existing recovery and
+whole-attempt-idle checks.
+
+### Internal operation generations
+
+0060 separates current saga and deferred-operation storage from the physical
+tables older binaries use. Both halves belong to one internal generation;
+apply, import and delete are explicit operation kinds. Current apply dispatch
+requires its immutable selection to be verified by the active lease. Import
+and delete cannot carry an apply selection. These are private persistence
+identities, not a new Takoform API or Form version.
+
+Legacy rows are not copied, backfilled, or adopted by the current executor.
+Legacy insertion is frozen; an older invocation already associated with a
+retained row can finish, but its cleanup cannot delete an unresolved planned
+saga or nonterminal deferred request. Current acceptance must reject conflicting legacy operation, replay,
+Resource UID or target identities before reserving claims. Historical operation
+readback does not authorize execution or mutation of that legacy record.
+
+This quarantine preserves missing evidence rather than repairing it. Its
+removal requires a separate proven legacy retirement, not elapsed time or an
+empty current-generation table. The existing-data D1 cutover remains disabled
+pending qualification through the [owning schema surface](deploy.md#0059-provider-selection-schema-current-data-cutover-unavailable).
+Neither local compatibility tests nor a fresh database demonstrate recovery
+of historical unresolved operations.
 
 ### Runtime-specific support
 

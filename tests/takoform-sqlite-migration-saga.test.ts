@@ -101,7 +101,7 @@ describe("SQLiteMigrationApplication provider saga", () => {
     const review = await prepare(host, desired, "admin");
     database.exec(`
       CREATE TRIGGER test_reject_apply_selection
-      BEFORE UPDATE OF selection_json ON tf_provider_mutation_sagas
+      BEFORE UPDATE OF selection_json ON tf_provider_mutation_sagas_selection_v1
       WHEN NEW.selection_json IS NOT NULL
       BEGIN
         SELECT RAISE(ABORT, 'test_reject_apply_selection');
@@ -112,7 +112,9 @@ describe("SQLiteMigrationApplication provider saga", () => {
 
     expect(response?.status).toBeGreaterThanOrEqual(400);
     expect(events).toEqual(["selectApply"]);
-    expect(database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas").get()).toEqual({
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1").get(),
+    ).toEqual({
       n: 0,
     });
   });
@@ -235,7 +237,9 @@ describe("SQLiteMigrationApplication provider saga", () => {
     const lost = await apply(host, desired, review, "lost-ack-initial", "admin");
     expect(lost?.status).toBe(503);
     expect(suffixInputs).toHaveLength(1);
-    expect(database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas").get()).toEqual({
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1").get(),
+    ).toEqual({
       n: 1,
     });
     const sagaAfterLost = dispatchedSaga(database);
@@ -283,7 +287,9 @@ describe("SQLiteMigrationApplication provider saga", () => {
     expect(applicationCalls[0]?.executionAuthority.leaseToken).not.toBe(
       suffixInputs[0]?.executionAuthority.leaseToken,
     );
-    expect(database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas").get()).toEqual({
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1").get(),
+    ).toEqual({
       n: 0,
     });
   });
@@ -821,7 +827,7 @@ function dispatchedSaga(database: Database): Record<string, unknown> | null {
   return database
     .query(
       `SELECT operation_id, resource_uid, fingerprint, phase, provider_outcome, receipt_json
-       FROM tf_provider_mutation_sagas`,
+       FROM tf_provider_mutation_sagas_selection_v1`,
     )
     .get() as Record<string, unknown> | null;
 }

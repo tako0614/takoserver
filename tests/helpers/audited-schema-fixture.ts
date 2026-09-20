@@ -21,13 +21,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * 0052 termination intent, 0053 Queue custody state, its 0054 bounded
  * readiness index, its 0055 durable transfer notices, the 0056 bounded
  * VectorIndex SQL store, the 0057 execution-material tables, 0058 managed
- * Worker domain receipts, and 0059 apply provider selection. */
+ * Worker domain receipts, 0059 apply provider selection, and 0060 operation
+ * generation. */
 export function copyCurrentSchemaFixture(directory: string): string {
   if (
-    MIGRATIONS.length !== 59 ||
-    MIGRATIONS.at(-1)?.name !== "0059_takoform_apply_provider_selection.sql"
+    MIGRATIONS.length !== 60 ||
+    MIGRATIONS.at(-1)?.name !== "0060_takoform_operation_generation.sql"
   ) {
-    throw new Error("current schema fixture requires the audited 0001-0059 lineage");
+    throw new Error("current schema fixture requires the audited 0001-0060 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {

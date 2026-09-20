@@ -316,7 +316,7 @@ describe("provider adoption recovery settlement", () => {
     const lost = await requestImport();
     expect(lost?.status).toBe(503);
     const pending = await sql.query(
-      `SELECT operation_id, provider_outcome FROM tf_provider_mutation_sagas`,
+      `SELECT operation_id, provider_outcome FROM tf_provider_mutation_sagas_selection_v1`,
     );
     expect(pending).toEqual([
       { operation_id: expect.any(String), provider_outcome: "indeterminate" },
@@ -333,7 +333,9 @@ describe("provider adoption recovery settlement", () => {
       },
     });
     expect(recoveryOperationIds).toEqual([operationId]);
-    expect(await sql.query(`SELECT operation_id FROM tf_provider_mutation_sagas`)).toEqual([]);
+    expect(
+      await sql.query(`SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1`),
+    ).toEqual([]);
     expect(await sql.query(`SELECT uid FROM tf_resources`)).toEqual([]);
     expect(await sql.query(`SELECT resource_uid FROM tf_resource_deletion_attestations`)).toEqual(
       [],
