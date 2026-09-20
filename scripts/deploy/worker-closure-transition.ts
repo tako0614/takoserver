@@ -233,7 +233,13 @@ export async function runWorkerClosureTransition(
     });
     const migrations =
       options.migrations ??
-      remoteMigrationReader(inspectionConfig, environment, run, sourceRepositoryRoot);
+      remoteMigrationReader(
+        inspectionConfig,
+        environment,
+        run,
+        sourceRepositoryRoot,
+        options.wranglerPath,
+      );
     const history = await currentHistory("preflight", target, state);
     const selector = invocation.closurePredecessorVersionId;
 
@@ -886,11 +892,18 @@ function remoteMigrationReader(
   environment: Readonly<Record<string, string>>,
   run: ClosureTransitionProcess,
   sourceRepositoryRoot = REPOSITORY,
+  wranglerPath?: string,
 ): WorkerMigrationReader {
   return {
     async read() {
       const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
-      const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
+      const remote = await readD1SchemaState(
+        new RemoteD1(configPath, {
+          environment,
+          run,
+          wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
+        }),
+      );
       return { local: local.names, applied: remote.applied };
     },
   };

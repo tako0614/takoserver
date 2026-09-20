@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
@@ -427,6 +427,78 @@ function withRoot<T>(name: string, body: (root: string) => Promise<T>): Promise<
 }
 
 describe("reviewed Worker closure transition", () => {
+  test("uses the composed Wrangler for the default remote migration reader", async () => {
+    await withRoot("takoserver-closure-wrangler-path-", async (root) => {
+      const parts = fixture(root);
+      const packageRoot = resolve(import.meta.dir, "..");
+      const sourceRepositoryRoot = join(root, "selected-source-checkout");
+      const migrationDirectory = join(sourceRepositoryRoot, "migrations");
+      const wranglerPath = join(root, "private-runtime", "node_modules", ".bin", "wrangler");
+      mkdirSync(migrationDirectory, { recursive: true });
+      writeFileSync(
+        join(sourceRepositoryRoot, "wrangler.jsonc"),
+        readFileSync(join(packageRoot, "wrangler.jsonc")),
+      );
+      writeFileSync(
+        join(migrationDirectory, "0001_first.sql"),
+        "CREATE TABLE first_row (id TEXT);\n",
+      );
+      writeFileSync(
+        join(migrationDirectory, "0002_second.sql"),
+        "CREATE TABLE second_row (id TEXT);\n",
+      );
+
+      const d1Commands: string[][] = [];
+      const run: ClosureTransitionProcess = async (command) => {
+        d1Commands.push([...command]);
+        const queryIndex = command.indexOf("--command");
+        const query = queryIndex < 0 ? undefined : command[queryIndex + 1];
+        const results =
+          query?.includes("WHERE type = 'table'") === true
+            ? [{ name: "d1_migrations" }]
+            : query?.startsWith("SELECT name FROM d1_migrations") === true
+              ? [{ name: "0001_first.sql" }, { name: "0002_second.sql" }]
+              : query?.includes("WHERE name NOT LIKE 'sqlite_%'") === true
+                ? []
+                : undefined;
+        if (results === undefined) throw new Error(`unexpected remote D1 query: ${query}`);
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ success: true, results }]),
+          stderr: "",
+        };
+      };
+
+      expect(sourceRepositoryRoot).not.toBe(packageRoot);
+      const status = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: INTEGRATION_DELTA,
+        },
+        target,
+        {
+          run,
+          state: parts.state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          sourceRepositoryRoot,
+          wranglerPath,
+          outputDirectory: join(root, "work"),
+        },
+      );
+
+      expect(status).toMatchObject({
+        state: "closure-predecessor-current",
+        pendingMigrations: [],
+      });
+      expect(d1Commands).toHaveLength(3);
+      expect(d1Commands.map(([executable]) => executable)).toEqual(Array(3).fill(wranglerPath));
+    });
+  });
+
   test("stages the all-traffic compatibility Worker across only the exact pending 0043 suffix", async () => {
     await withRoot("takoserver-closure-artifact-quiescence-", async (root) => {
       const selected = {
