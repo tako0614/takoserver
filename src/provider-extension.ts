@@ -230,6 +230,7 @@ export {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export { isSpaceId } from "./takoform/space-id.ts";
 export {
   parseVectorIndexConfig,
   type VectorIndexConfig,
