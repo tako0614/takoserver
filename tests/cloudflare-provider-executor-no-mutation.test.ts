@@ -96,15 +96,17 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
   test("requires the snapshotted identity and initial execution authority", async () => {
     const original = makeInput("apply");
     const proof = proofFor("apply", original);
+    const { executionAuthority: _authority, ...withoutAuthority } = original;
+    const { operationMode: _mode, ...withoutMode } = original;
     const cases = [
       ["tenant mismatch", makeInput("apply", { identity: { ...identity, tenantRef: "tenant-2" } })],
       [
         "resource uid mismatch",
         makeInput("apply", { identity: { ...identity, uid: "resource-2" } }),
       ],
-      ["missing authority", makeInput("apply", { executionAuthority: undefined })],
+      ["missing authority", withoutAuthority],
       ["recovery mode", makeInput("apply", { operationMode: "recovery" })],
-      ["missing mode", makeInput("apply", { operationMode: undefined })],
+      ["missing mode", withoutMode],
     ] as const;
 
     for (const [name, input] of cases) {
@@ -194,6 +196,10 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
   });
 });
 
+function makeInput(action: "apply", overrides?: Partial<ApplyInput>): ApplyInput;
+function makeInput(action: "delete", overrides?: Partial<DeleteInput>): DeleteInput;
+function makeInput(action: "adopt", overrides?: Partial<AdoptInput>): AdoptInput;
+function makeInput(action: Action, overrides?: Partial<InitialInput>): InitialInput;
 function makeInput(action: Action, overrides: Partial<InitialInput> = {}): InitialInput {
   const common = {
     operationId: "operation-1",
