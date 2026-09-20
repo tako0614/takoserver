@@ -28,32 +28,6 @@ const currentFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-current-schema
 const currentMigrations = copyCurrentSchemaFixture(join(currentFixtureRoot, "migrations"));
 afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 
-// The integration lane intentionally accepts a current source tail. Keep the
-// unreviewed tail synthetic and isolated so this test does not depend on
-// ambient worktree migrations that are absent from a clean historical commit.
-const INVENTED_UNAUDITED_TAIL = [
-  [
-    "0060_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0060_container_runtime_input_custody (id TEXT);\n",
-  ],
-  [
-    "0061_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0061_container_runtime_input_rewrap (id TEXT);\n",
-  ],
-  [
-    "0062_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0062_container_runtime_input_acceptance (id TEXT);\n",
-  ],
-] as const;
-
-function currentIntegrationMigrations(directory: string): string {
-  const result = copyCurrentSchemaFixture(directory);
-  for (const [name, sql] of INVENTED_UNAUDITED_TAIL) {
-    writeFileSync(join(result, name), sql, { mode: 0o600 });
-  }
-  return result;
-}
-
 const COMMIT = "a".repeat(40);
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -74,6 +48,8 @@ const integration0043Target = {
   environment: "integration",
   artifactBlobIoMode: "pre-0043-quiesced",
 } satisfies DeployTarget;
+
+const integrationTarget = { ...target, environment: "integration" } satisfies DeployTarget;
 
 function migrations(root: string): string {
   const directory = join(root, "source-migrations");
@@ -137,17 +113,6 @@ function integration0043Reader(states: readonly D1SchemaState[]): SchemaReader {
 function migrationStateThrough(count: number, marker: string): D1SchemaState {
   return {
     applied: MIGRATIONS.slice(0, count).map(({ name }) => name),
-    shape: `${marker}\n`,
-    shapeDigest: `sha256:${marker.repeat(64).slice(0, 64)}`,
-  };
-}
-
-function migrationStateThroughCurrentTail(marker: string): D1SchemaState {
-  return {
-    applied: [
-      ...MIGRATIONS.slice(0, 59).map(({ name }) => name),
-      ...INVENTED_UNAUDITED_TAIL.map(([name]) => name),
-    ],
     shape: `${marker}\n`,
     shapeDigest: `sha256:${marker.repeat(64).slice(0, 64)}`,
   };
@@ -220,6 +185,138 @@ describe("forward-only D1 schema surface", () => {
         pendingMigrations: ["0002_second.sql"],
         schemaShapeDigest: PRE.shapeDigest,
       });
+      expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("status marks pending 0059 provider-selection cutover as unavailable", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-status-"));
+    try {
+      const result = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          reader: readerSequence([migrationStateThrough(58, "0058-pre")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(result).toMatchObject({
+        pendingMigrations: ["0059_takoform_apply_provider_selection.sql"],
+        applyProviderSelectionCutover: {
+          status: "old_apply_writers_quiescence_unproven",
+        },
+        readyForApply: false,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("apply refuses pending 0059 before qualification, gate, or provider mutation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-apply-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const failure = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          run: fixture.run,
+          reader: readerSequence([migrationStateThrough(58, "0058-pre")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "work"),
+          leaseRoot: join(root, "leases"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("old_apply_writers_quiescence_unproven");
+      expect(fixture.calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a no-selector suffix before 0059 is also refused, while an older selected wave is unchanged", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-tail-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const failure = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          run: fixture.run,
+          reader: readerSequence([migrationStateThrough(57, "0057-pre")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "pending-tail-work"),
+          leaseRoot: join(root, "pending-tail-leases"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("old_apply_writers_quiescence_unproven");
+      expect(fixture.calls).toHaveLength(0);
+
+      const olderWave = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT, throughMigration: "0057" },
+        integrationTarget,
+        {
+          reader: readerSequence([migrationStateThrough(56, "0056-pre")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "older-wave-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(olderWave).toMatchObject({
+        pendingMigrations: ["0057_cloudflare_managed_worker_version_execution_material.sql"],
+        applyProviderSelectionCutover: { status: "not_pending" },
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a completed 0059 lineage keeps the existing no-op apply refusal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-complete-"));
+    try {
+      const fixture = processFixture("rehearsal");
+      const state = migrationStateThrough(59, "0059-post");
+      const status = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          reader: readerSequence([state]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "status-work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(status).toMatchObject({
+        pendingMigrations: [],
+        applyProviderSelectionCutover: { status: "not_pending" },
+        readyForApply: false,
+      });
+
+      const failure = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        integrationTarget,
+        {
+          run: fixture.run,
+          reader: readerSequence([state]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "apply-work"),
+          leaseRoot: join(root, "leases"),
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(failure.message).toContain("selected D1 migration wave is already complete");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -440,7 +537,7 @@ describe("forward-only D1 schema surface", () => {
   test("integration pending-0043 dispatch passes the OAuth bearer to compatibility reads only", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-oauth-0043-"));
     try {
-      const migrationDirectory = currentIntegrationMigrations(join(root, "current-migrations"));
+      const migrationDirectory = currentMigrations;
       const oauthToken = "d1-0043-oauth-token-only-in-process";
       const calls: {
         readonly command: readonly string[];
@@ -459,9 +556,14 @@ describe("forward-only D1 schema surface", () => {
         return await fixture.run(command, options);
       };
       const pre = migrationStateThrough(36, "oauth-0043-pre");
-      const post = migrationStateThroughCurrentTail("oauth-current-post");
+      const post = migrationStateThrough(43, "oauth-current-post");
       const result = await runD1Schema(
-        { action: "apply", environment: "integration", commit: COMMIT },
+        {
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0043",
+        },
         integration0043Target,
         {
           run,
@@ -495,25 +597,6 @@ describe("forward-only D1 schema surface", () => {
           "0041_selfhost_object_buckets.sql",
           "0042_worker_endpoint_origin_reservation_space_id.sql",
           "0043_artifact_blob_io_fences.sql",
-          "0044_artifact_consumer_resolution_receipts.sql",
-          "0045_cloudflare_provider_executor_operations.sql",
-          "0046_exact_artifact_recovery_receipts.sql",
-          "0047_sponsorship_cutover_consumption.sql",
-          "0048_resource_execution_evidence.sql",
-          "0049_artifact_consumer_active_resolution.sql",
-          "0050_workflow_instances.sql",
-          "0051_workflow_execution.sql",
-          "0052_workflow_termination_intent.sql",
-          "0053_queue_custody.sql",
-          "0054_queue_custody_readiness.sql",
-          "0055_queue_custody_transfer_notices.sql",
-          "0056_vector_index_storage.sql",
-          "0057_cloudflare_managed_worker_version_execution_material.sql",
-          "0058_cloudflare_managed_worker_domain_receipts.sql",
-          "0059_takoform_apply_provider_selection.sql",
-          "0060_container_runtime_input_custody.sql",
-          "0061_container_runtime_input_rewrap.sql",
-          "0062_container_runtime_input_acceptance.sql",
         ],
       });
       expect(compatibilityReads).toHaveLength(4);

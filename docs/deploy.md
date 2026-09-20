@@ -104,7 +104,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0058 lineage and verifies its canonical schema, then creates the
+audited 0001–0059 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
@@ -396,7 +396,7 @@ bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
 `takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0058 migration lineage,
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0059 migration lineage,
 and canonical migrated schema before preparation and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
@@ -1153,14 +1153,15 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0058 names and SHA-256 inventory, so a checkout with unreviewed 0059+
+  0001–0059 names and SHA-256 inventory, so a checkout with unreviewed 0060+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
   `integration-protected-wave` result is never accepted by rehearsal or
-  production; the no-selector integration lane remains the disposable suffix
-  path described above.
+  production. The no-selector integration lane remains the disposable suffix
+  path only while its pending suffix does not include 0059; a pending 0059 is
+  reported as unavailable and refuses apply before qualification or mutation.
   If the selected wave includes 0043, integration uses the staged compatibility
   protocol below. Keep its maintenance projection while the selected 0044–0057
   trail is pending; a Cloudflare provider executor (CPE) service is optional
@@ -1170,9 +1171,10 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes 0058 for fresh, explicitly disposable integration
-storage. Protected wave selectors still stop at 0057: neither rehearsal nor
-production accepts `--through-migration=0058`.
+The current source includes audited 0058 and 0059 for fresh, explicitly
+disposable integration storage. Protected wave selectors still stop at 0057:
+neither rehearsal nor production accepts `--through-migration=0058` or
+`--through-migration=0059`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1185,6 +1187,24 @@ copy size/runtime against platform limits, and compare rows, BLOBs, triggers and
 foreign keys after migration. Large targets require a separate bounded
 maintenance/shadow transition. Do not use an integration reset as production
 recovery or bypass the protected selector.
+
+### 0059 provider-selection schema: current-data cutover unavailable
+
+0059 retains the provider selection accepted before a provider-visible apply
+callback. For an existing database with 0059 pending, old apply writers may
+still reach that callback, and this surface has no supported proof that they
+are quiesced or that the old writer was never served. Status therefore returns
+`applyProviderSelectionCutover.status=old_apply_writers_quiescence_unproven`
+and `readyForApply=false`; apply refuses before source qualification, the
+migration gate, or provider mutation. Empty counts or shape, lease expiry,
+503/time waits, and a reviewer string are not a never-served proof and cannot
+bypass this refusal.
+
+Historical `NULL` selection rows are not backfilled or reinterpreted. Only the
+separate `takoserver-integration-storage-generation` surface may create an
+absent D1/R2 pair and apply the sealed 0001–0059 lineage before adoption. That
+fresh-generation initialization is not a recovery alternative for current
+protected data.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

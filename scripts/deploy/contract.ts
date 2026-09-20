@@ -1180,7 +1180,14 @@ export const DEPLOY_CONTRACT = {
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
           "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
           "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
-          "repository never manufactures the external drained-or-cancelled assertion.",
+          "repository never manufactures the external drained-or-cancelled assertion. Pending 0059 " +
+          "returns applyProviderSelectionCutover.status=old_apply_writers_quiescence_unproven and " +
+          "refuses apply before source qualification, the migration gate, or provider mutation: this " +
+          "surface has no supported quiescence or never-served proof for current existing data. Counts, " +
+          "lease expiry, 503/time waits, and reviewer strings do not substitute, and historical NULL " +
+          "selection rows are not backfilled. Only the separate fresh integration-storage-generation " +
+          "surface may initialize an absent 0001-0059 generation; it is not a recovery alternative " +
+          "for protected data.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +

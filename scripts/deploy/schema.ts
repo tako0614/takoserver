@@ -400,6 +400,7 @@ const RUNTIME_INPUT_PREPARATION_MIGRATION = "0032_worker_runtime_input_preparati
 const RUNTIME_INPUT_PREPARATION_V2_MIGRATION = "0037_worker_runtime_input_preparation_v2.sql";
 const LIVE_NATIVE_CLAIM_MIGRATION = "0039_takoform_live_native_claim_across_tenants.sql";
 const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
+const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -770,6 +771,10 @@ export async function runD1Schema(
       options.reader,
     );
     const wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
+    const applyProviderSelectionCutover = inspectApplyProviderSelectionCutover(wave.pending);
+    if (invocation.action === "apply") {
+      assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
+    }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: wave.pending,
@@ -833,6 +838,7 @@ export async function runD1Schema(
               : null,
         },
         artifactBlobIoCompatibility,
+        applyProviderSelectionCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -842,7 +848,8 @@ export async function runD1Schema(
                 legacyCatchupApplicationShapeDigest ===
                   CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST))) &&
           (artifactBlobIoCompatibility.status === "ready" ||
-            artifactBlobIoCompatibility.status === "not_pending"),
+            artifactBlobIoCompatibility.status === "not_pending") &&
+          applyProviderSelectionCutover.status === "not_pending",
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -1390,6 +1397,7 @@ export async function runD1Schema(
             : null,
       },
       artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
+      applyProviderSelectionCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1778,6 +1786,10 @@ interface ArtifactBlobIoFencePreflight {
   readonly activeRootDeletingCandidateConflictCount: number;
 }
 
+interface ApplyProviderSelectionCutover {
+  readonly status: "not_pending" | "old_apply_writers_quiescence_unproven";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -1855,6 +1867,23 @@ function assertArtifactBlobIoCompatibilityReady(
     throw preflightError(
       `0043 artifact blob I/O deployment compatibility requires operator action ${when}`,
       JSON.stringify(preflight),
+    );
+  }
+}
+
+function inspectApplyProviderSelectionCutover(
+  pending: readonly string[],
+): ApplyProviderSelectionCutover {
+  return pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)
+    ? { status: "old_apply_writers_quiescence_unproven" }
+    : { status: "not_pending" };
+}
+
+function assertApplyProviderSelectionCutoverReady(cutover: ApplyProviderSelectionCutover): void {
+  if (cutover.status !== "not_pending") {
+    throw preflightError(
+      "0059 apply-provider-selection cutover is unavailable: old_apply_writers_quiescence_unproven",
+      JSON.stringify(cutover),
     );
   }
 }
