@@ -69,13 +69,21 @@ function unseeded() {
   };
 }
 
-async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "ModuleWorker") {
-  const fixture = unseeded();
+async function committedAuthority(
+  kind: "ModuleWorker" | "ActorNamespace" | "SQLiteDatabase" = "ModuleWorker",
+  options: { fixture?: ReturnType<typeof unseeded>; publisherKey?: string } = {},
+) {
+  const fixture = options.fixture ?? unseeded();
+  const publisherKey = options.publisherKey ?? "publisher-a";
   const form = fixture.catalog.forms.find((candidate) => candidate.identity.formRef.kind === kind);
   if (!form) throw new Error(`${kind} candidate form missing`);
   const packageDigest = form.identity.packageDigest;
   if (packageDigest === undefined) throw new Error("candidate package digest missing");
-  const packageDirectory = kind === "ActorNamespace" ? "actor-namespace" : "module-worker";
+  const packageDirectory = {
+    ActorNamespace: "actor-namespace",
+    ModuleWorker: "module-worker",
+    SQLiteDatabase: "sqlite-database",
+  }[kind];
   const directory = new URL(
     `./fixtures/takoform-v1/forms/candidates/edge.forms.takoform.com/${packageDirectory}/`,
     import.meta.url,
@@ -101,14 +109,14 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     files,
   };
   const publisher: AdmissionPublisherPin = {
-    publisherKey: "publisher-a",
+    publisherKey,
     policyDigest: digest("1"),
     policy: { apiVersion: "policy.forms.takoform.com/v1alpha1", mode: "reviewed" },
     oidcIssuer: "https://issuer.example.test",
     sourceRepository: "https://github.com/example/forms",
     workflow: ".github/workflows/release.yml",
     ref: "refs/tags/v1.0.0",
-    identity: "publisher-a",
+    identity: publisherKey,
     trustedRootDigest: digest("2"),
     sourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     workflowCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -135,7 +143,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
   const entriesDigest = TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST;
   const checkpoint = await writer.execute({
     kind: "AppendCheckpoint",
-    publisherKey: "publisher-a",
+    publisherKey,
     checkpointApiVersion: TAKOFORM_REVOCATION_V1,
     policyDigest: publisher.policyDigest,
     policyEventDigest: allow.eventDigest,
@@ -192,7 +200,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     operation: "install",
     packageDigest: pkg.packageDigest,
     formRef: pkg.formRef,
-    publisherKey: "publisher-a",
+    publisherKey,
     publisher,
     policyEventDigest: allow.eventDigest,
     checkpointApiVersion: TAKOFORM_REVOCATION_V1,
@@ -202,7 +210,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     report,
   };
   const implementationDigest = digest("6");
-  await writer.execute({
+  const install = await writer.execute({
     kind: "InstallPackage",
     package: pkg,
     handle: handles.issue(claims),
@@ -247,6 +255,10 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     audience,
     activation,
     checkpoint,
+    install,
+    handles,
+    claims,
+    pkg,
   };
 }
 
@@ -748,6 +760,107 @@ describe("durable read-only Takoform Host authority", () => {
         formRef: fixture.form.identity.formRef,
       }),
     ).resolves.toMatchObject({ implementationDigest: fixture.implementationDigest });
+  });
+
+  test("a valid stale install/support generation does not poison unrelated Form creation", async () => {
+    const stale = await committedAuthority();
+    const healthy = await committedAuthority("SQLiteDatabase", {
+      fixture: stale,
+      publisherKey: "publisher-b",
+    });
+    const counted = countingDriver();
+    const host = createTakoformHost({
+      sql: stale.sql,
+      objects: stale.objects,
+      forms: stale.catalog.forms,
+      bindings: stale.catalog.bindings,
+      authority: stale.authority,
+      driver: counted.driver,
+      authenticate: async () => ({ tenantId: CONTEXT.tenantId, principalId: CONTEXT.principalId }),
+    });
+    const staleReview = await prepareResource(host, stale.form.identity.formRef);
+
+    await stale.writer.execute({
+      kind: "SetActivation",
+      formRef: stale.form.identity.formRef,
+      packageDigest: stale.packageDigest,
+      implementationDigest: stale.implementationDigest,
+      active: false,
+      audience: stale.audience,
+      predecessorDigest: stale.activation.eventDigest,
+      actor: "test-operator",
+      reason: "retire old implementation before replacement",
+    });
+    const before = await stale.authority.catalog(CONTEXT);
+    await stale.writer.execute({
+      kind: "ReplacePackage",
+      package: stale.pkg,
+      handle: stale.handles.issue({
+        ...stale.claims,
+        operation: "replace",
+        report: { ...stale.claims.report, operation: "replace" },
+      }),
+      implementationDigest: digest("a"),
+      predecessorDigest: stale.install.eventDigest,
+      actor: "test-operator",
+      reason: "replace package without granting new implementation support",
+    });
+
+    const after = await stale.authority.catalog(CONTEXT);
+    expect(after.forms).toHaveLength(2);
+    const staleEntry = after.forms.find(
+      (entry) => entry.form.identity.formRef.kind === "ModuleWorker",
+    );
+    expect(staleEntry).toMatchObject({
+      supported: false,
+      availability: { executable: false, activated: false, availableToPrincipal: false },
+    });
+    expect(staleEntry?.headDigest).not.toBe(
+      before.forms.find((entry) => entry.form.identity.formRef.kind === "ModuleWorker")?.headDigest,
+    );
+    expect(
+      after.forms.find((entry) => entry.form.identity.formRef.kind === "SQLiteDatabase"),
+    ).toMatchObject({ supported: true, availability: { executable: true, activated: true } });
+
+    const stalePrepare = await host.handle(
+      new Request("https://host.invalid/apis/forms.takoform.com/v1/resources/prepare", {
+        method: "POST",
+        headers: { authorization: "Bearer test", "content-type": "application/json" },
+        body: JSON.stringify(resourceBody(stale.form.identity.formRef)),
+      }),
+    );
+    expect(stalePrepare?.status).toBe(503);
+
+    const staleCreate = await host.handle(
+      new Request(`https://host.invalid${resourcePath(stale.form.identity.formRef)}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer test",
+          "content-type": "application/json",
+          "idempotency-key": "stale-module-worker-after-replace",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify(resourceBody(stale.form.identity.formRef, staleReview)),
+      }),
+    );
+    expect(staleCreate?.status).toBe(503);
+    expect(counted.calls.apply).toBe(0);
+
+    const review = await prepareResource(host, healthy.form.identity.formRef);
+    const created = await host.handle(
+      new Request(`https://host.invalid${resourcePath(healthy.form.identity.formRef)}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer test",
+          "content-type": "application/json",
+          "idempotency-key": "healthy-form-beside-stale",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify(resourceBody(healthy.form.identity.formRef, review)),
+      }),
+    );
+    expect(created?.status).toBe(201);
+    expect(counted.calls.apply).toBe(1);
   });
 
   test("refuses support when the semantic implementation changes", async () => {
