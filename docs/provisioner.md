@@ -254,6 +254,23 @@ through this explicit proof path; any priced hold stays reserved until the
 Host's existing atomic failure settlement releases it with the lifecycle.
 This internal recovery contract changes no Form, public API, or database schema.
 
+Known recovery limitation: an accepted, unresolved apply is not yet portable
+across semantic Host implementation changes. Explicitly reconciling admission
+to the new implementation restores fresh operations, but does not replace the
+accepted saga's authority head. A different head still refuses continuation and
+retains the uncertain attempt. The whole-operation proof above does not bypass
+that authority check.
+
+There is also no generic persisted initial provider selection for such an
+attempt: planned/dispatched effect records omit the selected pack, installation
+and Offering, while successful receipts retain provider identity. Today's
+catalog cannot prove yesterday's dispatch destination. A provider-specific
+intent record is not a substitute for that missing Host-wide evidence. Until
+the initial selection is durably recorded before effects, do not relax the
+head comparison, rewrite historical saga evidence, or settle an old attempt
+using a newly selected provider's absence proof. This is an implementation gap,
+not a new public API/Form contract or a supported recovery procedure.
+
 Vector has an explicit development-only self-host integration. It requires a
 matching VectorIndex Offering, the exact candidate Interface and Binding, and
 an injected `vectorIndexStore` for both provisioning and the data plane. The

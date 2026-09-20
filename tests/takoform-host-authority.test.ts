@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject, Row, Sql } from "../src/ports.ts";
+import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import {
   type AdmissionDigest,
   type AdmissionHandleClaims,
@@ -1060,6 +1061,190 @@ describe("durable read-only Takoform Host authority", () => {
         (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
       ),
     ).toBe(0);
+  });
+
+  test("retains an accepted apply when explicit implementation reconvergence changes its authority", async () => {
+    const fixture = await committedAuthority();
+    const memory = new InMemoryTakoformResourceDriver();
+    let applyCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      apply: async (input) => {
+        applyCalls += 1;
+        if (applyCalls === 1) throw new ProviderMutationRecoveryError("indeterminate");
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+      import: (input) => memory.import(input),
+    };
+    const hostOptions = {
+      sql: fixture.sql,
+      objects: fixture.objects,
+      forms: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      driver,
+      deferredOperations: {
+        shouldDefer: () => true,
+        pollsBeforeCommit: 1,
+        retryAfterSeconds: 0,
+        executeOnAccept: true,
+      },
+      authenticate: async () => ({
+        tenantId: CONTEXT.tenantId,
+        principalId: CONTEXT.principalId,
+      }),
+    } as const;
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const initialHost = createTakoformHost({ ...hostOptions, authority: fixture.authority });
+      const review = await prepareResource(initialHost, fixture.form.identity.formRef);
+      const accepted = await initialHost.handle(
+        new Request(`https://host.invalid${resourcePath(fixture.form.identity.formRef)}`, {
+          method: "PUT",
+          headers: {
+            authorization: "Bearer test",
+            "content-type": "application/json",
+            "idempotency-key": "authority-implementation-reconvergence-1",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify(resourceBody(fixture.form.identity.formRef, review)),
+        }),
+      );
+      expect(accepted?.status).toBe(202);
+      if (!accepted) throw new Error("deferred create response missing");
+      const operationId = String(
+        ((await accepted.json()) as { readonly operation: { readonly id: string } }).operation.id,
+      );
+      expect(applyCalls).toBe(1);
+
+      const sagaBefore = await fixture.sql.query(
+        "SELECT * FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+        [operationId],
+      );
+      const saga = first(sagaBefore, "accepted provider mutation saga");
+      const resourceUid = String(saga.resource_uid);
+      const effectsBefore = await fixture.sql.query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      const incarnationBefore = await fixture.sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ?`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(effectsBefore).toHaveLength(2);
+      expect(incarnationBefore).toHaveLength(1);
+
+      const newImplementationDigest = digest("a");
+      const deactivation = await fixture.writer.execute({
+        kind: "SetActivation",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: fixture.implementationDigest,
+        active: false,
+        audience: fixture.audience,
+        predecessorDigest: fixture.activation.eventDigest,
+        actor: "test-operator",
+        reason: "retire the old implementation before explicit reconvergence",
+      });
+      await fixture.writer.execute({
+        kind: "ReplacePackage",
+        package: fixture.pkg,
+        handle: fixture.handles.issue({
+          ...fixture.claims,
+          operation: "replace",
+          report: { ...fixture.claims.report, operation: "replace" },
+        }),
+        implementationDigest: newImplementationDigest,
+        predecessorDigest: fixture.install.eventDigest,
+        actor: "test-operator",
+        reason: "admit the replacement implementation",
+      });
+      await fixture.writer.execute({
+        kind: "SetSupport",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: newImplementationDigest,
+        supported: true,
+        profile: {
+          kind: "takoserver.form-support@v1",
+          workerArtifactDigest: PUBLIC_WORKER_ARTIFACT_DIGEST,
+          publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+          capabilityDigest: digest("8"),
+          implementationDigest: newImplementationDigest,
+        },
+        operations: ["create", "read", "delete", "observe"],
+        actor: "test-operator",
+        reason: "support the replacement implementation",
+      });
+      await fixture.writer.execute({
+        kind: "SetActivation",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: newImplementationDigest,
+        active: true,
+        audience: fixture.audience,
+        predecessorDigest: deactivation.eventDigest,
+        actor: "test-operator",
+        reason: "activate the replacement implementation",
+      });
+      const currentAuthority = createTakoformHostAuthority({
+        sql: fixture.sql,
+        objects: fixture.objects,
+        hostId: "host-a",
+        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+        implementationDigest: newImplementationDigest,
+        candidates: fixture.catalog.forms,
+        bindings: fixture.catalog.bindings,
+        technicalAvailability: technicallyAvailable,
+      });
+      const currentGrant = await currentAuthority.authorizeMutation({
+        operation: "create",
+        context: CONTEXT,
+        formRef: fixture.form.identity.formRef,
+      });
+      expect(currentGrant.fence.headDigest).not.toBe(saga.authority_head_digest);
+
+      const recoveredHost = createTakoformHost({ ...hostOptions, authority: currentAuthority });
+      const held = await recoveredHost.handle(
+        new Request(`https://host.invalid/apis/forms.takoform.com/v1/operations/${operationId}`, {
+          headers: { authorization: "Bearer test" },
+        }),
+      );
+      expect(await held?.json()).toMatchObject({ id: operationId, done: false });
+      expect(applyCalls).toBe(1);
+      expect(
+        log.mock.calls.some(
+          ([entry]) =>
+            typeof entry === "string" &&
+            entry.includes('"event":"takoform.deferred_operation.repair_required"') &&
+            entry.includes('"errorCode":"resource_busy"'),
+        ),
+      ).toBe(true);
+      expect(
+        await fixture.sql.query("SELECT * FROM tf_provider_mutation_sagas WHERE operation_id = ?", [
+          operationId,
+        ]),
+      ).toEqual(sagaBefore);
+      expect(
+        await fixture.sql.query(
+          `SELECT * FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
+          [CONTEXT.tenantId, resourceUid],
+        ),
+      ).toEqual(effectsBefore);
+      expect(
+        await fixture.sql.query(
+          `SELECT * FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ?`,
+          [CONTEXT.tenantId, resourceUid],
+        ),
+      ).toEqual(incarnationBefore);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test("the final D1 fence rejects a head change that races the provider side effect", async () => {
