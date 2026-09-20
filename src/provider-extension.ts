@@ -117,8 +117,10 @@ export {
 export type {
   CloudflareProviderAdoptInput,
   CloudflareProviderAdoptionRecoveryResult,
+  CloudflareProviderApplyConvergenceResult,
   CloudflareProviderDeleteInput,
   CloudflareProviderExecutorAdoptionAbortEvidence,
+  CloudflareProviderExecutorApplyAbortEvidence,
   CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
   CloudflareProviderInitialMutationResult,
@@ -132,6 +134,7 @@ export type {
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {

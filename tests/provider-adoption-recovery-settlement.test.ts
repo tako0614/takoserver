@@ -111,7 +111,7 @@ describe("provider adoption recovery settlement", () => {
     ).toBe(false);
   });
 
-  test("the real driver recognizes whole-operation proof only from direct adoption recovery", async () => {
+  test("the real driver distinguishes direct adoption and apply whole-operation recovery", async () => {
     const direct = await rejectedImport(
       providerWith({
         recoverAdopt: async (input) =>
@@ -197,11 +197,12 @@ describe("provider adoption recovery settlement", () => {
           failedWithoutProviderOperationMutation(
             input.operationId,
             "not_found",
-            "apply cannot use adoption proof",
+            "the exact apply was durably fenced",
           ),
       }),
     );
-    expect(genericApply).toBeInstanceOf(ProviderMutationRecoveryError);
+    expect(genericApply).toBeInstanceOf(ProviderMutationWholeOperationRefusalError);
+    expect(genericApply).toMatchObject({ action: "convergeApply" });
 
     const genericDelete = await rejectedDelete(
       providerWith({
@@ -214,6 +215,33 @@ describe("provider adoption recovery settlement", () => {
       }),
     );
     expect(genericDelete).toBeInstanceOf(ProviderMutationRecoveryError);
+  });
+
+  test("apply convergence never upgrades initial, cloned, wrong-operation, ordinary or polled refusals", async () => {
+    for (const ticket of [
+      failed("conflict", "ordinary refusal"),
+      failedWithoutProviderMutation("operation-1", "conflict", "invocation only"),
+      failedWithoutProviderOperationMutation("other-operation", "conflict", "wrong operation"),
+      structuredClone(
+        failedWithoutProviderOperationMutation("operation-1", "conflict", "cloned proof"),
+      ),
+    ]) {
+      expect(
+        await rejectedApply(providerWith({ convergeApply: async () => ticket })),
+      ).toBeInstanceOf(ProviderMutationRecoveryError);
+    }
+    const proof = () =>
+      failedWithoutProviderOperationMutation("operation-1", "conflict", "whole operation");
+    expect(
+      await rejectedApply(providerWith({ apply: async () => proof() }), {
+        operationMode: "initial",
+      }),
+    ).toBeInstanceOf(ProviderMutationRecoveryError);
+    expect(
+      await rejectedApply(providerWith({ poll: async () => proof() }), {
+        providerHandle: "durable-handle",
+      }),
+    ).toBeInstanceOf(ProviderMutationRecoveryError);
   });
 
   test("a lost initial response followed by a definitive recovery abort retires the import plan", async () => {
@@ -320,6 +348,7 @@ describe("provider adoption recovery settlement", () => {
 });
 
 function providerWith(options: {
+  readonly apply?: Provider["apply"];
   readonly adopt?: NonNullable<Provider["adopt"]>;
   readonly recoverAdopt?: NonNullable<Provider["recoverAdopt"]>;
   readonly convergeApply?: NonNullable<Provider["convergeApply"]>;
@@ -329,9 +358,7 @@ function providerWith(options: {
   return {
     id: "recovery-provider",
     offerings: [providerOffering],
-    async apply() {
-      return failed("unavailable", "not used", true);
-    },
+    apply: options.apply ?? (async () => failed("unavailable", "not used", true)),
     async observe() {
       return failed("not_found", "not used");
     },
@@ -378,13 +405,20 @@ async function rejectedImport(
   return await rejected(driver.import?.(input), "provider import");
 }
 
-async function rejectedApply(provider: Provider): Promise<unknown> {
+async function rejectedApply(
+  provider: Provider,
+  overrides: {
+    readonly operationMode?: "initial" | "recovery";
+    readonly providerHandle?: string;
+  } = {},
+): Promise<unknown> {
   const { driver } = providerDriver(provider);
   return await rejected(
     driver.apply({
       operationId: "operation-1",
       operationKey: "operation-key-1",
       operationMode: "recovery",
+      ...overrides,
       executionAuthority: executionAuthority(),
       tenantId,
       resourceUid: "resource-1",

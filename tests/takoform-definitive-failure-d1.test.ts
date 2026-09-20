@@ -10,6 +10,11 @@ import {
   type Offering,
 } from "../src/index.ts";
 import type { Sql, SqlParam } from "../src/ports.ts";
+import {
+  type ApplyInput,
+  failed,
+  failedWithoutProviderOperationMutation,
+} from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
@@ -90,6 +95,42 @@ const LANE = "/apis/forms.takoform.com/v1";
 const QUERY =
   `space=${SPACE}&definitionVersion=${FORM_REF.definitionVersion}` +
   `&schemaDigest=${encodeURIComponent(FORM_REF.schemaDigest)}`;
+
+test("native D1 settles whole-operation apply abort with an atomic exact hold release", async () => {
+  for (const injectReleaseConstraint of [false, true]) {
+    await withNativeD1(
+      { failOn: [], recoveryAbort: true, injectReleaseConstraint },
+      async ({ app, sql, observe }) => {
+        const tenant = await createTenant(app.fetch);
+        const initial = await applyResource(app.fetch, tenant.provider, "d1-recovery-abort");
+        expect(initial.status).toBe(202);
+        const operationId = operationIdFrom(initial.body);
+        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+          heldMinor: 500,
+        });
+        const recovered = (await app.tick()).providerRepairs;
+        expect(recovered).toMatchObject(
+          injectReleaseConstraint ? { settled: 0, pending: 1 } : { settled: 1, pending: 0 },
+        );
+        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+          settledMinor: 2_000,
+          heldMinor: injectReleaseConstraint ? 500 : 0,
+        });
+        expect(
+          await sql.query(
+            "SELECT provider_outcome FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+            [operationId],
+          ),
+        ).toEqual(injectReleaseConstraint ? [{ provider_outcome: "indeterminate" }] : []);
+        expect(
+          await sql.query("SELECT phase FROM tf_deferred_operations WHERE id = ?", [operationId]),
+        ).toEqual([{ phase: injectReleaseConstraint ? "committing" : "failed" }]);
+        expect(observe.releaseIntercepts).toBe(1);
+        expect(observe.maxBindParams).toBeLessThanOrEqual(100);
+      },
+    );
+  }
+}, 30_000);
 
 test("native D1 terminalizes a definitive refusal and releases its exact hold", async () => {
   await withNativeD1({ failOn: ["d1-success"] }, async ({ app, sql, observe }) => {
@@ -256,6 +297,7 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
 }, 30_000);
 
 interface NativeD1Options {
+  readonly recoveryAbort?: boolean;
   readonly failOn: readonly string[];
   readonly injectReleaseConstraint?: boolean;
 }
@@ -304,7 +346,20 @@ async function withNativeD1(
     const base = createD1Sql(database);
     const observe: NativeD1Observation = { releaseIntercepts: 0, maxBindParams: 0 };
     const sql = observeSql(base, observe, options.injectReleaseConstraint === true);
-    const provider = new FakeProvider({
+    class AbortProvider extends FakeProvider {
+      override async apply(_input: ApplyInput) {
+        return failed("unavailable", "initial response lost before claim", true);
+      }
+      async convergeApply(input: ApplyInput) {
+        return failedWithoutProviderOperationMutation(
+          input.operationId,
+          "conflict",
+          "exact apply durably fenced",
+        );
+      }
+    }
+    const ProviderClass = options.recoveryAbort ? AbortProvider : FakeProvider;
+    const provider = new ProviderClass({
       offerings: [PROVIDER_OFFERING],
       failOn: options.failOn,
     });

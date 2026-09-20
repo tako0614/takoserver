@@ -12,8 +12,10 @@ import {
 } from "../src/provider-port.ts";
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
   type CloudflareProviderAdoptionRecoveryResult,
+  type CloudflareProviderApplyConvergenceResult,
   type CloudflareProviderExecutorRpc,
   type CloudflareProviderInitialMutationResult,
 } from "../src/providers/cloudflare-provider-executor-port.ts";
@@ -41,6 +43,113 @@ const identity = {
 const offering = {} as ProviderOffering;
 
 describe("Cloudflare provider executor no-mutation bridge", () => {
+  test("apply-abort evidence requires exact snapshotted recovery identity and closed shape", async () => {
+    const input = makeInput("apply", { operationMode: "recovery" });
+    const mutations: readonly (readonly [readonly string[], unknown])[] = [
+      [["phase"], "succeeded"],
+      [["extra"], true],
+      [["failure", "extra"], true],
+      [["failure", "retryable"], true],
+      [["failure", "code"], "bogus"],
+      [["failure", "message"], ""],
+      [["executorNoMutation"], {}],
+      [["executorAdoptionAbort"], {}],
+      [["executorApplyAbort", "extra"], true],
+      [["executorApplyAbort", "schema"], "wrong"],
+      [["executorApplyAbort", "action"], "recoverAdopt"],
+      [["executorApplyAbort", "operationId"], "wrong"],
+      [["executorApplyAbort", "providerInstallationRef"], "wrong"],
+      ...["tenantId", "resourceUid", "leaseToken", "fingerprint", "extra"].map(
+        (key) => [["executorApplyAbort", "executionAuthority", key], "wrong"] as const,
+      ),
+    ];
+    for (const [path, value] of mutations) {
+      const proof = structuredClone(applyAbortFor(input)) as unknown as Record<string, unknown>;
+      let parent = proof;
+      for (const key of path.slice(0, -1)) parent = parent[key] as Record<string, unknown>;
+      const key = path.at(-1);
+      if (key === undefined) throw new Error("missing mutation path");
+      parent[key] = value;
+      const ticket = await createProxy(
+        createBinding(() => proof, proof as unknown as ProviderTicket),
+      ).convergeApply(input);
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(providerFailureProvesWholeOperationNoMutation(ticket, input.operationId)).toBe(false);
+    }
+    const proof = applyAbortFor(input);
+    const { operationMode: _mode, ...withoutMode } = input;
+    const { executionAuthority: _authority, ...withoutAuthority } = input;
+    for (const altered of [
+      { ...input, operationMode: "initial" as const },
+      withoutMode,
+      withoutAuthority,
+      { ...input, providerHandle: "handle" },
+      { ...input, previous: { nativeId: "existing", spec: {} } },
+      { ...input, identity: { ...input.identity, uid: "wrong" } },
+      { ...input, identity: { ...input.identity, tenantRef: "wrong" } },
+    ]) {
+      const ticket = await createProxy(createBinding(() => proof, proof)).convergeApply(altered);
+      expect(ticket).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+    }
+    let resolve!: (value: unknown) => void;
+    const response = new Promise<unknown>((done) => {
+      resolve = done;
+    });
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.convergeApply = async () =>
+      (await response) as CloudflareProviderApplyConvergenceResult;
+    const pending = createProxy(binding).convergeApply(input);
+    Object.assign(input, { operationId: "changed", previous: { nativeId: "changed" } });
+    Object.assign(input.identity, { uid: "changed" });
+    if (!input.executionAuthority) throw new Error("missing execution authority");
+    Object.assign(input.executionAuthority, { leaseToken: "changed" });
+    resolve(structuredClone(proof));
+    expect(providerFailureProvesWholeOperationNoMutation(await pending, "operation-1")).toBe(true);
+  });
+  test("restores exact whole-operation apply abort only from convergence", async () => {
+    const input = makeInput("apply", { operationMode: "recovery" }) as ApplyInput;
+    const remote = {
+      phase: "failed",
+      failure: {
+        code: "conflict",
+        message: "the exact apply was durably fenced",
+        retryable: false,
+      },
+      executorApplyAbort: {
+        schema: "takoserver.cloudflare-provider-executor-apply-abort@v1",
+        action: "convergeApply",
+        operationId: input.operationId,
+        providerInstallationRef: installationId,
+        executionAuthority: structuredClone(input.executionAuthority),
+      },
+    };
+    const proxy = createProxy(createBinding(() => remote, remote as unknown as ProviderTicket));
+    const ticket = await proxy.convergeApply(input);
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, input.operationId)).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, input.operationId)).toBe(false);
+    expect(Object.hasOwn(ticket, "executorApplyAbort")).toBe(false);
+    for (const wrong of [
+      await proxy.apply(input),
+      await proxy.recoverApply(input),
+      await proxy.poll({
+        operationId: input.operationId,
+        handle: "handle",
+        executionAuthority: authority,
+      }),
+    ]) {
+      expect(wrong).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(providerFailureProvesWholeOperationNoMutation(wrong, input.operationId)).toBe(false);
+    }
+  });
   test("restores cloned no-mutation evidence for initial apply, delete, and adopt", async () => {
     for (const action of ["apply", "delete", "adopt"] as const) {
       const input = makeInput(action);
@@ -361,6 +470,25 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
     expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1")).toBe(false);
   });
 });
+
+function applyAbortFor(input: ApplyInput): CloudflareProviderApplyConvergenceResult {
+  if (!input.executionAuthority) throw new Error("missing execution authority");
+  return {
+    phase: "failed",
+    failure: {
+      code: "conflict",
+      message: "the exact operation was durably fenced",
+      retryable: false,
+    },
+    executorApplyAbort: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+      action: "convergeApply",
+      operationId: input.operationId,
+      providerInstallationRef: installationId,
+      executionAuthority: { ...input.executionAuthority },
+    },
+  };
+}
 
 function makeInput(action: "apply", overrides?: Partial<ApplyInput>): ApplyInput;
 function makeInput(action: "delete", overrides?: Partial<DeleteInput>): DeleteInput;

@@ -253,6 +253,14 @@ describe("SQLiteMigrationApplication provider saga", () => {
         if (input.form.identity.formRef.kind === "SQLiteMigrationApplication") {
           applicationCalls += 1;
           executionTrace.push("application:refuse");
+          if (input.operationMode === "recovery") {
+            throw new ProviderMutationWholeOperationRefusalError(
+              "unsupported_capability",
+              422,
+              "provider apply was durably aborted, but the migration already ran",
+              { action: "convergeApply" },
+            );
+          }
           throw new ProviderMutationDefinitiveRefusalError("unsupported_capability", 422);
         }
         return await memory.apply(input);
@@ -323,6 +331,25 @@ describe("SQLiteMigrationApplication provider saga", () => {
     expect(
       database.query("SELECT COUNT(*) AS n FROM tf_operations WHERE id = ?").get(saga.operation_id),
     ).toEqual({ n: 0 });
+    const recovered = await apply(
+      host,
+      desired,
+      review,
+      "definitive-migration-refusal-0001",
+      "admin",
+    );
+    expect(recovered?.status).toBe(422);
+    expect(applicationCalls).toBe(2);
+    expect(dispatchedSaga(database)).toMatchObject({
+      phase: "planned",
+      provider_outcome: "indeterminate",
+      receipt_json: null,
+    });
+    expect(
+      database
+        .query("SELECT state FROM tf_resource_deletion_attestations WHERE resource_uid = ?")
+        .get(saga.resource_uid),
+    ).toEqual({ state: "live" });
   });
 
   test("one live saga lease fences a concurrent suffix dispatch", async () => {

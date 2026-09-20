@@ -406,6 +406,7 @@ export function createDeferredOperations(input: {
             claimOwnerId: leaseToken,
             operation: failure.operation,
             charge: failure.charge,
+            ...(failure.recoveryAction ? { recoveryAction: failure.recoveryAction } : {}),
             hostOperation: {
               kind: "deferred",
               operation,

@@ -126,6 +126,7 @@ export interface EngineContext {
 }
 
 export interface EngineDefinitiveProviderFailureCommit {
+  readonly recoveryAction?: "convergeApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly operation: "create" | "update";
@@ -317,7 +318,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     /** The wallet hold and Host lifecycle settle through one store-owned batch. */
     readonly commitDefinitiveFailure?: (
       leaseToken: string,
-      error: ProviderMutationDefinitiveRefusalError,
+      error: ProviderMutationDefinitiveRefusalError | ProviderMutationWholeOperationRefusalError,
     ) => Promise<boolean>;
     /** Provider-only refusal proof cannot erase an earlier mutation step. */
     readonly providerRefusalProvesWholeAttemptIdle?: () => boolean;
@@ -473,7 +474,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         error.code === "import_conflict";
       const recoveryAdoptionAborted =
         execution.mode === "recovery" &&
-        error instanceof ProviderMutationWholeOperationRefusalError;
+        error instanceof ProviderMutationWholeOperationRefusalError &&
+        error.action === "recoverAdopt";
       let definitiveImportFailureOutcome: "import_conflict" | "adoption_aborted" | undefined;
       if (
         executeEntered &&
@@ -511,10 +513,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         execution.mode === "initial" &&
         providerRefusalProvesWholeAttemptIdle &&
         error instanceof ProviderMutationDefinitiveRefusalError;
+      const definitiveApplyAbort =
+        execution.mode === "recovery" &&
+        // Only apply installs this lifecycle settlement owner; imports and
+        // deletes must never consume an apply-convergence disposition.
+        input.commitDefinitiveFailure !== undefined &&
+        providerRefusalProvesWholeAttemptIdle &&
+        error instanceof ProviderMutationWholeOperationRefusalError &&
+        error.action === "convergeApply";
+      const definitiveRefusal = definitiveInitialRefusal || definitiveApplyAbort;
       const recoveryError =
         error instanceof ProviderMutationRecoveryError
           ? error
-          : executeEntered && !definitiveInitialRefusal
+          : executeEntered && !definitiveRefusal
             ? new ProviderMutationRecoveryError("indeterminate")
             : undefined;
       if (recoveryError) {
@@ -527,7 +538,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           ...(recoveryError.providerHandle ? { providerHandle: recoveryError.providerHandle } : {}),
         });
         if (!recorded) input.onContention?.();
-      } else if (definitiveInitialRefusal && error.heldCharge) {
+      } else if (definitiveRefusal && error.heldCharge) {
         if (input.commitDefinitiveFailure) {
           try {
             settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
@@ -548,13 +559,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
       } else if (
         (execution.mode === "initial" && providerDispatchMarked && !executeEntered) ||
-        (executeEntered && definitiveInitialRefusal)
+        (executeEntered && definitiveRefusal)
       ) {
         settledPrecondition = await store.settleProviderMutationPreconditionFailure({
           tenantId: input.tenantId,
           operationId: input.operationId,
           resourceUid: input.resourceUid,
           leaseToken,
+          ...(definitiveApplyAbort ? { recoveryAction: "convergeApply" as const } : {}),
         });
         if (settledPrecondition) input.onProvablyIdle?.();
         else input.onContention?.();
@@ -1553,6 +1565,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               providerLeaseToken,
               operation: create ? ("create" as const) : ("update" as const),
               charge,
+              ...(error instanceof ProviderMutationWholeOperationRefusalError &&
+              error.action === "convergeApply"
+                ? { recoveryAction: "convergeApply" as const }
+                : {}),
             };
             if (context.durableOperation) {
               return await context.durableOperation.commitDefinitiveProviderFailure({

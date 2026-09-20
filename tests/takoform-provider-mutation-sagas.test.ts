@@ -20,6 +20,72 @@ const saga: ProviderMutationSaga = {
 };
 
 describe("provider mutation saga execution leases", () => {
+  test("only explicit whole-operation apply proof and the current lease retire an indeterminate create", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const identity = {
+      tenantId: saga.tenantId,
+      operationId: saga.operationId,
+      resourceUid: saga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(saga);
+    await store.acquireProviderMutationExecution({
+      ...identity,
+      leaseToken: "old",
+      leaseUntil: 2_000,
+    });
+    await store.markProviderMutationDispatch({ ...identity, leaseToken: "old" });
+    await store.recordProviderMutationOutcome({
+      ...identity,
+      leaseToken: "old",
+      outcome: "indeterminate",
+    });
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "current",
+        leaseUntil: 3_000,
+      }),
+    ).toMatchObject({ kind: "acquired", mode: "recovery" });
+    expect(
+      await store.settleProviderMutationPreconditionFailure({ ...identity, leaseToken: "current" }),
+    ).toBe(false);
+    expect(
+      await store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "old",
+        recoveryAction: "convergeApply",
+      }),
+    ).toBe(false);
+    await expect(
+      store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "current",
+        recoveryAction: "recoverAdopt" as "convergeApply",
+      }),
+    ).rejects.toThrow("invalid provider refusal recovery action");
+    expect(
+      await store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "current",
+        recoveryAction: "convergeApply",
+      }),
+    ).toBe(true);
+    await expect(
+      store.recordProviderMutationReceipt({
+        ...identity,
+        leaseToken: "old",
+        receipt: { observed: { late: true } },
+      }),
+    ).rejects.toMatchObject({ code: "resource_busy" });
+    expect(
+      await store.providerMutationPlanExists(saga.tenantId, saga.operationId, saga.resourceUid),
+    ).toBe(false);
+    database.close();
+  });
   test("fences concurrent and stale executors while preserving one idempotent receipt", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);

@@ -132,15 +132,26 @@ export class ProviderMutationDefinitiveRefusalError extends TakoformHostError {
 }
 
 /**
- * Adoption recovery proved that the entire durable operation, rather than
- * merely its current invocation, produced no provider mutation. The engine
- * recognizes this only on its import-specific recovery settlement seam.
+ * A direct recovery result proved the entire durable operation idle. The
+ * action keeps import settlement separate from create convergence settlement.
  */
 export class ProviderMutationWholeOperationRefusalError extends TakoformHostError {
-  constructor(code: string, status: number, message?: string) {
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    options?: {
+      readonly action?: "recoverAdopt" | "convergeApply";
+      readonly heldCharge?: LedgerHeldCharge;
+    },
+  ) {
     super(code, status, undefined, sanitizedMessage(message));
     this.name = "ProviderMutationWholeOperationRefusalError";
+    this.action = options?.action ?? "recoverAdopt";
+    if (options?.heldCharge) this.heldCharge = options.heldCharge;
   }
+  readonly action: "recoverAdopt" | "convergeApply";
+  readonly heldCharge?: LedgerHeldCharge;
 }
 
 /**
@@ -534,7 +545,7 @@ export function createProviderDriver(
     mutation?: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
-      readonly wholeOperationProof?: "recoverAdopt";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply";
     },
   ): ProviderResult => {
     if (ticket.phase === "succeeded") {
@@ -564,11 +575,13 @@ export function createProviderDriver(
     // desired state the message names" against a message that named nothing.
     const [code, status] = failureToWire(ticket.failure.code);
     if (
-      mutation?.wholeOperationProof === "recoverAdopt" &&
+      mutation?.wholeOperationProof !== undefined &&
       mutation.mode === "recovery" &&
       providerFailureProvesWholeOperationNoMutation(ticket, mutation.operationId)
     ) {
-      throw new ProviderMutationWholeOperationRefusalError(code, status, ticket.failure.message);
+      throw new ProviderMutationWholeOperationRefusalError(code, status, ticket.failure.message, {
+        action: mutation.wholeOperationProof,
+      });
     }
     if (mutation && providerFailureProvesNoMutation(ticket, mutation.operationId)) {
       if (mutation.mode === "initial") {
@@ -638,6 +651,7 @@ export function createProviderDriver(
     mutation: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply";
     },
     work: () => Promise<ProviderTicket>,
   ): Promise<ProviderResult> => {
@@ -681,6 +695,17 @@ export function createProviderDriver(
       return resultOf(ticket, mutation);
     } catch (error) {
       if (error instanceof ProviderMutationRecoveryError) throw error;
+      if (error instanceof ProviderMutationWholeOperationRefusalError) {
+        throw new ProviderMutationWholeOperationRefusalError(
+          error.code,
+          error.status,
+          error.publicMessage,
+          {
+            action: error.action,
+            heldCharge: { reference: mutation.operationId, amountMinor: priceMinor },
+          },
+        );
+      }
       if (error instanceof ProviderMutationDefinitiveRefusalError) {
         // Releasing here would put money back before the engine's provider-plan
         // lease fence commits. Carry the exact hold to the lifecycle owner so
@@ -1380,30 +1405,47 @@ export function createProviderDriver(
       } satisfies import("./provider-port.ts").ApplyInput;
       let providerBoundaryEntered = false;
       let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
+      const mutation: {
+        readonly operationId: string;
+        readonly mode: "initial" | "recovery";
+        wholeOperationProof?: "convergeApply";
+      } = {
+        operationId: input.operationId,
+        mode: input.operationMode === "recovery" ? "recovery" : "initial",
+      };
       const work = async () => {
         providerBoundaryEntered = true;
         try {
+          const firstTicket = input.providerHandle
+            ? await pollHandle(
+                provider,
+                input.operationId,
+                input.providerHandle,
+                input.executionAuthority,
+              )
+            : input.operationMode === "recovery"
+              ? provider.convergeApply
+                ? await provider.convergeApply(providerInput)
+                : (() => {
+                    // A Host recovery lease may resume a mutation only through
+                    // an explicitly operation-keyed convergence seam. The
+                    // read-only `recoverApply` capability is never promoted
+                    // into mutation authority here.
+                    throw new ProviderMutationRecoveryError("indeterminate");
+                  })()
+              : await provider.apply(providerInput);
+          if (
+            input.operationMode === "recovery" &&
+            !input.providerHandle &&
+            !previous &&
+            firstTicket.phase === "failed"
+          ) {
+            mutation.wholeOperationProof = "convergeApply";
+          }
           const ticket = await settle(
             provider,
             input.operationId,
-            input.providerHandle
-              ? await pollHandle(
-                  provider,
-                  input.operationId,
-                  input.providerHandle,
-                  input.executionAuthority,
-                )
-              : input.operationMode === "recovery"
-                ? provider.convergeApply
-                  ? await provider.convergeApply(providerInput)
-                  : (() => {
-                      // A Host recovery lease may resume a mutation only through
-                      // an explicitly operation-keyed convergence seam. The
-                      // read-only `recoverApply` capability is never promoted
-                      // into mutation authority here.
-                      throw new ProviderMutationRecoveryError("indeterminate");
-                    })()
-                : await provider.apply(providerInput),
+            firstTicket,
             input.executionAuthority,
             Boolean(input.providerHandle),
           );
@@ -1442,10 +1484,6 @@ export function createProviderDriver(
       // Charging the organization wallet again here would double-settle the
       // same Resource. Direct organization credentials have no such authority
       // and retain the ordinary hold/capture path.
-      const mutation = {
-        operationId: input.operationId,
-        mode: input.operationMode === "recovery" ? "recovery" : "initial",
-      } as const;
       let result: ProviderResult;
       try {
         result =

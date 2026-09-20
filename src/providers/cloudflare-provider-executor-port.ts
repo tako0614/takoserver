@@ -57,6 +57,27 @@ export type CloudflareProviderAdoptionRecoveryResult =
       readonly executorAdoptionAbort: CloudflareProviderExecutorAdoptionAbortEvidence;
     };
 
+export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA =
+  "takoserver.cloudflare-provider-executor-apply-abort@v1" as const;
+
+/** An exact create was durably fenced against every earlier provider invocation. */
+export interface CloudflareProviderExecutorApplyAbortEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA;
+  readonly action: "convergeApply";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only mutation-authorized convergence may carry this whole-operation proof. */
+export type CloudflareProviderApplyConvergenceResult =
+  | ProviderTicket
+  | {
+      readonly phase: "failed";
+      readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
+      readonly executorApplyAbort: CloudflareProviderExecutorApplyAbortEvidence;
+    };
+
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
 export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
 export type CloudflareProviderRecoverDeleteInput = Parameters<
@@ -107,7 +128,7 @@ export type CloudflareProviderMeterReadResult =
 export interface CloudflareProviderExecutorRpc {
   apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
-  convergeApply(input: ApplyInput): Promise<ProviderTicket>;
+  convergeApply(input: ApplyInput): Promise<CloudflareProviderApplyConvergenceResult>;
   poll(input: CloudflareProviderPollInput): Promise<ProviderTicket>;
   observe(input: CloudflareProviderObserveInput): Promise<ProviderTicket>;
   delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;

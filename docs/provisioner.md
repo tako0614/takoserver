@@ -240,6 +240,20 @@ current invocation, never an older operation's uncertain side effects.
 The [Workflow implementation note](workflow-runtime.md) separates the internal
 instance store from the execution and binding work still required for support.
 
+A create convergence result may instead carry the separate, identity-bound whole-operation no-effect proof,
+but only after the provider durably fences the exact operation against late
+initial effects. The Cloudflare service-binding transport carries this as
+`executorApplyAbort` (`action: convergeApply`), bound to the operation,
+installation, tenant, resource UID, fingerprint, and current execution lease.
+The proxy snapshots that context before awaiting RPC, validates the closed
+envelope, and restores a non-wire proof. Initial calls, read-only recovery,
+polling, updates, and mixed adoption/apply evidence cannot use this proof.
+The Host settles only under its current lease and only when no separately
+prepared migration could have mutated. An indeterminate saga is eligible only
+through this explicit proof path; any priced hold stays reserved until the
+Host's existing atomic failure settlement releases it with the lifecycle.
+This internal recovery contract changes no Form, public API, or database schema.
+
 Vector has an explicit development-only self-host integration. It requires a
 matching VectorIndex Offering, the exact candidate Interface and Binding, and
 an injected `vectorIndexStore` for both provisioning and the data plane. The

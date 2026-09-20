@@ -211,6 +211,8 @@ export interface ProviderMutationSaga {
 
 /** One no-effect provider refusal committed with its exact priced hold. */
 export interface DefinitiveProviderMutationFailureCommit {
+  /** Set only after the driver restores operation-wide proof from convergence. */
+  readonly recoveryAction?: "convergeApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly claimOwnerId: string;
@@ -460,8 +462,9 @@ export interface TakoformStore {
     readonly outcome: "running" | "indeterminate";
     readonly providerHandle?: string;
   }): Promise<boolean>;
-  /** Terminalizes a failure proven to have happened before provider dispatch. */
+  /** Retires a proven no-effect refusal; recovery requires a whole-operation fence. */
   settleProviderMutationPreconditionFailure(input: {
+    readonly recoveryAction?: "convergeApply";
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
@@ -2038,11 +2041,15 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async settleProviderMutationPreconditionFailure(input) {
+      if (input.recoveryAction !== undefined && input.recoveryAction !== "convergeApply") {
+        throw new TypeError("invalid provider refusal recovery action");
+      }
       const settled = await sql.run(
         `DELETE FROM tf_provider_mutation_sagas
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
-           AND provider_handle IS NULL AND provider_outcome = 'running'
+           AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
+           ${input.recoveryAction === "convergeApply" ? "AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL" : ""}
            AND execution_started_at IS NOT NULL
            AND execution_lease_token = ? AND execution_lease_until > ?`,
         [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, now()],
@@ -2199,7 +2206,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           sql: `DELETE FROM tf_provider_mutation_sagas
                 WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                   AND phase = 'planned' AND receipt_json IS NULL
-                  AND provider_handle IS NULL AND provider_outcome = 'running'
+                  AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
                   AND execution_started_at IS NOT NULL
                   AND execution_lease_token = ? AND execution_lease_until > ?`,
           params: [
@@ -3845,6 +3852,16 @@ function assertDefinitiveProviderMutationFailure(
   input: DefinitiveProviderMutationFailureCommit,
 ): void {
   const { saga } = input;
+  if (
+    input.recoveryAction !== undefined &&
+    (input.recoveryAction !== "convergeApply" ||
+      input.operation !== "create" ||
+      saga.acceptedUid !== undefined ||
+      saga.acceptedGeneration !== undefined ||
+      saga.acceptedRevision !== undefined)
+  ) {
+    throw new TypeError("invalid provider refusal recovery action");
+  }
   if (input.charge.reference !== saga.operationId) {
     throw new TypeError("provider failure charge has the wrong operation identity");
   }
@@ -3896,7 +3913,7 @@ function definitiveProviderFailureInitialFence(
       AND target_space = ? AND target_api_version = ? AND target_kind = ? AND target_name = ?
       AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
       AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
-      AND provider_handle IS NULL AND provider_outcome = 'running'
+      AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
       AND execution_started_at IS NOT NULL
       AND execution_lease_token = ? AND execution_lease_until > ?
   )`;
