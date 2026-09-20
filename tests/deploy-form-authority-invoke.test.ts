@@ -38,6 +38,7 @@ const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
 const ORIGIN = "https://form-authority.integration.takoserver.com";
 const HOST_ID = "https://api.integration.example.test";
+const UNSUPPORTED_RETAINED_FORM_KIND = "ActorNamespace" as const;
 const TRANSITION_TARGET_SCOPE = {
   tenantId: "tenant-yurucommu-transition-target",
   space: "space-yurucommu-transition-target",
@@ -262,19 +263,19 @@ describe("signed Form authority operator invocation", () => {
         };
       }[];
     };
-    expect(readback.forms.find((form) => form.formRef.kind === "WorkerCustomDomain")).toMatchObject(
-      {
-        installed: true,
-        supported: false,
-        operations: [],
-        activationHead: {
-          present: true,
-          active: false,
-          implementationDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-          eventDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-        },
+    expect(
+      readback.forms.find((form) => form.formRef.kind === UNSUPPORTED_RETAINED_FORM_KIND),
+    ).toMatchObject({
+      installed: true,
+      supported: false,
+      operations: [],
+      activationHead: {
+        present: true,
+        active: false,
+        implementationDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        eventDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
       },
-    );
+    });
 
     fixture.calls.length = 0;
     fixture.assertions.length = 0;
@@ -327,7 +328,7 @@ describe("signed Form authority operator invocation", () => {
             activationHead: { present: boolean; active: boolean };
           }[];
         }
-      ).forms.find((form) => form.formRef.kind === "WorkerCustomDomain"),
+      ).forms.find((form) => form.formRef.kind === UNSUPPORTED_RETAINED_FORM_KIND),
     ).toMatchObject({ activationHead: { present: true, active: true } });
   });
 
@@ -857,11 +858,13 @@ async function invocationFixture(
         const unsupportedIndex = readback.forms.findIndex(
           (form) =>
             (form.formRef as { readonly kind?: unknown } | undefined)?.kind ===
-            "WorkerCustomDomain",
+            UNSUPPORTED_RETAINED_FORM_KIND,
         );
         const unsupported = readback.forms[unsupportedIndex];
         if (!unsupported || unsupportedIndex < 0) {
-          throw new Error("unsupported WorkerCustomDomain package is missing from readback");
+          throw new Error(
+            `unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} package is missing from readback`,
+          );
         }
         const retained = {
           ...unsupported,
@@ -876,7 +879,7 @@ async function invocationFixture(
         const eventDigest = retained.activationHead.eventDigest;
         const scope = target.formAuthority?.integrationOperatorScope;
         if (!scope || typeof unsupported.packageDigest !== "string") {
-          throw new Error("unsupported WorkerCustomDomain identity is incomplete");
+          throw new Error(`unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} identity is incomplete`);
         }
         const audience = takoformActivationAudience("space", scope);
         const activationKey = `${canonicalJson(unsupported.formRef)}\0${unsupported.packageDigest}\0${audience.value}`;
@@ -888,7 +891,9 @@ async function invocationFixture(
         if (
           !currentHeads.some((head) => head.kind === "activation" && head.key === activationKey)
         ) {
-          throw new Error("unsupported WorkerCustomDomain activation summary is missing");
+          throw new Error(
+            `unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} activation summary is missing`,
+          );
         }
         returned = {
           ...(result as unknown as Record<string, unknown>),

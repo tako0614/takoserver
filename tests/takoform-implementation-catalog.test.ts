@@ -16,7 +16,8 @@ import {
 } from "../src/takoform/implementation-catalog.ts";
 
 const HISTORICAL_PUBLIC_CAPABILITY_DIGESTS = [
-  // Capability identity before StaticAssetBundle was admitted as intrinsic.
+  // Capability identity before StaticAssetBundle was admitted as intrinsic,
+  // before the public Worker separately admitted WorkerCustomDomain.
   "sha256:a5bc1508638fb1c47182d4ee68be5eedb7acc050394bd3507b532a78daacc024",
   // Capability identity before ADR 0007's ObjectBucket admission.
   "sha256:630899ce5e482e7e274c87dab17d74edd904620852a71c2b021aade236a1ea73",
@@ -209,7 +210,8 @@ describe("Form authority implementation catalog", () => {
       capabilities,
     });
     expect(semantic.capabilityDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
-    const predecessorCapabilities = withoutStaticAssetCapability(capabilities);
+    const predecessorCapabilities = historicalPreStaticAssetPublicCapabilities();
+    expect(predecessorCapabilities.forms.WorkerCustomDomain).toBeUndefined();
     const predecessor = await derivePublicFormImplementationIdentity({
       implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
       capabilities: predecessorCapabilities,
@@ -220,15 +222,27 @@ describe("Form authority implementation catalog", () => {
     expect(semantic.implementationDigest).not.toBe(predecessor.implementationDigest);
   });
 
-  test("keeps self-host and public capability parity while rotating implementation identity", async () => {
+  test("keeps the common self-host/public subset aligned and admits public WorkerCustomDomain", async () => {
     const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
-    // A self-host realizes the ObjectBucket supply now, so it names one. Both
-    // Hosts share the intrinsic-aware capability manifest, while their
-    // implementation identities differ because one binds a local payload and
-    // the other binds a sealed Worker artifact.
+    const publicCapabilities = publicFormCapabilityManifest();
+    // Self-host remains on the Yurucommu subset. The public Worker shares that
+    // subset but separately admits the exact WorkerCustomDomain lifecycle.
     expect(capabilities.implementation).toBe(
       "takoserver.public-worker-target@v1:AtLeastOnceQueue,EdgeKVNamespace,ModuleWorker,ObjectBucket,SQLiteDatabase",
     );
+    expect(
+      Object.fromEntries(
+        Object.keys(capabilities.forms).map((kind) => [kind, publicCapabilities.forms[kind]]),
+      ),
+    ).toEqual(capabilities.forms);
+    expect(capabilities.forms.WorkerCustomDomain).toBeUndefined();
+    expect(publicCapabilities.forms.WorkerCustomDomain).toEqual([
+      "create",
+      "read",
+      "delete",
+      "import",
+      "observe",
+    ]);
     expect(capabilities.forms.StaticAssetBundle).toEqual([
       "create",
       "read",
@@ -239,7 +253,7 @@ describe("Form authority implementation catalog", () => {
     ]);
     const publicSemantic = await derivePublicFormImplementationIdentity({
       implementationPayloadDigest: `sha256:${"0".repeat(64)}`,
-      capabilities: publicFormCapabilityManifest(),
+      capabilities: publicCapabilities,
     });
     const implementationPayloadDigest = await canonicalDigest({
       kind: "takoserver.selfhost-form-implementation@v1",
@@ -249,7 +263,7 @@ describe("Form authority implementation catalog", () => {
       implementationPayloadDigest,
       capabilities,
     });
-    expect(semantic.capabilityDigest).toBe(publicSemantic.capabilityDigest);
+    expect(semantic.capabilityDigest).not.toBe(publicSemantic.capabilityDigest);
     expect(semantic.capabilityDigest).not.toBe(HISTORICAL_PUBLIC_CAPABILITY_DIGESTS[0]);
     expect(semantic.implementationPayloadDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
     expect(semantic.implementationPayloadDigest).not.toBe(
@@ -414,13 +428,14 @@ describe("Form authority implementation catalog", () => {
   });
 });
 
-function withoutStaticAssetCapability(
-  capabilities: ReturnType<typeof publicFormCapabilityManifest>,
-): ReturnType<typeof publicFormCapabilityManifest> {
+function historicalPreStaticAssetPublicCapabilities(): ReturnType<
+  typeof publicFormCapabilityManifest
+> {
+  const yurucommu = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
   return {
-    ...capabilities,
+    ...yurucommu,
     forms: Object.fromEntries(
-      Object.entries(capabilities.forms).filter(([kind]) => kind !== "StaticAssetBundle"),
+      Object.entries(yurucommu.forms).filter(([kind]) => kind !== "StaticAssetBundle"),
     ),
   };
 }

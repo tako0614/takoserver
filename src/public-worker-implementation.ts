@@ -50,7 +50,14 @@ export interface PublicFormImplementationConfiguration {
  * this exact code-owned manifest truthful.
  */
 export function publicFormCapabilityManifest(): TakoformLifecycleCapabilityManifest {
-  return yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
+  const yurucommu = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
+  return {
+    ...yurucommu,
+    forms: {
+      ...yurucommu.forms,
+      WorkerCustomDomain: ["create", "read", "delete", "import", "observe"],
+    },
+  };
 }
 
 /** Derives semantic identity from the sealed runtime payload and exact support set. */
