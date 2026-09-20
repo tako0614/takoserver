@@ -281,6 +281,7 @@ export async function verifyIntegrationStorageGenerationTarget(
       sourceArtifact.digest,
       expectedApplicationShape,
       generated.databaseId,
+      "preflight",
     );
     return {
       generation: generated.generation,
@@ -333,6 +334,19 @@ function generatedStorageTarget(
     databaseId: target.d1.databaseId,
     bucketName,
   };
+}
+
+/** Purely identifies whether a selected environment target is this surface's generated pair. */
+export function isGeneratedIntegrationStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+): boolean {
+  try {
+    generatedStorageTarget(target, environment);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validateInvocation(
@@ -887,11 +901,12 @@ function assertCompleteDatabase(
   migrationDigest: string,
   expectedApplicationShape: string,
   databaseId: string,
+  phase: "preflight" | "verification" = "verification",
 ): void {
   if (JSON.stringify(state.applied) !== JSON.stringify(expectedMigrations)) {
-    throw verificationError(
-      "D1 migration readback does not contain the exact audited 0001-0058 lineage; " +
-        "R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "does not contain the exact audited 0001-0058 lineage",
       JSON.stringify({ databaseId, expectedMigrations, appliedMigrations: state.applied }),
     );
   }
@@ -900,49 +915,68 @@ function assertCompleteDatabase(
     !SHA256.test(state.shapeDigest) ||
     state.shapeDigest !== digestShape(state.shape)
   ) {
-    throw verificationError(
-      "D1 migration readback has an invalid canonical schema digest; R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "has an invalid canonical schema digest",
       `databaseId=${databaseId}`,
     );
   }
-  const applicationShape = assertCanonicalShape(state, databaseId);
-  if (applicationShape !== expectedApplicationShape) {
-    throw verificationError(
-      "D1 migration readback differs from the exact audited application schema; " +
-        "R2 creation is withheld",
+  const applicationShape = assertCanonicalShape(state, databaseId, phase);
+  if (!sameApplicationSchemaWithSqlTrivia(expectedApplicationShape, applicationShape)) {
+    throw completeDatabaseReadbackError(
+      phase,
+      "differs from the exact audited application schema",
       `databaseId=${databaseId}`,
     );
   }
 }
 
-function assertCanonicalShape(state: D1SchemaState, databaseId: string): string {
+function completeDatabaseReadbackError(
+  phase: "preflight" | "verification",
+  reason: string,
+  detail: string,
+): DeployError {
+  if (phase === "preflight") {
+    return preflightError(`Existing generated D1 schema readback ${reason}`, detail);
+  }
+  return verificationError(`D1 migration readback ${reason}; R2 creation is withheld`, detail);
+}
+
+function assertCanonicalShape(
+  state: D1SchemaState,
+  databaseId: string,
+  phase: "preflight" | "verification" = "verification",
+): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(state.shape);
   } catch {
-    throw verificationError(
-      "D1 migration readback is not a canonical schema shape; R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "is not a canonical schema shape",
       `databaseId=${databaseId}`,
     );
   }
   if (!Array.isArray(parsed)) {
-    throw verificationError(
-      "D1 migration readback is not a canonical schema shape; R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "is not a canonical schema shape",
       `databaseId=${databaseId}`,
     );
   }
   const rows = parsed.map((entry) => {
     if (!isRecord(entry)) {
-      throw verificationError(
-        "D1 migration readback contains a malformed canonical schema row; R2 creation is withheld",
+      throw completeDatabaseReadbackError(
+        phase,
+        "contains a malformed canonical schema row",
         `databaseId=${databaseId}`,
       );
     }
     const keys = Object.keys(entry).sort();
     if (JSON.stringify(keys) !== JSON.stringify(["name", "sql", "table", "type"])) {
-      throw verificationError(
-        "D1 migration readback contains an unexpected canonical schema row; " +
-          "R2 creation is withheld",
+      throw completeDatabaseReadbackError(
+        phase,
+        "contains an unexpected canonical schema row",
         `databaseId=${databaseId}`,
       );
     }
@@ -952,8 +986,9 @@ function assertCanonicalShape(state: D1SchemaState, databaseId: string): string 
       typeof entry.table !== "string" ||
       typeof entry.sql !== "string"
     ) {
-      throw verificationError(
-        "D1 migration readback contains a malformed canonical schema row; R2 creation is withheld",
+      throw completeDatabaseReadbackError(
+        phase,
+        "contains a malformed canonical schema row",
         `databaseId=${databaseId}`,
       );
     }
@@ -969,12 +1004,126 @@ function assertCanonicalShape(state: D1SchemaState, databaseId: string): string 
       throw new Error("noncanonical");
     }
   } catch {
-    throw verificationError(
-      "D1 migration readback is not canonically ordered; R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "is not canonically ordered",
       `databaseId=${databaseId}`,
     );
   }
   return canonicalSchemaShape(rows.filter((row) => !isPlatformSchemaMetadata(row)));
+}
+
+function sameApplicationSchemaWithSqlTrivia(expectedShape: string, actualShape: string): boolean {
+  let expected: unknown;
+  let actual: unknown;
+  try {
+    expected = JSON.parse(expectedShape);
+    actual = JSON.parse(actualShape);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(expected) || !Array.isArray(actual) || expected.length !== actual.length) {
+    return false;
+  }
+  for (let index = 0; index < expected.length; index += 1) {
+    const expectedRow = expected[index];
+    const actualRow = actual[index];
+    if (
+      !isRecord(expectedRow) ||
+      !isRecord(actualRow) ||
+      expectedRow.type !== actualRow.type ||
+      expectedRow.name !== actualRow.name ||
+      expectedRow.table !== actualRow.table ||
+      typeof expectedRow.sql !== "string" ||
+      typeof actualRow.sql !== "string"
+    ) {
+      return false;
+    }
+    const expectedSql = normalizeSqlTrivia(expectedRow.sql);
+    const actualSql = normalizeSqlTrivia(actualRow.sql);
+    if (expectedSql === null || actualSql === null || expectedSql !== actualSql) return false;
+  }
+  return true;
+}
+
+/**
+ * Removes only SQLite comments and ASCII whitespace outside SQL quotes. This
+ * is deliberately local to generated-storage schema readback; raw shape
+ * digests and migration/import evidence remain exact.
+ */
+function normalizeSqlTrivia(sql: string): string | null {
+  let normalized = "";
+  let pendingWhitespace = false;
+  let index = 0;
+  const append = (value: string): void => {
+    if (pendingWhitespace && normalized.length > 0) normalized += " ";
+    normalized += value;
+    pendingWhitespace = false;
+  };
+
+  while (index < sql.length) {
+    const character = sql[index];
+    if (character === undefined) return null;
+    if (isSqliteAsciiWhitespace(character)) {
+      pendingWhitespace = true;
+      index += 1;
+      continue;
+    }
+    if (character === "-" && sql[index + 1] === "-") {
+      pendingWhitespace = true;
+      index += 2;
+      while (index < sql.length && sql[index] !== "\n") index += 1;
+      continue;
+    }
+    if (character === "/" && sql[index + 1] === "*") {
+      const end = sql.indexOf("*/", index + 2);
+      if (end < 0) return null;
+      pendingWhitespace = true;
+      index = end + 2;
+      continue;
+    }
+    if (character === "'" || character === '"' || character === "`") {
+      const start = index;
+      index += 1;
+      let closed = false;
+      while (index < sql.length) {
+        if (sql[index] !== character) {
+          index += 1;
+          continue;
+        }
+        if (sql[index + 1] === character) {
+          index += 2;
+          continue;
+        }
+        index += 1;
+        closed = true;
+        break;
+      }
+      if (!closed) return null;
+      append(sql.slice(start, index));
+      continue;
+    }
+    if (character === "[") {
+      const end = sql.indexOf("]", index + 1);
+      if (end < 0) return null;
+      append(sql.slice(index, end + 1));
+      index = end + 1;
+      continue;
+    }
+    append(character);
+    index += 1;
+  }
+  return normalized;
+}
+
+function isSqliteAsciiWhitespace(character: string): boolean {
+  return (
+    character === " " ||
+    character === "\t" ||
+    character === "\n" ||
+    character === "\f" ||
+    character === "\r"
+  );
 }
 
 function isPlatformSchemaMetadata(row: Record<string, unknown>): boolean {

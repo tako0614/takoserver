@@ -10,6 +10,7 @@ import { parseStrictJson } from "../../src/strict-json.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
+import { runFormAuthorityCodeGate } from "./form-authority-gate.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -365,6 +366,18 @@ export async function runFormAuthorityIdentityProbe(
   if (publicBefore.commit !== source.commit) {
     throw preflightError("served public Worker differs from identity probe source commit");
   }
+  const ordinaryIntegrationFullProfileUpdate =
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    invocation.adoptLivePath === undefined &&
+    !initialHostOnlyProfile &&
+    !hostOnlyProfilePreservingUpdate &&
+    probeProfile === null &&
+    before !== null &&
+    before.bindingTransitionProfile === "none" &&
+    before.drift.length === 0 &&
+    authorityWorkerPresent &&
+    readbackBefore.identity?.hostId === selected.hostId;
   const integrationServiceBindingRefresh =
     invocation.environment === "integration" &&
     (invocation.transition?.delta.refreshedServiceBindings?.length ?? 0) > 0;
@@ -381,6 +394,8 @@ export async function runFormAuthorityIdentityProbe(
       "tests/deploy-worker-state.test.ts",
       "tests/deploy-contract.test.ts",
     ]);
+  } else if (ordinaryIntegrationFullProfileUpdate) {
+    await runFormAuthorityCodeGate(run, invocation.surface);
   } else {
     await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
   }

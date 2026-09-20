@@ -47,16 +47,54 @@ protocol, Core tag, Core commit, and artifact digest. The portable
 `--containers-rollout none`; the native image build belongs to the deploy
 surface and requires Docker on the operator machine.
 
-An integration-only, explicitly declared closure transition may reuse the
-already-running verifier image when its live identity matches both the exact
-predecessor Worker Version and the current source-derived verifier digest.
-The deploy surface derives this choice internally and passes
-`--containers-rollout none` to both bundle preparation and publication. It
-rechecks the same identity immediately before upload and still requires the
-successor Version's verifier readback. A missing or mismatched initial proof
-keeps the normal image-build path; drift after reuse was selected stops before
-upload. Bootstrap, other environments, and undeclared transitions do not select
-this path.
+Integration image reuse has two distinct, narrow admission shapes. A routine
+code apply may reuse the already-running verifier image only when the present
+authority Version has the exact target binding closure; this updates code
+without making a closure transition. A closure-changing apply remains separate:
+it needs the existing explicit integration transition and an admitted exact
+declared-delta predecessor. Neither path changes the closure proof required by
+the transition itself.
+
+For either admitted shape, the live verifier identity must match both the
+current authority Worker Version and source-derived verifier digest. The deploy
+surface derives reuse internally and passes `--containers-rollout none` to the
+final bundle preparation and publication. It rechecks the same identity
+immediately before upload and still requires the successor Version's verifier
+readback. A missing or mismatched initial proof keeps the normal image-build
+path; drift after reuse was selected stops before upload. Scope transitions,
+bootstrap, rehearsal, and production do not select this path.
+
+Ordinary integration code-only applies to the probe, route-less authority, and
+operator gateway also have a bounded Form-local gate instead of repeating the
+complete repository check. It runs the repository typecheck, all four Form
+Worker typechecks and generated-type checks, import/corpus/package checks, the
+selected surface's runtime and deploy-boundary tests, and four Docker-free
+Worker bundle/closure builds with Container rollout disabled. The caller must
+first prove the existing exact closure and predecessor, selected Host/source
+identity, and absence of drift; it selects this gate once for the invocation.
+Bootstrap, profile/scope/closure/storage/service transitions, production and
+rehearsal retain their existing gates.
+
+The identity probe uses the scoped gate only for an existing full-profile
+update with its current authority present and no drift; Host-only bootstrap or
+profile-preserving updates stay on their previous paths. The operator gateway
+additionally requires its exact scope and dynamic public-identity RPC closure,
+and an exact, source-matched, no-drift authority dependency on the selected
+Host. The route-less authority fast path is narrower still: it requires an
+already-present dynamic-public-RPC authority at exact-target scope and an
+existing generated integration D1/R2 target. The existing D1 UUID/name, R2
+existence, migration-lineage and canonical-schema verification runs before
+the gate and is repeated with identical proof immediately before upload. A
+migration already applied (including 0058) or changed elsewhere is not itself
+a reason to force the complete repository check. For the released-Core
+route-less target, scoped gating also requires the already-selected reusable
+Core verifier identity; a missing or mismatched identity keeps the full gate
+and normal image build. No gate eligibility carries across deploy invocations.
+For generated-storage application-schema verification, only SQL comments and
+ASCII whitespace outside quoted SQL bytes are treated as equivalent in both
+the fresh-generation and read-only target proofs. The source migration digest
+and raw live schema digest remain exact, including at the repeated final proof
+fence.
 
 The verifier's Container name includes the Host id, while its application permits
 only one running instance. A Host-id transition can therefore hit native

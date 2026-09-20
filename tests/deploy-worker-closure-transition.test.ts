@@ -859,8 +859,9 @@ describe("reviewed Worker closure transition", () => {
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect((failure as DeployError).message).toContain(
-        "D1 migration readback differs from the exact audited application schema",
+        "Existing generated D1 schema readback differs from the exact audited application schema",
       );
+      expect((failure as DeployError).phase).toBe("preflight");
       expect(parts.calls.filter((call) => call.includes("--dry-run"))).toHaveLength(1);
       expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
 

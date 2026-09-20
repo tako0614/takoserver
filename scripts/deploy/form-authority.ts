@@ -28,6 +28,7 @@ import {
   verificationError,
 } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
+import { runFormAuthorityCodeGate } from "./form-authority-gate.ts";
 import {
   readPublicHostIdentityProbe,
   runFormAuthorityIdentityProbe,
@@ -39,6 +40,7 @@ import {
 } from "./form-authority-scope-transition.ts";
 import {
   type IntegrationStorageGenerationTargetVerificationOptions,
+  isGeneratedIntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
 import {
@@ -367,6 +369,9 @@ export async function runFormAuthority(
             : { cloudflareEnvironment: options.cloudflareEnvironment }),
           ...options.integrationStorageVerification,
         });
+  let routineIntegrationStorageProof: Awaited<
+    ReturnType<typeof verifyIntegrationStorageGenerationTarget>
+  > | null = null;
   const state =
     options.state ??
     new CloudflareState({
@@ -632,14 +637,24 @@ export async function runFormAuthority(
     }
   }
 
+  const routineExactTargetCoreVerifierReuse =
+    before !== null &&
+    invocation.transition === undefined &&
+    invocation.scopeTransition === undefined &&
+    !bootstrapVerifierBridge &&
+    before.scopeBindingProfile === "exact-target" &&
+    before.bindingTransitionProfile === "none";
+  const declaredTransitionCoreVerifierReuse =
+    before !== null &&
+    invocation.transition !== undefined &&
+    before.bindingTransitionProfile === "declared-delta-predecessor";
   const coreVerifierReusePredecessorVersionId =
     invocation.action === "apply" &&
     invocation.environment === "integration" &&
     selected.kind === "authority" &&
     selected.verificationMode === "released-core" &&
     before !== null &&
-    invocation.transition !== undefined &&
-    before.bindingTransitionProfile === "declared-delta-predecessor"
+    (routineExactTargetCoreVerifierReuse || declaredTransitionCoreVerifierReuse)
       ? before.history.versionId
       : null;
   const initialCoreVerifierReadback =
@@ -699,6 +714,61 @@ export async function runFormAuthority(
       "served integration Form authority Worker differs from the operator gateway source commit",
     );
   }
+
+  const exactSelectedHost =
+    target.formAuthority?.hostId === selected.hostId &&
+    publicIdentityReadback.identity?.hostId === selected.hostId;
+  const exactCurrentFormAuthority =
+    before !== null &&
+    before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+    before.scopeBindingProfile === "exact-target" &&
+    before.bindingTransitionProfile === "none" &&
+    before.drift.length === 0;
+  const exactCurrentGatewayDependency =
+    selected.kind === "authority" ||
+    (dependencySelected !== null &&
+      dependencyBefore !== null &&
+      selected.authorityWorkerName !== undefined &&
+      dependencySelected.workerName === selected.authorityWorkerName &&
+      dependencySelected.hostId === selected.hostId &&
+      dependencyBefore.commit === source.commit &&
+      dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+      dependencyBefore.scopeBindingProfile === "exact-target" &&
+      dependencyBefore.bindingTransitionProfile === "none" &&
+      dependencyBefore.drift.length === 0);
+  const hasGeneratedAuthorityStorageTarget =
+    selected.kind !== "authority" ||
+    isGeneratedIntegrationStorageTarget(target, invocation.environment);
+  const releasedCoreVerifierAlreadyReusable =
+    selected.verificationMode !== "released-core" || reusableCoreVerifierIdentity !== null;
+  const routineIntegrationCodeGateEligible =
+    invocation.action === "apply" &&
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    invocation.scopeTransition === undefined &&
+    transitionDelta === null &&
+    !bootstrapVerifierBridge &&
+    invocation.adoptLivePath === undefined &&
+    exactSelectedHost &&
+    exactCurrentFormAuthority &&
+    exactCurrentGatewayDependency &&
+    hasGeneratedAuthorityStorageTarget &&
+    releasedCoreVerifierAlreadyReusable;
+
+  if (routineIntegrationCodeGateEligible && selected.kind === "authority") {
+    routineIntegrationStorageProof = await verifyIntegrationStorageGenerationTarget(
+      target,
+      invocation.environment,
+      {
+        run,
+        ...(options.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: options.cloudflareEnvironment }),
+        ...options.integrationStorageVerification,
+      },
+    );
+  }
+
   if (transitionDelta?.storageRebind !== undefined) {
     await checked(run, "integration Form authority storage-rebind typecheck", [
       "bun",
@@ -729,6 +799,8 @@ export async function runFormAuthority(
       "tests/deploy-worker-state.test.ts",
       "tests/deploy-contract.test.ts",
     ]);
+  } else if (routineIntegrationCodeGateEligible) {
+    await runFormAuthorityCodeGate(run, invocation.surface);
   } else {
     await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
   }
@@ -844,7 +916,8 @@ export async function runFormAuthority(
         );
       }
     }
-    if (initialStorageProof !== null) {
+    const storageProofForFinalFence = initialStorageProof ?? routineIntegrationStorageProof;
+    if (storageProofForFinalFence !== null) {
       const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
         target,
         invocation.environment,
@@ -856,7 +929,7 @@ export async function runFormAuthority(
           ...options.integrationStorageVerification,
         },
       );
-      if (JSON.stringify(initialStorageProof) !== JSON.stringify(finalStorageProof)) {
+      if (JSON.stringify(storageProofForFinalFence) !== JSON.stringify(finalStorageProof)) {
         throw preflightError(
           "generated integration storage target or schema changed before publication",
         );

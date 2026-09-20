@@ -277,6 +277,158 @@ describe("integration Host-only identity probe bootstrap profile", () => {
     .digest("hex")}` as const;
   const UPDATED_PROBE_VERSION = "99999999-9999-4999-8999-999999999999";
 
+  test("uses the scoped gate for an existing exact full profile with its authority present", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-identity-probe-scoped-gate-"));
+    const probePublished = { value: true };
+    const uploaded = { value: false };
+    const calls: string[][] = [];
+    const base = hostOnlyState(probePublished, integrationHostOnlyTarget, {
+      publicCommit: UPDATED_PROFILE_COMMIT,
+    });
+    const fullBindings = [
+      {
+        name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+        type: "plain_text",
+        text: integrationHostOnlyTarget.formAuthority.hostId,
+      },
+      {
+        name: "PUBLIC_HOST_IDENTITY",
+        type: "service",
+        service: integrationHostOnlyTarget.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+      {
+        name: "FORM_AUTHORITY",
+        type: "service",
+        service: integrationHostOnlyTarget.formAuthority.workerName,
+        entrypoint: "FormAuthorityEntrypoint",
+      },
+    ];
+    const state: FormAuthorityIdentityProbeState = {
+      ...base,
+      async workerScripts() {
+        return [
+          ...(await base.workerScripts()),
+          integrationHostOnlyTarget.formAuthority.workerName,
+        ];
+      },
+      async workerDeployments(workerName) {
+        if (workerName !== integrationHostOnlyTarget.formAuthority.identityProbeWorkerName) {
+          return await base.workerDeployments(workerName);
+        }
+        return uploaded.value
+          ? [
+              {
+                id: "probe-update-deployment",
+                created_on: "2026-09-02T02:00:00Z",
+                versions: [{ version_id: UPDATED_PROBE_VERSION, percentage: 100 }],
+              },
+              {
+                id: "probe-deployment",
+                created_on: "2026-09-02T01:00:00Z",
+                versions: [{ version_id: PROBE_VERSION, percentage: 100 }],
+              },
+            ]
+          : [
+              {
+                id: "probe-deployment",
+                created_on: "2026-09-02T01:00:00Z",
+                versions: [{ version_id: PROBE_VERSION, percentage: 100 }],
+              },
+            ];
+      },
+      async workerVersion(workerName, versionId) {
+        const current = await base.workerVersion(workerName, versionId);
+        if (workerName === integrationHostOnlyTarget.workerName) return current;
+        const version = current as {
+          readonly annotations: Readonly<Record<string, unknown>>;
+        };
+        return {
+          ...version,
+          annotations: {
+            ...version.annotations,
+            "workers/message": uploaded.value
+              ? `form-authority-identity-probe:${UPDATED_PROFILE_COMMIT}:${UPDATED_PROBE_DIGEST}`
+              : `form-authority-identity-probe:${PROFILE_COMMIT}:${PROBE_DIGEST}`,
+          },
+          resources: { bindings: fullBindings },
+        };
+      },
+    };
+
+    try {
+      const result = await runFormAuthorityIdentityProbe(
+        {
+          surface: "takoserver-form-authority-identity-probe",
+          action: "apply",
+          environment: "integration",
+          commit: UPDATED_PROFILE_COMMIT,
+        },
+        integrationHostOnlyTarget,
+        {
+          state,
+          fetcher: hostOnlyFetcher(),
+          review: "independent-reviewer",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          run: async (command) => {
+            calls.push([...command]);
+            const key = command.join(" ");
+            if (key === "git rev-parse HEAD") return ok(`${UPDATED_PROFILE_COMMIT}\n`);
+            if (key === "git branch --show-current")
+              return ok("fix/integration-probe-full-profile\n");
+            if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
+            if (
+              [
+                "bun run typecheck",
+                "bun run typecheck:form-authority-worker",
+                "bun run check:form-authority-worker-types",
+                "bun run check:imports",
+                "bun run check:form-corpora",
+                "bun run check:integration-form-packages",
+                "bun run build:form-authority-worker",
+              ].includes(key) ||
+              (command[0] === "bun" && command[1] === "test")
+            ) {
+              return ok("green\n");
+            }
+            if (command.includes("--dry-run")) {
+              const out = command[command.indexOf("--outdir") + 1];
+              if (!out) throw new Error("dry-run outdir missing");
+              mkdirSync(out, { recursive: true });
+              writeFileSync(
+                join(out, "worker.js"),
+                out.includes("public-worker-proof") ? PUBLIC_BUNDLE : UPDATED_PROBE_BUNDLE,
+              );
+              writeFileSync(join(out, "worker.js.map"), "{}\n");
+              return ok("built\n");
+            }
+            if (command.includes("--no-bundle")) {
+              uploaded.value = true;
+              return ok("uploaded\n");
+            }
+            throw new Error(`unexpected command: ${key}`);
+          },
+        },
+      );
+
+      const commands = calls.map((command) => command.join(" "));
+      const runtimeTests = calls.find((command) => command[1] === "test");
+      expect(result).toMatchObject({
+        probeProfile: null,
+        formAuthorityWorkerPresent: true,
+        previousVersionId: PROBE_VERSION,
+        ready: true,
+      });
+      expect(commands).not.toContain("bun run check");
+      expect(commands).toContain("bun run typecheck");
+      expect(commands).toContain("bun run build:form-authority-worker");
+      expect(runtimeTests).toContain("tests/form-authority-identity-probe.test.ts");
+      expect(calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("publishes the exact Host-only closure when both native Workers are absent", async () => {
     const uploaded = { value: false };
     const uploads: string[][] = [];
@@ -358,6 +510,8 @@ describe("integration Host-only identity probe bootstrap profile", () => {
       "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
       "PUBLIC_HOST_IDENTITY",
     ]);
+    expect(uploads).toContainEqual(["bun", "run", "check"]);
+    expect(uploads.some((command) => command.join(" ") === "bun run typecheck")).toBe(false);
   });
 
   test("status recognizes the emitted Host-only profile without inventing Core readiness", async () => {
@@ -498,6 +652,8 @@ describe("integration Host-only identity probe bootstrap profile", () => {
         entrypoint: "PublicHostIdentityEntrypoint",
       },
     ]);
+    expect(uploads).toContainEqual(["bun", "run", "check"]);
+    expect(uploads.some((command) => command.join(" ") === "bun run typecheck")).toBe(false);
   });
 
   test("refuses an existing Host-only update after Core appears instead of auto-transitioning", async () => {

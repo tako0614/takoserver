@@ -76,6 +76,51 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
   };
 }
 
+interface TestSchemaRow {
+  type: string;
+  name: string;
+  table: string;
+  sql: string;
+}
+
+function schemaRows(value: D1SchemaState): TestSchemaRow[] {
+  return JSON.parse(value.shape) as TestSchemaRow[];
+}
+
+function stateWithSchemaRows(base: D1SchemaState, rows: readonly TestSchemaRow[]): D1SchemaState {
+  const canonicalRows = [...rows].sort((left, right) =>
+    `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+  );
+  const shape = canonicalSchemaShape(
+    canonicalRows.map(({ type, name, table, sql }) => ({ type, name, tbl_name: table, sql })),
+  );
+  return stateWithShape(base.applied, shape);
+}
+
+function editedTriggerState(base: D1SchemaState, edit: (sql: string) => string): D1SchemaState {
+  return editedSchemaSqlState(
+    base,
+    "cloudflare_managed_worker_version_execution_material_exact_insert",
+    edit,
+  );
+}
+
+function editedSchemaSqlState(
+  base: D1SchemaState,
+  name: string,
+  edit: (sql: string) => string,
+): D1SchemaState {
+  let changed = false;
+  const rows = schemaRows(base).map((row) => {
+    if (row.name !== name) return row;
+    const sql = edit(row.sql);
+    changed = sql !== row.sql;
+    return { ...row, sql };
+  });
+  if (!changed) throw new Error(`schema test edit did not change ${name}`);
+  return stateWithSchemaRows(base, rows);
+}
+
 function applicationShape(directory: string): string {
   const database = new Database(":memory:");
   try {
@@ -263,6 +308,147 @@ describe("integration storage generation bootstrap", () => {
     expect(calls).toEqual([`getD1:${DATABASE_ID}`, `getR2:${GENERATED_NAME}`]);
   });
 
+  test("generated application schema comparison ignores only SQL trivia and keeps raw digests", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const triviaState = editedTriggerState(completeState, (sql) =>
+      `-- readback-only comment\n${sql}`
+        .replace("CREATE TRIGGER", "CREATE/* harmless block comment */TRIGGER")
+        .replace("BEFORE INSERT", "BEFORE\t \nINSERT"),
+    );
+    expect(triviaState.shapeDigest).not.toBe(completeState.shapeDigest);
+
+    const readProvider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        return { uuid: databaseId, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      provider: readProvider,
+      reader: {
+        async read() {
+          return triviaState;
+        },
+      },
+      migrationDirectory: currentMigrations,
+    });
+    expect(proof.schemaShapeDigest).toBe(triviaState.shapeDigest);
+    expect(proof.schemaShapeDigest).not.toBe(completeState.shapeDigest);
+
+    const fresh = providerFixture();
+    const process = processFixture();
+    const result = await runIntegrationStorageGeneration(
+      invocation,
+      target,
+      options(fresh.provider, [emptyState, triviaState], process),
+    );
+    expect(result.schemaShapeDigest).toBe(triviaState.shapeDigest);
+    expect(result.schemaShapeDigest).not.toBe(completeState.shapeDigest);
+    expect(fresh.calls).toContain(`createR2:${GENERATED_NAME}`);
+  });
+
+  test("generated schema proof rejects semantic, structural, malformed, and raw-digest drift", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        return { uuid: databaseId, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const verify = async (readState: D1SchemaState): Promise<Error> =>
+      await rejectedError(
+        verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+          provider,
+          reader: {
+            async read() {
+              return readState;
+            },
+          },
+          migrationDirectory: currentMigrations,
+        }),
+      );
+    const expectPreflight = async (readState: D1SchemaState): Promise<void> => {
+      const error = await verify(readState);
+      expect(error).toBeInstanceOf(DeployError);
+      if (!(error instanceof DeployError)) throw error;
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("Existing generated D1 schema readback");
+    };
+
+    const semanticChanges: readonly [string, (sql: string) => string][] = [
+      ["literal", (sql) => sql.replace("'version'", "'versions'")],
+      ["identifier", (sql) => sql.replace("NEW.provider_id", "NEW.providerId")],
+      ["operator", (sql) => sql.replace(") = 2", ") != 2")],
+      ["predicate", (sql) => sql.replace("WHEN NOT EXISTS", "WHEN EXISTS")],
+      ["action", (sql) => sql.replace("RAISE(ABORT", "RAISE(FAIL")],
+      ["quoted literal bytes", (sql) => sql.replace("'version'", "'ver sion'")],
+      [
+        "comment token inside a literal",
+        (sql) =>
+          sql.replace(
+            "'managed_worker_version_execution_material_receipt_not_exact'",
+            "'managed_worker_version_execution_material_receipt/*note*/_not_exact'",
+          ),
+      ],
+    ];
+    for (const [, edit] of semanticChanges)
+      await expectPreflight(editedTriggerState(completeState, edit));
+
+    const quotedIdentifierChanges: readonly [string, (sql: string) => string][] = [
+      ["double-quoted identifier", (sql) => sql.replace('"principals"', '"principals--marker"')],
+      [
+        "backtick-quoted identifier",
+        (sql) => sql.replace('"principals"', "`principals/*marker*/`"),
+      ],
+      ["bracket-quoted identifier", (sql) => sql.replace('"principals"', "[principals--marker]")],
+    ];
+    for (const [, edit] of quotedIdentifierChanges) {
+      await expectPreflight(editedSchemaSqlState(completeState, "principals", edit));
+    }
+
+    const malformedSql: readonly [string, (sql: string) => string][] = [
+      ["single quote", (sql) => `${sql} 'unterminated`],
+      ["double quote", (sql) => `${sql} "unterminated`],
+      ["backtick", (sql) => `${sql} \`unterminated`],
+      ["bracket identifier", (sql) => `${sql} [unterminated`],
+      ["block comment", (sql) => `${sql} /* unterminated`],
+    ];
+    for (const [, edit] of malformedSql)
+      await expectPreflight(editedTriggerState(completeState, edit));
+
+    const rowCases: readonly [string, (rows: TestSchemaRow[]) => TestSchemaRow[]][] = [
+      ["inventory", (rows) => rows.slice(1)],
+      ["type", (rows) => rows.map((row, index) => (index === 0 ? { ...row, type: "view" } : row))],
+      [
+        "name",
+        (rows) =>
+          rows.map((row, index) => (index === 0 ? { ...row, name: `${row.name}-changed` } : row)),
+      ],
+      [
+        "table",
+        (rows) =>
+          rows.map((row, index) => (index === 0 ? { ...row, table: `${row.table}-changed` } : row)),
+      ],
+    ];
+    for (const [, change] of rowCases) {
+      await expectPreflight(stateWithSchemaRows(completeState, change(schemaRows(completeState))));
+    }
+
+    await expectPreflight({ ...completeState, shapeDigest: `sha256:${"0".repeat(64)}` });
+  });
+
   test("storage rebind verifier uses the composing owner's Wrangler for OAuth and D1 readback", async () => {
     const generatedTarget = {
       ...target,
@@ -383,7 +569,7 @@ describe("integration storage generation bootstrap", () => {
     expect(reads).toBe(0);
   });
 
-  test("storage rebind verifier rejects wrong provider identity and non-canonical schema", async () => {
+  test("read-only storage proof classifies a schema mismatch as preflight", async () => {
     const generatedTarget = {
       ...target,
       d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
@@ -409,11 +595,14 @@ describe("integration storage generation bootstrap", () => {
       }),
     ).rejects.toThrow("D1 identity readback does not match");
 
+    const reads: string[] = [];
     const exactProvider: IntegrationStorageTargetReadProvider = {
       async getD1() {
+        reads.push("D1");
         return { uuid: DATABASE_ID, name: GENERATED_NAME };
       },
       async getR2(name) {
+        reads.push("R2");
         return { name };
       },
     };
@@ -421,17 +610,24 @@ describe("integration storage generation bootstrap", () => {
       MIGRATIONS.slice(0, 56).map(({ name }) => name),
       [],
     );
-    await expect(
+    const mismatch = await rejectedError(
       verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
         provider: exactProvider,
         reader: {
-          async read() {
+          async read(phase) {
+            reads.push(`schema:${phase}`);
             return incomplete;
           },
         },
         migrationDirectory: currentMigrations,
       }),
-    ).rejects.toThrow("exact audited 0001-0058 lineage");
+    );
+    expect(mismatch).toBeInstanceOf(DeployError);
+    if (!(mismatch instanceof DeployError)) throw mismatch;
+    expect(mismatch.phase).toBe("preflight");
+    expect(mismatch.message).toContain("exact audited 0001-0058 lineage");
+    expect(mismatch.message).not.toContain("R2 creation is withheld");
+    expect(reads).toEqual(["D1", "R2", "schema:preflight"]);
   });
 
   test("D1 filtered inventory ignores account-wide total_count and closes on a short page", async () => {
@@ -677,17 +873,21 @@ describe("integration storage generation bootstrap", () => {
     expect(failed.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrong = providerFixture();
-    await expect(
+    const wrongError = await rejectedError(
       runIntegrationStorageGeneration(
         invocation,
         target,
         options(wrong.provider, [emptyState, state(["0001_runtime_storage.sql"], [])]),
       ),
-    ).rejects.toThrow("exact audited 0001-0058 lineage");
+    );
+    expect(wrongError).toBeInstanceOf(DeployError);
+    if (!(wrongError instanceof DeployError)) throw wrongError;
+    expect(wrongError.phase).toBe("verification");
+    expect(wrongError.message).toContain("exact audited 0001-0058 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
-    await expect(
+    const wrongShapeError = await rejectedError(
       runIntegrationStorageGeneration(
         invocation,
         target,
@@ -699,7 +899,11 @@ describe("integration storage generation bootstrap", () => {
           ),
         ]),
       ),
-    ).rejects.toThrow("differs from the exact audited application schema");
+    );
+    expect(wrongShapeError).toBeInstanceOf(DeployError);
+    if (!(wrongShapeError instanceof DeployError)) throw wrongShapeError;
+    expect(wrongShapeError.phase).toBe("verification");
+    expect(wrongShapeError.message).toContain("differs from the exact audited application schema");
     expect(wrongShape.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const raced = providerFixture({ secondR2: { name: GENERATED_NAME } });

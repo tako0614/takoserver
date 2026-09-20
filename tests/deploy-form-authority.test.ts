@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import {
+  type FormAuthorityDeployOptions,
   type FormAuthorityDeployState,
   type FormAuthorityProcess,
   publicFormCapabilityManifest,
@@ -12,6 +13,8 @@ import {
   takoformCoreVerifierArtifactDigest,
   writeFormAuthorityConfig,
 } from "../scripts/deploy/form-authority.ts";
+import { isGeneratedIntegrationStorageTarget } from "../scripts/deploy/integration-storage-generation.ts";
+import { canonicalSchemaShape } from "../scripts/deploy/migrations.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
@@ -26,7 +29,10 @@ import {
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
-import { integrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
+import {
+  completeIntegrationStorageState,
+  integrationStorageVerificationOptions,
+} from "./helpers/integration-storage-generation-verification.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -46,6 +52,16 @@ const FORM_STORAGE_NAME = `takoserver-i-${"f".repeat(32)}`;
 const FORM_PREDECESSOR_STORAGE_BUCKET = `takoserver-i-${"e".repeat(32)}`;
 const FORM_PREDECESSOR_HOST_ID = "https://api.previous.integration.example.test";
 const FORM_PREDECESSOR_PUBLIC_SERVICE = "takoserver-api-integration-previous";
+const SUCCESSFUL_FORM_GATE_COMMANDS = new Set([
+  "bun run check",
+  "bun run typecheck",
+  "bun run typecheck:form-authority-worker",
+  "bun run check:form-authority-worker-types",
+  "bun run check:imports",
+  "bun run check:form-corpora",
+  "bun run check:integration-form-packages",
+  "bun run build:form-authority-worker",
+]);
 const BUNDLE = "export default class FormAuthorityEntrypoint {}\n";
 const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('public'); } };\n";
 const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex")}` as const;
@@ -163,11 +179,7 @@ function fakeProcess(input?: { readonly onUpload?: () => void; readonly failUplo
     if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (key === "git branch --show-current") return ok("feature/form-authority\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
-    if (
-      key === "bun run check" ||
-      key === "bun run typecheck:form-authority-worker" ||
-      (command[0] === "bun" && command[1] === "test")
-    ) {
+    if (SUCCESSFUL_FORM_GATE_COMMANDS.has(key) || (command[0] === "bun" && command[1] === "test")) {
       return ok("");
     }
     if (command.includes("--dry-run")) {
@@ -201,6 +213,7 @@ function stateSequence(
     readonly legacyBoundVersionId?: string;
     readonly legacyBoundArtifactDigest?: `sha256:${string}`;
     readonly legacyCommit?: string;
+    readonly dynamicBefore?: boolean;
   },
   inspectedTarget: DeployTarget = target,
 ): FormAuthorityDeployState {
@@ -256,13 +269,15 @@ function stateSequence(
       const current = versionId === CURRENT_AUTHORITY_VERSION_ID;
       const commit = current ? COMMIT : (input?.legacyCommit ?? PREVIOUS_COMMIT);
       const artifactDigest = current ? BUNDLE_DIGEST : PREVIOUS_DIGEST;
-      return current
-        ? dynamicVersion(commit, artifactDigest)
+      return current || input?.dynamicBefore === true
+        ? dynamicVersion(commit, artifactDigest, undefined, inspectedTarget)
         : version(
             commit,
             artifactDigest,
             input?.legacyBoundVersionId ?? PREVIOUS_PUBLIC_WORKER_VERSION_ID,
             input?.legacyBoundArtifactDigest ?? PREVIOUS_PUBLIC_WORKER_DIGEST,
+            undefined,
+            inspectedTarget,
           );
     },
     async workerSecrets(workerName) {
@@ -356,6 +371,7 @@ function version(
   publicWorkerArtifactDigest: `sha256:${string}` = PUBLIC_WORKER_DIGEST,
   scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
     .integrationOperatorScope,
+  inspectedTarget: DeployTarget = target,
 ) {
   return {
     annotations: {
@@ -363,13 +379,17 @@ function version(
     },
     resources: {
       bindings: [
-        { type: "d1", name: "STATE_DB", id: target.d1.databaseId },
-        { type: "r2_bucket", name: "OBJECTS", bucket_name: target.r2.bucketName },
-        { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: "integration" },
+        { type: "d1", name: "STATE_DB", id: inspectedTarget.d1.databaseId },
+        { type: "r2_bucket", name: "OBJECTS", bucket_name: inspectedTarget.r2.bucketName },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_ENVIRONMENT",
+          text: inspectedTarget.environment,
+        },
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
-          text: target.formAuthority.hostId,
+          text: inspectedTarget.formAuthority?.hostId,
         },
         {
           type: "plain_text",
@@ -404,7 +424,7 @@ function version(
         {
           type: "service",
           name: "PUBLIC_HOST_IDENTITY",
-          service: target.workerName,
+          service: inspectedTarget.workerName,
           entrypoint: "PublicHostIdentityEntrypoint",
         },
       ],
@@ -417,6 +437,7 @@ function dynamicVersion(
   artifactDigest: `sha256:${string}`,
   scope: { readonly tenantId: string; readonly space: string } = target.formAuthority
     .integrationOperatorScope,
+  inspectedTarget: DeployTarget = target,
 ) {
   const value = version(
     commit,
@@ -424,6 +445,7 @@ function dynamicVersion(
     PUBLIC_WORKER_VERSION_ID,
     PUBLIC_WORKER_DIGEST,
     scope,
+    inspectedTarget,
   );
   value.resources.bindings = value.resources.bindings.filter(
     ({ name }) =>
@@ -1129,7 +1151,387 @@ function ok(stdout: string) {
   return { exitCode: 0, stdout, stderr: "" };
 }
 
+describe("ordinary integration Form code gate", () => {
+  test("recognizes only an exact parser-approved generated D1/R2 pair", () => {
+    expect(isGeneratedIntegrationStorageTarget(formStorageTarget, "integration")).toBe(true);
+    expect(isGeneratedIntegrationStorageTarget(target, "integration")).toBe(false);
+    expect(isGeneratedIntegrationStorageTarget(formStorageTarget, "production")).toBe(false);
+  });
+
+  test("gates the exact route-less target and fences its already-applied 0058 schema twice", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-generated-target-"));
+    let uploaded = false;
+    let d1Reads = 0;
+    let r2Reads = 0;
+    let schemaReads = 0;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const completeState = completeIntegrationStorageState();
+      expect(completeState.applied).toContain("0058_cloudflare_managed_worker_domain_receipts.sql");
+      const storageVerification = integrationStorageVerificationOptions(formStorageTarget, {
+        provider: {
+          async getD1(databaseId) {
+            d1Reads += 1;
+            return { uuid: databaseId, name: FORM_STORAGE_NAME };
+          },
+          async getR2(name) {
+            r2Reads += 1;
+            return { name };
+          },
+        },
+        readState: async () => {
+          schemaReads += 1;
+          return completeState;
+        },
+      });
+      await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        formStorageTarget,
+        {
+          run: process.run,
+          state: stateSequence(
+            { isUploaded: () => uploaded, dynamicBefore: true },
+            formStorageTarget,
+          ),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+          integrationStorageVerification: storageVerification,
+        },
+      );
+
+      const commands = process.calls.map((command) => command.join(" "));
+      expect(commands).not.toContain("bun run check");
+      expect(commands).toContain("bun run typecheck");
+      expect(commands).toContain("bun run check:form-authority-worker-types");
+      expect(commands).toContain("bun run build:form-authority-worker");
+      expect(schemaReads).toBe(2);
+      expect(d1Reads).toBe(2);
+      expect(r2Reads).toBe(2);
+      expect(uploaded).toBe(true);
+      expect(process.calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses raw schema proof drift between trivia-equivalent generated-target fences", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-raw-schema-drift-"));
+    let uploaded = false;
+    let schemaReads = 0;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const firstState = completeIntegrationStorageState();
+      const rows = JSON.parse(firstState.shape) as {
+        readonly type: string;
+        readonly name: string;
+        readonly table: string;
+        readonly sql: string;
+      }[];
+      let changed = false;
+      const changedRows = rows.map((row) => {
+        if (row.name !== "cloudflare_managed_worker_version_execution_material_exact_insert") {
+          return row;
+        }
+        changed = true;
+        return { ...row, sql: row.sql.replace("CREATE TRIGGER", "CREATE  TRIGGER") };
+      });
+      if (!changed) throw new Error("expected the generated storage schema trigger");
+      const secondShape = canonicalSchemaShape(
+        changedRows.map(({ type, name, table, sql }) => ({ type, name, tbl_name: table, sql })),
+      );
+      const secondState = {
+        ...firstState,
+        shape: secondShape,
+        shapeDigest: `sha256:${createHash("sha256").update(secondShape).digest("hex")}`,
+      };
+      expect(secondState.shapeDigest).not.toBe(firstState.shapeDigest);
+
+      const storageVerification = integrationStorageVerificationOptions(formStorageTarget, {
+        readState: async () => {
+          schemaReads += 1;
+          return schemaReads === 1 ? firstState : secondState;
+        },
+      });
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        formStorageTarget,
+        {
+          run: process.run,
+          state: stateSequence(
+            { isUploaded: () => uploaded, dynamicBefore: true },
+            formStorageTarget,
+          ),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+          integrationStorageVerification: storageVerification,
+        },
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      if (!(failure instanceof DeployError)) throw failure;
+      expect(failure.phase).toBe("preflight");
+      expect(failure.message).toContain("generated integration storage target or schema changed");
+      expect(schemaReads).toBe(2);
+      expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+      expect(uploaded).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["missing D1", "drifting schema"] as const)(
+    "refuses a %s before the scoped gate or upload",
+    async (failureKind) => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-storage-refusal-"));
+      let uploaded = false;
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const completeState = completeIntegrationStorageState();
+      const storageVerification =
+        failureKind === "missing D1"
+          ? integrationStorageVerificationOptions(formStorageTarget, {
+              provider: {
+                async getD1() {
+                  throw new Error("database missing");
+                },
+                async getR2(name) {
+                  return { name };
+                },
+              },
+            })
+          : integrationStorageVerificationOptions(formStorageTarget, {
+              readState: async () => ({
+                ...completeState,
+                applied: completeState.applied.filter(
+                  (name) => name !== "0058_cloudflare_managed_worker_domain_receipts.sql",
+                ),
+              }),
+            });
+      try {
+        const failure = await runFormAuthority(
+          {
+            surface: "takoserver-integration-form-authority-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          formStorageTarget,
+          {
+            run: process.run,
+            state: stateSequence(
+              { isUploaded: () => uploaded, dynamicBefore: true },
+              formStorageTarget,
+            ),
+            outputDirectory: root,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            review: "independent-reviewer",
+            integrationStorageVerification: storageVerification,
+          },
+        ).catch((error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).phase).toBe("preflight");
+        expect(process.calls.some((command) => command[1] === "test")).toBe(false);
+        expect(process.calls.some((command) => command.includes("--dry-run"))).toBe(false);
+        expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+        expect(uploaded).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("a real runtime test failure stops before the Form build and upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-runtime-failure-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const run: FormAuthorityProcess = async (command, options) => {
+        if (command[1] === "test") {
+          return { exitCode: 1, stdout: "runtime test failed", stderr: "" };
+        }
+        return await process.run(command, options);
+      };
+      const failure = await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        formStorageTarget,
+        {
+          run,
+          state: stateSequence(
+            { isUploaded: () => uploaded, dynamicBefore: true },
+            formStorageTarget,
+          ),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+          integrationStorageVerification: integrationStorageVerificationOptions(formStorageTarget),
+        },
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as DeployError).message).toContain("Form code gate bun test");
+      expect(
+        process.calls.some(
+          (command) => command.join(" ") === "bun run build:form-authority-worker",
+        ),
+      ).toBe(false);
+      expect(process.calls.some((command) => command.includes("--dry-run"))).toBe(false);
+      expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+      expect(uploaded).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the full owner gate for an exact but non-generated legacy storage target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-legacy-target-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state: stateSequence({ isUploaded: () => uploaded, dynamicBefore: true }),
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+      expect(process.calls).toContainEqual(["bun", "run", "check"]);
+      expect(process.calls.some((command) => command.join(" ") === "bun run typecheck")).toBe(
+        false,
+      );
+      expect(uploaded).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("route-less Form authority deploy surfaces", () => {
+  test("gates an ordinary operator update only when its current authority dependency is exact", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-gateway-code-gate-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const base = gatewayState();
+      const state: FormAuthorityDeployState = {
+        ...base,
+        async workerDeployments(workerName) {
+          if (workerName !== target.formAuthority.integrationOperatorWorkerName) {
+            return await base.workerDeployments(workerName);
+          }
+          return uploaded
+            ? [
+                deployment("gateway-current", GATEWAY_CURRENT_VERSION_ID, "2026-08-28T03:00:00Z"),
+                deployment(
+                  "gateway-predecessor",
+                  GATEWAY_PREVIOUS_VERSION_ID,
+                  "2026-08-28T02:00:00Z",
+                ),
+              ]
+            : [
+                deployment(
+                  "gateway-predecessor",
+                  GATEWAY_PREVIOUS_VERSION_ID,
+                  "2026-08-28T02:00:00Z",
+                ),
+              ];
+        },
+        async workerVersion(workerName, versionId) {
+          if (workerName === target.formAuthority.integrationOperatorWorkerName) {
+            return gatewayVersion();
+          }
+          return await base.workerVersion(workerName, versionId);
+        },
+      };
+      await runFormAuthority(
+        {
+          surface: "takoserver-integration-form-authority-operator-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        {
+          run: process.run,
+          state,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "independent-reviewer",
+        },
+      );
+
+      const commands = process.calls.map((command) => command.join(" "));
+      const runtimeTests = process.calls.find((command) => command[1] === "test");
+      expect(commands).not.toContain("bun run check");
+      expect(commands).toContain("bun run typecheck");
+      expect(runtimeTests).toContain("tests/integration-form-authority-gateway.test.ts");
+      expect(uploaded).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not select the gateway code gate for an inexact authority dependency", async () => {
+    const process = fakeProcess();
+    const base = gatewayState();
+    const state: FormAuthorityDeployState = {
+      ...base,
+      async workerVersion(workerName, versionId) {
+        if (workerName === target.formAuthority.integrationWorkerName) {
+          return dynamicVersion(COMMIT, BUNDLE_DIGEST, {
+            tenantId: "foreign-tenant",
+            space: "foreign-space",
+          });
+        }
+        return await base.workerVersion(workerName, versionId);
+      },
+    };
+    const failure = await runFormAuthority(
+      {
+        surface: "takoserver-integration-form-authority-operator-worker",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      {
+        run: process.run,
+        state,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        review: "independent-reviewer",
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(process.calls.some((command) => command.join(" ") === "bun run typecheck")).toBe(false);
+    expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+  });
+
   test("writes one route-less released-Core Container with exact build identity", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-core-config-"));
     try {
@@ -3250,8 +3652,9 @@ describe("released-Core Form authority bootstrap", () => {
   function releasedCoreVersion(
     commit: string,
     artifactDigest: `sha256:${string}`,
-    inspectedTarget: typeof target | typeof formStorageTarget = target,
+    inspectedTarget: DeployTarget = target,
   ) {
+    const formAuthority = requiredFormAuthority(inspectedTarget);
     return {
       annotations: {
         "workers/message": `form-authority:takoserver-form-authority-worker:${commit}:${artifactDigest}`,
@@ -3273,12 +3676,12 @@ describe("released-Core Form authority bootstrap", () => {
           {
             type: "plain_text" as const,
             name: "TAKOSERVER_ENVIRONMENT",
-            text: "integration",
+            text: inspectedTarget.environment,
           },
           {
             type: "plain_text" as const,
             name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
-            text: inspectedTarget.formAuthority.hostId,
+            text: formAuthority.hostId,
           },
           {
             type: "plain_text" as const,
@@ -3308,15 +3711,16 @@ describe("released-Core Form authority bootstrap", () => {
       readonly isUploaded?: () => boolean;
       readonly declaredTransitionPredecessor?: boolean;
     },
-    inspectedTarget: typeof target | typeof formStorageTarget = target,
+    inspectedTarget: DeployTarget = target,
   ): FormAuthorityDeployState {
+    const formAuthority = requiredFormAuthority(inspectedTarget);
     const live = () => input.present || (input.isUploaded?.() ?? false);
     return {
       async workerScripts() {
         return [
-          inspectedTarget.formAuthority.integrationWorkerName,
-          inspectedTarget.formAuthority.identityProbeWorkerName,
-          ...(live() ? [inspectedTarget.formAuthority.workerName] : []),
+          formAuthority.integrationWorkerName,
+          formAuthority.identityProbeWorkerName,
+          ...(live() ? [formAuthority.workerName] : []),
         ];
       },
       async workerDeployments(workerName) {
@@ -3325,7 +3729,7 @@ describe("released-Core Form authority bootstrap", () => {
             deployment("public-deployment", PUBLIC_WORKER_VERSION_ID, "2026-08-28T00:00:00Z"),
           ];
         }
-        if (workerName === inspectedTarget.formAuthority.identityProbeWorkerName) {
+        if (workerName === formAuthority.identityProbeWorkerName) {
           return [
             deployment(
               "identity-probe-predecessor",
@@ -3359,7 +3763,7 @@ describe("released-Core Form authority bootstrap", () => {
             inspectedTarget,
           );
         }
-        if (workerName === inspectedTarget.formAuthority.identityProbeWorkerName) {
+        if (workerName === formAuthority.identityProbeWorkerName) {
           return {
             annotations: {
               "workers/message": `form-authority-identity-probe:${COMMIT}:${BUNDLE_DIGEST}`,
@@ -3369,7 +3773,7 @@ describe("released-Core Form authority bootstrap", () => {
                 {
                   type: "plain_text",
                   name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
-                  text: inspectedTarget.formAuthority.hostId,
+                  text: formAuthority.hostId,
                 },
                 {
                   type: "service",
@@ -3420,13 +3824,26 @@ describe("released-Core Form authority bootstrap", () => {
       },
       async workerSubdomain(workerName) {
         return {
-          enabled: workerName === inspectedTarget.formAuthority.identityProbeWorkerName,
+          enabled: workerName === formAuthority.identityProbeWorkerName,
           previewsEnabled: false,
         };
       },
       async workerRoutes() {
         return [];
       },
+    };
+  }
+
+  function requiredFormAuthority(
+    inspectedTarget: DeployTarget,
+  ): NonNullable<DeployTarget["formAuthority"]> & { readonly integrationWorkerName: string } {
+    const formAuthority = inspectedTarget.formAuthority;
+    if (formAuthority === undefined || formAuthority.integrationWorkerName === undefined) {
+      throw new Error("released-Core test target must have an integration Form authority worker");
+    }
+    return {
+      ...formAuthority,
+      integrationWorkerName: formAuthority.integrationWorkerName,
     };
   }
 
@@ -3537,6 +3954,114 @@ describe("released-Core Form authority bootstrap", () => {
     );
   }
 
+  async function applyRoutineExactTarget(input: {
+    readonly run: FormAuthorityProcess;
+    readonly state: FormAuthorityDeployState;
+    readonly fetcher: (url: string, init?: RequestInit) => Promise<Response>;
+    readonly outputDirectory: string;
+    readonly target?: DeployTarget;
+    readonly integrationStorageVerification?: FormAuthorityDeployOptions["integrationStorageVerification"];
+  }) {
+    const selectedTarget = input.target ?? target;
+    return await runFormAuthorityImpl(
+      { ...invocation, action: "apply", environment: selectedTarget.environment },
+      selectedTarget,
+      {
+        run: input.run,
+        state: input.state,
+        fetcher: input.fetcher,
+        outputDirectory: input.outputDirectory,
+        review: "independent-reviewer",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        ...(input.integrationStorageVerification === undefined
+          ? {}
+          : { integrationStorageVerification: input.integrationStorageVerification }),
+      },
+    );
+  }
+
+  test("uses the scoped gate only after proving generated storage and reusable Core identity", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-core-scoped-gate-"));
+    let uploaded = false;
+    let schemaReads = 0;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
+      ]);
+      const state = completeIntegrationStorageState();
+      const result = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }, formStorageTarget),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+        target: formStorageTarget,
+        integrationStorageVerification: integrationStorageVerificationOptions(formStorageTarget, {
+          readState: async () => {
+            schemaReads += 1;
+            return state;
+          },
+        }),
+      });
+
+      const commands = process.calls.map((command) => command.join(" "));
+      expect(commands).not.toContain("bun run check");
+      expect(commands).toContain("bun run typecheck");
+      expect(commands).toContain("bun run check:form-authority-worker-types");
+      expect(commands).toContain("bun run build:form-authority-worker");
+      expect(schemaReads).toBe(2);
+      expect(probes.coreProbeCount()).toBe(3);
+      expect(result).toMatchObject({
+        previousVersionId: RELEASED_CORE_VERSION_ID,
+        versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+        coreVerifierRpcReady: true,
+      });
+      expect(uploaded).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the native build and full gate when the Core image is not reusable", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-core-full-gate-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        {
+          authorityWorkerVersionId: RELEASED_CORE_VERSION_ID,
+          artifactDigest: PREVIOUS_DIGEST,
+        },
+        { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
+      ]);
+      const result = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }, formStorageTarget),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+        target: formStorageTarget,
+        integrationStorageVerification: integrationStorageVerificationOptions(formStorageTarget),
+      });
+
+      const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+      const upload = process.calls.find((command) => command.includes("--no-bundle"));
+      expect(process.calls).toContainEqual(["bun", "run", "check"]);
+      expect(process.calls.some((command) => command.join(" ") === "bun run typecheck")).toBe(
+        false,
+      );
+      expect(dryRuns.every((command) => !command.includes("--containers-rollout"))).toBe(true);
+      expect(upload).toBeDefined();
+      expect(upload ?? []).not.toContain("--containers-rollout");
+      expect(probes.coreProbeCount()).toBe(2);
+      expect(uploaded).toBe(true);
+      expect(result).toMatchObject({ coreVerifierRpcReady: true });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("publishes the first Version with its readback deferred, and names what finishes the lane", async () => {
     let uploaded = false;
     const process = fakeProcess({
@@ -3575,6 +4100,14 @@ describe("released-Core Form authority bootstrap", () => {
     });
     // Deferred, not attempted: the bridge cannot answer, so nothing asks it.
     expect(live.paths).not.toContain(CORE_VERIFIER_PATH);
+    expect(
+      process.calls
+        .filter((command) => command.includes("--dry-run"))
+        .every((command) => !command.includes("--containers-rollout")),
+    ).toBe(true);
+    const bootstrapUpload = process.calls.find((command) => command.includes("--no-bundle"));
+    expect(bootstrapUpload).toBeDefined();
+    expect(bootstrapUpload ?? []).not.toContain("--containers-rollout");
     expect(String(result.verifierBridgeNextStep)).toContain(
       "takoserver-form-authority-identity-probe --apply",
     );
@@ -3586,6 +4119,8 @@ describe("released-Core Form authority bootstrap", () => {
     // rest of the sequence rather than a rollback that does not exist.
     expect(String(result.rollback)).toContain("forward repair only");
     expect(String(result.rollback)).toContain("takoserver-form-authority-identity-probe --apply");
+    expect(process.calls).toContainEqual(["bun", "run", "check"]);
+    expect(process.calls.some((command) => command.join(" ") === "bun run typecheck")).toBe(false);
   });
 
   test("refuses a first upload that does not name the deferral, before it uploads", async () => {
@@ -3701,6 +4236,191 @@ describe("released-Core Form authority bootstrap", () => {
         versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
         coreVerifierRpcReady: true,
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reuses the exact Core verifier image for a routine exact-target integration apply", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-routine-container-reuse-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
+      ]);
+      const result = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      });
+
+      const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+      const reuseDryRuns = dryRuns.filter((command) => command.includes("--containers-rollout"));
+      const upload = process.calls.find((command) => command.includes("--no-bundle"));
+      const finalDryRun = dryRuns.at(-1);
+      if (!finalDryRun || !upload) throw new Error("expected one final dry-run and upload command");
+      expect(reuseDryRuns).toEqual([finalDryRun]);
+      expect(finalDryRun.slice(-2)).toEqual(["--containers-rollout", "none"]);
+      expect(upload.slice(-2)).toEqual(["--containers-rollout", "none"]);
+      expect(probes.coreProbeCount()).toBe(3);
+      expect(result).toMatchObject({
+        verificationMode: "released-core",
+        previousVersionId: RELEASED_CORE_VERSION_ID,
+        versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+        coreVerifierRpcReady: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the normal image path when the routine predecessor proof mismatches", async () => {
+    const root = mkdtempSync(
+      join(tmpdir(), "takoserver-form-authority-routine-container-fallback-"),
+    );
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const live = releasedCoreFetcher({
+        coreVerifier: "ready",
+        authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+      });
+      const result = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+        fetcher: live.fetcher,
+        outputDirectory: root,
+      });
+
+      const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+      const upload = process.calls.find((command) => command.includes("--no-bundle"));
+      expect(dryRuns.every((command) => !command.includes("--containers-rollout"))).toBe(true);
+      expect(upload).toBeDefined();
+      expect(upload ?? []).not.toContain("--containers-rollout");
+      expect(live.paths.filter((path) => path === CORE_VERIFIER_PATH)).toHaveLength(2);
+      expect(uploaded).toBe(true);
+      expect(result).toMatchObject({
+        versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+        coreVerifierRpcReady: true,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["production", "rehearsal"] as const)(
+    "does not reuse the Core verifier image for routine %s applies",
+    async (environment) => {
+      const root = mkdtempSync(
+        join(tmpdir(), `takoserver-form-authority-${environment}-container-`),
+      );
+      let uploaded = false;
+      try {
+        const selectedTarget = { ...target, environment } satisfies DeployTarget;
+        const process = fakeProcess({ onUpload: () => (uploaded = true) });
+        const run: FormAuthorityProcess =
+          environment === "production"
+            ? async (command, options) => {
+                const key = command.join(" ");
+                if (key === "git branch --show-current") return ok("main\n");
+                if (key === "git fetch --quiet origin main") return ok("");
+                if (key === "git rev-parse origin/main") return ok(`${COMMIT}\n`);
+                return await process.run(command, options);
+              }
+            : process.run;
+        const live = releasedCoreFetcher({
+          coreVerifier: "ready",
+          authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+        });
+        const result = await applyRoutineExactTarget({
+          run,
+          state: releasedCoreState({ present: true, isUploaded: () => uploaded }, selectedTarget),
+          fetcher: live.fetcher,
+          outputDirectory: root,
+          target: selectedTarget,
+        });
+
+        const dryRuns = process.calls.filter((command) => command.includes("--dry-run"));
+        const upload = process.calls.find((command) => command.includes("--no-bundle"));
+        expect(process.calls).toContainEqual(["bun", "run", "check"]);
+        expect(process.calls.some((command) => command.join(" ") === "bun run typecheck")).toBe(
+          false,
+        );
+        expect(dryRuns.every((command) => !command.includes("--containers-rollout"))).toBe(true);
+        expect(upload).toBeDefined();
+        expect(upload ?? []).not.toContain("--containers-rollout");
+        expect(live.paths.filter((path) => path === CORE_VERIFIER_PATH)).toHaveLength(1);
+        expect(uploaded).toBe(true);
+        expect(result).toMatchObject({
+          environment,
+          versionId: RELEASED_CORE_SUCCESSOR_VERSION_ID,
+          coreVerifierRpcReady: true,
+        });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("refuses proof drift before uploading the same-image routine apply", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-routine-container-drift-"));
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        {
+          authorityWorkerVersionId: RELEASED_CORE_VERSION_ID,
+          artifactDigest: PREVIOUS_DIGEST,
+        },
+      ]);
+      const failure = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as DeployError).message).toContain("identity changed before same-image");
+      expect(probes.coreProbeCount()).toBe(2);
+      expect(process.calls.some((command) => command.includes("--no-bundle"))).toBe(false);
+      expect(uploaded).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("still requires the successor Core verifier readback after routine image reuse", async () => {
+    const root = mkdtempSync(
+      join(tmpdir(), "takoserver-form-authority-routine-container-successor-"),
+    );
+    let uploaded = false;
+    try {
+      const process = fakeProcess({ onUpload: () => (uploaded = true) });
+      const probes = releasedCoreProbeSequence([
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
+        null,
+      ]);
+      const failure = await applyRoutineExactTarget({
+        run: process.run,
+        state: releasedCoreState({ present: true, isUploaded: () => uploaded }),
+        fetcher: probes.fetcher,
+        outputDirectory: root,
+      }).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("verification");
+      expect((failure as DeployError).message).toContain("released Core verifier live identity");
+      expect(probes.coreProbeCount()).toBe(3);
+      expect(process.calls.filter((command) => command.includes("--no-bundle"))).toHaveLength(1);
+      expect(uploaded).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

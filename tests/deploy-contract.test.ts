@@ -211,7 +211,13 @@ describe("Takoserver split deploy entrypoint", () => {
       "production and rehearsal retain the absence refusal",
     );
     expect(identityProbe?.obligations["failure-handling"]).toContain(
-      "Every other probe apply retains `bun run check`.",
+      "All other probe applies retain `bun run check`.",
+    );
+    expect(identityProbe?.obligations["failure-handling"]).toContain(
+      "only a full-profile update of an existing no-drift authority",
+    );
+    expect(identityProbe?.obligations["failure-handling"]).toContain(
+      "Host-only bootstrap/profile updates",
     );
     expect(identityProbe?.obligations["failure-handling"]).toContain(
       "`bun test tests/deploy-form-authority-identity-probe.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`",
@@ -222,13 +228,23 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(surface?.requiresScripts).toContain("typecheck:form-authority-worker");
       expect(surface?.obligations["failure-handling"]).toContain(serviceRefreshTests);
       expect(surface?.obligations["failure-handling"]).toContain("`bun run check`");
+      expect(surface?.obligations["failure-handling"]).toContain(
+        "An ordinary integration code-only apply to an existing exact closure",
+      );
+      expect(surface?.obligations["failure-handling"]).toContain(
+        "dry-runs all four Worker bundles with `--containers-rollout none`",
+      );
     }
     expect(formAuthority?.obligations["failure-handling"]).toContain(
-      "Every other Form authority apply keeps `bun run check`.",
+      "parser-approved generated integration D1/R2 target",
     );
     expect(integrationAuthority?.obligations["failure-handling"]).toContain(
-      "Every other Form authority apply keeps `bun run check`.",
+      "migrations already applied or changed elsewhere do not select the full-repository gate",
     );
+    expect(formAuthority?.obligations["failure-handling"]).toContain(
+      "an already-selected reusable Core verifier identity is also required",
+    );
+    expect(formAuthority?.obligations["failure-handling"]).toContain("normal image build");
     expect(formAuthority?.obligations["failure-handling"]).toContain(
       "it retains precedence when a service-binding refresh is declared too",
     );
@@ -241,7 +257,10 @@ describe("Takoserver split deploy entrypoint", () => {
       "typecheck:form-authority-worker",
     ]);
     expect(gateway?.obligations["failure-handling"]).toContain(
-      "Every other operator gateway apply keeps `bun run check`.",
+      "exact, source-matched, no-drift authority dependency on the selected Host",
+    );
+    expect(gateway?.obligations["failure-handling"]).toContain(
+      "All other operator gateway applies keep `bun run check`.",
     );
     expect(schemaBaseline?.obligations.provenance).toContain("fixed empty-to-0022");
     expect(schemaBaseline?.obligations["failure-handling"]).toContain(

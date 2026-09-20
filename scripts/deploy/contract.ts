@@ -67,6 +67,8 @@ const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
 const integrationServiceBindingRefresh =
   "The `--refresh-service-binding=NAME` delta is integration-only: the exact pinned predecessor must contain exactly one same-name service binding whose observed `service`/`entrypoint` pair differs from the selected target. The successor pair remains target-derived; D1, R2, Durable Object, plain-text and secret bindings cannot use this selector.";
+const ordinaryIntegrationFormCodeGate =
+  "An ordinary integration code-only apply to an existing exact closure, with source/Host/dependency identities matched and no bootstrap or declared transition, uses the Form-local gate once: `bun run typecheck`, `bun run typecheck:form-authority-worker`, generated Worker types, imports, corpus and integration-package checks, the surface-specific runtime/deploy tests, then `bun run build:form-authority-worker`. That build dry-runs all four Worker bundles with `--containers-rollout none`; it does not build or publish a Core image. Production, rehearsal, bootstrap and transition paths keep their existing gates.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -480,8 +482,12 @@ export const DEPLOY_CONTRACT = {
           "`--refresh-service-binding` runs `bun run typecheck:form-authority-worker` followed by " +
           "`bun test tests/deploy-form-authority-identity-probe.test.ts " +
           "tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` before Wrangler dry-run " +
-          "or upload; either gate failure stops before dry-run and upload. Every other probe apply " +
-          "retains `bun run check`. " +
+          "or upload; either gate failure stops before dry-run and upload. " +
+          ordinaryIntegrationFormCodeGate +
+          " For the identity probe this is only a full-profile update of an existing no-drift authority " +
+          "whose public identity Host id matches the selected target; Host-only bootstrap/profile updates, " +
+          "service refreshes and other transitions do not select it. All other probe applies retain " +
+          "`bun run check`. " +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -558,7 +564,15 @@ export const DEPLOY_CONTRACT = {
           "an integration service-binding refresh runs `bun run typecheck:form-authority-worker` and " +
           "`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
           "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
-          "Every other Form authority apply keeps `bun run check`." +
+          ordinaryIntegrationFormCodeGate +
+          " The route-less fast path additionally requires the already-present no-drift dynamic-public-RPC " +
+          "authority at exact-target scope on the parser-approved generated integration D1/R2 target. " +
+          "Its exact D1/R2/schema proof runs before the gate and is repeated identically at the immediate " +
+          "upload fence; migrations already applied or changed elsewhere do not force the full-repository " +
+          "gate. For the released-Core route-less target, an already-selected reusable Core verifier identity " +
+          "is also required; absent or mismatched image identity retains the full check and normal image build. " +
+          "Bootstrap, scope/storage/service transitions, other storage targets, and production or rehearsal " +
+          "retain their existing gates. All other Form authority applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -617,7 +631,11 @@ export const DEPLOY_CONTRACT = {
           "rebind, an integration service-binding refresh runs `bun run typecheck:form-authority-worker` " +
           "and `bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
           "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
-          "Every other Form authority apply keeps `bun run check`." +
+          ordinaryIntegrationFormCodeGate +
+          " The same exact-target/no-drift and generated D1/R2/schema fence applies here; migrations " +
+          "already applied or changed elsewhere do not select the full-repository gate. Bootstrap, " +
+          "transitions, other storage targets, and production or rehearsal retain their existing gate. " +
+          "All other Form authority applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -668,8 +686,11 @@ export const DEPLOY_CONTRACT = {
           " An integration apply declaring this service refresh runs " +
           "`bun run typecheck:form-authority-worker` and `bun test " +
           "tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` " +
-          "before Wrangler dry-run or upload; either gate failure stops both. Every other operator " +
-          "gateway apply keeps `bun run check`." +
+          "before Wrangler dry-run or upload; either gate failure stops both. " +
+          ordinaryIntegrationFormCodeGate +
+          " The gateway branch requires its existing exact scope and dynamic-public-RPC closure plus an " +
+          "exact, source-matched, no-drift authority dependency on the selected Host; bootstrap, scope and " +
+          "service transitions do not select it. All other operator gateway applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
