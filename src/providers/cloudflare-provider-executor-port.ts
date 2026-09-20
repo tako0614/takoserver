@@ -36,6 +36,27 @@ export type CloudflareProviderInitialMutationResult =
       readonly executorNoMutation: CloudflareProviderExecutorNoMutationEvidence;
     };
 
+export const CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA =
+  "takoserver.cloudflare-provider-executor-adoption-abort@v1" as const;
+
+/** Durable whole-operation proof, emitted only by adoption recovery. */
+export interface CloudflareProviderExecutorAdoptionAbortEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA;
+  readonly action: "recoverAdopt";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only recoverAdopt may carry this whole-operation result across RPC. */
+export type CloudflareProviderAdoptionRecoveryResult =
+  | ProviderTicket
+  | {
+      readonly phase: "failed";
+      readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
+      readonly executorAdoptionAbort: CloudflareProviderExecutorAdoptionAbortEvidence;
+    };
+
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
 export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
 export type CloudflareProviderRecoverDeleteInput = Parameters<
@@ -92,7 +113,9 @@ export interface CloudflareProviderExecutorRpc {
   delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverDelete(input: CloudflareProviderRecoverDeleteInput): Promise<ProviderTicket>;
   adopt(input: CloudflareProviderAdoptInput): Promise<CloudflareProviderInitialMutationResult>;
-  recoverAdopt(input: CloudflareProviderRecoverAdoptInput): Promise<ProviderTicket>;
+  recoverAdopt(
+    input: CloudflareProviderRecoverAdoptInput,
+  ): Promise<CloudflareProviderAdoptionRecoveryResult>;
   verifyNativeAbsence(
     input: CloudflareProviderVerifyNativeAbsenceInput,
   ): Promise<ProviderNativeAbsence>;

@@ -5,6 +5,7 @@ import { SqlError } from "../ports.ts";
 import {
   ProviderMutationDefinitiveRefusalError,
   ProviderMutationRecoveryError,
+  ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import { type BindingRegistry, installedBindings } from "./bindings.ts";
@@ -335,7 +336,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       dependencies: ResourceDependencySet | undefined,
       mode: "initial" | "recovery",
     ) => Promise<void>;
-    readonly settleDefinitiveImportConflict?: (leaseToken: string) => Promise<boolean>;
+    readonly settleDefinitiveImportFailure?: (
+      leaseToken: string,
+      outcome: "import_conflict" | "adoption_aborted",
+    ) => Promise<boolean>;
     readonly execute: (
       mode: "initial" | "recovery",
       execution: Extract<ProviderMutationExecution, { readonly kind: "acquired" }>,
@@ -463,17 +467,29 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     } catch (error) {
       const providerRefusalProvesWholeAttemptIdle =
         input.providerRefusalProvesWholeAttemptIdle?.() ?? true;
+      const initialImportConflict =
+        execution.mode === "initial" &&
+        error instanceof TakoformHostError &&
+        error.code === "import_conflict";
+      const recoveryAdoptionAborted =
+        execution.mode === "recovery" &&
+        error instanceof ProviderMutationWholeOperationRefusalError;
+      let definitiveImportFailureOutcome: "import_conflict" | "adoption_aborted" | undefined;
       if (
         executeEntered &&
-        execution.mode === "initial" &&
         providerRefusalProvesWholeAttemptIdle &&
-        input.settleDefinitiveImportConflict &&
-        error instanceof TakoformHostError &&
-        error.code === "import_conflict"
+        input.settleDefinitiveImportFailure
       ) {
+        if (initialImportConflict) definitiveImportFailureOutcome = "import_conflict";
+        else if (recoveryAdoptionAborted) definitiveImportFailureOutcome = "adoption_aborted";
+      }
+      if (definitiveImportFailureOutcome && input.settleDefinitiveImportFailure) {
         let settled: boolean;
         try {
-          settled = await input.settleDefinitiveImportConflict(leaseToken);
+          settled = await input.settleDefinitiveImportFailure(
+            leaseToken,
+            definitiveImportFailureOutcome,
+          );
         } catch (settlementError) {
           input.onContention?.();
           throw settlementError;
@@ -2050,14 +2066,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               authority,
             );
           },
-          settleDefinitiveImportConflict: async (leaseToken) => {
-            return await store.settleDefinitiveProviderImportConflict({
+          settleDefinitiveImportFailure: async (leaseToken, outcome) => {
+            return await store.settleDefinitiveProviderImportFailure({
               tenantId: context.tenantId,
               operationId: importId,
               replayKey,
               resourceUid: uid,
               leaseToken,
-              outcome: "import_conflict",
+              outcome,
             });
           },
           execute: async (operationMode, execution, leaseToken) => {

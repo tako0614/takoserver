@@ -287,7 +287,7 @@ describe("provider mutation saga execution leases", () => {
     database.close();
   });
 
-  test("a stale import refusal cannot erase recovery after the newer lease releases", async () => {
+  test("only the current exact lease settles a closed definitive import outcome", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
     let now = 1_000;
@@ -329,7 +329,7 @@ describe("provider mutation saga execution leases", () => {
       }),
     ).toEqual({ kind: "acquired", mode: "recovery" });
     expect(
-      await store.settleDefinitiveProviderImportConflict({
+      await store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
         operationId: staleImportSaga.operationId,
         replayKey: staleImportSaga.replayKey,
@@ -347,13 +347,13 @@ describe("provider mutation saga execution leases", () => {
       }),
     ).toBe(true);
     expect(
-      await store.settleDefinitiveProviderImportConflict({
+      await store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
         operationId: staleImportSaga.operationId,
         replayKey: staleImportSaga.replayKey,
         resourceUid: staleImportSaga.resourceUid,
         leaseToken: "lease_stale_import",
-        outcome: "import_conflict",
+        outcome: "adoption_aborted",
       }),
     ).toBe(false);
     expect(
@@ -365,6 +365,33 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 3_001,
       }),
     ).toEqual({ kind: "acquired", mode: "recovery" });
+    await expect(
+      store.settleDefinitiveProviderImportFailure({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_after_stale_import",
+        outcome: "not_definitive" as "adoption_aborted",
+      }),
+    ).rejects.toThrow("provider import outcome must be definitive");
+    expect(
+      await store.settleDefinitiveProviderImportFailure({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_after_stale_import",
+        outcome: "adoption_aborted",
+      }),
+    ).toBe(true);
+    expect(
+      await store.providerMutationPlanExists(
+        staleImportSaga.tenantId,
+        staleImportSaga.operationId,
+        staleImportSaga.resourceUid,
+      ),
+    ).toBe(false);
     database.close();
   });
 

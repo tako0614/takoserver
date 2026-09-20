@@ -8,9 +8,12 @@ import {
   type ProviderOffering,
   type ProviderTicket,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationNoMutation,
 } from "../src/provider-port.ts";
 import {
+  CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  type CloudflareProviderAdoptionRecoveryResult,
   type CloudflareProviderExecutorRpc,
   type CloudflareProviderInitialMutationResult,
 } from "../src/providers/cloudflare-provider-executor-port.ts";
@@ -194,6 +197,169 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
       expect(providerFailureProvesNoMutation(ticket, "operation-1")).toBe(false);
     }
   });
+
+  test("restores a cloned whole-operation abort only from recoverAdopt", async () => {
+    const input = makeAdoptionRecoveryInput();
+    const remoteAbort = adoptionAbortFor(input);
+    const ticket = await createProxy(
+      createBinding(() => failed("unavailable", "unused", true), remoteAbort),
+    ).recoverAdopt(input);
+
+    expect(ticket).toEqual({
+      phase: "failed",
+      failure: {
+        code: "conflict",
+        message: "the adoption was durably aborted before provider effects",
+        retryable: false,
+      },
+    });
+    expect(Object.hasOwn(ticket, "executorAdoptionAbort")).toBe(false);
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1")).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, "operation-1")).toBe(false);
+  });
+
+  test("refuses adoption-abort evidence with mismatched recovery context", async () => {
+    const baseInput = makeAdoptionRecoveryInput();
+    const mismatches: readonly [string, (abort: MutableAdoptionAbort) => void][] = [
+      ["schema", (abort) => (abort.executorAdoptionAbort.schema = "other-schema")],
+      ["action", (abort) => (abort.executorAdoptionAbort.action = "adopt")],
+      ["operation id", (abort) => (abort.executorAdoptionAbort.operationId = "other-operation")],
+      [
+        "installation",
+        (abort) => (abort.executorAdoptionAbort.providerInstallationRef = "other-installation"),
+      ],
+      [
+        "tenant",
+        (abort) => (abort.executorAdoptionAbort.executionAuthority.tenantId = "other-tenant"),
+      ],
+      [
+        "resource uid",
+        (abort) => (abort.executorAdoptionAbort.executionAuthority.resourceUid = "other-resource"),
+      ],
+      [
+        "lease token",
+        (abort) => (abort.executorAdoptionAbort.executionAuthority.leaseToken = "other-lease"),
+      ],
+      [
+        "fingerprint",
+        (abort) =>
+          (abort.executorAdoptionAbort.executionAuthority.fingerprint = "other-fingerprint"),
+      ],
+      [
+        "evidence handle",
+        (abort) => (abort.executorAdoptionAbort.providerHandle = "unexpected-handle"),
+      ],
+      ["ticket key", (abort) => (abort.debug = true)],
+      ["failure key", (abort) => (abort.failure.debug = true)],
+      ["authority key", (abort) => (abort.executorAdoptionAbort.executionAuthority.debug = true)],
+      ["retryable failure", (abort) => (abort.failure.retryable = true)],
+    ];
+
+    for (const [name, mutate] of mismatches) {
+      const malformed = mutateAdoptionAbort(adoptionAbortFor(baseInput), mutate);
+      const ticket = await createProxy(
+        createBinding(() => failed("unavailable", "unused", true), malformed),
+      ).recoverAdopt(baseInput);
+      expectUnavailable(ticket, name, "Provider executor returned invalid adoption-abort evidence");
+    }
+  });
+
+  test("requires recovery mode, no provider handle, and authority matching the identity", async () => {
+    const baseInput = makeAdoptionRecoveryInput();
+    const proof = adoptionAbortFor(baseInput);
+    const { operationMode: _mode, ...withoutMode } = baseInput;
+    const { executionAuthority: _authority, ...withoutAuthority } = baseInput;
+    const cases = [
+      ["initial mode", makeAdoptionRecoveryInput({ operationMode: "initial" })],
+      ["missing mode", withoutMode],
+      ["provider handle", makeAdoptionRecoveryInput({ providerHandle: "prior-handle" })],
+      [
+        "tenant mismatch",
+        makeAdoptionRecoveryInput({ identity: { ...identity, tenantRef: "tenant-2" } }),
+      ],
+      [
+        "resource uid mismatch",
+        makeAdoptionRecoveryInput({ identity: { ...identity, uid: "resource-2" } }),
+      ],
+      ["missing authority", withoutAuthority],
+    ] as const;
+
+    for (const [name, input] of cases) {
+      const ticket = await createProxy(
+        createBinding(() => failed("unavailable", "unused", true), proof),
+      ).recoverAdopt(input);
+      expectUnavailable(ticket, name, "Provider executor returned invalid adoption-abort evidence");
+    }
+  });
+
+  test("captures adoption recovery context before the RPC promise resolves", async () => {
+    const input = makeAdoptionRecoveryInput();
+    const proof = adoptionAbortFor(input);
+    let resolveResult: ((value: unknown) => void) | undefined;
+    const pendingResult = new Promise<unknown>((resolve) => {
+      resolveResult = resolve;
+    });
+    const proxy = createProxy(
+      createBinding(() => failed("unavailable", "unused", true), pendingResult),
+    );
+    const pendingTicket = proxy.recoverAdopt(input);
+
+    Object.assign(input, {
+      operationId: "changed-operation",
+      operationMode: "initial",
+      providerHandle: "late-handle",
+    });
+    Object.assign(input.identity, { tenantRef: "changed-tenant", uid: "changed-resource" });
+    Object.assign(input.executionAuthority as object, { leaseToken: "changed-lease" });
+    resolveResult?.(structuredClone(proof));
+
+    const ticket = await pendingTicket;
+    expect(ticket).toEqual({
+      phase: "failed",
+      failure: {
+        code: "conflict",
+        message: "the adoption was durably aborted before provider effects",
+        retryable: false,
+      },
+    });
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1")).toBe(true);
+  });
+
+  test("does not cross-accept invocation-only and whole-operation proof envelopes", async () => {
+    const initialInput = makeInput("adopt");
+    const wholeOperationAbort = adoptionAbortFor(makeAdoptionRecoveryInput());
+    const initialTicket = await createProxy(
+      createBinding(
+        () => wholeOperationAbort as unknown as CloudflareProviderInitialMutationResult,
+      ),
+    ).adopt(initialInput);
+    expectUnavailable(initialTicket, "adoption abort on initial adopt");
+
+    const recoveryInput = makeAdoptionRecoveryInput();
+    const invocationProof = proofFor("adopt", initialInput);
+    const recoveryTicket = await createProxy(
+      createBinding(
+        () => failed("unavailable", "unused", true),
+        invocationProof as unknown as ProviderTicket,
+      ),
+    ).recoverAdopt(recoveryInput);
+    expectUnavailable(
+      recoveryTicket,
+      "initial proof on adoption recovery",
+      "Provider executor returned invalid adoption-abort evidence",
+    );
+  });
+
+  test("leaves ordinary recoverAdopt tickets conservative", async () => {
+    const ordinary = failed("conflict", "ordinary adoption recovery result", false);
+    const ticket = await createProxy(
+      createBinding(() => failed("unavailable", "unused", true), ordinary),
+    ).recoverAdopt(makeAdoptionRecoveryInput());
+
+    expect(ticket).toEqual(ordinary);
+    expect(Object.hasOwn(ticket, "executorAdoptionAbort")).toBe(false);
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1")).toBe(false);
+  });
 });
 
 function makeInput(action: "apply", overrides?: Partial<ApplyInput>): ApplyInput;
@@ -235,6 +401,64 @@ function proofFor(action: Action, input: InitialInput): CloudflareProviderInitia
   };
 }
 
+function makeAdoptionRecoveryInput(
+  overrides: Partial<AdoptInput> = {},
+): Parameters<NonNullable<Provider["recoverAdopt"]>>[0] {
+  return {
+    ...makeInput("adopt", { operationMode: "recovery" }),
+    ...overrides,
+  } as Parameters<NonNullable<Provider["recoverAdopt"]>>[0];
+}
+
+function adoptionAbortFor(
+  input: Parameters<NonNullable<Provider["recoverAdopt"]>>[0],
+): CloudflareProviderAdoptionRecoveryResult {
+  return {
+    phase: "failed",
+    failure: {
+      code: "conflict",
+      message: "the adoption was durably aborted before provider effects",
+      retryable: false,
+    },
+    executorAdoptionAbort: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
+      action: "recoverAdopt",
+      operationId: input.operationId,
+      providerInstallationRef: installationId,
+      executionAuthority: { ...(input.executionAuthority ?? authority) },
+    },
+  };
+}
+
+interface MutableAdoptionAbort {
+  phase: unknown;
+  failure: { code: unknown; message: unknown; retryable: unknown; [key: string]: unknown };
+  executorAdoptionAbort: {
+    schema: unknown;
+    action: unknown;
+    operationId: unknown;
+    providerInstallationRef: unknown;
+    executionAuthority: {
+      tenantId: unknown;
+      resourceUid: unknown;
+      leaseToken: unknown;
+      fingerprint: unknown;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+  [key: string]: unknown;
+}
+
+function mutateAdoptionAbort(
+  abort: unknown,
+  mutate: (value: MutableAdoptionAbort) => void,
+): unknown {
+  const clone = structuredClone(abort) as MutableAdoptionAbort;
+  mutate(clone);
+  return clone;
+}
+
 function invoke(proxy: CloudflareProviderProxy, action: Action, input: InitialInput) {
   if (action === "apply") return proxy.apply(input as ApplyInput);
   if (action === "delete") return proxy.delete(input as DeleteInput);
@@ -252,11 +476,13 @@ function createProxy(binding: CloudflareProviderExecutorRpc): CloudflareProvider
 
 function createBinding(
   handler: InitialHandler,
-  recoveryResult: ProviderTicket = failed("unavailable", "unused", true),
+  recoveryResult: unknown | Promise<unknown> = failed("unavailable", "unused", true),
 ): CloudflareProviderExecutorRpc {
   const initial = async (action: Action, input: InitialInput) =>
     structuredClone(await handler(action, input)) as CloudflareProviderInitialMutationResult;
-  const recovery = async () => structuredClone(recoveryResult);
+  const recovery = async () => structuredClone(await recoveryResult) as ProviderTicket;
+  const adoptionRecovery = async () =>
+    structuredClone(await recoveryResult) as CloudflareProviderAdoptionRecoveryResult;
   const unused = async (): Promise<never> => {
     throw new Error("unused executor RPC");
   };
@@ -269,7 +495,7 @@ function createBinding(
     delete: (input) => initial("delete", input),
     recoverDelete: recovery,
     adopt: (input) => initial("adopt", input),
-    recoverAdopt: recovery,
+    recoverAdopt: adoptionRecovery,
     verifyNativeAbsence: unused,
     verifyArtifactConsumption: unused,
     readSqliteMigrationLedger: unused,
@@ -307,14 +533,21 @@ function mutateProof(
   return clone;
 }
 
-function expectUnavailable(ticket: ProviderTicket, caseName: string): void {
+function expectUnavailable(
+  ticket: ProviderTicket,
+  caseName: string,
+  message = "Provider executor returned invalid no-mutation evidence",
+): void {
   expect(ticket, caseName).toMatchObject({
     phase: "failed",
     failure: {
       code: "unavailable",
-      message: "Provider executor returned invalid no-mutation evidence",
+      message,
       retryable: true,
     },
   });
   expect(providerFailureProvesNoMutation(ticket, "operation-1"), caseName).toBe(false);
+  expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1"), caseName).toBe(
+    false,
+  );
 }

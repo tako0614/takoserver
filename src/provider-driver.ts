@@ -23,6 +23,7 @@ import {
   type ProviderTicket,
   type ProviderValue,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationNoMutation,
 } from "./provider-port.ts";
 import {
   canMaterializeAcrossProviderPacks,
@@ -128,6 +129,18 @@ export class ProviderMutationDefinitiveRefusalError extends TakoformHostError {
   }
 
   readonly heldCharge?: LedgerHeldCharge;
+}
+
+/**
+ * Adoption recovery proved that the entire durable operation, rather than
+ * merely its current invocation, produced no provider mutation. The engine
+ * recognizes this only on its import-specific recovery settlement seam.
+ */
+export class ProviderMutationWholeOperationRefusalError extends TakoformHostError {
+  constructor(code: string, status: number, message?: string) {
+    super(code, status, undefined, sanitizedMessage(message));
+    this.name = "ProviderMutationWholeOperationRefusalError";
+  }
 }
 
 /**
@@ -521,6 +534,7 @@ export function createProviderDriver(
     mutation?: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
+      readonly wholeOperationProof?: "recoverAdopt";
     },
   ): ProviderResult => {
     if (ticket.phase === "succeeded") {
@@ -549,6 +563,13 @@ export function createProviderDriver(
     // with `invalid_argument` and a repair line telling them to "correct the
     // desired state the message names" against a message that named nothing.
     const [code, status] = failureToWire(ticket.failure.code);
+    if (
+      mutation?.wholeOperationProof === "recoverAdopt" &&
+      mutation.mode === "recovery" &&
+      providerFailureProvesWholeOperationNoMutation(ticket, mutation.operationId)
+    ) {
+      throw new ProviderMutationWholeOperationRefusalError(code, status, ticket.failure.message);
+    }
     if (mutation && providerFailureProvesNoMutation(ticket, mutation.operationId)) {
       if (mutation.mode === "initial") {
         throw new ProviderMutationDefinitiveRefusalError(code, status, ticket.failure.message);
@@ -2103,6 +2124,7 @@ export function createProviderDriver(
       const resolvedProviderRelations = () =>
         definitiveProviderPreflight(() => providerRelations(input.tenantId, input.relations));
       let firstTicket: ProviderTicket;
+      let wholeOperationProof: "recoverAdopt" | undefined;
       if (input.providerHandle) {
         firstTicket = await pollHandle(
           provider,
@@ -2144,6 +2166,12 @@ export function createProviderDriver(
               relations,
             }),
           );
+          // Only a terminal ticket returned directly by recoverAdopt may carry
+          // whole-operation proof. A running result must first cross a poll,
+          // whose answer describes that poll invocation and is never trusted
+          // for this settlement even if a future caller makes its handle
+          // durable before entering settle().
+          if (firstTicket.phase === "failed") wholeOperationProof = "recoverAdopt";
         } else {
           const relations = await resolvedProviderRelations();
           firstTicket = await enteredProviderMutation(() =>
@@ -2187,6 +2215,7 @@ export function createProviderDriver(
         {
           operationId: input.operationId,
           mode: input.operationMode === "recovery" ? "recovery" : "initial",
+          ...(wholeOperationProof ? { wholeOperationProof } : {}),
         },
       );
       if (result.nativeId !== input.nativeId) {

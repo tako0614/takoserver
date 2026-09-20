@@ -496,13 +496,13 @@ export interface TakoformStore {
     readonly replayKey: string;
     readonly resourceUid: string;
   }): Promise<boolean>;
-  settleDefinitiveProviderImportConflict(input: {
+  settleDefinitiveProviderImportFailure(input: {
     readonly tenantId: string;
     readonly operationId: string;
     readonly replayKey: string;
     readonly resourceUid: string;
     readonly leaseToken: string;
-    readonly outcome: "import_conflict";
+    readonly outcome: "import_conflict" | "adoption_aborted";
   }): Promise<boolean>;
   recordProviderMutationReceipt(input: {
     readonly tenantId: string;
@@ -2275,9 +2275,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return removed.changes === 1;
     },
 
-    async settleDefinitiveProviderImportConflict(input) {
-      if (input.outcome !== "import_conflict") {
-        throw new TypeError("provider import outcome must be import_conflict");
+    async settleDefinitiveProviderImportFailure(input) {
+      if (input.outcome !== "import_conflict" && input.outcome !== "adoption_aborted") {
+        throw new TypeError("provider import outcome must be definitive");
       }
       const timestamp = now();
       const removed = await sql.run(

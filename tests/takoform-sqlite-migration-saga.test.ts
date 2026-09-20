@@ -5,6 +5,10 @@ import { ProviderMutationDefinitiveRefusalError } from "../src/index.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject } from "../src/ports.ts";
+import {
+  ProviderMutationRecoveryError,
+  ProviderMutationWholeOperationRefusalError,
+} from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import type {
   TakoformArtifactManifest,
@@ -400,6 +404,52 @@ describe("SQLiteMigrationApplication provider saga", () => {
     expect(importInputs[0]).toMatchObject({
       operationId: saga?.operation_id,
       operationMode: "recovery",
+    });
+  });
+
+  test("keeps adoption-abort recovery pending while a SQLite migration is prepared", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const suffixInputs: Array<Parameters<typeof memory.sqliteMigrations.applySuffix>[0]> = [];
+    const importModes: Array<"initial" | "recovery" | undefined> = [];
+    const driver = migrationDriver(memory, {
+      async applySuffix(input) {
+        suffixInputs.push(input);
+        await memory.sqliteMigrations.applySuffix(input);
+      },
+      async import(input) {
+        importModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+        throw new ProviderMutationWholeOperationRefusalError(
+          "resource_not_found",
+          404,
+          "the adoption was durably aborted",
+        );
+      },
+    });
+    const { host, database } = harness(driver);
+    await seedDatabaseAndSet(host);
+    const desired = {
+      ...applicationDesired("prepared-migration-import"),
+      nativeId: "native-prepared-migration-import",
+    };
+
+    const lost = await importResource(host, desired, "prepared-migration-import", "admin");
+    expect(lost?.status).toBe(503);
+    const operationId = String(dispatchedSaga(database)?.operation_id);
+
+    const refused = await importResource(host, desired, "prepared-migration-import", "admin");
+    expect(refused?.status).toBe(404);
+    expect(await refused?.json()).toMatchObject({
+      error: { code: "resource_not_found", message: "the adoption was durably aborted" },
+    });
+    expect(importModes).toEqual(["initial", "recovery"]);
+    expect(suffixInputs.map(({ operationMode }) => operationMode)).toEqual(["initial"]);
+    expect(dispatchedSaga(database)).toMatchObject({
+      operation_id: operationId,
+      provider_outcome: "indeterminate",
+      receipt_json: null,
     });
   });
 

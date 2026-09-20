@@ -606,6 +606,17 @@ export function failed(
  */
 const mutationFreeProviderRefusals = new WeakMap<object, string>();
 
+/**
+ * Non-wire proof that recovery durably concluded the whole named operation
+ * without any provider mutation, including every earlier invocation.
+ *
+ * This is deliberately a separate identity-bound capability from the
+ * invocation-only proof above. It may be minted only after recovery has
+ * durably closed the exact operation's provider reservation/receipt, and it
+ * cannot survive cloning or an untrusted RPC boundary.
+ */
+const wholeOperationMutationFreeProviderRefusals = new WeakMap<object, string>();
+
 export function failedWithoutProviderMutation(
   operationId: string,
   code: ProviderFailure["code"],
@@ -625,6 +636,28 @@ export function providerFailureProvesNoMutation(
     ticket.phase === "failed" &&
     !ticket.failure.retryable &&
     mutationFreeProviderRefusals.get(ticket) === operationId
+  );
+}
+
+export function failedWithoutProviderOperationMutation(
+  operationId: string,
+  code: ProviderFailure["code"],
+  message: string,
+): ProviderTicket {
+  const ticket = failed(code, message, false);
+  wholeOperationMutationFreeProviderRefusals.set(ticket, operationId);
+  return ticket;
+}
+
+/** Host-internal consumer for the whole-operation recovery proof above. */
+export function providerFailureProvesWholeOperationNoMutation(
+  ticket: ProviderTicket,
+  operationId: string,
+): boolean {
+  return (
+    ticket.phase === "failed" &&
+    !ticket.failure.retryable &&
+    wholeOperationMutationFreeProviderRefusals.get(ticket) === operationId
   );
 }
 

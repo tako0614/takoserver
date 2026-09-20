@@ -15,7 +15,11 @@ import type {
   ProviderTicket,
   ResourceIdentity,
 } from "../provider-port.ts";
-import { failed, failedWithoutProviderMutation } from "../provider-port.ts";
+import {
+  failed,
+  failedWithoutProviderMutation,
+  failedWithoutProviderOperationMutation,
+} from "../provider-port.ts";
 import { MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } from "../provider-runtime-input-port.ts";
 import {
   canonicalWorkerEndpointOrigin,
@@ -31,6 +35,7 @@ import {
   maybeExactRecord,
 } from "./cloudflare-provider-executor-codec.ts";
 import {
+  CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
   type CloudflareProviderExecutorRpc,
 } from "./cloudflare-provider-executor-port.ts";
@@ -152,10 +157,11 @@ export class CloudflareProviderProxy implements Provider {
     return restoreInitialMutationResult(await this.#binding.adopt(input), context);
   }
 
-  recoverAdopt(
+  async recoverAdopt(
     input: Parameters<NonNullable<Provider["recoverAdopt"]>>[0],
   ): Promise<ProviderTicket> {
-    return this.#binding.recoverAdopt(input);
+    const context = snapshotAdoptionRecoveryContext(input, this.#providerInstallationId);
+    return restoreAdoptionRecoveryResult(await this.#binding.recoverAdopt(input), context);
   }
 
   createNativeReadbackDescriptor(
@@ -328,9 +334,13 @@ function restoreInitialMutationResult(
   value: unknown,
   context: InitialMutationContext,
 ): ProviderTicket {
-  if (typeof value !== "object" || value === null || !Object.hasOwn(value, "executorNoMutation")) {
+  if (typeof value !== "object" || value === null) {
     return value as ProviderTicket;
   }
+  const hasInvocationEvidence = Object.hasOwn(value, "executorNoMutation");
+  const hasAdoptionAbort = Object.hasOwn(value, "executorAdoptionAbort");
+  if (!hasInvocationEvidence && !hasAdoptionAbort) return value as ProviderTicket;
+  if (!hasInvocationEvidence) return invalidInitialMutationEvidence();
 
   const ticket = maybeExactRecord(value, ["phase", "failure", "executorNoMutation"]);
   const failure = ticket
@@ -372,10 +382,104 @@ function restoreInitialMutationResult(
     authority.leaseToken !== context.executionAuthority.leaseToken ||
     authority.fingerprint !== context.executionAuthority.fingerprint
   ) {
-    return failed("unavailable", "Provider executor returned invalid no-mutation evidence", true);
+    return invalidInitialMutationEvidence();
   }
 
   return failedWithoutProviderMutation(context.operationId, failure.code, failure.message);
+}
+
+interface AdoptionRecoveryContext {
+  readonly operationId: string;
+  readonly operationMode: "initial" | "recovery" | undefined;
+  readonly providerHandle: string | undefined;
+  readonly providerInstallationId: string;
+  readonly tenantId: string;
+  readonly resourceUid: string | undefined;
+  readonly executionAuthority: ProviderExecutionAuthority | undefined;
+}
+
+interface AdoptionRecoveryInput extends InitialMutationInput {
+  readonly providerHandle?: string;
+}
+
+function snapshotAdoptionRecoveryContext(
+  input: AdoptionRecoveryInput,
+  providerInstallationId: string,
+): AdoptionRecoveryContext {
+  return {
+    operationId: input.operationId,
+    operationMode: input.operationMode,
+    providerHandle: input.providerHandle,
+    providerInstallationId,
+    tenantId: input.identity.tenantRef,
+    resourceUid: input.identity.uid,
+    executionAuthority: snapshotExecutionAuthority(input.executionAuthority),
+  };
+}
+
+function restoreAdoptionRecoveryResult(
+  value: unknown,
+  context: AdoptionRecoveryContext,
+): ProviderTicket {
+  if (typeof value !== "object" || value === null) return value as ProviderTicket;
+  const hasAdoptionAbort = Object.hasOwn(value, "executorAdoptionAbort");
+  const hasInvocationEvidence = Object.hasOwn(value, "executorNoMutation");
+  if (!hasAdoptionAbort && !hasInvocationEvidence) return value as ProviderTicket;
+  if (!hasAdoptionAbort || hasInvocationEvidence) return invalidAdoptionAbortEvidence();
+
+  const ticket = maybeExactRecord(value, ["phase", "failure", "executorAdoptionAbort"]);
+  const failure = ticket
+    ? maybeExactRecord(ticket.failure, ["code", "message", "retryable"])
+    : null;
+  const evidence = ticket
+    ? maybeExactRecord(ticket.executorAdoptionAbort, [
+        "schema",
+        "action",
+        "operationId",
+        "providerInstallationRef",
+        "executionAuthority",
+      ])
+    : null;
+  const authority = evidence
+    ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+    : null;
+
+  if (
+    ticket?.phase !== "failed" ||
+    !failure ||
+    !isProviderFailureCode(failure.code) ||
+    !boundedString(failure.message, 1, 1_024) ||
+    failure.retryable !== false ||
+    !evidence ||
+    evidence.schema !== CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA ||
+    evidence.action !== "recoverAdopt" ||
+    evidence.operationId !== context.operationId ||
+    evidence.providerInstallationRef !== context.providerInstallationId ||
+    context.operationMode !== "recovery" ||
+    context.providerHandle !== undefined ||
+    !context.executionAuthority ||
+    typeof context.tenantId !== "string" ||
+    typeof context.resourceUid !== "string" ||
+    context.executionAuthority.tenantId !== context.tenantId ||
+    context.executionAuthority.resourceUid !== context.resourceUid ||
+    !authority ||
+    authority.tenantId !== context.executionAuthority.tenantId ||
+    authority.resourceUid !== context.executionAuthority.resourceUid ||
+    authority.leaseToken !== context.executionAuthority.leaseToken ||
+    authority.fingerprint !== context.executionAuthority.fingerprint
+  ) {
+    return invalidAdoptionAbortEvidence();
+  }
+
+  return failedWithoutProviderOperationMutation(context.operationId, failure.code, failure.message);
+}
+
+function invalidInitialMutationEvidence(): ProviderTicket {
+  return failed("unavailable", "Provider executor returned invalid no-mutation evidence", true);
+}
+
+function invalidAdoptionAbortEvidence(): ProviderTicket {
+  return failed("unavailable", "Provider executor returned invalid adoption-abort evidence", true);
 }
 
 function isProviderFailureCode(value: unknown): value is ProviderFailure["code"] {

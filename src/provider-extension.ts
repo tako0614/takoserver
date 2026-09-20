@@ -59,6 +59,7 @@ export {
   type ApplyInput,
   failed,
   failedWithoutProviderMutation,
+  failedWithoutProviderOperationMutation,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderArtifactConsumption,
@@ -76,6 +77,7 @@ export {
   type ProviderTicket,
   type ProviderValue,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationNoMutation,
   type ResourceIdentity,
   succeeded,
 } from "./provider-port.ts";
@@ -114,7 +116,9 @@ export {
 } from "./providers/cloudflare-provider-executor-codec.ts";
 export type {
   CloudflareProviderAdoptInput,
+  CloudflareProviderAdoptionRecoveryResult,
   CloudflareProviderDeleteInput,
+  CloudflareProviderExecutorAdoptionAbortEvidence,
   CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
   CloudflareProviderInitialMutationResult,
@@ -126,7 +130,10 @@ export type {
   CloudflareProviderVerifyArtifactConsumptionInput,
   CloudflareProviderVerifyNativeAbsenceInput,
 } from "./providers/cloudflare-provider-executor-port.ts";
-export { CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA } from "./providers/cloudflare-provider-executor-port.ts";
+export {
+  CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+} from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CloudflareProviderProxy,
   createCloudflareProviderMeterProxySources,
