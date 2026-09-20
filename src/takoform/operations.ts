@@ -457,13 +457,12 @@ export function createDeferredOperations(input: {
             operation.resourceUid,
           );
       if (providerReceipt && !carriableReceipt(operation, providerReceipt, input.forms)) {
-        // A hold that can never settle is not a hold. The receipt is durable
-        // and the Form is frozen, so no repair makes this answer publishable;
-        // holding it pinned one Host misconfiguration to a resource name for
-        // the life of the deployment. It is a refusal about this Host, and
-        // ADR 0008 re-attempts those, so the operator who reconfigures the Host
-        // and re-runs the identical apply gets a fresh attempt. The saga goes
-        // with it: adopting it again would re-project the same answer.
+        // The provider acted, so this exact receipt remains the only recovery
+        // authority even when the current Form cannot publish it. Retiring the
+        // saga and minting a new operation/resource identity would not be a
+        // retry: provider execution is keyed by the operation identity and may
+        // create a second native object. Hold the command until an explicit
+        // adopt-or-compensate recovery can consume this receipt.
         console.error(
           canonicalJson({
             event: "takoform.deferred_operation.unpublishable_receipt",
@@ -476,19 +475,10 @@ export function createDeferredOperations(input: {
           "unsupported_capability",
           422,
           undefined,
-          `the provider's answer for this ${operation.target.kind} is not one ${operation.target.kind}@${operation.target.formRef.definitionVersion} can publish, so this Host cannot record it; repair the Host's configuration and apply again`,
+          `the provider's answer for this ${operation.target.kind} is not one ${operation.target.kind}@${operation.target.formRef.definitionVersion} can publish, so this Host cannot record it; the exact provider receipt is retained for explicit adopt-or-compensate repair, and changing configuration or repeating this request will not dispatch the provider again`,
         );
-        await input.store.retireUnpublishableProviderMutation({
-          operation,
-          leaseToken,
-          terminalJson: failureTerminal(
-            operation.id,
-            refusal.code,
-            refusal.publicMessage ?? diagnosticMessage(refusal.code),
-            refusal.hostCode,
-          ),
-        });
-        return { kind: "settled" };
+        await input.store.holdDeferredProviderRepair({ operation, leaseToken });
+        return { kind: "repair", error: refusal };
       }
       if (providerReceipt || providerPlan) {
         console.error(

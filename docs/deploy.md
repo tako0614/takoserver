@@ -1159,9 +1159,9 @@ managed customer runtime.
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
   `integration-protected-wave` result is never accepted by rehearsal or
-  production. The no-selector integration lane remains the disposable suffix
-  path only while its pending suffix includes neither 0059 nor 0060; either
-  pending cutover is unavailable and refuses apply before qualification or mutation.
+  production. The no-selector integration lane additionally permits only the
+  exact existing-data 0058/0059 to 0060 transition described below. Earlier
+  predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
   protocol below. Keep its maintenance projection while the selected 0044–0057
   trail is pending; a Cloudflare provider executor (CPE) service is optional
@@ -1188,32 +1188,52 @@ foreign keys after migration. Large targets require a separate bounded
 maintenance/shadow transition. Do not use an integration reset as production
 recovery or bypass the protected selector.
 
-### 0059 provider-selection schema: current-data cutover unavailable
+### 0059/0060: additive existing-data integration cutover
 
-0059 retains the provider selection accepted before a provider-visible apply
-callback. For an existing database with 0059 pending, old apply writers may
-still reach that callback, and this surface has no supported proof that they
-are quiesced or that the old writer was never served. Status therefore returns
-`applyProviderSelectionCutover.status=old_apply_writers_quiescence_unproven`
-and `readyForApply=false`; apply refuses before source qualification, the
-migration gate, or provider mutation. Empty counts or shape, lease expiry,
-503/time waits, and a reviewer string are not a never-served proof and cannot
-bypass this refusal.
+The no-selector `takoserver-d1-schema` integration lane accepts only an exact
+audited 0058 predecessor with `[0059, 0060]` pending, or an exact 0059
+predecessor with `[0060]` pending. Production and rehearsal selectors still
+stop at 0057. This does not qualify the table replacement in 0058.
 
-Historical `NULL` selection rows are not backfilled or reinterpreted. Only the
-separate `takoserver-integration-storage-generation` surface may create an
-absent D1/R2 pair and apply the sealed 0001–0060 lineage before adoption. That
-fresh-generation initialization is not a recovery alternative for current
-protected data.
+0059 adds selection columns and guards. 0060 creates separate, paired saga
+and deferred-operation tables, freezes new legacy insertions, and prevents
+cleanup from deleting unresolved legacy control rows. Neither migration copies
+or backfills historical operations. Current acceptance also checks retained
+open apply/import/delete effects: an older runtime could already have swept a
+planned saga while its preparation callback was running. The append-only effect
+and its Resource attestation preserve that conflict even without the saga.
+Terminal `succeeded`/`cancelled` evidence closes only the same tenant, Resource
+UID and effect identity.
 
-0060 introduces physically separate saga and deferred-operation records for
-the current runtime, retaining legacy records without copying or backfilling
-them. This is a compatibility implementation, not a qualified live transition.
-If 0059 is already applied but 0060 is pending, status returns
-`applyProviderSelectionCutover.status=operation_generation_cutover_unqualified`
-and apply still refuses before mutation. Existing-data D1 qualification and
-owning cutover/readback work remain required; passing local tests does not
-remove this guard or authorize a reset.
+Status and apply require the exact audited source inventory and hashes,
+canonical predecessor schema, and zero open effects missing their retained
+`live`/`pending` Resource attestation. A nonzero count of correctly identified
+unresolved operations is allowed; this is not a drain assertion. Integrity is
+read again during qualification and immediately before mutation. A schema
+mismatch or orphan effect refuses apply before qualification or mutation.
+An earlier integration predecessor remains unavailable. Neither a reviewer
+string, lease expiry, nor a wait can override these checks.
+
+The scoped migration gate and independent review precede mutation. Pinned
+Wrangler submits each complete migration together with its ledger insert as
+one D1 transaction. A failure is followed by authoritative readback, never a
+blind retry. A complete 0059 with 0060 pending is the supported partial boundary;
+resume through the same owning surface. Success requires exact 0060 lineage,
+canonical schema and retained-effect integrity readback, not only a successful
+provider response.
+
+Once 0060 commits, old binaries cannot accept new work: this is a forward-only
+availability boundary. Have the matching provider executor and Host candidates
+ready before applying. After successful schema readback, publish the current
+executor, then the current Host. A mixed runtime pair refuses execution
+retryably; restoring an old binary does not restore service. Repair forward
+through the owning surfaces if publication fails.
+
+Historical `NULL` selections stay quarantined, not recovered or reinterpreted.
+An isolated fresh database is not a recovery alternative for protected existing
+data. A successful cutover must still be followed by apply/recovery checks on
+the exact deployed Host/executor pair; local tests alone do not claim that live
+cutover or application operation has completed.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

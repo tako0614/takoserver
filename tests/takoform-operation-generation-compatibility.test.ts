@@ -41,6 +41,16 @@ const LEGACY_DEFERRED_INSERT = `INSERT OR IGNORE INTO tf_deferred_operations
  VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
          NULL, NULL, NULL, NULL, ?, ?, ?)`;
 
+const LEGACY_RESOURCE_EFFECT_INSERT = `INSERT OR IGNORE INTO tf_resource_provider_effects
+   (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+    operation_mode, provider_pack_ref, provider_installation_ref,
+    native_id, target_json, created_at)
+ SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+ WHERE EXISTS (
+   SELECT 1 FROM tf_resource_deletion_attestations
+   WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')
+ )`;
+
 const FORM_REF: TakoformV1Alpha3FormRef = {
   apiVersion: "generation.forms.invalid",
   kind: "GenerationThing",
@@ -132,6 +142,94 @@ function insertLegacyDeferred(
       timestamp,
       timestamp,
     );
+}
+
+function insertLegacyResourceEffects(
+  database: Database,
+  input: {
+    readonly tenantId?: string;
+    readonly resourceUid: string;
+    readonly operationId: string;
+    readonly targetName: string;
+    readonly kind: "apply" | "import" | "delete";
+    readonly phases: readonly ("planned" | "dispatched" | "succeeded" | "cancelled")[];
+  },
+): void {
+  const tenantId = input.tenantId ?? "tenant-generation";
+  database
+    .query(
+      `INSERT INTO tf_resource_deletion_attestations
+         (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
+          state, closure_fence, effects_json, evidence_json, evidence_ref,
+          evidence_effect_digest, evidence_checked_at, evidence_status,
+          created_at, updated_at)
+       VALUES (?, ?, 'main', 'generation.forms.invalid', 'GenerationThing', ?, ?,
+               'live', 1, '[]', NULL, NULL, NULL, NULL, NULL, 1, 1)`,
+    )
+    .run(tenantId, input.resourceUid, input.targetName, JSON.stringify(FORM_REF));
+  for (const [index, phase] of input.phases.entries()) {
+    const timestamp = index + 2;
+    const eventId = `${input.operationId}:${phase}`;
+    const recorded = database
+      .query(LEGACY_RESOURCE_EFFECT_INSERT)
+      .run(
+        tenantId,
+        input.resourceUid,
+        eventId,
+        input.operationId,
+        input.kind,
+        phase,
+        "initial",
+        null,
+        null,
+        null,
+        null,
+        timestamp,
+        tenantId,
+        input.resourceUid,
+      );
+    expect(recorded.changes).toBe(1);
+    database
+      .query(
+        `UPDATE tf_resource_deletion_attestations
+         SET closure_fence = closure_fence + 1,
+             effects_json = json_insert(effects_json, '$[#]', json(?)),
+             updated_at = ?
+         WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')`,
+      )
+      .run(
+        JSON.stringify({
+          eventId,
+          operationId: input.operationId,
+          kind: input.kind,
+          phase,
+          operationMode: "initial",
+        }),
+        timestamp,
+        tenantId,
+        input.resourceUid,
+      );
+  }
+}
+
+function deferredForSaga(record: ProviderMutationSaga) {
+  return {
+    id: record.operationId,
+    tenantId: record.tenantId,
+    principalId: "principal-generation",
+    operation: record.operationKind,
+    phase: "pending" as const,
+    requestPath: "/v1/resources",
+    requestQuery: "",
+    requestHeaders: {},
+    requestBody: "{}",
+    fingerprint: record.fingerprint,
+    replayKey: `host:${record.replayKey}`,
+    target: { ...record.target, formRef: FORM_REF },
+    resourceUid: record.resourceUid,
+    pollsRemaining: 1,
+    createdAt: new Date(10_000).toISOString(),
+  };
 }
 
 function saga(input: {
@@ -549,6 +647,189 @@ describe("Takoform paired operation generation compatibility", () => {
       expect(
         database.query("SELECT COUNT(*) AS count FROM tf_deferred_operations_selection_v1").get(),
       ).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("retained old effects fence a swept saga without blocking terminal or current work", async () => {
+    const database = new Database(":memory:");
+    try {
+      applyBeforeGeneration(database);
+      const open = [
+        {
+          suffix: "operation",
+          resourceUid: "uid-effect-operation",
+          targetName: "effect-operation",
+          kind: "apply",
+          phases: ["planned"],
+        },
+        {
+          suffix: "uid",
+          resourceUid: "uid-effect-shared",
+          targetName: "effect-uid",
+          kind: "import",
+          phases: ["planned", "dispatched"],
+        },
+        {
+          suffix: "target",
+          resourceUid: "uid-effect-target",
+          targetName: "effect-target-shared",
+          kind: "delete",
+          phases: ["planned", "dispatched"],
+        },
+      ] as const;
+      for (const entry of open) {
+        insertLegacySaga(database, {
+          operationId: `op-effect-${entry.suffix}`,
+          replayKey: `replay-effect-${entry.suffix}`,
+          resourceUid: entry.resourceUid,
+          targetName: entry.targetName,
+          expiresAt: 1,
+        });
+        insertLegacyResourceEffects(database, {
+          resourceUid: entry.resourceUid,
+          operationId: `op-effect-${entry.suffix}`,
+          targetName: entry.targetName,
+          kind: entry.kind,
+          phases: entry.phases,
+        });
+      }
+      for (const [suffix, terminal] of [
+        ["cancelled", ["planned", "cancelled"]],
+        ["succeeded", ["planned", "dispatched", "succeeded"]],
+      ] as const) {
+        insertLegacySaga(database, {
+          operationId: `op-effect-${suffix}`,
+          replayKey: `replay-effect-${suffix}`,
+          resourceUid: `uid-effect-${suffix}`,
+          targetName: `effect-${suffix}`,
+          expiresAt: 1,
+        });
+        insertLegacyResourceEffects(database, {
+          resourceUid: `uid-effect-${suffix}`,
+          operationId: `op-effect-${suffix}`,
+          targetName: `effect-${suffix}`,
+          kind: suffix === "cancelled" ? "apply" : "import",
+          phases: terminal,
+        });
+      }
+
+      // This is the released pre-0060 sweep. It can erase a seven-day-old
+      // planned saga while the provider's pre-dispatch callback is still live.
+      expect(
+        database
+          .query(
+            `DELETE FROM tf_provider_mutation_sagas WHERE rowid IN (
+               SELECT rowid FROM tf_provider_mutation_sagas
+               WHERE phase = 'planned' AND expires_at <= ? ORDER BY expires_at LIMIT ?
+             )`,
+          )
+          .run(10_000, 128).changes,
+      ).toBe(5);
+      expect(
+        database.query("SELECT COUNT(*) AS count FROM tf_provider_mutation_sagas").get(),
+      ).toEqual({ count: 0 });
+      applyGeneration(database);
+
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(10_000));
+      const operationConflict = saga({
+        operationId: "op-effect-operation",
+        replayKey: "new-replay-effect-operation",
+        resourceUid: "uid-new-effect-operation",
+        targetName: "new-effect-operation",
+        operationKind: "apply",
+      });
+      const conflicts = [
+        operationConflict,
+        saga({
+          operationId: "op-new-effect-uid",
+          replayKey: "new-replay-effect-uid",
+          resourceUid: "uid-effect-shared",
+          targetName: "new-effect-uid",
+          operationKind: "import",
+        }),
+        saga({
+          operationId: "op-new-effect-target",
+          replayKey: "new-replay-effect-target",
+          resourceUid: "uid-new-effect-target",
+          targetName: "effect-target-shared",
+          operationKind: "delete",
+        }),
+      ];
+      let providerCallbacks = 0;
+      for (const conflict of conflicts) {
+        await expect(
+          (async () => {
+            await store.acceptProviderMutationSaga(conflict);
+            providerCallbacks += 1;
+          })(),
+        ).rejects.toMatchObject({ hostCode: LEGACY_OPERATION_GENERATION_CONFLICT });
+      }
+      await expect(
+        store.acceptDeferredOperation(deferredForSaga(operationConflict)),
+      ).rejects.toMatchObject({ hostCode: LEGACY_OPERATION_GENERATION_CONFLICT });
+      expect(providerCallbacks).toBe(0);
+      expect(
+        database
+          .query("SELECT COUNT(*) AS count FROM tf_provider_mutation_sagas_selection_v1")
+          .get(),
+      ).toEqual({ count: 0 });
+      expect(
+        database.query("SELECT COUNT(*) AS count FROM tf_deferred_operations_selection_v1").get(),
+      ).toEqual({ count: 0 });
+
+      for (const suffix of ["cancelled", "succeeded"] as const) {
+        await store.acceptProviderMutationSaga(
+          saga({
+            operationId: `op-new-after-${suffix}`,
+            replayKey: `new-replay-after-${suffix}`,
+            resourceUid: `uid-effect-${suffix}`,
+            targetName: `effect-${suffix}`,
+          }),
+        );
+      }
+
+      const otherTenant = saga({
+        operationId: "op-effect-operation",
+        replayKey: "other-tenant-replay",
+        resourceUid: "uid-effect-operation",
+        targetName: "effect-operation",
+        tenantId: "unrelated-tenant",
+        operationKind: "apply",
+      });
+      await store.acceptProviderMutationSaga(otherTenant);
+
+      const current = saga({
+        operationId: "op-current-generation",
+        replayKey: "current-generation-replay",
+        resourceUid: "uid-current-generation",
+        targetName: "current-generation",
+        operationKind: "apply",
+      });
+      const currentDeferred = deferredForSaga(current);
+      const acceptedDeferred = await store.acceptDeferredOperation(currentDeferred);
+      const acceptedSaga = await store.acceptProviderMutationSaga(current);
+      expect(
+        await store.reserveResourceIncarnation({
+          tenantId: current.tenantId,
+          resourceUid: current.resourceUid,
+          address: current.target,
+          formRef: FORM_REF,
+        }),
+      ).toBe(true);
+      expect(
+        await store.recordResourceEffect({
+          tenantId: current.tenantId,
+          resourceUid: current.resourceUid,
+          effectId: current.operationId,
+          kind: "apply",
+          phase: "planned",
+          operationMode: "initial",
+        }),
+      ).toBe(true);
+      expect(await store.acceptProviderMutationSaga(current)).toEqual(acceptedSaga);
+      expect(await store.acceptDeferredOperation(currentDeferred)).toEqual(acceptedDeferred);
     } finally {
       database.close();
     }

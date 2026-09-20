@@ -25,7 +25,7 @@ const saga: ProviderMutationSaga = {
   },
 };
 
-const applySelection: TakoformApplySelection = {
+const applySelection = {
   version: TAKOFORM_APPLY_SELECTION_VERSION,
   kind: "provider",
   providerPackRef: "provider-a",
@@ -45,7 +45,47 @@ const applySelection: TakoformApplySelection = {
     capabilities: ["create", "update"],
   },
   relations: [],
-};
+} satisfies TakoformApplySelection;
+
+async function recordPlannedProviderEffect(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+): Promise<void> {
+  expect(
+    await store.reserveResourceIncarnation({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      address: mutationSaga.target,
+      formRef: applySelection.technicalOffering.form,
+    }),
+  ).toBe(true);
+  expect(
+    await store.recordResourceEffect({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      effectId: mutationSaga.operationId,
+      kind: mutationSaga.operationKind,
+      phase: "planned",
+      operationMode: "initial",
+    }),
+  ).toBe(true);
+}
+
+async function recordDispatchedProviderEffect(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+): Promise<void> {
+  expect(
+    await store.recordResourceEffect({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      effectId: mutationSaga.operationId,
+      kind: mutationSaga.operationKind,
+      phase: "dispatched",
+      operationMode: "initial",
+    }),
+  ).toBe(true);
+}
 
 describe("provider mutation saga execution leases", () => {
   test("retains an accepted selection across the ordinary plan expiry before dispatch", async () => {
@@ -417,7 +457,24 @@ describe("provider mutation saga execution leases", () => {
         selection: applySelection,
       }),
     ).toEqual(applySelection);
-    await store.markProviderMutationDispatch({ ...identity, leaseToken: "old" });
+    await recordPlannedProviderEffect(store, saga);
+    expect(await store.markProviderMutationDispatch({ ...identity, leaseToken: "old" })).toBe(true);
+    await recordDispatchedProviderEffect(store, saga);
+    const unrelatedSaga: ProviderMutationSaga = {
+      ...saga,
+      operationId: "op_unrelated_open_effect",
+      replayKey: "replay-unrelated-open-effect",
+      resourceUid: "uid_unrelated_open_effect",
+      target: { ...saga.target, name: "unrelated-open-effect" },
+    };
+    await recordPlannedProviderEffect(store, unrelatedSaga);
+    await recordDispatchedProviderEffect(store, unrelatedSaga);
+    const unrelatedEffects = database
+      .query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+      )
+      .all(unrelatedSaga.tenantId, unrelatedSaga.resourceUid);
     await store.recordProviderMutationOutcome({
       ...identity,
       leaseToken: "old",
@@ -465,6 +522,26 @@ describe("provider mutation saga execution leases", () => {
     expect(
       await store.providerMutationPlanExists(saga.tenantId, saga.operationId, saga.resourceUid),
     ).toBe(false);
+    expect(
+      database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(saga.operationId),
+    ).toEqual([
+      { effect_kind: "apply", phase: "cancelled" },
+      { effect_kind: "apply", phase: "dispatched" },
+      { effect_kind: "apply", phase: "planned" },
+    ]);
+    expect(
+      database
+        .query(
+          `SELECT * FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+        )
+        .all(unrelatedSaga.tenantId, unrelatedSaga.resourceUid),
+    ).toEqual(unrelatedEffects);
     database.close();
   });
   test("fences concurrent and stale executors while preserving one idempotent receipt", async () => {
@@ -999,6 +1076,136 @@ describe("provider mutation saga execution leases", () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+    for (const [suffix, terminalKind, terminalMode] of [
+      ["wrong-kind", "apply", "initial"],
+      ["wrong-mode", "import", "recovery"],
+    ] as const) {
+      const mismatchedSaga: ProviderMutationSaga = {
+        ...saga,
+        operationKind: "import",
+        operationId: `op_precondition_${suffix}`,
+        replayKey: `replay-precondition-${suffix}`,
+        resourceUid: `uid_precondition_${suffix}`,
+        target: { ...saga.target, name: `precondition-${suffix}` },
+      };
+      const leaseToken = `lease_${suffix}`;
+      await store.acceptProviderMutationSaga(mismatchedSaga);
+      await recordPlannedProviderEffect(store, mismatchedSaga);
+      await store.acquireProviderMutationExecution({
+        tenantId: mismatchedSaga.tenantId,
+        operationId: mismatchedSaga.operationId,
+        resourceUid: mismatchedSaga.resourceUid,
+        leaseToken,
+        leaseUntil: 2_000,
+      });
+      expect(
+        await store.markProviderMutationDispatch({
+          tenantId: mismatchedSaga.tenantId,
+          operationId: mismatchedSaga.operationId,
+          resourceUid: mismatchedSaga.resourceUid,
+          leaseToken,
+        }),
+      ).toBe(true);
+      await recordDispatchedProviderEffect(store, mismatchedSaga);
+      database
+        .query(
+          `INSERT INTO tf_resource_provider_effects
+             (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+              operation_mode, provider_pack_ref, provider_installation_ref,
+              native_id, target_json, created_at)
+           VALUES (?, ?, ?, ?, ?, 'cancelled', ?, NULL, NULL, NULL, NULL, 1000)`,
+        )
+        .run(
+          mismatchedSaga.tenantId,
+          mismatchedSaga.resourceUid,
+          `${mismatchedSaga.operationId}:cancelled`,
+          mismatchedSaga.operationId,
+          terminalKind,
+          terminalMode,
+        );
+      expect(
+        await store.settleProviderMutationPreconditionFailure({
+          tenantId: mismatchedSaga.tenantId,
+          operationId: mismatchedSaga.operationId,
+          resourceUid: mismatchedSaga.resourceUid,
+          leaseToken,
+        }),
+      ).toBe(false);
+      expect(
+        await store.providerMutationPlanExists(
+          mismatchedSaga.tenantId,
+          mismatchedSaga.operationId,
+          mismatchedSaga.resourceUid,
+        ),
+      ).toBe(true);
+    }
+    const rollbackSaga: ProviderMutationSaga = {
+      ...saga,
+      operationKind: "delete",
+      operationId: "op_precondition_rollback",
+      replayKey: "replay-precondition-rollback",
+      resourceUid: "uid_precondition_rollback",
+      target: { ...saga.target, name: "precondition-rollback" },
+    };
+    const rollbackIdentity = {
+      tenantId: rollbackSaga.tenantId,
+      operationId: rollbackSaga.operationId,
+      resourceUid: rollbackSaga.resourceUid,
+      leaseToken: "lease_precondition_rollback",
+    };
+    await store.acceptProviderMutationSaga(rollbackSaga);
+    await recordPlannedProviderEffect(store, rollbackSaga);
+    await store.acquireProviderMutationExecution({ ...rollbackIdentity, leaseUntil: 2_000 });
+    expect(await store.markProviderMutationDispatch(rollbackIdentity)).toBe(true);
+    await recordDispatchedProviderEffect(store, rollbackSaga);
+    const rollbackState = () => ({
+      attestation: database
+        .query(
+          `SELECT * FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ?`,
+        )
+        .get(rollbackSaga.tenantId, rollbackSaga.resourceUid),
+      effects: database
+        .query(
+          `SELECT * FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+        )
+        .all(rollbackSaga.tenantId, rollbackSaga.resourceUid),
+      guards: database.query("SELECT * FROM tf_operation_commit_guards ORDER BY token").all(),
+      saga: database
+        .query(
+          `SELECT * FROM tf_provider_mutation_sagas_selection_v1
+           WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?`,
+        )
+        .get(rollbackSaga.tenantId, rollbackSaga.operationId, rollbackSaga.resourceUid),
+    });
+    const beforeRollback = rollbackState();
+    database.exec(`
+      CREATE TRIGGER test_reject_provider_precondition_saga_delete
+      BEFORE DELETE ON tf_provider_mutation_sagas_selection_v1
+      WHEN OLD.operation_id = 'op_precondition_rollback'
+      BEGIN
+        SELECT RAISE(ABORT, 'precondition_settlement_rollback');
+      END;
+    `);
+    await expect(store.settleProviderMutationPreconditionFailure(rollbackIdentity)).rejects.toThrow(
+      "precondition_settlement_rollback",
+    );
+    expect(rollbackState()).toEqual(beforeRollback);
+    database.exec("DROP TRIGGER test_reject_provider_precondition_saga_delete");
+
+    expect(await store.settleProviderMutationPreconditionFailure(rollbackIdentity)).toBe(true);
+    const afterCommit = rollbackState();
+    expect(afterCommit.saga).toBeNull();
+    expect(afterCommit.guards).toEqual([]);
+    expect(afterCommit.effects).toEqual([
+      expect.objectContaining({ effect_kind: "delete", phase: "cancelled" }),
+      expect.objectContaining({ effect_kind: "delete", phase: "dispatched" }),
+      expect.objectContaining({ effect_kind: "delete", phase: "planned" }),
+    ]);
+    expect(await store.settleProviderMutationPreconditionFailure(rollbackIdentity)).toBe(false);
+    expect(rollbackState()).toEqual(afterCommit);
+
     const failedSaga: ProviderMutationSaga = {
       ...saga,
       operationKind: "import",
@@ -1008,6 +1215,7 @@ describe("provider mutation saga execution leases", () => {
       target: { ...saga.target, name: "provider-precondition" },
     };
     await store.acceptProviderMutationSaga(failedSaga);
+    await recordPlannedProviderEffect(store, failedSaga);
     await store.acquireProviderMutationExecution({
       tenantId: failedSaga.tenantId,
       operationId: failedSaga.operationId,
@@ -1015,12 +1223,15 @@ describe("provider mutation saga execution leases", () => {
       leaseToken: "lease_precondition",
       leaseUntil: 2_000,
     });
-    await store.markProviderMutationDispatch({
-      tenantId: failedSaga.tenantId,
-      operationId: failedSaga.operationId,
-      resourceUid: failedSaga.resourceUid,
-      leaseToken: "lease_precondition",
-    });
+    expect(
+      await store.markProviderMutationDispatch({
+        tenantId: failedSaga.tenantId,
+        operationId: failedSaga.operationId,
+        resourceUid: failedSaga.resourceUid,
+        leaseToken: "lease_precondition",
+      }),
+    ).toBe(true);
+    await recordDispatchedProviderEffect(store, failedSaga);
     expect(
       await store.settleProviderMutationPreconditionFailure({
         tenantId: failedSaga.tenantId,
@@ -1036,6 +1247,18 @@ describe("provider mutation saga execution leases", () => {
         failedSaga.resourceUid,
       ),
     ).toBe(false);
+    expect(
+      database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(failedSaga.operationId),
+    ).toEqual([
+      { effect_kind: "import", phase: "cancelled" },
+      { effect_kind: "import", phase: "dispatched" },
+      { effect_kind: "import", phase: "planned" },
+    ]);
     database.close();
   });
 });

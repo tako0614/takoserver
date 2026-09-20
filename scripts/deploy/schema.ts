@@ -15,6 +15,10 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  applicationSchemaMatches,
+  deriveExpectedApplicationShape,
+} from "./application-schema-shape.ts";
+import {
   type ArtifactBlobIoDeploymentCompatibility,
   inspectArtifactBlobIoDeploymentCompatibility,
 } from "./artifact-blob-io-compatibility.ts";
@@ -424,6 +428,8 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Open effects need their retained resource identity; unresolved work itself is allowed. */
+  orphanOpenProviderEffectCount?(phase: DeployPhase): Promise<number>;
   /** Fixed 0016->0022 catch-up snapshot; counts bind rehearsal to production. */
   legacyProductionCatchupDataIntegrity?(phase: DeployPhase): Promise<{
     readonly ledgerRowCount: number;
@@ -775,7 +781,29 @@ export async function runD1Schema(
       options.reader,
     );
     const wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
-    const applyProviderSelectionCutover = inspectApplyProviderSelectionCutover(wave.pending);
+    const inspectSelectionCutover = (
+      state: D1SchemaState,
+      selected: SelectedSchemaWave,
+      phase: DeployPhase,
+      configPath: string,
+    ) =>
+      inspectApplyProviderSelectionCutover({
+        invocation,
+        wave: selected,
+        state,
+        artifact: sourceMigrations,
+        phase,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+    const applyProviderSelectionCutover = await inspectSelectionCutover(
+      initial,
+      wave,
+      "preflight",
+      inspectionConfig,
+    );
     if (invocation.action === "apply") {
       assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
     }
@@ -853,7 +881,8 @@ export async function runD1Schema(
                   CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST))) &&
           (artifactBlobIoCompatibility.status === "ready" ||
             artifactBlobIoCompatibility.status === "not_pending") &&
-          applyProviderSelectionCutover.status === "not_pending",
+          (applyProviderSelectionCutover.status === "not_pending" ||
+            applyProviderSelectionCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -911,6 +940,10 @@ export async function runD1Schema(
     ) {
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
+    const operationGenerationPostShape =
+      applyProviderSelectionCutover.status === "ready"
+        ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
+        : null;
     const migrationImport =
       wave.selector === "0047"
         ? buildD1MigrationImport(
@@ -939,6 +972,9 @@ export async function runD1Schema(
     if (JSON.stringify(requalifiedWave.pending) !== JSON.stringify(wave.pending)) {
       throw preflightError("D1 selected wave suffix changed during qualification");
     }
+    assertApplyProviderSelectionCutoverReady(
+      await inspectSelectionCutover(requalified, requalifiedWave, "preflight", configPath),
+    );
     const requalifiedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: requalifiedWave.pending,
@@ -1007,6 +1043,9 @@ export async function runD1Schema(
     const fenced = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(requalified, fenced);
     const fencedWave = selectSchemaWave(sourceMigrations, fenced.applied, invocation);
+    assertApplyProviderSelectionCutoverReady(
+      await inspectSelectionCutover(fenced, fencedWave, "preflight", configPath),
+    );
     const fencedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: fencedWave.pending,
@@ -1200,6 +1239,11 @@ export async function runD1Schema(
         run,
         injected: options.reader,
       });
+      // Keep the retained-effect integrity read immediately before the one
+      // migration request. Old writers may finish; they need not be drained.
+      assertApplyProviderSelectionCutoverReady(
+        await inspectSelectionCutover(fenced, fencedWave, "mutation", configPath),
+      );
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1313,6 +1357,26 @@ export async function runD1Schema(
       throw verificationError(
         "D1 post-readback still has migrations pending within the selected wave",
       );
+    }
+    if (operationGenerationPostShape !== null) {
+      if (!applicationSchemaMatches(post, operationGenerationPostShape)) {
+        throw verificationError(
+          "operation-generation cutover post-shape differs from the exact audited 0060 schema; repair forward",
+        );
+      }
+      const orphanCount = await readOrphanOpenProviderEffectCount({
+        phase: "verification",
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+      if (orphanCount !== 0) {
+        throw verificationError(
+          "operation-generation cutover has orphan open provider effects after migration; repair forward",
+          JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
+        );
+      }
     }
     if (
       fencedReceiptEvidence &&
@@ -1793,8 +1857,12 @@ interface ArtifactBlobIoFencePreflight {
 interface ApplyProviderSelectionCutover {
   readonly status:
     | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "orphan_open_effects_repair_required"
     | "old_apply_writers_quiescence_unproven"
     | "operation_generation_cutover_unqualified";
+  readonly orphanOpenProviderEffectCount?: number;
 }
 
 interface DataPreflights {
@@ -1878,22 +1946,109 @@ function assertArtifactBlobIoCompatibilityReady(
   }
 }
 
-function inspectApplyProviderSelectionCutover(
-  pending: readonly string[],
-): ApplyProviderSelectionCutover {
-  if (pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)) {
-    return { status: "old_apply_writers_quiescence_unproven" };
+async function inspectApplyProviderSelectionCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<ApplyProviderSelectionCutover> {
+  const { pending } = input.wave;
+  if (
+    !pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION) &&
+    !pending.includes(OPERATION_GENERATION_MIGRATION)
+  ) {
+    return { status: "not_pending" };
   }
-  return pending.includes(OPERATION_GENERATION_MIGRATION)
-    ? { status: "operation_generation_cutover_unqualified" }
-    : { status: "not_pending" };
+  // No new protected selector and no arbitrary integration suffix adoption:
+  // only the two additive transitions from an already complete 0058/0059.
+  const count = input.state.applied.length;
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    (count !== 58 && count !== 59) ||
+    JSON.stringify(pending) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE.slice(count))
+  ) {
+    return {
+      status: pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)
+        ? "old_apply_writers_quiescence_unproven"
+        : "operation_generation_cutover_unqualified",
+    };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "operation-generation cutover requires the exact audited 0001-0060 inventory",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  if (
+    !applicationSchemaMatches(
+      input.state,
+      deriveExpectedApplicationShape(input.artifact.files.slice(0, count)),
+    )
+  ) {
+    return { status: "predecessor_schema_mismatch" };
+  }
+  const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+  return {
+    status: orphanOpenProviderEffectCount === 0 ? "ready" : "orphan_open_effects_repair_required",
+    orphanOpenProviderEffectCount,
+  };
 }
 
 function assertApplyProviderSelectionCutoverReady(cutover: ApplyProviderSelectionCutover): void {
-  if (cutover.status !== "not_pending") {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
     throw preflightError(
       `apply-provider-selection cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
+    );
+  }
+}
+
+async function readOrphanOpenProviderEffectCount(input: {
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<number> {
+  try {
+    const count = input.injected
+      ? await input.injected.orphanOpenProviderEffectCount?.(input.phase)
+      : await readSingleCount(
+          new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+          input.phase,
+          "operation-generation retained effect identity",
+          `SELECT COUNT(*) AS row_count FROM tf_resource_provider_effects AS effect
+         WHERE effect.effect_kind IN ('apply', 'import', 'delete')
+           AND effect.phase IN ('planned', 'dispatched')
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resource_provider_effects AS terminal
+             WHERE terminal.tenant_id = effect.tenant_id
+               AND terminal.resource_uid = effect.resource_uid
+               AND terminal.effect_id = effect.effect_id
+               AND terminal.phase IN ('succeeded', 'cancelled')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resource_deletion_attestations AS identity
+             WHERE identity.tenant_id = effect.tenant_id
+               AND identity.resource_uid = effect.resource_uid
+               AND identity.state IN ('live', 'pending')
+           )`,
+          "row_count",
+        );
+    return exactNonnegativeCount(count, "operation-generation orphan open provider effects");
+  } catch (error) {
+    // A malformed post-mutation response must never claim the target was
+    // untouched merely because the shared count parser is a preflight helper.
+    if (error instanceof DeployError && error.phase === input.phase) throw error;
+    throw new DeployError(
+      input.phase,
+      error instanceof Error ? error.message : "invalid operation-generation effect count",
     );
   }
 }

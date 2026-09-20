@@ -94,6 +94,7 @@ describe("Takoserver split deploy entrypoint", () => {
       kind: string;
       surfaces: {
         surface: string;
+        covers: readonly string[];
         requiresScripts: readonly string[];
         triggers: readonly string[];
         requiresEnv: readonly string[];
@@ -148,6 +149,11 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
     );
     const schema = contract.surfaces.find(({ surface }) => surface === "takoserver-d1-schema");
+    for (const owner of ["takoserver-d1-schema", "takoserver-integration-storage-generation"]) {
+      expect(contract.surfaces.find(({ surface }) => surface === owner)?.covers).toContain(
+        "scripts/deploy/application-schema-shape.ts",
+      );
+    }
     const operatorIdentity = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-operator-identity",
     );

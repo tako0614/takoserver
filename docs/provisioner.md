@@ -302,6 +302,16 @@ that run before dispatch; an older Worker is not a supported serving rollback.
 Previously accepted side effects remain subject to their existing recovery and
 whole-attempt-idle checks.
 
+A provider receipt that cannot satisfy the frozen Form output constraints is
+still evidence of a real mutation. The Host retains the executed saga and full
+receipt in a nonterminal repair operation; the same caller key cannot create a
+fresh operation or dispatch again. Changing Host configuration alone does not
+authorize discarding that receipt. An explicit adopt-or-compensate recovery
+would be needed to release it; that recovery is not yet implemented. Conversely,
+a proven whole-attempt-idle refusal atomically closes its effect as cancelled
+when retiring its saga, so a legitimate new attempt is not blocked by an orphan
+open effect. See [the ADR 0008 correction](adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md#correction--2026-09-20-an-unpublishable-receipt-is-still-a-real-effect).
+
 ### Internal operation generations
 
 0060 separates current saga and deferred-operation storage from the physical
@@ -315,13 +325,17 @@ Legacy rows are not copied, backfilled, or adopted by the current executor.
 Legacy insertion is frozen; an older invocation already associated with a
 retained row can finish, but its cleanup cannot delete an unresolved planned
 saga or nonterminal deferred request. Current acceptance must reject conflicting legacy operation, replay,
-Resource UID or target identities before reserving claims. Historical operation
+Resource UID or target identities before reserving claims. It also checks open
+apply/import/delete effects and their retained incarnation address, even when
+an older TTL sweep already removed the control row. Only terminal evidence for
+that exact effect closes the conflict. Historical operation
 readback does not authorize execution or mutation of that legacy record.
 
 This quarantine preserves missing evidence rather than repairing it. Its
 removal requires a separate proven legacy retirement, not elapsed time or an
-empty current-generation table. The existing-data D1 cutover remains disabled
-pending qualification through the [owning schema surface](deploy.md#0059-provider-selection-schema-current-data-cutover-unavailable).
+empty current-generation table. The additive existing-data integration cutover
+requires exact 0058/0059 predecessor and retained-effect integrity through the
+[owning schema surface](deploy.md#00590060-additive-existing-data-integration-cutover).
 Neither local compatibility tests nor a fresh database demonstrate recovery
 of historical unresolved operations.
 

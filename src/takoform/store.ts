@@ -594,23 +594,6 @@ export interface TakoformStore {
     readonly id: string;
     readonly terminalJson: string;
   }): Promise<"cancelled" | "settled" | "too_late" | "not_found">;
-  /**
-   * Ends a held provider repair whose receipt the Form can never carry.
-   *
-   * The ordinary hold is right where a native object exists and the exact Host
-   * command is the only thing that can reconcile it. This one cannot be
-   * reconciled by anything: the receipt is durable and the Form is frozen, so
-   * the command answers the same refusal for ever and owns the caller's replay
-   * key while it does. It is settled as a refusal about this Host — which
-   * ADR 0008 re-attempts — and the executed saga is dropped with it, because a
-   * fresh attempt on the same target would otherwise adopt it and re-project
-   * the same answer.
-   */
-  retireUnpublishableProviderMutation(input: {
-    readonly operation: DeferredOperationRecord;
-    readonly leaseToken: string;
-    readonly terminalJson: string;
-  }): Promise<boolean>;
   settleDeferredFailure(input: {
     readonly operation: DeferredOperationRecord;
     readonly leaseToken: string;
@@ -730,6 +713,11 @@ function legacyOperationConflictFence(input: OperationGenerationIdentity): {
   readonly sql: string;
   readonly params: readonly SqlParam[];
 } {
+  // A pre-generation runtime could sweep its planned saga while provider
+  // preparation was still in flight. Its append-only effect and incarnation
+  // attestations outlive that control row, so unresolved retained effects are
+  // part of the same cutover fence. A terminal event closes only its exact
+  // (tenant, Resource UID, effect id) attempt.
   return {
     sql: `(
       EXISTS (
@@ -752,6 +740,30 @@ function legacyOperationConflictFence(input: OperationGenerationIdentity): {
             )
           ))
         )
+      ) OR EXISTS (
+        SELECT 1 FROM tf_resource_provider_effects AS retained_effect
+        WHERE retained_effect.tenant_id = ?
+          AND retained_effect.effect_kind IN ('apply', 'import', 'delete')
+          AND retained_effect.phase IN ('planned', 'dispatched')
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+            WHERE terminal_effect.tenant_id = retained_effect.tenant_id
+              AND terminal_effect.resource_uid = retained_effect.resource_uid
+              AND terminal_effect.effect_id = retained_effect.effect_id
+              AND terminal_effect.phase IN ('succeeded', 'cancelled')
+          )
+          AND (
+            retained_effect.effect_id = ? OR retained_effect.resource_uid = ?
+            OR EXISTS (
+              SELECT 1 FROM tf_resource_deletion_attestations AS retained_incarnation
+              WHERE retained_incarnation.tenant_id = retained_effect.tenant_id
+                AND retained_incarnation.resource_uid = retained_effect.resource_uid
+                AND retained_incarnation.space = ?
+                AND retained_incarnation.api_version = ?
+                AND retained_incarnation.kind = ?
+                AND retained_incarnation.name = ?
+            )
+          )
       )
     )`,
     params: [
@@ -766,6 +778,13 @@ function legacyOperationConflictFence(input: OperationGenerationIdentity): {
       input.operationId,
       input.replayKey,
       input.tenantId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+      input.tenantId,
+      input.operationId,
       input.resourceUid,
       input.target.space,
       input.target.apiVersion,
@@ -2238,17 +2257,150 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       if (input.recoveryAction !== undefined && input.recoveryAction !== "convergeApply") {
         throw new TypeError("invalid provider refusal recovery action");
       }
-      const settled = await sql.run(
-        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
-         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL
-           AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
-           ${input.recoveryAction === "convergeApply" ? "AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL" : ""}
-           AND execution_started_at IS NOT NULL
-           AND execution_lease_token = ? AND execution_lease_until > ?`,
-        [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, now()],
-      );
-      return settled.changes === 1;
+      const timestamp = now();
+      const eventId = `${input.operationId}:cancelled`;
+      const guard = boundedGuard(`precondition_failure_${input.operationId}_${input.leaseToken}`);
+      const sagaFence = (alias: string): string => `${alias}.tenant_id = ?
+        AND ${alias}.operation_id = ? AND ${alias}.resource_uid = ?
+        AND ${alias}.phase = 'planned' AND ${alias}.receipt_json IS NULL
+        AND ${alias}.provider_handle IS NULL
+        AND ${alias}.provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
+        ${input.recoveryAction === "convergeApply" ? `AND ${alias}.accepted_uid IS NULL AND ${alias}.accepted_generation IS NULL AND ${alias}.accepted_revision IS NULL` : ""}
+        AND ${alias}.execution_started_at IS NOT NULL
+        AND ${alias}.execution_lease_token = ? AND ${alias}.execution_lease_until > ?`;
+      const sagaFenceParams = (): readonly SqlParam[] => [
+        input.tenantId,
+        input.operationId,
+        input.resourceUid,
+        input.leaseToken,
+        timestamp,
+      ];
+      const [, , , settled] = await sql.batch([
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                WHERE ${sagaFence("saga")}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_deletion_attestations AS incarnation
+                    WHERE incarnation.tenant_id = saga.tenant_id
+                      AND incarnation.resource_uid = saga.resource_uid
+                      AND incarnation.state IN ('live', 'pending')
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS open_effect
+                    WHERE open_effect.tenant_id = saga.tenant_id
+                      AND open_effect.resource_uid = saga.resource_uid
+                      AND open_effect.effect_id = saga.operation_id
+                      AND open_effect.effect_kind = saga.operation_kind
+                      AND open_effect.phase = 'planned'
+                      AND open_effect.operation_mode = 'initial'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                    WHERE terminal_effect.tenant_id = saga.tenant_id
+                      AND terminal_effect.resource_uid = saga.resource_uid
+                      AND terminal_effect.effect_id = saga.operation_id
+                      AND terminal_effect.phase IN ('succeeded', 'cancelled')
+                  )`,
+          params: [guard, ...sagaFenceParams()],
+        },
+        {
+          sql: `INSERT INTO tf_resource_provider_effects
+                  (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+                   operation_mode, provider_pack_ref, provider_installation_ref,
+                   native_id, target_json, created_at)
+                SELECT saga.tenant_id, saga.resource_uid, ?, saga.operation_id,
+                       saga.operation_kind, 'cancelled', 'initial',
+                       NULL, NULL, NULL, NULL, ?
+                FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                WHERE ${sagaFence("saga")}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )`,
+          params: [eventId, timestamp, ...sagaFenceParams(), guard],
+        },
+        {
+          sql: `UPDATE tf_resource_deletion_attestations
+                SET closure_fence = closure_fence + 1,
+                    effects_json = json_insert(
+                      effects_json, '$[#]', json_object(
+                        'eventId', ?, 'operationId', ?,
+                        'kind', (
+                          SELECT effect_kind FROM tf_resource_provider_effects
+                          WHERE tenant_id = ? AND resource_uid = ? AND event_id = ?
+                        ),
+                        'phase', 'cancelled', 'operationMode', 'initial'
+                      )
+                    ),
+                    evidence_json = NULL, evidence_ref = NULL,
+                    evidence_effect_digest = NULL, evidence_checked_at = NULL,
+                    evidence_status = NULL, updated_at = ?
+                WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(effects_json) AS recorded
+                    WHERE json_extract(recorded.value, '$.eventId') = ?
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM tf_resource_provider_effects AS terminal_effect
+                    INNER JOIN ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                      ON saga.tenant_id = terminal_effect.tenant_id
+                     AND saga.resource_uid = terminal_effect.resource_uid
+                     AND saga.operation_id = terminal_effect.effect_id
+                     AND saga.operation_kind = terminal_effect.effect_kind
+                    WHERE terminal_effect.tenant_id = ?
+                      AND terminal_effect.resource_uid = ?
+                      AND terminal_effect.effect_id = ?
+                      AND terminal_effect.event_id = ?
+                      AND terminal_effect.phase = 'cancelled'
+                      AND terminal_effect.operation_mode = 'initial'
+                      AND ${sagaFence("saga")}
+                  )`,
+          params: [
+            eventId,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            eventId,
+            timestamp,
+            input.tenantId,
+            input.resourceUid,
+            guard,
+            eventId,
+            input.tenantId,
+            input.resourceUid,
+            input.operationId,
+            eventId,
+            ...sagaFenceParams(),
+          ],
+        },
+        {
+          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+                WHERE ${sagaFence(PROVIDER_MUTATION_SAGA_TABLE)}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                    WHERE terminal_effect.tenant_id = ${PROVIDER_MUTATION_SAGA_TABLE}.tenant_id
+                      AND terminal_effect.resource_uid = ${PROVIDER_MUTATION_SAGA_TABLE}.resource_uid
+                      AND terminal_effect.effect_id = ${PROVIDER_MUTATION_SAGA_TABLE}.operation_id
+                      AND terminal_effect.effect_kind = ${PROVIDER_MUTATION_SAGA_TABLE}.operation_kind
+                      AND terminal_effect.event_id = ?
+                      AND terminal_effect.phase = 'cancelled'
+                      AND terminal_effect.operation_mode = 'initial'
+                  )`,
+          params: [...sagaFenceParams(), guard, eventId],
+        },
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+          params: [guard],
+        },
+      ]);
+      return (settled?.changes ?? 0) === 1;
     },
 
     async commitDefinitiveProviderMutationFailure(input) {
@@ -2931,55 +3083,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const record = await this.readDeferredOperation(input.tenantId, input.principalId, input.id);
       if (!record) return "not_found";
       return terminalPhase(record.phase) ? "settled" : "too_late";
-    },
-
-    async retireUnpublishableProviderMutation(input) {
-      const timestamp = now();
-      const [settled] = await sql.batch([
-        {
-          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
-                SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-                    expires_at = ?, updated_at = ?
-                WHERE id = ? AND tenant_id = ? AND principal_id = ?
-                  AND phase = 'committing' AND lease_token = ?`,
-          params: [
-            input.terminalJson,
-            timestamp + OPERATION_TTL_MILLISECONDS,
-            timestamp,
-            input.operation.id,
-            input.operation.tenantId,
-            input.operation.principalId,
-            input.leaseToken,
-          ],
-        },
-        {
-          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
-                WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
-                  AND phase = 'executed'
-                  AND EXISTS (
-                    SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
-                    WHERE id = ? AND tenant_id = ? AND phase = 'failed'
-                  )`,
-          params: [
-            input.operation.id,
-            input.operation.tenantId,
-            input.operation.resourceUid,
-            input.operation.id,
-            input.operation.tenantId,
-          ],
-        },
-      ]);
-      if ((settled?.changes ?? 0) !== 1) return false;
-      // The durable record of the refusal. It outlives the command row that
-      // ADR 0008 retires on the next presentation of the same key, and it is
-      // what a reservation repair reads to know this effect settled.
-      await this.putOperation(input.operation.tenantId, {
-        id: input.operation.id,
-        operation: input.operation.operation,
-        state: "failed",
-        createdAt: input.operation.createdAt,
-      });
-      return true;
     },
 
     async settleDeferredFailure(input) {

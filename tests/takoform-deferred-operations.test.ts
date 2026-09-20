@@ -12,6 +12,7 @@ import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selectio
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type {
   InstalledTakoformForm,
+  TakoformDriverReceipt,
   TakoformHost,
   TakoformResourceDriver,
 } from "../src/takoform/types.ts";
@@ -1860,6 +1861,18 @@ describe("durable deferred Takoform operations", () => {
         .query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1")
         .all(),
     ).toEqual([]);
+    expect(
+      opened.database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(operationId),
+    ).toEqual([
+      { effect_kind: "delete", phase: "cancelled" },
+      { effect_kind: "delete", phase: "dispatched" },
+      { effect_kind: "delete", phase: "planned" },
+    ]);
 
     // And once the operator has done what the refusal asked, the same destroy
     // under the same key is a second attempt rather than the stored refusal.
@@ -2023,27 +2036,49 @@ describe("durable deferred Takoform operations", () => {
   });
 
   /**
-   * A held repair that can never settle is not a repair.
+   * An invalid Form projection does not erase a real provider effect.
    *
-   * The engine holds every receipt to its Form before it materializes a
-   * Resource. When that refuses, the provider has already acted, so the command
-   * is held for repair — and for this one failure the hold is permanent: the
-   * receipt is durable, the Form is frozen, and nothing an operator does makes
-   * the stored answer publishable. The command owns the caller's plan-derived
-   * replay key while it waits, so every later apply resumed it and read back
-   * the same refusal. A real self-host left a Space unable to create its
-   * endpoint on a Host where every other Space succeeded first time.
+   * The provider's executed receipt is the only authority that can adopt or
+   * compensate the native object. A projection failure cannot discard it and
+   * start again under a new operation id or Resource uid: provider idempotency
+   * is bound to the original operation, not the caller's replay key. Until an
+   * explicit recovery consumes that receipt, the same command stays held and
+   * must never dispatch the provider again.
    */
-  test("settles a held command whose receipt its Form can never carry, and re-attempts it", async () => {
+  test("holds an unpublishable receipt without duplicating provider work", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     let published = "https://ported.invalid:28988/";
+    const appliedResourceUids: string[] = [];
+    let issuedReceipt: TakoformDriverReceipt | undefined;
     const driver: TakoformResourceDriver = {
       ...memory,
       selectApply: (input) => memory.selectApply(input),
-      apply: async (input) => ({
-        ...(await memory.apply(input)),
-        outputs: { url: published },
-      }),
+      apply: async (input) => {
+        appliedResourceUids.push(input.resourceUid);
+        const base = await memory.apply(input);
+        const observed = base.observed ?? {};
+        const outputs = { url: published };
+        issuedReceipt = {
+          ...base,
+          outputs,
+          deploymentMutation: {
+            kind: "create",
+            deployment: {
+              tenantId: input.tenantId,
+              id: `deployment:${input.operationId}`,
+              resourceUid: input.resourceUid,
+              offeringId: "test.unpublishable",
+              providerPackRef: "provider.unpublishable",
+              providerInstallationRef: "provider.unpublishable.primary",
+              nativeId: `native:${input.operationId}`,
+              state: "active",
+              observed,
+              outputs,
+            },
+          },
+        };
+        return issuedReceipt;
+      },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
     };
@@ -2072,37 +2107,79 @@ describe("durable deferred Takoform operations", () => {
         }),
       );
 
-    const refused = await apply();
-    expect(refused?.status).toBe(422);
-    expect(await refused?.json()).toMatchObject({
-      error: { code: "unsupported_capability", retryable: false },
-    });
-    // Settled, not held: the command has a terminal answer and its executed
-    // saga is gone, so a fresh attempt plans rather than adopting it.
-    expect(
-      opened.database.query("SELECT phase FROM tf_deferred_operations_selection_v1").all() as {
-        phase: string;
-      }[],
-    ).toEqual([{ phase: "failed" }]);
+    const held = await apply();
+    expect(held?.status).toBe(202);
+    if (!held) throw new Error("held apply returned no response");
+    const operationId = ((await held.json()) as { operation: { id: string } }).operation.id;
     expect(
       opened.database
-        .query("SELECT count(*) AS rows FROM tf_provider_mutation_sagas_selection_v1")
-        .get(),
-    ).toEqual({ rows: 0 });
-    // The refusal is about this Host, so the operation ledger keeps the record
-    // a later repair reads.
-    expect(
-      opened.database.query("SELECT state FROM tf_operations").all() as { state: string }[],
-    ).toEqual([{ state: "failed" }]);
-
-    // The identical apply, under the identical plan-derived key, once the Host
-    // publishes an address the Form can carry.
-    published = "https://repaired.invalid/";
-    const created = await apply();
-    expect(created?.status).toBe(201);
-    expect(await created?.json()).toMatchObject({
-      status: { outputs: { url: "https://repaired.invalid/" } },
+        .query(
+          `SELECT id, resource_uid, phase
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ id: operationId, resource_uid: appliedResourceUids[0], phase: "committing" });
+    const executed = opened.database
+      .query(
+        `SELECT operation_id, resource_uid, phase, receipt_json
+         FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+      )
+      .get(operationId) as {
+      operation_id: string;
+      resource_uid: string;
+      phase: string;
+      receipt_json: string;
+    };
+    expect(executed).toMatchObject({
+      operation_id: operationId,
+      resource_uid: appliedResourceUids[0],
+      phase: "executed",
     });
+    expect(JSON.parse(executed.receipt_json)).toEqual(issuedReceipt);
+    expect(
+      opened.database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(operationId),
+    ).toEqual([
+      { effect_kind: "apply", phase: "dispatched" },
+      { effect_kind: "apply", phase: "planned" },
+    ]);
+    expect(opened.database.query("SELECT state FROM tf_operations").all()).toEqual([]);
+    expect(opened.database.query("SELECT * FROM tf_resource_deployments").all()).toEqual([]);
+
+    // Changing what a fresh provider call would publish cannot authorize one:
+    // the exact executed receipt remains the only repair authority.
+    published = "https://repaired.invalid/";
+    const retried = await apply();
+    expect(retried?.status).toBe(202);
+    if (!retried) throw new Error("held apply retry returned no response");
+    expect(((await retried.json()) as { operation: { id: string } }).operation.id).toBe(
+      operationId,
+    );
+    expect(appliedResourceUids).toEqual([executed.resource_uid]);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_id, resource_uid, phase, receipt_json
+           FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual(executed);
+    expect(
+      opened.database
+        .query(
+          `SELECT count(*) AS terminal FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase IN ('cancelled', 'succeeded')`,
+        )
+        .get(operationId),
+    ).toEqual({ terminal: 0 });
+    expect(opened.database.query("SELECT * FROM tf_resource_deployments").all()).toEqual([]);
+    expect(
+      opened.database.query("SELECT uid FROM tf_resources WHERE name = 'unpublishable'").all(),
+    ).toEqual([]);
     opened.close();
   });
 

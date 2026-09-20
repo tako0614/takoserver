@@ -953,6 +953,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-integration-storage-generation",
       target: "cloudflare-d1-and-r2:new-integration-generation-only",
       covers: [
+        "scripts/deploy/application-schema-shape.ts",
         "migrations",
         "scripts/deploy.ts",
         "scripts/deploy/integration-storage-generation.ts",
@@ -1116,6 +1117,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-d1-schema",
       target: "cloudflare-d1:environment-selected-takoserver-state",
       covers: [
+        "scripts/deploy/application-schema-shape.ts",
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
@@ -1180,22 +1182,24 @@ export const DEPLOY_CONTRACT = {
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
           "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
           "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
-          "repository never manufactures the external drained-or-cancelled assertion. Pending 0059 " +
-          "returns applyProviderSelectionCutover.status=old_apply_writers_quiescence_unproven and " +
-          "refuses apply before source qualification, the migration gate, or provider mutation: this " +
-          "surface has no supported quiescence or never-served proof for current existing data. Counts, " +
-          "lease expiry, 503/time waits, and reviewer strings do not substitute, and historical NULL " +
-          "selection rows are not backfilled. A pending 0060 after 0059 returns " +
-          "operation_generation_cutover_unqualified and also refuses apply before mutation; local " +
-          "generation-isolation tests do not qualify an existing-data D1 transition. " +
-          "Only the separate fresh integration-storage-generation " +
-          "surface may initialize an absent 0001-0060 generation; it is not a recovery alternative " +
-          "for protected data.",
+          "repository never manufactures the external drained-or-cancelled assertion. The no-selector " +
+          "integration lane permits only exact audited 0058 to 0059+0060 or 0059 to 0060: canonical " +
+          "predecessor shape and zero open apply/import/delete effects without a live/pending " +
+          "Resource attestation are required before qualification and at the final mutation fence. " +
+          "Unresolved identified effects remain retained and fence new conflicting work; no drain, " +
+          "NULL-selection backfill, reset or arbitrary suffix adoption is implied. Each migration " +
+          "and its ledger insert share one D1 transaction; complete 0059 is the resumable boundary. " +
+          "Exact 0060 schema and lineage plus retained-effect integrity must read back before " +
+          "publishing the matching executor then Host. After 0060 the old binaries cannot restore " +
+          "service: repair forward. Protected selectors remain capped at 0057, and fresh generation " +
+          "initialization is not a recovery alternative for protected data.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
-          "native claim, plus the 0043 active-root/deleting-candidate conflict count. Rehearsal writes " +
+          "native claim, plus the 0043 active-root/deleting-candidate conflict count. The additive " +
+          "integration 0058/0059 to 0060 transition also requires exact canonical schema and no " +
+          "orphan open provider effects; identified unresolved effects need not be drained. Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
           "bytes, pre-shape and expected post-shape. Before 0037, one monotonic single-statement " +

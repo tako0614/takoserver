@@ -210,7 +210,7 @@ describe("forward-only D1 schema surface", () => {
           "0060_takoform_operation_generation.sql",
         ],
         applyProviderSelectionCutover: {
-          status: "old_apply_writers_quiescence_unproven",
+          status: "predecessor_schema_mismatch",
         },
         readyForApply: false,
       });
@@ -237,7 +237,7 @@ describe("forward-only D1 schema surface", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("old_apply_writers_quiescence_unproven");
+      expect(failure.message).toContain("predecessor_schema_mismatch");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -302,7 +302,7 @@ describe("forward-only D1 schema surface", () => {
       );
       expect(status).toMatchObject({
         pendingMigrations: ["0060_takoform_operation_generation.sql"],
-        applyProviderSelectionCutover: { status: "operation_generation_cutover_unqualified" },
+        applyProviderSelectionCutover: { status: "predecessor_schema_mismatch" },
         readyForApply: false,
       });
       const failure = await runD1Schema(
@@ -318,7 +318,7 @@ describe("forward-only D1 schema surface", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("operation_generation_cutover_unqualified");
+      expect(failure.message).toContain("predecessor_schema_mismatch");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
