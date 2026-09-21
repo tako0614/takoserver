@@ -917,10 +917,14 @@ so is an expression this Host cannot read — at apply, rather than by recording
 trigger that would never fire.
 
 When day-of-month and day-of-week are both *restricted* a day matches if either
-selects it; when only one is, only that one constrains the day. Restricted is
-decided from the field's first character, which is the historical rule: `*/2` in
-a day field restricts nothing, so `0 0 */2 * 1` is Mondays and `0 0 1 * */1` is
-the 1st of each month.
+selects it; when only one is, only that one constrains the day. The frozen Form
+does not define whether a day field beginning with `*/step` is restricted.
+This Host currently decides from the first character: `*/2` in a day field
+restricts nothing, so `0 0 */2 * 1` is Mondays, `0 0 1 * */1` is the 1st of each
+month, and `0 0 */2 * *` fires daily. These examples describe existing Host
+behavior, not an additional rule imposed on other hosts. The shared library
+preserves this behavior; resolving the contract ambiguity must not silently
+reinterpret the published definition or be claimed as completed interoperability.
 
 **A missed run is not made up.** A match is fired only while the minute it
 belongs to is still the current one; a machine that was down, or whose previous

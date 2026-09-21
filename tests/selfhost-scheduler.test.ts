@@ -253,7 +253,7 @@ test("forgets the next-fire state of one trigger, or of a whole script", async (
   expect(await state()).toEqual([]);
 });
 
-test("reads the five-field UTC grammar the Form fixes, and refuses the rest", () => {
+test("reads the frozen UTC grammar and preserves existing Host day-field matching", () => {
   const next = (expression: string, from: number) =>
     parseWorkerCron(expression)?.nextAfter(from) ?? null;
   const noon = Date.UTC(2026, 8, 2, 12, 0, 0);
@@ -266,9 +266,9 @@ test("reads the five-field UTC grammar the Form fixes, and refuses the rest", ()
   expect(next("0 0 1 * 3", noon)).toBe(Date.UTC(2026, 8, 9, 0, 0, 0));
   // Only one restricted constrains the day on its own.
   expect(next("0 0 * * 0", noon)).toBe(Date.UTC(2026, 8, 6, 0, 0, 0));
-  // A step is not a restriction. Vixie cron sets a field's star flag from its
-  // first character, so `*/1` in day-of-week leaves the day to day-of-month
-  // alone: the 1st of each month, not every day.
+  // Preserve the existing Host decision for star-step day fields. The frozen
+  // Form leaves their restriction status unspecified; this is a behavior
+  // regression, not proof of an additional cross-host requirement.
   expect(next("0 0 1 * */1", noon)).toBe(Date.UTC(2026, 9, 1, 0, 0, 0));
   // And the same the other way round: `*/2` in day-of-month restricts nothing,
   // so this is Mondays -- not Mondays and every other day of the month. From a

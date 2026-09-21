@@ -18,12 +18,12 @@
  *
  * When day-of-month and day-of-week are BOTH restricted a day matches if
  * either selects it; when only one is restricted only that one constrains the
- * day. That is the historical crontab rule and the one the Form states, and
- * "restricted" is decided the way Vixie cron decides it: from the field's
- * FIRST CHARACTER. `*&#47;2` is therefore unrestricted -- it is a step through
- * every value of the field, so the field still selects all of them -- while
- * `1-5/2` and a bare literal are restricted. Reading a step as restriction
- * makes `0 0 1 * *&#47;1` fire every day instead of on the 1st of each month.
+ * day. The frozen Form does not define whether a day field beginning with
+ * `*&#47;step` is restricted. This module preserves the existing Host behavior:
+ * restriction is decided from the first character, so such a day field is
+ * ignored when choosing matching days. For example, `0 0 *&#47;2 * *` fires
+ * daily here. That behavior is not a resolved cross-host contract; sharing
+ * this implementation must not silently turn it into one or change it.
  */
 
 /** Fields, in order, with the inclusive range each accepts. */
@@ -63,10 +63,9 @@ interface Field {
   /**
    * Whether this field constrains the day, for the two day fields.
    *
-   * Vixie cron sets a field's star flag from its first character and reads that
-   * flag as "unrestricted", so anything beginning with `*` -- `*` itself and
-   * every `*&#47;step` -- is unrestricted however few values it ends up
-   * selecting.
+   * Existing Host behavior uses the first character: anything beginning with
+   * `*` is treated as unrestricted regardless of the expanded values. The
+   * frozen Form leaves the star-step case unspecified; see the module note.
    */
   readonly restricted: boolean;
 }
