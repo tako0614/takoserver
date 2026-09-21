@@ -36,27 +36,48 @@ export interface CloudflareManagedObjectBucketReceiptStatus {
 }
 
 export interface CloudflareManagedScheduleReconciliationStatus {
-  readonly state: "idle" | "leased" | "operator_reconciliation_required" | "absent";
+  readonly state:
+    | "idle"
+    | "leased"
+    | "operator_reconciliation_required"
+    | "portable_clock_cutover_required"
+    | "absent";
   readonly desiredGeneration: number | null;
   readonly appliedGeneration: number | null;
   readonly appliedDigest: `sha256:${string}` | null;
   readonly desiredSchedules: readonly string[];
   readonly actualSchedules: readonly string[];
   readonly actualDigest: `sha256:${string}`;
+  /** Null when a bounded read cannot prove the complete, valid inventory. */
+  readonly membershipCount: number | null;
+  readonly membershipCapacity: number;
+  readonly nativeProjectionSchedules: readonly string[];
+  readonly routeAuthorityDigest: `sha256:${string}` | null;
+  readonly nativeProjectionDigest: `sha256:${string}` | null;
+  readonly clockClosure: "legacy-v1" | "portable-v2" | "unresolved";
   readonly leaseToken: string | null;
   readonly leaseUntil: number | null;
   readonly ambiguousGeneration: number | null;
   readonly ambiguityReason: "lease_expired" | "mutation_indeterminate" | null;
 }
 
-export interface CloudflareManagedScheduleOperatorProof {
-  readonly operatorAcknowledgement: string;
-  readonly leaseToken: string;
-  readonly ambiguousGeneration: number;
-  readonly desiredGeneration: number;
-  readonly actualDigest: `sha256:${string}`;
-  readonly action: "accept-provider-state" | "replace-with-desired";
-}
+/** Provider/operator library contract only; not part of the portable Host API. */
+export type CloudflareManagedScheduleOperatorProof =
+  | {
+      readonly operatorAcknowledgement: string;
+      readonly leaseToken: string;
+      readonly ambiguousGeneration: number;
+      readonly desiredGeneration: number;
+      readonly actualDigest: `sha256:${string}`;
+      readonly action: "accept-provider-state" | "replace-with-desired";
+    }
+  | {
+      readonly action: "cutover-portable-clock";
+      readonly operatorAcknowledgement: string;
+      readonly desiredGeneration: number;
+      readonly legacyAppliedDigest: `sha256:${string}`;
+      readonly actualDigest: `sha256:${string}`;
+    };
 
 export type CloudflareWorkerBackendOptions =
   | CloudflareOrdinaryWorkerBackendOptions
