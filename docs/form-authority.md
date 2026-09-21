@@ -413,9 +413,11 @@ the exact package's `create`, `read`, `delete`, `import`, and `observe`
 operations, never `update`. WorkerVersion owns the separate asset attachment
 and serving policy; admitting the bundle does not provision a Worker or domain.
 This is bundle lifecycle support, not qualification of every Worker backend's
-asset attachment. The current managed Workers-for-Platforms backend still
-refuses asset-bearing WorkerVersions until its upload and authoritative
-readback path is implemented and qualified.
+asset attachment. The managed Workers-for-Platforms backend implements the
+asset upload and provider-only attachment/readback path for asset-bearing
+WorkerVersions in source. Hosted/native qualification remains open: an exact
+WfP install must still prove attachment and serving before this capability is
+advertised as live-qualified.
 `WorkerCustomDomain` is in the implementation catalog with its declared
 `create`, `read`, `delete`, `import`, and `observe` operations. Its provider
 handler requires an exact tenant/hostname zone grant; integration qualification
