@@ -133,6 +133,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     APPLY_PROVIDER_SELECTION_MIGRATION,
     OPERATION_GENERATION_MIGRATION,
     ACCEPTED_AUTHORITY_CONTINUITY_MIGRATION,
+    "0062_takoform_import_provider_selection.sql",
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();

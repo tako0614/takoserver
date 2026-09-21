@@ -362,11 +362,11 @@ describe("forward-only D1 schema surface", () => {
     }
   });
 
-  test("a completed 0060 lineage keeps the existing no-op apply refusal", async () => {
+  test("a completed current lineage keeps the existing no-op apply refusal", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-complete-"));
     try {
       const fixture = processFixture("rehearsal");
-      const state = migrationStateThrough(60, "0060-post");
+      const state = migrationStateThrough(MIGRATIONS.length, "current-post");
       const status = await runD1Schema(
         { action: "status", environment: "integration", commit: COMMIT },
         integrationTarget,
