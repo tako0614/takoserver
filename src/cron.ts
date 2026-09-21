@@ -19,11 +19,11 @@
  * When day-of-month and day-of-week are BOTH restricted a day matches if
  * either selects it; when only one is restricted only that one constrains the
  * day. That is the historical crontab rule and the one the Form states, and
- * "restricted" is decided the way Vixie cron decides it: from the field's FIRST
- * CHARACTER. `*&#47;2` is therefore unrestricted -- it is a step through every
- * value of the field, so the field still selects all of them -- while `1-5/2`
- * and a bare literal are restricted. Reading a step as restriction makes
- * `0 0 1 * *&#47;1` fire every day instead of on the 1st of each month.
+ * "restricted" is decided the way Vixie cron decides it: from the field's
+ * FIRST CHARACTER. `*&#47;2` is therefore unrestricted -- it is a step through
+ * every value of the field, so the field still selects all of them -- while
+ * `1-5/2` and a bare literal are restricted. Reading a step as restriction
+ * makes `0 0 1 * *&#47;1` fire every day instead of on the 1st of each month.
  */
 
 /** Fields, in order, with the inclusive range each accepts. */
@@ -46,7 +46,7 @@ const MINUTE_MS = 60_000;
  */
 const SEARCH_LIMIT_MS = 4 * 366 * 24 * 60 * MINUTE_MS;
 
-export interface SelfhostCronSchedule {
+export interface WorkerCronSchedule {
   /** The expression exactly as written; it is the durable identity. */
   readonly expression: string;
   /** Whether the minute containing this instant is a match. */
@@ -77,7 +77,7 @@ interface Field {
  * The bound on length is deliberate and comes first: this string arrives in a
  * Resource spec, is stored durably, and is compared on every scheduler tick.
  */
-export function parseSelfhostCron(expression: unknown): SelfhostCronSchedule | null {
+export function parseWorkerCron(expression: unknown): WorkerCronSchedule | null {
   if (typeof expression !== "string" || expression.length < 9 || expression.length > 256) {
     return null;
   }

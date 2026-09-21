@@ -1,12 +1,12 @@
 import { beforeEach, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
+import { parseWorkerCron } from "../src/cron.ts";
 import type { Sql } from "../src/ports.ts";
 import type {
   SelfhostEventSelection,
   SelfhostEventTarget,
   SelfhostEventTargets,
 } from "../src/providers/selfhost.ts";
-import { parseSelfhostCron } from "../src/providers/selfhost-cron.ts";
 import {
   SELFHOST_WORKER_EVENT_PROTOCOL,
   SELFHOST_WORKER_EVENT_TOKEN_HEADER,
@@ -255,7 +255,7 @@ test("forgets the next-fire state of one trigger, or of a whole script", async (
 
 test("reads the five-field UTC grammar the Form fixes, and refuses the rest", () => {
   const next = (expression: string, from: number) =>
-    parseSelfhostCron(expression)?.nextAfter(from) ?? null;
+    parseWorkerCron(expression)?.nextAfter(from) ?? null;
   const noon = Date.UTC(2026, 8, 2, 12, 0, 0);
   expect(next("0 * * * *", noon)).toBe(Date.UTC(2026, 8, 2, 13, 0, 0));
   expect(next("*/15 * * * *", noon)).toBe(Date.UTC(2026, 8, 2, 12, 15, 0));
@@ -296,6 +296,6 @@ test("reads the five-field UTC grammar the Form fixes, and refuses the rest", ()
     "-1 * * * *",
     "+1 * * * *",
   ]) {
-    expect(parseSelfhostCron(refused)).toBeNull();
+    expect(parseWorkerCron(refused)).toBeNull();
   }
 });

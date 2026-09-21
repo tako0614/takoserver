@@ -29,6 +29,7 @@ export {
 } from "./actor-class-execution.ts";
 
 export { createCloudflareProviderSurface } from "./cloudflare-provider-surface.ts";
+export { parseWorkerCron, type WorkerCronSchedule } from "./cron.ts";
 export { buildEdgeForms } from "./edge-forms.ts";
 export { isEdgeFormsApiVersion } from "./form-ref.ts";
 export {
