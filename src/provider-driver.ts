@@ -29,7 +29,11 @@ import {
   canMaterializeAcrossProviderPacks,
   materializeProviderRuntimeBindings,
 } from "./provider-runtime-bindings.ts";
-import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import type {
+  ResourceDeployment,
+  ResourceDeploymentMutation,
+  ResourceDeploymentStore,
+} from "./resource-deployments.ts";
 import {
   sameTakoformApplySelection,
   TAKOFORM_APPLY_SELECTION_VERSION,
@@ -1932,32 +1936,51 @@ export function createProviderDriver(
         throw runtimeBindingCallbacksEntered ? withoutDefinitiveProviderProof(error) : error;
       }
       if (input.atomicDeploymentCommit) {
+        const outputs = deploymentOutputs(result.outputs, input);
+        let deploymentMutation: ResourceDeploymentMutation;
+        if (!current) {
+          deploymentMutation = {
+            kind: "create",
+            deployment: {
+              tenantId: input.tenantId,
+              id: `dep_${input.operationId}`,
+              resourceUid: input.resourceUid,
+              offeringId: offering.id,
+              providerPackRef: provider.id,
+              providerInstallationRef,
+              nativeId: result.nativeId,
+              state: "active",
+              observed: result.observed,
+              outputs,
+            },
+          };
+        } else if (result.nativeId === current.nativeId) {
+          deploymentMutation = {
+            kind: "refresh",
+            tenantId: input.tenantId,
+            deploymentId: current.id,
+            expectedNativeId: current.nativeId,
+            observed: result.observed,
+            outputs,
+          };
+        } else {
+          // An import makes the old object a customer claim. A provider apply
+          // may replace only the Host-minted realization it already owned; the
+          // store repeats this unclaimed fence in the atomic commit batch.
+          if (current.nativeClaimed) throw new TakoformHostError("resource_busy", 409);
+          deploymentMutation = {
+            kind: "replace",
+            tenantId: input.tenantId,
+            deploymentId: current.id,
+            expectedNativeId: current.nativeId,
+            nativeId: result.nativeId,
+            observed: result.observed,
+            outputs,
+          };
+        }
         return {
           ...receiptOf(result),
-          deploymentMutation: current
-            ? {
-                kind: "refresh",
-                tenantId: input.tenantId,
-                deploymentId: current.id,
-                expectedNativeId: current.nativeId,
-                observed: result.observed,
-                outputs: deploymentOutputs(result.outputs, input),
-              }
-            : {
-                kind: "create",
-                deployment: {
-                  tenantId: input.tenantId,
-                  id: `dep_${input.operationId}`,
-                  resourceUid: input.resourceUid,
-                  offeringId: offering.id,
-                  providerPackRef: provider.id,
-                  providerInstallationRef,
-                  nativeId: result.nativeId,
-                  state: "active",
-                  observed: result.observed,
-                  outputs: deploymentOutputs(result.outputs, input),
-                },
-              },
+          deploymentMutation,
         };
       }
       if (current) {

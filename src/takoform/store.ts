@@ -5581,9 +5581,11 @@ function providerEffectSql(
       ? providerMutation.providerInstallationRef
       : undefined;
   const nativeId =
-    providerMutation && "expectedNativeId" in providerMutation
-      ? providerMutation.expectedNativeId
-      : undefined;
+    providerMutation?.kind === "replace"
+      ? providerMutation.nativeId
+      : providerMutation && "expectedNativeId" in providerMutation
+        ? providerMutation.expectedNativeId
+        : undefined;
   const target = {
     resourceUid: mutation.resourceUid,
     address: {
@@ -5756,6 +5758,30 @@ function deploymentMutationSql(
     WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'
   )`;
   const commonParams = [mutation.tenantId, mutation.deploymentId, mutation.expectedNativeId];
+  if (mutation.kind === "replace") {
+    return {
+      fence: `${commonFence} AND EXISTS (
+        SELECT 1 FROM tf_resource_deployments
+        WHERE tenant_id = ? AND id = ? AND native_id = ? AND native_claimed = 0
+      )`,
+      fenceParams: [...commonParams, ...commonParams],
+      statements: [
+        {
+          sql: `UPDATE tf_resource_deployments
+                SET native_id = ?, observed_json = ?, outputs_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ?
+                  AND native_claimed = 0 AND state = 'active'`,
+          params: [
+            mutation.nativeId,
+            JSON.stringify(mutation.observed),
+            JSON.stringify(mutation.outputs),
+            timestamp,
+            ...commonParams,
+          ],
+        },
+      ],
+    };
+  }
   if (mutation.kind === "refresh") {
     return {
       fence: commonFence,

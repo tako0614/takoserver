@@ -212,4 +212,77 @@ describe("Resource Deployments", () => {
       (await deployments.findByNative("org_1", "selfhost.primary", "bucket:adopted"))?.id,
     ).toBe("dep_readopted");
   });
+
+  test("replaces only the exact active unclaimed native realization", async () => {
+    const deployments = store();
+    await deployments.create({
+      tenantId: "org_1",
+      id: "dep_replace",
+      resourceUid: "uid_replace",
+      offeringId: "compute.edge.internal",
+      providerPackRef: "internal",
+      providerInstallationRef: "internal.primary",
+      nativeId: "worker:g1",
+      state: "active",
+      observed: { generation: 1 },
+      outputs: { endpoint: "g1.example.test" },
+    });
+
+    expect(
+      await deployments.replaceNative({
+        tenantId: "org_1",
+        deploymentId: "dep_replace",
+        expectedNativeId: "worker:stale",
+        nativeId: "worker:g2",
+        observed: { generation: 2 },
+        outputs: { endpoint: "g2.example.test" },
+      }),
+    ).toBe(false);
+    expect(await deployments.find("org_1", "dep_replace")).toMatchObject({
+      nativeId: "worker:g1",
+      nativeClaimed: false,
+      observed: { generation: 1 },
+      outputs: { endpoint: "g1.example.test" },
+    });
+
+    expect(
+      await deployments.replaceNative({
+        tenantId: "org_1",
+        deploymentId: "dep_replace",
+        expectedNativeId: "worker:g1",
+        nativeId: "worker:g2",
+        observed: { generation: 2 },
+        outputs: { endpoint: "g2.example.test" },
+      }),
+    ).toBe(true);
+    expect(await deployments.find("org_1", "dep_replace")).toMatchObject({
+      nativeId: "worker:g2",
+      nativeClaimed: false,
+      observed: { generation: 2 },
+      outputs: { endpoint: "g2.example.test" },
+    });
+
+    expect(
+      await deployments.claimNative({
+        tenantId: "org_1",
+        deploymentId: "dep_replace",
+        expectedNativeId: "worker:g2",
+        nativeId: "worker:claimed",
+        observed: { generation: 2 },
+        outputs: { endpoint: "claimed.example.test" },
+      }),
+    ).toBe(true);
+    const claimed = await deployments.find("org_1", "dep_replace");
+    expect(
+      await deployments.replaceNative({
+        tenantId: "org_1",
+        deploymentId: "dep_replace",
+        expectedNativeId: "worker:claimed",
+        nativeId: "worker:must-not-move",
+        observed: { generation: 3 },
+        outputs: { endpoint: "must-not-move.example.test" },
+      }),
+    ).toBe(false);
+    expect(await deployments.find("org_1", "dep_replace")).toEqual(claimed);
+  });
 });
