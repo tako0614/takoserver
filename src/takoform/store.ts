@@ -2765,6 +2765,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
              operation_kind <> 'import' OR
              (import_selection_protocol = 1 AND import_selection_json IS NULL)
            )
+           AND (
+             operation_kind <> 'apply' OR
+             selection_json IS NULL
+           )
            AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
       );

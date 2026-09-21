@@ -119,6 +119,76 @@ describe("SQLiteMigrationApplication provider saga", () => {
     });
   });
 
+  test.each(["apply", "import"] as const)(
+    "releases a settled %s incarnation when the dispatched effect fence fails",
+    async (operation) => {
+      const memory = new InMemoryTakoformResourceDriver();
+      const suffixInputs: Array<Parameters<MigrationSuffix>[0]> = [];
+      const driver = migrationDriver(memory, {
+        async applySuffix(input) {
+          suffixInputs.push(input);
+          await memory.sqliteMigrations.applySuffix(input);
+        },
+      });
+      const { host, database } = harness(driver);
+      await seedDatabaseAndSet(host);
+      const desired = applicationDesired(`dispatch-effect-fence-${operation}`);
+      const review = await prepare(host, desired, "admin");
+      const baselineIncarnations = database
+        .query("SELECT COUNT(*) AS n FROM tf_resource_deletion_attestations")
+        .get();
+      const baselineEffects = database
+        .query("SELECT COUNT(*) AS n FROM tf_resource_provider_effects")
+        .get();
+      const baselineClaims = database.query("SELECT COUNT(*) AS n FROM tf_resource_claims").get();
+      database.exec(`
+        CREATE TRIGGER test_reject_dispatched_provider_effect
+        BEFORE INSERT ON tf_resource_provider_effects
+        WHEN NEW.effect_kind = '${operation}' AND NEW.phase = 'dispatched'
+        BEGIN
+          SELECT RAISE(ABORT, 'test_reject_dispatched_provider_effect');
+        END;
+      `);
+
+      const refused =
+        operation === "import"
+          ? await importResource(
+              host,
+              { ...desired, nativeId: `native-${operation}` },
+              `dispatch-effect-fence-${operation}-0001`,
+              "admin",
+            )
+          : await apply(host, desired, review, `dispatch-effect-fence-${operation}-0001`, "admin");
+      expect(refused?.status).toBeGreaterThanOrEqual(400);
+      expect(suffixInputs).toHaveLength(0);
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1").get(),
+      ).toEqual({ n: 0 });
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM tf_resource_deletion_attestations").get(),
+      ).toEqual(baselineIncarnations);
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM tf_resource_provider_effects").get(),
+      ).toEqual(baselineEffects);
+      expect(database.query("SELECT COUNT(*) AS n FROM tf_resource_claims").get()).toEqual(
+        baselineClaims,
+      );
+
+      database.exec("DROP TRIGGER test_reject_dispatched_provider_effect");
+      const retried =
+        operation === "import"
+          ? await importResource(
+              host,
+              { ...desired, nativeId: `native-${operation}` },
+              `dispatch-effect-fence-${operation}-0001`,
+              "admin",
+            )
+          : await apply(host, desired, review, `dispatch-effect-fence-${operation}-0001`, "admin");
+      expect(retried?.status).toBe(201);
+      expect(suffixInputs).toHaveLength(1);
+    },
+  );
+
   test("consumes final create authority before dispatching a migration suffix", async () => {
     const events: string[] = [];
     const memory = new InMemoryTakoformResourceDriver();
@@ -156,6 +226,74 @@ describe("SQLiteMigrationApplication provider saga", () => {
     expect(events).toEqual(["beforeCreate"]);
   });
 
+  test("retains a bound initial plan after a lost create-claim acknowledgement and retries the exact token", async () => {
+    const events: string[] = [];
+    let claimAttempts = 0;
+    let claimed = false;
+    const memory = new InMemoryTakoformResourceDriver();
+    const suffixInputs: Array<Parameters<MigrationSuffix>[0]> = [];
+    const driver = migrationDriver(memory, {
+      async applySuffix(input) {
+        suffixInputs.push(input);
+        events.push("applySuffix");
+        await memory.sqliteMigrations.applySuffix(input);
+      },
+    });
+    const { host, database } = harness(driver, async (token) =>
+      token === "Bearer provision"
+        ? {
+            tenantId: TENANT_ID,
+            principalId: PRINCIPAL_ID,
+            scope: {
+              space: "main",
+              formRef: applicationForm.identity.formRef,
+              resourceName: "claim-retry",
+              mode: "provision" as const,
+              claimCreate: async () => {
+                claimAttempts += 1;
+                if (!claimed) {
+                  claimed = true;
+                  events.push("beforeCreate:claim");
+                  throw new TakoformHostError("backend_unavailable", 503);
+                }
+                events.push("beforeCreate:retry");
+              },
+            },
+          }
+        : principal(token),
+    );
+    await seedDatabaseAndSet(host);
+    const desired = applicationDesired("claim-retry");
+    const review = await prepare(host, desired, "admin");
+
+    const lost = await apply(host, desired, review, "claim-retry-0001", "provision");
+    expect(lost?.status).toBe(503);
+    expect(claimAttempts).toBe(1);
+    expect(suffixInputs).toHaveLength(0);
+    expect(
+      database
+        .query(
+          `SELECT phase, execution_started_at, selection_json
+           FROM tf_provider_mutation_sagas_selection_v1`,
+        )
+        .get(),
+    ).toMatchObject({
+      phase: "planned",
+      execution_started_at: null,
+      selection_json: expect.any(String),
+    });
+
+    const retried = await apply(host, desired, review, "claim-retry-0001", "provision");
+    expect(retried?.status).toBe(201);
+    expect(claimAttempts).toBe(2);
+    expect(events).toEqual(["beforeCreate:claim", "beforeCreate:retry", "applySuffix"]);
+    expect(suffixInputs).toHaveLength(1);
+    expect(suffixInputs[0]?.operationMode).toBe("initial");
+    expect(
+      database.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1").get(),
+    ).toEqual({ n: 0 });
+  });
+
   test("refreshes revocation authority after planning and before dispatching a suffix", async () => {
     const events: string[] = [];
     const memory = new InMemoryTakoformResourceDriver();
@@ -186,6 +324,78 @@ describe("SQLiteMigrationApplication provider saga", () => {
 
     expect(response?.status).toBe(503);
     expect(events).toEqual(["authority:1", "authority:2", "authority:3"]);
+  });
+
+  test("retains the bound initial plan when refresh fails after a successful create claim", async () => {
+    const events: string[] = [];
+    const memory = new InMemoryTakoformResourceDriver();
+    const suffixInputs: Array<Parameters<MigrationSuffix>[0]> = [];
+    const driver = migrationDriver(memory, {
+      async applySuffix(input) {
+        suffixInputs.push(input);
+        events.push("applySuffix");
+        await memory.sqliteMigrations.applySuffix(input);
+      },
+    });
+    let applicationAuthorityReads = 0;
+    const { host, database } = harness(
+      driver,
+      async (token) =>
+        token === "Bearer provision"
+          ? {
+              tenantId: TENANT_ID,
+              principalId: PRINCIPAL_ID,
+              scope: {
+                space: "main",
+                formRef: applicationForm.identity.formRef,
+                resourceName: "authority-after-claim",
+                mode: "provision" as const,
+                claimCreate: async () => {
+                  events.push("beforeCreate");
+                },
+              },
+            }
+          : principal(token),
+      {
+        async resolve({ form: checkedForm }) {
+          if (checkedForm.identity.formRef.kind === "SQLiteMigrationApplication") {
+            applicationAuthorityReads += 1;
+            events.push(`authority:${applicationAuthorityReads}`);
+            if (applicationAuthorityReads === 5) {
+              return { executable: false, activated: false, availableToPrincipal: false };
+            }
+          }
+          return { executable: true, activated: true, availableToPrincipal: true };
+        },
+      },
+    );
+    await seedDatabaseAndSet(host);
+    const desired = applicationDesired("authority-after-claim");
+    const review = await prepare(host, desired, "admin");
+
+    const refused = await apply(host, desired, review, "authority-after-claim-0001", "provision");
+    expect(refused?.status).toBe(503);
+    expect(events).toEqual([
+      "authority:1",
+      "authority:2",
+      "authority:3",
+      "authority:4",
+      "beforeCreate",
+      "authority:5",
+    ]);
+    expect(suffixInputs).toHaveLength(0);
+    expect(
+      database
+        .query(
+          `SELECT phase, execution_started_at, selection_json
+           FROM tf_provider_mutation_sagas_selection_v1`,
+        )
+        .get(),
+    ).toMatchObject({
+      phase: "planned",
+      execution_started_at: null,
+      selection_json: expect.any(String),
+    });
   });
 
   test("retains one dispatched saga after lost acknowledgement and recovers from the ledger without rerunning SQL", async () => {

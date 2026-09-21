@@ -249,7 +249,9 @@ The proxy snapshots that context before awaiting RPC, validates the closed
 envelope, and restores a non-wire proof. Initial calls, read-only recovery,
 polling, updates, and mixed adoption/apply evidence cannot use this proof.
 The Host settles only under its current lease and only when no separately
-prepared migration could have mutated. An indeterminate saga is eligible only
+prepared migration or declared standard-service slot could have produced an
+effect. A provider's proof does not cover service material issued before the
+provider was called. An indeterminate saga is eligible only
 through this explicit proof path; any priced hold stays reserved until the
 Host's existing atomic failure settlement releases it with the lifecycle.
 This internal recovery contract changes no Form, public API, or database schema.
@@ -291,6 +293,23 @@ neither execution lease and does not authorize a stale executor or a different
 selection. A database failure rolls back both updates; a lost response requires
 durable readback and never authorizes assuming that acceptance failed.
 
+Pure validation, read-only SQLite preparation, and any provision-claim
+satisfiability check run before the durable dispatch marker. The internal
+`beforeCreate` authority callback also runs before that marker and must be
+retry-safe for the same exact request and claim token. A lost acknowledgement
+retains the bound selection and claims; the same caller may retry that claim,
+but recovery must not skip an unconfirmed claim by treating it as provider
+dispatch. Provision redemption remains synchronous and is not enrolled in the
+deferred-operation repair scheduler.
+
+Standard-service material is resolved only on the initial execution after the
+dispatch marker and before SQLite or provider effects. Recovery does not issue
+that material again. Once placement is bound, a preparation failure cannot
+abandon the saga or release its claims merely because provider dispatch has
+not started. Cleanup requires a successful guarded abandonment or proof that
+the whole attempt was idle; a provider-only refusal is insufficient when a
+standard-service slot could already have produced material.
+
 The internal schema additions do not backfill older attempts. Planned and
 dispatched effect records from those builds omit the destination, while a
 successful receipt can retain it. Today's catalog and a provider-specific
@@ -308,6 +327,12 @@ inserts. It changes no public API or Form. The database upgrade is forward-only.
 The 0059 dispatch check alone cannot fence preparation callbacks in older
 binaries that run before dispatch; an older Worker is not a supported serving
 rollback.
+The runtime preparation/cleanup repair likewise applies only to invocations
+executing the repaired build. It adds no database fence against an older
+in-flight callback's deletion path. Publishing a new Version alone is not
+proof that those invocations have drained; a rollout that claims overlap
+safety needs owner-backed quiescence evidence, not elapsed time or a source
+label. Otherwise that historical overlap risk remains explicit.
 Previously accepted side effects remain subject to their existing recovery and
 whole-attempt-idle checks.
 

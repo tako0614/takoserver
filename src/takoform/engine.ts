@@ -110,7 +110,13 @@ export interface EngineContext {
   readonly url: URL;
   readonly tenantId: string;
   readonly principalId: string;
-  /** Runs after every portable fence/review check and immediately before create side effects. */
+  /**
+   * Runs after every portable fence/review check and immediately before create
+   * side effects. The callback is invoked before the durable dispatch marker,
+   * so its owner must make the same exact request/token retry-safe: a lost
+   * acknowledgement may invoke it again before the provider boundary is
+   * crossed.
+   */
   readonly beforeCreate?: () => Promise<void>;
   /** A paid create credential must never inherit authority over an existing incarnation. */
   readonly provisionOnly?: boolean;
@@ -1159,7 +1165,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("resource_not_found", 404);
       }
       await requireArtifact(form, body.spec, context.tenantId);
-      validateStandardServiceSlots({ form, spec: body.spec });
+      const hasApplyServiceSlots =
+        validateStandardServiceSlots({ form, spec: body.spec }).length > 0;
 
       const replayKey = replayKeyFor(context, body.metadata.space, "apply");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -1521,7 +1528,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerProvablyIdle = true;
             releaseClaimsOnFailure = true;
           },
-          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
+          providerRefusalProvesWholeAttemptIdle: () =>
+            preparedMigration === null && !hasApplyServiceSlots,
           onDispatch: async (operationMode) => {
             if (
               !(await store.recordResourceEffect({
@@ -1603,28 +1611,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               artifacts,
               driver,
             });
-            // Supply resolution is deliberately part of the initial
-            // pre-dispatch prepare. Completed receipts and recovered commands
-            // must not depend on a resolver being available or project new
-            // runtime material.
+            // Satisfiability is pure pre-dispatch preparation. Completed
+            // receipts and recovered commands must not depend on a resolver or
+            // project fresh runtime material.
             if (executionMode === "initial") {
-              if (create && context.beforeCreate) {
-                // A provision token is single-use authority. Check required
-                // service satisfiability before claiming it, then resolve the
-                // execution projection only after that authority succeeds.
-                await resolveStandardServiceSlots({
-                  tenantId: context.tenantId,
-                  space: body.metadata.space,
-                  form,
-                  spec: body.spec,
-                  ...(options.standardServiceResolver
-                    ? { resolver: options.standardServiceResolver }
-                    : {}),
-                  project: false,
-                });
-                await context.beforeCreate();
-              }
-              standardServices = await resolveStandardServiceSlots({
+              await resolveStandardServiceSlots({
                 tenantId: context.tenantId,
                 space: body.metadata.space,
                 form,
@@ -1632,8 +1623,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 ...(options.standardServiceResolver
                   ? { resolver: options.standardServiceResolver }
                   : {}),
-                project: true,
+                project: false,
               });
+              if (create && context.beforeCreate) {
+                await context.beforeCreate();
+              }
             }
             authority = await refreshMutation(
               context,
@@ -1675,6 +1669,21 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           execute: async (operationMode, execution, leaseToken) => {
             providerOperationMode = operationMode;
             if (!applySelection) throw new TakoformHostError("backend_unavailable", 503);
+            // Material projection is deliberately after the durable dispatch
+            // marker. If acknowledgement is lost, the saga remains a repair
+            // unit and recovery never issues a second projection.
+            if (operationMode === "initial") {
+              standardServices = await resolveStandardServiceSlots({
+                tenantId: context.tenantId,
+                space: body.metadata.space,
+                form,
+                spec: body.spec,
+                ...(options.standardServiceResolver
+                  ? { resolver: options.standardServiceResolver }
+                  : {}),
+                project: true,
+              });
+            }
             const executionAuthority = {
               tenantId: context.tenantId,
               resourceUid: uid,
@@ -1809,16 +1818,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         return { kind: "resource", resource: next, status };
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
-          await store.releaseResourceClaims(claimOwnerId);
-          if (!providerDispatched) {
-            await store.abandonProviderMutationPlan({
+          let idle = providerProvablyIdle;
+          if (!providerDispatched && !idle) {
+            idle = await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: opId,
               replayKey,
               resourceUid: uid,
             });
           }
-          if (!providerDispatched || providerProvablyIdle) {
+          if (idle) {
+            await store.releaseResourceClaims(claimOwnerId);
             if (providerPlanRecorded) {
               await settleIdleAttempt(context.tenantId, uid, opId, "apply");
             } else {
@@ -2353,7 +2363,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
           let idle = providerProvablyIdle;
-          if (!providerDispatched) {
+          if (!providerDispatched && !idle) {
             idle = await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,

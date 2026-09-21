@@ -311,6 +311,83 @@ describe("provider mutation saga execution leases", () => {
     database.close();
   });
 
+  test("does not abandon a bound apply plan, even after its execution lease is released", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+      const selectedSaga = {
+        ...saga,
+        operationId: "op_bound_apply_retention",
+        replayKey: "replay-bound-apply-retention",
+        resourceUid: "uid_bound_apply_retention",
+        target: { ...saga.target, name: "bound-apply-retention" },
+      };
+      const identity = {
+        tenantId: selectedSaga.tenantId,
+        operationId: selectedSaga.operationId,
+        resourceUid: selectedSaga.resourceUid,
+      };
+      await store.acceptProviderMutationSaga(selectedSaga);
+      expect(
+        await store.acquireProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply",
+          leaseUntil: 2_000,
+        }),
+      ).toEqual({ kind: "acquired", mode: "initial" });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          ...identity,
+          fingerprint: selectedSaga.fingerprint,
+          leaseToken: "lease_bound_apply",
+          mode: "initial",
+          selection: applySelection,
+        }),
+      ).toEqual(applySelection);
+
+      // A live execution lease is never an abandon proof.
+      expect(
+        await store.abandonProviderMutationPlan({
+          ...identity,
+          replayKey: selectedSaga.replayKey,
+        }),
+      ).toBe(false);
+      expect(
+        await store.releaseProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply",
+        }),
+      ).toBe(true);
+
+      // Releasing the lease does not erase the accepted destination. The
+      // caller can retry the same initial command, while cleanup remains
+      // forbidden to discard the repair unit.
+      expect(
+        await store.abandonProviderMutationPlan({
+          ...identity,
+          replayKey: selectedSaga.replayKey,
+        }),
+      ).toBe(false);
+      expect(
+        await store.providerMutationPlanExists(
+          identity.tenantId,
+          identity.operationId,
+          identity.resourceUid,
+        ),
+      ).toBe(true);
+      expect(
+        await store.acquireProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply_retry",
+          leaseUntil: 2_000,
+        }),
+      ).toEqual({ kind: "acquired", mode: "initial", applySelection });
+    } finally {
+      database.close();
+    }
+  });
+
   test("retains a selected deferred apply atomically without extending either execution lease", async () => {
     const database = new Database(":memory:");
     try {
