@@ -451,6 +451,7 @@ describe("historical Takoform Host engine regression", () => {
       },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
     };
     const referenceSchema = {
@@ -684,6 +685,7 @@ describe("historical Takoform Host engine regression", () => {
     const driver: TakoformResourceDriver = {
       selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
       delete: (input) => memory.delete(input),
       async observe(input) {

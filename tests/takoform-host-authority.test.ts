@@ -280,6 +280,7 @@ function countingDriver() {
       calls.delete += 1;
       return memory.delete(input);
     },
+    selectImport: (input) => memory.selectImport(input),
     import: async (input) => {
       calls.import += 1;
       return memory.import(input);
@@ -1088,6 +1089,7 @@ describe("durable read-only Takoform Host authority", () => {
       },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
     };
     const hostOptions = {
@@ -1280,6 +1282,7 @@ describe("durable read-only Takoform Host authority", () => {
       },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
       sqliteMigrations: memory.sqliteMigrations,
     };

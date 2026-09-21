@@ -640,6 +640,7 @@ function migrationDriver(
 ): TakoformResourceDriver {
   return {
     selectApply: overrides.selectApply ?? ((input) => memory.selectApply(input)),
+    selectImport: (input) => memory.selectImport(input),
     apply: overrides.apply ?? ((input) => memory.apply(input)),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),

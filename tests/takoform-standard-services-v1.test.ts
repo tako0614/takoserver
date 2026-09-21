@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { ProviderMutationWholeOperationRefusalError } from "../src/provider-driver.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
+import { TAKOFORM_IMPORT_SELECTION_VERSION } from "../src/takoform/import-selection.ts";
 import type { DeferredOperationsConfiguration } from "../src/takoform/operations.ts";
 import type {
   InstalledTakoformForm,
@@ -377,6 +379,112 @@ describe("stable StandardServiceRef", () => {
     expect(projected[1]).toBeUndefined();
     expect({ satisfiableCalls, resolveCalls }).toEqual(beforeRecovery);
   });
+
+  test.each([false, true])(
+    "import retains service projection uncertainty across recovery (lost projection ACK: %s)",
+    async (loseProjectionAck) => {
+      const sql = createEphemeralSql();
+      let projections = 0;
+      let imports = 0;
+      const host = createTakoformHost({
+        sql,
+        objects: createMemoryObjectStore(),
+        authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+        forms: [{ ...form, operations: [...form.operations, "import"] }],
+        deferredOperations: {
+          shouldDefer: () => true,
+          pollsBeforeCommit: 1,
+          retryAfterSeconds: 0,
+          executeOnAccept: true,
+        },
+        driver: {
+          async selectApply() {
+            return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" };
+          },
+          async selectImport(input) {
+            return {
+              version: TAKOFORM_IMPORT_SELECTION_VERSION,
+              kind: "intrinsic",
+              nativeId: input.nativeId,
+            };
+          },
+          async apply() {
+            throw new Error("not an apply");
+          },
+          async import(input) {
+            imports += 1;
+            if (input.operationMode === "recovery")
+              throw new ProviderMutationWholeOperationRefusalError("import_conflict", 409);
+            throw new TakoformHostError("import_conflict", 409);
+          },
+          async observe() {
+            return {};
+          },
+          async delete() {},
+        },
+        standardServiceResolver: {
+          async satisfiable() {
+            return true;
+          },
+          async resolve() {
+            projections += 1;
+            // Material issuance starts only after both durable dispatch markers.
+            expect(
+              await sql.query(
+                "SELECT execution_started_at, import_selection_json FROM tf_provider_mutation_sagas_selection_v1",
+              ),
+            ).toEqual([
+              {
+                execution_started_at: expect.any(Number),
+                import_selection_json: expect.any(String),
+              },
+            ]);
+            expect(
+              await sql.query("SELECT phase FROM tf_resource_provider_effects ORDER BY phase"),
+            ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+            if (loseProjectionAck) throw new Error("material issued but acknowledgement lost");
+            return {
+              endpoint: { endpoint: "sealed-endpoint:main" },
+              credential: { token: "sealed-credential" },
+            };
+          },
+        },
+      });
+      const accepted = await host.handle(
+        request(`${lane}/resources/example.forms.invalid/StandardClient/client/import`, {
+          method: "POST",
+          headers: { "idempotency-key": "service-import-retention-0001", "if-none-match": "*" },
+          body: JSON.stringify({
+            ...resource("com.example.archive"),
+            nativeId: "native-standard-client",
+          }),
+        }),
+      );
+      expect(accepted?.status).toBe(202);
+      expect(projections).toBe(1);
+      expect(imports).toBe(loseProjectionAck ? 0 : 1);
+      expect(await host.maintenance?.drainProviderRepairs()).toMatchObject({
+        pending: 1,
+        settled: 0,
+      });
+      expect(projections).toBe(1);
+      expect(imports).toBe(loseProjectionAck ? 1 : 2);
+      expect(
+        await sql.query(
+          "SELECT phase, provider_outcome, import_selection_json FROM tf_provider_mutation_sagas_selection_v1",
+        ),
+      ).toEqual([
+        {
+          phase: "planned",
+          provider_outcome: "indeterminate",
+          import_selection_json: expect.any(String),
+        },
+      ]);
+      expect(
+        await sql.query("SELECT phase FROM tf_resource_provider_effects ORDER BY phase"),
+      ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+    },
+  );
 
   test("rejects portable endpoint, credential, FormRef, and Resource selector fields", async () => {
     const host = stableHost({

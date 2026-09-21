@@ -5,6 +5,7 @@ import type { JsonObject, Sql } from "../src/ports.ts";
 import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import type { TakoformApplySelection } from "../src/takoform/apply-selection.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
+import { TAKOFORM_IMPORT_SELECTION_VERSION } from "../src/takoform/import-selection.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
 import type {
@@ -58,6 +59,13 @@ test("a create reserves a Definition claim atomically across provider await and 
       enteredFirst();
       await blocked;
       return receipt(input.spec);
+    },
+    async selectImport(input) {
+      return {
+        version: TAKOFORM_IMPORT_SELECTION_VERSION,
+        kind: "intrinsic",
+        nativeId: input.nativeId,
+      } as const;
     },
     async import(input) {
       importCalls += 1;
@@ -322,6 +330,13 @@ test("an expired reservation can be recovered but its stale provider winner cann
       enteredFirst();
       await blocked;
       return receipt(input.spec);
+    },
+    async selectImport(input) {
+      return {
+        version: TAKOFORM_IMPORT_SELECTION_VERSION,
+        kind: "intrinsic",
+        nativeId: input.nativeId,
+      } as const;
     },
     async import(input) {
       return receipt(input.spec);

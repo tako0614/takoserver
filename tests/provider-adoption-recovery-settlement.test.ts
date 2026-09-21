@@ -386,6 +386,18 @@ async function rejectedImport(
   },
 ): Promise<unknown> {
   const { driver } = providerDriver(provider);
+  const selectionInput = {
+    tenantId,
+    resourceUid: "resource-1",
+    form,
+    name: "imported",
+    space: "main",
+    spec: { value: "existing" },
+    nativeId: "native-existing",
+    relations: [],
+  };
+  const selection = await driver.selectImport?.(selectionInput);
+  if (!selection) throw new Error("provider import selection unavailable");
   const input: Parameters<NonNullable<TakoformResourceDriver["import"]>>[0] = {
     operationId: "operation-1",
     operationMode: mutation.operationMode,
@@ -396,14 +408,9 @@ async function rejectedImport(
       leaseToken: "lease-1",
       fingerprint: "fingerprint-1",
     },
-    tenantId,
-    resourceUid: "resource-1",
-    form,
-    name: "imported",
-    space: "main",
-    spec: { value: "existing" },
-    nativeId: "native-existing",
-    relations: [],
+    ...selectionInput,
+    selection,
+    atomicDeploymentCommit: true,
   };
   return await rejected(driver.import?.(input), "provider import");
 }

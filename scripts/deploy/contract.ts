@@ -364,7 +364,7 @@ export const DEPLOY_CONTRACT = {
           "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
           "and all other closure names, types and fields remain exact. Before upload and again at the " +
           "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
-          "R2 name, audited 0001-0061 lineage and canonical migrated schema. Production and rehearsal " +
+          "R2 name, audited 0001-0062 lineage and canonical migrated schema. Production and rehearsal " +
           "refuse this pair before provider effects. " +
           integrationServiceBindingRefresh +
           " This one integration rebind branch runs " +
@@ -971,11 +971,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0061 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0062 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0061 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0062 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1140,7 +1140,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0061; unreviewed 0062+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0062; unreviewed 0063+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1194,10 +1194,19 @@ export const DEPLOY_CONTRACT = {
           "service: repair forward. Protected selectors remain capped at 0057, and fresh generation " +
           "initialization is not a recovery alternative for protected data. A separate exact 0060 " +
           "to 0061 integration transition preserves historical NULL accepted-authority summaries " +
-          "without backfill and fences new pre-0061 apply admissions. It requires audited 0001-0061 " +
-          "source bytes, canonical predecessor/post schemas and retained-effect integrity. Never " +
+          "without backfill and fences new pre-0061 apply admissions. It requires the audited " +
+          "0001-0061 prefix bytes, canonical predecessor/post schemas and retained-effect integrity. Never " +
           "bundle it with the 0059/0060 transition. Have the compatible Host ready before migration; " +
           "publish it only after schema readback, then reconcile current Form authority as needed. " +
+          "A separate exact 0061 to 0062 integration transition requires the audited 0061 predecessor " +
+          "and canonical 0061 application shape, from exact current 0001-0062 source. It requires zero planned current-generation imports " +
+          "before qualification and at the final mutation fence; the migration, ledger insert and " +
+          "old-writer fence are one atomic D1 transaction. New import writers explicitly insert immutable " +
+          "import_selection_protocol=1; old inserts are refused before preparation. The import selection " +
+          "is immutable once bound while its verified token is renewed per lease; " +
+          "historical rows are never backfilled. A provider native destination has one unique reservation " +
+          "retained through receipt publication. Read back the schema, then publish CPE and Host in that " +
+          "order as a forward-only integration repair; it grants no production authorization. " +
           "The executor protocol generation is unchanged; unrelated components need not be republished. " +
           "This forward-only availability boundary is not a zero-downtime or historical recovery claim.",
         "pre-mutation-proof":
@@ -1208,7 +1217,10 @@ export const DEPLOY_CONTRACT = {
           "integration 0058/0059 to 0060 transition also requires exact canonical schema and no " +
           "orphan open provider effects; identified unresolved effects need not be drained. The separate " +
           "0060 to 0061 integration transition additionally runs focused transition/preservation tests " +
-          "before the local D1 migration gate. Rehearsal writes " +
+          "before the local D1 migration gate. The separate 0061 to 0062 transition additionally checks " +
+          "the exact 0061 predecessor shape, zero planned current-generation imports and the unique " +
+          "native-destination reservation through receipt publication before the local D1 migration gate. " +
+          "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
           "bytes, pre-shape and expected post-shape. Before 0037, one monotonic single-statement " +

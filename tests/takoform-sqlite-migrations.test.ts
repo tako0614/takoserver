@@ -110,6 +110,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
   const calls: Array<Parameters<typeof memory.sqliteMigrations.applySuffix>[0]> = [];
   const driver: TakoformResourceDriver = {
     selectApply: (input) => memory.selectApply(input),
+    selectImport: (input) => memory.selectImport(input),
     apply: (input) => memory.apply(input),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),
@@ -133,6 +134,15 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
   };
   const value = context(secondSet, driver);
   const prepared = await prepareSqliteMigrationApplication(value);
+  const selection = await driver.selectApply({
+    tenantId: value.tenantId,
+    resourceUid: "uid_application_a",
+    form: value.form,
+    name: "application-a",
+    space: value.space,
+    spec: {},
+    relations: value.relations,
+  });
   const executionAuthority = {
     tenantId: value.tenantId,
     resourceUid: "uid_application_a",
@@ -148,6 +158,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
       executionAuthority,
       prepared,
       driver,
+      selection,
     }),
   ).rejects.toMatchObject({ code: "backend_unavailable", status: 503 });
 
@@ -161,6 +172,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
     executionAuthority: { ...executionAuthority, leaseToken: "pmlease-a-recovery" },
     prepared,
     driver,
+    selection,
   });
 
   expect(calls).toHaveLength(2);
@@ -354,6 +366,15 @@ async function execute(
   operationMode: "initial" | "recovery",
 ) {
   const prepared = await prepareSqliteMigrationApplication(value);
+  const selection = await value.driver.selectApply({
+    tenantId: value.tenantId,
+    resourceUid: "uid_application",
+    form: value.form,
+    name: "application",
+    space: value.space,
+    spec: {},
+    relations: value.relations,
+  });
   await applySqliteMigrationApplication({
     tenantId: value.tenantId,
     operationId,
@@ -366,6 +387,7 @@ async function execute(
     },
     prepared,
     driver: value.driver,
+    selection,
   });
 }
 
@@ -412,6 +434,7 @@ function relation(pointer: string, target: TakoformStoredResource) {
     targetName: target.metadata.name,
     targetUid: target.metadata.uid,
     targetFormRef: target.form.formRef,
+    resource: target,
   };
 }
 

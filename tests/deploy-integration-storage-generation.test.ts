@@ -625,7 +625,7 @@ describe("integration storage generation bootstrap", () => {
     expect(mismatch).toBeInstanceOf(DeployError);
     if (!(mismatch instanceof DeployError)) throw mismatch;
     expect(mismatch.phase).toBe("preflight");
-    expect(mismatch.message).toContain("exact audited 0001-0061 lineage");
+    expect(mismatch.message).toContain("exact audited 0001-0062 lineage");
     expect(mismatch.message).not.toContain("R2 creation is withheld");
     expect(reads).toEqual(["D1", "R2", "schema:preflight"]);
   });
@@ -883,7 +883,7 @@ describe("integration storage generation bootstrap", () => {
     expect(wrongError).toBeInstanceOf(DeployError);
     if (!(wrongError instanceof DeployError)) throw wrongError;
     expect(wrongError.phase).toBe("verification");
-    expect(wrongError.message).toContain("exact audited 0001-0061 lineage");
+    expect(wrongError.message).toContain("exact audited 0001-0062 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
@@ -955,7 +955,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0062_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0063_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -963,7 +963,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0061");
+      ).rejects.toThrow("exactly 0001-0062");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

@@ -234,6 +234,7 @@ function createHost(database: Database, deleteCalls: { count: number }): Takofor
         deleteCalls.count += 1;
         return await memory.delete(input);
       },
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
       sqliteMigrations: memory.sqliteMigrations,
     },

@@ -34,6 +34,11 @@ import {
 } from "./dependency-fence.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
 import {
+  encodeTakoformImportSelection,
+  parseTakoformImportSelection,
+  type TakoformImportSelection,
+} from "./import-selection.ts";
+import {
   OPERATION_TTL_MILLISECONDS,
   PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS,
   REPLAY_TTL_MILLISECONDS,
@@ -266,6 +271,8 @@ export type ProviderMutationExecution =
       readonly mode: "initial" | "recovery";
       /** Immutable selection retained before this apply first crossed dispatch. */
       readonly applySelection?: TakoformApplySelection;
+      /** Import placement is distinct from apply's commercial selection. */
+      readonly importSelection?: TakoformImportSelection;
       /** Opaque provider handle from the last accepted dispatch, if any. */
       readonly providerHandle?: string;
       /** Whether the accepted dispatch is still running or indeterminate. */
@@ -491,6 +498,16 @@ export interface TakoformStore {
     readonly mode: "initial" | "recovery";
     readonly selection: TakoformApplySelection;
   }): Promise<TakoformApplySelection | null>;
+  /** Binds import placement before effects; dispatched historical NULL stays held. */
+  bindProviderMutationImportSelection(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly fingerprint: string;
+    readonly leaseToken: string;
+    readonly mode: "initial" | "recovery";
+    readonly selection: TakoformImportSelection;
+  }): Promise<TakoformImportSelection | null>;
   markProviderMutationDispatch(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -1763,11 +1780,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       await sql.run(
         `INSERT OR IGNORE INTO ${PROVIDER_MUTATION_SAGA_TABLE}
            (operation_id, protocol_generation, operation_kind, replay_key,
-            tenant_id, fingerprint, resource_uid,
-            target_space, target_api_version, target_kind, target_name,
-            accepted_uid, accepted_generation, accepted_revision, phase,
-            receipt_json, authority_head_digest, created_at, updated_at, expires_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?
+           tenant_id, fingerprint, resource_uid,
+           target_space, target_api_version, target_kind, target_name,
+           accepted_uid, accepted_generation, accepted_revision, phase,
+            receipt_json, authority_head_digest, import_selection_protocol,
+            created_at, updated_at, expires_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?, ?
          WHERE NOT ${legacyFence.sql}`,
         [
           record.operationId,
@@ -1785,6 +1803,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.acceptedGeneration ?? null,
           record.acceptedRevision ?? null,
           record.authorityHeadDigest ?? null,
+          record.operationKind === "import" ? 1 : null,
           timestamp,
           timestamp,
           253_402_300_799_999,
@@ -1881,7 +1900,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       if (initial.changes === 1) {
         const stateRows = await sql.query(
-          `SELECT selection_json
+          `SELECT selection_json, import_selection_json
            FROM ${PROVIDER_MUTATION_SAGA_TABLE}
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
@@ -1891,6 +1910,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           kind: "acquired",
           mode: "initial",
           ...providerMutationApplySelectionState(stateRows[0]),
+          ...providerMutationImportSelectionState(stateRows[0]),
         };
       }
 
@@ -1913,7 +1933,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       if (recovery.changes === 1) {
         const stateRows = await sql.query(
-          `SELECT provider_handle, provider_outcome, selection_json
+          `SELECT provider_handle, provider_outcome, selection_json, import_selection_json
            FROM ${PROVIDER_MUTATION_SAGA_TABLE}
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
@@ -2010,6 +2030,112 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       );
       if (rows.length !== 1 || typeof rows[0]?.selection_json !== "string") return null;
       return parseTakoformApplySelection(rows[0].selection_json);
+    },
+
+    async bindProviderMutationImportSelection(input) {
+      const timestamp = now();
+      const selectionJson = encodeTakoformImportSelection(input.selection);
+      // The read-only selector is not a reservation: different tenants can
+      // select the same native object concurrently. Fence existing owners and
+      // pending imports in this atomic write; 0062's unique index is the final
+      // cross-tenant guard through receipt publication.
+      const nativeFence =
+        input.selection.kind === "provider"
+          ? {
+              sql: `AND NOT EXISTS (
+                SELECT 1 FROM tf_resource_deployments AS deployment
+                WHERE deployment.provider_installation_ref = ? AND deployment.native_id = ?
+                  AND deployment.state IN ('provisioning', 'candidate', 'active', 'draining')
+                  AND NOT (deployment.tenant_id = ? AND deployment.resource_uid = ? AND deployment.id IS ?)
+              ) AND NOT EXISTS (
+                SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS contender
+                WHERE contender.operation_kind = 'import'
+                  AND json_extract(contender.import_selection_json, '$.kind') = 'provider'
+                  AND json_extract(contender.import_selection_json, '$.providerInstallationRef') = ?
+                  AND json_extract(contender.import_selection_json, '$.nativeId') = ?
+                  AND contender.operation_id <> ?
+              )`,
+              params: [
+                input.selection.providerInstallationRef,
+                input.selection.nativeId,
+                input.tenantId,
+                input.resourceUid,
+                input.selection.incumbent?.id ?? null,
+                input.selection.providerInstallationRef,
+                input.selection.nativeId,
+                input.operationId,
+              ],
+            }
+          : { sql: "", params: [] };
+      // Retain both halves atomically before any projection or provider effect.
+      // A lost acknowledgement must leave the same non-expiring repair unit.
+      const [bound] = await sql.batch([
+        {
+          sql: `UPDATE OR IGNORE ${PROVIDER_MUTATION_SAGA_TABLE}
+                SET import_selection_json = COALESCE(import_selection_json, ?),
+                    import_selection_verified_lease_token = ?, updated_at = ?,
+                    expires_at = 253402300799999
+                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND fingerprint = ? AND operation_kind = 'import'
+                  AND phase = 'planned' AND receipt_json IS NULL
+                  AND import_selection_protocol = 1
+                  AND execution_lease_token = ? AND execution_lease_until > ?
+                  AND execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                  AND ${input.mode === "initial" ? "(import_selection_json IS NULL OR import_selection_json = ?)" : "import_selection_json = ?"}
+                  ${nativeFence.sql}`,
+          params: [
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            input.fingerprint,
+            input.leaseToken,
+            timestamp,
+            selectionJson,
+            ...nativeFence.params,
+          ],
+        },
+        {
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND operation = 'import' AND phase = 'committing'
+                  AND EXISTS (
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                    WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                      AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                      AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
+                      AND saga.fingerprint = ? AND saga.import_selection_json = ?
+                      AND saga.operation_kind = 'import'
+                      AND saga.import_selection_protocol = 1
+                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                      AND saga.execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                      AND saga.execution_lease_token = ? AND saga.execution_lease_until > ?
+                      AND saga.import_selection_verified_lease_token = saga.execution_lease_token
+                  )`,
+          params: [
+            timestamp,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            input.fingerprint,
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+      ]);
+      if (bound?.changes !== 1) return null;
+      const rows = await sql.query(
+        `SELECT import_selection_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND execution_lease_token = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.fingerprint, input.leaseToken],
+      );
+      if (rows.length !== 1 || typeof rows[0]?.import_selection_json !== "string") return null;
+      return parseTakoformImportSelection(rows[0].import_selection_json);
     },
 
     async markProviderMutationDispatch(input) {
@@ -2635,6 +2761,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
            AND protocol_generation = 1
            AND phase = 'planned' AND receipt_json IS NULL
+           AND (
+             operation_kind <> 'import' OR
+             (import_selection_protocol = 1 AND import_selection_json IS NULL)
+           )
            AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
       );
@@ -2651,6 +2781,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
            AND protocol_generation = 1 AND operation_kind = 'import'
            AND phase = 'planned' AND receipt_json IS NULL
+           AND import_selection_protocol = 1
            AND execution_lease_token = ? AND execution_lease_until > ?
            AND execution_started_at IS NOT NULL`,
         [
@@ -3085,7 +3216,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            AND (operation.lease_until IS NULL OR operation.lease_until <= ?)
            AND saga.phase = 'planned'
            AND saga.receipt_json IS NULL
-           AND saga.execution_started_at IS NOT NULL
+           AND (saga.execution_started_at IS NOT NULL
+             OR (
+               saga.operation_kind = 'import' AND
+               saga.import_selection_protocol = 1 AND
+               saga.import_selection_json IS NOT NULL
+             ))
            AND (saga.execution_lease_until IS NULL OR saga.execution_lease_until <= ?)
          ORDER BY operation.updated_at, operation.id
          LIMIT ?`,
@@ -4680,6 +4816,7 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
 
 function providerMutationExecutionState(row: Row | undefined): {
   readonly applySelection?: TakoformApplySelection;
+  readonly importSelection?: TakoformImportSelection;
   readonly providerHandle?: string;
   readonly providerOutcome?: "running" | "indeterminate";
 } {
@@ -4691,6 +4828,7 @@ function providerMutationExecutionState(row: Row | undefined): {
       : undefined;
   return {
     ...providerMutationApplySelectionState(row),
+    ...providerMutationImportSelectionState(row),
     ...(providerHandle ? { providerHandle } : {}),
     ...(providerOutcome === "indeterminate" || (providerOutcome === "running" && providerHandle)
       ? { providerOutcome }
@@ -4707,6 +4845,17 @@ function providerMutationApplySelectionState(row: Row | undefined): {
     throw new Error("provider_mutation_apply_selection_invalid");
   }
   return { applySelection: parseTakoformApplySelection(row.selection_json) };
+}
+
+function providerMutationImportSelectionState(row: Row | undefined): {
+  readonly importSelection?: TakoformImportSelection;
+} {
+  if (!row) throw new Error("provider_mutation_saga_missing_after_lease");
+  if (row.import_selection_json === null || row.import_selection_json === undefined) return {};
+  if (typeof row.import_selection_json !== "string") {
+    throw new Error("provider_mutation_import_selection_invalid");
+  }
+  return { importSelection: parseTakoformImportSelection(row.import_selection_json) };
 }
 
 function sameProviderMutationSaga(

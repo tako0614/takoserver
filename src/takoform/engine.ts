@@ -18,6 +18,7 @@ import { createResourceDependencySet, type ResourceDependencySet } from "./depen
 import { canonicalizeEdgeSpec } from "./edge-semantics.ts";
 import { exactInstalledForm, type FormRegistry, installedForms, sameFormRef } from "./forms.ts";
 import type { TakoformAuthorityFence, TakoformHostAuthority } from "./host-authority.ts";
+import { sameTakoformImportSelection, type TakoformImportSelection } from "./import-selection.ts";
 import {
   PREPARE_TTL_MILLISECONDS,
   PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS,
@@ -347,6 +348,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       mode: "initial" | "recovery",
       leaseToken: string,
       acceptedSelection?: TakoformApplySelection,
+      acceptedImportSelection?: TakoformImportSelection,
     ) => Promise<void>;
     readonly settleDefinitiveImportFailure?: (
       leaseToken: string,
@@ -441,7 +443,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDependenciesAccepted?.(dependencySet);
       }
-      await input.prepare?.(dependencySet, execution.mode, leaseToken, execution.applySelection);
+      await input.prepare?.(
+        dependencySet,
+        execution.mode,
+        leaseToken,
+        execution.applySelection,
+        execution.importSelection,
+      );
       const marked = await store.markProviderMutationDispatch({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -1914,9 +1922,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
       };
       const importProviderResource = driver.import?.bind(driver);
-      if (!form.operations.includes("import") || !importProviderResource) {
+      const selectImport = driver.selectImport?.bind(driver);
+      if (!form.operations.includes("import") || !importProviderResource || !selectImport) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
+      const hasImportServiceSlots =
+        validateStandardServiceSlots({ form, spec: body.spec }).length > 0;
       const diagnostics = validateDesired(form, body.spec);
       if (diagnostics.some((entry) => entry.severity === "error")) {
         throw new TakoformHostError("invalid_argument", 400, { diagnostics });
@@ -2067,13 +2078,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           formRef: form.identity.formRef,
         }))
       ) {
-        await store.releaseResourceClaims(claimOwnerId);
-        await store.abandonProviderMutationPlan({
+        const abandoned = await store.abandonProviderMutationPlan({
           tenantId: context.tenantId,
           operationId: importId,
           replayKey,
           resourceUid: uid,
         });
+        if (abandoned) await store.releaseResourceClaims(claimOwnerId);
         throw new TakoformHostError("resource_busy", 409);
       }
       if (
@@ -2097,6 +2108,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
         let acceptedRelations = relations;
         let preparedMigration: PreparedSqliteMigrationApplication | null = null;
+        let importSelection: TakoformImportSelection | undefined;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: importId,
@@ -2122,7 +2134,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerProvablyIdle = true;
             releaseClaimsOnFailure = true;
           },
-          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
+          providerRefusalProvesWholeAttemptIdle: () =>
+            preparedMigration === null && !hasImportServiceSlots,
           onDispatch: async () => {
             if (
               !(await store.recordResourceEffect({
@@ -2139,13 +2152,40 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerDispatched = true;
           },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies, executionMode) => {
+          prepare: async (
+            acceptedDependencies,
+            executionMode,
+            leaseToken,
+            _acceptedApplySelection,
+            acceptedImportSelection,
+          ) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
               body.metadata.space,
               acceptedRelations,
             );
+            const resolvedSelection = await selectImport({
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              nativeId: body.nativeId,
+              relations: preparedDriverRelations,
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+            // Even an undispatched retry can already have accepted placement.
+            // Never overwrite it; historical dispatched NULL cannot be filled.
+            if (
+              resolvedSelection.nativeId !== body.nativeId ||
+              (executionMode === "recovery" && !acceptedImportSelection) ||
+              (acceptedImportSelection &&
+                !sameTakoformImportSelection(resolvedSelection, acceptedImportSelection))
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
             preparedMigration = await prepareSqliteMigrationApplication({
               tenantId: context.tenantId,
               space: body.metadata.space,
@@ -2155,22 +2195,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               artifacts,
               driver,
             });
-            // Supply resolution is deliberately part of the initial
-            // pre-dispatch prepare. Completed receipts and recovered commands
-            // must not depend on a resolver being available or project new
-            // runtime material.
-            if (executionMode === "initial") {
-              standardServices = await resolveStandardServiceSlots({
-                tenantId: context.tenantId,
-                space: body.metadata.space,
-                form,
-                spec: body.spec,
-                ...(options.standardServiceResolver
-                  ? { resolver: options.standardServiceResolver }
-                  : {}),
-                project: true,
-              });
-            }
             await refreshMutation(
               context,
               "import",
@@ -2178,6 +2202,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form.identity.formRef,
               authority,
             );
+            const boundSelection = await store.bindProviderMutationImportSelection({
+              tenantId: context.tenantId,
+              operationId: importId,
+              resourceUid: uid,
+              fingerprint,
+              leaseToken,
+              mode: executionMode,
+              selection: acceptedImportSelection ?? resolvedSelection,
+            });
+            if (!boundSelection) throw new TakoformHostError("resource_busy", 409);
+            importSelection = boundSelection;
           },
           settleDefinitiveImportFailure: async (leaseToken, outcome) => {
             return await store.settleDefinitiveProviderImportFailure({
@@ -2190,6 +2225,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             });
           },
           execute: async (operationMode, execution, leaseToken) => {
+            if (!importSelection) throw new TakoformHostError("resource_busy", 409);
+            // A resolver can issue material. Cross the durable dispatch fence
+            // first so an uncertain projection is never erased as idle prep.
+            // Recovery does not issue fresh material or infer prior absence.
+            if (operationMode === "initial") {
+              standardServices = await resolveStandardServiceSlots({
+                tenantId: context.tenantId,
+                space: body.metadata.space,
+                form,
+                spec: body.spec,
+                ...(options.standardServiceResolver
+                  ? { resolver: options.standardServiceResolver }
+                  : {}),
+                project: true,
+              });
+            }
             const executionAuthority = {
               tenantId: context.tenantId,
               resourceUid: uid,
@@ -2203,8 +2254,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               executionAuthority,
               prepared: preparedMigration,
               driver,
+              selection: importSelection,
             });
             return await importProviderResource({
+              selection: importSelection,
               operationId: importId,
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
@@ -2299,16 +2352,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         return { kind: "resource", resource: next, status };
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
-          await store.releaseResourceClaims(claimOwnerId);
+          let idle = providerProvablyIdle;
           if (!providerDispatched) {
-            await store.abandonProviderMutationPlan({
+            idle = await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,
               replayKey,
               resourceUid: uid,
             });
           }
-          if (!providerDispatched || providerProvablyIdle) {
+          // The guarded delete is also the ACK-loss readback: a bound import
+          // remains a repair unit, even when this invocation saw no bind result.
+          if (idle) {
+            await store.releaseResourceClaims(claimOwnerId);
             await settleIdleAttempt(context.tenantId, uid, importId, "import");
           }
         }

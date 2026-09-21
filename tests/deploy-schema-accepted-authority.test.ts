@@ -429,7 +429,7 @@ describe("0061 accepted-authority cutover", () => {
       );
       expect(result).toMatchObject({
         pendingMigrations: [ACCEPTED_AUTHORITY_MIGRATION],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 61).map(({ name }) => name),
         applyProviderSelectionCutover: {
           status: "ready",
           orphanOpenProviderEffectCount: 0,
@@ -519,7 +519,7 @@ describe("0061 accepted-authority cutover", () => {
       );
       expect(result).toMatchObject({
         pendingMigrations: [ACCEPTED_AUTHORITY_MIGRATION],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 61).map(({ name }) => name),
       });
       expect(resumed.migrationApplyCalls()).toBe(1);
       expect(legacySnapshot(database)).toEqual(before);
@@ -580,7 +580,7 @@ describe("0061 accepted-authority cutover", () => {
       );
       expect(result).toMatchObject({
         pendingMigrations: [ACCEPTED_AUTHORITY_MIGRATION],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 61).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(fixture.migrationApplyCalls()).toBe(1);
@@ -669,7 +669,7 @@ describe("0061 accepted-authority cutover", () => {
     }
   });
 
-  test("rejects bundled predecessors and protected selectors", async () => {
+  test("caps earlier predecessors at 0060 and rejects protected selectors", async () => {
     for (const count of [58, 59] as const) {
       const database = createDatabaseThrough(count);
       const root = mkdtempSync(
@@ -683,8 +683,10 @@ describe("0061 accepted-authority cutover", () => {
           applyOptions(root, fixture),
         );
         expect(status).toMatchObject({
-          applyProviderSelectionCutover: { status: "accepted_authority_cutover_unqualified" },
-          readyForApply: false,
+          throughMigration: OPERATION_GENERATION_MIGRATION,
+          pendingMigrations: MIGRATIONS.slice(count, 60).map(({ name }) => name),
+          applyProviderSelectionCutover: { status: "ready" },
+          readyForApply: true,
         });
         expect(fixture.migrationApplyCalls()).toBe(0);
       } finally {
@@ -730,10 +732,10 @@ describe("0061 accepted-authority cutover", () => {
       {
         label: "extra source",
         mutate(directory: string, database: Database) {
-          writeFileSync(join(directory, "0062_rogue.sql"), "-- rogue\n");
+          writeFileSync(join(directory, "0063_rogue.sql"), "-- rogue\n");
           void database;
         },
-        message: "accepted_authority_cutover_unqualified",
+        message: "exact audited source inventory 0001-0062",
       },
       {
         label: "rogue predecessor shape",

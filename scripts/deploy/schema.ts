@@ -125,6 +125,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0059_takoform_apply_provider_selection.sql",
   "0060_takoform_operation_generation.sql",
   "0061_takoform_accepted_authority_continuity.sql",
+  "0062_takoform_import_provider_selection.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -250,6 +251,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:4d5c04322a3eee95669a8ad83186ad0bf4a69ca192110c6e05d07bebc5ca99c2",
   "0061_takoform_accepted_authority_continuity.sql":
     "sha256:63d2029fa680130f4af59fae2f1f613a7d9ea220816eb224576521b59943ad88",
+  "0062_takoform_import_provider_selection.sql":
+    "sha256:1ba57124b32b621eda2a7ba08a461731aead99ce956e82de59726cdb3c365c3e",
 };
 const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
 const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(
@@ -420,6 +423,7 @@ const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
 const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
 const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
+const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -441,6 +445,10 @@ export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
   /** Open effects need their retained resource identity; unresolved work itself is allowed. */
   orphanOpenProviderEffectCount?(phase: DeployPhase): Promise<number>;
+  /** Old import preparation may have effects; 0062 must fence every planned import. */
+  plannedImportSagaCount?(phase: DeployPhase): Promise<number>;
+  /** Post-0062 only; concurrent new-protocol imports are not legacy evidence. */
+  historicalPlannedImportSagaCount?(phase: DeployPhase): Promise<number>;
   /** Fixed 0016->0022 catch-up snapshot; counts bind rehearsal to production. */
   legacyProductionCatchupDataIntegrity?(phase: DeployPhase): Promise<{
     readonly ledgerRowCount: number;
@@ -937,6 +945,14 @@ export async function runD1Schema(
         "tests/takoform-accepted-authority-migration.test.ts",
       ]);
     }
+    if (wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+      await checked(run, "preflight", "import-selection transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-import-selection.test.ts",
+        "tests/takoform-import-selection-schema.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -1378,10 +1394,12 @@ export async function runD1Schema(
       );
     }
     if (additiveCutoverPostShape !== null) {
-      const cutoverName = wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-        ? "accepted-authority"
-        : "operation-generation";
-      const cutoverBoundary = wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION) ? "0061" : "0060";
+      const cutoverName = wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+        ? "import-selection"
+        : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+          ? "accepted-authority"
+          : "operation-generation";
+      const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
           `${cutoverName} cutover post-shape differs from the exact audited ${cutoverBoundary} schema; repair forward`,
@@ -1399,6 +1417,23 @@ export async function runD1Schema(
           `${cutoverName} cutover has orphan open provider effects after migration; repair forward`,
           JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
         );
+      }
+      if (wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+        const historicalPlannedCount = await readPlannedImportSagaCount(
+          {
+            phase: "verification",
+            configPath,
+            environment,
+            run,
+            injected: options.reader,
+          },
+          true,
+        );
+        if (historicalPlannedCount !== 0) {
+          throw verificationError(
+            "import-selection cutover has historical planned imports after migration; repair forward",
+          );
+        }
       }
     }
     if (
@@ -1547,26 +1582,54 @@ function selectSchemaWave(
         "rehearsal and production D1 schema invocations require one fixed --through-migration boundary",
       );
     }
-    const migrationFiles = artifact.files.slice(applied.length);
+    // Keep independent availability transitions separate even when the source
+    // contains a newer audited tail. Never accept a truncated or invented tail
+    // merely because only its older prefix would be uploaded.
+    const hasAvailabilityCutover = artifact.names.some((name) =>
+      [
+        APPLY_PROVIDER_SELECTION_MIGRATION,
+        OPERATION_GENERATION_MIGRATION,
+        ACCEPTED_AUTHORITY_MIGRATION,
+        IMPORT_PROVIDER_SELECTION_MIGRATION,
+      ].includes(name),
+    );
+    if (hasAvailabilityCutover) {
+      if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+        throw preflightError(
+          "integration D1 cutover requires the exact audited source inventory 0001-0062",
+        );
+      }
+      assertAuditedMigrationHashes(artifact.files);
+    }
+    const throughCount = hasAvailabilityCutover
+      ? applied.length < 60
+        ? 60
+        : applied.length === 60
+          ? 61
+          : 62
+      : artifact.names.length;
+    const throughPrefixNames = artifact.names.slice(0, throughCount);
+    const throughPrefixFiles = artifact.files.slice(0, throughCount);
+    const migrationFiles = throughPrefixFiles.slice(applied.length);
     return {
       selector: null,
       fromMigration: last(applied),
-      throughMigration: artifact.names.at(-1) as string,
+      throughMigration: throughPrefixNames.at(-1) as string,
       fromPrefixNames: [...applied],
-      throughPrefixNames: artifact.names,
+      throughPrefixNames,
       migrationFiles,
-      throughPrefixFiles: artifact.files,
+      throughPrefixFiles,
       migrationDigest: digestMigrationFiles(migrationFiles),
       migrationBytes: migrationFiles.reduce((total, file) => total + file.bytes, 0),
-      throughPrefixDigest: artifact.digest,
-      pending: artifact.names.slice(applied.length),
+      throughPrefixDigest: digestMigrationFiles(throughPrefixFiles),
+      pending: throughPrefixNames.slice(applied.length),
     };
   }
 
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0061",
+      "selected D1 wave requires the exact audited source inventory 0001-0062",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1642,7 +1705,7 @@ function assertOperationGenerationMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0061 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0062 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1653,7 +1716,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0061",
+      "audited migration lineage must contain exactly 0001-0062",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -1663,7 +1726,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0061 source inventory: the
+ * intentionally separate from the current 0001-0062 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -1929,8 +1992,11 @@ interface ApplyProviderSelectionCutover {
     | "orphan_open_effects_repair_required"
     | "old_apply_writers_quiescence_unproven"
     | "operation_generation_cutover_unqualified"
-    | "accepted_authority_cutover_unqualified";
+    | "accepted_authority_cutover_unqualified"
+    | "import_selection_cutover_unqualified"
+    | "planned_imports_require_settlement";
   readonly orphanOpenProviderEffectCount?: number;
+  readonly plannedImportSagaCount?: number;
 }
 
 interface DataPreflights {
@@ -2026,6 +2092,36 @@ async function inspectApplyProviderSelectionCutover(input: {
   readonly injected: SchemaReader | undefined;
 }): Promise<ApplyProviderSelectionCutover> {
   const { pending } = input.wave;
+  if (pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+    if (
+      input.invocation.environment !== "integration" ||
+      input.invocation.throughMigration !== undefined ||
+      input.state.applied.length !== 61 ||
+      JSON.stringify(pending) !== JSON.stringify([IMPORT_PROVIDER_SELECTION_MIGRATION])
+    ) {
+      return { status: "import_selection_cutover_unqualified" };
+    }
+    if (
+      !applicationSchemaMatches(
+        input.state,
+        deriveExpectedApplicationShape(input.artifact.files.slice(0, 61)),
+      )
+    ) {
+      return { status: "predecessor_schema_mismatch" };
+    }
+    const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+    const plannedImportSagaCount = await readPlannedImportSagaCount(input);
+    return {
+      status:
+        orphanOpenProviderEffectCount !== 0
+          ? "orphan_open_effects_repair_required"
+          : plannedImportSagaCount !== 0
+            ? "planned_imports_require_settlement"
+            : "ready",
+      orphanOpenProviderEffectCount,
+      plannedImportSagaCount,
+    };
+  }
   // This additive transition fences new old-writer apply admission, not the
   // recovery of historical rows. It is intentionally separate from the frozen
   // 0058/0059 -> 0060 lane: never bundle the two availability boundaries.
@@ -2040,7 +2136,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited 0001-0061 inventory",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0062",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -2080,15 +2176,12 @@ async function inspectApplyProviderSelectionCutover(input: {
         : "operation_generation_cutover_unqualified",
     };
   }
-  if (
-    JSON.stringify(input.artifact.names) !==
-    JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE)
-  ) {
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited 0001-0060 inventory",
+      "operation-generation cutover requires the exact audited source inventory 0001-0062",
     );
   }
-  assertOperationGenerationMigrationHashes(input.artifact.files);
+  assertAuditedMigrationHashes(input.artifact.files);
   if (
     !applicationSchemaMatches(
       input.state,
@@ -2109,6 +2202,40 @@ function assertApplyProviderSelectionCutoverReady(cutover: ApplyProviderSelectio
     throw preflightError(
       `apply-provider-selection cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
+    );
+  }
+}
+
+async function readPlannedImportSagaCount(
+  input: {
+    readonly phase: DeployPhase;
+    readonly configPath: string;
+    readonly environment: Readonly<Record<string, string>>;
+    readonly run: SchemaProcess;
+    readonly injected: SchemaReader | undefined;
+  },
+  historicalOnly = false,
+): Promise<number> {
+  try {
+    const count = input.injected
+      ? historicalOnly
+        ? await input.injected.historicalPlannedImportSagaCount?.(input.phase)
+        : await input.injected.plannedImportSagaCount?.(input.phase)
+      : await readSingleCount(
+          new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+          input.phase,
+          "import-selection pending old-writer preparation",
+          `SELECT COUNT(*) AS row_count FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_kind = 'import' AND phase = 'planned'
+             ${historicalOnly ? "AND import_selection_protocol IS NULL" : ""}`,
+          "row_count",
+        );
+    return exactNonnegativeCount(count, "import-selection planned import sagas");
+  } catch (error) {
+    if (error instanceof DeployError && error.phase === input.phase) throw error;
+    throw new DeployError(
+      input.phase,
+      error instanceof Error ? error.message : "invalid planned import saga count",
     );
   }
 }

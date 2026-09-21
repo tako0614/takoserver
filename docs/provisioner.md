@@ -321,6 +321,54 @@ a proven whole-attempt-idle refusal atomically closes its effect as cancelled
 when retiring its saga, so a legitimate new attempt is not blocked by an orphan
 open effect. See [the ADR 0008 correction](adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md#correction--2026-09-20-an-unpublishable-receipt-is-still-a-real-effect).
 
+### Accepted import placement
+
+Import retains a separate `takoserver.takoform-import-selection@v1` snapshot;
+it does not use apply's commercial selection or create a charge. Every snapshot
+pins the requested native identity. Provider-backed imports also pin the
+Provider Pack, installation, technical Offering, catalog-versus-inherited
+placement, incumbent Deployment (including its native-claim state), and exact
+relation projections. SQLite migration imports pin their database Deployment
+before reading or applying its migration ledger.
+
+Native ownership is installation-wide, not tenant-local. Selection refuses an
+object governed by another live Deployment; only the exact selected active
+incumbent is exempt, not another candidate for the same Resource. Binding also
+atomically checks existing ownership and reserves the installation/native pair
+with a unique saga index. Competing imports cannot both enter the provider.
+The reservation survives an executed-but-unpublished receipt and ends with the
+existing atomic Deployment publication and saga retirement.
+
+The Host resolves and verifies placement without provider effects, then binds
+the canonical snapshot under the current saga lease, marks dispatch, and only
+then projects service material or invokes the provider. A retry verifies the same snapshot under its
+new lease. Changed provider placement or relation state holds the same operation;
+it never authorizes a new provider's adoption, polling, or absence proof.
+
+Migration 0062 adds import-only columns to the current-generation saga table.
+Existing values remain NULL. An undispatched attempt may bind once under its
+initial lease; a previously dispatched import without that evidence stays held.
+The private executor checks that the retained import snapshot was verified by
+its exact current lease before adoption or adoption polling. The RPC and
+published API/Form contracts are unchanged.
+
+Binding atomically retains the saga and its matching committing deferred import
+without extending either execution lease. A failed or lost bind acknowledgement
+does not authorize deleting the accepted snapshot, planned effect, or resource
+incarnation. Undispatched imports with bound placement participate in the same
+repair scheduler. Only an exact guarded abandonment of an unbound plan, or
+existing whole-attempt-idle proof, permits cleanup. This does not add explicit
+adopt-or-compensate repair for historical uncertainty.
+
+A provider-only refusal cannot prove an import with declared standard-service
+slots idle: the service resolver may already have issued material. This remains
+true after restart; recovery does not reissue that material or erase its uncertain
+effect based on an adoption refusal alone.
+
+These are implementation requirements, not evidence of a live rollout. Existing
+deployments need the owning schema transition before upgrading the private
+executor and Host; a new local migration file does not qualify a live database.
+
 ### Internal operation generations
 
 0060 separates current saga and deferred-operation storage from the physical

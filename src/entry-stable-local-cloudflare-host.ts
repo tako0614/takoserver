@@ -29,6 +29,7 @@ import type {
   InstalledTakoformForm,
   TakoformDriverRelation,
   TakoformResourceDriver,
+  TakoformSqliteMigrationSelection,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { loadProviderEraTestCatalog } from "./worker-stable-local-composition.ts";
@@ -307,11 +308,17 @@ function localProviderDriver(
     database: Parameters<
       NonNullable<TakoformResourceDriver["sqliteMigrations"]>["readLedger"]
     >[0]["database"],
-    selection?: TakoformApplySelection,
+    selection?: TakoformSqliteMigrationSelection,
   ) => {
     const current = deployments.get(database.metadata.uid);
     if (!current) throw new TakoformHostError("resource_not_found", 404);
     if (selection) {
+      // This stable-local fixture deliberately has no import/adoption driver.
+      // Do not treat an import snapshot as an apply snapshot or fall back to
+      // the current target when the persisted version differs.
+      if (selection.version !== TAKOFORM_APPLY_SELECTION_VERSION) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
       const retained =
         selection.kind === "sqlite-migration"
           ? selection.relations.find((relation) => relation.relation === "/database")?.deployment

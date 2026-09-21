@@ -760,6 +760,7 @@ describe("durable deferred Takoform operations", () => {
     const driver: TakoformResourceDriver = {
       ...memory,
       selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
       apply: (input) => memory.apply(input),
       import: async () => {
         providerCalls += 1;

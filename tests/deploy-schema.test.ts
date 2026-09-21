@@ -22,16 +22,11 @@ import {
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import {
-  copyCurrentSchemaFixture,
-  copyOperationGenerationSchemaFixture,
-} from "./helpers/audited-schema-fixture.ts";
+import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
 const currentFixtureRoot = mkdtempSync(join(tmpdir(), "takoserver-current-schema-surface-"));
 const currentMigrations = copyCurrentSchemaFixture(join(currentFixtureRoot, "migrations"));
-const operationGenerationMigrations = copyOperationGenerationSchemaFixture(
-  join(currentFixtureRoot, "operation-generation-migrations"),
-);
+const operationGenerationMigrations = currentMigrations;
 afterAll(() => rmSync(currentFixtureRoot, { recursive: true, force: true }));
 
 const COMMIT = "a".repeat(40);

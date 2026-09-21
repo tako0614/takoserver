@@ -6,6 +6,10 @@ import {
   TAKOFORM_APPLY_SELECTION_VERSION,
   type TakoformApplySelection,
 } from "../src/takoform/apply-selection.ts";
+import {
+  TAKOFORM_IMPORT_SELECTION_VERSION,
+  type TakoformImportSelection,
+} from "../src/takoform/import-selection.ts";
 import { OPERATION_TTL_MILLISECONDS } from "../src/takoform/limits.ts";
 import { createTakoformStore, type ProviderMutationSaga } from "../src/takoform/store.ts";
 
@@ -46,6 +50,12 @@ const applySelection = {
   },
   relations: [],
 } satisfies TakoformApplySelection;
+
+const importSelection = {
+  version: TAKOFORM_IMPORT_SELECTION_VERSION,
+  kind: "intrinsic",
+  nativeId: "native-import",
+} satisfies TakoformImportSelection;
 
 const UNFENCED_ACCEPTED_AUTHORITY =
   '{"mode":"unfenced","protocolGeneration":1,"version":"takoserver.takoform-accepted-authority@v1"}';
@@ -88,6 +98,25 @@ async function recordDispatchedProviderEffect(
       operationMode: "initial",
     }),
   ).toBe(true);
+}
+
+async function bindImportSelection(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+  leaseToken: string,
+  mode: "initial" | "recovery",
+): Promise<void> {
+  expect(
+    await store.bindProviderMutationImportSelection({
+      tenantId: mutationSaga.tenantId,
+      operationId: mutationSaga.operationId,
+      resourceUid: mutationSaga.resourceUid,
+      fingerprint: mutationSaga.fingerprint,
+      leaseToken,
+      mode,
+      selection: importSelection,
+    }),
+  ).toEqual(importSelection);
 }
 
 describe("provider mutation saga execution leases", () => {
@@ -833,6 +862,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, postDispatchSaga, "lease_post_dispatch", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: postDispatchSaga.tenantId,
@@ -868,7 +898,8 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_after_preflight_failure",
         leaseUntil: 2_000,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, postDispatchSaga, "lease_after_preflight_failure", "recovery");
     database.close();
   });
 
@@ -895,6 +926,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, staleImportSaga, "lease_stale_import", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: staleImportSaga.tenantId,
@@ -913,7 +945,8 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_recovered_import",
         leaseUntil: 3_001,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, staleImportSaga, "lease_recovered_import", "recovery");
     expect(
       await store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
@@ -950,7 +983,8 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_after_stale_import",
         leaseUntil: 3_001,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, staleImportSaga, "lease_after_stale_import", "recovery");
     await expect(
       store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
@@ -1004,6 +1038,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, recoverySaga, "lease_handle_initial", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: recoverySaga.tenantId,
@@ -1043,9 +1078,11 @@ describe("provider mutation saga execution leases", () => {
     ).toEqual({
       kind: "acquired",
       mode: "recovery",
+      importSelection,
       providerHandle: "opaque-provider-handle",
       providerOutcome: "running",
     });
+    await bindImportSelection(store, recoverySaga, "lease_handle_recovery", "recovery");
     expect(
       await store.recordProviderMutationOutcome({
         tenantId: recoverySaga.tenantId,
@@ -1073,7 +1110,13 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_indeterminate_recovery",
         leaseUntil: 4_002,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery", providerOutcome: "indeterminate" });
+    ).toEqual({
+      kind: "acquired",
+      mode: "recovery",
+      importSelection,
+      providerOutcome: "indeterminate",
+    });
+    await bindImportSelection(store, recoverySaga, "lease_indeterminate_recovery", "recovery");
     database.close();
   });
 
@@ -1103,6 +1146,7 @@ describe("provider mutation saga execution leases", () => {
         leaseToken,
         leaseUntil: 2_000,
       });
+      await bindImportSelection(store, mismatchedSaga, leaseToken, "initial");
       expect(
         await store.markProviderMutationDispatch({
           tenantId: mismatchedSaga.tenantId,
@@ -1228,6 +1272,7 @@ describe("provider mutation saga execution leases", () => {
       leaseToken: "lease_precondition",
       leaseUntil: 2_000,
     });
+    await bindImportSelection(store, failedSaga, "lease_precondition", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: failedSaga.tenantId,

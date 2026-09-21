@@ -44,6 +44,7 @@ describe("independent Takoserver Host boundary", () => {
       },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
     };
     const host = createStaticStableEphemeralTakoformHost({

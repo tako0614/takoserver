@@ -102,6 +102,15 @@ export interface ResourceDeploymentStore {
     providerInstallationRef: string,
     nativeId: string,
   ): Promise<ResourceDeployment | null>;
+  /**
+   * Finds the live owner of a native object across all tenants. Migration
+   * 0039 makes this pair installation-wide, so import preflight must use the
+   * same scope before a provider callback can claim it.
+   */
+  findNativeClaim(
+    providerInstallationRef: string,
+    nativeId: string,
+  ): Promise<ResourceDeployment | null>;
   active(tenantId: string, resourceUid: string): Promise<ResourceDeployment | null>;
   forResource(tenantId: string, resourceUid: string): Promise<readonly ResourceDeployment[]>;
   meteringCandidates(limit: number): Promise<readonly ResourceDeployment[]>;
@@ -210,6 +219,20 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
          WHERE tenant_id = ? AND provider_installation_ref = ? AND native_id = ?
            AND state IN ('provisioning', 'candidate', 'active', 'draining') LIMIT 2`,
         [tenantId, providerInstallationRef, nativeId],
+      );
+      return one(rows);
+    },
+
+    async findNativeClaim(providerInstallationRef, nativeId) {
+      // Migration 0039 deliberately fences this pair across tenants. Keep
+      // the lookup's scope aligned with that unique index; a tenant-scoped
+      // read could otherwise dispatch an adoption that only fails after the
+      // final Deployment insert hits the cross-tenant constraint.
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deployments
+         WHERE provider_installation_ref = ? AND native_id = ?
+           AND state IN ('provisioning', 'candidate', 'active', 'draining') LIMIT 2`,
+        [providerInstallationRef, nativeId],
       );
       return one(rows);
     },

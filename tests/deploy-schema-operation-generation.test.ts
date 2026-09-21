@@ -9,17 +9,12 @@ import type { CommandResult } from "../scripts/deploy/process.ts";
 import { runD1Schema, type SchemaProcess } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import {
-  copyCurrentSchemaFixture,
-  copyOperationGenerationSchemaFixture,
-} from "./helpers/audited-schema-fixture.ts";
+import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
 const migrationFixtureRoot = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-operation-generation-"),
 );
-const currentMigrations = copyOperationGenerationSchemaFixture(
-  join(migrationFixtureRoot, "migrations"),
-);
+const currentMigrations = copyCurrentSchemaFixture(join(migrationFixtureRoot, "migrations"));
 const fullCurrentMigrations = copyCurrentSchemaFixture(
   join(migrationFixtureRoot, "current-migrations"),
 );
@@ -431,7 +426,7 @@ describe("0060 operation-generation cutover", () => {
             .query("UPDATE d1_migrations SET name = '0059_rogue.sql' WHERE name = ?")
             .run(APPLY_PROVIDER_SELECTION);
         },
-        message: "exact audited 0001-0060 inventory",
+        message: "exact audited source inventory 0001-0062",
       },
       {
         label: "rogue predecessor shape",
@@ -516,7 +511,7 @@ describe("0060 operation-generation cutover", () => {
   });
 
   test("keeps the no-op refusal and rehearsal/production fixed-wave selectors unchanged", async () => {
-    const complete = createDatabaseThrough(60);
+    const complete = createDatabaseThrough(62);
     const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "takoserver-opgen-noop-"));
     try {
       const fixture = databaseProcess(complete);

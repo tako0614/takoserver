@@ -1192,6 +1192,195 @@ describe("Takoform apply on a real backend", () => {
     ).toEqual([{ state: "live" }]);
   });
 
+  test("never reroutes an accepted import to a different provider after restart", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    const importForm: InstalledTakoformForm = {
+      ...FORM,
+      operations: [...FORM.operations, "import"],
+    };
+    let initialCalls = 0;
+    let recoveryCalls = 0;
+    const provider: Provider = {
+      id: "fake-initial",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("not an apply");
+      },
+      async adopt() {
+        initialCalls += 1;
+        throw new Error("import acknowledgement lost");
+      },
+      async recoverAdopt(input) {
+        recoveryCalls += 1;
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const open = (selected: Provider) =>
+      buildApp({
+        sql,
+        objects,
+        identity,
+        settlement,
+        publicOrigin: "https://api.takoserver.com",
+        forms: [importForm],
+        hostForms: [importForm],
+        takoformHostFactory: createStaticStableTestTakoformHost,
+        providers: [selected],
+        offerings: [
+          {
+            ...SOLD,
+            providerPackRef: selected.id,
+            providerInstallationRef: `${selected.id}.primary`,
+          },
+        ],
+      });
+    const app = open(provider);
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await call(
+      app.fetch,
+      "POST",
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/import-selection-restart/import`,
+      {
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        form: { formRef: FORM_REF },
+        metadata: { name: "import-selection-restart", space: "default" },
+        nativeId: "native-import-restart",
+        spec: {},
+      },
+      { ...auth, "idempotency-key": "import-selection-restart-0001", "if-none-match": "*" },
+    );
+    expect(accepted.status).toBe(202);
+    expect(initialCalls).toBe(1);
+    const selected = await sql.query(
+      `SELECT import_selection_json FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+      [organizationId],
+    );
+    expect(selected).toEqual([
+      { import_selection_json: expect.stringContaining('"providerPackRef":"fake-initial"') },
+    ]);
+    const restarted = open({ ...provider, id: "fake-rerouted" });
+    expect((await restarted.tick()).providerRepairs).toMatchObject({ pending: 1, settled: 0 });
+    expect(initialCalls).toBe(1);
+    expect(recoveryCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT import_selection_json FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual(selected);
+    expect(
+      await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects WHERE tenant_id = ? ORDER BY phase`,
+        [organizationId],
+      ),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+  });
+
+  test("retains accepted import placement when its bind acknowledgement is lost", async () => {
+    const baseSql = createEphemeralSql();
+    let lost = false;
+    const sql: Sql = {
+      ...baseSql,
+      async batch(statements) {
+        const result = await baseSql.batch(statements);
+        if (
+          !lost &&
+          statements.some((statement) => statement.sql.includes("SET import_selection_json"))
+        ) {
+          lost = true;
+          throw new Error("bind acknowledgement lost after commit");
+        }
+        return result;
+      },
+    };
+    let providerCalls = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("not an apply");
+      },
+      async adopt(input) {
+        providerCalls += 1;
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const importForm: InstalledTakoformForm = {
+      ...FORM,
+      operations: [...FORM.operations, "import"],
+    };
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [importForm],
+      hostForms: [importForm],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [provider],
+      offerings: [SOLD],
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await call(
+      app.fetch,
+      "POST",
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/import-bind-loss/import`,
+      {
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        form: { formRef: FORM_REF },
+        metadata: { name: "import-bind-loss", space: "default" },
+        nativeId: "native-bind-loss",
+        spec: {},
+      },
+      { ...auth, "idempotency-key": "import-bind-loss-0001", "if-none-match": "*" },
+    );
+    expect(accepted.status).toBe(202);
+    expect(lost).toBe(true);
+    expect(providerCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT import_selection_json, execution_started_at, expires_at FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual([
+      {
+        import_selection_json: expect.stringContaining('"nativeId":"native-bind-loss"'),
+        execution_started_at: null,
+        expires_at: 253402300799999,
+      },
+    ]);
+    expect(
+      await sql.query(`SELECT phase FROM tf_resource_provider_effects WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ phase: "planned" }]);
+    expect(
+      await sql.query(`SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ state: "live" }]);
+    expect((await app.tick()).providerRepairs).toMatchObject({ pending: 0, settled: 1 });
+    expect(providerCalls).toBe(1);
+  });
+
   test("inherits one exact provider installation for a revision Form", async () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-19T00:00:00.000Z");
@@ -1603,8 +1792,20 @@ describe("Takoform apply on a real backend", () => {
       previous,
     } as const;
 
-    await driver.import?.({ ...command, operationMode: "initial" });
-    await driver.import?.({ ...command, operationMode: "recovery" });
+    const selection = await driver.selectImport?.(command);
+    if (!selection) throw new Error("import selection unavailable");
+    await driver.import?.({
+      ...command,
+      selection,
+      atomicDeploymentCommit: true,
+      operationMode: "initial",
+    });
+    await driver.import?.({
+      ...command,
+      selection,
+      atomicDeploymentCommit: true,
+      operationMode: "recovery",
+    });
     expect(calls).toEqual([
       {
         mode: "initial",

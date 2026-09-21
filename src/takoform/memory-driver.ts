@@ -1,9 +1,11 @@
 import { canonicalDigest } from "../json.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "./apply-selection.ts";
+import { TAKOFORM_IMPORT_SELECTION_VERSION } from "./import-selection.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformResourceDriver,
+  TakoformSqliteMigrationSelection,
   TakoformStoredResource,
 } from "./types.ts";
 import { TakoformHostError } from "./types.ts";
@@ -36,7 +38,7 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     readLedger: async (input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
-      readonly selection?: import("./apply-selection.ts").TakoformApplySelection;
+      readonly selection?: TakoformSqliteMigrationSelection;
     }) =>
       structuredClone(
         this.#migrationLedgers.get(`${input.tenantId}\0${input.database.metadata.uid}`) ?? [],
@@ -47,7 +49,7 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
       readonly executionAuthority: import("./types.ts").TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
-      readonly selection?: import("./apply-selection.ts").TakoformApplySelection;
+      readonly selection: TakoformSqliteMigrationSelection;
       readonly desired: readonly {
         readonly path: string;
         readonly digest: `sha256:${string}`;
@@ -134,6 +136,59 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
     };
   }
 
+  async selectImport(
+    input: Parameters<NonNullable<TakoformResourceDriver["selectImport"]>>[0],
+  ): Promise<Awaited<ReturnType<NonNullable<TakoformResourceDriver["selectImport"]>>>> {
+    if (input.form.identity.formRef.kind === "SQLiteMigrationApplication") {
+      return {
+        version: TAKOFORM_IMPORT_SELECTION_VERSION,
+        kind: "sqlite-migration",
+        nativeId: input.nativeId,
+        relations: await Promise.all(
+          input.relations.map(async (relation) => ({
+            pointer: relation.pointer,
+            relation: relation.relation,
+            targetUid: relation.targetUid,
+            resource: {
+              apiVersion: relation.resource.apiVersion,
+              kind: relation.resource.kind,
+              formRef: structuredClone(relation.resource.form.formRef),
+              name: relation.resource.metadata.name,
+              space: relation.resource.metadata.space,
+              uid: relation.resource.metadata.uid,
+              generation: relation.resource.metadata.generation,
+              revision: relation.resource.metadata.revision,
+            },
+            ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+            ...(relation.relation === "/database"
+              ? {
+                  deployment: {
+                    id: `memory:${relation.resource.metadata.uid}`,
+                    resourceUid: relation.resource.metadata.uid,
+                    offeringId: "memory.sqlite",
+                    providerPackRef: "memory.intrinsic",
+                    providerInstallationRef: "memory.intrinsic",
+                    nativeId: `memory:${relation.resource.metadata.uid}`,
+                    state: "active" as const,
+                    nativeClaimed: false,
+                    projectionDigest: await canonicalDigest({
+                      observed: relation.resource.status.observed ?? {},
+                      outputs: relation.resource.status.outputs ?? {},
+                    }),
+                  },
+                }
+              : {}),
+          })),
+        ),
+      };
+    }
+    return {
+      version: TAKOFORM_IMPORT_SELECTION_VERSION,
+      kind: "intrinsic",
+      nativeId: input.nativeId,
+    };
+  }
+
   async observe(input: {
     readonly tenantId: string;
     readonly resource: TakoformStoredResource;
@@ -149,6 +204,15 @@ export class InMemoryTakoformResourceDriver implements TakoformResourceDriver {
   async import(
     input: Parameters<NonNullable<TakoformResourceDriver["import"]>>[0],
   ): Promise<TakoformDriverReceipt> {
+    if (input.selection.nativeId !== input.nativeId) {
+      throw new TakoformHostError("resource_busy", 409);
+    }
+    if (
+      input.form.identity.formRef.kind === "SQLiteMigrationApplication" &&
+      input.selection.kind !== "sqlite-migration"
+    ) {
+      throw new TakoformHostError("invalid_argument", 400);
+    }
     const resourceKey = `${input.tenantId}\0${input.resourceUid}`;
     const nativeKey = `${input.tenantId}\0${input.nativeId}`;
     const claimedResource = this.#resourceByNative.get(nativeKey);
