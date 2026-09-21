@@ -13,6 +13,7 @@ import type { TakoformV1Alpha3FormRef } from "../src/takoform/types.ts";
 
 const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
 const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
+const IMPORT_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
 const generationIndex = MIGRATIONS.findIndex(({ name }) => name === OPERATION_GENERATION_MIGRATION);
 if (generationIndex < 0) throw new Error("operation generation migration is missing");
 const generationMigration = MIGRATIONS[generationIndex];
@@ -23,6 +24,9 @@ const acceptedAuthorityMigration = MIGRATIONS.find(
 );
 if (!acceptedAuthorityMigration) throw new Error("accepted authority migration is missing");
 const acceptedAuthoritySql = acceptedAuthorityMigration.sql;
+const importSelectionMigration = MIGRATIONS.find(({ name }) => name === IMPORT_SELECTION_MIGRATION);
+if (!importSelectionMigration) throw new Error("import selection migration is missing");
+const importSelectionSql = importSelectionMigration.sql;
 
 // These are the pinned legacy statement projections from both
 // 3b9a4e3036d943c6167d5e16f8eb04df04aa6985 and runtime 532 at 1d3d126; the
@@ -75,6 +79,7 @@ function applyGeneration(database: Database): void {
 function applyCurrentGeneration(database: Database): void {
   applyGeneration(database);
   database.exec(acceptedAuthoritySql);
+  database.exec(importSelectionSql);
 }
 
 function insertLegacySaga(
