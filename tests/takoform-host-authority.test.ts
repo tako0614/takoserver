@@ -15,6 +15,10 @@ import {
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../src/takoform/admission.ts";
 import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
+import {
+  parseTakoformApplySelection,
+  TAKOFORM_APPLY_SELECTION_VERSION,
+} from "../src/takoform/apply-selection.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { createFormPackageStore, formPackageKey } from "../src/takoform/form-packages.ts";
 import { createTakoformHost } from "../src/takoform/host.ts";
@@ -984,15 +988,33 @@ describe("durable read-only Takoform Host authority", () => {
     expect(Number((await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_resources"))[0]?.n)).toBe(
       0,
     );
+    const retainedSagas = await fixture.sql.query(
+      `SELECT operation_kind, phase, receipt_json, execution_started_at, selection_json
+       FROM tf_provider_mutation_sagas_selection_v1`,
+    );
+    expect(retainedSagas).toHaveLength(1);
+    expect(retainedSagas[0]).toMatchObject({
+      operation_kind: "apply",
+      phase: "planned",
+      receipt_json: null,
+      execution_started_at: null,
+    });
+    const retainedSelectionJson = retainedSagas[0]?.selection_json;
+    const retainedSelection =
+      typeof retainedSelectionJson === "string"
+        ? parseTakoformApplySelection(retainedSelectionJson)
+        : retainedSelectionJson;
+    expect(retainedSelection).toEqual({
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "intrinsic",
+    });
     expect(
-      Number(
-        (
-          await fixture.sql.query(
-            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
-          )
-        )[0]?.n,
+      await fixture.sql.query(
+        `SELECT effect_kind, phase
+         FROM tf_resource_provider_effects
+         WHERE effect_kind = 'apply'`,
       ),
-    ).toBe(0);
+    ).toEqual([{ effect_kind: "apply", phase: "planned" }]);
   });
 
   test("a deferred resume reauthorizes fresh heads before any provider side effect", async () => {

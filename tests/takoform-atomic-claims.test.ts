@@ -598,11 +598,15 @@ test("a recovery selection mismatch preserves the accepted claim and blocks a co
   const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
   expect(firstApplyCalls).toBe(1);
   const acceptedClaims = await sql.query(
-    `SELECT claim_key, state, owner_operation_id, holder_uid
+    `SELECT claim_key, state, owner_operation_id, tenant_id, holder_space,
+            holder_api_version, holder_kind, holder_name, holder_uid
      FROM tf_resource_claims
      WHERE state = 'reserved'`,
   );
   expect(acceptedClaims.length).toBeGreaterThan(0);
+  const acceptedDependencyClaims = acceptedClaims.filter((row) =>
+    String(row.claim_key).startsWith("host-dependency:"),
+  );
 
   const driverB: TakoformResourceDriver = {
     selectApply: async () => selectionB,
@@ -625,13 +629,55 @@ test("a recovery selection mismatch preserves the accepted claim and blocks a co
   expect(recoveredApplyCalls).toBe(0);
 
   const claims = await sql.query(
-    `SELECT claim_key, state, owner_operation_id, holder_uid
+    `SELECT claim_key, state, owner_operation_id, tenant_id, holder_space,
+            holder_api_version, holder_kind, holder_name, holder_uid
      FROM tf_resource_claims`,
   );
-  for (const acceptedClaim of acceptedClaims) {
-    expect(claims).toContainEqual(acceptedClaim);
+  const acceptedDefinitionClaim = acceptedClaims.find(
+    (row) => !String(row.claim_key).startsWith("host-dependency:"),
+  );
+  if (!acceptedDefinitionClaim) throw new Error("accepted definition claim missing");
+  const retainedDefinitionClaim = claims.find(
+    (row) => row.claim_key === acceptedDefinitionClaim.claim_key,
+  );
+  if (!retainedDefinitionClaim) throw new Error("retained definition claim missing");
+  expect(retainedDefinitionClaim).toMatchObject({
+    claim_key: acceptedDefinitionClaim.claim_key,
+    state: "reserved",
+    tenant_id: acceptedDefinitionClaim.tenant_id,
+    holder_space: acceptedDefinitionClaim.holder_space,
+    holder_api_version: acceptedDefinitionClaim.holder_api_version,
+    holder_kind: acceptedDefinitionClaim.holder_kind,
+    holder_name: acceptedDefinitionClaim.holder_name,
+    holder_uid: acceptedDefinitionClaim.holder_uid,
+    owner_operation_id: expect.any(String),
+  });
+  expect(retainedDefinitionClaim.owner_operation_id).not.toBe(
+    acceptedDefinitionClaim.owner_operation_id,
+  );
+  expect(retainedDefinitionClaim.owner_operation_id).not.toBe("");
+  const dependencyClaims = claims.filter((row) =>
+    String(row.claim_key).startsWith("host-dependency:"),
+  );
+  expect(dependencyClaims).toHaveLength(acceptedDependencyClaims.length);
+  expect(dependencyClaims.every((row) => row.owner_operation_id === operationId)).toBe(true);
+  for (const acceptedDependencyClaim of acceptedDependencyClaims) {
+    expect(dependencyClaims).toContainEqual(acceptedDependencyClaim);
   }
-  expect(claims.some((row) => row.owner_operation_id === operationId)).toBe(true);
+
+  // Releasing the stale pre-recovery lease must not remove the successor
+  // definition claim or the operation-owned dependency markers.
+  const store = createTakoformStore(sql, () => new Date());
+  await store.releaseResourceClaims(String(acceptedDefinitionClaim.owner_operation_id));
+  const afterStaleRelease = await sql.query(
+    `SELECT claim_key, state, owner_operation_id, tenant_id, holder_space,
+            holder_api_version, holder_kind, holder_name, holder_uid
+     FROM tf_resource_claims`,
+  );
+  expect(afterStaleRelease).toContainEqual(retainedDefinitionClaim);
+  for (const dependencyClaim of dependencyClaims) {
+    expect(afterStaleRelease).toContainEqual(dependencyClaim);
+  }
 
   const contenderDesired = resource("selection-contender");
   const contenderPrepared = await hostB.handle(
