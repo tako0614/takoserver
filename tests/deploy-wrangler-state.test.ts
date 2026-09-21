@@ -12,6 +12,7 @@ import {
 } from "../scripts/deploy/worker.ts";
 import {
   acquireWranglerVersionPublicationLease,
+  deployExistingWranglerVersion,
   deployWranglerLifecycleChange,
   inspectWranglerVersionPublicationLease,
   parseWranglerDeploymentOutput,
@@ -20,6 +21,7 @@ import {
   parseWranglerVersionDeployOutput,
   parseWranglerVersionOutput,
   parseWranglerVersionUploadOutput,
+  publishWranglerVersion,
   WranglerWorkerState,
 } from "../scripts/deploy/wrangler-state.ts";
 
@@ -244,6 +246,133 @@ describe("Wrangler version publication output", () => {
       }).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect((failure as DeployError).detail).toBe("exit=7");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps bounded allowlisted detail for staged and rollback failures", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-publication-failure-${crypto.randomUUID()}`;
+    const syntheticBearer = "synthetic-bearer-value";
+    const syntheticConfig = `${root}/synthetic-config-value.jsonc`;
+    const rawDiagnostics = [
+      `Error: request failed for account ${target.accountId} worker ${target.workerName}`,
+      `Authorization: Bearer ${syntheticBearer}`,
+      `target=${target.publicOrigin} config=${syntheticConfig}`,
+      "[code: 10021] [code: 10022] [code: 10023] [code: 10024] [code: 1234567]",
+      "ECONNRESET ETIMEDOUT fetch failed ECONNRESET_SECRET raw diagnostic text",
+    ].join("\n");
+    const lease = {
+      accountId: target.accountId,
+      workerName: target.workerName,
+      release: async () => {},
+    };
+    const assertSafeFailure = (failure: unknown, expectedExit: number): void => {
+      expect(failure).toBeInstanceOf(DeployError);
+      const error = failure as DeployError;
+      expect(error.phase).toBe("mutation");
+      expect(error.message).toContain("acknowledgement is indeterminate");
+      expect(error.message).toMatch(/do not retry|run --status/u);
+      expect(error.detail).toContain(`exit=${expectedExit}`);
+      expect(error.detail).toContain("10021");
+      expect(error.detail).toContain("10022");
+      expect(error.detail).toContain("ECONNRESET");
+      expect(error.detail).toContain("ETIMEDOUT");
+      expect(error.detail).toContain("fetch failed");
+      expect(error.detail).not.toContain("10024");
+      expect(error.detail).not.toContain("1234567");
+      const serialized = JSON.stringify(error);
+      for (const secret of [
+        syntheticBearer,
+        target.accountId,
+        target.workerName,
+        target.publicOrigin,
+        syntheticConfig,
+        "ECONNRESET_SECRET",
+        "raw diagnostic text",
+      ]) {
+        expect(serialized).not.toContain(secret);
+      }
+    };
+
+    try {
+      let uploadAttempts = 0;
+      const uploadFailure = await publishWranglerVersion({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: syntheticConfig,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message: syntheticBearer,
+        lease,
+        assertPredecessorStillCurrent: async () => {},
+        run: async () => {
+          uploadAttempts += 1;
+          return { exitCode: 9, stdout: rawDiagnostics, stderr: rawDiagnostics };
+        },
+      }).catch((error) => error);
+      assertSafeFailure(uploadFailure, 9);
+      expect(uploadAttempts).toBe(1);
+
+      let stagedAttempts = 0;
+      const stagedCommands: string[][] = [];
+      const stagedFailure = await publishWranglerVersion({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: syntheticConfig,
+        accountId: target.accountId,
+        workerName: WORKER,
+        message: syntheticBearer,
+        lease,
+        assertPredecessorStillCurrent: async () => {},
+        run: async (command, options) => {
+          stagedAttempts += 1;
+          stagedCommands.push([...command]);
+          if (command.includes("upload")) {
+            const outputPath = options?.env?.WRANGLER_OUTPUT_FILE_PATH;
+            if (!outputPath) throw new Error("missing upload output path");
+            await Bun.write(
+              outputPath,
+              JSON.stringify({
+                type: "version-upload",
+                version: 1,
+                worker_name: WORKER,
+                worker_tag: null,
+                version_id: VERSION,
+                preview_url: null,
+                preview_alias_url: null,
+                worker_name_overridden: false,
+              }),
+            );
+            return result("Uploaded\n");
+          }
+          return { exitCode: 9, stdout: rawDiagnostics, stderr: rawDiagnostics };
+        },
+      }).catch((error) => error);
+      assertSafeFailure(stagedFailure, 9);
+      expect(stagedAttempts).toBe(2);
+      expect(stagedCommands[1]).toContain(`${VERSION}@100%`);
+
+      let rollbackAttempts = 0;
+      const rollbackCommands: string[][] = [];
+      const rollbackFailure = await deployExistingWranglerVersion({
+        root,
+        configPath: syntheticConfig,
+        accountId: target.accountId,
+        workerName: WORKER,
+        versionId: VERSION,
+        message: syntheticBearer,
+        lease,
+        assertCurrentStillExpected: async () => {},
+        run: async (command) => {
+          rollbackAttempts += 1;
+          rollbackCommands.push([...command]);
+          return { exitCode: 9, stdout: rawDiagnostics, stderr: rawDiagnostics };
+        },
+      }).catch((error) => error);
+      assertSafeFailure(rollbackFailure, 9);
+      expect(rollbackAttempts).toBe(1);
+      expect(rollbackCommands[0]).toContain(`${VERSION}@100%`);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
