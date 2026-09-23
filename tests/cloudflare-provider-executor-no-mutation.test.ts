@@ -564,6 +564,222 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
     });
   });
 
+  test("restores RPC disposer metadata and disposes its transport root once", async () => {
+    const input = applyNoEffectInput();
+    let disposals = 0;
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.concludeApplyNoEffect = async () =>
+      withRpcDisposer(applyNoEffectUnsupportedFor(input), () => {
+        disposals += 1;
+      }) as CloudflareProviderApplyNoEffectConclusionResult;
+
+    expect(await createProxy(binding).concludeApplyNoEffect(input)).toEqual({
+      phase: "unsupported",
+    });
+    expect(disposals).toBe(1);
+  });
+
+  test("normalizes every exact proof seam without weakening identity checks", async () => {
+    for (const action of ["apply", "delete", "adopt"] as const) {
+      const input = makeInput(action);
+      let disposals = 0;
+      const proof = withRpcDisposer(proofFor(action, input), () => {
+        disposals += 1;
+      });
+      const binding = createBinding(() => failed("unavailable", "unused", true));
+      if (action === "apply") binding.apply = async () => proof;
+      if (action === "delete") binding.delete = async () => proof;
+      if (action === "adopt") binding.adopt = async () => proof;
+      expect(
+        providerFailureProvesNoMutation(
+          await invoke(createProxy(binding), action, input),
+          input.operationId,
+        ),
+      ).toBe(true);
+      expect(disposals).toBe(1);
+    }
+
+    const adoptionInput = makeAdoptionRecoveryInput();
+    let adoptionDisposals = 0;
+    const adoptionBinding = createBinding(() => failed("unavailable", "unused", true));
+    adoptionBinding.recoverAdopt = async () =>
+      withRpcDisposer(adoptionAbortFor(adoptionInput), () => {
+        adoptionDisposals += 1;
+      });
+    expect(
+      providerFailureProvesWholeOperationNoMutation(
+        await createProxy(adoptionBinding).recoverAdopt(adoptionInput),
+        adoptionInput.operationId,
+      ),
+    ).toBe(true);
+    expect(adoptionDisposals).toBe(1);
+
+    const convergeInput = makeInput("apply", { operationMode: "recovery" }) as ApplyInput;
+    let convergeDisposals = 0;
+    const convergeBinding = createBinding(() => failed("unavailable", "unused", true));
+    convergeBinding.convergeApply = async () =>
+      withRpcDisposer(applyAbortFor(convergeInput), () => {
+        convergeDisposals += 1;
+      });
+    expect(
+      providerFailureProvesWholeOperationNoMutation(
+        await createProxy(convergeBinding).convergeApply(convergeInput),
+        convergeInput.operationId,
+      ),
+    ).toBe(true);
+    expect(convergeDisposals).toBe(1);
+
+    const noEffectInput = applyNoEffectInput();
+    let noEffectDisposals = 0;
+    const noEffectBinding = createBinding(() => failed("unavailable", "unused", true));
+    noEffectBinding.concludeApplyNoEffect = async () =>
+      withRpcDisposer(applyNoEffectFor(noEffectInput), () => {
+        noEffectDisposals += 1;
+      });
+    const noEffectResult = await createProxy(noEffectBinding).concludeApplyNoEffect(noEffectInput);
+    expect(noEffectResult.phase).toBe("failed");
+    if (noEffectResult.phase !== "failed") throw new Error("missing no-effect proof");
+    expect(
+      providerFailureProvesWholeOperationNoMutation(noEffectResult, noEffectInput.operationId),
+    ).toBe(true);
+    expect(noEffectDisposals).toBe(1);
+
+    const compensationInput = applyCompensationInput();
+    let compensationDisposals = 0;
+    const compensationBinding = createBinding(() => failed("unavailable", "unused", true));
+    compensationBinding.compensateApply = async () =>
+      withRpcDisposer(applyCompensationFor(compensationInput), () => {
+        compensationDisposals += 1;
+      });
+    const compensationResult =
+      await createProxy(compensationBinding).compensateApply(compensationInput);
+    expect(compensationResult.phase).toBe("failed");
+    if (compensationResult.phase !== "failed") throw new Error("missing compensated proof");
+    expect(
+      providerFailureProvesWholeOperationCompensated(
+        compensationResult,
+        compensationInput.operationId,
+      ),
+    ).toBe(true);
+    expect(compensationDisposals).toBe(1);
+
+    let artifactDisposals = 0;
+    const artifactBinding = createBinding(() => failed("unavailable", "unused", true));
+    artifactBinding.verifyArtifactConsumption = async () =>
+      withRpcDisposer({ outcome: "unknown", reason: "unsupported", retryable: false }, () => {
+        artifactDisposals += 1;
+      });
+    expect(
+      await createProxy(artifactBinding).verifyArtifactConsumption(
+        {} as Parameters<NonNullable<Provider["verifyArtifactConsumption"]>>[0],
+      ),
+    ).toEqual({ outcome: "unknown", reason: "unsupported", retryable: false });
+    expect(artifactDisposals).toBe(1);
+  });
+
+  test("rejects unknown root metadata, accessors, nested disposers, and mismatches", async () => {
+    const input = makeInput("apply");
+    const unknownSymbolProof = proofFor("apply", input) as Record<PropertyKey, unknown>;
+    Object.defineProperty(unknownSymbolProof, Symbol("unknown-rpc-metadata"), {
+      configurable: true,
+      enumerable: false,
+      value: true,
+    });
+    let binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.apply = async () =>
+      unknownSymbolProof as unknown as CloudflareProviderInitialMutationResult;
+    expectUnavailableCode(await createProxy(binding).apply(input), "unknown root symbol");
+
+    const unknownStringProof = proofFor("apply", input) as MutableProof;
+    Object.defineProperty(unknownStringProof, "debug", {
+      configurable: true,
+      enumerable: false,
+      value: true,
+      writable: true,
+    });
+    binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.apply = async () =>
+      unknownStringProof as unknown as CloudflareProviderInitialMutationResult;
+    expectUnavailableCode(await createProxy(binding).apply(input), "unknown root string");
+
+    const accessorProof = proofFor("apply", input) as Record<string, unknown>;
+    let getterCalls = 0;
+    Object.defineProperty(accessorProof, "phase", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return "failed";
+      },
+    });
+    binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.apply = async () => accessorProof as unknown as CloudflareProviderInitialMutationResult;
+    expectUnavailableCode(await createProxy(binding).apply(input), "root accessor");
+    expect(getterCalls).toBe(0);
+
+    const nestedProof = proofFor("apply", input) as unknown as MutableProof;
+    Object.defineProperty(nestedProof.executorNoMutation, Symbol.dispose, {
+      configurable: true,
+      enumerable: false,
+      value: () => undefined,
+    });
+    binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.apply = async () => nestedProof as unknown as CloudflareProviderInitialMutationResult;
+    expectUnavailableCode(await createProxy(binding).apply(input), "nested disposer");
+
+    let disposals = 0;
+    const mismatched = withRpcDisposer(proofFor("apply", input), () => {
+      disposals += 1;
+    }) as MutableProof;
+    mismatched.executorNoMutation.executionAuthority.leaseToken = "wrong-lease";
+    binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.apply = async () => mismatched as unknown as CloudflareProviderInitialMutationResult;
+    expectUnavailableCode(await createProxy(binding).apply(input), "mismatched authority");
+    expect(disposals).toBe(1);
+  });
+
+  test("returns ordinary passthrough tickets as fresh roots without a disposer", async () => {
+    const ordinary = failed("conflict", "ordinary provider refusal", false);
+    let disposals = 0;
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.poll = async () =>
+      withRpcDisposer(ordinary, () => {
+        disposals += 1;
+      });
+    const result = await createProxy(binding).poll({
+      operationId: "operation-1",
+      handle: "handle-1",
+      executionAuthority: authority,
+    });
+    expect(result).toEqual(ordinary);
+    expect(result).not.toBe(ordinary);
+    expect(Reflect.ownKeys(result)).not.toContain(Symbol.dispose);
+    expect(disposals).toBe(1);
+  });
+
+  test("keeps ordinary tickets unchanged when root disposal fails", async () => {
+    const ordinary = failed("conflict", "ordinary provider refusal", false);
+    for (const dispose of [
+      () => {
+        throw new Error("sync disposer failure");
+      },
+      async () => {
+        throw new Error("async disposer failure");
+      },
+    ]) {
+      const binding = createBinding(() => failed("unavailable", "unused", true));
+      binding.poll = async () => withRpcDisposer(ordinary, dispose);
+      const result = await createProxy(binding).poll({
+        operationId: "operation-1",
+        handle: "handle-1",
+        executionAuthority: authority,
+      });
+      expect(result).toEqual(ordinary);
+      expect(result).not.toBe(ordinary);
+      expect(Reflect.ownKeys(result)).not.toContain(Symbol.dispose);
+    }
+  });
+
   test("restores compensated proof only for the exact dedicated lease-bound call", async () => {
     const input = applyCompensationInput();
     const exact = applyCompensationFor(input);
@@ -899,6 +1115,16 @@ function createBinding(
   } satisfies CloudflareProviderExecutorRpc;
 }
 
+function withRpcDisposer<T extends object>(value: T, dispose: () => void): T {
+  Object.defineProperty(value, Symbol.dispose, {
+    configurable: true,
+    enumerable: false,
+    value: dispose,
+    writable: true,
+  });
+  return value;
+}
+
 interface MutableProof {
   phase: unknown;
   failure: { code: unknown; message: unknown; retryable: unknown; [key: string]: unknown };
@@ -940,6 +1166,17 @@ function expectUnavailable(
       message,
       retryable: true,
     },
+  });
+  expect(providerFailureProvesNoMutation(ticket, "operation-1"), caseName).toBe(false);
+  expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1"), caseName).toBe(
+    false,
+  );
+}
+
+function expectUnavailableCode(ticket: ProviderTicket, caseName: string): void {
+  expect(ticket, caseName).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
   });
   expect(providerFailureProvesNoMutation(ticket, "operation-1"), caseName).toBe(false);
   expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1"), caseName).toBe(

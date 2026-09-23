@@ -125,11 +125,16 @@ export class CloudflareProviderProxy implements Provider {
 
   async apply(input: ApplyInput): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("apply", input, this.#providerInstallationId);
-    return restoreInitialMutationResult(await this.#binding.apply(input), context);
+    return restoreInitialMutationResult(
+      providerRpcResult(await this.#binding.apply(input)),
+      context,
+    );
   }
 
   async recoverApply(input: ApplyInput): Promise<ProviderTicket> {
-    return rejectUnexpectedExecutorEvidence(await this.#binding.recoverApply(input));
+    return rejectUnexpectedExecutorEvidence(
+      providerRpcResult(await this.#binding.recoverApply(input)),
+    );
   }
 
   async convergeApply(input: ApplyInput): Promise<ProviderTicket> {
@@ -137,7 +142,10 @@ export class CloudflareProviderProxy implements Provider {
       ...snapshotAdoptionRecoveryContext(input, this.#providerInstallationId),
       hasPrevious: input.previous !== undefined,
     };
-    return restoreApplyConvergenceResult(await this.#binding.convergeApply(input), context);
+    return restoreApplyConvergenceResult(
+      providerRpcResult(await this.#binding.convergeApply(input)),
+      context,
+    );
   }
 
   async concludeApplyNoEffect(
@@ -151,11 +159,11 @@ export class CloudflareProviderProxy implements Provider {
       input.operationId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "unknown";
     try {
       const rawResult = await this.#binding.concludeApplyNoEffect(input);
-      const result = restoreApplyNoEffectConclusionResult(rawResult, context);
+      const result = restoreApplyNoEffectConclusionResult(providerRpcResult(rawResult), context);
       try {
         const rawPhaseValue =
           typeof rawResult === "object" && rawResult !== null
-            ? (rawResult as { readonly phase?: unknown }).phase
+            ? Object.getOwnPropertyDescriptor(rawResult, "phase")?.value
             : undefined;
         const restoredPhaseValue =
           typeof result === "object" && result !== null
@@ -211,11 +219,14 @@ export class CloudflareProviderProxy implements Provider {
     if (!context.selectionMatchesInstallation) {
       return failed("unavailable", "Provider executor placement no longer matches", true);
     }
-    return restoreApplyCompensationResult(await this.#binding.compensateApply(input), context);
+    return restoreApplyCompensationResult(
+      providerRpcResult(await this.#binding.compensateApply(input)),
+      context,
+    );
   }
 
   async poll(input: Parameters<NonNullable<Provider["poll"]>>[0]): Promise<ProviderTicket> {
-    return rejectUnexpectedExecutorEvidence(await this.#binding.poll(input));
+    return rejectUnexpectedExecutorEvidence(providerRpcResult(await this.#binding.poll(input)));
   }
 
   observe(input: {
@@ -230,7 +241,10 @@ export class CloudflareProviderProxy implements Provider {
 
   async delete(input: Parameters<Provider["delete"]>[0]): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("delete", input, this.#providerInstallationId);
-    return restoreInitialMutationResult(await this.#binding.delete(input), context);
+    return restoreInitialMutationResult(
+      providerRpcResult(await this.#binding.delete(input)),
+      context,
+    );
   }
 
   recoverDelete(
@@ -241,14 +255,20 @@ export class CloudflareProviderProxy implements Provider {
 
   async adopt(input: Parameters<NonNullable<Provider["adopt"]>>[0]): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("adopt", input, this.#providerInstallationId);
-    return restoreInitialMutationResult(await this.#binding.adopt(input), context);
+    return restoreInitialMutationResult(
+      providerRpcResult(await this.#binding.adopt(input)),
+      context,
+    );
   }
 
   async recoverAdopt(
     input: Parameters<NonNullable<Provider["recoverAdopt"]>>[0],
   ): Promise<ProviderTicket> {
     const context = snapshotAdoptionRecoveryContext(input, this.#providerInstallationId);
-    return restoreAdoptionRecoveryResult(await this.#binding.recoverAdopt(input), context);
+    return restoreAdoptionRecoveryResult(
+      providerRpcResult(await this.#binding.recoverAdopt(input)),
+      context,
+    );
   }
 
   createNativeReadbackDescriptor(
@@ -272,7 +292,7 @@ export class CloudflareProviderProxy implements Provider {
   async verifyArtifactConsumption(
     input: Parameters<NonNullable<Provider["verifyArtifactConsumption"]>>[0],
   ): Promise<ProviderArtifactConsumption> {
-    const result: unknown = await this.#binding.verifyArtifactConsumption(input);
+    const result = providerRpcResult(await this.#binding.verifyArtifactConsumption(input));
     return isCloudflareProviderArtifactConsumption(result)
       ? result
       : { outcome: "unknown", reason: "malformed", retryable: false };
@@ -288,6 +308,43 @@ export class CloudflareProviderProxy implements Provider {
         migrations: input.migrations.map(({ path, digest }) => ({ path, digest })),
       }),
   };
+}
+
+/** Remove only RPC-owned root disposal metadata, never payload or evidence keys. */
+function providerRpcResult(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  let dispose: ((this: object) => unknown) | undefined;
+  const invalid = () => failed("unavailable", "Provider executor returned invalid RPC data", true);
+  try {
+    const disposer = Object.getOwnPropertyDescriptor(value, Symbol.dispose);
+    if (disposer) {
+      if (!("value" in disposer) || typeof disposer.value !== "function") return invalid();
+      dispose = disposer.value;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return invalid();
+    const result = Object.create(prototype) as Record<string, unknown>;
+    for (const key of Reflect.ownKeys(value)) {
+      if (key === Symbol.dispose) continue;
+      if (typeof key !== "string") return invalid();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !("value" in descriptor)) return invalid();
+      // Preserve unknown/non-enumerable string keys for the strict decoder to reject.
+      // Nested evidence is deliberately left untouched.
+      Object.defineProperty(result, key, descriptor);
+    }
+    return result;
+  } catch {
+    return invalid();
+  } finally {
+    if (dispose) {
+      try {
+        void Promise.resolve(dispose.call(value)).catch(() => undefined);
+      } catch {
+        // Transport cleanup failure cannot replace the provider's result.
+      }
+    }
+  }
 }
 
 /**
