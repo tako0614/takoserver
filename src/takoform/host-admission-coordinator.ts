@@ -24,6 +24,10 @@ import type {
   TakoformImplementationCatalog,
   TakoformImplementationCatalogEntry,
 } from "./implementation-catalog.ts";
+import {
+  parseSpaceAdmissionPolicy,
+  type SpaceAdmissionPolicyV1,
+} from "./space-admission-policy.ts";
 
 export interface FormAuthorityIdentity {
   readonly environment: FormAuthorityEnvironment;
@@ -45,6 +49,13 @@ export interface FormAuthorityPackageIdentity {
   readonly formRef: TakoformImplementationCatalogEntry["formRef"];
   readonly packageDigest: AdmissionDigest;
 }
+
+/**
+ * Operator-pinned positive activation scope.  This is deliberately separate
+ * from the publisher package import set: installs, support reconciliation,
+ * and Core verification continue to cover the complete package closure.
+ */
+export type FormAuthorityActivationPolicy = SpaceAdmissionPolicyV1;
 
 export interface FormAuthorityPlanRequest extends FormAuthorityIdentity {
   readonly kind: "takoserver.form-authority-plan-request@v2";
@@ -111,6 +122,8 @@ type FormAuthorityCommandDescriptor<T = FormAuthorityCommand> = T extends FormAu
 export interface FormAuthorityPlan {
   readonly kind: "takoserver.form-authority-plan@v2";
   readonly request: FormAuthorityPlanRequest;
+  /** Exact operator policy used to derive activation commands, when scoped. */
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
   readonly packages: readonly {
     readonly formRef: TakoformImplementationCatalogEntry["formRef"];
     readonly schemaDigest: AdmissionDigest;
@@ -237,6 +250,8 @@ export function createHostAdmissionCoordinator(options: {
    * existing callers.
    */
   readonly packageSet?: readonly FormAuthorityPackageIdentity[];
+  /** Optional operator-pinned positive activation scope. */
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
   /**
    * Exact evidence every request must carry verbatim. Production binds this
    * to the embedded publisher-set closure so a caller cannot substitute
@@ -274,9 +289,18 @@ export function createHostAdmissionCoordinator(options: {
     ]),
   );
   const packageEntries = normalizePackageSet(options.packageSet ?? implementationEntries);
+  const activationPolicy = normalizeActivationPolicy(
+    options.activationPolicy,
+    packageEntries,
+    implementationByIdentity,
+  );
+  const activationPolicyIdentities = new Set(
+    activationPolicy?.forms.map((entry) => packageIdentityKey(entry.formRef, entry.packageDigest)),
+  );
 
   const readState = async (request: FormAuthorityPlanRequest): Promise<AuthorityState> => {
     assertRequestIdentity(request, options.identity);
+    assertActivationPolicyRequest(request, activationPolicy);
     if (
       options.expectedEvidence !== undefined &&
       canonicalJson(request.evidence) !== canonicalJson(options.expectedEvidence)
@@ -508,6 +532,8 @@ export function createHostAdmissionCoordinator(options: {
       }
       if (
         implementationEntry &&
+        (activationPolicy === undefined ||
+          activationPolicyIdentities.has(packageIdentityKey(entry.formRef, entry.packageDigest))) &&
         !activationMatches(activation, options.identity.implementationDigest)
       ) {
         descriptors.push({
@@ -525,6 +551,9 @@ export function createHostAdmissionCoordinator(options: {
     const unsigned = {
       kind: "takoserver.form-authority-plan@v2" as const,
       request: structuredClone(request),
+      ...(activationPolicy === undefined
+        ? {}
+        : { activationPolicy: structuredClone(activationPolicy) }),
       packages: packageEntries.map((entry) => ({
         formRef: structuredClone(entry.formRef),
         schemaDigest: entry.formRef.schemaDigest as AdmissionDigest,
@@ -1134,6 +1163,63 @@ function normalizePackageSet(
     canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
   );
   return normalized;
+}
+
+function normalizeActivationPolicy(
+  value: FormAuthorityActivationPolicy | undefined,
+  packageEntries: readonly FormAuthorityPackageIdentity[],
+  implementationByIdentity: ReadonlyMap<string, TakoformImplementationCatalogEntry>,
+): FormAuthorityActivationPolicy | undefined {
+  if (value === undefined) return undefined;
+
+  let policy: FormAuthorityActivationPolicy;
+  try {
+    policy = parseSpaceAdmissionPolicy(value);
+  } catch (error) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      error instanceof Error ? error.message : "space admission policy is invalid",
+    );
+  }
+
+  const importedIdentities = new Set(
+    packageEntries.map((entry) => packageIdentityKey(entry.formRef, entry.packageDigest)),
+  );
+  for (const entry of policy.forms) {
+    const key = packageIdentityKey(entry.formRef, entry.packageDigest);
+    if (!importedIdentities.has(key)) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        "space admission policy identity is outside the full publisher package set",
+      );
+    }
+    if (!implementationByIdentity.has(key)) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        "space admission policy identity has no realized implementation",
+      );
+    }
+  }
+  return structuredClone(policy);
+}
+
+function assertActivationPolicyRequest(
+  request: FormAuthorityPlanRequest,
+  policy: FormAuthorityActivationPolicy | undefined,
+): void {
+  if (policy === undefined) return;
+  if (request.activation.tenantId !== policy.organizationId) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "space activation tenant does not match the pinned policy organization",
+    );
+  }
+  if (!request.activation.desiredActive) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "pinned space admission policy only permits positive activation",
+    );
+  }
 }
 
 function head(

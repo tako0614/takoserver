@@ -1,5 +1,9 @@
 # Takoform Form authority
 
+For the positive-only, multi-Space implementation foundation and its remaining
+deployment integration, see [Managed Space admission](managed-space-admission.md).
+It does not replace or widen the sealed integration operator scope below.
+
 Takoserver’s public Worker, router, and OpenAPI surface are read-only consumers
 of durable Form admission state. They may reach `host-authority.ts` and the
 package reader, but they must not import `admission-store.ts`, `admission.ts`,
