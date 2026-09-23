@@ -435,6 +435,7 @@ export function createDeferredOperations(input: {
             operation: failure.operation,
             ...(failure.charge ? { charge: failure.charge } : {}),
             ...(failure.recoveryAction ? { recoveryAction: failure.recoveryAction } : {}),
+            ...(failure.compensation ? { compensation: failure.compensation } : {}),
             hostOperation: {
               kind: "deferred",
               operation,

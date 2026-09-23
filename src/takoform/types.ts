@@ -294,6 +294,22 @@ export interface TakoformResourceDriver {
     readonly selection: TakoformApplySelection;
     readonly commercialAuthority?: TakoformCommercialAuthority;
   }) => Promise<void>;
+  /**
+   * Compensates provider effects for one exact accepted create. This has the
+   * same closed Host authority as no-effect conclusion, but it never proves
+   * the original attempt idle and therefore retains compensated history.
+   */
+  readonly compensateApply?: (input: {
+    readonly operationId: string;
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly selection: TakoformApplySelection;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+  }) => Promise<void>;
   apply(input: {
     readonly operationId: string;
     /** Caller-chosen Host idempotency identity, retained across operation recovery. */

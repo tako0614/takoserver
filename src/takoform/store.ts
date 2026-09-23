@@ -53,6 +53,11 @@ import {
   type TakoformV1Alpha3FormRef,
 } from "./types.ts";
 
+const PROVIDER_APPLY_COMPENSATION_TARGET = Object.freeze({
+  schema: "takoserver.provider-apply-compensation@v1",
+  disposition: "compensated",
+}) satisfies JsonObject;
+
 const OPERATION_PROTOCOL_GENERATION = 1;
 const PROVIDER_MUTATION_SAGA_TABLE = "tf_provider_mutation_sagas_selection_v1";
 const DEFERRED_OPERATION_TABLE = "tf_deferred_operations_selection_v1";
@@ -246,15 +251,20 @@ interface OperationGenerationIdentity {
   readonly target: ResourceAddress;
 }
 
-/** One no-effect provider refusal committed with its exact optional priced hold. */
+/** One definitive no-effect or compensated failure, with its exact optional priced hold. */
 export interface DefinitiveProviderMutationFailureCommit {
-  /** Set only after the dedicated seam restores operation-wide no-effect proof. */
-  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
+  /** Set only after a dedicated recovery seam restores its exact proof. */
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect" | "compensateApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly claimOwnerId: string;
   readonly operation: "create" | "update";
   readonly charge?: LedgerHeldCharge;
+  /** Immutable accepted authority retained only for compensated create settlement. */
+  readonly compensation?: {
+    readonly selection: TakoformApplySelection;
+    readonly dependencies: ResourceDependencySet;
+  };
   readonly hostOperation:
     | { readonly kind: "immediate"; readonly createdAt: string }
     | {
@@ -546,8 +556,20 @@ export interface TakoformStore {
     readonly leaseToken: string;
   }): Promise<boolean>;
   /**
-   * Atomically terminalizes a proven no-effect provider attempt and releases
-   * its exact wallet hold. A lost fence returns false with both still durable.
+   * Classifies an exact leased accepted dependency set. Missing or malformed
+   * authority is null; only an intact set with a monotonic target mismatch is
+   * changed.
+   */
+  providerMutationDependencyStatus(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+  }): Promise<"current" | "changed" | null>;
+  /**
+   * Atomically terminalizes either whole-operation no-effect or a tagged,
+   * retained compensation history, while releasing the exact wallet hold. A
+   * lost fence returns false with both lifecycle and hold still durable.
    */
   commitDefinitiveProviderMutationFailure(
     input: DefinitiveProviderMutationFailureCommit,
@@ -2419,6 +2441,80 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return recorded.changes === 1;
     },
 
+    async providerMutationDependencyStatus(input) {
+      const timestamp = now();
+      const sagaRows = await sql.query(
+        `SELECT selection_json, target_space
+         FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND protocol_generation = 1 AND operation_kind = 'apply'
+           AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND import_selection_json IS NULL AND selection_json IS NOT NULL
+           AND selection_verified_lease_token = execution_lease_token
+           AND provider_handle IS NULL AND provider_outcome = 'indeterminate'
+           AND execution_started_at IS NOT NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?
+         LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, timestamp],
+      );
+      if (sagaRows.length !== 1 || !sagaRows[0]) return null;
+      let selection: TakoformApplySelection;
+      try {
+        selection = parseTakoformApplySelection(text(sagaRows[0].selection_json));
+      } catch {
+        return null;
+      }
+      if (selection.kind !== "provider" || selection.incumbent !== undefined) return null;
+
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const claimRows = await sql.query(
+        `SELECT claim_key FROM tf_resource_claims
+         WHERE tenant_id = ? AND holder_uid = ? AND owner_operation_id = ?
+           AND holder_space = ? AND holder_api_version = ?
+           AND holder_kind = ? AND holder_name = ?
+           AND claim_key >= ? AND claim_key < ?
+           AND (state = 'committed' OR expires_at > ?)
+         ORDER BY claim_key`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+          dependencyStart,
+          dependencyEnd,
+          timestamp,
+        ],
+      );
+      let dependencies: ResourceDependencySet | null;
+      try {
+        dependencies = await decodeResourceDependencySet(
+          claimRows.map((row) => text(row.claim_key)),
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+        );
+      } catch {
+        return null;
+      }
+      if (!dependencies) return null;
+      if (
+        !compensationSelectionMatchesDependencies(
+          selection,
+          dependencies,
+          text(sagaRows[0].target_space),
+        )
+      ) {
+        return null;
+      }
+      return (await resourceDependencyTargetsStillCurrent(sql, input.tenantId, dependencies))
+        ? "current"
+        : "changed";
+    },
+
     async settleProviderMutationPreconditionFailure(input) {
       if (
         input.recoveryAction !== undefined &&
@@ -2612,15 +2708,19 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         `definitive_failure_result_${input.saga.operationId}_${input.providerLeaseToken}`,
       );
       const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const compensationTargetJson = input.compensation
+        ? canonicalJson(PROVIDER_APPLY_COMPENSATION_TARGET)
+        : null;
       const cancelledEvent = canonicalJson({
         eventId: `${input.saga.operationId}:cancelled`,
         operationId: input.saga.operationId,
         kind: "apply",
         phase: "cancelled",
         operationMode: "initial",
+        ...(input.compensation ? { target: PROVIDER_APPLY_COMPENSATION_TARGET } : {}),
       });
       const incarnationRelease =
-        input.operation === "create"
+        input.operation === "create" && !input.compensation
           ? uncommittedResourceIncarnationRelease({
               tenantId: input.saga.tenantId,
               resourceUid: input.saga.resourceUid,
@@ -2646,18 +2746,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
                    operation_mode, provider_pack_ref, provider_installation_ref,
                    native_id, target_json, created_at)
-                VALUES (?, ?, ?, ?, 'apply', 'cancelled', 'initial', NULL, NULL, NULL, NULL, ?)`,
+                VALUES (?, ?, ?, ?, 'apply', 'cancelled', 'initial', NULL, NULL, NULL, ?, ?)`,
           params: [
             input.saga.tenantId,
             input.saga.resourceUid,
             `${input.saga.operationId}:cancelled`,
             input.saga.operationId,
+            compensationTargetJson,
             timestamp,
           ],
         },
         {
           sql: `UPDATE tf_resource_deletion_attestations
-                SET closure_fence = closure_fence + 1,
+                SET state = ${input.compensation ? "'cancelled'" : "state"},
+                    closure_fence = closure_fence + 1,
                     effects_json = json_insert(effects_json, '$[#]', json(?)),
                     evidence_json = NULL, evidence_ref = NULL,
                     evidence_effect_digest = NULL, evidence_checked_at = NULL,
@@ -4411,7 +4513,9 @@ interface StoreSqlFence {
 function definitiveProviderFailureOutcomeSql(
   action: DefinitiveProviderMutationFailureCommit["recoveryAction"],
 ): string {
-  if (action === "concludeApplyNoEffect") return "= 'indeterminate'";
+  if (action === "concludeApplyNoEffect" || action === "compensateApply") {
+    return "= 'indeterminate'";
+  }
   if (action === "convergeApply") return "IN ('running', 'indeterminate')";
   return "= 'running'";
 }
@@ -4426,13 +4530,32 @@ function assertDefinitiveProviderMutationFailure(
   if (
     input.recoveryAction !== undefined &&
     ((input.recoveryAction !== "convergeApply" &&
-      input.recoveryAction !== "concludeApplyNoEffect") ||
+      input.recoveryAction !== "concludeApplyNoEffect" &&
+      input.recoveryAction !== "compensateApply") ||
       input.operation !== "create" ||
       saga.acceptedUid !== undefined ||
       saga.acceptedGeneration !== undefined ||
       saga.acceptedRevision !== undefined)
   ) {
     throw new TypeError("invalid provider refusal recovery action");
+  }
+  if ((input.recoveryAction === "compensateApply") !== (input.compensation !== undefined)) {
+    throw new TypeError("provider compensation authority is incomplete");
+  }
+  if (input.compensation) {
+    if (
+      input.hostOperation.kind !== "deferred" ||
+      input.compensation.selection.kind !== "provider" ||
+      input.compensation.selection.incumbent !== undefined ||
+      input.compensation.dependencies.operationId !== saga.operationId ||
+      !compensationSelectionMatchesDependencies(
+        input.compensation.selection,
+        input.compensation.dependencies,
+        saga.target.space,
+      )
+    ) {
+      throw new TypeError("invalid provider compensation authority");
+    }
   }
   if (input.charge && input.charge.reference !== saga.operationId) {
     throw new TypeError("provider failure charge has the wrong operation identity");
@@ -4487,6 +4610,7 @@ function definitiveProviderFailureInitialFence(
       AND protocol_generation = 1 AND operation_kind = 'apply'
       AND phase = 'planned' AND receipt_json IS NULL
       AND provider_handle IS NULL AND provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
+      ${input.compensation ? "AND selection_json = ? AND import_selection_json IS NULL AND selection_verified_lease_token = execution_lease_token" : ""}
       AND execution_started_at IS NOT NULL
       AND execution_lease_token = ? AND execution_lease_until > ?
   )`;
@@ -4504,6 +4628,7 @@ function definitiveProviderFailureInitialFence(
     saga.acceptedUid ?? null,
     saga.acceptedGeneration ?? null,
     saga.acceptedRevision ?? null,
+    ...(input.compensation ? [encodeTakoformApplySelection(input.compensation.selection)] : []),
     input.providerLeaseToken,
     timestamp,
   ];
@@ -4553,7 +4678,7 @@ function definitiveProviderFailureInitialFence(
     saga.target.name,
   ] as const;
   const incarnationRelease =
-    input.operation === "create"
+    input.operation === "create" && !input.compensation
       ? uncommittedResourceIncarnationRelease({
           tenantId: saga.tenantId,
           resourceUid: saga.resourceUid,
@@ -4562,10 +4687,22 @@ function definitiveProviderFailureInitialFence(
       : undefined;
   const resourceFence =
     input.operation === "create"
-      ? `NOT EXISTS (
-          SELECT 1 FROM tf_resources
-          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-        ) AND (${incarnationRelease?.fence ?? "0 = 1"})`
+      ? input.compensation
+        ? `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ?
+          )`
+        : `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          ) AND (${incarnationRelease?.fence ?? "0 = 1"})`
       : `EXISTS (
           SELECT 1 FROM tf_resources
           WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
@@ -4573,7 +4710,9 @@ function definitiveProviderFailureInitialFence(
         )`;
   const resourceParams: readonly SqlParam[] =
     input.operation === "create"
-      ? [...target, ...(incarnationRelease?.fenceParams ?? [])]
+      ? input.compensation
+        ? [...target, saga.tenantId, saga.resourceUid, saga.tenantId, saga.resourceUid]
+        : [...target, ...(incarnationRelease?.fenceParams ?? [])]
       : [
           ...target,
           saga.acceptedUid ?? "",
@@ -4623,13 +4762,65 @@ function definitiveProviderFailureInitialFence(
     saga.resourceUid,
     saga.operationId,
   ];
+  const dependencyFence = input.compensation
+    ? `AND (
+        SELECT COUNT(*) FROM tf_resource_claims
+        WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+          AND claim_key >= ? AND claim_key < ?
+          AND (state = 'committed' OR expires_at > ?)
+      ) = json_array_length(?)
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) AS expected
+        WHERE NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims AS dependency
+          WHERE dependency.claim_key = CAST(expected.value AS TEXT)
+            AND dependency.owner_operation_id = ?
+            AND dependency.tenant_id = ? AND dependency.holder_uid = ?
+            AND dependency.holder_space = ? AND dependency.holder_api_version = ?
+            AND dependency.holder_kind = ? AND dependency.holder_name = ?
+            AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+        )
+      )`
+    : "";
+  const dependencyParams: readonly SqlParam[] = input.compensation
+    ? (() => {
+        const keysJson = resourceDependencyKeysJson(input.compensation.dependencies);
+        const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+        return [
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          dependencyStart,
+          dependencyEnd,
+          timestamp,
+          keysJson,
+          keysJson,
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+          timestamp,
+        ];
+      })()
+    : [];
   return {
     sql: `${sagaFence}
       AND NOT EXISTS (SELECT 1 FROM tf_operations WHERE id = ?)
       AND ${hostFence}
       AND ${resourceFence}
-      AND ${attemptFence}`,
-    params: [...sagaParams, saga.operationId, ...hostParams, ...resourceParams, ...attemptParams],
+      AND ${attemptFence}
+      ${dependencyFence}`,
+    params: [
+      ...sagaParams,
+      saga.operationId,
+      ...hostParams,
+      ...resourceParams,
+      ...attemptParams,
+      ...dependencyParams,
+    ],
   };
 }
 
@@ -4721,27 +4912,100 @@ function definitiveProviderFailureCommittedFence(
     saga.target.kind,
     saga.target.name,
   ] as const;
+  const compensationEffectsJson = input.compensation
+    ? canonicalJson([
+        {
+          eventId: `${saga.operationId}:planned`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "planned",
+          operationMode: "initial",
+        },
+        {
+          eventId: `${saga.operationId}:dispatched`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "dispatched",
+          operationMode: "initial",
+        },
+        {
+          eventId: `${saga.operationId}:cancelled`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "cancelled",
+          operationMode: "initial",
+          target: PROVIDER_APPLY_COMPENSATION_TARGET,
+        },
+      ])
+    : undefined;
   const attemptFence =
     input.operation === "create"
-      ? `NOT EXISTS (
-          SELECT 1 FROM tf_resources
-          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_deployments
-          WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_provider_effects
-          WHERE tenant_id = ? AND resource_uid = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_deletion_attestations
-          WHERE tenant_id = ? AND resource_uid = ?
-        )`
+      ? input.compensation
+        ? `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ?
+          )
+          AND (
+            SELECT COUNT(*) FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+          ) = 3
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'planned' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json IS NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'dispatched' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json IS NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'cancelled' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json = ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_deletion_attestations
+            WHERE tenant_id = ? AND resource_uid = ?
+              AND space = ? AND api_version = ? AND kind = ? AND name = ?
+              AND form_ref_json = ? AND state = 'cancelled' AND closure_fence = 4
+              AND effects_json = ?
+              AND evidence_json IS NULL AND evidence_ref IS NULL
+              AND evidence_effect_digest IS NULL
+              AND evidence_checked_at IS NULL AND evidence_status IS NULL
+          )`
+        : `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deletion_attestations
+            WHERE tenant_id = ? AND resource_uid = ?
+          )`
       : `EXISTS (
           SELECT 1 FROM tf_resources
           WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
@@ -4772,17 +5036,53 @@ function definitiveProviderFailureCommittedFence(
         )`;
   const attemptParams: readonly SqlParam[] =
     input.operation === "create"
-      ? [
-          ...target,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-        ]
+      ? input.compensation
+        ? [
+            ...target,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:planned`,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:dispatched`,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:cancelled`,
+            saga.operationId,
+            canonicalJson(PROVIDER_APPLY_COMPENSATION_TARGET),
+            saga.tenantId,
+            saga.resourceUid,
+            saga.target.space,
+            saga.target.apiVersion,
+            saga.target.kind,
+            saga.target.name,
+            canonicalJson(
+              input.hostOperation.kind === "deferred"
+                ? input.hostOperation.operation.target.formRef
+                : {},
+            ),
+            compensationEffectsJson ?? "",
+          ]
+        : [
+            ...target,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+          ]
       : [
           ...target,
           saga.acceptedUid ?? "",
@@ -6318,6 +6618,36 @@ function resourceDependencyFencesJson(dependencies: ResourceDependencySet): stri
   );
 }
 
+function compensationSelectionMatchesDependencies(
+  selection: TakoformApplySelection,
+  dependencies: ResourceDependencySet,
+  targetSpace: string,
+): boolean {
+  if (selection.kind !== "provider" || selection.incumbent !== undefined) return false;
+  if (
+    selection.relations.some(
+      (relation) =>
+        relation.targetUid !== relation.resource.uid || relation.resource.space !== targetSpace,
+    )
+  ) {
+    return false;
+  }
+  const selectedRelations: readonly TakoformStoredRelation[] = selection.relations.map(
+    (relation) => ({
+      pointer: relation.pointer,
+      relation: relation.relation,
+      targetApiVersion: relation.resource.apiVersion,
+      targetKind: relation.resource.kind,
+      targetName: relation.resource.name,
+      targetUid: relation.targetUid,
+      targetRevision: relation.resource.revision,
+      targetFormRef: structuredClone(relation.resource.formRef),
+      ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+    }),
+  );
+  return canonicalJson(selectedRelations) === canonicalJson(dependencies.relations);
+}
+
 /** D1 bounds each string parameter at 2,000,000 bytes, including JSON1 inputs. */
 function boundedResourceDependencyJson(value: unknown, label: string): string {
   const serialized = canonicalJson(value);
@@ -6351,6 +6681,14 @@ async function resourceDependenciesStillCurrent(
   if (canonicalJson(rows.map((row) => text(row.claim_key))) !== canonicalJson(expectedKeys)) {
     return false;
   }
+  return await resourceDependencyTargetsStillCurrent(sql, input.tenantId, input.dependencies);
+}
+
+async function resourceDependencyTargetsStillCurrent(
+  sql: Sql,
+  tenantId: string,
+  dependencies: ResourceDependencySet,
+): Promise<boolean> {
   const targets = await sql.query(
     `SELECT CASE WHEN NOT EXISTS (
        SELECT 1 FROM json_each(?) AS fence
@@ -6375,7 +6713,7 @@ async function resourceDependenciesStillCurrent(
            )
        )
      ) THEN 1 ELSE 0 END AS current`,
-    [resourceDependencyFencesJson(input.dependencies), input.tenantId],
+    [resourceDependencyFencesJson(dependencies), tenantId],
   );
   return targets.length === 1 && targets[0]?.current === 1;
 }

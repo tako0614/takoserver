@@ -1,9 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { createLedger } from "../src/ledger.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { Sql } from "../src/ports.ts";
 import {
+  ProviderApplyNoEffectUnsupportedError,
+  ProviderMutationCompensatedFailureError,
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
 } from "../src/provider-driver.ts";
@@ -368,6 +371,400 @@ test("concludes an accepted create before live worker and dependency revisions a
   ).toEqual({ revision: "3" });
 });
 
+test("compensates a drifted accepted create atomically and replays after a lost acknowledgement", async () => {
+  const fixture = await acceptedCompensationFixture({ loseFirstAcknowledgement: true });
+  const {
+    database,
+    host,
+    worker,
+    deployment,
+    operationId,
+    resourceUid,
+    applyModes,
+    recoverySequence,
+    compensationInputs,
+  } = fixture;
+  const originalClaim = database
+    .query(
+      `SELECT owner_operation_id FROM tf_resource_claims
+       WHERE tenant_id = ? AND holder_uid = ? AND owner_operation_id <> ?
+       ORDER BY claim_key LIMIT 1`,
+    )
+    .get("tenant-a", resourceUid, operationId) as { owner_operation_id: string } | null;
+  if (!originalClaim) throw new Error("accepted create retained no declaration claim");
+  database
+    .query(
+      `INSERT INTO tf_resource_claims
+         (claim_key, tenant_id, holder_space, holder_api_version, holder_kind,
+          holder_name, holder_uid, owner_operation_id, state, expires_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)`,
+    )
+    .run(
+      "claim:compensation-unrelated",
+      "tenant-a",
+      "main",
+      cronForm.identity.formRef.apiVersion,
+      cronForm.identity.formRef.kind,
+      "unrelated-schedule",
+      "uid_unrelated_compensation",
+      originalClaim.owner_operation_id,
+      Date.parse("2099-01-01T00:00:00.000Z"),
+      Date.parse("2026-09-23T00:00:00.000Z"),
+    );
+
+  database
+    .query("DELETE FROM tf_resource_claims WHERE holder_uid = ?")
+    .run(deployment.metadata.uid);
+  database
+    .query("DELETE FROM tf_resources WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", deployment.metadata.uid);
+  const liveWorker: TakoformStoredResource = {
+    ...worker,
+    metadata: { ...worker.metadata, revision: "3" },
+    status: {
+      ...worker.status,
+      conditions: [
+        {
+          type: "Ready",
+          status: "False",
+          reason: "Provisioning",
+          hostReason: "ModuleWorker worker has no active WorkerDeployment",
+          lastTransitionTime:
+            worker.status.conditions[0]?.lastTransitionTime ?? "2026-09-23T00:00:00.000Z",
+        },
+      ],
+    },
+  };
+  database
+    .query(
+      "UPDATE tf_resources SET revision = '3', resource_json = ? WHERE tenant_id = ? AND uid = ?",
+    )
+    .run(JSON.stringify(liveWorker), "tenant-a", worker.metadata.uid);
+
+  const held = await host.handle(request(`${lane}/operations/${operationId}`));
+  expect(await held?.json()).toMatchObject({ id: operationId, done: false });
+  expect(recoverySequence).toEqual(["no-effect:open", "compensate:first"]);
+  expect(applyModes).toEqual(["initial"]);
+  expect(
+    database
+      .query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?")
+      .get(operationId),
+  ).toEqual({ phase: "committing" });
+
+  const terminal = await host.handle(request(`${lane}/operations/${operationId}`));
+  expect(await terminal?.json()).toMatchObject({
+    id: operationId,
+    done: true,
+    error: { code: "conflict", message: "the accepted create was durably compensated" },
+  });
+  expect(recoverySequence).toEqual([
+    "no-effect:open",
+    "compensate:first",
+    "no-effect:compensated",
+    "compensate:replay",
+  ]);
+  expect(applyModes).toEqual(["initial"]);
+  expect(compensationInputs).toHaveLength(2);
+  expect(compensationInputs[1]).toMatchObject({
+    operationId,
+    resourceUid,
+    selection: {
+      providerPackRef: "accepted-provider",
+      providerInstallationRef: "accepted-provider.primary",
+      relations: [{ resource: { uid: worker.metadata.uid, revision: "1" } }],
+    },
+    executionAuthority: {
+      tenantId: "tenant-a",
+      resourceUid,
+      leaseToken: expect.any(String),
+      fingerprint: expect.any(String),
+    },
+  });
+  expect(compensationInputs[0]?.executionAuthority.leaseToken).not.toBe(
+    compensationInputs[1]?.executionAuthority.leaseToken,
+  );
+
+  expect(
+    database
+      .query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?")
+      .get(operationId),
+  ).toEqual({ phase: "failed" });
+  expect(
+    database
+      .query(
+        "SELECT COUNT(*) AS rows FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+      )
+      .get(operationId),
+  ).toEqual({ rows: 0 });
+  expect(
+    database
+      .query(
+        "SELECT COUNT(*) AS rows FROM tf_resource_claims WHERE tenant_id = ? AND holder_uid = ?",
+      )
+      .get("tenant-a", resourceUid),
+  ).toEqual({ rows: 0 });
+  expect(
+    database
+      .query("SELECT owner_operation_id, state FROM tf_resource_claims WHERE claim_key = ?")
+      .get("claim:compensation-unrelated"),
+  ).toEqual({ owner_operation_id: originalClaim.owner_operation_id, state: "reserved" });
+  const effects = database
+    .query(
+      `SELECT phase, target_json FROM tf_resource_provider_effects
+       WHERE tenant_id = ? AND resource_uid = ?
+       ORDER BY CASE phase WHEN 'planned' THEN 1 WHEN 'dispatched' THEN 2 ELSE 3 END`,
+    )
+    .all("tenant-a", resourceUid) as Array<{ phase: string; target_json: string | null }>;
+  expect(effects).toEqual([
+    { phase: "planned", target_json: null },
+    { phase: "dispatched", target_json: null },
+    {
+      phase: "cancelled",
+      target_json: JSON.stringify({
+        disposition: "compensated",
+        schema: "takoserver.provider-apply-compensation@v1",
+      }),
+    },
+  ]);
+  const attestation = database
+    .query(
+      `SELECT state, closure_fence, effects_json
+       FROM tf_resource_deletion_attestations WHERE tenant_id = ? AND resource_uid = ?`,
+    )
+    .get("tenant-a", resourceUid) as {
+    state: string;
+    closure_fence: number;
+    effects_json: string;
+  };
+  expect(attestation).toMatchObject({ state: "cancelled", closure_fence: 4 });
+  expect(JSON.parse(attestation.effects_json)).toEqual([
+    {
+      eventId: `${operationId}:planned`,
+      operationId,
+      kind: "apply",
+      phase: "planned",
+      operationMode: "initial",
+    },
+    {
+      eventId: `${operationId}:dispatched`,
+      operationId,
+      kind: "apply",
+      phase: "dispatched",
+      operationMode: "initial",
+    },
+    {
+      eventId: `${operationId}:cancelled`,
+      operationId,
+      kind: "apply",
+      phase: "cancelled",
+      operationMode: "initial",
+      target: {
+        disposition: "compensated",
+        schema: "takoserver.provider-apply-compensation@v1",
+      },
+    },
+  ]);
+  expect(
+    database
+      .query("SELECT COUNT(*) AS rows FROM tf_resources WHERE tenant_id = ? AND uid = ?")
+      .get("tenant-a", resourceUid),
+  ).toEqual({ rows: 0 });
+  expect(
+    database
+      .query("SELECT revision FROM tf_resources WHERE tenant_id = ? AND uid = ?")
+      .get("tenant-a", worker.metadata.uid),
+  ).toEqual({ revision: "3" });
+});
+
+test("keeps current accepted dependencies on ordinary apply recovery", async () => {
+  const fixture = await acceptedCompensationFixture();
+  const terminal = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await terminal?.json()).toMatchObject({ id: fixture.operationId, done: true });
+  expect(fixture.applyModes).toEqual(["initial", "recovery"]);
+  expect(fixture.recoverySequence).toEqual(["no-effect:open"]);
+  expect(fixture.compensationInputs).toHaveLength(0);
+});
+
+test("holds instead of compensating when accepted dependency claims are incomplete", async () => {
+  const fixture = await acceptedCompensationFixture();
+  fixture.database
+    .query(
+      `DELETE FROM tf_resource_claims WHERE claim_key = (
+         SELECT claim_key FROM tf_resource_claims
+         WHERE tenant_id = ? AND holder_uid = ? AND owner_operation_id = ?
+           AND claim_key >= 'host-dependency:v1:' AND claim_key < 'host-dependency:v1;'
+         ORDER BY claim_key LIMIT 1
+       )`,
+    )
+    .run("tenant-a", fixture.resourceUid, fixture.operationId);
+
+  const held = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await held?.json()).toMatchObject({ id: fixture.operationId, done: false });
+  expect(fixture.applyModes).toEqual(["initial"]);
+  expect(fixture.recoverySequence).toEqual(["no-effect:open"]);
+  expect(fixture.compensationInputs).toHaveLength(0);
+  expect(
+    fixture.database
+      .query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?")
+      .get(fixture.operationId),
+  ).toEqual({ phase: "committing" });
+});
+
+test("holds when the accepted selection is not verified by the current provider lease", async () => {
+  const fixture = await acceptedCompensationFixture({ invalidateSelectionVerification: true });
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+
+  const held = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await held?.json()).toMatchObject({ id: fixture.operationId, done: false });
+  expect(fixture.dependencyObservation.invalidations).toBe(1);
+  expect(fixture.applyModes).toEqual(["initial"]);
+  expect(fixture.recoverySequence).toEqual(["no-effect:open"]);
+  expect(fixture.compensationInputs).toHaveLength(0);
+});
+
+test("enters changed-dependency compensation without requiring a no-effect capability", async () => {
+  const fixture = await acceptedCompensationFixture({ compensationOnly: true });
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+
+  const terminal = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await terminal?.json()).toMatchObject({
+    id: fixture.operationId,
+    done: true,
+    error: { code: "conflict", message: "the accepted create was durably compensated" },
+  });
+  expect(fixture.recoverySequence).toEqual(["compensate:first"]);
+  expect(fixture.compensationInputs).toHaveLength(1);
+  expect(fixture.applyModes).toEqual(["initial"]);
+});
+
+test("recognizes an atomically committed compensation after its Host acknowledgement is lost", async () => {
+  const fixture = await acceptedCompensationFixture({
+    compensationChargeMinor: 500,
+    settlementFault: "lost-acknowledgement",
+  });
+  await fixture.ledger.fund({
+    organizationId: "tenant-a",
+    fundingRef: "funding:compensation-readback",
+    amountMinor: 1_000,
+  });
+  expect(
+    await fixture.ledger.hold({
+      organizationId: "tenant-a",
+      reference: fixture.operationId,
+      amountMinor: 500,
+    }),
+  ).toBe(true);
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+
+  const terminal = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await terminal?.json()).toMatchObject({
+    id: fixture.operationId,
+    done: true,
+    error: { code: "conflict" },
+  });
+  expect(fixture.settlementObservation.faults).toBe(1);
+  const wallet = await fixture.ledger.wallet("tenant-a");
+  expect(wallet).toMatchObject({ settledMinor: 1_000, heldMinor: 0, availableMinor: 1_000 });
+  expect(wallet.entries).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        type: "release",
+        reference: fixture.operationId,
+        heldDeltaMinor: -500,
+      }),
+    ]),
+  );
+});
+
+test("rolls back compensation history and wallet release when its exact lease fence is lost", async () => {
+  const fixture = await acceptedCompensationFixture({
+    compensationChargeMinor: 500,
+    settlementFault: "invalidate-lease",
+  });
+  await fixture.ledger.fund({
+    organizationId: "tenant-a",
+    fundingRef: "funding:compensation-rollback",
+    amountMinor: 1_000,
+  });
+  expect(
+    await fixture.ledger.hold({
+      organizationId: "tenant-a",
+      reference: fixture.operationId,
+      amountMinor: 500,
+    }),
+  ).toBe(true);
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+
+  const held = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await held?.json()).toMatchObject({ id: fixture.operationId, done: false });
+  expect(fixture.settlementObservation.faults).toBe(1);
+  const wallet = await fixture.ledger.wallet("tenant-a");
+  expect(wallet).toMatchObject({ settledMinor: 1_000, heldMinor: 500, availableMinor: 500 });
+  expect(wallet.entries).not.toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ type: "release", reference: fixture.operationId }),
+    ]),
+  );
+  expect(
+    fixture.database
+      .query(
+        `SELECT phase FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY phase`,
+      )
+      .all("tenant-a", fixture.resourceUid),
+  ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+  expect(
+    fixture.database
+      .query(
+        "SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ? AND resource_uid = ?",
+      )
+      .get("tenant-a", fixture.resourceUid),
+  ).toEqual({ state: "live" });
+  expect(
+    fixture.database
+      .query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?")
+      .get(fixture.operationId),
+  ).toEqual({ phase: "committing" });
+});
+
+test("holds a compensated create when any target ResourceDeployment appears before commit", async () => {
+  const fixture = await acceptedCompensationFixture({ settlementFault: "insert-deployment" });
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+
+  const held = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await held?.json()).toMatchObject({ id: fixture.operationId, done: false });
+  expect(fixture.settlementObservation.faults).toBe(1);
+  expect(
+    fixture.database
+      .query("SELECT state FROM tf_resource_deployments WHERE tenant_id = ? AND resource_uid = ?")
+      .all("tenant-a", fixture.resourceUid),
+  ).toEqual([{ state: "failed" }]);
+  expect(
+    fixture.database
+      .query(
+        "SELECT phase FROM tf_resource_provider_effects WHERE tenant_id = ? AND resource_uid = ? ORDER BY phase",
+      )
+      .all("tenant-a", fixture.resourceUid),
+  ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+  expect(
+    fixture.database
+      .query(
+        "SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ? AND resource_uid = ?",
+      )
+      .get("tenant-a", fixture.resourceUid),
+  ).toEqual({ state: "live" });
+});
+
 test.each([
   {
     label: "accepted runtime Binding",
@@ -536,6 +933,251 @@ test.each([
     expect(conclusionCalls).toBe(0);
   },
 );
+
+async function acceptedCompensationFixture(
+  options: {
+    readonly compensationChargeMinor?: number;
+    readonly compensationOnly?: boolean;
+    readonly invalidateSelectionVerification?: boolean;
+    readonly loseFirstAcknowledgement?: boolean;
+    readonly settlementFault?: "insert-deployment" | "invalidate-lease" | "lost-acknowledgement";
+  } = {},
+) {
+  const database = new Database(":memory:");
+  databases.push(database);
+  migrateSqlite(database);
+  const durableSql = createSqliteSql(database);
+  const settlementObservation = { faults: 0 };
+  const dependencyObservation = { invalidations: 0 };
+  const sql: Sql = {
+    ...durableSql,
+    async query(statement, params) {
+      if (
+        options.invalidateSelectionVerification &&
+        dependencyObservation.invalidations === 0 &&
+        statement.includes("SELECT selection_json, target_space")
+      ) {
+        dependencyObservation.invalidations += 1;
+        await durableSql.run(
+          `UPDATE tf_provider_mutation_sagas_selection_v1
+           SET selection_verified_lease_token = 'stale-selection-verification'
+           WHERE provider_outcome = 'indeterminate' AND execution_lease_token IS NOT NULL`,
+        );
+      }
+      return await durableSql.query(statement, params);
+    },
+    async batch(statements) {
+      const compensationCommit = statements.some((statement) =>
+        statement.sql.includes("SET state = 'cancelled'"),
+      );
+      if (
+        compensationCommit &&
+        settlementObservation.faults === 0 &&
+        options.settlementFault === "invalidate-lease"
+      ) {
+        settlementObservation.faults += 1;
+        await durableSql.run(
+          `UPDATE tf_provider_mutation_sagas_selection_v1
+           SET execution_lease_token = 'invalidated-compensation-lease'
+          WHERE provider_outcome = 'indeterminate' AND execution_lease_token IS NOT NULL`,
+        );
+      }
+      if (
+        compensationCommit &&
+        settlementObservation.faults === 0 &&
+        options.settlementFault === "insert-deployment"
+      ) {
+        settlementObservation.faults += 1;
+        await durableSql.run(
+          `INSERT INTO tf_resource_deployments
+             (tenant_id, id, resource_uid, offering_id, provider_pack_ref,
+              provider_installation_ref, native_id, native_claimed, state,
+              observed_json, outputs_json, created_at, updated_at)
+           SELECT tenant_id, 'dep_compensation_race', resource_uid, 'offering.compensation-race',
+                  'provider-race', 'provider-race.primary', 'native:compensation-race', 0,
+                  'failed', '{}', '{}', 1, 1
+           FROM tf_provider_mutation_sagas_selection_v1
+           WHERE provider_outcome = 'indeterminate' AND execution_lease_token IS NOT NULL`,
+        );
+      }
+      const result = await durableSql.batch(statements);
+      if (
+        compensationCommit &&
+        settlementObservation.faults === 0 &&
+        options.settlementFault === "lost-acknowledgement"
+      ) {
+        settlementObservation.faults += 1;
+        throw new Error("compensation commit acknowledgement lost");
+      }
+      return result;
+    },
+  };
+  const ledger = createLedger(durableSql, () => new Date("2026-09-23T00:00:00.000Z"));
+  const memory = new InMemoryTakoformResourceDriver();
+  const applyModes: Array<"initial" | "recovery" | undefined> = [];
+  const recoverySequence: string[] = [];
+  const compensationInputs: Array<
+    Parameters<NonNullable<TakoformResourceDriver["compensateApply"]>>[0]
+  > = [];
+  let compensationPersisted = false;
+  const driver: TakoformResourceDriver = {
+    ...memory,
+    selectApply: async (input) => ({
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "provider",
+      providerPackRef: "accepted-provider",
+      providerInstallationRef: "accepted-provider.primary",
+      technicalOffering: {
+        id: `accepted-${input.form.identity.formRef.kind}`,
+        kind: `takoform.${input.form.identity.formRef.kind}`,
+        displayName: input.form.identity.formRef.kind,
+        form: structuredClone(input.form.identity.formRef),
+        capabilities: ["create", "update", "delete", "observe"],
+        providedInterfaces: [],
+        bindingRefs: [],
+      },
+      relations: input.relations.map((relation) => ({
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid: relation.targetUid,
+        resource: {
+          apiVersion: relation.resource.apiVersion,
+          kind: relation.resource.kind,
+          formRef: structuredClone(relation.resource.form.formRef),
+          name: relation.resource.metadata.name,
+          space: relation.resource.metadata.space,
+          uid: relation.resource.metadata.uid,
+          generation: relation.resource.metadata.generation,
+          revision: relation.resource.metadata.revision,
+        },
+      })),
+    }),
+    async apply(input) {
+      if (input.form.identity.formRef.kind === "WorkerCronTrigger") {
+        applyModes.push(input.operationMode);
+        if (input.operationMode !== "recovery") {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+        return { observed: {} };
+      }
+      return await memory.apply(input);
+    },
+    ...(options.compensationOnly
+      ? {}
+      : {
+          async concludeApplyNoEffect() {
+            recoverySequence.push(`no-effect:${compensationPersisted ? "compensated" : "open"}`);
+            throw new ProviderApplyNoEffectUnsupportedError();
+          },
+        }),
+    async compensateApply(input) {
+      compensationInputs.push(structuredClone(input));
+      if (options.loseFirstAcknowledgement && !compensationPersisted) {
+        compensationPersisted = true;
+        recoverySequence.push("compensate:first");
+        throw new ProviderMutationRecoveryError("indeterminate");
+      }
+      recoverySequence.push(compensationPersisted ? "compensate:replay" : "compensate:first");
+      compensationPersisted = true;
+      throw new ProviderMutationCompensatedFailureError(
+        "conflict",
+        409,
+        "the accepted create was durably compensated",
+        options.compensationChargeMinor
+          ? {
+              heldCharge: {
+                reference: input.operationId,
+                amountMinor: options.compensationChargeMinor,
+              },
+            }
+          : undefined,
+      );
+    },
+    observe: (input) => memory.observe(input),
+    delete: (input) => memory.delete(input),
+  };
+  let ids = 0;
+  const host = createConfiguredHistoricalTakoformHost({
+    sql,
+    objects: createMemoryObjectStore(),
+    forms,
+    driver,
+    authenticate: async () => ({ tenantId: "tenant-a", principalId: "principal-a" }),
+    routes: {
+      hostApiVersion: "forms.takoform.com/v1beta4",
+      apiPath: lane,
+      supportProfileApiVersion: "support.takoform.com/v1alpha2",
+      reviewSpecDigest: true,
+    },
+    deferredOperations: {
+      shouldDefer: ({ request }) => request.headers.get("takoform-conformance-probe") === "async",
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+      retryAfterSeconds: 0,
+      leaseMilliseconds: 1_000,
+    },
+    randomId: () => `compensation-${++ids}`,
+  });
+
+  const worker = await create(host, workerForm, "worker", {});
+  await create(host, versionForm, "version", {
+    worker: reference(workerForm, "worker"),
+    handlers: ["fetch", "scheduled"],
+  });
+  const deployment = await create(host, deploymentForm, "deployment", {
+    worker: reference(workerForm, "worker"),
+    versions: [{ workerVersion: reference(versionForm, "version"), weight: 10_000 }],
+  });
+  const desired = desiredResource(cronForm, "compensated-schedule", {
+    worker: reference(workerForm, "worker"),
+    cron: "*/20 * * * *",
+  });
+  const review = await prepare(host, desired);
+  const accepted = await host.handle(
+    request(resourcePath(cronForm, "compensated-schedule"), {
+      method: "PUT",
+      headers: {
+        "idempotency-key": `accepted-cron-compensation-${ids}`,
+        "if-none-match": "*",
+        "takoform-conformance-probe": "async",
+      },
+      body: JSON.stringify({ ...desired, review }),
+    }),
+  );
+  expect(accepted?.status).toBe(202);
+  if (!accepted) throw new Error("accepted compensation create returned no response");
+  const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+  const saga = database
+    .query(
+      `SELECT resource_uid, provider_handle, provider_outcome, receipt_json
+       FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+    )
+    .get(operationId) as {
+    resource_uid: string;
+    provider_handle: string | null;
+    provider_outcome: string;
+    receipt_json: string | null;
+  };
+  expect(saga).toMatchObject({
+    provider_handle: null,
+    provider_outcome: "indeterminate",
+    receipt_json: null,
+  });
+  return {
+    database,
+    host,
+    worker,
+    deployment,
+    operationId,
+    resourceUid: saga.resource_uid,
+    applyModes,
+    recoverySequence,
+    compensationInputs,
+    ledger,
+    dependencyObservation,
+    settlementObservation,
+  };
+}
 
 function installedForm(
   kind: string,

@@ -3,7 +3,9 @@ import type { LedgerHeldCharge } from "../ledger.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import {
+  ProviderApplyCompensationUnsupportedError,
   ProviderApplyNoEffectUnsupportedError,
+  ProviderMutationCompensatedFailureError,
   ProviderMutationDefinitiveRefusalError,
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
@@ -144,11 +146,15 @@ export interface EngineContext {
 }
 
 export interface EngineDefinitiveProviderFailureCommit {
-  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect" | "compensateApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly operation: "create" | "update";
   readonly charge?: LedgerHeldCharge;
+  readonly compensation?: {
+    readonly selection: TakoformApplySelection;
+    readonly dependencies: ResourceDependencySet;
+  };
   readonly error: {
     readonly code: string;
     readonly publicMessage?: string;
@@ -336,7 +342,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     /** The wallet hold and Host lifecycle settle through one store-owned batch. */
     readonly commitDefinitiveFailure?: (
       leaseToken: string,
-      error: ProviderMutationDefinitiveRefusalError | ProviderMutationWholeOperationRefusalError,
+      error:
+        | ProviderMutationCompensatedFailureError
+        | ProviderMutationDefinitiveRefusalError
+        | ProviderMutationWholeOperationRefusalError,
     ) => Promise<boolean>;
     /** Provider-only refusal proof cannot erase an earlier mutation step. */
     readonly providerRefusalProvesWholeAttemptIdle?: () => boolean;
@@ -564,7 +573,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         providerRefusalProvesWholeAttemptIdle &&
         error instanceof ProviderMutationWholeOperationRefusalError &&
         (error.action === "convergeApply" || error.action === "concludeApplyNoEffect");
-      const definitiveRefusal = definitiveInitialRefusal || definitiveApplyAbort;
+      const definitiveCompensation =
+        execution.mode === "recovery" &&
+        input.commitDefinitiveFailure !== undefined &&
+        error instanceof ProviderMutationCompensatedFailureError &&
+        error.action === "compensateApply";
+      const definitiveRefusal =
+        definitiveInitialRefusal || definitiveApplyAbort || definitiveCompensation;
       const recoveryError =
         error instanceof ProviderMutationRecoveryError
           ? error
@@ -1303,7 +1318,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         establishedSaga &&
         create &&
         context.durableOperation !== undefined &&
-        driver.concludeApplyNoEffect !== undefined &&
+        (driver.concludeApplyNoEffect !== undefined || driver.compensateApply !== undefined) &&
         !hasApplyServiceSlots &&
         !isSqliteMigrationApplication(form) &&
         (await store.isProviderMutationApplyNoEffectCandidate({
@@ -1314,11 +1329,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (applyNoEffectCandidate) {
         const durableOperation = context.durableOperation;
         const concludeApplyNoEffect = driver.concludeApplyNoEffect;
-        if (!durableOperation || !concludeApplyNoEffect) {
+        if (!durableOperation) {
           throw new ProviderMutationRecoveryError("indeterminate");
         }
 
+        const compensateApply = driver.compensateApply;
         let applySelection: TakoformApplySelection | undefined;
+        let compensationDependencies: ResourceDependencySet | undefined;
         let providerProvablyIdle = false;
         try {
           // A concurrently recorded receipt is returned here and then consumed
@@ -1354,6 +1371,27 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               applySelection = boundSelection;
             },
             commitDefinitiveFailure: async (providerLeaseToken, error) => {
+              if (error instanceof ProviderMutationCompensatedFailureError) {
+                if (!applySelection || !compensationDependencies) {
+                  throw new ProviderMutationRecoveryError("indeterminate");
+                }
+                return await durableOperation.commitDefinitiveProviderFailure({
+                  saga: proposedSaga,
+                  providerLeaseToken,
+                  operation: "create",
+                  recoveryAction: "compensateApply",
+                  compensation: {
+                    selection: applySelection,
+                    dependencies: compensationDependencies,
+                  },
+                  ...(error.heldCharge ? { charge: error.heldCharge } : {}),
+                  error: {
+                    code: error.code,
+                    ...(error.publicMessage ? { publicMessage: error.publicMessage } : {}),
+                    ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+                  },
+                });
+              }
               return await durableOperation.commitDefinitiveProviderFailure({
                 saga: proposedSaga,
                 providerLeaseToken,
@@ -1400,7 +1438,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               ) {
                 throw new ProviderApplyNoEffectUnsupportedError();
               }
-              await concludeApplyNoEffect({
+              const recoveryInput = {
                 operationId: proposedOperationId,
                 executionAuthority: {
                   tenantId: context.tenantId,
@@ -1417,7 +1455,44 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 ...(context.commercialAuthority
                   ? { commercialAuthority: context.commercialAuthority }
                   : {}),
+              } as const;
+              if (concludeApplyNoEffect) {
+                try {
+                  await concludeApplyNoEffect(recoveryInput);
+                } catch (error) {
+                  if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) throw error;
+                }
+              }
+              if (!compensateApply) throw new ProviderApplyNoEffectUnsupportedError();
+              const dependencyStatus = await store.providerMutationDependencyStatus({
+                tenantId: context.tenantId,
+                operationId: proposedOperationId,
+                resourceUid: proposedResourceUid,
+                leaseToken,
               });
+              if (dependencyStatus === "current") {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              if (dependencyStatus === null) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              compensationDependencies =
+                (await store.readProviderMutationDependencies({
+                  tenantId: context.tenantId,
+                  resourceUid: proposedResourceUid,
+                  operationId: proposedOperationId,
+                })) ?? undefined;
+              if (!compensationDependencies) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              try {
+                await compensateApply(recoveryInput);
+              } catch (error) {
+                if (error instanceof ProviderApplyCompensationUnsupportedError) {
+                  throw new ProviderApplyNoEffectUnsupportedError();
+                }
+                throw error;
+              }
               // The capability never returns success. A return is
               // inconclusive and therefore keeps the accepted operation held.
               throw new ProviderMutationRecoveryError("indeterminate");

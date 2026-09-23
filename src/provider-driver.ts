@@ -23,6 +23,7 @@ import {
   type ProviderTicket,
   type ProviderValue,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationCompensated,
   providerFailureProvesWholeOperationNoMutation,
 } from "./provider-port.ts";
 import {
@@ -186,6 +187,31 @@ export class ProviderApplyNoEffectUnsupportedError extends Error {
   constructor() {
     super("the provider does not support this apply no-effect conclusion");
     this.name = "ProviderApplyNoEffectUnsupportedError";
+  }
+}
+
+/** Provider effects existed and were compensated; their history must be retained. */
+export class ProviderMutationCompensatedFailureError extends TakoformHostError {
+  readonly action = "compensateApply" as const;
+  readonly heldCharge?: LedgerHeldCharge;
+
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    options?: { readonly heldCharge?: LedgerHeldCharge },
+  ) {
+    super(code, status, undefined, sanitizedMessage(message));
+    this.name = "ProviderMutationCompensatedFailureError";
+    if (options?.heldCharge) this.heldCharge = options.heldCharge;
+  }
+}
+
+/** Capability declined before attempting any compensation. */
+export class ProviderApplyCompensationUnsupportedError extends Error {
+  constructor() {
+    super("the provider does not support this apply compensation");
+    this.name = "ProviderApplyCompensationUnsupportedError";
   }
 }
 
@@ -1633,6 +1659,109 @@ export function createProviderDriver(
               }
               throw error;
             }
+            throw new ProviderMutationRecoveryError("indeterminate");
+          },
+        }
+      : {}),
+    ...([...byId.values()].some((provider) => provider.compensateApply !== undefined)
+      ? {
+          async compensateApply(
+            input: Parameters<NonNullable<TakoformResourceDriver["compensateApply"]>>[0],
+          ): Promise<void> {
+            // Preserve the accepted identity across wallet/provider awaits. Neither
+            // the caller nor the Provider receives this proof-consumption snapshot.
+            const accepted = structuredClone(input);
+            const selection = accepted.selection;
+            if (
+              selection.kind !== "provider" ||
+              selection.incumbent !== undefined ||
+              !sameForm(selection.technicalOffering.form, accepted.form.identity.formRef) ||
+              !selection.technicalOffering.capabilities.includes("create") ||
+              accepted.executionAuthority.tenantId !== accepted.tenantId ||
+              accepted.executionAuthority.resourceUid !== accepted.resourceUid
+            ) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            const provider = byId.get(selection.providerPackRef);
+            if (!provider) throw new ProviderMutationRecoveryError("indeterminate");
+            const compensate = provider.compensateApply;
+            if (!compensate) throw new ProviderApplyCompensationUnsupportedError();
+
+            const priceMinor = selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+            let heldCharge: LedgerHeldCharge | undefined;
+            if (!accepted.commercialAuthority && priceMinor > 0) {
+              const held = await ledger.hold({
+                organizationId: accepted.tenantId,
+                reference: accepted.operationId,
+                amountMinor: priceMinor,
+              });
+              if (!held) {
+                throw new ProviderMutationRecoveryError(
+                  "indeterminate",
+                  undefined,
+                  "insufficient_funds",
+                  402,
+                );
+              }
+              heldCharge = { reference: accepted.operationId, amountMinor: priceMinor };
+            }
+            let conclusion: Awaited<ReturnType<NonNullable<Provider["compensateApply"]>>>;
+            try {
+              conclusion = await compensate.call(provider, {
+                operationId: accepted.operationId,
+                providerInstallationRef: selection.providerInstallationRef,
+                executionAuthority: { ...accepted.executionAuthority },
+                offering: structuredClone(selection.technicalOffering),
+                identity: {
+                  tenantRef: accepted.tenantId,
+                  space: accepted.space,
+                  name: accepted.name,
+                  uid: accepted.resourceUid,
+                },
+              });
+            } catch (error) {
+              // A thrown driver-shaped error is not an operation-bound proof.
+              throw error instanceof TakoformHostError
+                ? new ProviderMutationRecoveryError(
+                    "indeterminate",
+                    undefined,
+                    error.code,
+                    error.status,
+                    error.publicMessage,
+                  )
+                : new ProviderMutationRecoveryError("indeterminate");
+            }
+            if (conclusion.phase === "unsupported") {
+              if (Object.keys(conclusion).length !== 1) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              throw new ProviderApplyCompensationUnsupportedError();
+            }
+            if (conclusion.phase === "failed") {
+              const [code, status] = failureToWire(conclusion.failure.code);
+              if (
+                conclusion.handle === undefined &&
+                providerFailureProvesWholeOperationCompensated(conclusion, accepted.operationId)
+              ) {
+                // The Host owns atomic failure, effect history, claims and wallet
+                // settlement. Never release this hold independently in the driver.
+                throw new ProviderMutationCompensatedFailureError(
+                  code,
+                  status,
+                  conclusion.failure.message,
+                  heldCharge ? { heldCharge } : undefined,
+                );
+              }
+              throw new ProviderMutationRecoveryError(
+                "indeterminate",
+                undefined,
+                code,
+                status,
+                conclusion.failure.message,
+              );
+            }
+            // A compensation progress handle is not the original apply handle;
+            // neither success nor progress can produce a Resource/receipt here.
             throw new ProviderMutationRecoveryError("indeterminate");
           },
         }
