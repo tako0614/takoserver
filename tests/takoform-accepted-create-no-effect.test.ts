@@ -483,6 +483,10 @@ test("compensates a drifted accepted create atomically and replays after a lost 
   expect(compensationInputs[0]?.executionAuthority.leaseToken).not.toBe(
     compensationInputs[1]?.executionAuthority.leaseToken,
   );
+  expect(fixture.settlementObservation.compensationStatementCount).toBeGreaterThan(0);
+  expect(fixture.settlementObservation.compensationStatementCount).toBeLessThanOrEqual(100);
+  expect(fixture.settlementObservation.maxCompensationBindParams).toBeLessThanOrEqual(100);
+  expect(fixture.settlementObservation.maxCompensationSqlBytes).toBeLessThanOrEqual(100_000);
 
   expect(
     database
@@ -947,7 +951,12 @@ async function acceptedCompensationFixture(
   databases.push(database);
   migrateSqlite(database);
   const durableSql = createSqliteSql(database);
-  const settlementObservation = { faults: 0 };
+  const settlementObservation = {
+    faults: 0,
+    maxCompensationBindParams: 0,
+    maxCompensationSqlBytes: 0,
+    compensationStatementCount: 0,
+  };
   const dependencyObservation = { invalidations: 0 };
   const sql: Sql = {
     ...durableSql,
@@ -970,6 +979,15 @@ async function acceptedCompensationFixture(
       const compensationCommit = statements.some((statement) =>
         statement.sql.includes("SET state = 'cancelled'"),
       );
+      if (compensationCommit) {
+        settlementObservation.compensationStatementCount = statements.length;
+        settlementObservation.maxCompensationBindParams = Math.max(
+          ...statements.map((statement) => statement.params?.length ?? 0),
+        );
+        settlementObservation.maxCompensationSqlBytes = Math.max(
+          ...statements.map((statement) => new TextEncoder().encode(statement.sql).byteLength),
+        );
+      }
       if (
         compensationCommit &&
         settlementObservation.faults === 0 &&
