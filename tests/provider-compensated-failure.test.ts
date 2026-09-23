@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
 import {
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
+  type CloudflareProviderApplyCompensationResult,
+  type CloudflareProviderExecutorApplyCompensationEvidence,
+  type CloudflareProviderExecutorApplyCompensationUnsupportedEvidence,
   failed,
   failedAfterProviderOperationCompensation,
   failedWithoutProviderMutation,
@@ -8,6 +12,31 @@ import {
   providerFailureProvesWholeOperationCompensated,
   providerFailureProvesWholeOperationNoMutation,
 } from "../src/provider-extension.ts";
+
+test("provider extension exports the closed compensation wire contract", () => {
+  const proof: CloudflareProviderExecutorApplyCompensationEvidence = {
+    schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
+    action: "compensateApply",
+    operationId: "operation-1",
+    providerInstallationRef: "cloudflare.primary",
+    executionAuthority: {
+      tenantId: "tenant-1",
+      resourceUid: "resource-1",
+      leaseToken: "lease-1",
+      fingerprint: "fingerprint-1",
+    },
+  };
+  const unsupported: CloudflareProviderExecutorApplyCompensationUnsupportedEvidence = {
+    ...proof,
+    action: "unsupported",
+  };
+  const result: CloudflareProviderApplyCompensationResult = {
+    phase: "unsupported",
+    executorApplyCompensationUnsupported: unsupported,
+  };
+  expect(proof.schema).toBe("takoserver.cloudflare-provider-executor-apply-compensation@v1");
+  expect(result.phase).toBe("unsupported");
+});
 
 test("compensated failure proves only the exact terminated operation", () => {
   const ticket = failedAfterProviderOperationCompensation(
