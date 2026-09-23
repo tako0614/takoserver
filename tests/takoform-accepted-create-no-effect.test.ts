@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { createLedger } from "../src/ledger.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
@@ -643,6 +643,60 @@ test("enters changed-dependency compensation without requiring a no-effect capab
   expect(fixture.recoverySequence).toEqual(["compensate:first"]);
   expect(fixture.compensationInputs).toHaveLength(1);
   expect(fixture.applyModes).toEqual(["initial"]);
+});
+
+test("bounds accepted-create recovery logs without provider payloads", async () => {
+  const fixture = await acceptedCompensationFixture();
+  fixture.database
+    .query("UPDATE tf_resources SET revision = '3' WHERE tenant_id = ? AND uid = ?")
+    .run("tenant-a", fixture.worker.metadata.uid);
+  const lines: string[] = [];
+  const log = spyOn(console, "error").mockImplementation((value: unknown) => {
+    lines.push(String(value));
+  });
+  try {
+    const terminal = await fixture.host.handle(
+      request(`${lane}/operations/${fixture.operationId}`),
+    );
+    expect(await terminal?.json()).toMatchObject({ id: fixture.operationId, done: true });
+  } finally {
+    log.mockRestore();
+  }
+
+  const entries = lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    })
+    .filter(
+      (entry): entry is Record<string, unknown> =>
+        entry?.event === "takoform.accepted_apply_recovery",
+    );
+  expect(entries).toEqual([
+    {
+      event: "takoform.accepted_apply_recovery",
+      operationId: fixture.operationId,
+      stage: "unsupported-accepted",
+    },
+    {
+      event: "takoform.accepted_apply_recovery",
+      operationId: fixture.operationId,
+      stage: "dependency-status",
+      dependencyStatus: "changed",
+    },
+    {
+      event: "takoform.accepted_apply_recovery",
+      operationId: fixture.operationId,
+      stage: "dependencies-read",
+      dependenciesRead: true,
+    },
+  ]);
+  expect(JSON.stringify(entries)).not.toContain("accepted-provider");
+  expect(JSON.stringify(entries)).not.toContain("fingerprint");
+  expect(JSON.stringify(entries)).not.toContain("leaseToken");
 });
 
 test("recognizes an atomically committed compensation after its Host acknowledgement is lost", async () => {

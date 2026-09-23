@@ -1333,6 +1333,33 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           throw new ProviderMutationRecoveryError("indeterminate");
         }
 
+        const recoveryOperationId =
+          proposedOperationId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "unknown";
+        const logRecoveryStage = (
+          stage:
+            | "unsupported-accepted"
+            | "dependency-status"
+            | "dependency-status-threw"
+            | "dependencies-read",
+          details?: {
+            readonly dependencyStatus?: "current" | "changed" | null;
+            readonly dependenciesRead?: boolean;
+          },
+        ): void => {
+          try {
+            console.error(
+              canonicalJson({
+                event: "takoform.accepted_apply_recovery",
+                operationId: recoveryOperationId,
+                stage,
+                ...(details ?? {}),
+              }),
+            );
+          } catch {
+            // Recovery diagnostics must not change Host behavior.
+          }
+        };
+
         const compensateApply = driver.compensateApply;
         let applySelection: TakoformApplySelection | undefined;
         let compensationDependencies: ResourceDependencySet | undefined;
@@ -1461,27 +1488,39 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                   await concludeApplyNoEffect(recoveryInput);
                 } catch (error) {
                   if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) throw error;
+                  logRecoveryStage("unsupported-accepted");
                 }
               }
               if (!compensateApply) throw new ProviderApplyNoEffectUnsupportedError();
-              const dependencyStatus = await store.providerMutationDependencyStatus({
-                tenantId: context.tenantId,
-                operationId: proposedOperationId,
-                resourceUid: proposedResourceUid,
-                leaseToken,
-              });
+              let dependencyStatus: "current" | "changed" | null;
+              try {
+                dependencyStatus = await store.providerMutationDependencyStatus({
+                  tenantId: context.tenantId,
+                  operationId: proposedOperationId,
+                  resourceUid: proposedResourceUid,
+                  leaseToken,
+                });
+              } catch (error) {
+                logRecoveryStage("dependency-status-threw");
+                throw error;
+              }
+              logRecoveryStage("dependency-status", { dependencyStatus });
               if (dependencyStatus === "current") {
                 throw new ProviderApplyNoEffectUnsupportedError();
               }
               if (dependencyStatus === null) {
                 throw new ProviderMutationRecoveryError("indeterminate");
               }
-              compensationDependencies =
-                (await store.readProviderMutationDependencies({
-                  tenantId: context.tenantId,
-                  resourceUid: proposedResourceUid,
-                  operationId: proposedOperationId,
-                })) ?? undefined;
+              const acceptedDependencies = await store.readProviderMutationDependencies({
+                tenantId: context.tenantId,
+                resourceUid: proposedResourceUid,
+                operationId: proposedOperationId,
+              });
+              compensationDependencies = acceptedDependencies ?? undefined;
+              logRecoveryStage("dependencies-read", {
+                dependenciesRead:
+                  acceptedDependencies !== null && acceptedDependencies !== undefined,
+              });
               if (!compensationDependencies) {
                 throw new ProviderMutationRecoveryError("indeterminate");
               }

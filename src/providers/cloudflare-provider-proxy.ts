@@ -1,3 +1,4 @@
+import { canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import type { MeterSource } from "../provider-meter-port.ts";
 import type {
@@ -146,10 +147,61 @@ export class CloudflareProviderProxy implements Provider {
     if (!context.selectionMatchesInstallation) {
       return failed("unavailable", "Provider executor placement no longer matches", true);
     }
-    return restoreApplyNoEffectConclusionResult(
-      await this.#binding.concludeApplyNoEffect(input),
-      context,
-    );
+    const safeOperationId =
+      input.operationId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "unknown";
+    try {
+      const rawResult = await this.#binding.concludeApplyNoEffect(input);
+      const result = restoreApplyNoEffectConclusionResult(rawResult, context);
+      try {
+        const rawPhaseValue =
+          typeof rawResult === "object" && rawResult !== null
+            ? (rawResult as { readonly phase?: unknown }).phase
+            : undefined;
+        const restoredPhaseValue =
+          typeof result === "object" && result !== null
+            ? (result as { readonly phase?: unknown }).phase
+            : undefined;
+        const rawPhase =
+          rawPhaseValue === "succeeded" ||
+          rawPhaseValue === "failed" ||
+          rawPhaseValue === "running" ||
+          rawPhaseValue === "unsupported"
+            ? rawPhaseValue
+            : "unknown";
+        const restoredPhase =
+          restoredPhaseValue === "succeeded" ||
+          restoredPhaseValue === "failed" ||
+          restoredPhaseValue === "running" ||
+          restoredPhaseValue === "unsupported"
+            ? restoredPhaseValue
+            : "unknown";
+        console.error(
+          canonicalJson({
+            event: "takoform.accepted_apply_recovery",
+            operationId: safeOperationId,
+            stage: "proxy-conclusion",
+            rawPhase,
+            restoredPhase,
+          }),
+        );
+      } catch {
+        // Recovery diagnostics must not change the provider result.
+      }
+      return result;
+    } catch (error) {
+      try {
+        console.error(
+          canonicalJson({
+            event: "takoform.accepted_apply_recovery",
+            operationId: safeOperationId,
+            stage: "proxy-conclusion-threw",
+          }),
+        );
+      } catch {
+        // Recovery diagnostics must not change the provider error.
+      }
+      throw error;
+    }
   }
 
   async compensateApply(
