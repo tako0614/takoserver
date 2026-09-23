@@ -1,3 +1,5 @@
+/// <reference lib="esnext.disposable" />
+
 import { canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import type { MeterSource } from "../provider-meter-port.ts";
