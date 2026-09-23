@@ -612,6 +612,475 @@ describe("durable deferred Takoform operations", () => {
     opened.close();
   });
 
+  test("retains recovery provenance when a cached receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "recovery-handle");
+        }
+        const receipt = await memory.apply(input);
+        // The Host owns this reserved field; a provider cannot choose the mode.
+        return { ...receipt, providerExecutionMode: "initial" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = desiredResource("receipt-recovery-provenance", "recovery");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-recovery-provenance`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "receipt-recovery-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const first = await apply();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(operationModes).toEqual(["initial"]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await apply();
+    expect(lostCommit?.status).toBe(202);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await apply();
+    expect(settled?.status).toBe(201);
+    expect(providerCalls).toBe(2);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("keeps initial provenance when a cached initial receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        const receipt = await memory.apply(input);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { ...receipt, providerExecutionMode: "recovery" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const desired = desiredResource("receipt-initial-provenance", "initial");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-initial-provenance`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "receipt-initial-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const lostCommit = await apply();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await apply();
+    expect(settled?.status).toBe(201);
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
+    opened.close();
+  });
+
+  test("retains recovery provenance when a cached import receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
+      apply: (input) => memory.apply(input),
+      import: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "import-recovery-handle");
+        }
+        const receipt = await memory.import(input);
+        // The provider attempts to forge initial provenance on a recovery call.
+        return { ...receipt, providerExecutionMode: "initial" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [importForm], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = importedResource("receipt-import-recovery-provenance", "recovery");
+    const path = `${lane}/resources/example.forms.invalid/DeferredImportThing/receipt-import-recovery-provenance/import`;
+    const importResource = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "POST",
+          headers: {
+            "idempotency-key": "receipt-import-recovery-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify(desired),
+        }),
+      );
+
+    const first = await importResource();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial import recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(operationModes).toEqual(["initial"]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await importResource();
+    expect(lostCommit?.status).toBe(202);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await importResource();
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(2);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("keeps initial provenance when a cached initial import receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
+      apply: (input) => memory.apply(input),
+      import: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        const receipt = await memory.import(input);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { ...receipt, providerExecutionMode: "recovery" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [importForm], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = importedResource("receipt-import-initial-provenance", "initial");
+    const path = `${lane}/resources/example.forms.invalid/DeferredImportThing/receipt-import-initial-provenance/import`;
+    const importResource = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "POST",
+          headers: {
+            "idempotency-key": "receipt-import-initial-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify(desired),
+        }),
+      );
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await importResource();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial import receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await importResource();
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
+    opened.close();
+  });
+
+  test("uses durable recovery provenance for a cached provider delete receipt", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const deleteModes: Array<"initial" | "recovery" | undefined> = [];
+    let deleteCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        deleteCalls += 1;
+        deleteModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "delete-recovery-handle");
+        }
+        // The provider attempts to forge initial provenance on a recovery call.
+        return { providerExecutionMode: "initial" };
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "receipt-delete-provenance");
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-delete-provenance?${query}`;
+    const remove = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "receipt-delete-provenance-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        }),
+      );
+
+    const first = await remove();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial delete recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(deleteModes).toEqual(["initial"]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await remove();
+    expect(lostCommit?.status).toBe(202);
+    expect(deleteModes).toEqual(["initial", "recovery"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await remove();
+    expect(settled?.status).toBe(204);
+    expect(deleteCalls).toBe(2);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("keeps initial provenance for a cached provider delete receipt", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const deleteModes: Array<"initial" | "recovery" | undefined> = [];
+    let deleteCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        deleteCalls += 1;
+        deleteModes.push(input.operationMode);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { providerExecutionMode: "recovery" };
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "receipt-delete-initial-provenance");
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-delete-initial-provenance?${query}`;
+    const remove = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "receipt-delete-initial-provenance-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        }),
+      );
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await remove();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial delete receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(deleteCalls).toBe(1);
+    expect(deleteModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await remove();
+    expect(settled?.status).toBe(204);
+    expect(deleteCalls).toBe(1);
+    expect(deleteModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
+    opened.close();
+  });
+
   test("returns a 202 Operation handle when inline execution holds a provider-plan conflict", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     let providerCalls = 0;
@@ -2136,7 +2605,10 @@ describe("durable deferred Takoform operations", () => {
       resource_uid: appliedResourceUids[0],
       phase: "executed",
     });
-    expect(JSON.parse(executed.receipt_json)).toEqual(issuedReceipt);
+    expect(JSON.parse(executed.receipt_json)).toEqual({
+      ...issuedReceipt,
+      providerExecutionMode: "initial",
+    });
     expect(
       opened.database
         .query(
@@ -2503,6 +2975,17 @@ function desiredResource(name: string, value: string) {
   };
 }
 
+function importedResource(name: string, value: string) {
+  return {
+    apiVersion: importForm.identity.formRef.apiVersion,
+    kind: importForm.identity.formRef.kind,
+    form: { formRef: importForm.identity.formRef },
+    metadata: { name, space: "main" },
+    spec: { value },
+    nativeId: `native-${name}`,
+  };
+}
+
 async function prepareReview(
   host: TakoformHost,
   desired: ReturnType<typeof desiredResource>,
@@ -2574,4 +3057,15 @@ function request(path: string, token: string, init?: RequestInit): Request {
   headers.set("authorization", `Bearer ${token}`);
   if (init?.body !== undefined) headers.set("content-type", "application/json");
   return new Request(`https://candidate.invalid${path}`, { ...init, headers });
+}
+
+function failNextProviderSagaCommit(database: Database): () => void {
+  database.exec(`
+    CREATE TRIGGER fail_next_provider_saga_commit
+    BEFORE DELETE ON tf_provider_mutation_sagas_selection_v1
+    BEGIN
+      SELECT no_such_provider_commit_function();
+    END;
+  `);
+  return () => database.exec("DROP TRIGGER fail_next_provider_saga_commit");
 }

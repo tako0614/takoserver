@@ -176,6 +176,11 @@ export interface TakoformDriverReceipt {
    * host-side status transition without pretending desired state changed.
    */
   readonly conditions?: readonly TakoformCondition[];
+  /**
+   * Host-internal provenance for the durable provider mutation execution.
+   * Historical receipts may omit it; callers retain the legacy initial default.
+   */
+  readonly providerExecutionMode?: "initial" | "recovery";
   /** Host-internal provider realization; never rendered into a Resource. */
   readonly deploymentMutation?: ResourceDeploymentMutation;
 }
