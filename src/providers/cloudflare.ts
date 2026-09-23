@@ -1123,6 +1123,7 @@ export class CloudflareProvider implements Provider {
       return failed("unavailable", "the Cloudflare provider handle is unavailable", false);
     }
     if (
+      !this.#workerBackend?.managedObjectBucketVacancy ||
       !this.#workerBackend?.prepareManagedObjectBucketDestroy ||
       !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
@@ -1455,6 +1456,7 @@ export class CloudflareProvider implements Provider {
     if (
       !identity ||
       !this.#workerBackend?.managedObjectBucketReceiptStatus ||
+      !this.#workerBackend.managedObjectBucketVacancy ||
       !this.#workerBackend.prepareManagedObjectBucketDestroy ||
       !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
@@ -1511,6 +1513,45 @@ export class CloudflareProvider implements Provider {
   async #deletePreparedManagedObjectBucket(
     handle: ManagedObjectDestroyHandle,
   ): Promise<ProviderTicket> {
+    const backend = this.#workerBackend;
+    if (!backend?.managedObjectBucketVacancy) {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket vacancy authority is unavailable"),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    let vacancy: ProviderValue<{ readonly empty: boolean }>;
+    try {
+      vacancy = await backend.managedObjectBucketVacancy({
+        identity: handle.identity,
+        bucketName: handle.bucketName,
+      });
+    } catch {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket vacancy authority is unavailable", true),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    if (!vacancy.ok) {
+      return providerValueTicket(vacancy, { ...handle, stage: "prepare" });
+    }
+    const empty = managedObjectBucketVacancyValue(vacancy.value);
+    if (empty === null) {
+      return managedObjectDestroyTicketWithHandle(
+        failed("provider_error", "the managed ObjectBucket vacancy readback is malformed"),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    if (!empty) {
+      return managedObjectDestroyTicketWithHandle(
+        failed(
+          "occupied",
+          "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+            "delete its contents and destroy again",
+        ),
+        { ...handle, stage: "prepare" },
+      );
+    }
     const path = `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(handle.bucketName)}`;
     const removed = await this.#call("DELETE", path);
     if (!removed.ok && removed.status !== 404) {

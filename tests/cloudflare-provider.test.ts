@@ -1105,7 +1105,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     });
     if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
     expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
-    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET"]);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET"]);
 
     const commit = backend.commitManagedObjectBucketDestroy;
     if (!commit) throw new Error("expected commit authority");
@@ -1117,7 +1117,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     });
     if (held.phase !== "failed") throw new Error("expected retained handle failure");
     expect(held.handle).toBe(refused.handle);
-    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET"]);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET"]);
     backend.commitManagedObjectBucketDestroy = commit;
 
     present = false;
@@ -1129,9 +1129,11 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     expect(events).toEqual([
       "vacancy",
       "prepare",
+      "vacancy",
       "DELETE",
       "GET",
       "prepare",
+      "vacancy",
       "DELETE",
       "GET",
       "commit",
@@ -1185,7 +1187,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     if (ticket.phase !== "failed" || !ticket.handle) throw new Error("expected retained handle");
     expect(ticket.handle.startsWith("tsobjd1.")).toBe(true);
     expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
-    expect(events).toEqual(["vacancy", "prepare", "DELETE"]);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE"]);
 
     refused = false;
     const finished = await provider.poll({ operationId, handle: ticket.handle });
@@ -1193,7 +1195,17 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
       phase: "succeeded",
       result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
     });
-    expect(events).toEqual(["vacancy", "prepare", "DELETE", "prepare", "DELETE", "GET", "commit"]);
+    expect(events).toEqual([
+      "vacancy",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
   });
 
   test("retains a commit handle for a nonretryable authority refusal", async () => {
@@ -1251,14 +1263,62 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
     expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
     expect(providerFailureProvesNoMutation(refused, operationId)).toBe(false);
-    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET", "commit"]);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET", "commit"]);
 
     const finished = await provider.poll({ operationId, handle: refused.handle });
     expect(finished).toMatchObject({
       phase: "succeeded",
       result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
     });
-    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET", "commit", "commit"]);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET", "commit", "commit"]);
+  });
+
+  test("rechecks vacancy before replaying an occupied prepare handle", async () => {
+    const events: string[] = [];
+    let vacancyReads = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        vacancyReads += 1;
+        return { ok: true, value: { empty: vacancyReads === 1 } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("occupied vacancy must prevent every native delete");
+    });
+    const operationId = "op-managed-bucket-replayed-occupied";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(providerFailureProvesNoMutation(refused, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy"]);
+
+    const held = await provider.poll({ operationId, handle: refused.handle });
+    expect(held).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (held.phase !== "failed") throw new Error("expected retained occupied handle");
+    expect(held.handle).toBe(refused.handle);
+    expect(providerFailureProvesNoMutation(held, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "prepare", "vacancy"]);
   });
 
   test("does not recover a no-handle delete from an active receipt", async () => {
@@ -1276,6 +1336,10 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
             nextActionAt: null,
           },
         };
+      },
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
       },
       prepareManagedObjectBucketDestroy: async () => {
         events.push("prepare");
@@ -1343,8 +1407,9 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     expect(events).toEqual([]);
   });
 
-  test("reconstructs a no-handle delete only from a destroying repair fence", async () => {
+  test("does not replay a destroying recovery while the bucket is occupied", async () => {
     const events: string[] = [];
+    let empty = false;
     const backend = managedBackend({
       managedObjectBucketReceiptStatus: async () => {
         events.push("status");
@@ -1361,7 +1426,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
       },
       managedObjectBucketVacancy: async () => {
         events.push("vacancy");
-        return { ok: true, value: { empty: false } };
+        return { ok: true, value: { empty } };
       },
       prepareManagedObjectBucketDestroy: async () => {
         events.push("prepare");
@@ -1389,10 +1454,36 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
       identity: MANAGED_IDENTITY,
     });
     expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (recovered.phase !== "failed" || !recovered.handle) {
+      throw new Error("expected retained occupied recovery handle");
+    }
+    expect(
+      providerFailureProvesNoMutation(recovered, "op-managed-bucket-destroying-recovery"),
+    ).toBe(false);
+    expect(events).toEqual(["status", "prepare", "vacancy"]);
+
+    empty = true;
+    const finished = await provider.poll({
+      operationId: "op-managed-bucket-destroying-recovery",
+      handle: recovered.handle,
+    });
+    expect(finished).toMatchObject({
       phase: "succeeded",
       result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
     });
-    expect(events).toEqual(["status", "prepare", "DELETE", "GET", "commit"]);
+    expect(events).toEqual([
+      "status",
+      "prepare",
+      "vacancy",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
   });
 });
 
