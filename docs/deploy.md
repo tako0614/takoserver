@@ -342,6 +342,8 @@ it:
 - `takoserver-integration-form-authority-worker`
 - `takoserver-integration-form-authority-operator-worker`
 - `takoserver-form-authority-identity-probe`
+- `takoserver-sponsorship-authority-worker` (only the managed Space admission
+  addition described below)
 
 No other public surface needs it: `takoserver-worker` shares the public
 Worker's closure and its declaration is `takoserver-worker-authority-cutover`;
@@ -358,6 +360,15 @@ the current code derives and the predecessor lacks. Code-derived values stay
 code-derived: the declaration names the binding, and the value still comes
 from the selected commit and target. Where nothing is declared, every surface
 stays exactly as strict as it is today.
+
+The sponsorship surface accepts only the initial managed-admission addition:
+`--add-var=TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST` and
+`--add-binding=TENANT_SPACE_ADMISSION`, together with its exact predecessor
+Version. Both are required and any additional delta is rejected. An absent
+sponsorship Worker uses ordinary first creation, not a predecessor transition.
+The released-Core Form authority must already serve the exact target policy
+and narrow named entrypoint. See [managed Space admission](managed-space-admission.md)
+for the publication order and remaining live acceptance.
 
 `--refresh-service-binding=NAME` is integration-only and names an existing
 service binding whose exact service/entrypoint tuple changes. The pinned
@@ -943,6 +954,12 @@ managed customer runtime.
   released Form package verification exists. Released Core supplies verification
   facts only; Takoserver Host retains admission policy and private handle
   issuance. Deploying the shell does not grant Form mutation authority.
+  An optional operator-owned `formAuthority.managedSpaceAdmissionPolicy`
+  enables the separate `TenantSpaceAdmissionEntrypoint`; only that narrow
+  entrypoint may be bound to the sponsorship issuer. Its exact policy is
+  configuration, not a live value adopted implicitly by `--adopt-live`.
+  This released-Core surface also supports the integration environment; it is
+  distinct from the singleton fixture surface below.
 - `takoserver-integration-form-authority-worker`: integration only. It packages
   the exact generated 17-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.

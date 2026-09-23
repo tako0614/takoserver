@@ -224,12 +224,15 @@ export const DEPLOY_CONTRACT = {
         "src/sponsorship-credential.ts",
         "src/sponsorship-authority.ts",
         "src/sponsorship-issuance-receipt.ts",
+        "sponsorship-authority-worker-configuration.d.ts",
         "migrations/0047_sponsorship_cutover_consumption.sql",
         "wrangler.sponsorship-authority.jsonc",
         "scripts/build-sponsorship-authority-worker.ts",
+        "scripts/deploy.ts",
         "scripts/deploy/cloudflare-topology-audit.ts",
         "scripts/deploy/sponsorship-authority.ts",
         "scripts/deploy/target.ts",
+        "scripts/deploy/worker-surface-transition.ts",
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler"],
@@ -246,11 +249,11 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} The operator-private target pins the only organization and Worker name; ` +
           "the ordinary runtime signing row is read only to prove separation, the target-pinned sponsorship credential public key is append-only registered and read back before its owned 0600 private half is published only to this route-less Worker, the distinct receipt public key is proven against its separate owned 0600 private JWK, and the exact bundle/config/two-secret file is sealed before one upload. A separate owner-private audit credential authenticates the deployment token's active all-zone Zone Read and Workers Routes Read policy; Workers Routes Write is explicitly refused before exhaustive topology readback.",
         "post-conditions":
-          "Authoritative Worker history identifies the selected commit and artifact; immutable Version readback proves exactly STATE_DB, the deploy-pinned organization and issuer, dedicated sponsorship credential key id/public JWK/secret, distinct issuance-receipt key id/secret, and Worker version metadata. The public Worker retains only its ordinary run-token key and has no tenant-run mint API or sponsorship private material. Runtime verification requires the immutable issuance-operation row's credential key id to match the JWT kid. Authenticated all-zone topology readback proves workers.dev=false, preview URLs=false, and no public route or custom domain and records only token/policy/resource digests. The entrypoint has exactly one issueTenantRunCredential method, no fetch, and a maximum 300-second credential. After additive migration 0047, one stable logical operation atomically admits the tenant/wallet decision and exact retries reconstruct byte-identical bearer/receipt bytes. This closure status is followed by Hosted's exact service-binding release and a bounded authenticated staging credential issuance/readback before any public route or retired-secret removal.",
+          "Authoritative Worker history identifies the selected commit and artifact; immutable Version readback proves exactly STATE_DB, the deploy-pinned organization and issuer, dedicated sponsorship credential key id/public JWK/secret, distinct issuance-receipt key id/secret, and Worker version metadata. A policyless target retains that exact closure; an opted-in managed-Space target additionally carries only the target-derived policy digest and TENANT_SPACE_ADMISSION service binding to the named narrow entrypoint. The full Form authority entrypoint is never bound. The public Worker retains only its ordinary run-token key and has no tenant-run mint API or sponsorship private material. Runtime verification requires the immutable issuance-operation row's credential key id to match the JWT kid. Authenticated all-zone topology readback proves workers.dev=false, preview URLs=false, and no public route or custom domain and records only token/policy/resource digests. The entrypoint has exactly one issueTenantRunCredential method, no fetch, and a maximum 300-second credential. After additive migration 0047, one stable logical operation atomically admits the tenant/wallet decision and exact retries reconstruct byte-identical bearer/receipt bytes. This closure status is followed by Hosted's exact service-binding release and a bounded authenticated staging credential issuance/readback before any public route or retired-secret removal.",
         reversal:
           "The immediately previous authority Worker Version is the provider-history rollback target; first publication has forward repair only and never deletes shared D1 state.",
         "failure-handling":
-          `${highRiskFailure} The only receipt authority is the dedicated redacted issuance-attestation signer; no funding, inventory, OAuth, billing, delete, managed-object/payment receipt, executor, Form, or public-fetch authority is present. Any extra binding, partial-scope topology token, or public topology fails closed.` +
+          `${highRiskFailure} The only receipt authority is the dedicated redacted issuance-attestation signer; no funding, inventory, OAuth, billing, delete, managed-object/payment receipt, executor, full Form, or public-fetch authority is present. Managed mode may carry only its exact narrow Form-admission service binding and policy digest. Any extra binding, partial-scope topology token, or public topology fails closed.` +
           inputContract(
             applyReviewInput,
             sponsorshipCredentialPrivateJwkInput,
@@ -505,9 +508,13 @@ export const DEPLOY_CONTRACT = {
         "src/form-authority-public-identity.ts",
         "src/public-host-identity.ts",
         "src/takoform/publisher-set-closure.ts",
+        "src/takoform/space-admission-policy.ts",
+        "src/takoform/tenant-space-admission.ts",
+        "form-authority-worker-configuration.d.ts",
         "src/generated/takoform-publisher-set-receipt.ts",
         "src/generated/takoform-publisher-set-authority-closure.ts",
         "services/takoform-core-verifier",
+        "scripts/build-form-authority-worker.ts",
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
@@ -529,7 +536,9 @@ export const DEPLOY_CONTRACT = {
           "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY, CORE_VERIFIER, WORKER_VERSION " +
           "and the four plain-text variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID, " +
           "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST and TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST, " +
-          "with no public Worker identity pins, " +
+          "with no public Worker identity pins; an opted-in released-Core target adds only its canonical " +
+          "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY plain-text binding, while the integration fixture " +
+          "surface remains unchanged, " +
           "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
           "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I. " +
           "Every apply against a Worker that already has a Version must additionally read the live " +

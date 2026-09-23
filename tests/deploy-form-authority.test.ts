@@ -84,6 +84,22 @@ const PREDECESSOR_SCOPE = {
   space: "space-yurucommu-predecessor",
 } as const;
 
+const MANAGED_SPACE_ADMISSION_POLICY = {
+  kind: "takoserver.space-form-admission-policy@v1",
+  organizationId: "org_hosted",
+  forms: [
+    {
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "Alpha",
+        definitionVersion: "1.0.0",
+        schemaDigest: `sha256:${"a".repeat(64)}`,
+      },
+      packageDigest: `sha256:${"b".repeat(64)}`,
+    },
+  ],
+} as const;
+
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -120,6 +136,14 @@ const target = {
     hostId: "https://api.integration.example.test",
   },
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+
+const managedTarget = {
+  ...target,
+  formAuthority: {
+    ...target.formAuthority,
+    managedSpaceAdmissionPolicy: MANAGED_SPACE_ADMISSION_POLICY,
+  },
 } satisfies DeployTarget;
 
 const formStorageTarget = {
@@ -1585,6 +1609,69 @@ describe("route-less Form authority deploy surfaces", () => {
         ],
       });
       expect(config).not.toHaveProperty("routes");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("emits managed policy only for the released-Core authority, not the fixture", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-managed-policy-"));
+    try {
+      const releasedPath = writeFormAuthorityConfig({
+        path: join(root, "released-wrangler.jsonc"),
+        main: "worker.js",
+        invocation: {
+          surface: "takoserver-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target: managedTarget,
+        selected: {
+          kind: "authority",
+          workerName: managedTarget.formAuthority.workerName,
+          hostId: managedTarget.formAuthority.hostId,
+          main: "src/entry-form-authority-worker.ts",
+          policyAuthority: "takoserver-host",
+          verificationMode: "released-core",
+          verificationAvailable: true,
+          productionEligible: false,
+        },
+        capabilityManifestJson: CAPABILITY_MANIFEST_JSON,
+      });
+      const released = JSON.parse(readFileSync(releasedPath, "utf8")) as Record<string, unknown>;
+      expect(released).toMatchObject({
+        vars: {
+          TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: canonicalJson(MANAGED_SPACE_ADMISSION_POLICY),
+        },
+      });
+
+      const fixturePath = writeFormAuthorityConfig({
+        path: join(root, "fixture-wrangler.jsonc"),
+        main: "worker.js",
+        invocation: {
+          surface: "takoserver-integration-form-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target: managedTarget,
+        selected: {
+          kind: "authority",
+          workerName: managedTarget.formAuthority.integrationWorkerName,
+          hostId: managedTarget.formAuthority.hostId,
+          main: "src/entry-integration-form-authority-worker.ts",
+          operatorPublicJwk: OPERATOR_PUBLIC_JWK,
+          operatorScope: managedTarget.formAuthority.integrationOperatorScope,
+          policyAuthority: "takoserver-host",
+          verificationMode: "integration-fixture",
+          verificationAvailable: true,
+          productionEligible: false,
+        },
+        capabilityManifestJson: CAPABILITY_MANIFEST_JSON,
+      });
+      const fixture = JSON.parse(readFileSync(fixturePath, "utf8")) as Record<string, unknown>;
+      expect(fixture.vars).not.toHaveProperty("TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -3699,6 +3786,15 @@ describe("released-Core Form authority bootstrap", () => {
             name: "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
             text: takoformCoreVerifierArtifactDigest(),
           },
+          ...(inspectedTarget.formAuthority?.managedSpaceAdmissionPolicy === undefined
+            ? []
+            : [
+                {
+                  type: "plain_text" as const,
+                  name: "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY",
+                  text: canonicalJson(inspectedTarget.formAuthority.managedSpaceAdmissionPolicy),
+                },
+              ]),
         ],
       },
     };
@@ -3925,6 +4021,18 @@ describe("released-Core Form authority bootstrap", () => {
     environment: "integration",
     commit: COMMIT,
   } as const;
+
+  test("released-Core owner readback includes the exact managed policy closure", async () => {
+    const live = releasedCoreFetcher({ coreVerifier: "ready" });
+    const status = await runFormAuthorityImpl({ ...invocation, action: "status" }, managedTarget, {
+      state: releasedCoreState({ present: true }, managedTarget),
+      fetcher: live.fetcher,
+    });
+    expect(status).toMatchObject({
+      workerName: managedTarget.formAuthority.workerName,
+      ready: true,
+    });
+  });
 
   async function applyCoreServiceStorageTransition(input: {
     readonly run: FormAuthorityProcess;

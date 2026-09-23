@@ -237,6 +237,17 @@ interface FormAuthorityInspection {
   readonly drift: readonly BindingDifference[];
 }
 
+/**
+ * Minimal immutable identity readback consumed by dependent authority
+ * surfaces. The dependency must be the exact released-Core Form Version; a
+ * same-name service binding by itself is not an admission proof.
+ */
+export interface ReleasedCoreFormAuthorityDependencyInspection {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string;
+  readonly artifactDigest: `sha256:${string}`;
+}
+
 interface PublicWorkerInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
@@ -1158,6 +1169,10 @@ export function writeFormAuthorityConfig(input: {
     input.selected.verificationMode === "released-core"
       ? takoformCoreVerifierArtifactDigest()
       : null;
+  const managedSpaceAdmissionPolicy =
+    input.selected.kind === "authority" && input.selected.verificationMode === "released-core"
+      ? input.target.formAuthority?.managedSpaceAdmissionPolicy
+      : undefined;
   const configuration =
     input.selected.kind === "operator-gateway"
       ? operatorGatewayConfiguration(input, shared)
@@ -1171,6 +1186,13 @@ export function writeFormAuthorityConfig(input: {
               ? {}
               : {
                   TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+                }),
+            ...(managedSpaceAdmissionPolicy === undefined
+              ? {}
+              : {
+                  TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: canonicalJson(
+                    managedSpaceAdmissionPolicy,
+                  ),
                 }),
             ...(input.invocation.surface === "takoserver-integration-form-authority-worker"
               ? {
@@ -1374,6 +1396,53 @@ async function inspectFormAuthority(
     throw phaseError(phase, "Form authority Worker has a workers.dev or preview subdomain enabled");
   }
   return { history, ...identity, ...binding };
+}
+
+/**
+ * Reuse the Form-authority owner's complete readback for narrow dependents.
+ * This deliberately proves the public composition, exact released-Core
+ * closure (including any operator policy), and immutable Version identity
+ * before a dependent surface may bind the named narrow entrypoint.
+ */
+export async function inspectReleasedCoreFormAuthorityDependency(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: FormAuthorityDeployState,
+): Promise<ReleasedCoreFormAuthorityDependencyInspection | null> {
+  const invocation: FormAuthorityDeployInvocation = {
+    surface: "takoserver-form-authority-worker",
+    action: "status",
+    environment: target.environment,
+    commit: "0".repeat(40),
+  };
+  const selected = selectTarget(invocation, target);
+  const publicWorker = await inspectPublicWorker(phase, target, state);
+  const inspection = await inspectFormAuthority(
+    phase,
+    invocation,
+    target,
+    selected,
+    publicWorker,
+    canonicalJson(publicFormCapabilityManifest()),
+    state,
+  );
+  if (inspection === null) return null;
+  if (
+    inspection.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
+    inspection.scopeBindingProfile !== "exact-target" ||
+    inspection.bindingTransitionProfile !== "none" ||
+    inspection.drift.length !== 0
+  ) {
+    throw phaseError(
+      phase,
+      "released-Core Form authority dependency is not at its exact target closure",
+    );
+  }
+  return {
+    history: inspection.history,
+    commit: inspection.commit,
+    artifactDigest: inspection.authorityArtifactDigest,
+  };
 }
 
 async function classifyPublicWorkerBinding(
@@ -1838,6 +1907,18 @@ function expectedBindings(
           TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: {
             type: "plain_text",
             fields: { text: takoformCoreVerifierArtifactDigest() },
+          },
+        }
+      : {}),
+    ...(selected.kind === "authority" &&
+    selected.verificationMode === "released-core" &&
+    target.formAuthority?.managedSpaceAdmissionPolicy !== undefined
+      ? {
+          TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: {
+            type: "plain_text",
+            fields: {
+              text: canonicalJson(target.formAuthority.managedSpaceAdmissionPolicy),
+            },
           },
         }
       : {}),

@@ -44,6 +44,29 @@ function descriptor(overrides: Record<string, unknown> = {}) {
   };
 }
 
+const managedSpaceAdmissionPolicy = {
+  kind: "takoserver.space-form-admission-policy@v1",
+  organizationId: "org_hosted",
+  forms: [
+    {
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "Alpha",
+        definitionVersion: "1.0.0",
+        schemaDigest: `sha256:${"a".repeat(64)}`,
+      },
+      packageDigest: `sha256:${"b".repeat(64)}`,
+    },
+  ],
+} as const;
+
+const releasedCoreFormAuthority = {
+  workerName: "takoserver-form-authority-rehearsal",
+  identityProbeWorkerName: "takoserver-form-identity-rehearsal",
+  identityProbeOrigin: "https://takoserver-form-identity-rehearsal.example.workers.dev",
+  hostId: "https://takoserver-api-rehearsal.example.workers.dev",
+} as const;
+
 function withTarget(value: unknown, run: (path: string) => void): void {
   const root = mkdtempSync(join(tmpdir(), "takoserver-target-v2-"));
   try {
@@ -378,6 +401,71 @@ describe("environment-exact deploy target", () => {
       }),
       (path) => expect(() => loadTarget(path, "rehearsal")).toThrow("unexpected keys"),
     );
+  });
+
+  test("parses an operator-owned managed Space policy and binds its organization", () => {
+    const parsed = parseDeployTarget(
+      descriptor({
+        formAuthority: {
+          ...releasedCoreFormAuthority,
+          managedSpaceAdmissionPolicy,
+        },
+      }),
+      "managed Space target",
+      "rehearsal",
+    );
+    expect(parsed.formAuthority?.managedSpaceAdmissionPolicy).toEqual(managedSpaceAdmissionPolicy);
+
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          formAuthority: {
+            ...releasedCoreFormAuthority,
+            managedSpaceAdmissionPolicy: {
+              ...managedSpaceAdmissionPolicy,
+              organizationId: "org_other",
+            },
+          },
+        }),
+        "mismatched managed Space target",
+        "rehearsal",
+      ),
+    ).toThrow("organization");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          formAuthority: {
+            ...releasedCoreFormAuthority,
+            managedSpaceAdmissionPolicy: { ...managedSpaceAdmissionPolicy, extra: true },
+          },
+        }),
+        "extra managed Space policy member",
+        "rehearsal",
+      ),
+    ).toThrow("managedSpaceAdmissionPolicy");
+  });
+
+  test("allows managed policy on the integration released-Core target", () => {
+    const parsed = parseDeployTarget(
+      descriptor({
+        environment: "integration",
+        publicOrigin: "https://takoserver-api-integration.example.workers.dev",
+        sponsorshipAuthority: {
+          ...descriptor().sponsorshipAuthority,
+          organizationId: "org_hosted",
+        },
+        formAuthority: {
+          workerName: "takoserver-form-authority-integration",
+          identityProbeWorkerName: "takoserver-form-identity-integration",
+          identityProbeOrigin: "https://takoserver-form-identity-integration.example.workers.dev",
+          hostId: "https://takoserver-api-integration.example.workers.dev",
+          managedSpaceAdmissionPolicy,
+        },
+      }),
+      "integration managed Space target",
+      "integration",
+    );
+    expect(parsed.formAuthority?.managedSpaceAdmissionPolicy).toEqual(managedSpaceAdmissionPolicy);
   });
 
   test("accepts only a closed integration-only pre-executor public Worker snapshot", () => {

@@ -200,6 +200,7 @@ const MAX_ORG_API_KEY_FLAGS = 12;
  */
 const TRANSITION_SURFACES: readonly Surface[] = [
   "takoserver-worker-authority-cutover",
+  "takoserver-sponsorship-authority-worker",
   "takoserver-form-authority-worker",
   "takoserver-integration-form-authority-worker",
   "takoserver-integration-form-authority-operator-worker",
@@ -967,6 +968,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           action: invocation.action,
           environment: invocation.environment,
           commit: invocation.commit,
+          ...(surfaceTransition === undefined ? {} : { transition: surfaceTransition }),
         },
         target,
       );

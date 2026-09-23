@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../../src/artifact-recovery.ts";
@@ -10,8 +11,13 @@ import {
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
+import { canonicalJson } from "../../src/json.ts";
 import { isCloudflareWorkersAiModelReference } from "../../src/providers/cloudflare-workers-ai.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
+import {
+  parseSpaceAdmissionPolicy,
+  type SpaceAdmissionPolicyV1,
+} from "../../src/takoform/space-admission-policy.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import type { DeployEnvironment } from "./qualification.ts";
@@ -127,6 +133,8 @@ export interface DeployTarget {
     readonly historicalPreExecutorPublicWorker?: {
       readonly workerEndpointSuffix: string;
     };
+    /** Operator-owned exact positive managed-Space Form identities. */
+    readonly managedSpaceAdmissionPolicy?: SpaceAdmissionPolicyV1;
     readonly hostId: string;
   };
   /** One incident-only route-less integration recovery Worker and owner retention authority. */
@@ -527,6 +535,16 @@ export function parseDeployTarget(
     throw preflightError("deploy target `integrationE2eCredentialAuthority` is integration-only");
   }
   if (target.formAuthority) {
+    if (
+      target.formAuthority.managedSpaceAdmissionPolicy !== undefined &&
+      target.sponsorshipAuthority !== undefined &&
+      target.formAuthority.managedSpaceAdmissionPolicy.organizationId !==
+        target.sponsorshipAuthority.organizationId
+    ) {
+      throw preflightError(
+        "deploy target managed Space admission policy organization must match sponsorship authority organization",
+      );
+    }
     if (target.formAuthority.hostId !== target.publicOrigin) {
       throw preflightError(
         "deploy target `formAuthority.hostId` must equal the public Takoserver Host origin",
@@ -758,6 +776,7 @@ function formAuthority(
       "integrationOperatorScope",
       "operatorPublicJwk",
       "historicalPreExecutorPublicWorker",
+      "managedSpaceAdmissionPolicy",
     ],
   );
   const integrationWorkerName =
@@ -804,6 +823,10 @@ function formAuthority(
     value.historicalPreExecutorPublicWorker === undefined
       ? undefined
       : parseHistoricalPreExecutorPublicWorker(value.historicalPreExecutorPublicWorker);
+  const managedSpaceAdmissionPolicy =
+    value.managedSpaceAdmissionPolicy === undefined
+      ? undefined
+      : parseManagedSpaceAdmissionPolicy(value.managedSpaceAdmissionPolicy);
   if (historicalPreExecutorPublicWorker !== undefined && environment !== "integration") {
     throw preflightError(
       "deploy target `formAuthority.historicalPreExecutorPublicWorker` is integration-only",
@@ -853,8 +876,34 @@ function formAuthority(
     ...(historicalPreExecutorPublicWorker === undefined
       ? {}
       : { historicalPreExecutorPublicWorker }),
+    ...(managedSpaceAdmissionPolicy === undefined ? {} : { managedSpaceAdmissionPolicy }),
     hostId: value.hostId,
   };
+}
+
+function parseManagedSpaceAdmissionPolicy(value: unknown): SpaceAdmissionPolicyV1 {
+  if (!isRecord(value)) {
+    throw preflightError(
+      "deploy target `formAuthority.managedSpaceAdmissionPolicy` must be an object",
+    );
+  }
+  try {
+    return parseSpaceAdmissionPolicy(value);
+  } catch (error) {
+    throw preflightError(
+      "deploy target `formAuthority.managedSpaceAdmissionPolicy` is invalid",
+      error instanceof Error ? error.message : undefined,
+    );
+  }
+}
+
+/** Digest of the exact canonical operator policy emitted into Worker config. */
+export function managedSpaceAdmissionPolicyDigest(
+  policy: SpaceAdmissionPolicyV1,
+): `sha256:${string}` {
+  return `sha256:${createHash("sha256")
+    .update(canonicalJson(parseSpaceAdmissionPolicy(policy)))
+    .digest("hex")}`;
 }
 
 function parseHistoricalPreExecutorPublicWorker(

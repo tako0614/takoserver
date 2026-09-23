@@ -22,6 +22,10 @@ export interface SponsorshipAuthorityWorkerBindings {
   readonly TAKOSERVER_SPONSORSHIP_AUTHORITY_WORKER_NAME: string;
   readonly TAKOSERVER_SPONSORSHIP_AUTHORITY_SOURCE_COMMIT: string;
   readonly TAKOSERVER_SPONSORSHIP_AUTHORITY_ARTIFACT_SHA256: `sha256:${string}`;
+  readonly TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST?: string;
+  readonly TENANT_SPACE_ADMISSION?: {
+    ensureTenantSpaceAdmission(input: { readonly tenantRef: string }): Promise<unknown>;
+  };
   readonly WORKER_VERSION: WorkerVersionMetadata;
 }
 
@@ -59,12 +63,11 @@ export default class SponsorshipAuthorityEntrypoint extends WorkerEntrypoint<Spo
     ) {
       throw new TypeError("sponsorship credential and receipt authorities must differ");
     }
-    // One invocation uses one instant for the D1 wallet decision, JWT iat/exp,
-    // and returned-expiry validation. Crossing a wall-clock second while D1 is
-    // running must not turn an otherwise exact 300-second grant into a local
-    // validation failure after it has already been signed.
-    const issuedAt = new Date();
-    const clock = () => new Date(issuedAt.getTime());
+    // Admission can take time. The authority samples the issuance instant only
+    // after admission; the signer and expiry validation use the retained
+    // operation's explicit instant, including when an RPC result is replayed.
+    const clock = () => new Date();
+    const admission = managedSpaceAdmission(this.env);
     const credentialIssuer = createSponsorshipCredentialIssuer({
       issuer: exactHttpsOrigin(this.env.TAKOSERVER_SPONSORSHIP_TOKEN_ISSUER),
       signingKey,
@@ -93,8 +96,28 @@ export default class SponsorshipAuthorityEntrypoint extends WorkerEntrypoint<Spo
         receiptKeyId: this.env.TAKOSERVER_SPONSORSHIP_RECEIPT_KEY_ID,
       },
       clock,
+      ...(admission ? { managedSpaceAdmission: admission } : {}),
     }).issueTenantRunCredential(input);
   }
+}
+
+function managedSpaceAdmission(env: SponsorshipAuthorityWorkerBindings) {
+  const policyDigest = env.TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST;
+  const authority = env.TENANT_SPACE_ADMISSION;
+  if (policyDigest === undefined && authority === undefined) return undefined;
+  if (
+    typeof policyDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(policyDigest) ||
+    !authority ||
+    typeof authority.ensureTenantSpaceAdmission !== "function"
+  ) {
+    throw new TypeError("managed Space admission binding is incomplete");
+  }
+  return {
+    policyDigest: policyDigest as `sha256:${string}`,
+    ensureTenantSpaceAdmission: (input: { readonly tenantRef: string }) =>
+      authority.ensureTenantSpaceAdmission(input),
+  };
 }
 
 function credentialPublicJwk(raw: string): {

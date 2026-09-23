@@ -1560,6 +1560,21 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 
+  test("offers the closure transition selector to sponsorship authority", async () => {
+    const result = await deploy([
+      "takoserver-sponsorship-authority-worker",
+      "--status",
+      "--environment=integration",
+      `--commit=${"a".repeat(40)}`,
+      "--closure-predecessor-version=00000000-0000-4000-8000-0000000000a1",
+      "--add-var=TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST",
+      "--add-binding=TENANT_SPACE_ADMISSION",
+    ]);
+    expect(result.exitCode).toBe(2);
+    expect(result.stderr).toContain("deploy target descriptor not found");
+    expect(result.stderr).not.toContain("no target was touched");
+  });
+
   test("parses the paired generated-storage predecessor selector only on its three integration Workers", async () => {
     const sha = "a".repeat(40);
     const predecessor = "00000000-0000-4000-8000-0000000000a1";

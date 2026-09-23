@@ -2,20 +2,44 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import type { SigningDatabase } from "../scripts/deploy/signing.ts";
 import {
   assertDedicatedSponsorshipKeys,
+  inspectSponsorshipAuthority,
   registerSponsorshipCredentialPublicKey,
   runSponsorshipAuthority,
   type SponsorshipAuthorityDeployState,
   sponsorshipAuthorityBindingClosure,
   writeSponsorshipAuthorityConfig,
 } from "../scripts/deploy/sponsorship-authority.ts";
-import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { type DeployTarget, managedSpaceAdmissionPolicyDigest } from "../scripts/deploy/target.ts";
+import { canonicalJson } from "../src/json.ts";
+import { publicFormCapabilityManifest } from "../src/public-worker-implementation.ts";
 
 const COMMIT = "a".repeat(40);
 const DIGEST = `sha256:${"b".repeat(64)}` as const;
 const VERSION = "11111111-1111-4111-8111-111111111111";
+const FORM_VERSION = "22222222-2222-4222-8222-222222222222";
+const PUBLIC_VERSION = "33333333-3333-4333-8333-333333333333";
+const PUBLIC_DIGEST = `sha256:${"c".repeat(64)}` as const;
+const FORM_DIGEST = `sha256:${"d".repeat(64)}` as const;
+
+const managedSpaceAdmissionPolicy = {
+  kind: "takoserver.space-form-admission-policy@v1",
+  organizationId: "org_hosted",
+  forms: [
+    {
+      formRef: {
+        apiVersion: "edge.forms.takoform.com",
+        kind: "Alpha",
+        definitionVersion: "1.0.0",
+        schemaDigest: `sha256:${"a".repeat(64)}`,
+      },
+      packageDigest: `sha256:${"b".repeat(64)}`,
+    },
+  ],
+} as const;
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -33,7 +57,7 @@ const target = {
     workerName: "takoserver-sponsorship-authority-integration",
     organizationId: "org_hosted",
     credentialKeyId: "sponsorship-credential-key",
-    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: `${"B".repeat(42)}A` },
     receiptKeyId: "receipt-key",
     receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
   },
@@ -42,6 +66,18 @@ const target = {
 const targetWithNextSigningKey = {
   ...target,
   signing: { currentKeyId: target.signing.currentKeyId, nextKeyId: "key-next" },
+} satisfies DeployTarget;
+
+const managedTarget = {
+  ...target,
+  formAuthority: {
+    workerName: "takoserver-form-authority-integration",
+    identityProbeWorkerName: "takoserver-form-identity-probe-integration",
+    identityProbeOrigin: "https://takoserver-form-identity-probe-integration.example.test",
+    integrationWorkerName: "takoserver-form-authority-fixture-integration",
+    hostId: "https://form-authority.integration.example.test",
+    managedSpaceAdmissionPolicy,
+  },
 } satisfies DeployTarget;
 
 describe("route-less sponsorship authority deploy", () => {
@@ -63,7 +99,7 @@ describe("route-less sponsorship authority deploy", () => {
         keyId: target.sponsorshipAuthority.credentialKeyId,
         publicJwk: JSON.stringify({
           ...target.sponsorshipAuthority.credentialPublicJwk,
-          x: "D".repeat(42) + "A",
+          x: `${"D".repeat(42)}A`,
         }),
         createdAtEpochSeconds: 1,
         revokedAtEpochSeconds: null,
@@ -121,6 +157,137 @@ describe("route-less sponsorship authority deploy", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("emits the exact managed policy digest and narrow Form service binding", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-managed-policy-"));
+    try {
+      const path = writeSponsorshipAuthorityConfig({
+        path: join(root, "wrangler.jsonc"),
+        main: "worker.js",
+        target: managedTarget,
+        commit: COMMIT,
+        artifactDigest: DIGEST,
+      });
+      const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      expect(config).toMatchObject({
+        vars: {
+          TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST: managedSpaceAdmissionPolicyDigest(
+            managedSpaceAdmissionPolicy,
+          ),
+        },
+        services: [
+          {
+            binding: "TENANT_SPACE_ADMISSION",
+            service: managedTarget.formAuthority.workerName,
+            entrypoint: "TenantSpaceAdmissionEntrypoint",
+          },
+        ],
+      });
+      expect(config).not.toHaveProperty("services.0.entrypoint", "FormAuthorityEntrypoint");
+
+      const closure = sponsorshipAuthorityBindingClosure(managedTarget, {
+        commit: COMMIT,
+        artifactDigest: DIGEST,
+      });
+      expect(closure).toMatchObject({
+        TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST: {
+          type: "plain_text",
+          fields: {
+            text: managedSpaceAdmissionPolicyDigest(managedSpaceAdmissionPolicy),
+          },
+        },
+        TENANT_SPACE_ADMISSION: {
+          type: "service",
+          fields: {
+            service: managedTarget.formAuthority.workerName,
+            entrypoint: "TenantSpaceAdmissionEntrypoint",
+          },
+        },
+      });
+      expect(closure).not.toHaveProperty("FORM_AUTHORITY");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts only the explicit managed closure transition for an existing sponsor", async () => {
+    const transition = {
+      predecessorVersionId: VERSION,
+      delta: {
+        retiredVars: [],
+        addedVars: ["TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST"],
+        refreshedVars: [],
+        addedBindings: ["TENANT_SPACE_ADMISSION"],
+        addedSecrets: [],
+        rotatedSecrets: [],
+      },
+    } as const;
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({
+          sponsorshipBindings: versionBindings(),
+        }),
+        transition,
+      ),
+    ).resolves.toMatchObject({
+      history: { versionId: VERSION },
+      bindingTransitionProfile: "declared-delta-predecessor",
+    });
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({
+          sponsorshipBindings: versionBindings(),
+        }),
+        {
+          ...transition,
+          delta: { ...transition.delta, addedVars: ["FOREIGN_BINDING"] },
+        },
+      ),
+    ).rejects.toThrow("must add exactly its policy digest");
+  });
+
+  test("refuses a managed dependency with policy or named-entrypoint drift", async () => {
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({
+          formPolicy: { ...managedSpaceAdmissionPolicy, forms: [] },
+        }),
+      ),
+    ).rejects.toThrow("exact target closure");
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({ namedHandlers: ["FormAuthorityEntrypoint"] }),
+      ),
+    ).rejects.toThrow("named narrow admission entrypoint");
+  });
+
+  test("checks the managed dependency even before the sponsorship Worker exists", async () => {
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({ sponsorshipPresent: false }),
+      ),
+    ).resolves.toBeNull();
+    await expect(
+      inspectSponsorshipAuthority(
+        "preflight",
+        managedTarget,
+        managedAuthorityState({
+          sponsorshipPresent: false,
+          namedHandlers: ["FormAuthorityEntrypoint"],
+        }),
+      ),
+    ).rejects.toThrow("named narrow admission entrypoint");
   });
 
   test("registers and reads back the exact target-pinned credential public key", async () => {
@@ -427,6 +594,200 @@ describe("route-less sponsorship authority deploy", () => {
   });
 });
 
+function managedAuthorityState(
+  input: {
+    readonly sponsorshipPresent?: boolean;
+    readonly sponsorshipBindings?: readonly Record<string, unknown>[];
+    readonly formPolicy?: unknown;
+    readonly namedHandlers?: readonly string[];
+  } = {},
+): SponsorshipAuthorityDeployState {
+  const formAuthority = managedTarget.formAuthority;
+  if (formAuthority === undefined) throw new Error("managed test target has no Form authority");
+  const sponsorshipPresent = input.sponsorshipPresent ?? true;
+  const formVersion = managedFormVersion(
+    input.formPolicy ?? managedSpaceAdmissionPolicy,
+    input.namedHandlers ?? ["ensureTenantSpaceAdmission"],
+  );
+  return {
+    async workerScripts() {
+      return [
+        managedTarget.workerName,
+        formAuthority.identityProbeWorkerName,
+        formAuthority.workerName,
+        ...(sponsorshipPresent ? [managedTarget.sponsorshipAuthority.workerName] : []),
+      ];
+    },
+    async workerDeployments(workerName) {
+      if (workerName === managedTarget.workerName) {
+        return [
+          {
+            id: "public-deployment",
+            created_on: "2026-09-04T00:00:00Z",
+            versions: [{ version_id: PUBLIC_VERSION, percentage: 100 }],
+          },
+        ];
+      }
+      if (workerName === formAuthority.workerName) {
+        return [
+          {
+            id: "form-deployment",
+            created_on: "2026-09-04T01:00:00Z",
+            versions: [{ version_id: FORM_VERSION, percentage: 100 }],
+          },
+        ];
+      }
+      if (!sponsorshipPresent) return [];
+      return [
+        {
+          id: "sponsorship-deployment",
+          created_on: "2026-09-04T02:00:00Z",
+          versions: [{ version_id: VERSION, percentage: 100 }],
+        },
+      ];
+    },
+    async workerVersion(workerName) {
+      if (workerName === managedTarget.workerName) return managedPublicVersion();
+      if (workerName === formAuthority.workerName) return formVersion;
+      return {
+        annotations: {
+          "workers/message": `sponsorship-authority:${COMMIT}:${DIGEST}`,
+          "workers/triggered_by": "version_upload",
+        },
+        resources: {
+          script: { etag: "authority-script-etag" },
+          bindings: input.sponsorshipBindings ?? versionBindings(managedTarget),
+        },
+      };
+    },
+    async workerSecrets(workerName) {
+      if (workerName === managedTarget.sponsorshipAuthority.workerName) {
+        return [
+          { name: "TAKOSERVER_SPONSORSHIP_CREDENTIAL_SIGNING_KEY", type: "secret_text" },
+          { name: "TAKOSERVER_SPONSORSHIP_RECEIPT_SIGNING_KEY", type: "secret_text" },
+        ];
+      }
+      if (workerName === managedTarget.workerName) {
+        return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
+      }
+      return [];
+    },
+    async workerDomains() {
+      return [
+        {
+          hostname: new URL(managedTarget.publicOrigin).hostname,
+          service: managedTarget.workerName,
+        },
+      ];
+    },
+    async workerRoutes() {
+      return [];
+    },
+    async workerSubdomain() {
+      return { enabled: false, previewsEnabled: false };
+    },
+    async workerTopologyAudit() {
+      return {
+        deploymentTokenIdSha256: DIGEST,
+        deploymentTokenPolicySha256: PUBLIC_DIGEST,
+        allZoneResourceSha256: FORM_DIGEST,
+      };
+    },
+  };
+}
+
+function managedPublicVersion(): Record<string, unknown> {
+  return {
+    annotations: {
+      "workers/message": `takoserver-worker:${COMMIT}:${PUBLIC_DIGEST.slice("sha256:".length)}`,
+      "workers/triggered_by": "version_upload",
+    },
+    resources: {
+      bindings: [
+        { type: "ai", name: "AI" },
+        { type: "version_metadata", name: "WORKER_VERSION" },
+        { type: "d1", name: "STATE_DB", id: managedTarget.d1.databaseId },
+        {
+          type: "r2_bucket",
+          name: "OBJECTS",
+          bucket_name: managedTarget.r2.bucketName,
+        },
+        { type: "plain_text", name: "PUBLIC_ORIGIN", text: managedTarget.publicOrigin },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_SIGNING_KEY_ID",
+          text: managedTarget.signing.currentKeyId,
+        },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_WORKER_ARTIFACT_DIGEST",
+          text: PUBLIC_DIGEST,
+        },
+        { type: "secret_text", name: "TAKOSERVER_SIGNING_KEY" },
+      ],
+    },
+  };
+}
+
+function managedFormVersion(
+  policy: unknown,
+  namedHandlers: readonly string[],
+): Record<string, unknown> {
+  const formAuthority = managedTarget.formAuthority;
+  if (formAuthority === undefined) throw new Error("managed test target has no Form authority");
+  return {
+    annotations: {
+      "workers/message": `form-authority:takoserver-form-authority-worker:${COMMIT}:${FORM_DIGEST}`,
+    },
+    resources: {
+      script: {
+        named_handlers: [{ name: "TenantSpaceAdmissionEntrypoint", handlers: namedHandlers }],
+      },
+      bindings: [
+        { type: "d1", name: "STATE_DB", id: managedTarget.d1.databaseId },
+        {
+          type: "r2_bucket",
+          name: "OBJECTS",
+          bucket_name: managedTarget.r2.bucketName,
+        },
+        {
+          type: "service",
+          name: "PUBLIC_HOST_IDENTITY",
+          service: managedTarget.workerName,
+          entrypoint: "PublicHostIdentityEntrypoint",
+        },
+        { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: managedTarget.environment },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
+          text: formAuthority.hostId,
+        },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST",
+          text: canonicalJson(publicFormCapabilityManifest()),
+        },
+        { type: "version_metadata", name: "WORKER_VERSION" },
+        {
+          type: "durable_object_namespace",
+          name: "CORE_VERIFIER",
+          class_name: "TakoformCoreVerifierContainer",
+        },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
+          text: takoformCoreVerifierArtifactDigest(),
+        },
+        {
+          type: "plain_text",
+          name: "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY",
+          text: canonicalJson(policy),
+        },
+      ],
+    },
+  };
+}
+
 function authorityState(
   input: {
     readonly domains?: readonly { readonly hostname: string; readonly service: string }[];
@@ -494,9 +855,11 @@ function authorityState(
   };
 }
 
-function versionBindings(): readonly Record<string, unknown>[] {
+function versionBindings(
+  inspectedTarget: DeployTarget = target,
+): readonly Record<string, unknown>[] {
   return Object.entries(
-    sponsorshipAuthorityBindingClosure(target, { commit: COMMIT, artifactDigest: DIGEST }),
+    sponsorshipAuthorityBindingClosure(inspectedTarget, { commit: COMMIT, artifactDigest: DIGEST }),
   ).flatMap(([name, requirement]) =>
     requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
   );
