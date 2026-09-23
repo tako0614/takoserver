@@ -236,6 +236,7 @@ export class CloudflareProvider implements Provider {
     Provider["workerEndpointOriginReservations"]
   >;
   readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
+  readonly concludeApplyNoEffect?: NonNullable<Provider["concludeApplyNoEffect"]>;
   readonly #accountId: string;
   readonly #origin: string;
   readonly #artifacts: ArtifactBytes;
@@ -292,6 +293,18 @@ export class CloudflareProvider implements Provider {
             zoneFor: (hostname, tenantRef) => this.#zoneFor(hostname, tenantRef),
           })
         : undefined;
+    const noEffectBackend = this.#workerBackend;
+    const concludeApplyNoEffect = noEffectBackend?.concludeApplyNoEffect;
+    if (noEffectBackend && concludeApplyNoEffect) {
+      this.concludeApplyNoEffect = async (input) => {
+        if (!noEffectBackend.owns(input.offering)) {
+          // No managed conclusion call was entered. Preserve the provider's
+          // existing convergence behavior for ordinary Cloudflare offerings.
+          return { phase: "unsupported" };
+        }
+        return await concludeApplyNoEffect.call(noEffectBackend, input);
+      };
+    }
     this.workerEndpointOriginReservations = {
       derive: async (input) => {
         if (this.#workerBackend) return await this.#workerBackend.deriveOrigin(input);
@@ -2979,6 +2992,7 @@ const REQUIRED_WORKER_BACKEND_METHODS = [
 ] as const;
 
 const OPTIONAL_WORKER_BACKEND_METHODS = [
+  "concludeApplyNoEffect",
   "adopt",
   "recoverAdopt",
   "readSqliteMigrationLedger",

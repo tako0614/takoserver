@@ -3,6 +3,8 @@ import type { MeterSource } from "../provider-meter-port.ts";
 import type {
   ApplyInput,
   Provider,
+  ProviderApplyNoEffectConclusionInput,
+  ProviderApplyNoEffectConclusionResult,
   ProviderArtifactConsumption,
   ProviderExecutionAuthority,
   ProviderFailure,
@@ -37,6 +39,7 @@ import {
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
   type CloudflareProviderExecutorRpc,
 } from "./cloudflare-provider-executor-port.ts";
@@ -130,6 +133,19 @@ export class CloudflareProviderProxy implements Provider {
       hasPrevious: input.previous !== undefined,
     };
     return restoreApplyConvergenceResult(await this.#binding.convergeApply(input), context);
+  }
+
+  async concludeApplyNoEffect(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<ProviderApplyNoEffectConclusionResult> {
+    const context = snapshotApplyNoEffectContext(input, this.#providerInstallationId);
+    if (!context.selectionMatchesInstallation) {
+      return failed("unavailable", "Provider executor placement no longer matches", true);
+    }
+    return restoreApplyNoEffectConclusionResult(
+      await this.#binding.concludeApplyNoEffect(input),
+      context,
+    );
   }
 
   async poll(input: Parameters<NonNullable<Provider["poll"]>>[0]): Promise<ProviderTicket> {
@@ -344,7 +360,12 @@ function restoreInitialMutationResult(
   }
   const hasInvocationEvidence = Object.hasOwn(value, "executorNoMutation");
   const hasAdoptionAbort = Object.hasOwn(value, "executorAdoptionAbort");
-  if (Object.hasOwn(value, "executorApplyAbort")) return invalidInitialMutationEvidence();
+  if (
+    Object.hasOwn(value, "executorApplyNoEffect") ||
+    Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyAbort")
+  )
+    return invalidInitialMutationEvidence();
   if (!hasInvocationEvidence && !hasAdoptionAbort) return value as ProviderTicket;
   if (!hasInvocationEvidence) return invalidInitialMutationEvidence();
 
@@ -428,7 +449,12 @@ function restoreAdoptionRecoveryResult(
   context: AdoptionRecoveryContext,
 ): ProviderTicket {
   if (typeof value !== "object" || value === null) return value as ProviderTicket;
-  if (Object.hasOwn(value, "executorApplyAbort")) return invalidAdoptionAbortEvidence();
+  if (
+    Object.hasOwn(value, "executorApplyNoEffect") ||
+    Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyAbort")
+  )
+    return invalidAdoptionAbortEvidence();
   const hasAdoptionAbort = Object.hasOwn(value, "executorAdoptionAbort");
   const hasInvocationEvidence = Object.hasOwn(value, "executorNoMutation");
   if (!hasAdoptionAbort && !hasInvocationEvidence) return value as ProviderTicket;
@@ -532,11 +558,138 @@ function restoreApplyConvergenceResult(
   return failedWithoutProviderOperationMutation(context.operationId, failure.code, failure.message);
 }
 
+interface ApplyNoEffectContext {
+  readonly operationId: string;
+  readonly providerInstallationId: string;
+  readonly selectionMatchesInstallation: boolean;
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly executionAuthority: ProviderExecutionAuthority | undefined;
+}
+
+function snapshotApplyNoEffectContext(
+  input: ProviderApplyNoEffectConclusionInput,
+  providerInstallationId: string,
+): ApplyNoEffectContext {
+  return {
+    operationId: input.operationId,
+    providerInstallationId,
+    selectionMatchesInstallation: input.providerInstallationRef === providerInstallationId,
+    tenantId: input.identity.tenantRef,
+    resourceUid: input.identity.uid,
+    executionAuthority: snapshotExecutionAuthority(input.executionAuthority),
+  };
+}
+
+function restoreApplyNoEffectConclusionResult(
+  value: unknown,
+  context: ApplyNoEffectContext,
+): ProviderApplyNoEffectConclusionResult {
+  if (typeof value !== "object" || value === null) return value as ProviderTicket;
+  if (Object.hasOwn(value, "executorApplyNoEffectUnsupported")) {
+    const unsupported = maybeExactRecord(value, ["phase", "executorApplyNoEffectUnsupported"]);
+    const evidence = unsupported
+      ? maybeExactRecord(unsupported.executorApplyNoEffectUnsupported, [
+          "schema",
+          "action",
+          "operationId",
+          "providerInstallationRef",
+          "executionAuthority",
+        ])
+      : null;
+    const authority = evidence
+      ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+      : null;
+    if (
+      unsupported?.phase === "unsupported" &&
+      evidence?.schema === CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA &&
+      evidence.action === "unsupported" &&
+      evidence.operationId === context.operationId &&
+      evidence.providerInstallationRef === context.providerInstallationId &&
+      context.selectionMatchesInstallation &&
+      context.executionAuthority &&
+      context.executionAuthority.tenantId === context.tenantId &&
+      context.executionAuthority.resourceUid === context.resourceUid &&
+      authority?.tenantId === context.executionAuthority.tenantId &&
+      authority.resourceUid === context.executionAuthority.resourceUid &&
+      authority.leaseToken === context.executionAuthority.leaseToken &&
+      authority.fingerprint === context.executionAuthority.fingerprint
+    ) {
+      return { phase: "unsupported" };
+    }
+    return failed(
+      "unavailable",
+      "Provider executor returned invalid apply no-effect evidence",
+      true,
+    );
+  }
+  if (!Object.hasOwn(value, "executorApplyNoEffect")) {
+    if (
+      Object.hasOwn(value, "phase") &&
+      (value as { readonly phase?: unknown }).phase === "unsupported"
+    ) {
+      return failed(
+        "unavailable",
+        "Provider executor returned invalid apply no-effect evidence",
+        true,
+      );
+    }
+    return rejectUnexpectedExecutorEvidence(value);
+  }
+  const ticket = maybeExactRecord(value, ["phase", "failure", "executorApplyNoEffect"]);
+  const failure = ticket
+    ? maybeExactRecord(ticket.failure, ["code", "message", "retryable"])
+    : null;
+  const evidence = ticket
+    ? maybeExactRecord(ticket.executorApplyNoEffect, [
+        "schema",
+        "action",
+        "operationId",
+        "providerInstallationRef",
+        "executionAuthority",
+      ])
+    : null;
+  const authority = evidence
+    ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+    : null;
+  if (
+    ticket?.phase !== "failed" ||
+    !failure ||
+    !isProviderFailureCode(failure.code) ||
+    !boundedString(failure.message, 1, 1_024) ||
+    failure.retryable !== false ||
+    !evidence ||
+    evidence.schema !== CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA ||
+    evidence.action !== "concludeApplyNoEffect" ||
+    evidence.operationId !== context.operationId ||
+    evidence.providerInstallationRef !== context.providerInstallationId ||
+    !context.selectionMatchesInstallation ||
+    !context.executionAuthority ||
+    typeof context.tenantId !== "string" ||
+    typeof context.resourceUid !== "string" ||
+    context.executionAuthority.tenantId !== context.tenantId ||
+    context.executionAuthority.resourceUid !== context.resourceUid ||
+    !authority ||
+    authority.tenantId !== context.executionAuthority.tenantId ||
+    authority.resourceUid !== context.executionAuthority.resourceUid ||
+    authority.leaseToken !== context.executionAuthority.leaseToken ||
+    authority.fingerprint !== context.executionAuthority.fingerprint
+  )
+    return failed(
+      "unavailable",
+      "Provider executor returned invalid apply no-effect evidence",
+      true,
+    );
+  return failedWithoutProviderOperationMutation(context.operationId, failure.code, failure.message);
+}
+
 function rejectUnexpectedExecutorEvidence(value: unknown): ProviderTicket {
   if (
     typeof value === "object" &&
     value !== null &&
-    (Object.hasOwn(value, "executorApplyAbort") ||
+    (Object.hasOwn(value, "executorApplyNoEffect") ||
+      Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+      Object.hasOwn(value, "executorApplyAbort") ||
       Object.hasOwn(value, "executorAdoptionAbort") ||
       Object.hasOwn(value, "executorNoMutation"))
   )

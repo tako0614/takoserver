@@ -246,15 +246,15 @@ interface OperationGenerationIdentity {
   readonly target: ResourceAddress;
 }
 
-/** One no-effect provider refusal committed with its exact priced hold. */
+/** One no-effect provider refusal committed with its exact optional priced hold. */
 export interface DefinitiveProviderMutationFailureCommit {
-  /** Set only after the driver restores operation-wide proof from convergence. */
-  readonly recoveryAction?: "convergeApply";
+  /** Set only after the dedicated seam restores operation-wide no-effect proof. */
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly claimOwnerId: string;
   readonly operation: "create" | "update";
-  readonly charge: LedgerHeldCharge;
+  readonly charge?: LedgerHeldCharge;
   readonly hostOperation:
     | { readonly kind: "immediate"; readonly createdAt: string }
     | {
@@ -477,6 +477,16 @@ export interface TakoformStore {
   acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
   /** Read-only proof that this exact command already crossed Host review. */
   establishedProviderMutationSaga(record: ProviderMutationSaga): Promise<boolean>;
+  /**
+   * Cheap routing predicate for the one recovery state eligible to ask for an
+   * apply no-effect conclusion. The authoritative selection and mutation
+   * state are still restored only after acquiring the current saga lease.
+   */
+  isProviderMutationApplyNoEffectCandidate(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+  }): Promise<boolean>;
   acquireProviderMutationExecution(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -529,7 +539,7 @@ export interface TakoformStore {
   }): Promise<boolean>;
   /** Retires a proven no-effect refusal; recovery requires a whole-operation fence. */
   settleProviderMutationPreconditionFailure(input: {
-    readonly recoveryAction?: "convergeApply";
+    readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
@@ -1876,6 +1886,24 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return true;
     },
 
+    async isProviderMutationApplyNoEffectCandidate(input) {
+      const rows = await sql.query(
+        `SELECT 1 AS candidate
+         FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
+           AND operation_kind = 'apply'
+           AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_started_at IS NOT NULL
+           AND provider_handle IS NULL AND provider_outcome = 'indeterminate'
+           AND selection_json IS NOT NULL AND import_selection_json IS NULL
+         LIMIT 2`,
+        [input.operationId, input.tenantId, input.resourceUid],
+      );
+      if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
+      return rows.length === 1;
+    },
+
     async acquireProviderMutationExecution(input) {
       const timestamp = now();
       if (input.leaseUntil <= timestamp)
@@ -2392,7 +2420,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     },
 
     async settleProviderMutationPreconditionFailure(input) {
-      if (input.recoveryAction !== undefined && input.recoveryAction !== "convergeApply") {
+      if (
+        input.recoveryAction !== undefined &&
+        input.recoveryAction !== "convergeApply" &&
+        input.recoveryAction !== "concludeApplyNoEffect"
+      ) {
         throw new TypeError("invalid provider refusal recovery action");
       }
       const timestamp = now();
@@ -2402,8 +2434,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         AND ${alias}.operation_id = ? AND ${alias}.resource_uid = ?
         AND ${alias}.phase = 'planned' AND ${alias}.receipt_json IS NULL
         AND ${alias}.provider_handle IS NULL
-        AND ${alias}.provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
-        ${input.recoveryAction === "convergeApply" ? `AND ${alias}.accepted_uid IS NULL AND ${alias}.accepted_generation IS NULL AND ${alias}.accepted_revision IS NULL` : ""}
+        AND ${alias}.provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
+        ${input.recoveryAction ? `AND ${alias}.accepted_uid IS NULL AND ${alias}.accepted_generation IS NULL AND ${alias}.accepted_revision IS NULL` : ""}
         AND ${alias}.execution_started_at IS NOT NULL
         AND ${alias}.execution_lease_token = ? AND ${alias}.execution_lease_until > ?`;
       const sagaFenceParams = (): readonly SqlParam[] => [
@@ -2544,12 +2576,16 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     async commitDefinitiveProviderMutationFailure(input) {
       assertDefinitiveProviderMutationFailure(input);
       const timestamp = now();
-      const releaseIdentity = {
-        organizationId: input.saga.tenantId,
-        reference: input.charge.reference,
-        amountMinor: input.charge.amountMinor,
-      };
-      const releaseFence = ledgerHoldReleaseCommittedFence(releaseIdentity);
+      const releaseIdentity = input.charge
+        ? {
+            organizationId: input.saga.tenantId,
+            reference: input.charge.reference,
+            amountMinor: input.charge.amountMinor,
+          }
+        : undefined;
+      const releaseFence = releaseIdentity
+        ? ledgerHoldReleaseCommittedFence(releaseIdentity)
+        : { sql: "1 = 1", params: [] as const };
       const committedFence = definitiveProviderFailureCommittedFence(input, releaseFence);
       const committed = async (): Promise<boolean> => {
         const rows = await sql.query(
@@ -2565,7 +2601,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       // after commit would look like a conservation failure on retry.
       if (await committed()) return true;
 
-      const release = await prepareLedgerHoldRelease(sql, clock, releaseIdentity);
+      const release = releaseIdentity
+        ? await prepareLedgerHoldRelease(sql, clock, releaseIdentity)
+        : { statements: [] as const, committedFence: releaseFence };
       const initialFence = definitiveProviderFailureInitialFence(input, timestamp);
       const initialGuard = boundedGuard(
         `definitive_failure_start_${input.saga.operationId}_${input.providerLeaseToken}`,
@@ -2629,11 +2667,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         },
         {
           sql: `DELETE FROM tf_resource_claims
-                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                WHERE ${input.operation === "create" ? "" : "owner_operation_id = ? AND "}tenant_id = ? AND holder_uid = ?
                   AND state = 'reserved'
                   AND NOT (claim_key >= ? AND claim_key < ?)`,
           params: [
-            input.claimOwnerId,
+            ...(input.operation === "create" ? [] : [input.claimOwnerId]),
             input.saga.tenantId,
             input.saga.resourceUid,
             dependencyStart,
@@ -2690,7 +2728,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                 WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                   AND phase = 'planned' AND receipt_json IS NULL
-                  AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
+                  AND provider_handle IS NULL AND provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
                   AND execution_started_at IS NOT NULL
                   AND execution_lease_token = ? AND execution_lease_until > ?`,
           params: [
@@ -4370,6 +4408,14 @@ interface StoreSqlFence {
   readonly params: readonly SqlParam[];
 }
 
+function definitiveProviderFailureOutcomeSql(
+  action: DefinitiveProviderMutationFailureCommit["recoveryAction"],
+): string {
+  if (action === "concludeApplyNoEffect") return "= 'indeterminate'";
+  if (action === "convergeApply") return "IN ('running', 'indeterminate')";
+  return "= 'running'";
+}
+
 function assertDefinitiveProviderMutationFailure(
   input: DefinitiveProviderMutationFailureCommit,
 ): void {
@@ -4379,7 +4425,8 @@ function assertDefinitiveProviderMutationFailure(
   }
   if (
     input.recoveryAction !== undefined &&
-    (input.recoveryAction !== "convergeApply" ||
+    ((input.recoveryAction !== "convergeApply" &&
+      input.recoveryAction !== "concludeApplyNoEffect") ||
       input.operation !== "create" ||
       saga.acceptedUid !== undefined ||
       saga.acceptedGeneration !== undefined ||
@@ -4387,7 +4434,7 @@ function assertDefinitiveProviderMutationFailure(
   ) {
     throw new TypeError("invalid provider refusal recovery action");
   }
-  if (input.charge.reference !== saga.operationId) {
+  if (input.charge && input.charge.reference !== saga.operationId) {
     throw new TypeError("provider failure charge has the wrong operation identity");
   }
   if ((input.operation === "create") !== (saga.acceptedUid === undefined)) {
@@ -4439,7 +4486,7 @@ function definitiveProviderFailureInitialFence(
       AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
       AND protocol_generation = 1 AND operation_kind = 'apply'
       AND phase = 'planned' AND receipt_json IS NULL
-      AND provider_handle IS NULL AND provider_outcome ${input.recoveryAction === "convergeApply" ? "IN ('running', 'indeterminate')" : "= 'running'"}
+      AND provider_handle IS NULL AND provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
       AND execution_started_at IS NOT NULL
       AND execution_lease_token = ? AND execution_lease_until > ?
   )`;

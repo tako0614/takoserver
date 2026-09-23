@@ -822,14 +822,31 @@ describe("Takoform apply on a real backend", () => {
   });
 
   test("whole-operation apply abort settles the indeterminate operation and its exact held money", async () => {
-    for (const scenario of ["priced", "free", "stale", "rollback", "lost-ack"] as const) {
-      const amountMinor = scenario === "free" ? 0 : 500;
+    for (const scenario of [
+      "priced",
+      "free",
+      "free-lost-ack",
+      "stale",
+      "rollback",
+      "lost-ack",
+    ] as const) {
+      const amountMinor = scenario === "free" || scenario === "free-lost-ack" ? 0 : 500;
       const durable = createEphemeralSql();
       let injected = false;
       const sql: Sql = {
         query: (statement, params) => durable.query(statement, params),
         run: (statement, params) => durable.run(statement, params),
         async batch(statements) {
+          const terminalDeferredFailure = statements.some(
+            ({ sql: statement }) =>
+              statement.includes("UPDATE tf_deferred_operations_selection_v1") &&
+              statement.includes("SET phase = 'failed'"),
+          );
+          if (!injected && scenario === "free-lost-ack" && terminalDeferredFailure) {
+            injected = true;
+            await durable.batch(statements);
+            throw new SqlError("unavailable", "lost free abort settlement acknowledgement");
+          }
           const releaseIndex = statements.findIndex(
             ({ sql: statement, params }) =>
               statement.includes("INSERT INTO ledger") && params?.[2] === "release",
@@ -858,6 +875,7 @@ describe("Takoform apply on a real backend", () => {
       let now = Date.parse("2026-09-20T00:00:00.000Z");
       const clock = () => new Date(now);
       let applyCalls = 0;
+      let unrelatedConclusionCalls = 0;
       let initialAuthority: Parameters<Provider["apply"]>[0]["executionAuthority"];
       const provider: Provider = {
         id: "fake",
@@ -886,6 +904,24 @@ describe("Takoform apply on a real backend", () => {
           return failed("not_found", "not found");
         },
       };
+      const proofOnlyProvider: Provider = {
+        id: "proof-only",
+        offerings: [],
+        ...fakeReadback,
+        async apply() {
+          return failed("unavailable", "not selected", true);
+        },
+        async concludeApplyNoEffect() {
+          unrelatedConclusionCalls += 1;
+          return { phase: "unsupported" };
+        },
+        async observe() {
+          return failed("not_found", "not found");
+        },
+        async delete() {
+          return failed("not_found", "not found");
+        },
+      };
       const app = buildApp({
         sql,
         objects: createMemoryObjectStore(),
@@ -896,7 +932,7 @@ describe("Takoform apply on a real backend", () => {
         forms: [FORM],
         hostForms: [FORM],
         takoformHostFactory: createStaticStableTestTakoformHost,
-        providers: [provider],
+        providers: [provider, proofOnlyProvider],
         offerings: [
           {
             ...SOLD,
@@ -941,6 +977,10 @@ describe("Takoform apply on a real backend", () => {
         expect((await app.tick()).providerRepairs).toMatchObject({ settled: 1, pending: 0 });
       } else expect(firstRecovery).toMatchObject({ settled: 1, pending: 0 });
       expect(applyCalls).toBe(1);
+      expect(unrelatedConclusionCalls).toBe(0);
+      if (scenario === "lost-ack" || scenario === "free-lost-ack") {
+        expect(injected).toBe(true);
+      }
       expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
         heldMinor: 0,
         settledMinor: 2_000,

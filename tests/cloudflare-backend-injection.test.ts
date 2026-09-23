@@ -8,6 +8,7 @@ import {
   type CloudflareWorkerBackend,
   type CloudflareWorkerBackendFactoryContext,
   derivedProviderResourceIncarnationName,
+  type ProviderApplyNoEffectConclusionInput,
   type ProviderOffering,
 } from "@takoserver/core/provider-extension";
 
@@ -167,6 +168,55 @@ test("CloudflareProvider honors one synchronous managed backend factory and its 
   ).toMatchObject({ phase: "succeeded", result: { nativeId: "injected-native" } });
   expect(factoryCalls).toBe(1);
   expect(applyCalls).toBe(1);
+});
+
+test("CloudflareProvider delegates no-effect conclusion only to its owning managed backend", async () => {
+  let received: ProviderApplyNoEffectConclusionInput | undefined;
+  let conclusionCalls = 0;
+  const conclusion = { phase: "unsupported" as const };
+  const injectedBackend: CloudflareWorkerBackend = {
+    ...backend,
+    owns: (candidate) => candidate.id === offering.id,
+    async concludeApplyNoEffect(input) {
+      conclusionCalls += 1;
+      received = input;
+      return conclusion;
+    },
+  };
+  const provider = new CloudflareProvider({
+    ...baseOptions(),
+    workerBackend: { kind: "workers-for-platforms", create: () => injectedBackend },
+  });
+  const input: ProviderApplyNoEffectConclusionInput = {
+    operationId: "managed-conclusion-operation",
+    providerInstallationRef: "cloudflare.injected.primary",
+    executionAuthority: {
+      tenantId: "tenant-injected",
+      resourceUid: "worker-injected",
+      leaseToken: "provider-conclusion-lease",
+      fingerprint: '{"request":"accepted"}',
+    },
+    offering,
+    identity: {
+      tenantRef: "tenant-injected",
+      space: "default",
+      name: "worker",
+      uid: "worker-injected",
+    },
+  };
+  if (!provider.concludeApplyNoEffect) throw new Error("managed conclusion port is missing");
+
+  await expect(provider.concludeApplyNoEffect(input)).resolves.toBe(conclusion);
+  expect(received).toBe(input);
+  expect(conclusionCalls).toBe(1);
+
+  await expect(
+    provider.concludeApplyNoEffect({
+      ...input,
+      offering: { ...offering, id: "cloudflare.injected.unmanaged" },
+    }),
+  ).resolves.toEqual({ phase: "unsupported" });
+  expect(conclusionCalls).toBe(1);
 });
 
 test("managed backend context delegates zone selection with existing restrictions and precedence", () => {

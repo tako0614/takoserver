@@ -387,6 +387,7 @@ describe("stable StandardServiceRef", () => {
     const sql = createEphemeralSql();
     let projections = 0;
     let applies = 0;
+    let conclusions = 0;
     const host = createTakoformHost({
       sql,
       objects: createMemoryObjectStore(),
@@ -401,6 +402,15 @@ describe("stable StandardServiceRef", () => {
       driver: {
         async selectApply() {
           return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+        },
+        async concludeApplyNoEffect() {
+          conclusions += 1;
+          throw new ProviderMutationWholeOperationRefusalError(
+            "conflict",
+            409,
+            "provider-only no-effect proof",
+            { action: "concludeApplyNoEffect" },
+          );
         },
         async apply(input) {
           applies += 1;
@@ -476,6 +486,10 @@ describe("stable StandardServiceRef", () => {
     });
     expect(projections).toBe(1);
     expect(applies).toBe(1);
+    expect(conclusions).toBe(0);
+    expect(
+      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1"),
+    ).toEqual([]);
   });
 
   test.each([false, true])(

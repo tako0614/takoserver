@@ -205,6 +205,37 @@ export interface ProviderExecutionAuthority {
   readonly fingerprint: string;
 }
 
+/**
+ * Closed authority for concluding one already-dispatched create as no-effect.
+ *
+ * This input deliberately cannot describe a provider mutation. In particular,
+ * it carries no desired spec, relations, previous native identity, provider
+ * handle, runtime material, standard-service projection, or migration bytes.
+ * A provider may use it only to fence its own exact operation record against a
+ * late initial invocation and return operation-wide no-effect proof.
+ */
+export interface ProviderApplyNoEffectConclusionInput {
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+  readonly offering: ProviderOffering;
+  readonly identity: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly name: string;
+    readonly uid: string;
+  };
+}
+
+/**
+ * `unsupported` is a trusted pre-attempt answer: the provider did not begin a
+ * conclusion or mutate its abort fence. Every other non-proof result remains
+ * an ordinary ProviderTicket and therefore leaves the accepted saga held.
+ */
+export type ProviderApplyNoEffectConclusionResult =
+  | ProviderTicket
+  | { readonly phase: "unsupported" };
+
 export interface ApplyInput extends ProviderMutationInput {
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
@@ -479,6 +510,15 @@ export interface Provider {
    * recovery retry can never accidentally issue a second write.
    */
   recoverApply?(input: ApplyInput): Promise<ProviderTicket>;
+  /**
+   * Durably fences one accepted create against every provider effect and, only
+   * then, may return whole-operation no-effect proof. This is neither read-only
+   * recovery nor mutation convergence: it cannot observe/adopt/create a native
+   * resource and cannot be used for updates or handled operations.
+   */
+  concludeApplyNoEffect?(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<ProviderApplyNoEffectConclusionResult>;
   /**
    * Mutating convergence for an apply command whose durable Host dispatch may
    * already have crossed the provider boundary. The Host calls this only while

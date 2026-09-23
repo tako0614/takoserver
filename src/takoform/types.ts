@@ -278,6 +278,22 @@ export interface TakoformResourceDriver {
     readonly relations: readonly TakoformDriverRelation[];
     readonly previous?: TakoformStoredResource;
   }) => Promise<TakoformImportSelection>;
+  /**
+   * Attempts only to close an already-dispatched accepted create as no-effect.
+   * Implementations return no receipt: conclusive proof is raised as the
+   * driver's whole-operation refusal, while every other result remains held.
+   */
+  readonly concludeApplyNoEffect?: (input: {
+    readonly operationId: string;
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly selection: TakoformApplySelection;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+  }) => Promise<void>;
   apply(input: {
     readonly operationId: string;
     /** Caller-chosen Host idempotency identity, retained across operation recovery. */

@@ -3,6 +3,7 @@ import type { LedgerHeldCharge } from "../ledger.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import {
+  ProviderApplyNoEffectUnsupportedError,
   ProviderMutationDefinitiveRefusalError,
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
@@ -36,6 +37,7 @@ import {
 import { materializeDefaults, validateDesired } from "./schema.ts";
 import {
   applySqliteMigrationApplication,
+  isSqliteMigrationApplication,
   type PreparedSqliteMigrationApplication,
   prepareSqliteMigrationApplication,
   sqliteMigrationCondition,
@@ -142,11 +144,11 @@ export interface EngineContext {
 }
 
 export interface EngineDefinitiveProviderFailureCommit {
-  readonly recoveryAction?: "convergeApply";
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly operation: "create" | "update";
-  readonly charge: LedgerHeldCharge;
+  readonly charge?: LedgerHeldCharge;
   readonly error: {
     readonly code: string;
     readonly publicMessage?: string;
@@ -494,6 +496,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       return receipt;
     } catch (error) {
+      if (error instanceof ProviderApplyNoEffectUnsupportedError) {
+        // The dedicated provider seam explicitly declined before attempting
+        // its abort fence. Release this lease unchanged so the caller may
+        // resume the pre-existing recovery path for that offering.
+        const released = await store.releaseProviderMutationExecution({
+          tenantId: input.tenantId,
+          operationId: input.operationId,
+          resourceUid: input.resourceUid,
+          leaseToken,
+        });
+        if (!released) input.onContention?.();
+        throw error;
+      }
       const providerRefusalProvesWholeAttemptIdle =
         input.providerRefusalProvesWholeAttemptIdle?.() ?? true;
       const initialImportConflict =
@@ -548,7 +563,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         input.commitDefinitiveFailure !== undefined &&
         providerRefusalProvesWholeAttemptIdle &&
         error instanceof ProviderMutationWholeOperationRefusalError &&
-        error.action === "convergeApply";
+        (error.action === "convergeApply" || error.action === "concludeApplyNoEffect");
       const definitiveRefusal = definitiveInitialRefusal || definitiveApplyAbort;
       const recoveryError =
         error instanceof ProviderMutationRecoveryError
@@ -566,23 +581,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           ...(recoveryError.providerHandle ? { providerHandle: recoveryError.providerHandle } : {}),
         });
         if (!recorded) input.onContention?.();
-      } else if (definitiveRefusal && error.heldCharge) {
-        if (input.commitDefinitiveFailure) {
-          try {
-            settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
-          } catch (settlementError) {
-            input.onContention?.();
-            throw settlementError;
-          }
-          if (settledPrecondition) {
-            settledDefinitiveFailureAtomically = true;
-            input.onDefinitiveFailureSettled?.();
-          } else {
-            input.onContention?.();
-          }
+      } else if (definitiveRefusal && input.commitDefinitiveFailure) {
+        try {
+          settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
+        } catch (settlementError) {
+          input.onContention?.();
+          throw settlementError;
+        }
+        if (settledPrecondition) {
+          settledDefinitiveFailureAtomically = true;
+          input.onDefinitiveFailureSettled?.();
         } else {
-          // A held refusal cannot fall back to saga-only retirement: doing so
-          // would strand the money without the plan that owns its recovery.
           input.onContention?.();
         }
       } else if (
@@ -594,7 +603,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           operationId: input.operationId,
           resourceUid: input.resourceUid,
           leaseToken,
-          ...(definitiveApplyAbort ? { recoveryAction: "convergeApply" as const } : {}),
+          ...(definitiveApplyAbort && error instanceof ProviderMutationWholeOperationRefusalError
+            ? { recoveryAction: error.action as "convergeApply" | "concludeApplyNoEffect" }
+            : {}),
         });
         if (settledPrecondition) input.onProvablyIdle?.();
         else input.onContention?.();
@@ -1281,6 +1292,154 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const establishedSaga =
         context.durableOperation !== undefined &&
         (await store.establishedProviderMutationSaga(proposedSaga));
+
+      // An accepted create whose original provider acknowledgement was lost
+      // may no longer satisfy today's mutable relation/readiness projection.
+      // Route only the exact persisted no-handle/indeterminate state around
+      // those checks. The authoritative selection is restored below under the
+      // current saga lease; this read-only predicate conveys no placement or
+      // provider authority of its own.
+      const applyNoEffectCandidate =
+        establishedSaga &&
+        create &&
+        context.durableOperation !== undefined &&
+        driver.concludeApplyNoEffect !== undefined &&
+        !hasApplyServiceSlots &&
+        !isSqliteMigrationApplication(form) &&
+        (await store.isProviderMutationApplyNoEffectCandidate({
+          tenantId: context.tenantId,
+          operationId: proposedOperationId,
+          resourceUid: proposedResourceUid,
+        }));
+      if (applyNoEffectCandidate) {
+        const durableOperation = context.durableOperation;
+        const concludeApplyNoEffect = driver.concludeApplyNoEffect;
+        if (!durableOperation || !concludeApplyNoEffect) {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+
+        let applySelection: TakoformApplySelection | undefined;
+        let providerProvablyIdle = false;
+        try {
+          // A concurrently recorded receipt is returned here and then consumed
+          // by the ordinary path below. Only a current leased, receipt-less
+          // recovery can enter the conclusion capability.
+          await executeProviderMutation({
+            tenantId: context.tenantId,
+            operationId: proposedOperationId,
+            resourceUid: proposedResourceUid,
+            fingerprint,
+            claimOwnerId: durableOperation.claimOwnerId,
+            providerRefusalProvesWholeAttemptIdle: () => true,
+            onProvablyIdle: () => {
+              providerProvablyIdle = true;
+            },
+            ...(acceptedSagaAuthorityHeadDigest
+              ? { authorityHeadDigest: acceptedSagaAuthorityHeadDigest }
+              : {}),
+            prepare: async (_dependencies, mode, leaseToken, acceptedSelection) => {
+              if (mode !== "recovery" || !acceptedSelection) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              const boundSelection = await store.bindProviderMutationApplySelection({
+                tenantId: context.tenantId,
+                operationId: proposedOperationId,
+                resourceUid: proposedResourceUid,
+                fingerprint,
+                leaseToken,
+                mode,
+                selection: acceptedSelection,
+              });
+              if (!boundSelection) throw new ProviderMutationRecoveryError("indeterminate");
+              applySelection = boundSelection;
+            },
+            commitDefinitiveFailure: async (providerLeaseToken, error) => {
+              return await durableOperation.commitDefinitiveProviderFailure({
+                saga: proposedSaga,
+                providerLeaseToken,
+                operation: "create",
+                recoveryAction: "concludeApplyNoEffect",
+                ...(error.heldCharge ? { charge: error.heldCharge } : {}),
+                error: {
+                  code: error.code,
+                  ...(error.publicMessage ? { publicMessage: error.publicMessage } : {}),
+                  ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+                },
+              });
+            },
+            execute: async (mode, execution, leaseToken) => {
+              if (mode !== "recovery" || !applySelection) {
+                throw new ProviderMutationRecoveryError(
+                  execution.providerOutcome === "running" ? "running" : "indeterminate",
+                  execution.providerHandle,
+                );
+              }
+              // The cheap candidate read may race a newly recorded handle.
+              // Nothing on the conclusion seam has run yet, so hand this
+              // exact leased state back to the existing poll/convergence path.
+              if (
+                execution.providerHandle !== undefined ||
+                execution.providerOutcome === "running"
+              ) {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              if (execution.providerOutcome !== "indeterminate") {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              // Provider-only proof cannot cover Host or extension work that
+              // may have happened before the original provider invocation.
+              // Treat these accepted selections as pre-attempt unsupported so
+              // the shipped apply/convergence path performs its own callback
+              // and reservation handling. This check is under the current
+              // saga lease and precedes any conclusion/provider/ledger call.
+              if (
+                context.workerEndpointOriginReservationId !== undefined ||
+                form.identity.formRef.kind === "WorkerEndpoint" ||
+                (applySelection.kind === "provider" &&
+                  applySelection.relations.some((relation) => relation.bindingRef !== undefined))
+              ) {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              await concludeApplyNoEffect({
+                operationId: proposedOperationId,
+                executionAuthority: {
+                  tenantId: context.tenantId,
+                  resourceUid: proposedResourceUid,
+                  leaseToken,
+                  fingerprint,
+                },
+                tenantId: context.tenantId,
+                resourceUid: proposedResourceUid,
+                form,
+                name: body.metadata.name,
+                space: body.metadata.space,
+                selection: applySelection,
+                ...(context.commercialAuthority
+                  ? { commercialAuthority: context.commercialAuthority }
+                  : {}),
+              });
+              // The capability never returns success. A return is
+              // inconclusive and therefore keeps the accepted operation held.
+              throw new ProviderMutationRecoveryError("indeterminate");
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) {
+            if (providerProvablyIdle) {
+              await store.releaseResourceClaims(durableOperation.claimOwnerId);
+              await settleIdleAttempt(
+                context.tenantId,
+                proposedResourceUid,
+                proposedOperationId,
+                "apply",
+              );
+            }
+            throw error;
+          }
+        }
+        // An explicit pre-attempt unsupported result continues into the
+        // original validation and convergence path below.
+      }
       if (!establishedSaga) {
         const review = await store.readPrepare(context.tenantId, body.review.prepareDigest);
         const reviewAuthorityHeadDigest =
@@ -1640,16 +1799,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             );
           },
           commitDefinitiveFailure: async (providerLeaseToken, error) => {
-            const charge = error.heldCharge;
-            if (!charge) return false;
             const failure = {
               saga,
               providerLeaseToken,
               operation: create ? ("create" as const) : ("update" as const),
-              charge,
+              ...(error.heldCharge ? { charge: error.heldCharge } : {}),
               ...(error instanceof ProviderMutationWholeOperationRefusalError &&
-              error.action === "convergeApply"
-                ? { recoveryAction: "convergeApply" as const }
+              (error.action === "convergeApply" || error.action === "concludeApplyNoEffect")
+                ? { recoveryAction: error.action }
                 : {}),
             };
             if (context.durableOperation) {

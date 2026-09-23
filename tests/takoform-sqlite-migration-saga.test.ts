@@ -510,6 +510,7 @@ describe("SQLiteMigrationApplication provider saga", () => {
     const executionTrace: string[] = [];
     let observedDatabase: TakoformStoredResource | undefined;
     let applicationCalls = 0;
+    let conclusionCalls = 0;
     const driver = migrationDriver(memory, {
       async applySuffix(input) {
         observedDatabase = input.database;
@@ -534,8 +535,22 @@ describe("SQLiteMigrationApplication provider saga", () => {
         }
         return await memory.apply(input);
       },
+      async concludeApplyNoEffect() {
+        conclusionCalls += 1;
+        throw new ProviderMutationWholeOperationRefusalError(
+          "conflict",
+          409,
+          "provider-only no-effect proof",
+          { action: "concludeApplyNoEffect" },
+        );
+      },
     });
-    const { host, database } = harness(driver);
+    const { host, database } = harness(driver, undefined, undefined, {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      retryAfterSeconds: 0,
+      executeOnAccept: true,
+    });
     await seedDatabaseAndSet(host);
     const desired = applicationDesired("definitive-migration-refusal");
     const review = await prepare(host, desired, "admin");
@@ -547,10 +562,8 @@ describe("SQLiteMigrationApplication provider saga", () => {
       "definitive-migration-refusal-0001",
       "admin",
     );
-    expect(refused?.status).toBe(422);
-    expect(await refused?.json()).toMatchObject({
-      error: { code: "unsupported_capability", retryable: false },
-    });
+    expect(refused?.status).toBe(202);
+    expect(await refused?.json()).toMatchObject({ operation: { done: false } });
     expect(executionTrace).toEqual([
       "applySuffix:start",
       "applySuffix:complete",
@@ -600,15 +613,14 @@ describe("SQLiteMigrationApplication provider saga", () => {
     expect(
       database.query("SELECT COUNT(*) AS n FROM tf_operations WHERE id = ?").get(saga.operation_id),
     ).toEqual({ n: 0 });
-    const recovered = await apply(
-      host,
-      desired,
-      review,
-      "definitive-migration-refusal-0001",
-      "admin",
-    );
-    expect(recovered?.status).toBe(422);
+    expect(await host.maintenance?.drainProviderRepairs()).toMatchObject({
+      candidates: 1,
+      acquired: 1,
+      settled: 0,
+      pending: 1,
+    });
     expect(applicationCalls).toBe(2);
+    expect(conclusionCalls).toBe(0);
     expect(dispatchedSaga(database)).toMatchObject({
       phase: "planned",
       provider_outcome: "indeterminate",
@@ -809,6 +821,7 @@ function harness(
     authorization,
   ) => principal(authorization),
   availability?: ConfiguredHistoricalHostOptions["availability"],
+  deferredOperations?: ConfiguredHistoricalHostOptions["deferredOperations"],
 ) {
   const database = new Database(":memory:");
   databases.push(database);
@@ -825,6 +838,7 @@ function harness(
       artifacts,
       authenticate: async (request) => await authenticate(request.headers.get("authorization")),
       ...(availability ? { availability } : {}),
+      ...(deferredOperations ? { deferredOperations } : {}),
       routes: {
         hostApiVersion: "forms.takoform.com/v1",
         apiPath: LANE,
@@ -845,12 +859,16 @@ function migrationDriver(
     readonly readLedger?: typeof memory.sqliteMigrations.readLedger;
     readonly applySuffix?: MigrationSuffix;
     readonly apply?: TakoformResourceDriver["apply"];
+    readonly concludeApplyNoEffect?: NonNullable<TakoformResourceDriver["concludeApplyNoEffect"]>;
     readonly import?: NonNullable<TakoformResourceDriver["import"]>;
   },
 ): TakoformResourceDriver {
   return {
     selectApply: overrides.selectApply ?? ((input) => memory.selectApply(input)),
     selectImport: (input) => memory.selectImport(input),
+    ...(overrides.concludeApplyNoEffect
+      ? { concludeApplyNoEffect: overrides.concludeApplyNoEffect }
+      : {}),
     apply: overrides.apply ?? ((input) => memory.apply(input)),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),

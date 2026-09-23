@@ -311,6 +311,109 @@ describe("provider mutation saga execution leases", () => {
     database.close();
   });
 
+  test("routes apply no-effect conclusion only for a receiptless no-handle create", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+      const seedDispatched = async (
+        suffix: string,
+        accepted?: {
+          readonly acceptedUid: string;
+          readonly acceptedGeneration: string;
+          readonly acceptedRevision: string;
+        },
+      ) => {
+        const mutationSaga: ProviderMutationSaga = {
+          ...saga,
+          operationId: `op_no_effect_${suffix}`,
+          replayKey: `replay-no-effect-${suffix}`,
+          resourceUid: `uid_no_effect_${suffix}`,
+          target: { ...saga.target, name: `no-effect-${suffix}` },
+          ...accepted,
+        };
+        const identity = {
+          tenantId: mutationSaga.tenantId,
+          operationId: mutationSaga.operationId,
+          resourceUid: mutationSaga.resourceUid,
+        };
+        const leaseToken = `lease_${suffix}`;
+        await store.acceptProviderMutationSaga(mutationSaga);
+        expect(
+          await store.acquireProviderMutationExecution({
+            ...identity,
+            leaseToken,
+            leaseUntil: 2_000,
+          }),
+        ).toMatchObject({ kind: "acquired", mode: "initial" });
+        expect(
+          await store.bindProviderMutationApplySelection({
+            ...identity,
+            fingerprint: mutationSaga.fingerprint,
+            leaseToken,
+            mode: "initial",
+            selection: applySelection,
+          }),
+        ).toEqual(applySelection);
+        expect(await store.markProviderMutationDispatch({ ...identity, leaseToken })).toBe(true);
+        expect(
+          await store.recordProviderMutationOutcome({
+            ...identity,
+            leaseToken,
+            outcome: "indeterminate",
+          }),
+        ).toBe(true);
+        return { identity, leaseToken };
+      };
+
+      const noHandle = await seedDispatched("no_handle");
+      expect(await store.isProviderMutationApplyNoEffectCandidate(noHandle.identity)).toBe(true);
+      expect(
+        await store.recordProviderMutationOutcome({
+          ...noHandle.identity,
+          leaseToken: noHandle.leaseToken,
+          outcome: "running",
+          providerHandle: "provider-operation-handle",
+        }),
+      ).toBe(true);
+      expect(await store.isProviderMutationApplyNoEffectCandidate(noHandle.identity)).toBe(false);
+
+      const receipt = await seedDispatched("receipt");
+      expect(await store.isProviderMutationApplyNoEffectCandidate(receipt.identity)).toBe(true);
+      await store.recordProviderMutationReceipt({
+        ...receipt.identity,
+        leaseToken: receipt.leaseToken,
+        receipt: { observed: { durable: true } },
+      });
+      expect(await store.isProviderMutationApplyNoEffectCandidate(receipt.identity)).toBe(false);
+
+      const update = await seedDispatched("update", {
+        acceptedUid: "uid_existing_resource",
+        acceptedGeneration: "7",
+        acceptedRevision: "9",
+      });
+      expect(await store.isProviderMutationApplyNoEffectCandidate(update.identity)).toBe(false);
+
+      const unselectedSaga: ProviderMutationSaga = {
+        ...saga,
+        operationId: "op_no_effect_unselected",
+        replayKey: "replay-no-effect-unselected",
+        resourceUid: "uid_no_effect_unselected",
+        target: { ...saga.target, name: "no-effect-unselected" },
+      };
+      await store.acceptProviderMutationSaga(unselectedSaga);
+      expect(
+        await store.isProviderMutationApplyNoEffectCandidate({
+          tenantId: unselectedSaga.tenantId,
+          operationId: unselectedSaga.operationId,
+          resourceUid: unselectedSaga.resourceUid,
+        }),
+      ).toBe(false);
+    } finally {
+      database.close();
+    }
+  });
+
   test("does not abandon a bound apply plan, even after its execution lease is released", async () => {
     const database = new Database(":memory:");
     try {

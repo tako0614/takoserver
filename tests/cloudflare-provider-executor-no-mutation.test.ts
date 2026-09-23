@@ -4,6 +4,7 @@ import {
   failed,
   failedWithoutProviderMutation,
   type Provider,
+  type ProviderApplyNoEffectConclusionInput,
   type ProviderExecutionAuthority,
   type ProviderOffering,
   type ProviderTicket,
@@ -13,9 +14,11 @@ import {
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
   type CloudflareProviderAdoptionRecoveryResult,
   type CloudflareProviderApplyConvergenceResult,
+  type CloudflareProviderApplyNoEffectConclusionResult,
   type CloudflareProviderExecutorRpc,
   type CloudflareProviderInitialMutationResult,
 } from "../src/providers/cloudflare-provider-executor-port.ts";
@@ -469,7 +472,121 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
     expect(Object.hasOwn(ticket, "executorAdoptionAbort")).toBe(false);
     expect(providerFailureProvesWholeOperationNoMutation(ticket, "operation-1")).toBe(false);
   });
+
+  test("restores apply no-effect proof only for the exact dedicated lease-bound call", async () => {
+    const input = applyNoEffectInput();
+    const exact = applyNoEffectFor(input);
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.concludeApplyNoEffect = async () => structuredClone(exact);
+    const ticket = await createProxy(binding).concludeApplyNoEffect(input);
+    expect(ticket).toEqual({
+      phase: "failed",
+      failure: {
+        code: "conflict",
+        message: "the exact accepted create was fenced before effects",
+        retryable: false,
+      },
+    });
+    expect(ticket.phase).toBe("failed");
+    if (ticket.phase !== "failed") throw new Error("expected failed ticket");
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, input.operationId)).toBe(true);
+
+    for (const mutate of [
+      (value: MutableApplyNoEffect) => (value.executorApplyNoEffect.operationId = "wrong"),
+      (value: MutableApplyNoEffect) =>
+        (value.executorApplyNoEffect.executionAuthority.leaseToken = "wrong"),
+      (value: MutableApplyNoEffect) => (value.executorApplyNoEffect.action = "convergeApply"),
+      (value: MutableApplyNoEffect) => (value.extra = true),
+    ]) {
+      const malformed = structuredClone(exact) as unknown as MutableApplyNoEffect;
+      mutate(malformed);
+      binding.concludeApplyNoEffect = async () =>
+        malformed as unknown as CloudflareProviderApplyNoEffectConclusionResult;
+      const rejected = await createProxy(binding).concludeApplyNoEffect(input);
+      expect(rejected).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      expect(rejected.phase).not.toBe("unsupported");
+    }
+  });
+
+  test("accepts unsupported only as an exact pre-attempt conclusion envelope", async () => {
+    const input = applyNoEffectInput();
+    const unsupported = applyNoEffectUnsupportedFor(input);
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.concludeApplyNoEffect = async () => structuredClone(unsupported);
+    expect(await createProxy(binding).concludeApplyNoEffect(input)).toEqual({
+      phase: "unsupported",
+    });
+
+    const spoofed = structuredClone(unsupported);
+    spoofed.executorApplyNoEffectUnsupported.executionAuthority.fingerprint = "wrong";
+    binding.concludeApplyNoEffect = async () => spoofed;
+    expect(await createProxy(binding).concludeApplyNoEffect(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    binding.concludeApplyNoEffect = async () =>
+      ({ phase: "unsupported" }) as CloudflareProviderApplyNoEffectConclusionResult;
+    expect(await createProxy(binding).concludeApplyNoEffect(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+  });
 });
+
+interface MutableApplyNoEffect {
+  executorApplyNoEffect: {
+    operationId: unknown;
+    action: unknown;
+    executionAuthority: { leaseToken: unknown };
+  };
+  extra?: unknown;
+}
+
+function applyNoEffectInput(): ProviderApplyNoEffectConclusionInput {
+  return {
+    operationId: "operation-no-effect-1",
+    providerInstallationRef: installationId,
+    executionAuthority: { ...authority },
+    offering,
+    identity: { ...identity, uid: authority.resourceUid },
+  };
+}
+
+function applyNoEffectFor(
+  input: ProviderApplyNoEffectConclusionInput,
+): CloudflareProviderApplyNoEffectConclusionResult {
+  return {
+    phase: "failed",
+    failure: {
+      code: "conflict",
+      message: "the exact accepted create was fenced before effects",
+      retryable: false,
+    },
+    executorApplyNoEffect: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
+      action: "concludeApplyNoEffect",
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: { ...input.executionAuthority },
+    },
+  };
+}
+
+function applyNoEffectUnsupportedFor(input: ProviderApplyNoEffectConclusionInput) {
+  return {
+    phase: "unsupported" as const,
+    executorApplyNoEffectUnsupported: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
+      action: "unsupported" as const,
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: { ...input.executionAuthority },
+    },
+  };
+}
 
 function applyAbortFor(input: ApplyInput): CloudflareProviderApplyConvergenceResult {
   if (!input.executionAuthority) throw new Error("missing execution authority");
@@ -618,6 +735,7 @@ function createBinding(
     apply: (input) => initial("apply", input),
     recoverApply: recovery,
     convergeApply: recovery,
+    concludeApplyNoEffect: recovery,
     poll: recovery,
     observe: recovery,
     delete: (input) => initial("delete", input),

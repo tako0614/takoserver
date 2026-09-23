@@ -433,7 +433,7 @@ export function createDeferredOperations(input: {
             providerLeaseToken: failure.providerLeaseToken,
             claimOwnerId: leaseToken,
             operation: failure.operation,
-            charge: failure.charge,
+            ...(failure.charge ? { charge: failure.charge } : {}),
             ...(failure.recoveryAction ? { recoveryAction: failure.recoveryAction } : {}),
             hostOperation: {
               kind: "deferred",

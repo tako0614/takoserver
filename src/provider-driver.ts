@@ -168,7 +168,7 @@ export class ProviderMutationWholeOperationRefusalError extends TakoformHostErro
     status: number,
     message?: string,
     options?: {
-      readonly action?: "recoverAdopt" | "convergeApply";
+      readonly action?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
       readonly heldCharge?: LedgerHeldCharge;
     },
   ) {
@@ -177,8 +177,16 @@ export class ProviderMutationWholeOperationRefusalError extends TakoformHostErro
     this.action = options?.action ?? "recoverAdopt";
     if (options?.heldCharge) this.heldCharge = options.heldCharge;
   }
-  readonly action: "recoverAdopt" | "convergeApply";
+  readonly action: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
   readonly heldCharge?: LedgerHeldCharge;
+}
+
+/** The dedicated conclusion seam declined before creating any provider effect. */
+export class ProviderApplyNoEffectUnsupportedError extends Error {
+  constructor() {
+    super("the provider does not support this apply no-effect conclusion");
+    this.name = "ProviderApplyNoEffectUnsupportedError";
+  }
 }
 
 /**
@@ -886,7 +894,7 @@ export function createProviderDriver(
     mutation?: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
-      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
     },
   ): ProviderResult => {
     if (ticket.phase === "succeeded") {
@@ -992,7 +1000,7 @@ export function createProviderDriver(
     mutation: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
-      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
     },
     work: () => Promise<ProviderTicket>,
   ): Promise<ProviderResult> => {
@@ -1535,6 +1543,100 @@ export function createProviderDriver(
         );
       },
     },
+    ...([...byId.values()].some((provider) => provider.concludeApplyNoEffect !== undefined)
+      ? {
+          async concludeApplyNoEffect(
+            input: Parameters<NonNullable<TakoformResourceDriver["concludeApplyNoEffect"]>>[0],
+          ): Promise<void> {
+            const selection = input.selection;
+            if (
+              selection.kind !== "provider" ||
+              selection.incumbent !== undefined ||
+              !sameForm(selection.technicalOffering.form, input.form.identity.formRef) ||
+              !selection.technicalOffering.capabilities.includes("create") ||
+              input.executionAuthority.tenantId !== input.tenantId ||
+              input.executionAuthority.resourceUid !== input.resourceUid
+            ) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            const provider = byId.get(selection.providerPackRef);
+            const concludeApplyNoEffect = provider?.concludeApplyNoEffect;
+            if (!provider) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            // The accepted selection is still exact, and this provider has not been
+            // called through the dedicated conclusion seam. Capability absence is
+            // therefore the same closed pre-attempt unsupported result as the wire
+            // sentinel: release this short execution lease and preserve the shipped
+            // convergence path. A missing selected provider remains indeterminate.
+            if (!concludeApplyNoEffect) throw new ProviderApplyNoEffectUnsupportedError();
+            const mutation = {
+              operationId: input.operationId,
+              mode: "recovery" as const,
+              wholeOperationProof: "concludeApplyNoEffect" as const,
+            };
+            const priceMinor = selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+            let heldCharge: LedgerHeldCharge | undefined;
+            if (!input.commercialAuthority && priceMinor > 0) {
+              const held = await ledger.hold({
+                organizationId: input.tenantId,
+                reference: input.operationId,
+                amountMinor: priceMinor,
+              });
+              if (!held) {
+                throw new ProviderMutationRecoveryError(
+                  "indeterminate",
+                  undefined,
+                  "insufficient_funds",
+                  402,
+                );
+              }
+              heldCharge = { reference: input.operationId, amountMinor: priceMinor };
+            }
+            let conclusion: Awaited<ReturnType<NonNullable<Provider["concludeApplyNoEffect"]>>>;
+            try {
+              conclusion = await concludeApplyNoEffect.call(provider, {
+                operationId: input.operationId,
+                providerInstallationRef: selection.providerInstallationRef,
+                executionAuthority: input.executionAuthority,
+                offering: structuredClone(selection.technicalOffering),
+                identity: {
+                  tenantRef: input.tenantId,
+                  space: input.space,
+                  name: input.name,
+                  uid: input.resourceUid,
+                },
+              });
+            } catch (error) {
+              throw indeterminateProviderMutationFailure(error);
+            }
+            if (conclusion.phase === "unsupported") {
+              throw new ProviderApplyNoEffectUnsupportedError();
+            }
+            const ticket = conclusion;
+            try {
+              // A successful or ordinary failure ticket is inconclusive on this
+              // seam. Only the identity-bound whole-operation proof throws the
+              // terminal refusal consumed by the Host lifecycle below.
+              resultOf(ticket, mutation);
+            } catch (error) {
+              if (error instanceof ProviderMutationWholeOperationRefusalError && heldCharge) {
+                throw new ProviderMutationWholeOperationRefusalError(
+                  error.code,
+                  error.status,
+                  error.publicMessage,
+                  {
+                    action: error.action,
+                    heldCharge,
+                  },
+                );
+              }
+              throw error;
+            }
+            throw new ProviderMutationRecoveryError("indeterminate");
+          },
+        }
+      : {}),
     async apply(input): Promise<TakoformDriverReceipt> {
       if (intrinsicForm(input.form)) {
         const current = await definitiveProviderPreflight(() =>

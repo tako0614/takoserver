@@ -1,6 +1,8 @@
 import type { JsonObject } from "../ports.ts";
 import type {
   ApplyInput,
+  ProviderApplyNoEffectConclusionInput,
+  ProviderApplyNoEffectConclusionResult,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
   ProviderExecutionAuthority,
@@ -141,6 +143,10 @@ export interface CloudflareWorkerBackend {
   apply(input: ApplyInput): Promise<ProviderTicket>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<ProviderTicket>;
+  /** Optional closed create-abort authority owned by the managed backend. */
+  concludeApplyNoEffect?(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<ProviderApplyNoEffectConclusionResult>;
   observe(input: {
     readonly offering: ProviderOffering;
     readonly nativeId: string;

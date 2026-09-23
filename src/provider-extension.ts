@@ -63,6 +63,8 @@ export {
   failedWithoutProviderOperationMutation,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderApplyNoEffectConclusionInput,
+  type ProviderApplyNoEffectConclusionResult,
   type ProviderArtifactConsumption,
   type ProviderArtifactConsumptionInput,
   type ProviderExecutionAuthority,
@@ -119,9 +121,12 @@ export type {
   CloudflareProviderAdoptInput,
   CloudflareProviderAdoptionRecoveryResult,
   CloudflareProviderApplyConvergenceResult,
+  CloudflareProviderApplyNoEffectConclusionResult,
   CloudflareProviderDeleteInput,
   CloudflareProviderExecutorAdoptionAbortEvidence,
   CloudflareProviderExecutorApplyAbortEvidence,
+  CloudflareProviderExecutorApplyNoEffectEvidence,
+  CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence,
   CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
   CloudflareProviderInitialMutationResult,
@@ -136,6 +141,7 @@ export type {
 export {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {

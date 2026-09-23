@@ -3,6 +3,7 @@ import type { ProviderMeterDeployment, ProviderMeterUsage } from "../provider-me
 import type {
   ApplyInput,
   Provider,
+  ProviderApplyNoEffectConclusionInput,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
   ProviderExecutionAuthority,
@@ -60,7 +61,7 @@ export type CloudflareProviderAdoptionRecoveryResult =
 export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA =
   "takoserver.cloudflare-provider-executor-apply-abort@v1" as const;
 
-/** An exact create was durably fenced against every earlier provider invocation. */
+/** Existing convergence proof used by provider-specific create repair. */
 export interface CloudflareProviderExecutorApplyAbortEvidence {
   readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA;
   readonly action: "convergeApply";
@@ -69,13 +70,46 @@ export interface CloudflareProviderExecutorApplyAbortEvidence {
   readonly executionAuthority: ProviderExecutionAuthority;
 }
 
-/** Only mutation-authorized convergence may carry this whole-operation proof. */
 export type CloudflareProviderApplyConvergenceResult =
   | ProviderTicket
   | {
       readonly phase: "failed";
       readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
       readonly executorApplyAbort: CloudflareProviderExecutorApplyAbortEvidence;
+    };
+
+export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA =
+  "takoserver.cloudflare-provider-executor-apply-no-effect@v1" as const;
+
+/** An exact create was durably fenced against every earlier provider invocation. */
+export interface CloudflareProviderExecutorApplyNoEffectEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA;
+  readonly action: "concludeApplyNoEffect";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Trusted only as a pre-attempt applicability answer on the dedicated seam. */
+export interface CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA;
+  readonly action: "unsupported";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only the closed no-effect conclusion seam may carry this proof. */
+export type CloudflareProviderApplyNoEffectConclusionResult =
+  | ProviderTicket
+  | {
+      readonly phase: "failed";
+      readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
+      readonly executorApplyNoEffect: CloudflareProviderExecutorApplyNoEffectEvidence;
+    }
+  | {
+      readonly phase: "unsupported";
+      readonly executorApplyNoEffectUnsupported: CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence;
     };
 
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
@@ -129,6 +163,9 @@ export interface CloudflareProviderExecutorRpc {
   apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<CloudflareProviderApplyConvergenceResult>;
+  concludeApplyNoEffect(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<CloudflareProviderApplyNoEffectConclusionResult>;
   poll(input: CloudflareProviderPollInput): Promise<ProviderTicket>;
   observe(input: CloudflareProviderObserveInput): Promise<ProviderTicket>;
   delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;

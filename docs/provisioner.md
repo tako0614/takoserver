@@ -240,21 +240,43 @@ current invocation, never an older operation's uncertain side effects.
 The [Workflow implementation note](workflow-runtime.md) separates the internal
 instance store from the execution and binding work still required for support.
 
-A create convergence result may instead carry the separate, identity-bound whole-operation no-effect proof,
-but only after the provider durably fences the exact operation against late
-initial effects. The Cloudflare service-binding transport carries this as
-`executorApplyAbort` (`action: convergeApply`), bound to the operation,
-installation, tenant, resource UID, fingerprint, and current execution lease.
-The proxy snapshots that context before awaiting RPC, validates the closed
-envelope, and restores a non-wire proof. Initial calls, read-only recovery,
-polling, updates, and mixed adoption/apply evidence cannot use this proof.
-The Host settles only under its current lease and only when no separately
-prepared migration or declared standard-service slot could have produced an
-effect. A provider's proof does not cover service material issued before the
-provider was called. An indeterminate saga is eligible only
-through this explicit proof path; any priced hold stays reserved until the
-Host's existing atomic failure settlement releases it with the lifecycle.
-This internal recovery contract changes no Form, public API, or database schema.
+A create convergence result may carry the separate, identity-bound
+whole-operation no-effect proof, but only after the provider durably fences the
+exact operation against late initial effects. The Cloudflare service-binding
+transport carries this existing path as `executorApplyAbort` (`action:
+convergeApply`), bound to the operation, installation, tenant, resource UID,
+fingerprint, and current execution lease. The proxy snapshots that context
+before awaiting RPC, validates the closed envelope, and restores a non-wire
+proof. Initial calls, read-only recovery, polling, updates, and mixed
+adoption/apply evidence cannot use this proof.
+
+An accepted create with a dispatched, indeterminate saga, no receipt, no
+provider handle, no incumbent, and an immutable accepted provider selection may
+instead enter the dedicated `concludeApplyNoEffect` capability before current
+relation and readiness projections are revalidated. Its closed input contains
+only the exact operation, installation, Offering, resource identity, and
+current execution authority; it does not send desired spec, relations, runtime
+inputs, service material, or migration state. Cloudflare carries the result as
+`executorApplyNoEffect`. Only its exact lease-bound whole-operation proof may
+fail the original operation. An exact `unsupported` envelope means the
+provider did not enter the conclusion attempt and permits the existing
+convergence path; a throw, malformed response, ordinary ticket, or uncertain
+attempt remains held. A selected provider that does not implement the optional
+capability is likewise unsupported before invocation, while a missing selected
+provider remains indeterminate.
+
+The Host never asks for that conclusion when a separately prepared SQLite
+migration or declared standard-service slot could have produced an effect. A
+provider-only proof does not cover service material issued before the provider
+was called. An accepted runtime Binding route and a `WorkerEndpoint` also use
+the ordinary convergence path: extension callbacks or Host-owned endpoint
+reservation/assignment work may have preceded the provider invocation, so a
+provider-only conclusion cannot prove the whole attempt idle. A conclusive
+result atomically fails the deferred operation and retires only its saga,
+effect, dependency and holder claims, and uncommitted incarnation; it is not a
+successful create. Priced and zero-price conclusions use the same atomic
+lifecycle batch, with any priced hold released in that batch. This internal
+recovery contract changes no Form, public API, or database schema.
 
 Accepted, unresolved applies are future-portable only when admission stored the
 closed accepted-authority summary introduced by migration 0061. A resume still
