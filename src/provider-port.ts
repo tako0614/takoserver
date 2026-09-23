@@ -236,6 +236,29 @@ export type ProviderApplyNoEffectConclusionResult =
   | ProviderTicket
   | { readonly phase: "unsupported" };
 
+/**
+ * Closed authority for compensating one already-dispatched accepted create.
+ *
+ * Compensation is a provider mutation, not no-effect proof. This envelope is
+ * deliberately limited to immutable operation, placement, resource identity,
+ * and the current Host lease; it cannot describe a new desired apply.
+ */
+export interface ProviderApplyCompensationInput {
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+  readonly offering: ProviderOffering;
+  readonly identity: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly name: string;
+    readonly uid: string;
+  };
+}
+
+/** `unsupported` is valid only before the compensation attempt begins. */
+export type ProviderApplyCompensationResult = ProviderTicket | { readonly phase: "unsupported" };
+
 export interface ApplyInput extends ProviderMutationInput {
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
@@ -520,6 +543,12 @@ export interface Provider {
     input: ProviderApplyNoEffectConclusionInput,
   ): Promise<ProviderApplyNoEffectConclusionResult>;
   /**
+   * Reverses and durably fences provider effects for one exact accepted create.
+   * A conclusive failure is distinct from no-effect proof because the original
+   * effect and its compensation must remain visible in the Host lifecycle.
+   */
+  compensateApply?(input: ProviderApplyCompensationInput): Promise<ProviderApplyCompensationResult>;
+  /**
    * Mutating convergence for an apply command whose durable Host dispatch may
    * already have crossed the provider boundary. The Host calls this only while
    * holding the exact operation lease. Implementations must key every effect
@@ -657,6 +686,15 @@ const mutationFreeProviderRefusals = new WeakMap<object, string>();
  */
 const wholeOperationMutationFreeProviderRefusals = new WeakMap<object, string>();
 
+/**
+ * Non-wire proof that the named operation's provider effects were durably
+ * compensated and fenced against later completion. Effects did happen: this
+ * proof must never be consumed as an invocation- or operation-wide no-mutation
+ * refusal. Producers retain the original effect and compensation evidence in
+ * their own durable authority before minting this identity-bound ticket.
+ */
+const compensatedProviderOperationFailures = new WeakMap<object, string>();
+
 export function failedWithoutProviderMutation(
   operationId: string,
   code: ProviderFailure["code"],
@@ -698,6 +736,28 @@ export function providerFailureProvesWholeOperationNoMutation(
     ticket.phase === "failed" &&
     !ticket.failure.retryable &&
     wholeOperationMutationFreeProviderRefusals.get(ticket) === operationId
+  );
+}
+
+export function failedAfterProviderOperationCompensation(
+  operationId: string,
+  code: ProviderFailure["code"],
+  message: string,
+): ProviderTicket {
+  const ticket = failed(code, message, false);
+  compensatedProviderOperationFailures.set(ticket, operationId);
+  return ticket;
+}
+
+/** Only the dedicated compensation recovery seam may consume this proof. */
+export function providerFailureProvesWholeOperationCompensated(
+  ticket: ProviderTicket,
+  operationId: string,
+): boolean {
+  return (
+    ticket.phase === "failed" &&
+    !ticket.failure.retryable &&
+    compensatedProviderOperationFailures.get(ticket) === operationId
   );
 }
 

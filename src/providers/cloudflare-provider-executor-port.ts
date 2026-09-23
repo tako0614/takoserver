@@ -3,6 +3,7 @@ import type { ProviderMeterDeployment, ProviderMeterUsage } from "../provider-me
 import type {
   ApplyInput,
   Provider,
+  ProviderApplyCompensationInput,
   ProviderApplyNoEffectConclusionInput,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
@@ -112,6 +113,40 @@ export type CloudflareProviderApplyNoEffectConclusionResult =
       readonly executorApplyNoEffectUnsupported: CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence;
     };
 
+export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA =
+  "takoserver.cloudflare-provider-executor-apply-compensation@v1" as const;
+
+/** Durable whole-operation proof emitted only after exact apply compensation. */
+export interface CloudflareProviderExecutorApplyCompensationEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA;
+  readonly action: "compensateApply";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Trusted only when compensation was rejected before its first write. */
+export interface CloudflareProviderExecutorApplyCompensationUnsupportedEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA;
+  readonly action: "unsupported";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only the closed compensation seam may carry compensated proof. */
+export type CloudflareProviderApplyCompensationResult =
+  | ProviderTicket
+  | {
+      readonly phase: "failed";
+      readonly failure: Omit<ProviderFailure, "retryable"> & { readonly retryable: false };
+      readonly executorApplyCompensation: CloudflareProviderExecutorApplyCompensationEvidence;
+    }
+  | {
+      readonly phase: "unsupported";
+      readonly executorApplyCompensationUnsupported: CloudflareProviderExecutorApplyCompensationUnsupportedEvidence;
+    };
+
 export type CloudflareProviderObserveInput = Parameters<Provider["observe"]>[0];
 export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
 export type CloudflareProviderRecoverDeleteInput = Parameters<
@@ -166,6 +201,9 @@ export interface CloudflareProviderExecutorRpc {
   concludeApplyNoEffect(
     input: ProviderApplyNoEffectConclusionInput,
   ): Promise<CloudflareProviderApplyNoEffectConclusionResult>;
+  compensateApply(
+    input: ProviderApplyCompensationInput,
+  ): Promise<CloudflareProviderApplyCompensationResult>;
   poll(input: CloudflareProviderPollInput): Promise<ProviderTicket>;
   observe(input: CloudflareProviderObserveInput): Promise<ProviderTicket>;
   delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;

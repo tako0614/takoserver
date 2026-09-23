@@ -237,6 +237,7 @@ export class CloudflareProvider implements Provider {
   >;
   readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
   readonly concludeApplyNoEffect?: NonNullable<Provider["concludeApplyNoEffect"]>;
+  readonly compensateApply?: NonNullable<Provider["compensateApply"]>;
   readonly #accountId: string;
   readonly #origin: string;
   readonly #artifacts: ArtifactBytes;
@@ -303,6 +304,17 @@ export class CloudflareProvider implements Provider {
           return { phase: "unsupported" };
         }
         return await concludeApplyNoEffect.call(noEffectBackend, input);
+      };
+    }
+    const compensateApply = noEffectBackend?.compensateApply;
+    if (noEffectBackend && compensateApply) {
+      this.compensateApply = async (input) => {
+        if (!noEffectBackend.owns(input.offering)) {
+          // The managed compensation seam has not been entered. Ordinary
+          // Cloudflare offerings retain their existing convergence behavior.
+          return { phase: "unsupported" };
+        }
+        return await compensateApply.call(noEffectBackend, input);
       };
     }
     this.workerEndpointOriginReservations = {
@@ -2993,6 +3005,7 @@ const REQUIRED_WORKER_BACKEND_METHODS = [
 
 const OPTIONAL_WORKER_BACKEND_METHODS = [
   "concludeApplyNoEffect",
+  "compensateApply",
   "adopt",
   "recoverAdopt",
   "readSqliteMigrationLedger",

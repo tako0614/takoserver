@@ -4,19 +4,23 @@ import {
   failed,
   failedWithoutProviderMutation,
   type Provider,
+  type ProviderApplyCompensationInput,
   type ProviderApplyNoEffectConclusionInput,
   type ProviderExecutionAuthority,
   type ProviderOffering,
   type ProviderTicket,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationCompensated,
   providerFailureProvesWholeOperationNoMutation,
 } from "../src/provider-port.ts";
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
   type CloudflareProviderAdoptionRecoveryResult,
+  type CloudflareProviderApplyCompensationResult,
   type CloudflareProviderApplyConvergenceResult,
   type CloudflareProviderApplyNoEffectConclusionResult,
   type CloudflareProviderExecutorRpc,
@@ -460,6 +464,31 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
       "initial proof on adoption recovery",
       "Provider executor returned invalid adoption-abort evidence",
     );
+
+    const compensationInput = applyCompensationInput();
+    const compensationProof = applyCompensationFor(compensationInput);
+    const compensationUnsupported = applyCompensationUnsupportedFor(compensationInput);
+    for (const [name, evidence] of [
+      ["proof", compensationProof],
+      ["unsupported", compensationUnsupported],
+    ] as const) {
+      const initialCompensation = await createProxy(
+        createBinding(() => evidence as unknown as CloudflareProviderInitialMutationResult),
+      ).apply(makeInput("apply"));
+      expectUnavailable(initialCompensation, `compensation ${name} on initial apply`);
+
+      const adoptionCompensation = await createProxy(
+        createBinding(
+          () => failed("unavailable", "unused", true),
+          evidence as unknown as ProviderTicket,
+        ),
+      ).recoverAdopt(makeAdoptionRecoveryInput());
+      expectUnavailable(
+        adoptionCompensation,
+        `compensation ${name} on adoption recovery`,
+        "Provider executor returned invalid adoption-abort evidence",
+      );
+    }
   });
 
   test("leaves ordinary recoverAdopt tickets conservative", async () => {
@@ -534,10 +563,86 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
       failure: { code: "unavailable", retryable: true },
     });
   });
+
+  test("restores compensated proof only for the exact dedicated lease-bound call", async () => {
+    const input = applyCompensationInput();
+    const exact = applyCompensationFor(input);
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.compensateApply = async () => structuredClone(exact);
+    const ticket = await createProxy(binding).compensateApply(input);
+    expect(ticket).toEqual({
+      phase: "failed",
+      failure: {
+        code: "conflict",
+        message: "the exact accepted create was durably compensated",
+        retryable: false,
+      },
+    });
+    expect(ticket.phase).toBe("failed");
+    if (ticket.phase !== "failed") throw new Error("expected failed ticket");
+    expect(providerFailureProvesWholeOperationCompensated(ticket, input.operationId)).toBe(true);
+    expect(providerFailureProvesWholeOperationNoMutation(ticket, input.operationId)).toBe(false);
+
+    for (const mutate of [
+      (value: MutableApplyCompensation) => (value.executorApplyCompensation.operationId = "wrong"),
+      (value: MutableApplyCompensation) =>
+        (value.executorApplyCompensation.executionAuthority.leaseToken = "wrong"),
+      (value: MutableApplyCompensation) =>
+        (value.executorApplyCompensation.action = "concludeApplyNoEffect"),
+      (value: MutableApplyCompensation) => (value.extra = true),
+    ]) {
+      const malformed = structuredClone(exact) as unknown as MutableApplyCompensation;
+      mutate(malformed);
+      binding.compensateApply = async () =>
+        malformed as unknown as CloudflareProviderApplyCompensationResult;
+      const rejected = await createProxy(binding).compensateApply(input);
+      expect(rejected).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+      if (rejected.phase === "unsupported") throw new Error("malformed proof was accepted");
+      expect(providerFailureProvesWholeOperationCompensated(rejected, input.operationId)).toBe(
+        false,
+      );
+    }
+  });
+
+  test("accepts compensation unsupported only on its dedicated seam", async () => {
+    const input = applyCompensationInput();
+    const unsupported = applyCompensationUnsupportedFor(input);
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.compensateApply = async () => structuredClone(unsupported);
+    expect(await createProxy(binding).compensateApply(input)).toEqual({ phase: "unsupported" });
+
+    const spoofed = structuredClone(unsupported);
+    spoofed.executorApplyCompensationUnsupported.executionAuthority.fingerprint = "wrong";
+    binding.compensateApply = async () => spoofed;
+    expect(await createProxy(binding).compensateApply(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+
+    binding.concludeApplyNoEffect = async () =>
+      structuredClone(unsupported) as unknown as CloudflareProviderApplyNoEffectConclusionResult;
+    const wrongSeam = await createProxy(binding).concludeApplyNoEffect(applyNoEffectInput());
+    expect(wrongSeam).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+  });
 });
 
 interface MutableApplyNoEffect {
   executorApplyNoEffect: {
+    operationId: unknown;
+    action: unknown;
+    executionAuthority: { leaseToken: unknown };
+  };
+  extra?: unknown;
+}
+
+interface MutableApplyCompensation {
+  executorApplyCompensation: {
     operationId: unknown;
     action: unknown;
     executionAuthority: { leaseToken: unknown };
@@ -580,6 +685,49 @@ function applyNoEffectUnsupportedFor(input: ProviderApplyNoEffectConclusionInput
     phase: "unsupported" as const,
     executorApplyNoEffectUnsupported: {
       schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
+      action: "unsupported" as const,
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: { ...input.executionAuthority },
+    },
+  };
+}
+
+function applyCompensationInput(): ProviderApplyCompensationInput {
+  return {
+    operationId: "operation-compensation-1",
+    providerInstallationRef: installationId,
+    executionAuthority: { ...authority },
+    offering,
+    identity: { ...identity, uid: authority.resourceUid },
+  };
+}
+
+function applyCompensationFor(
+  input: ProviderApplyCompensationInput,
+): CloudflareProviderApplyCompensationResult {
+  return {
+    phase: "failed",
+    failure: {
+      code: "conflict",
+      message: "the exact accepted create was durably compensated",
+      retryable: false,
+    },
+    executorApplyCompensation: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
+      action: "compensateApply",
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: { ...input.executionAuthority },
+    },
+  };
+}
+
+function applyCompensationUnsupportedFor(input: ProviderApplyCompensationInput) {
+  return {
+    phase: "unsupported" as const,
+    executorApplyCompensationUnsupported: {
+      schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
       action: "unsupported" as const,
       operationId: input.operationId,
       providerInstallationRef: input.providerInstallationRef,
@@ -736,6 +884,7 @@ function createBinding(
     recoverApply: recovery,
     convergeApply: recovery,
     concludeApplyNoEffect: recovery,
+    compensateApply: recovery,
     poll: recovery,
     observe: recovery,
     delete: (input) => initial("delete", input),

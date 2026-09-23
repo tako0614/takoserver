@@ -1,6 +1,8 @@
 import type { JsonObject } from "../ports.ts";
 import type {
   ApplyInput,
+  ProviderApplyCompensationInput,
+  ProviderApplyCompensationResult,
   ProviderApplyNoEffectConclusionInput,
   ProviderApplyNoEffectConclusionResult,
   ProviderArtifactConsumption,
@@ -147,6 +149,8 @@ export interface CloudflareWorkerBackend {
   concludeApplyNoEffect?(
     input: ProviderApplyNoEffectConclusionInput,
   ): Promise<ProviderApplyNoEffectConclusionResult>;
+  /** Optional closed compensation authority owned by the managed backend. */
+  compensateApply?(input: ProviderApplyCompensationInput): Promise<ProviderApplyCompensationResult>;
   observe(input: {
     readonly offering: ProviderOffering;
     readonly nativeId: string;

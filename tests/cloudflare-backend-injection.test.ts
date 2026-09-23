@@ -8,6 +8,7 @@ import {
   type CloudflareWorkerBackend,
   type CloudflareWorkerBackendFactoryContext,
   derivedProviderResourceIncarnationName,
+  type ProviderApplyCompensationInput,
   type ProviderApplyNoEffectConclusionInput,
   type ProviderOffering,
 } from "@takoserver/core/provider-extension";
@@ -217,6 +218,55 @@ test("CloudflareProvider delegates no-effect conclusion only to its owning manag
     }),
   ).resolves.toEqual({ phase: "unsupported" });
   expect(conclusionCalls).toBe(1);
+});
+
+test("CloudflareProvider delegates compensation only to its owning managed backend", async () => {
+  let received: ProviderApplyCompensationInput | undefined;
+  let compensationCalls = 0;
+  const compensation = { phase: "unsupported" as const };
+  const injectedBackend: CloudflareWorkerBackend = {
+    ...backend,
+    owns: (candidate) => candidate.id === offering.id,
+    async compensateApply(input) {
+      compensationCalls += 1;
+      received = input;
+      return compensation;
+    },
+  };
+  const provider = new CloudflareProvider({
+    ...baseOptions(),
+    workerBackend: { kind: "workers-for-platforms", create: () => injectedBackend },
+  });
+  const input: ProviderApplyCompensationInput = {
+    operationId: "managed-compensation-operation",
+    providerInstallationRef: "cloudflare.injected.primary",
+    executionAuthority: {
+      tenantId: "tenant-injected",
+      resourceUid: "worker-injected",
+      leaseToken: "provider-compensation-lease",
+      fingerprint: '{"request":"accepted"}',
+    },
+    offering,
+    identity: {
+      tenantRef: "tenant-injected",
+      space: "default",
+      name: "worker",
+      uid: "worker-injected",
+    },
+  };
+  if (!provider.compensateApply) throw new Error("managed compensation port is missing");
+
+  await expect(provider.compensateApply(input)).resolves.toBe(compensation);
+  expect(received).toBe(input);
+  expect(compensationCalls).toBe(1);
+
+  await expect(
+    provider.compensateApply({
+      ...input,
+      offering: { ...offering, id: "cloudflare.injected.unmanaged" },
+    }),
+  ).resolves.toEqual({ phase: "unsupported" });
+  expect(compensationCalls).toBe(1);
 });
 
 test("managed backend context delegates zone selection with existing restrictions and precedence", () => {
