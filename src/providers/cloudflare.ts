@@ -1137,12 +1137,25 @@ export class CloudflareProvider implements Provider {
       };
     }
     if (handle.stage === "prepare") {
-      const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
-        identity: handle.identity,
-        bucketName: handle.bucketName,
-        authorityProof: handle.authorityProof,
-      });
-      if (!prepared.ok) return providerValueTicket(prepared, handle);
+      let prepared: ProviderValue<{
+        readonly state: "draining" | "prepared";
+        readonly authorityProof: string;
+      }>;
+      try {
+        prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+          identity: handle.identity,
+          bucketName: handle.bucketName,
+          authorityProof: handle.authorityProof,
+        });
+      } catch {
+        return managedObjectDestroyTicketWithHandle(
+          failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", true),
+          { ...handle, stage: "prepare" },
+        );
+      }
+      if (!prepared.ok) {
+        return providerValueTicket(prepared, { ...handle, stage: "prepare" });
+      }
       const next = { ...handle, authorityProof: prepared.value.authorityProof };
       return prepared.value.state === "draining"
         ? running(managedObjectDestroyHandleValue(next), 2_000)
@@ -1520,7 +1533,10 @@ export class CloudflareProvider implements Provider {
           handle: managedObjectDestroyHandleValue({ ...handle, stage: "prepare" }),
         };
       }
-      return removed.ticket;
+      return managedObjectDestroyTicketWithHandle(removed.ticket, {
+        ...handle,
+        stage: "prepare",
+      });
     }
     const present = await this.#r2BucketPresent(handle.bucketName);
     if (present === null || present === true) {
@@ -1533,17 +1549,24 @@ export class CloudflareProvider implements Provider {
     handle: ManagedObjectDestroyHandle,
   ): Promise<ProviderTicket> {
     if (!this.#workerBackend?.commitManagedObjectBucketDestroy) {
-      return failed(
-        "unavailable",
-        "the managed ObjectBucket destroy authority is unavailable",
-        false,
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", false),
+        { ...handle, stage: "commit" },
       );
     }
-    const committed = await this.#workerBackend.commitManagedObjectBucketDestroy({
-      identity: handle.identity,
-      bucketName: handle.bucketName,
-      authorityProof: handle.authorityProof,
-    });
+    let committed: ProviderValue<{ readonly destroyed: true }>;
+    try {
+      committed = await this.#workerBackend.commitManagedObjectBucketDestroy({
+        identity: handle.identity,
+        bucketName: handle.bucketName,
+        authorityProof: handle.authorityProof,
+      });
+    } catch {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", true),
+        { ...handle, stage: "commit" },
+      );
+    }
     if (!committed.ok) {
       return providerValueTicket(committed, { ...handle, stage: "commit" });
     }
@@ -4094,13 +4117,30 @@ function providerValueTicket<T>(
   value: Extract<ProviderValue<T>, { readonly ok: false }>,
   handle?: ManagedObjectDestroyHandle,
 ): ProviderTicket {
-  return value.failure.retryable && handle
+  return handle
     ? {
         phase: "failed",
         failure: value.failure,
         handle: managedObjectDestroyHandleValue(handle),
       }
     : { phase: "failed", failure: value.failure };
+}
+
+function managedObjectDestroyTicketWithHandle(
+  ticket: ProviderTicket,
+  handle: ManagedObjectDestroyHandle,
+): ProviderTicket {
+  return ticket.phase === "failed"
+    ? { ...ticket, handle: managedObjectDestroyHandleValue(handle) }
+    : {
+        phase: "failed",
+        failure: {
+          code: "unavailable",
+          message: "the managed ObjectBucket delete outcome is indeterminate",
+          retryable: true,
+        },
+        handle: managedObjectDestroyHandleValue(handle),
+      };
 }
 
 function base64(bytes: Uint8Array): string {

@@ -1138,6 +1138,129 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     ]);
   });
 
+  test("retains a prepare handle for a definitive native refusal", async () => {
+    const events: string[] = [];
+    let refused = true;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      if (request.method === "DELETE" && refused) {
+        return Response.json(
+          { success: false, errors: [{ message: "forbidden" }] },
+          { status: 403 },
+        );
+      }
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-definitive-refusal";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    if (ticket.phase !== "failed" || !ticket.handle) throw new Error("expected retained handle");
+    expect(ticket.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "DELETE"]);
+
+    refused = false;
+    const finished = await provider.poll({ operationId, handle: ticket.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual(["vacancy", "prepare", "DELETE", "prepare", "DELETE", "GET", "commit"]);
+  });
+
+  test("retains a commit handle for a nonretryable authority refusal", async () => {
+    const events: string[] = [];
+    let commits = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        commits += 1;
+        return commits === 1
+          ? {
+              ok: false,
+              failure: {
+                code: "denied" as const,
+                message: "the managed ObjectBucket commit was refused",
+                retryable: false,
+              },
+            }
+          : { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-commit-refusal";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "the managed ObjectBucket commit was refused",
+        retryable: false,
+      },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(providerFailureProvesNoMutation(refused, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET", "commit"]);
+
+    const finished = await provider.poll({ operationId, handle: refused.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET", "commit", "commit"]);
+  });
+
   test("does not recover a no-handle delete from an active receipt", async () => {
     const events: string[] = [];
     const backend = managedBackend({
