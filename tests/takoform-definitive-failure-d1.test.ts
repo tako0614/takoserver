@@ -17,6 +17,9 @@ import {
 } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
+import { createResourceDependencySet } from "../src/takoform/dependency-fence.ts";
+import { createTakoformStore } from "../src/takoform/store.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const TENANT_PREFIX = "d1-definitive-failure";
@@ -298,10 +301,139 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
   );
 }, 30_000);
 
+test("native D1 compiles every generated compensated-create settlement statement", async () => {
+  await withNativeD1({ failOn: [] }, async ({ sql }) => {
+    const statements = await capturedCompensatedCreateStatements();
+    expect(statements).toHaveLength(10);
+    for (const [index, statement] of statements.entries()) {
+      try {
+        await sql.query(`EXPLAIN ${statement.sql}`, statement.params);
+      } catch (error) {
+        throw new Error(`compensated-create statement ${index + 1} did not compile`, {
+          cause: error,
+        });
+      }
+    }
+  });
+}, 30_000);
+
 interface NativeD1Options {
   readonly recoveryAbort?: boolean;
   readonly failOn: readonly string[];
   readonly injectReleaseConstraint?: boolean;
+}
+
+async function capturedCompensatedCreateStatements() {
+  const operationId = "op_d1_compensation_compile";
+  const tenantId = "tenant_d1_compensation_compile";
+  const resourceUid = "uid_d1_compensation_compile";
+  const targetUid = "uid_d1_compensation_target";
+  const providerLeaseToken = "provider_lease_d1_compensation_compile";
+  const hostLeaseToken = "host_lease_d1_compensation_compile";
+  const relation = {
+    pointer: "/spec/worker",
+    relation: "worker",
+    targetApiVersion: FORM_REF.apiVersion,
+    targetKind: FORM_REF.kind,
+    targetName: "dependency",
+    targetUid,
+    targetRevision: "1",
+    targetFormRef: FORM_REF,
+  } as const;
+  const dependencies = await createResourceDependencySet({
+    tenantId,
+    space: SPACE,
+    holderUid: resourceUid,
+    operationId,
+    relations: [relation],
+  });
+  const selection = {
+    version: TAKOFORM_APPLY_SELECTION_VERSION,
+    kind: "provider",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    technicalOffering: PROVIDER_OFFERING,
+    relations: [
+      {
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid,
+        resource: {
+          apiVersion: FORM_REF.apiVersion,
+          kind: FORM_REF.kind,
+          formRef: FORM_REF,
+          name: relation.targetName,
+          space: SPACE,
+          uid: targetUid,
+          generation: "1",
+          revision: "1",
+        },
+      },
+    ],
+  } as const;
+  const target = {
+    tenantId,
+    space: SPACE,
+    apiVersion: FORM_REF.apiVersion,
+    kind: FORM_REF.kind,
+    name: "compensated-create",
+  } as const;
+  let captured: Parameters<Sql["batch"]>[0] | undefined;
+  const captureSql: Sql = {
+    async query() {
+      return [{ committed: 0 }];
+    },
+    async run() {
+      throw new Error("compensation statement capture does not execute writes");
+    },
+    async batch(statements) {
+      captured = statements;
+      return statements.map(() => ({ rows: [], changes: 1 }));
+    },
+  };
+  const store = createTakoformStore(captureSql, () => NOW);
+  await store.commitDefinitiveProviderMutationFailure({
+    recoveryAction: "compensateApply",
+    saga: {
+      operationId,
+      operationKind: "apply",
+      replayKey: "replay_d1_compensation_compile",
+      tenantId,
+      fingerprint: "fingerprint_d1_compensation_compile",
+      resourceUid,
+      target,
+    },
+    providerLeaseToken,
+    claimOwnerId: hostLeaseToken,
+    operation: "create",
+    compensation: { selection, dependencies },
+    hostOperation: {
+      kind: "deferred",
+      leaseToken: hostLeaseToken,
+      terminalJson: JSON.stringify({ done: true }),
+      operation: {
+        id: operationId,
+        tenantId,
+        principalId: "principal_d1_compensation_compile",
+        operation: "apply",
+        phase: "committing",
+        requestPath: "/compile-only",
+        requestQuery: "",
+        requestHeaders: {},
+        requestBody: "{}",
+        fingerprint: "fingerprint_d1_compensation_compile",
+        replayKey: "replay_d1_compensation_compile",
+        target: { ...target, formRef: FORM_REF },
+        resourceUid,
+        pollsRemaining: 0,
+        leaseToken: hostLeaseToken,
+        leaseUntil: NOW.getTime() + 60_000,
+        createdAt: NOW.toISOString(),
+      },
+    },
+  });
+  if (!captured) throw new Error("compensated-create settlement produced no batch");
+  return captured;
 }
 
 interface NativeD1Observation {
