@@ -1126,11 +1126,15 @@ export class CloudflareProvider implements Provider {
       !this.#workerBackend?.prepareManagedObjectBucketDestroy ||
       !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
-      return failed(
-        "unavailable",
-        "the managed ObjectBucket destroy authority is unavailable",
-        false,
-      );
+      return {
+        phase: "failed",
+        failure: {
+          code: "unavailable",
+          message: "the managed ObjectBucket destroy authority is unavailable",
+          retryable: false,
+        },
+        handle: input.handle,
+      };
     }
     if (handle.stage === "prepare") {
       const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
@@ -1360,7 +1364,8 @@ export class CloudflareProvider implements Provider {
     if (
       !identity ||
       !this.#workerBackend?.managedObjectBucketVacancy ||
-      !this.#workerBackend.prepareManagedObjectBucketDestroy
+      !this.#workerBackend.prepareManagedObjectBucketDestroy ||
+      !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
       return identity
         ? failedWithoutProviderMutation(
@@ -1437,7 +1442,8 @@ export class CloudflareProvider implements Provider {
     if (
       !identity ||
       !this.#workerBackend?.managedObjectBucketReceiptStatus ||
-      !this.#workerBackend.prepareManagedObjectBucketDestroy
+      !this.#workerBackend.prepareManagedObjectBucketDestroy ||
+      !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
       return failed(
         "unavailable",

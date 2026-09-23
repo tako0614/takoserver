@@ -946,6 +946,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
           value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
         };
       },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
     });
     const provider = managedProvider(backend, async () => {
       events.push("native");
@@ -994,6 +995,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
           value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
         };
       },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
     });
     const provider = managedProvider(backend, async () => {
       events.push("native");
@@ -1017,6 +1019,41 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     });
     expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
     expect(events).toEqual(["vacancy"]);
+  });
+
+  test("requires commit authority before an initial managed delete can mutate", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("missing commit authority must prevent native mutation");
+    });
+    const operationId = "op-managed-bucket-missing-commit";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: false },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual([]);
   });
 
   test("retains a prepare handle when R2 refuses an occupied bucket", async () => {
@@ -1070,6 +1107,19 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
     expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
     expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET"]);
 
+    const commit = backend.commitManagedObjectBucketDestroy;
+    if (!commit) throw new Error("expected commit authority");
+    Reflect.deleteProperty(backend, "commitManagedObjectBucketDestroy");
+    const held = await provider.poll({ operationId, handle: refused.handle });
+    expect(held).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: false },
+    });
+    if (held.phase !== "failed") throw new Error("expected retained handle failure");
+    expect(held.handle).toBe(refused.handle);
+    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET"]);
+    backend.commitManagedObjectBucketDestroy = commit;
+
     present = false;
     const finished = await provider.poll({ operationId, handle: refused.handle });
     expect(finished).toMatchObject({
@@ -1108,6 +1158,7 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
         events.push("prepare");
         throw new Error("active receipt must not prepare");
       },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
     });
     const provider = managedProvider(backend, async () => {
       events.push("native");
@@ -1125,6 +1176,48 @@ describe("managed ObjectBucket deletion vacancy gate", () => {
       failure: { code: "unavailable", retryable: true },
     });
     expect(events).toEqual(["status"]);
+  });
+
+  test("does not recover a destroying delete when commit authority is incomplete", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "destroying" as const,
+            receiptCount: 0,
+            operatorReconciliationRequired: 0,
+            repairRequired: true,
+            nextActionAt: null,
+          },
+        };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        throw new Error("missing commit authority must prevent prepare");
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("missing commit authority must prevent native mutation");
+    });
+    const operationId = "op-managed-bucket-missing-commit-recovery";
+    const recovered = await provider.recoverDelete({
+      operationId,
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(recovered, operationId)).toBe(false);
+    expect(events).toEqual([]);
   });
 
   test("reconstructs a no-handle delete only from a destroying repair fence", async () => {
