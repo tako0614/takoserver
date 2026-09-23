@@ -184,6 +184,11 @@ export interface CloudflareWorkerBackend {
     readonly identity: ResourceIdentity;
     readonly bucketName: string;
   }): Promise<ProviderValue<CloudflareManagedObjectBucketReceiptStatus>>;
+  /** Read-only vacancy proof required before a managed ObjectBucket destroy. */
+  managedObjectBucketVacancy?(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+  }): Promise<ProviderValue<{ readonly empty: boolean }>>;
   prepareManagedObjectBucketDestroy?(input: {
     readonly identity: ResourceIdentity;
     readonly bucketName: string;

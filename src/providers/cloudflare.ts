@@ -1027,7 +1027,11 @@ export class CloudflareProvider implements Provider {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
-    if (native.kind === "r2" && this.#workerBackend?.prepareManagedObjectBucketDestroy) {
+    if (
+      native.kind === "r2" &&
+      (this.#workerBackend?.managedObjectBucketVacancy ||
+        this.#workerBackend?.prepareManagedObjectBucketDestroy)
+    ) {
       return await this.#beginManagedObjectBucketDestroy(input, native.name);
     }
     if (native.kind === "version") {
@@ -1177,6 +1181,16 @@ export class CloudflareProvider implements Provider {
     }
     if (input.providerHandle) {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
+    }
+    const native = parseNativeId(input.nativeId);
+    if (
+      native?.kind === "r2" &&
+      (providerKind(input.offering) === "ObjectBucket" ||
+        providerKind(input.offering) === "object_bucket") &&
+      (this.#workerBackend?.managedObjectBucketReceiptStatus ||
+        this.#workerBackend?.prepareManagedObjectBucketDestroy)
+    ) {
+      return await this.#recoverManagedObjectBucketDestroy(input, native.name);
     }
     const observed = await this.observe({
       offering: input.offering,
@@ -1343,8 +1357,118 @@ export class CloudflareProvider implements Provider {
     bucketName: string,
   ): Promise<ProviderTicket> {
     const identity = exactManagedObjectDestroyIdentity(input.identity);
-    if (!identity || !this.#workerBackend?.prepareManagedObjectBucketDestroy) {
-      return failed("invalid_spec", "the managed ObjectBucket destruction identity is incomplete");
+    if (
+      !identity ||
+      !this.#workerBackend?.managedObjectBucketVacancy ||
+      !this.#workerBackend.prepareManagedObjectBucketDestroy
+    ) {
+      return identity
+        ? failedWithoutProviderMutation(
+            input.operationId,
+            "unavailable",
+            "the managed ObjectBucket destroy authority is unavailable",
+          )
+        : failed("invalid_spec", "the managed ObjectBucket destruction identity is incomplete");
+    }
+    let vacancy: ProviderValue<{ readonly empty: boolean }>;
+    try {
+      vacancy = await this.#workerBackend.managedObjectBucketVacancy({
+        identity,
+        bucketName,
+      });
+    } catch {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "unavailable",
+        "the managed ObjectBucket vacancy authority is unavailable",
+      );
+    }
+    if (!vacancy.ok) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        vacancy.failure.code,
+        vacancy.failure.message,
+      );
+    }
+    const empty = managedObjectBucketVacancyValue(vacancy.value);
+    if (empty === null) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "provider_error",
+        "the managed ObjectBucket vacancy readback is malformed",
+      );
+    }
+    if (!empty) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "occupied",
+        "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
+      );
+    }
+    const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+      identity,
+      bucketName,
+    });
+    if (!prepared.ok) return providerValueTicket(prepared);
+    const handle: ManagedObjectDestroyHandle = {
+      schema: MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA,
+      stage: "prepare",
+      operationId: input.operationId,
+      nativeId: input.nativeId,
+      bucketName,
+      authorityProof: prepared.value.authorityProof,
+      identity,
+    };
+    return prepared.value.state === "draining"
+      ? running(managedObjectDestroyHandleValue(handle), 2_000)
+      : await this.#deletePreparedManagedObjectBucket({ ...handle, stage: "confirm" });
+  }
+
+  async #recoverManagedObjectBucketDestroy(
+    input: {
+      readonly operationId: string;
+      readonly nativeId: string;
+      readonly identity: ResourceIdentity;
+    },
+    bucketName: string,
+  ): Promise<ProviderTicket> {
+    const identity = exactManagedObjectDestroyIdentity(input.identity);
+    if (
+      !identity ||
+      !this.#workerBackend?.managedObjectBucketReceiptStatus ||
+      !this.#workerBackend.prepareManagedObjectBucketDestroy
+    ) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
+    }
+    let status: ProviderValue<CloudflareManagedObjectBucketReceiptStatus>;
+    try {
+      status = await this.#workerBackend.managedObjectBucketReceiptStatus({
+        identity,
+        bucketName,
+      });
+    } catch {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
+    }
+    if (
+      !status.ok ||
+      !managedObjectBucketReceiptStatusValue(status.value) ||
+      status.value.lifecycle !== "destroying" ||
+      !status.value.repairRequired
+    ) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
     }
     const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
       identity,
@@ -1378,10 +1502,17 @@ export class CloudflareProvider implements Provider {
         (removed.status === 400 || removed.status === 409) &&
         (await this.#r2BucketPresent(handle.bucketName)) === true
       ) {
-        return failed(
-          "conflict",
-          "the bucket is still present and contains objects; empty it and destroy again",
-        );
+        return {
+          phase: "failed",
+          failure: {
+            code: "occupied",
+            message:
+              "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+              "delete its contents and destroy again",
+            retryable: false,
+          },
+          handle: managedObjectDestroyHandleValue({ ...handle, stage: "prepare" }),
+        };
       }
       return removed.ticket;
     }
@@ -2785,6 +2916,7 @@ const OPTIONAL_WORKER_BACKEND_METHODS = [
   "managedScheduleReconciliationStatus",
   "reconcileManagedSchedules",
   "managedObjectBucketReceiptStatus",
+  "managedObjectBucketVacancy",
   "prepareManagedObjectBucketDestroy",
   "commitManagedObjectBucketDestroy",
 ] as const;
@@ -3920,6 +4052,36 @@ function managedObjectBucketValue(value: unknown): value is string {
     !value.includes("..") &&
     !/^\d+(?:\.\d+){3}$/u.test(value)
   );
+}
+
+function managedObjectBucketVacancyValue(value: unknown): boolean | null {
+  const object = record(value);
+  if (!object || Object.keys(object).length !== 1 || typeof object.empty !== "boolean") {
+    return null;
+  }
+  return object.empty;
+}
+
+function managedObjectBucketReceiptStatusValue(
+  value: unknown,
+): value is CloudflareManagedObjectBucketReceiptStatus {
+  const object = record(value);
+  if (
+    !object ||
+    Object.keys(object).sort().join(",") !==
+      "lifecycle,nextActionAt,operatorReconciliationRequired,receiptCount,repairRequired" ||
+    (object.lifecycle !== "active" && object.lifecycle !== "destroying") ||
+    !Number.isSafeInteger(object.receiptCount) ||
+    Number(object.receiptCount) < 0 ||
+    !Number.isSafeInteger(object.operatorReconciliationRequired) ||
+    Number(object.operatorReconciliationRequired) < 0 ||
+    typeof object.repairRequired !== "boolean" ||
+    (object.nextActionAt !== null &&
+      (!Number.isSafeInteger(object.nextActionAt) || Number(object.nextActionAt) < 0))
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function providerValueTicket<T>(

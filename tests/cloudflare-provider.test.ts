@@ -871,6 +871,315 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
   });
 });
 
+describe("managed ObjectBucket deletion vacancy gate", () => {
+  const MANAGED_IDENTITY = {
+    ...IDENTITY,
+    uid: "res_media_managed",
+    incarnationId: "dep_media_managed",
+    generation: "1",
+  } as const;
+  const MANAGED_NATIVE_ID = "r2:ts-managed-bucket";
+
+  function managedBackend(
+    overrides: Partial<CloudflareWorkerBackend> = {},
+  ): CloudflareWorkerBackend {
+    const unavailable = () => ({
+      phase: "failed" as const,
+      failure: { code: "unavailable" as const, message: "unused backend stub", retryable: true },
+    });
+    return {
+      kind: "workers-for-platforms",
+      deriveOrigin: async () => ({ canonicalPublicOrigin: "https://managed.example.test" }),
+      owns: () => false,
+      apply: async () => unavailable(),
+      recoverApply: async () => unavailable(),
+      convergeApply: async () => unavailable(),
+      observe: async () => unavailable(),
+      delete: async () => unavailable(),
+      recoverDelete: async () => unavailable(),
+      createNativeReadbackDescriptor: () => ({
+        apiVersion: "providers.takoserver.com/readback/v1",
+        provider: "cloudflare.test",
+        kind: "ObjectBucket",
+        nativeId: MANAGED_NATIVE_ID,
+        data: {},
+      }),
+      verifyNativeAbsence: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+      verifyArtifactConsumption: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+      ...overrides,
+    };
+  }
+
+  function managedProvider(
+    backend: CloudflareWorkerBackend,
+    fetch: (request: Request) => Promise<Response>,
+  ): CloudflareProvider {
+    return new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [BUCKET],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerBackend: { kind: "workers-for-platforms", create: () => backend },
+      fetch,
+    });
+  }
+
+  test("refuses an occupied bucket before prepare or native delete", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async (input) => {
+        events.push("vacancy");
+        expect(input.identity).toEqual(MANAGED_IDENTITY);
+        return { ok: true, value: { empty: false } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("occupied vacancy gate must not call Cloudflare");
+    });
+    const operationId = "op-managed-bucket-occupied";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "occupied",
+        retryable: false,
+        message:
+          "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual(["vacancy"]);
+  });
+
+  test("projects a vacancy authority failure as a no-mutation refusal", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return {
+          ok: false,
+          failure: {
+            code: "unavailable" as const,
+            message: "the managed ObjectBucket vacancy authority is unavailable",
+            retryable: true,
+          },
+        };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("vacancy failure must not call Cloudflare");
+    });
+    const operationId = "op-managed-bucket-vacancy-unavailable";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "unavailable",
+        message: "the managed ObjectBucket vacancy authority is unavailable",
+        retryable: false,
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual(["vacancy"]);
+  });
+
+  test("retains a prepare handle when R2 refuses an occupied bucket", async () => {
+    const events: string[] = [];
+    let present = true;
+    let deletes = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      if (request.method === "DELETE") {
+        deletes += 1;
+        return Response.json(
+          deletes === 1
+            ? { success: false, errors: [{ message: "bucket not empty" }] }
+            : { success: true, errors: [], result: {} },
+          { status: deletes === 1 ? 400 : 200 },
+        );
+      }
+      return present
+        ? Response.json({ success: true, errors: [], result: { name: "ts-managed-bucket" } })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-race";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(events).toEqual(["vacancy", "prepare", "DELETE", "GET"]);
+
+    present = false;
+    const finished = await provider.poll({ operationId, handle: refused.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual([
+      "vacancy",
+      "prepare",
+      "DELETE",
+      "GET",
+      "prepare",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
+  });
+
+  test("does not recover a no-handle delete from an active receipt", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "active" as const,
+            receiptCount: 0,
+            operatorReconciliationRequired: 0,
+            repairRequired: false,
+            nextActionAt: null,
+          },
+        };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        throw new Error("active receipt must not prepare");
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("active receipt must not call Cloudflare");
+    });
+    const recovered = await provider.recoverDelete({
+      operationId: "op-managed-bucket-active-recovery",
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(events).toEqual(["status"]);
+  });
+
+  test("reconstructs a no-handle delete only from a destroying repair fence", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "destroying" as const,
+            receiptCount: 2,
+            operatorReconciliationRequired: 1,
+            repairRequired: true,
+            nextActionAt: null,
+          },
+        };
+      },
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: false } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const recovered = await provider.recoverDelete({
+      operationId: "op-managed-bucket-destroying-recovery",
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(recovered).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual(["status", "prepare", "DELETE", "GET", "commit"]);
+  });
+});
+
 /**
  * Import is the one lifecycle whose native address comes from the caller. The
  * account credential this adapter holds reaches every object in the operator's
