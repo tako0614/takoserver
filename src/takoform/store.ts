@@ -5864,38 +5864,43 @@ function deploymentMutationSql(
       ],
     };
   }
-  return {
-    fence: commonFence,
-    fenceParams: commonParams,
-    statements: [
-      {
-        sql: mutation.operationId
-          ? `UPDATE tf_resource_deployments
-              SET state = 'deleted',
-                    outputs_json = json_set(
-                    outputs_json,
-                    '$.__takoserver.deleteOperationId', ?,
-                    '$.__takoserver.resourceUid', ?,
-                    '$.__takoserver.space', ?,
-                    '$.__takoserver.name', ?
-                  ),
-                  updated_at = ?
-              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
-          : `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
-              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
-        params: mutation.operationId
-          ? [
-              mutation.operationId,
-              mutation.resourceUid ?? "",
-              mutation.space ?? "",
-              mutation.name ?? "",
-              timestamp,
-              ...commonParams,
-            ]
-          : [timestamp, ...commonParams],
-      },
-    ],
-  };
+  if (mutation.kind === "delete") {
+    return {
+      fence: commonFence,
+      fenceParams: commonParams,
+      statements: [
+        {
+          sql: mutation.operationId
+            ? `UPDATE tf_resource_deployments
+                SET state = 'deleted',
+                      outputs_json = json_set(
+                      outputs_json,
+                      '$.__takoserver.deleteOperationId', ?,
+                      '$.__takoserver.resourceUid', ?,
+                      '$.__takoserver.space', ?,
+                      '$.__takoserver.name', ?
+                    ),
+                    updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
+            : `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+          params: mutation.operationId
+            ? [
+                mutation.operationId,
+                mutation.resourceUid ?? "",
+                mutation.space ?? "",
+                mutation.name ?? "",
+                timestamp,
+                ...commonParams,
+              ]
+            : [timestamp, ...commonParams],
+        },
+      ],
+    };
+  }
+  const exhaustive: never = mutation;
+  void exhaustive;
+  throw new TypeError("unknown resource deployment mutation kind");
 }
 
 function deferredOperation(row: Row): DeferredOperationRecord {

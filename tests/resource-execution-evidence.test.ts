@@ -356,6 +356,493 @@ describe("Takoserver Resource execution evidence", () => {
     }
   });
 
+  test("rejects an unknown deployment receipt kind before changing any commit evidence", async () => {
+    const database = databaseWithEvidenceMigration();
+    const clock = () => new Date(1_000);
+    const baseSql = createSqliteSql(database);
+    let batchCalls = 0;
+    const sql: Sql = {
+      async query(statement, params) {
+        return baseSql.query(statement, params);
+      },
+      async run(statement, params) {
+        return baseSql.run(statement, params);
+      },
+      async batch(statements) {
+        batchCalls += 1;
+        return baseSql.batch(statements);
+      },
+    };
+    const store = createTakoformStore(sql, clock);
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const operationId = "op_unknown_deployment_mutation";
+    const leaseToken = "lease_unknown_deployment_mutation";
+    const replayKey = "replay_unknown_deployment_mutation";
+    const fingerprint = "fingerprint_unknown_deployment_mutation";
+    try {
+      expect(
+        await store.reserveResourceIncarnation({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          address: ADDRESS,
+          formRef: FORM_REF,
+        }),
+      ).toBe(true);
+      await store.commitImmediateMutation({
+        tenantId: TENANT_ID,
+        operationId: "op_create_unknown_deployment_mutation",
+        operation: "create",
+        createdAt: clock().toISOString(),
+        mutation: writeMutation(
+          resource("1", "initial"),
+          null,
+          "op_create_unknown_deployment_mutation",
+        ),
+      });
+      await deployments.create({
+        tenantId: TENANT_ID,
+        id: "dep_unknown_deployment_mutation",
+        resourceUid: RESOURCE_UID,
+        offeringId: "offering.unknown",
+        providerPackRef: "provider.unknown",
+        providerInstallationRef: "provider.unknown.primary",
+        nativeId: "native:g1",
+        state: "active",
+        observed: { generation: 1 },
+        outputs: { endpoint: "g1.example.test" },
+      });
+      const receipt = {
+        observed: { generation: 2 },
+        outputs: {},
+        deploymentMutation: {
+          // Keep every field accepted by the old terminal delete path: only
+          // the discriminator is unknown, so this catches the old catch-all.
+          kind: "future-replace",
+          tenantId: TENANT_ID,
+          deploymentId: "dep_unknown_deployment_mutation",
+          expectedNativeId: "native:g1",
+          nativeId: "native:g2",
+          observed: { generation: 2 },
+          outputs: { endpoint: "g2.example.test" },
+        },
+      } as unknown as TakoformDriverReceipt;
+      await store.acceptProviderMutationSaga({
+        operationId,
+        operationKind: "apply",
+        replayKey,
+        tenantId: TENANT_ID,
+        fingerprint,
+        resourceUid: RESOURCE_UID,
+        target: ADDRESS,
+        acceptedUid: RESOURCE_UID,
+        acceptedGeneration: "1",
+        acceptedRevision: "1",
+      });
+      expect(
+        await store.acquireProviderMutationExecution({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          leaseToken,
+          leaseUntil: 2_000,
+        }),
+      ).toMatchObject({ kind: "acquired", mode: "initial" });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          fingerprint,
+          leaseToken,
+          mode: "initial",
+          selection: {
+            version: TAKOFORM_APPLY_SELECTION_VERSION,
+            kind: "provider",
+            providerPackRef: "provider.unknown",
+            providerInstallationRef: "provider.unknown.primary",
+            technicalOffering: {
+              id: "offering.unknown",
+              kind: "unknown",
+              displayName: "Unknown",
+              form: FORM_REF,
+              providedInterfaces: [],
+              bindingRefs: [],
+              capabilities: ["create", "update", "delete"],
+            },
+            relations: [],
+          },
+        }),
+      ).toMatchObject({ kind: "provider", providerPackRef: "provider.unknown" });
+      expect(
+        await store.recordResourceEffect({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          effectId: operationId,
+          kind: "apply",
+          phase: "planned",
+          operationMode: "initial",
+        }),
+      ).toBe(true);
+      expect(
+        await store.markProviderMutationDispatch({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          leaseToken,
+        }),
+      ).toBe(true);
+      expect(
+        await store.recordResourceEffect({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          effectId: operationId,
+          kind: "apply",
+          phase: "dispatched",
+          operationMode: "initial",
+        }),
+      ).toBe(true);
+      await store.recordProviderMutationReceipt({
+        tenantId: TENANT_ID,
+        operationId,
+        resourceUid: RESOURCE_UID,
+        leaseToken,
+        receipt,
+      });
+
+      const snapshot = () => ({
+        resources: database
+          .query(
+            `SELECT generation, revision, resource_json FROM tf_resources
+             WHERE tenant_id = ? AND uid = ?`,
+          )
+          .all(TENANT_ID, RESOURCE_UID),
+        deployments: database
+          .query(
+            `SELECT tenant_id, id, native_id, native_claimed, state, observed_json, outputs_json
+             FROM tf_resource_deployments ORDER BY tenant_id, id`,
+          )
+          .all(),
+        effects: database
+          .query(
+            `SELECT event_id, phase, native_id, target_json
+             FROM tf_resource_provider_effects
+             WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+          )
+          .all(TENANT_ID, RESOURCE_UID),
+        saga: database
+          .query(
+            `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+             WHERE tenant_id = ? AND operation_id = ?`,
+          )
+          .all(TENANT_ID, operationId),
+        operation: database
+          .query("SELECT * FROM tf_operations WHERE tenant_id = ? AND id = ?")
+          .all(TENANT_ID, operationId),
+        replay: database.query("SELECT * FROM tf_replays WHERE replay_key = ?").all(replayKey),
+        evidence: database
+          .query(
+            `SELECT sequence, operation_id, action, resource_generation, resource_revision
+             FROM tf_resource_execution_evidence
+             WHERE tenant_id = ? AND resource_uid = ? ORDER BY sequence`,
+          )
+          .all(TENANT_ID, RESOURCE_UID),
+        guards: database.query("SELECT * FROM tf_operation_commit_guards").all(),
+      });
+      const before = snapshot();
+      batchCalls = 0;
+      const updated: TakoformStoredResource = {
+        ...resource("2", "updated"),
+        metadata: {
+          ...resource("2", "updated").metadata,
+          generation: "2",
+        },
+        status: {
+          ...resource("2", "updated").status,
+          observedGeneration: "2",
+        },
+      };
+      await expect(
+        store.commitImmediateMutation({
+          tenantId: TENANT_ID,
+          operationId,
+          operation: "update",
+          createdAt: clock().toISOString(),
+          mutation: {
+            ...writeMutation(updated, "1", operationId),
+            replayKey,
+            replay: {
+              fingerprint,
+              status: 200,
+              resource: updated,
+              boundUid: RESOURCE_UID,
+            },
+            providerReceipt: receipt,
+            providerEffect: { effectId: operationId, kind: "apply" },
+          },
+        }),
+      ).rejects.toThrow(TypeError);
+      expect(batchCalls).toBe(0);
+      expect(snapshot()).toEqual(before);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("commits an unclaimed replacement with the new native identity across every receipt projection", async () => {
+    const database = databaseWithEvidenceMigration();
+    const clock = () => new Date(1_000);
+    const sql = createSqliteSql(database);
+    const store = createTakoformStore(sql, clock);
+    const deployments = createResourceDeploymentStore(sql, clock);
+    const operationId = "op_replace_success";
+    const leaseToken = "lease_replace_success";
+    const replayKey = `replay_${operationId}`;
+    const fingerprint = `fingerprint_${operationId}`;
+    try {
+      expect(
+        await store.reserveResourceIncarnation({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          address: ADDRESS,
+          formRef: FORM_REF,
+        }),
+      ).toBe(true);
+      await store.commitImmediateMutation({
+        tenantId: TENANT_ID,
+        operationId: "op_create_replace_success",
+        operation: "create",
+        createdAt: clock().toISOString(),
+        mutation: writeMutation(resource("1", "initial"), null, "op_create_replace_success"),
+      });
+      await deployments.create({
+        tenantId: TENANT_ID,
+        id: "dep_replace_success",
+        resourceUid: RESOURCE_UID,
+        offeringId: "offering.replace",
+        providerPackRef: "provider.replace",
+        providerInstallationRef: "provider.replace.primary",
+        nativeId: "native:g1",
+        state: "active",
+        observed: { generation: 1 },
+        outputs: { endpoint: "g1.example.test" },
+      });
+      const receipt: TakoformDriverReceipt = {
+        observed: { generation: 2 },
+        outputs: {},
+        deploymentMutation: {
+          kind: "replace",
+          tenantId: TENANT_ID,
+          deploymentId: "dep_replace_success",
+          expectedNativeId: "native:g1",
+          nativeId: "native:g2",
+          observed: { generation: 2 },
+          outputs: { endpoint: "g2.example.test" },
+        },
+      };
+      await store.acceptProviderMutationSaga({
+        operationId,
+        operationKind: "apply",
+        replayKey,
+        tenantId: TENANT_ID,
+        fingerprint,
+        resourceUid: RESOURCE_UID,
+        target: ADDRESS,
+        acceptedUid: RESOURCE_UID,
+        acceptedGeneration: "1",
+        acceptedRevision: "1",
+      });
+      expect(
+        await store.acquireProviderMutationExecution({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          leaseToken,
+          leaseUntil: 2_000,
+        }),
+      ).toMatchObject({ kind: "acquired", mode: "initial" });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          fingerprint,
+          leaseToken,
+          mode: "initial",
+          selection: {
+            version: TAKOFORM_APPLY_SELECTION_VERSION,
+            kind: "provider",
+            providerPackRef: "provider.replace",
+            providerInstallationRef: "provider.replace.primary",
+            technicalOffering: {
+              id: "offering.replace",
+              kind: "replacement",
+              displayName: "Replacement",
+              form: FORM_REF,
+              providedInterfaces: [],
+              bindingRefs: [],
+              capabilities: ["create", "update", "delete"],
+            },
+            relations: [],
+          },
+        }),
+      ).toMatchObject({ kind: "provider", providerPackRef: "provider.replace" });
+      expect(
+        await store.recordResourceEffect({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          effectId: operationId,
+          kind: "apply",
+          phase: "planned",
+          operationMode: "initial",
+        }),
+      ).toBe(true);
+      expect(
+        await store.markProviderMutationDispatch({
+          tenantId: TENANT_ID,
+          operationId,
+          resourceUid: RESOURCE_UID,
+          leaseToken,
+        }),
+      ).toBe(true);
+      expect(
+        await store.recordResourceEffect({
+          tenantId: TENANT_ID,
+          resourceUid: RESOURCE_UID,
+          effectId: operationId,
+          kind: "apply",
+          phase: "dispatched",
+          operationMode: "initial",
+        }),
+      ).toBe(true);
+      await store.recordProviderMutationReceipt({
+        tenantId: TENANT_ID,
+        operationId,
+        resourceUid: RESOURCE_UID,
+        leaseToken,
+        receipt,
+      });
+
+      const updated: TakoformStoredResource = {
+        ...resource("2", "updated"),
+        metadata: {
+          ...resource("2", "updated").metadata,
+          generation: "2",
+        },
+        status: {
+          ...resource("2", "updated").status,
+          observedGeneration: "2",
+        },
+      };
+      await store.commitImmediateMutation({
+        tenantId: TENANT_ID,
+        operationId,
+        operation: "update",
+        createdAt: clock().toISOString(),
+        mutation: {
+          ...writeMutation(updated, "1", operationId),
+          replayKey,
+          replay: {
+            fingerprint,
+            status: 200,
+            resource: updated,
+            boundUid: RESOURCE_UID,
+          },
+          providerReceipt: receipt,
+          providerEffect: { effectId: operationId, kind: "apply" },
+        },
+      });
+
+      const deploymentRows = database
+        .query(
+          `SELECT native_id, native_claimed, state, observed_json, outputs_json
+           FROM tf_resource_deployments WHERE tenant_id = ? AND id = ?`,
+        )
+        .all(TENANT_ID, "dep_replace_success") as Array<{
+        native_id: string;
+        native_claimed: number;
+        state: string;
+        observed_json: string;
+        outputs_json: string;
+      }>;
+      expect(deploymentRows).toHaveLength(1);
+      const deployment = deploymentRows[0];
+      expect(deployment).toMatchObject({
+        native_id: "native:g2",
+        native_claimed: 0,
+        state: "active",
+      });
+      expect(JSON.parse(String(deployment?.observed_json))).toEqual({ generation: 2 });
+      expect(JSON.parse(String(deployment?.outputs_json))).toEqual({ endpoint: "g2.example.test" });
+
+      const resourceRows = database
+        .query(
+          `SELECT generation, revision, resource_json
+           FROM tf_resources WHERE tenant_id = ? AND uid = ?`,
+        )
+        .all(TENANT_ID, RESOURCE_UID) as Array<{
+        generation: string;
+        revision: string;
+        resource_json: string;
+      }>;
+      expect(resourceRows).toHaveLength(1);
+      expect(resourceRows[0]).toMatchObject({ generation: "2", revision: "2" });
+      expect(JSON.parse(String(resourceRows[0]?.resource_json))).toEqual(updated);
+
+      const replayRows = database
+        .query(
+          `SELECT fingerprint, status, resource_json, bound_uid
+           FROM tf_replays WHERE replay_key = ?`,
+        )
+        .all(replayKey) as Array<{
+        fingerprint: string;
+        status: number;
+        resource_json: string;
+        bound_uid: string;
+      }>;
+      expect(replayRows).toHaveLength(1);
+      expect(replayRows[0]).toMatchObject({ fingerprint, status: 200, bound_uid: RESOURCE_UID });
+      expect(JSON.parse(String(replayRows[0]?.resource_json))).toEqual(updated);
+      expect(
+        database
+          .query("SELECT state FROM tf_operations WHERE tenant_id = ? AND id = ?")
+          .all(TENANT_ID, operationId),
+      ).toEqual([{ state: "succeeded" }]);
+      expect(
+        database
+          .query(
+            `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+             WHERE tenant_id = ? AND operation_id = ?`,
+          )
+          .all(TENANT_ID, operationId),
+      ).toEqual([]);
+
+      const effectRows = database
+        .query(
+          `SELECT event_id, phase, native_id, target_json
+           FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+        )
+        .all(TENANT_ID, RESOURCE_UID) as Array<{
+        event_id: string;
+        phase: string;
+        native_id: string | null;
+        target_json: string;
+      }>;
+      const succeededEffect = effectRows.find((row) => row.phase === "succeeded");
+      expect(succeededEffect).toMatchObject({
+        event_id: `${operationId}:succeeded`,
+        phase: "succeeded",
+        native_id: "native:g2",
+      });
+      expect(JSON.parse(String(succeededEffect?.target_json))).toMatchObject({
+        resourceUid: RESOURCE_UID,
+        nativeId: "native:g2",
+      });
+    } finally {
+      database.close();
+    }
+  });
+
   test("commits a value-free Resource lifecycle atomically and keeps cursor pages on one snapshot", async () => {
     const database = databaseWithEvidenceMigration();
     let currentTime = Date.parse("2026-09-04T00:00:00.000Z");
