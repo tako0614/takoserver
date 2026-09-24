@@ -467,48 +467,37 @@ export async function runSponsorshipAuthority(
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
   );
-  await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
-
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-sponsorship-authority-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let preflightConfigRoot: string | undefined;
   try {
-    const prepared = await prepareWorkerArtifact({
-      root,
-      target,
-      commit: source.commit,
-      main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
-      writeConfig: ({ path, main, bundleDigestHex }) =>
-        writeSponsorshipAuthorityConfig({
-          path,
-          main,
-          target,
-          commit: source.commit,
-          ...(bundleDigestHex === undefined ? {} : { artifactDigest: `sha256:${bundleDigestHex}` }),
-        }),
-      run,
-      environment,
-    });
-    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
-    const database =
-      options.database ?? createRemoteSigningDatabase(prepared.configPath, environment, run);
-    const signingRow = await database.readKey(target.signing.currentKeyId, "preflight");
-    const nextSigningRow =
+    let database = options.database;
+    if (database === undefined) {
+      preflightConfigRoot = mkdtempSync(
+        join(tmpdir(), "takoserver-sponsorship-authority-preflight-"),
+      );
+      const preflightConfigPath = writeSponsorshipAuthorityConfig({
+        path: join(preflightConfigRoot, "wrangler.jsonc"),
+        main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
+        target,
+        commit: source.commit,
+      });
+      database = createRemoteSigningDatabase(preflightConfigPath, environment, run);
+    }
+    const signingRowBeforeGate = await database.readKey(target.signing.currentKeyId, "preflight");
+    const nextSigningRowBeforeGate =
       target.signing.nextKeyId === undefined
         ? null
         : await database.readKey(target.signing.nextKeyId, "preflight");
-    const credentialRowBefore = await database.readKey(selected.credentialKeyId, "preflight");
-    assertDedicatedSponsorshipKeys(target, signingRow, credentialRowBefore, nextSigningRow);
-    if (
-      credentialRowBefore !== null &&
-      before?.commit === source.commit &&
-      before.artifactDigest === artifactDigest
-    ) {
-      throw preflightError(
-        "sponsorship authority and credential key already serve the selected identity; use --status",
-      );
-    }
+    const credentialRowBeforeGate = await database.readKey(selected.credentialKeyId, "preflight");
+    assertDedicatedSponsorshipKeys(
+      target,
+      signingRowBeforeGate,
+      credentialRowBeforeGate,
+      nextSigningRowBeforeGate,
+    );
     const signingJwk = await readVerifiedPrivateSigningJwk(
       options.privateJwkPath ??
         requireEnvironment("TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH"),
@@ -526,6 +515,43 @@ export async function runSponsorshipAuthority(
       },
       selected.receiptKeyId,
     );
+    await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
+
+    const prepared = await prepareWorkerArtifact({
+      root,
+      target,
+      commit: source.commit,
+      main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
+      writeConfig: ({ path, main, bundleDigestHex }) =>
+        writeSponsorshipAuthorityConfig({
+          path,
+          main,
+          target,
+          commit: source.commit,
+          ...(bundleDigestHex === undefined ? {} : { artifactDigest: `sha256:${bundleDigestHex}` }),
+        }),
+      run,
+      environment,
+    });
+    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
+    database =
+      options.database ?? createRemoteSigningDatabase(prepared.configPath, environment, run);
+    const signingRow = await database.readKey(target.signing.currentKeyId, "preflight");
+    const nextSigningRow =
+      target.signing.nextKeyId === undefined
+        ? null
+        : await database.readKey(target.signing.nextKeyId, "preflight");
+    const credentialRowBefore = await database.readKey(selected.credentialKeyId, "preflight");
+    assertDedicatedSponsorshipKeys(target, signingRow, credentialRowBefore, nextSigningRow);
+    if (
+      credentialRowBefore !== null &&
+      before?.commit === source.commit &&
+      before.artifactDigest === artifactDigest
+    ) {
+      throw preflightError(
+        "sponsorship authority and credential key already serve the selected identity; use --status",
+      );
+    }
     const secretsPath = join(prepared.releaseDirectory, "secrets.json");
     writeFileSync(
       secretsPath,
@@ -630,6 +656,8 @@ export async function runSponsorshipAuthority(
           : `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`,
     };
   } finally {
+    if (preflightConfigRoot !== undefined)
+      rmSync(preflightConfigRoot, { recursive: true, force: true });
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }

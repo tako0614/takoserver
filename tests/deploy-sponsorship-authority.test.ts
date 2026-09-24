@@ -14,6 +14,7 @@ import {
   writeSponsorshipAuthorityConfig,
 } from "../scripts/deploy/sponsorship-authority.ts";
 import { type DeployTarget, managedSpaceAdmissionPolicyDigest } from "../scripts/deploy/target.ts";
+import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { canonicalJson } from "../src/json.ts";
 import { publicFormCapabilityManifest } from "../src/public-worker-implementation.ts";
 
@@ -514,6 +515,94 @@ describe("route-less sponsorship authority deploy", () => {
     }
   });
 
+  test("rejects invalid credential and receipt JWKs before the owner gate, build, or upload", async () => {
+    const fixture = await sponsorshipSigningFixture();
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-invalid-input-"));
+    try {
+      const credentialPath = join(root, "credential.jwk");
+      const receiptPath = join(root, "receipt.jwk");
+      const validCredential = `${JSON.stringify(fixture.credentialPrivateJwk)}\n`;
+      const validReceipt = `${JSON.stringify(fixture.receiptPrivateJwk)}\n`;
+
+      for (const invalid of ["credential", "receipt"] as const) {
+        writeFileSync(
+          credentialPath,
+          invalid === "credential" ? '{"kty":"OKP"}\n' : validCredential,
+          {
+            mode: 0o600,
+          },
+        );
+        writeFileSync(receiptPath, invalid === "receipt" ? '{"kty":"OKP"}\n' : validReceipt, {
+          mode: 0o600,
+        });
+        const commands: string[][] = [];
+        const failure = await runSponsorshipAuthority(
+          {
+            surface: "takoserver-sponsorship-authority-worker",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          fixture.target,
+          {
+            state: authorityState({ inspectedTarget: fixture.target }),
+            database: sponsorshipDatabase(fixture.target),
+            privateJwkPath: credentialPath,
+            receiptPrivateJwkPath: receiptPath,
+            outputDirectory: join(root, invalid),
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            run: async (command) => {
+              commands.push([...command]);
+              const rendered = command.join(" ");
+              if (rendered === "git rev-parse HEAD") {
+                return { exitCode: 0, stdout: `${COMMIT}\n`, stderr: "" };
+              }
+              if (rendered === "git branch --show-current") {
+                return { exitCode: 0, stdout: "candidate/sponsorship-authority\n", stderr: "" };
+              }
+              if (rendered === "git status --porcelain=v1 -z --untracked-files=all") {
+                return { exitCode: 0, stdout: "", stderr: "" };
+              }
+              if (rendered === "bun run check") {
+                return { exitCode: 0, stdout: "checked\n", stderr: "" };
+              }
+              if (command.includes("--dry-run")) {
+                const outdirIndex = command.indexOf("--outdir");
+                const outdir = outdirIndex < 0 ? undefined : command[outdirIndex + 1];
+                if (outdir === undefined) throw new Error("missing dry-run outdir");
+                writeFileSync(join(outdir, "index.js"), "export default {};\n");
+                return { exitCode: 0, stdout: "built\n", stderr: "" };
+              }
+              throw new Error(`unexpected command: ${rendered}`);
+            },
+          },
+        ).catch((error) => error);
+
+        expect(failure, invalid).toBeInstanceOf(Error);
+        expect(failure.message, invalid).toContain("private signing JWK");
+        expect(
+          commands.some((command) => command.join(" ") === "bun run check"),
+          invalid,
+        ).toBe(false);
+        expect(
+          commands.some((command) => command.includes("--dry-run")),
+          invalid,
+        ).toBe(false);
+        expect(
+          commands.some(
+            (command) =>
+              command.includes("--secrets-file") ||
+              (command.includes("wrangler") && command.includes("deploy")),
+          ),
+          invalid,
+        ).toBe(false);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed on every public topology or authority-closure expansion", async () => {
     const variants: readonly {
       readonly name: string;
@@ -790,6 +879,7 @@ function managedFormVersion(
 
 function authorityState(
   input: {
+    readonly inspectedTarget?: DeployTarget;
     readonly domains?: readonly { readonly hostname: string; readonly service: string }[];
     readonly routes?: readonly {
       readonly zoneId: string;
@@ -803,9 +893,12 @@ function authorityState(
     readonly annotations?: Readonly<Record<string, string>>;
   } = {},
 ): SponsorshipAuthorityDeployState {
+  const inspectedTarget = input.inspectedTarget ?? target;
+  const selected = inspectedTarget.sponsorshipAuthority;
+  if (selected === undefined) throw new Error("test target has no sponsorship authority");
   return {
     async workerScripts() {
-      return [target.sponsorshipAuthority.workerName];
+      return [selected.workerName];
     },
     async workerDeployments() {
       return [
@@ -824,7 +917,7 @@ function authorityState(
         },
         resources: {
           script: { etag: "authority-script-etag" },
-          bindings: input.bindings ?? versionBindings(),
+          bindings: input.bindings ?? versionBindings(inspectedTarget),
         },
       };
     },
@@ -881,21 +974,25 @@ function ordinarySigningRow(
   } as const;
 }
 
-function sponsorshipCredentialRow() {
+function sponsorshipCredentialRow(inspectedTarget: DeployTarget = target) {
+  const selected = inspectedTarget.sponsorshipAuthority;
+  if (selected === undefined) throw new Error("test target has no sponsorship authority");
   return {
-    keyId: target.sponsorshipAuthority.credentialKeyId,
-    publicJwk: JSON.stringify(target.sponsorshipAuthority.credentialPublicJwk),
+    keyId: selected.credentialKeyId,
+    publicJwk: JSON.stringify(selected.credentialPublicJwk),
     createdAtEpochSeconds: 2,
     revokedAtEpochSeconds: null,
   } as const;
 }
 
-function sponsorshipDatabase(): SigningDatabase {
+function sponsorshipDatabase(inspectedTarget: DeployTarget = target): SigningDatabase {
+  const selected = inspectedTarget.sponsorshipAuthority;
+  if (selected === undefined) throw new Error("test target has no sponsorship authority");
   return {
     async readKey(keyId) {
       if (keyId === target.signing.currentKeyId) return ordinarySigningRow();
-      if (keyId === target.sponsorshipAuthority.credentialKeyId) {
-        return sponsorshipCredentialRow();
+      if (keyId === selected.credentialKeyId) {
+        return sponsorshipCredentialRow(inspectedTarget);
       }
       return null;
     },
@@ -903,4 +1000,38 @@ function sponsorshipDatabase(): SigningDatabase {
       throw new Error("status must not mutate the signing registry");
     },
   };
+}
+
+async function sponsorshipSigningFixture() {
+  const credentialPair = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const receiptPair = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const credentialPrivateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", credentialPair.privateKey),
+  );
+  const receiptPrivateJwk = normalizeGeneratedEd25519PrivateJwk(
+    await crypto.subtle.exportKey("jwk", receiptPair.privateKey),
+  );
+  const fixtureTarget = {
+    ...target,
+    sponsorshipAuthority: {
+      ...target.sponsorshipAuthority,
+      credentialPublicJwk: {
+        kty: "OKP",
+        crv: "Ed25519",
+        x: credentialPrivateJwk.x,
+      },
+      receiptPublicJwk: {
+        kty: "OKP",
+        crv: "Ed25519",
+        x: receiptPrivateJwk.x,
+      },
+    },
+  } satisfies DeployTarget;
+  return { target: fixtureTarget, credentialPrivateJwk, receiptPrivateJwk };
 }
