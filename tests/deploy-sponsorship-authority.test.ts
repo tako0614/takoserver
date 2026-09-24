@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
+import {
+  buildReleasedCoreFormAuthorityArtifactDigest,
+  takoformCoreVerifierArtifactDigest,
+} from "../scripts/deploy/form-authority.ts";
 import type { SigningDatabase } from "../scripts/deploy/signing.ts";
 import {
   assertDedicatedSponsorshipKeys,
   inspectSponsorshipAuthority,
   registerSponsorshipCredentialPublicKey,
   runSponsorshipAuthority,
+  type SponsorshipAuthorityDeployProcess,
   type SponsorshipAuthorityDeployState,
   sponsorshipAuthorityBindingClosure,
   writeSponsorshipAuthorityConfig,
@@ -25,6 +29,9 @@ const FORM_VERSION = "22222222-2222-4222-8222-222222222222";
 const PUBLIC_VERSION = "33333333-3333-4333-8333-333333333333";
 const PUBLIC_DIGEST = `sha256:${"c".repeat(64)}` as const;
 const FORM_DIGEST = `sha256:${"d".repeat(64)}` as const;
+const FORM_COMMIT = "e".repeat(40);
+const CHANGED_FORM_VERSION = "55555555-5555-4555-8555-555555555555";
+const UPLOADED_VERSION = "66666666-6666-4666-8666-666666666666";
 
 const managedSpaceAdmissionPolicy = {
   kind: "takoserver.space-form-admission-policy@v1",
@@ -603,6 +610,233 @@ describe("route-less sponsorship authority deploy", () => {
     }
   });
 
+  test("accepts a different served Form commit when a fresh candidate emits the exact artifact", async () => {
+    const fixture = await sponsorshipSigningFixture(managedTarget);
+    const candidateArtifactDigest = await buildReleasedCoreFormAuthorityArtifactDigest({
+      target: fixture.target,
+      commit: COMMIT,
+      run: fakeDryRunRunner(),
+    });
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-form-proof-match-"));
+    try {
+      const credentialPath = join(root, "credential.jwk");
+      const receiptPath = join(root, "receipt.jwk");
+      writeSigningFixtures(root, fixture);
+      let uploaded = false;
+      let uploadedArtifactDigest: `sha256:${string}` | null = null;
+      let inserts = 0;
+      let credentialRow: Awaited<ReturnType<SigningDatabase["readKey"]>> = null;
+      const database: SigningDatabase = {
+        async readKey(keyId) {
+          if (keyId === fixture.target.signing.currentKeyId) return ordinarySigningRow();
+          if (keyId === fixture.target.sponsorshipAuthority?.credentialKeyId) {
+            return credentialRow;
+          }
+          return null;
+        },
+        async insertPublicKey(keyId, publicJwk) {
+          inserts += 1;
+          credentialRow = {
+            keyId,
+            publicJwk,
+            createdAtEpochSeconds: 2,
+            revokedAtEpochSeconds: null,
+          };
+        },
+      };
+      const state = managedAuthorityState({
+        inspectedTarget: fixture.target,
+        formIdentity: () => ({
+          versionId: FORM_VERSION,
+          commit: FORM_COMMIT,
+          artifactDigest: candidateArtifactDigest,
+        }),
+        sponsorshipIdentity: () =>
+          uploaded
+            ? {
+                versionId: UPLOADED_VERSION,
+                previousVersionId: VERSION,
+                commit: COMMIT,
+                artifactDigest: uploadedArtifactDigest ?? DIGEST,
+              }
+            : {
+                versionId: VERSION,
+                previousVersionId: null,
+                commit: COMMIT,
+                artifactDigest: DIGEST,
+              },
+      });
+      const commands: string[][] = [];
+      const run = applyRunner(commands, {
+        onUpload(command) {
+          const configPathIndex = command.indexOf("--config");
+          const configPath = configPathIndex < 0 ? undefined : command[configPathIndex + 1];
+          if (configPath === undefined) throw new Error("missing sponsorship config path");
+          const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+            readonly vars?: Readonly<Record<string, unknown>>;
+          };
+          const digest = config.vars?.TAKOSERVER_SPONSORSHIP_AUTHORITY_ARTIFACT_SHA256;
+          if (typeof digest !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(digest)) {
+            throw new Error("missing sponsorship artifact digest");
+          }
+          uploadedArtifactDigest = digest as `sha256:${string}`;
+          uploaded = true;
+        },
+      });
+
+      const result = await runSponsorshipAuthority(
+        {
+          surface: "takoserver-sponsorship-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        fixture.target,
+        {
+          state,
+          database,
+          privateJwkPath: credentialPath,
+          receiptPrivateJwkPath: receiptPath,
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          run,
+        },
+      );
+
+      expect(result).toMatchObject({ kind: "takoserver.sponsorship-authority-worker-apply@v1" });
+      expect(inserts).toBe(1);
+      expect(commands.filter((command) => command.includes("--dry-run"))).toHaveLength(2);
+      expect(commands.filter((command) => command.includes("--secrets-file"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a different served Form artifact before registration or upload", async () => {
+    const fixture = await sponsorshipSigningFixture(managedTarget);
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-form-proof-mismatch-"));
+    try {
+      writeSigningFixtures(root, fixture);
+      let inserts = 0;
+      const database: SigningDatabase = {
+        async readKey(keyId) {
+          if (keyId === fixture.target.signing.currentKeyId) return ordinarySigningRow();
+          return null;
+        },
+        async insertPublicKey() {
+          inserts += 1;
+        },
+      };
+      const commands: string[][] = [];
+      const failure = await runSponsorshipAuthority(
+        {
+          surface: "takoserver-sponsorship-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        fixture.target,
+        {
+          state: managedAuthorityState({
+            inspectedTarget: fixture.target,
+            formIdentity: () => ({
+              versionId: FORM_VERSION,
+              commit: FORM_COMMIT,
+              artifactDigest: FORM_DIGEST,
+            }),
+          }),
+          database,
+          privateJwkPath: join(root, "credential.jwk"),
+          receiptPrivateJwkPath: join(root, "receipt.jwk"),
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          run: applyRunner(commands),
+        },
+      ).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toContain("emitted artifact differs");
+      expect(inserts).toBe(0);
+      expect(commands.some((command) => command.join(" ") === "bun run check")).toBe(false);
+      expect(commands.some((command) => command.includes("--secrets-file"))).toBe(false);
+      expect(commands.filter((command) => command.includes("--dry-run"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses a managed Form dependency that changes during qualification", async () => {
+    const fixture = await sponsorshipSigningFixture(managedTarget);
+    const candidateArtifactDigest = await buildReleasedCoreFormAuthorityArtifactDigest({
+      target: fixture.target,
+      commit: COMMIT,
+      run: fakeDryRunRunner(),
+    });
+    const root = mkdtempSync(join(tmpdir(), "takoserver-sponsorship-form-proof-race-"));
+    try {
+      writeSigningFixtures(root, fixture);
+      let changed = false;
+      let inserts = 0;
+      const database: SigningDatabase = {
+        async readKey(keyId) {
+          if (keyId === fixture.target.signing.currentKeyId) return ordinarySigningRow();
+          return null;
+        },
+        async insertPublicKey() {
+          inserts += 1;
+        },
+      };
+      const commands: string[][] = [];
+      const failure = await runSponsorshipAuthority(
+        {
+          surface: "takoserver-sponsorship-authority-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        fixture.target,
+        {
+          state: managedAuthorityState({
+            inspectedTarget: fixture.target,
+            formIdentity: () =>
+              changed
+                ? {
+                    versionId: CHANGED_FORM_VERSION,
+                    commit: FORM_COMMIT,
+                    artifactDigest: FORM_DIGEST,
+                  }
+                : {
+                    versionId: FORM_VERSION,
+                    commit: FORM_COMMIT,
+                    artifactDigest: candidateArtifactDigest,
+                  },
+          }),
+          database,
+          privateJwkPath: join(root, "credential.jwk"),
+          receiptPrivateJwkPath: join(root, "receipt.jwk"),
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          run: applyRunner(commands, {
+            onCheck() {
+              changed = true;
+            },
+          }),
+        },
+      ).catch((error) => error);
+
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toContain("Form authority managed-Space dependency changed");
+      expect(inserts).toBe(0);
+      expect(commands.some((command) => command.includes("--secrets-file"))).toBe(false);
+      expect(commands.filter((command) => command.includes("--dry-run"))).toHaveLength(2);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("fails closed on every public topology or authority-closure expansion", async () => {
     const variants: readonly {
       readonly name: string;
@@ -683,32 +917,65 @@ describe("route-less sponsorship authority deploy", () => {
   });
 });
 
+interface ManagedArtifactIdentity {
+  readonly commit: string;
+  readonly artifactDigest: `sha256:${string}`;
+}
+
+interface ManagedFormIdentity extends ManagedArtifactIdentity {
+  readonly versionId: string;
+}
+
+interface ManagedSponsorshipIdentity extends ManagedArtifactIdentity {
+  readonly versionId: string;
+  readonly previousVersionId: string | null;
+}
+
 function managedAuthorityState(
   input: {
+    readonly inspectedTarget?: DeployTarget;
     readonly sponsorshipPresent?: boolean;
     readonly sponsorshipBindings?: readonly Record<string, unknown>[];
     readonly formPolicy?: unknown;
     readonly namedHandlers?: readonly string[];
+    readonly formIdentity?: () => ManagedFormIdentity;
+    readonly sponsorshipIdentity?: () => ManagedSponsorshipIdentity;
   } = {},
 ): SponsorshipAuthorityDeployState {
-  const formAuthority = managedTarget.formAuthority;
+  const inspectedTarget = input.inspectedTarget ?? managedTarget;
+  const formAuthority = inspectedTarget.formAuthority;
+  const sponsorshipAuthority = inspectedTarget.sponsorshipAuthority;
   if (formAuthority === undefined) throw new Error("managed test target has no Form authority");
+  if (sponsorshipAuthority === undefined) {
+    throw new Error("managed test target has no sponsorship authority");
+  }
   const sponsorshipPresent = input.sponsorshipPresent ?? true;
-  const formVersion = managedFormVersion(
-    input.formPolicy ?? managedSpaceAdmissionPolicy,
-    input.namedHandlers ?? ["ensureTenantSpaceAdmission"],
-  );
+  const formIdentity =
+    input.formIdentity ??
+    (() => ({
+      versionId: FORM_VERSION,
+      commit: COMMIT,
+      artifactDigest: FORM_DIGEST,
+    }));
+  const sponsorshipIdentity =
+    input.sponsorshipIdentity ??
+    (() => ({
+      versionId: VERSION,
+      previousVersionId: null,
+      commit: COMMIT,
+      artifactDigest: DIGEST,
+    }));
   return {
     async workerScripts() {
       return [
-        managedTarget.workerName,
+        inspectedTarget.workerName,
         formAuthority.identityProbeWorkerName,
         formAuthority.workerName,
-        ...(sponsorshipPresent ? [managedTarget.sponsorshipAuthority.workerName] : []),
+        ...(sponsorshipPresent ? [sponsorshipAuthority.workerName] : []),
       ];
     },
     async workerDeployments(workerName) {
-      if (workerName === managedTarget.workerName) {
+      if (workerName === inspectedTarget.workerName) {
         return [
           {
             id: "public-deployment",
@@ -718,45 +985,69 @@ function managedAuthorityState(
         ];
       }
       if (workerName === formAuthority.workerName) {
+        const identity = formIdentity();
         return [
           {
             id: "form-deployment",
             created_on: "2026-09-04T01:00:00Z",
-            versions: [{ version_id: FORM_VERSION, percentage: 100 }],
+            versions: [{ version_id: identity.versionId, percentage: 100 }],
           },
         ];
       }
       if (!sponsorshipPresent) return [];
+      const identity = sponsorshipIdentity();
       return [
         {
           id: "sponsorship-deployment",
           created_on: "2026-09-04T02:00:00Z",
-          versions: [{ version_id: VERSION, percentage: 100 }],
+          versions: [{ version_id: identity.versionId, percentage: 100 }],
         },
+        ...(identity.previousVersionId === null
+          ? []
+          : [
+              {
+                id: "sponsorship-previous-deployment",
+                created_on: "2026-09-04T01:30:00Z",
+                versions: [{ version_id: identity.previousVersionId, percentage: 100 }],
+              },
+            ]),
       ];
     },
     async workerVersion(workerName) {
-      if (workerName === managedTarget.workerName) return managedPublicVersion();
-      if (workerName === formAuthority.workerName) return formVersion;
+      if (workerName === inspectedTarget.workerName) return managedPublicVersion(inspectedTarget);
+      if (workerName === formAuthority.workerName) {
+        return managedFormVersion(
+          input.formPolicy ?? managedSpaceAdmissionPolicy,
+          input.namedHandlers ?? ["ensureTenantSpaceAdmission"],
+          inspectedTarget,
+          formIdentity(),
+        );
+      }
+      const identity = sponsorshipIdentity();
       return {
         annotations: {
-          "workers/message": `sponsorship-authority:${COMMIT}:${DIGEST}`,
+          "workers/message": `sponsorship-authority:${identity.commit}:${identity.artifactDigest}`,
           "workers/triggered_by": "version_upload",
         },
         resources: {
           script: { etag: "authority-script-etag" },
-          bindings: input.sponsorshipBindings ?? versionBindings(managedTarget),
+          bindings:
+            input.sponsorshipBindings ??
+            versionBindings(inspectedTarget, {
+              commit: identity.commit,
+              artifactDigest: identity.artifactDigest,
+            }),
         },
       };
     },
     async workerSecrets(workerName) {
-      if (workerName === managedTarget.sponsorshipAuthority.workerName) {
+      if (workerName === sponsorshipAuthority.workerName) {
         return [
           { name: "TAKOSERVER_SPONSORSHIP_CREDENTIAL_SIGNING_KEY", type: "secret_text" },
           { name: "TAKOSERVER_SPONSORSHIP_RECEIPT_SIGNING_KEY", type: "secret_text" },
         ];
       }
-      if (workerName === managedTarget.workerName) {
+      if (workerName === inspectedTarget.workerName) {
         return [{ name: "TAKOSERVER_SIGNING_KEY", type: "secret_text" }];
       }
       return [];
@@ -764,8 +1055,8 @@ function managedAuthorityState(
     async workerDomains() {
       return [
         {
-          hostname: new URL(managedTarget.publicOrigin).hostname,
-          service: managedTarget.workerName,
+          hostname: new URL(inspectedTarget.publicOrigin).hostname,
+          service: inspectedTarget.workerName,
         },
       ];
     },
@@ -785,7 +1076,9 @@ function managedAuthorityState(
   };
 }
 
-function managedPublicVersion(): Record<string, unknown> {
+function managedPublicVersion(
+  inspectedTarget: DeployTarget = managedTarget,
+): Record<string, unknown> {
   return {
     annotations: {
       "workers/message": `takoserver-worker:${COMMIT}:${PUBLIC_DIGEST.slice("sha256:".length)}`,
@@ -795,13 +1088,13 @@ function managedPublicVersion(): Record<string, unknown> {
       bindings: [
         { type: "ai", name: "AI" },
         { type: "version_metadata", name: "WORKER_VERSION" },
-        { type: "d1", name: "STATE_DB", id: managedTarget.d1.databaseId },
+        { type: "d1", name: "STATE_DB", id: inspectedTarget.d1.databaseId },
         {
           type: "r2_bucket",
           name: "OBJECTS",
-          bucket_name: managedTarget.r2.bucketName,
+          bucket_name: inspectedTarget.r2.bucketName,
         },
-        { type: "plain_text", name: "PUBLIC_ORIGIN", text: managedTarget.publicOrigin },
+        { type: "plain_text", name: "PUBLIC_ORIGIN", text: inspectedTarget.publicOrigin },
         {
           type: "plain_text",
           name: "TAKOSERVER_SIGNING_KEY_ID",
@@ -821,31 +1114,37 @@ function managedPublicVersion(): Record<string, unknown> {
 function managedFormVersion(
   policy: unknown,
   namedHandlers: readonly string[],
+  inspectedTarget: DeployTarget = managedTarget,
+  identity: ManagedFormIdentity = {
+    versionId: FORM_VERSION,
+    commit: COMMIT,
+    artifactDigest: FORM_DIGEST,
+  },
 ): Record<string, unknown> {
-  const formAuthority = managedTarget.formAuthority;
+  const formAuthority = inspectedTarget.formAuthority;
   if (formAuthority === undefined) throw new Error("managed test target has no Form authority");
   return {
     annotations: {
-      "workers/message": `form-authority:takoserver-form-authority-worker:${COMMIT}:${FORM_DIGEST}`,
+      "workers/message": `form-authority:takoserver-form-authority-worker:${identity.commit}:${identity.artifactDigest}`,
     },
     resources: {
       script: {
         named_handlers: [{ name: "TenantSpaceAdmissionEntrypoint", handlers: namedHandlers }],
       },
       bindings: [
-        { type: "d1", name: "STATE_DB", id: managedTarget.d1.databaseId },
+        { type: "d1", name: "STATE_DB", id: inspectedTarget.d1.databaseId },
         {
           type: "r2_bucket",
           name: "OBJECTS",
-          bucket_name: managedTarget.r2.bucketName,
+          bucket_name: inspectedTarget.r2.bucketName,
         },
         {
           type: "service",
           name: "PUBLIC_HOST_IDENTITY",
-          service: managedTarget.workerName,
+          service: inspectedTarget.workerName,
           entrypoint: "PublicHostIdentityEntrypoint",
         },
-        { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: managedTarget.environment },
+        { type: "plain_text", name: "TAKOSERVER_ENVIRONMENT", text: inspectedTarget.environment },
         {
           type: "plain_text",
           name: "TAKOSERVER_FORM_AUTHORITY_HOST_ID",
@@ -950,11 +1249,11 @@ function authorityState(
 
 function versionBindings(
   inspectedTarget: DeployTarget = target,
+  identity: ManagedArtifactIdentity = { commit: COMMIT, artifactDigest: DIGEST },
 ): readonly Record<string, unknown>[] {
-  return Object.entries(
-    sponsorshipAuthorityBindingClosure(inspectedTarget, { commit: COMMIT, artifactDigest: DIGEST }),
-  ).flatMap(([name, requirement]) =>
-    requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
+  return Object.entries(sponsorshipAuthorityBindingClosure(inspectedTarget, identity)).flatMap(
+    ([name, requirement]) =>
+      requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],
   );
 }
 
@@ -1002,7 +1301,7 @@ function sponsorshipDatabase(inspectedTarget: DeployTarget = target): SigningDat
   };
 }
 
-async function sponsorshipSigningFixture() {
+async function sponsorshipSigningFixture(baseTarget: DeployTarget = target) {
   const credentialPair = (await crypto.subtle.generateKey("Ed25519", true, [
     "sign",
     "verify",
@@ -1017,10 +1316,12 @@ async function sponsorshipSigningFixture() {
   const receiptPrivateJwk = normalizeGeneratedEd25519PrivateJwk(
     await crypto.subtle.exportKey("jwk", receiptPair.privateKey),
   );
+  const baseAuthority = baseTarget.sponsorshipAuthority;
+  if (baseAuthority === undefined) throw new Error("fixture target has no sponsorship authority");
   const fixtureTarget = {
-    ...target,
+    ...baseTarget,
     sponsorshipAuthority: {
-      ...target.sponsorshipAuthority,
+      ...baseAuthority,
       credentialPublicJwk: {
         kty: "OKP",
         crv: "Ed25519",
@@ -1034,4 +1335,67 @@ async function sponsorshipSigningFixture() {
     },
   } satisfies DeployTarget;
   return { target: fixtureTarget, credentialPrivateJwk, receiptPrivateJwk };
+}
+
+function writeSigningFixtures(
+  root: string,
+  fixture: Awaited<ReturnType<typeof sponsorshipSigningFixture>>,
+): void {
+  writeFileSync(join(root, "credential.jwk"), `${JSON.stringify(fixture.credentialPrivateJwk)}\n`, {
+    mode: 0o600,
+  });
+  writeFileSync(join(root, "receipt.jwk"), `${JSON.stringify(fixture.receiptPrivateJwk)}\n`, {
+    mode: 0o600,
+  });
+}
+
+function fakeDryRunRunner(): SponsorshipAuthorityDeployProcess {
+  return async (command) => {
+    if (!command.includes("--dry-run")) {
+      throw new Error(`unexpected command: ${command.join(" ")}`);
+    }
+    const outdirIndex = command.indexOf("--outdir");
+    const outdir = outdirIndex < 0 ? undefined : command[outdirIndex + 1];
+    if (outdir === undefined) throw new Error("missing dry-run outdir");
+    writeFileSync(join(outdir, "index.js"), "export default {};\n");
+    return { exitCode: 0, stdout: "built\n", stderr: "" };
+  };
+}
+
+function applyRunner(
+  commands: string[][],
+  hooks: {
+    readonly onCheck?: () => void;
+    readonly onUpload?: (command: readonly string[]) => void;
+  } = {},
+): SponsorshipAuthorityDeployProcess {
+  return async (command) => {
+    commands.push([...command]);
+    const rendered = command.join(" ");
+    if (rendered === "git rev-parse HEAD") {
+      return { exitCode: 0, stdout: `${COMMIT}\n`, stderr: "" };
+    }
+    if (rendered === "git branch --show-current") {
+      return { exitCode: 0, stdout: "candidate/sponsorship-authority\n", stderr: "" };
+    }
+    if (rendered === "git status --porcelain=v1 -z --untracked-files=all") {
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    if (rendered === "bun run check") {
+      hooks.onCheck?.();
+      return { exitCode: 0, stdout: "checked\n", stderr: "" };
+    }
+    if (command.includes("--dry-run")) {
+      const outdirIndex = command.indexOf("--outdir");
+      const outdir = outdirIndex < 0 ? undefined : command[outdirIndex + 1];
+      if (outdir === undefined) throw new Error("missing dry-run outdir");
+      writeFileSync(join(outdir, "index.js"), "export default {};\n");
+      return { exitCode: 0, stdout: "built\n", stderr: "" };
+    }
+    if (command.includes("deploy") && command.includes("--secrets-file")) {
+      hooks.onUpload?.(command);
+      return { exitCode: 0, stdout: "uploaded\n", stderr: "" };
+    }
+    throw new Error(`unexpected command: ${rendered}`);
+  };
 }

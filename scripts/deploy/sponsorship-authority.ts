@@ -12,6 +12,7 @@ import {
   verificationError,
 } from "./errors.ts";
 import {
+  buildReleasedCoreFormAuthorityArtifactDigest,
   inspectReleasedCoreFormAuthorityDependency,
   type ReleasedCoreFormAuthorityDependencyInspection,
 } from "./form-authority.ts";
@@ -459,11 +460,6 @@ export async function runSponsorshipAuthority(
     commit: invocation.commit,
     run,
   });
-  if (dependencyBefore !== null && dependencyBefore.commit !== source.commit) {
-    throw preflightError(
-      "served released-Core Form authority dependency differs from the sponsorship source commit",
-    );
-  }
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
   );
@@ -515,6 +511,22 @@ export async function runSponsorshipAuthority(
       },
       selected.receiptKeyId,
     );
+
+    if (dependencyBefore !== null && dependencyBefore.commit !== source.commit) {
+      const candidateArtifactDigest = await buildReleasedCoreFormAuthorityArtifactDigest({
+        target,
+        commit: source.commit,
+        run,
+        environment,
+      });
+      if (candidateArtifactDigest !== dependencyBefore.artifactDigest) {
+        throw preflightError(
+          "served released-Core Form authority dependency emitted artifact differs from the sponsorship source",
+          `served=${dependencyBefore.artifactDigest} source=${candidateArtifactDigest}`,
+        );
+      }
+    }
+
     await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
 
     const prepared = await prepareWorkerArtifact({
