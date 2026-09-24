@@ -53,9 +53,10 @@ the identity Forms that composition did offer. The
 [second rotation](#second-rotation-the-self-host-realizes-the-supply) closed
 that gap; the rule that produced both answers is the same one.
 
-The four other installed-but-unsupported packages — `ActorNamespace`,
-`DurableWorkflow`, `StaticAssetBundle`, `WorkerCustomDomain` — are unchanged.
-They stay installed, unsupported, and without an activation head.
+The three other installed-but-unsupported packages — `ActorNamespace`,
+`DurableWorkflow`, and `WorkerCustomDomain` — are unchanged. They stay
+installed, unsupported, and without an activation head. `StaticAssetBundle` was
+admitted as an intrinsic executable resource by the 2026-09-11 amendment below.
 
 ## What each runtime hands the Worker
 
@@ -332,9 +333,9 @@ bun scripts/selfhost-form-admission.ts <organizationId> <space> ... --apply
 
 The section above says what each runtime hands the Worker. An adversarial
 review of the managed (Workers-for-Platforms) backend found that the sentence
-was not the whole truth, and that the lane could not have worked at all. No
-production composition builds it — `src/providers/cloudflare.ts` defaults to
-`ordinary-workers` and only tests construct `CloudflareWfpBackend` — so no
+was not the whole truth, and that the lane could not have worked at all. The
+public composition defaults to `ordinary-workers`; the concrete managed backend
+and its tests moved to the private owner with the public/private split. No
 tenant was affected, and none of the below is a migration. It is what had to be
 true before anyone composes it.
 
@@ -344,9 +345,11 @@ module that script runs — `import { env } from "cloudflare:workers"` included.
 So the internal `__TAKOSERVER_SQLITE_<i>` Durable Object namespace, the
 `__TAKOSERVER_OBJECTS_<i>` R2 handle, and the managed receipt namespace would
 be one import away from tenant code, along with every `secret_text` value.
-`tests/cloudflare-managed-worker-wrapper.test.ts` runs the generated wrapper
-under the pinned workerd and shows the raw bucket being written through that
-route. Every managed tenant user Worker is therefore now uploaded with
+The concrete managed implementation enforces this in the private owner. The
+public tree retains its backend contract in
+`src/providers/cloudflare-worker-backend.ts`; its current managed-worker test
+coverage is `tests/managed-worker-version-execution-material-migration.test.ts`.
+Every managed tenant user Worker is therefore now uploaded with
 `compatibility_flags: ["disallow_importable_env"]`, which empties the importable
 environment while the handler's own `env` argument keeps its bindings; the
 release readback accepts exactly `main_module`, `compatibility_date`,
@@ -365,16 +368,18 @@ Until it is, a defect in `disallow_importable_env` itself, or a release uploaded
 without it, is a tenant reading a raw namespace handle. The readback is what
 makes the second of those visible.
 
-**The Durable Object was unreachable.** `TakoserverManagedWorkerSqlite` did not
+**The Durable Object was unreachable in the pre-separation implementation.**
+`TakoserverManagedWorkerSqlite` did not
 extend `DurableObject` from `cloudflare:workers`, so on a real stub it answered
 only `fetch` and every RPC the provider and the wrapper make would have thrown.
-It now extends it, in
-`src/providers/cloudflare-managed-worker-sqlite-object.ts`, and delegates to
-`ManagedWorkerSqliteCore`, which keeps the behaviour testable against a faithful
-fake storage. Running it under the pinned workerd
-(`tests/cloudflare-managed-worker-sqlite-object.test.ts`) found three more
-defects no fake could: a projected row was a null-prototype object, which
-Cloudflare's RPC serializer refuses, so no `SELECT` could ever have returned;
+The concrete implementation that fixed this was moved with the managed backend
+to the private owner. The public tree retains the backend contract in
+`src/providers/cloudflare-worker-backend.ts` and migration coverage in
+`tests/managed-worker-version-execution-material-migration.test.ts`; the former
+SQLite Durable Object class and its pinned-workerd test are no longer present
+here. That historical pinned-workerd coverage found three more defects no fake
+could: a projected row was a null-prototype object, which Cloudflare's RPC
+serializer refuses, so no `SELECT` could ever have returned;
 destroy enumerated `sqlite_schema` and tried to drop the runtime's own `_cf_KV`
 table, which fails `SQLITE_AUTH` and took the whole destroy down with it; and
 the `pragma_*` table-valued functions answered where the `PRAGMA` keyword is
