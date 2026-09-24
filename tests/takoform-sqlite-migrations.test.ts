@@ -15,6 +15,7 @@ import type { JsonObject } from "../src/ports.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import type { Provider } from "../src/provider-port.ts";
 import type { TakoformArtifactManifest } from "../src/takoform/artifacts.ts";
+import { memoizeArtifacts } from "../src/takoform/engine.ts";
 import {
   applySqliteMigrationApplication,
   prepareSqliteMigrationApplication,
@@ -484,3 +485,54 @@ function resource(
     },
   };
 }
+
+test("request-scoped artifact memos resolve each digest once", async () => {
+  const manifestCalls: string[] = [];
+  const blobCalls: string[] = [];
+  const scoped = memoizeArtifacts({
+    async resolveManifest(tenantId: string, digest: string) {
+      manifestCalls.push(`${tenantId}:${digest}`);
+      return manifests.get(digest) ?? null;
+    },
+    async resolveBlob(tenantId: string, digest: string) {
+      blobCalls.push(`${tenantId}:${digest}`);
+      return digest === firstSql ? firstSqlBytes : null;
+    },
+  });
+  await scoped.resolveManifest("tenant-a", String(firstSet.spec.manifestDigest));
+  await scoped.resolveManifest("tenant-a", String(firstSet.spec.manifestDigest));
+  await scoped.resolveManifest("tenant-b", String(firstSet.spec.manifestDigest));
+  await scoped.resolveBlob("tenant-a", firstSql);
+  await scoped.resolveBlob("tenant-a", firstSql);
+  await scoped.resolveBlob("tenant-a", secondSql);
+  expect(manifestCalls).toEqual([
+    `tenant-a:${String(firstSet.spec.manifestDigest)}`,
+    `tenant-b:${String(firstSet.spec.manifestDigest)}`,
+  ]);
+  expect(blobCalls).toEqual([`tenant-a:${firstSql}`, `tenant-a:${secondSql}`]);
+});
+
+test("migration preparation resolves the immutable blob set concurrently", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const second = {
+    ...context(secondSet, new InMemoryTakoformResourceDriver()),
+    artifacts: {
+      async resolveManifest(_tenantId: string, digest: string) {
+        return manifests.get(digest) ?? null;
+      },
+      async resolveBlob(_tenantId: string, digest: string) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        if (digest === firstSql) return firstSqlBytes;
+        if (digest === secondSql) return secondSqlBytes;
+        return null;
+      },
+    },
+  };
+  const prepared = await prepareSqliteMigrationApplication(second);
+  expect(prepared?.desired).toHaveLength(2);
+  expect(maxInFlight).toBe(2);
+});

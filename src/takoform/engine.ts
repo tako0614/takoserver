@@ -109,6 +109,39 @@ export interface ArtifactResolver {
   resolveBlob(tenantId: string, digest: string): Promise<Uint8Array | null>;
 }
 
+/**
+ * Artifact identities are content-addressed digests, so a resolved manifest or
+ * blob is immutable for the lifetime of one engine operation. Migration
+ * preparation, application, and derived readiness each resolve the same
+ * manifest and every migration blob; memoizing per call turns the repeated
+ * store/R2 round trips into one fetch per digest. The memo never crosses
+ * engine calls, so a later request still observes freshly stored state.
+ */
+export function memoizeArtifacts(resolver: ArtifactResolver): ArtifactResolver {
+  const manifests = new Map<string, Promise<TakoformArtifactManifest | null>>();
+  const blobs = new Map<string, Promise<Uint8Array | null>>();
+  return {
+    resolveManifest(tenantId, digest) {
+      const key = `${tenantId}\u0000${digest}`;
+      let cached = manifests.get(key);
+      if (!cached) {
+        cached = resolver.resolveManifest(tenantId, digest);
+        manifests.set(key, cached);
+      }
+      return cached;
+    },
+    resolveBlob(tenantId, digest) {
+      const key = `${tenantId}\u0000${digest}`;
+      let cached = blobs.get(key);
+      if (!cached) {
+        cached = resolver.resolveBlob(tenantId, digest);
+        blobs.set(key, cached);
+      }
+      return cached;
+    },
+  };
+}
+
 export interface EngineContext {
   readonly request: Request;
   readonly url: URL;
@@ -762,12 +795,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     form: InstalledTakoformForm,
     spec: JsonObject,
     tenantId: string,
+    resolver: ArtifactResolver,
   ): Promise<void> => {
     const requirement = form.artifactRequirement;
     if (requirement === undefined) return;
     const manifestDigest = spec[requirement.specField];
     if (typeof manifestDigest !== "string") throw new TakoformHostError("artifact_missing", 404);
-    const manifest = await artifacts.resolveManifest(tenantId, manifestDigest);
+    const manifest = await resolver.resolveManifest(tenantId, manifestDigest);
     if (!manifest) throw new TakoformHostError("artifact_missing", 404);
     if (manifest.kind !== requirement.kind) throw new TakoformHostError("artifact_invalid", 400);
   };
@@ -1092,6 +1126,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async read(context, path): Promise<EngineResult> {
       exactQuery(context.url, resourceQueryKeys);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       let resource = await store.readResource(address);
@@ -1132,7 +1167,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             form,
             relations,
             store,
-            artifacts,
+            artifacts: scopedArtifacts,
             driver,
           });
       const workerCondition =
@@ -1158,6 +1193,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async apply(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       // Read before the original stream is consumed. This is the value-free
       // identity a sensitive runtime-input claim is fenced against: the
       // preparation committed to one exact apply, and only the request actually
@@ -1195,7 +1231,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (current && !sameFormRef(current.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
-      await requireArtifact(form, body.spec, context.tenantId);
+      await requireArtifact(form, body.spec, context.tenantId, scopedArtifacts);
       const hasApplyServiceSlots =
         validateStandardServiceSlots({ form, spec: body.spec }).length > 0;
 
@@ -1595,7 +1631,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form,
               relations: currentRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             })
           : null;
@@ -1885,7 +1921,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form,
               relations: acceptedRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             });
             // Satisfiability is pure pre-dispatch preparation. Completed
@@ -2020,7 +2056,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           form,
           relations: acceptedRelations,
           store,
-          artifacts,
+          artifacts: scopedArtifacts,
           driver,
         });
         const initialWorkerCondition = initialMigrationCondition
@@ -2124,6 +2160,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async observe(context, path): Promise<EngineResult> {
       exactQuery(context.url, resourceQueryKeys);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
       const queriedFormRef = formRefFromResourceQuery(context.url, path);
@@ -2175,7 +2212,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             form,
             relations,
             store,
-            artifacts,
+            artifacts: scopedArtifacts,
             driver,
           });
       const workerCondition =
@@ -2198,6 +2235,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async importResource(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const parsedBody = importRequest(await jsonBody(context.request));
       const runtime = await runtimeRegistry(context, parsedBody.metadata.space);
       let form = exactInstalledForm(parsedBody.form.formRef, runtime.forms);
@@ -2238,7 +2276,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         form.identity.formRef,
       );
       form = authority.form;
-      await requireArtifact(form, body.spec, context.tenantId);
+      await requireArtifact(form, body.spec, context.tenantId, scopedArtifacts);
       validateStandardServiceSlots({ form, spec: body.spec });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "import");
@@ -2480,7 +2518,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form,
               relations: acceptedRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             });
             await refreshMutation(
@@ -2572,7 +2610,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           form,
           relations: acceptedRelations,
           store,
-          artifacts,
+          artifacts: scopedArtifacts,
           driver,
         });
         const initialWorkerCondition = initialMigrationCondition
