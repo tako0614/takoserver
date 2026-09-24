@@ -66,6 +66,7 @@ import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migrati
 
 export type {
   ArtifactBytes,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,

@@ -71,6 +71,7 @@ export {
   type ProviderArtifactConsumption,
   type ProviderArtifactConsumptionInput,
   type ProviderExecutionAuthority,
+  type ProviderFailure,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
@@ -172,6 +173,7 @@ export {
 export type {
   ArtifactBytes,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
