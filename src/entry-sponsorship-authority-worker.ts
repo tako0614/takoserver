@@ -32,11 +32,15 @@ export interface SponsorshipAuthorityWorkerBindings {
 /**
  * Route-less authority bound only by the Hosted Worker.
  *
- * There is deliberately no `fetch` method. The default service-binding
- * entrypoint exports one operation and receives the owning organization,
+ * The registration-only HTTP handler always refuses the request. The default
+ * service-binding entrypoint exposes one authority RPC and receives the owning organization,
  * issuer, D1, and signing key only from its deploy-pinned binding closure.
  */
 export default class SponsorshipAuthorityEntrypoint extends WorkerEntrypoint<SponsorshipAuthorityWorkerBindings> {
+  override fetch(_request: Request): Response {
+    return new Response(null, { status: 404 });
+  }
+
   async issueTenantRunCredential(input: unknown) {
     const sql = createD1Sql(this.env.STATE_DB);
     const signingKey = await loadSponsorshipCredentialSigningKey(

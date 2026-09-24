@@ -1460,8 +1460,10 @@ time-based deletion policy; do not prune them merely to reduce the count.
   run-token secret, exposes no tenant-run mint API, and accepts a tenant-run JWT
   only when migration `0047` contains the matching immutable admission row and
   credential key id. The authority has `workers_dev=false`,
-  `preview_urls=false`, no routes or custom domains, no public `fetch`, and
-  exposes only `issueTenantRunCredential`. Status and post-apply readback prove
+  `preview_urls=false`, and no routes or custom domains. Its registration-only
+  `fetch` handler always returns an empty 404 without reading bindings or issuing
+  credentials; `issueTenantRunCredential` remains the only authority RPC.
+  Status and post-apply readback prove
   the active Version, script identity, exact binding/secret closure, and empty
   public topology. Before topology enumeration, an owner-private audit
   credential reads the exact deployment token's active policy and mechanically
