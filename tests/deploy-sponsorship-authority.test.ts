@@ -89,6 +89,37 @@ const managedTarget = {
 } satisfies DeployTarget;
 
 describe("route-less sponsorship authority deploy", () => {
+  test("recognizes both native upload APIs without accepting later settings mutations", async () => {
+    for (const trigger of ["upload", "version_upload"]) {
+      await expect(
+        inspectSponsorshipAuthority(
+          "verification",
+          target,
+          authorityState({
+            annotations: {
+              "workers/message": `sponsorship-authority:${COMMIT}:${DIGEST}`,
+              "workers/triggered_by": trigger,
+            },
+          }),
+        ),
+      ).resolves.toMatchObject({ commit: COMMIT, artifactDigest: DIGEST });
+    }
+    for (const trigger of ["secret_update", "settings_update", "", "Upload"]) {
+      await expect(
+        inspectSponsorshipAuthority(
+          "verification",
+          target,
+          authorityState({
+            annotations: {
+              "workers/message": `sponsorship-authority:${COMMIT}:${DIGEST}`,
+              "workers/triggered_by": trigger,
+            },
+          }),
+        ),
+      ).rejects.toThrow("no canonical identity");
+    }
+  });
+
   test("requires three distinct signing identities and public keys", () => {
     expect(() =>
       assertDedicatedSponsorshipKeys(

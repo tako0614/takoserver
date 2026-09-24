@@ -814,7 +814,8 @@ function authorityIdentity(
     !isRecord(value) ||
     !isRecord(value.annotations) ||
     !exactKeys(value.annotations, ["workers/message", "workers/triggered_by"]) ||
-    value.annotations["workers/triggered_by"] !== "version_upload"
+    (value.annotations["workers/triggered_by"] !== "version_upload" &&
+      value.annotations["workers/triggered_by"] !== "upload")
   ) {
     throw phaseError(phase, "sponsorship authority has no canonical identity");
   }
