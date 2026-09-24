@@ -111,12 +111,9 @@ try {
     const methods = [
       ...entrypoint.matchAll(/\n {2}(?:async )?([A-Za-z_$][A-Za-z0-9_$]*)\([^)]*\) \{/gu),
     ].map((match) => match[1]);
-    if (
-      JSON.stringify(methods) !== JSON.stringify(["issueTenantRunCredential"]) ||
-      entrypoint.includes("fetch(")
-    ) {
+    if (JSON.stringify(methods) !== JSON.stringify(["fetch", "issueTenantRunCredential"])) {
       throw new Error(
-        "sponsorship authority must export only issueTenantRunCredential and no fetch",
+        "sponsorship authority must export only its registration fetch and issueTenantRunCredential",
       );
     }
   }
