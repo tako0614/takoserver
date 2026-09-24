@@ -53,8 +53,8 @@ import {
 } from "./cloudflare-runtime-bindings.ts";
 import type {
   ArtifactBytes,
-  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareWorkerAdoptInput,
@@ -66,8 +66,8 @@ import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migrati
 
 export type {
   ArtifactBytes,
-  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
@@ -1031,17 +1031,20 @@ export class CloudflareProvider implements Provider {
     });
   }
 
-  async delete(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    executionAuthority?: ProviderExecutionAuthority;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: import("../provider-port.ts").ResourceIdentity;
-    spec?: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }, convergence = false): Promise<ProviderTicket> {
+  async delete(
+    input: {
+      operationId: string;
+      operationMode?: "initial" | "recovery";
+      providerHandle?: string;
+      executionAuthority?: ProviderExecutionAuthority;
+      offering: ProviderOffering;
+      nativeId: string;
+      identity: import("../provider-port.ts").ResourceIdentity;
+      spec?: JsonObject;
+      relations?: readonly ProviderRelation[];
+    },
+    convergence = false,
+  ): Promise<ProviderTicket> {
     if (this.#workerBackend?.owns(input.offering)) {
       if (convergence) {
         return this.#workerBackend.convergeDelete
@@ -1064,19 +1067,30 @@ export class CloudflareProvider implements Provider {
     if (
       native.kind === "queue" &&
       providerKind(input.offering) === "AtLeastOnceQueue" &&
+      this.#workerBackend &&
+      !this.#workerBackend.prepareManagedQueueDestroy
+    ) {
+      return convergence
+        ? failed("unavailable", "the managed Queue retirement authority is unavailable", true)
+        : failedWithoutProviderMutation(
+            input.operationId,
+            "unavailable",
+            "the managed Queue retirement authority is unavailable",
+          );
+    }
+    if (
+      native.kind === "queue" &&
+      providerKind(input.offering) === "AtLeastOnceQueue" &&
       this.#workerBackend?.prepareManagedQueueDestroy
     ) {
       let prepared: CloudflareManagedQueueDestroyPreparation;
       try {
         prepared = await this.#workerBackend.prepareManagedQueueDestroy(input);
       } catch {
-        return convergence
-          ? failed("unavailable", "the managed Queue retirement authority is unavailable", true)
-          : failedWithoutProviderMutation(
-              input.operationId,
-              "unavailable",
-              "the managed Queue retirement authority is unavailable",
-            );
+        // The closed hook may have persisted a marker or issued a helper
+        // mutation before its acknowledgement was lost. Only its explicit
+        // `effectsStarted: false` envelope may prove an initial call idle.
+        return failed("unavailable", "the managed Queue retirement authority is unavailable", true);
       }
       managedQueueEffectsStarted = prepared.effectsStarted;
       if (prepared.state !== "ready") {
@@ -3073,6 +3087,8 @@ const OPTIONAL_WORKER_BACKEND_METHODS = [
   "compensateApply",
   "adopt",
   "recoverAdopt",
+  "convergeDelete",
+  "prepareManagedQueueDestroy",
   "readSqliteMigrationLedger",
   "applySqliteMigrationSuffix",
   "managedScheduleReconciliationStatus",

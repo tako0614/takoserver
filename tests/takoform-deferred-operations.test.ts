@@ -925,6 +925,7 @@ describe("durable deferred Takoform operations", () => {
   test("uses durable recovery provenance for a cached provider delete receipt", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     const deleteModes: Array<"initial" | "recovery" | undefined> = [];
+    const recoveryActions: Array<"observe" | "converge" | undefined> = [];
     let deleteCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
@@ -934,6 +935,7 @@ describe("durable deferred Takoform operations", () => {
       delete: async (input) => {
         deleteCalls += 1;
         deleteModes.push(input.operationMode);
+        recoveryActions.push(input.recoveryAction);
         if (input.operationMode === "initial") {
           throw new ProviderMutationRecoveryError("indeterminate", "delete-recovery-handle");
         }
@@ -972,11 +974,13 @@ describe("durable deferred Takoform operations", () => {
     if (!first) throw new Error("initial delete recovery attempt returned no response");
     const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
     expect(deleteModes).toEqual(["initial"]);
+    expect(recoveryActions).toEqual([undefined]);
 
     const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
     const lostCommit = await remove();
     expect(lostCommit?.status).toBe(202);
     expect(deleteModes).toEqual(["initial", "recovery"]);
+    expect(recoveryActions).toEqual([undefined, "observe"]);
     expect(
       opened.database
         .query(
@@ -1001,6 +1005,80 @@ describe("durable deferred Takoform operations", () => {
         )
         .get(operationId),
     ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("background repair marks delete recovery as maintenance convergence", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let defer = false;
+    let now = Date.parse("2026-09-24T00:00:00.000Z");
+    const recoveryActions: Array<"observe" | "converge" | undefined> = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        recoveryActions.push(input.recoveryAction);
+        if (input.operationMode !== "recovery") {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+        return await memory.delete(input);
+      },
+    };
+    const opened = persistentHarness(() => new Date(now), driver, [form], {
+      shouldDefer: () => defer,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "maintenance-delete-convergence");
+    defer = true;
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/maintenance-delete-convergence?${query}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "maintenance-delete-convergence-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    expect(recoveryActions).toEqual([undefined]);
+    const leases = opened.database
+      .query(
+        `SELECT operation.lease_until AS operation_lease_until,
+                saga.execution_lease_until AS provider_lease_until
+         FROM tf_deferred_operations_selection_v1 AS operation
+         INNER JOIN tf_provider_mutation_sagas_selection_v1 AS saga
+           ON saga.operation_id = operation.id
+         WHERE operation.target_name = ?`,
+      )
+      .get("maintenance-delete-convergence") as {
+      operation_lease_until: number | null;
+      provider_lease_until: number | null;
+    } | null;
+    now = Math.max(now, leases?.operation_lease_until ?? 0, leases?.provider_lease_until ?? 0) + 1;
+    const maintenance = opened.host.maintenance;
+    if (!maintenance) throw new Error("durable Host maintenance is unavailable");
+    expect(await maintenance.drainProviderRepairs(8)).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 1,
+      pending: 0,
+    });
+    expect(recoveryActions).toEqual([undefined, "converge"]);
     opened.close();
   });
 

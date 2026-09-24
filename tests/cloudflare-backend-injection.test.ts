@@ -548,6 +548,8 @@ test("CloudflareProvider rejects invalid managed factories without ordinary fall
     { ...backend, readSqliteMigrationLedger: "not callable" },
     { ...backend, adopt: "not callable" },
     { ...backend, recoverAdopt: "not callable" },
+    { ...backend, convergeDelete: "not callable" },
+    { ...backend, prepareManagedQueueDestroy: "not callable" },
   ];
   for (const invalid of invalidBackends) {
     expect(

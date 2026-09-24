@@ -1774,6 +1774,7 @@ describe("released edge Form placement", () => {
   function queueDeleteProvider(
     response: { readonly status: number; readonly body: unknown } | "transport",
     offering = technical("AtLeastOnceQueue"),
+    backend?: CloudflareWorkerBackend,
   ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
     const calls: Call[] = [];
     const provider = new CloudflareProvider({
@@ -1782,6 +1783,9 @@ describe("released edge Form placement", () => {
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
+      ...(backend
+        ? { workerBackend: { kind: "workers-for-platforms" as const, create: () => backend } }
+        : {}),
       async fetch(request) {
         calls.push({
           method: request.method,
@@ -1841,6 +1845,97 @@ describe("released edge Form placement", () => {
     });
     expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
     expect(providerFailureProvesNoMutation(ticket, "another-operation")).toBe(false);
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("never proves no mutation when managed Queue preparation throws after an effect", async () => {
+    const operationId = "op-queue-retirement-preparation-lost-ack";
+    let markerPersisted = false;
+    const backend = {
+      ...managedBackendThatDoesNotOwnQueues(),
+      async prepareManagedQueueDestroy() {
+        markerPersisted = true;
+        throw new TypeError("retirement acknowledgement lost");
+      },
+    } satisfies CloudflareWorkerBackend;
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      { status: 204, body: { success: true, errors: [], result: null } },
+      offering,
+      backend,
+    );
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(markerPersisted).toBe(true);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("fails closed when managed Queue convergence has no retirement capability", async () => {
+    const operationId = "op-queue-retirement-missing-capability";
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      { status: 204, body: { success: true, errors: [], result: null } },
+      offering,
+      managedBackendThatDoesNotOwnQueues(),
+    );
+    const ticket = await provider.convergeDelete({
+      ...queueDeleteInput(offering, operationId),
+      operationMode: "recovery",
+      identity: {
+        ...IDENTITY,
+        name: "jobs",
+        uid: "resource-missing-retirement-capability",
+        incarnationId: "deployment-missing-retirement-capability",
+        generation: "1",
+      },
+      executionAuthority: {
+        tenantId: IDENTITY.tenantRef,
+        resourceUid: "resource-missing-retirement-capability",
+        leaseToken: "lease-missing-retirement-capability",
+        fingerprint: "missing-retirement-capability",
+      },
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("keeps exact Queue 11005 indeterminate after retirement effects started", async () => {
+    const operationId = "op-queue-retirement-referenced-after-effects";
+    const backend = {
+      ...managedBackendThatDoesNotOwnQueues(),
+      async prepareManagedQueueDestroy() {
+        return { state: "ready" as const, effectsStarted: true };
+      },
+    } satisfies CloudflareWorkerBackend;
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      {
+        status: 400,
+        body: {
+          success: false,
+          errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+        },
+      },
+      offering,
+      backend,
+    );
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
     expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
   });
 

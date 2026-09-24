@@ -785,3 +785,48 @@ test("delete recovery settles the exact provider tombstone before reservation de
     generation: "1",
   });
 });
+
+test("maintenance delete convergence falls back to a provider's read-only recovery capability", async () => {
+  const context = await fixture({
+    recoverDelete: async (input) =>
+      succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} }),
+  });
+  await context.deployments.create({
+    tenantId,
+    id: "deployment-endpoint-maintenance-fallback",
+    resourceUid: endpointUid,
+    offeringId: "fake.endpoint",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    nativeId: `endpoint:${endpointUid}`,
+    state: "active",
+    observed: {},
+    outputs: {},
+  });
+  const worker = (await buildEdgeForms()).forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!worker) throw new Error("released ModuleWorker Form missing");
+
+  await context.driver.delete({
+    operationId: "operation-endpoint-maintenance-fallback",
+    operationMode: "recovery",
+    recoveryAction: "converge",
+    executionAuthority: {
+      tenantId,
+      resourceUid: endpointUid,
+      leaseToken: "lease-endpoint-maintenance-fallback",
+      fingerprint: "fingerprint-endpoint-maintenance-fallback",
+    },
+    tenantId,
+    resourceUid: endpointUid,
+    resource: endpointResource(context.endpoint),
+    relations: [workerRelation(worker)],
+  });
+
+  expect(context.events).toEqual([
+    "reservation.lookup",
+    "provider.recoverDelete",
+    "reservation.deactivate",
+  ]);
+});
