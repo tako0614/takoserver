@@ -41,6 +41,7 @@ const TAKOFORM_APPLY_PROVIDER_SELECTION = "0059_takoform_apply_provider_selectio
 const TAKOFORM_OPERATION_GENERATION = "0060_takoform_operation_generation.sql";
 const TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY = "0061_takoform_accepted_authority_continuity.sql";
 const TAKOFORM_IMPORT_PROVIDER_SELECTION = "0062_takoform_import_provider_selection.sql";
+const CLOUDFLARE_MANAGED_QUEUE_RETIREMENT = "0063_cloudflare_managed_queue_retirement.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -72,6 +73,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   TAKOFORM_OPERATION_GENERATION,
   TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
   TAKOFORM_IMPORT_PROVIDER_SELECTION,
+  CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -443,6 +445,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_OPERATION_GENERATION,
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
+      CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -716,6 +719,7 @@ describe("bringing a local database up to date", () => {
         TAKOFORM_OPERATION_GENERATION,
         TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
         TAKOFORM_IMPORT_PROVIDER_SELECTION,
+        CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1282,6 +1286,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_OPERATION_GENERATION,
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
+      CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1425,6 +1430,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_OPERATION_GENERATION,
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
+      CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
     ]);
     expect(
       database
@@ -2375,6 +2381,7 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_OPERATION_GENERATION,
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
+      CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
     ]);
     expect(
       database

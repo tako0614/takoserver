@@ -126,6 +126,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0060_takoform_operation_generation.sql",
   "0061_takoform_accepted_authority_continuity.sql",
   "0062_takoform_import_provider_selection.sql",
+  "0063_cloudflare_managed_queue_retirement.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -253,6 +254,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:63d2029fa680130f4af59fae2f1f613a7d9ea220816eb224576521b59943ad88",
   "0062_takoform_import_provider_selection.sql":
     "sha256:1ba57124b32b621eda2a7ba08a461731aead99ce956e82de59726cdb3c365c3e",
+  "0063_cloudflare_managed_queue_retirement.sql":
+    "sha256:fb247f28b621ebe800711013ff3ea4b11fa276c41f1a5c6ffc4344a51dd2cc66",
 };
 const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
 const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(
@@ -424,6 +427,7 @@ const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selecti
 const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
 const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
 const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
+const MANAGED_QUEUE_RETIREMENT_MIGRATION = "0063_cloudflare_managed_queue_retirement.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -823,8 +827,15 @@ export async function runD1Schema(
       "preflight",
       inspectionConfig,
     );
+    const managedQueueRetirementCutover = inspectManagedQueueRetirementCutover({
+      invocation,
+      wave,
+      state: initial,
+      artifact: sourceMigrations,
+    });
     if (invocation.action === "apply") {
       assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
+      assertManagedQueueRetirementCutoverReady(managedQueueRetirementCutover);
     }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -890,6 +901,7 @@ export async function runD1Schema(
         },
         artifactBlobIoCompatibility,
         applyProviderSelectionCutover,
+        managedQueueRetirementCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -901,7 +913,9 @@ export async function runD1Schema(
           (artifactBlobIoCompatibility.status === "ready" ||
             artifactBlobIoCompatibility.status === "not_pending") &&
           (applyProviderSelectionCutover.status === "not_pending" ||
-            applyProviderSelectionCutover.status === "ready"),
+            applyProviderSelectionCutover.status === "ready") &&
+          (managedQueueRetirementCutover.status === "not_pending" ||
+            managedQueueRetirementCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -953,6 +967,13 @@ export async function runD1Schema(
         "tests/takoform-import-selection-schema.test.ts",
       ]);
     }
+    if (wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+      await checked(run, "preflight", "managed Queue retirement transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-managed-queue-retirement.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -976,7 +997,8 @@ export async function runD1Schema(
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
     const additiveCutoverPostShape =
-      applyProviderSelectionCutover.status === "ready"
+      applyProviderSelectionCutover.status === "ready" ||
+      managedQueueRetirementCutover.status === "ready"
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
@@ -1009,6 +1031,14 @@ export async function runD1Schema(
     }
     assertApplyProviderSelectionCutoverReady(
       await inspectSelectionCutover(requalified, requalifiedWave, "preflight", configPath),
+    );
+    assertManagedQueueRetirementCutoverReady(
+      inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: requalifiedWave,
+        state: requalified,
+        artifact: sourceMigrations,
+      }),
     );
     const requalifiedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -1080,6 +1110,14 @@ export async function runD1Schema(
     const fencedWave = selectSchemaWave(sourceMigrations, fenced.applied, invocation);
     assertApplyProviderSelectionCutoverReady(
       await inspectSelectionCutover(fenced, fencedWave, "preflight", configPath),
+    );
+    assertManagedQueueRetirementCutoverReady(
+      inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: fencedWave,
+        state: fenced,
+        artifact: sourceMigrations,
+      }),
     );
     const fencedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -1279,6 +1317,28 @@ export async function runD1Schema(
       assertApplyProviderSelectionCutoverReady(
         await inspectSelectionCutover(fenced, fencedWave, "mutation", configPath),
       );
+      if (fencedWave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+        const immediateManagedQueueRetirementState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(
+          fenced,
+          immediateManagedQueueRetirementState,
+          "at the immediate 0063 managed Queue retirement migration fence",
+        );
+        assertManagedQueueRetirementCutoverReady(
+          inspectManagedQueueRetirementCutover({
+            invocation,
+            wave: fencedWave,
+            state: immediateManagedQueueRetirementState,
+            artifact: sourceMigrations,
+          }),
+        );
+      }
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1394,31 +1454,38 @@ export async function runD1Schema(
       );
     }
     if (additiveCutoverPostShape !== null) {
-      const cutoverName = wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
-        ? "import-selection"
-        : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-          ? "accepted-authority"
-          : "operation-generation";
+      const cutoverName = wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+        ? "managed Queue retirement"
+        : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+          ? "import-selection"
+          : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+            ? "accepted-authority"
+            : "operation-generation";
       const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
           `${cutoverName} cutover post-shape differs from the exact audited ${cutoverBoundary} schema; repair forward`,
         );
       }
-      const orphanCount = await readOrphanOpenProviderEffectCount({
-        phase: "verification",
-        configPath,
-        environment,
-        run,
-        injected: options.reader,
-      });
-      if (orphanCount !== 0) {
-        throw verificationError(
-          `${cutoverName} cutover has orphan open provider effects after migration; repair forward`,
-          JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
-        );
+      if (applyProviderSelectionCutover.status === "ready") {
+        const orphanCount = await readOrphanOpenProviderEffectCount({
+          phase: "verification",
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        });
+        if (orphanCount !== 0) {
+          throw verificationError(
+            `${cutoverName} cutover has orphan open provider effects after migration; repair forward`,
+            JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
+          );
+        }
       }
-      if (wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+      if (
+        applyProviderSelectionCutover.status === "ready" &&
+        wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+      ) {
         const historicalPlannedCount = await readPlannedImportSagaCount(
           {
             phase: "verification",
@@ -1524,6 +1591,7 @@ export async function runD1Schema(
       },
       artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
       applyProviderSelectionCutover,
+      managedQueueRetirementCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1591,12 +1659,13 @@ function selectSchemaWave(
         OPERATION_GENERATION_MIGRATION,
         ACCEPTED_AUTHORITY_MIGRATION,
         IMPORT_PROVIDER_SELECTION_MIGRATION,
+        MANAGED_QUEUE_RETIREMENT_MIGRATION,
       ].includes(name),
     );
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0062",
+          "integration D1 cutover requires the exact audited source inventory 0001-0063",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -1606,7 +1675,9 @@ function selectSchemaWave(
         ? 60
         : applied.length === 60
           ? 61
-          : 62
+          : applied.length === 61
+            ? 62
+            : 63
       : artifact.names.length;
     const throughPrefixNames = artifact.names.slice(0, throughCount);
     const throughPrefixFiles = artifact.files.slice(0, throughCount);
@@ -1629,7 +1700,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0062",
+      "selected D1 wave requires the exact audited source inventory 0001-0063",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1705,7 +1776,7 @@ function assertOperationGenerationMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0062 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0063 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1716,7 +1787,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0062",
+      "audited migration lineage must contain exactly 0001-0063",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -1726,7 +1797,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0062 source inventory: the
+ * intentionally separate from the current 0001-0063 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -1999,6 +2070,14 @@ interface ApplyProviderSelectionCutover {
   readonly plannedImportSagaCount?: number;
 }
 
+interface ManagedQueueRetirementCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "managed_queue_retirement_cutover_unqualified";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -2080,6 +2159,46 @@ function assertArtifactBlobIoCompatibilityReady(
   }
 }
 
+function inspectManagedQueueRetirementCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+}): ManagedQueueRetirementCutover {
+  if (!input.wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+    return { status: "not_pending" };
+  }
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    input.state.applied.length !== 62 ||
+    JSON.stringify(input.wave.pending) !== JSON.stringify([MANAGED_QUEUE_RETIREMENT_MIGRATION])
+  ) {
+    return { status: "managed_queue_retirement_cutover_unqualified" };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0063",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  return applicationSchemaMatches(
+    input.state,
+    deriveExpectedApplicationShape(input.artifact.files.slice(0, 62)),
+  )
+    ? { status: "ready" }
+    : { status: "predecessor_schema_mismatch" };
+}
+
+function assertManagedQueueRetirementCutoverReady(cutover: ManagedQueueRetirementCutover): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `managed Queue retirement cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
 async function inspectApplyProviderSelectionCutover(input: {
   readonly invocation: SchemaInvocation;
   readonly wave: SelectedSchemaWave;
@@ -2136,7 +2255,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0062",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0063",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -2178,7 +2297,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0062",
+      "operation-generation cutover requires the exact audited source inventory 0001-0063",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -2996,13 +3115,17 @@ function writeD1Config(path: string, target: DeployTarget, migrationDirectory: s
   return path;
 }
 
-function assertSamePreState(left: D1SchemaState, right: D1SchemaState): void {
+function assertSamePreState(
+  left: D1SchemaState,
+  right: D1SchemaState,
+  when = "during qualification",
+): void {
   if (
     JSON.stringify(left.applied) !== JSON.stringify(right.applied) ||
     left.shapeDigest !== right.shapeDigest ||
     left.shape !== right.shape
   ) {
-    throw preflightError("D1 lineage or schema shape changed during qualification");
+    throw preflightError(`D1 lineage or schema shape changed ${when}`);
   }
 }
 

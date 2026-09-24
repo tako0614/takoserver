@@ -8,6 +8,7 @@ import { createTakoformStore } from "../src/takoform/store.ts";
 const OPERATION_GENERATION = "0060_takoform_operation_generation.sql";
 const ACCEPTED_AUTHORITY_CONTINUITY = "0061_takoform_accepted_authority_continuity.sql";
 const IMPORT_SELECTION = "0062_takoform_import_provider_selection.sql";
+const MANAGED_QUEUE_RETIREMENT = "0063_cloudflare_managed_queue_retirement.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -221,6 +222,7 @@ describe("Takoform accepted-authority continuity migration", () => {
     expect(migrateSqlite(database).applied).toEqual([
       ACCEPTED_AUTHORITY_CONTINUITY,
       IMPORT_SELECTION,
+      MANAGED_QUEUE_RETIREMENT,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

@@ -152,7 +152,7 @@ describe("0061 to 0062 existing-data import-selection transition", () => {
         const result = await f.invoke("apply");
         expect(result).toMatchObject({
           pendingMigrations: [IMPORT_SELECTION],
-          appliedMigrations: MIGRATIONS.map(({ name }) => name),
+          appliedMigrations: MIGRATIONS.slice(0, 62).map(({ name }) => name),
           applyProviderSelectionCutover: {
             status: "ready",
             plannedImportSagaCount: 0,
@@ -276,7 +276,7 @@ describe("0061 to 0062 existing-data import-selection transition", () => {
     });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 62).map(({ name }) => name),
       });
       expect(f.applies()).toBe(1);
     } finally {

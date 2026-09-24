@@ -104,7 +104,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0062 lineage and verifies its canonical schema, then creates the
+audited 0001–0063 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
@@ -412,7 +412,7 @@ bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
 `takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0062 migration lineage,
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0063 migration lineage,
 and canonical migrated schema before preparation and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
@@ -1175,15 +1175,15 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0062 names and SHA-256 inventory, so a checkout with unreviewed 0063+
+  0001–0063 names and SHA-256 inventory, so a checkout with unreviewed 0064+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
   `integration-protected-wave` result is never accepted by rehearsal or
   production. The no-selector integration lane additionally permits only the
-  exact existing-data 0058/0059 to 0060, separate 0060 to 0061, and separate
-  0061 to 0062 transitions
+  exact existing-data 0058/0059 to 0060, separate 0060 to 0061, separate
+  0061 to 0062, and separate 0062 to 0063 transitions
   described below. Earlier
   predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
@@ -1195,11 +1195,12 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes audited 0058–0062 for fresh, explicitly
+The current source includes audited 0058–0063 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
 `--through-migration=0059`, `--through-migration=0060`,
-`--through-migration=0061`, or `--through-migration=0062`.
+`--through-migration=0061`, `--through-migration=0062`, or
+`--through-migration=0063`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1323,6 +1324,33 @@ the matching CPE and then Host in order. This is forward-only integration
 repair, does not authorize rehearsal or production, and a fresh generation
 remains a disposable initialization path rather than a recovery alternative
 for protected data.
+
+### 0063: managed Queue retirement integration cutover
+
+The no-selector `takoserver-d1-schema` integration lane accepts one further
+standalone transition: the exact audited 0062 prefix with only
+`0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
+must be exactly 0001–0063 with the audited 0063 SHA-256, and the selected D1
+must have the canonical 0062 application shape. Protected rehearsal and
+production selectors remain capped at 0057; an unreviewed 0064 tail is refused.
+
+0063 creates only the durable managed Queue retirement marker, helper-phase
+rows, route tripwire and their immutable/no-regression guards. It rewrites and
+backfills no existing row, so this transition adds no generic writer
+quiescence or data-drain claim. Historical Queues without a marker are not
+adopted, repaired, or replayed by the migration.
+
+The owner checks the exact predecessor at initial preflight, after source and
+test qualification, and with a fresh authoritative state read immediately
+before the one migration request. The sealed migration and its ledger insert
+remain one D1 transaction. Success requires exact all-0063 lineage and the
+canonical 0063 post-shape. A lost acknowledgement is reconciled from that
+authoritative lineage and shape and must not trigger a second apply.
+
+Release order is schema, matching CPE, Host authority cutover, then Form. CPE
+readiness must itself prove the exact 0063 retirement objects before
+publication. Host scheduling and an actual managed Queue convergence E2E are
+separate post-publication evidence; local schema success does not claim either.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

@@ -367,7 +367,7 @@ export const DEPLOY_CONTRACT = {
           "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
           "and all other closure names, types and fields remain exact. Before upload and again at the " +
           "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
-          "R2 name, audited 0001-0062 lineage and canonical migrated schema. Production and rehearsal " +
+          "R2 name, audited 0001-0063 lineage and canonical migrated schema. Production and rehearsal " +
           "refuse this pair before provider effects. " +
           integrationServiceBindingRefresh +
           " This one integration rebind branch runs " +
@@ -980,11 +980,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0062 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0063 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0062 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0063 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1149,7 +1149,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0062; unreviewed 0063+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0063; unreviewed 0064+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1175,6 +1175,7 @@ export const DEPLOY_CONTRACT = {
           "The 0055 boundary adds durable value-free Queue custody dead-letter transfer notices after 0054; terminal transfer, notice coalescing and source removal remain one guarded atomic batch, while notice acknowledgement stays an exact source-generation/target/token CAS for a private destination wake. " +
           "The 0056 boundary adds Host-owned bounded VectorIndex SQL storage after 0055: immutable cosine index configuration, per-Resource record quotas, binary32 vector records, and type-sensitive equality filter terms; it changes no published identity, binding or provider catalog. " +
           "The 0057 boundary adds receipt-coupled, provider-private execution-material tables for immutable managed Worker Versions after 0056; it stores only bounded execution descriptors and sealed values, and does not publish a Worker, activate custody, or apply any schema automatically. " +
+          "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1208,7 +1209,7 @@ export const DEPLOY_CONTRACT = {
           "bundle it with the 0059/0060 transition. Have the compatible Host ready before migration; " +
           "publish it only after schema readback, then reconcile current Form authority as needed. " +
           "A separate exact 0061 to 0062 integration transition requires the audited 0061 predecessor " +
-          "and canonical 0061 application shape, from exact current 0001-0062 source. It requires zero planned current-generation imports " +
+          "and canonical 0061 application shape, from exact current 0001-0063 source. It requires zero planned current-generation imports " +
           "before qualification and at the final mutation fence; the migration, ledger insert and " +
           "old-writer fence are one atomic D1 transaction. New import writers explicitly insert immutable " +
           "import_selection_protocol=1; old inserts are refused before preparation. The import selection " +
@@ -1217,7 +1218,8 @@ export const DEPLOY_CONTRACT = {
           "retained through receipt publication. Read back the schema, then publish CPE and Host in that " +
           "order as a forward-only integration repair; it grants no production authorization. " +
           "The executor protocol generation is unchanged; unrelated components need not be republished. " +
-          "This forward-only availability boundary is not a zero-downtime or historical recovery claim.",
+          "This forward-only availability boundary is not a zero-downtime or historical recovery claim. " +
+          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0063 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
@@ -1229,6 +1231,7 @@ export const DEPLOY_CONTRACT = {
           "before the local D1 migration gate. The separate 0061 to 0062 transition additionally checks " +
           "the exact 0061 predecessor shape, zero planned current-generation imports and the unique " +
           "native-destination reservation through receipt publication before the local D1 migration gate. " +
+          "The separate 0062 to 0063 transition checks the exact canonical 0062 predecessor at initial preflight, after qualification and at an immediate mutation read, then requires the exact canonical 0063 post-shape. It admits no other pending suffix and leaves all protected selectors capped at 0057. " +
           "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
