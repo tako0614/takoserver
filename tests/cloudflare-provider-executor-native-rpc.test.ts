@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Miniflare } from "miniflare";
+import { miniflareServiceBinding } from "./helpers/miniflare-service-binding.ts";
 
 const executorModule = `
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -147,8 +148,8 @@ export default { fetch() { return new Response("ok"); } };
             type: "worker",
             compatibilityDate: "2026-08-17",
             env: {
-              EXECUTOR: { type: "worker", workerName: "executor", exportName: "Executor" },
-              SELF: { type: "worker", workerName: "caller", exportName: "Caller" },
+              EXECUTOR: miniflareServiceBinding("worker", "executor", "Executor"),
+              SELF: miniflareServiceBinding("worker", "caller", "Caller"),
             },
             manifest: {
               mainModule: "caller.js",

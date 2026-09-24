@@ -37,7 +37,9 @@ test("sponsorship registration handler refuses HTTP without any authority bindin
         const response = await runtime.dispatchFetch(`https://authority.test${path}`, {
           method,
           headers: { authorization: "Bearer not-an-authority", cookie: "session=not-authority" },
-          ...(method === "GET" || method === "HEAD" ? {} : { body: "not valid JSON" }),
+          ...(method === "GET" || method === "HEAD" || method === "OPTIONS"
+            ? {}
+            : { body: "not valid JSON" }),
         });
         expect(response.status).toBe(404);
         expect(await response.text()).toBe("");

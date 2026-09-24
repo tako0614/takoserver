@@ -13,6 +13,7 @@ import {
 } from "../scripts/deploy/worker-artifact.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
+import { wranglerPathForTests } from "./helpers/wrangler-path.ts";
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -34,6 +35,7 @@ async function build(root: string) {
     root,
     target,
     commit: COMMIT,
+    wranglerPath: wranglerPathForTests(),
     run: runCommand,
   });
   const bytes = readFileSync(prepared.bundlePath);
