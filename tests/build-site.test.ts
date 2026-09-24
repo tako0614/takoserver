@@ -24,8 +24,11 @@ describe("Takoserver public site build", () => {
       });
       expect(result.exitCode).toBe(0);
       const rootHtml = readFileSync(join(root, "index.html"), "utf8");
-      expect(readFileSync(join(root, "ja", "index.html"), "utf8")).toBe(rootHtml);
+      const japaneseHtml = readFileSync(join(root, "ja", "index.html"), "utf8");
       expect(readFileSync(join(root, "en", "index.html"), "utf8")).toBe(rootHtml);
+      expect(japaneseHtml).not.toBe(rootHtml);
+      expect(japaneseHtml).toContain('<html lang="ja">');
+      expect(japaneseHtml).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

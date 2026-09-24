@@ -11,7 +11,54 @@ export interface LandingOptions {
   readonly consoleOrigin: string | null;
   /** Prefix for the API links. Empty when the page is served by the API. */
   readonly apiOrigin: string | null;
+  /** Static locale for the page body; the API root defaults to English. */
+  readonly locale?: "en" | "ja";
 }
+
+const landingMessages = {
+  en: {
+    description: "A Takoform Host that owns accounts, money, and machines.",
+    console: "Open the console",
+    eyebrow: "Takoform Host",
+    headline: "Declare infrastructure. The Host prices, provisions, and meters it.",
+    lede: "Takoserver owns the accounts, money, and machines. Declare an exact Form, fund a prepaid wallet, and inspect every usage charge.",
+    products: "Host primitives",
+    formTitle: "Exact Form identity",
+    formBody: "Every declaration pins group, kind, definition version, and schema digest.",
+    holdTitle: "Prepaid hold / capture",
+    holdBody: "Work holds wallet balance, captures on success, and releases on failure.",
+    objectTitle: "edge.objects",
+    objectBody: "ObjectBucket binds through bucketBindings to the exact edge.objects interface.",
+    meterTitle: "Provision + meter",
+    meterBody: "Provision Deployments, record usage, and capture reported AI token use.",
+    billingTitle: "Usage-based, prepaid billing",
+    billingBody: "Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.",
+    api: "API description",
+    product: "Product discovery",
+    host: "Takoform Host discovery",
+  },
+  ja: {
+    description: "アカウント、資金、マシンを管理するTakoform Host。",
+    console: "コンソールを開く",
+    eyebrow: "Takoform Host",
+    headline: "インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。",
+    lede: "Takoserverはアカウント、資金、マシンを管理します。正確なFormを宣言し、前払いウォレットから利用量に応じて支払います。",
+    products: "Hostのプリミティブ",
+    formTitle: "正確なForm identity",
+    formBody: "すべての宣言はgroup、kind、definition version、schema digestを固定します。",
+    holdTitle: "Prepaid hold / capture",
+    holdBody: "処理前にウォレットをholdし、成功時にcapture、失敗時にreleaseします。",
+    objectTitle: "edge.objects",
+    objectBody: "ObjectBucketはbucketBindingsを通じて正確なedge.objects interfaceに接続します。",
+    meterTitle: "Provision + meter",
+    meterBody: "Deploymentをプロビジョニングし、利用量を記録して、AIの報告トークン使用量をcaptureします。",
+    billingTitle: "前払い・使用量ベースの課金",
+    billingBody: "細かな単位で利用量を蓄積し、明確な集計としてウォレットへ精算します。利用量と請求額を確認できます。",
+    api: "API仕様",
+    product: "製品ディスカバリー",
+    host: "Takoform Hostディスカバリー",
+  },
+} as const;
 
 /**
  * What the API serves at its own root.
@@ -24,18 +71,23 @@ export interface LandingOptions {
  * second request to render one screen.
  */
 export function landingHtml(options: LandingOptions): string {
+  const locale = options.locale ?? "en";
+  const copy = landingMessages[locale];
   const consoleOrigin = options.consoleOrigin;
   const console_ = consoleOrigin
-    ? `<a class="cta" href="${consoleOrigin}" data-i18n="console">Open the console</a>`
+    ? `<a class="cta" href="${consoleOrigin}" data-i18n="console">${copy.console}</a>`
     : "";
   const base = options.apiOrigin ?? "";
+  const noScriptLocale_ = options.apiOrigin !== null
+    ? `<noscript><a href="/ja/">日本語</a> · <a href="/en/">English</a></noscript>`
+    : "";
   return `<!doctype html>
-<html lang="en">
+<html lang="${locale}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Takoserver</title>
-<meta name="description" content="A prepaid resource platform. Declare infrastructure with Takoform.">
+<meta name="description" content="${copy.description}">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 34 34'%3E%3Crect width='34' height='34' fill='%23b0301f'/%3E%3C/svg%3E">
 <style>
@@ -65,7 +117,8 @@ main { max-width: 46rem; margin: 0 auto; padding: 88px 24px 96px; }
   appearance: none; border: 0; border-radius: 4px; padding: 5px 9px; cursor: pointer;
   background: transparent; color: var(--ink-2); font: inherit; font-size: 12px;
 }
-.locale button[aria-pressed="true"] { background: var(--bg-2); color: var(--ink); }
+.locale button[aria-pressed="true"], .locale a:hover { background: var(--bg-2); color: var(--ink); }
+.locale a { padding: 5px 9px; color: var(--ink-2); font-size: 12px; text-decoration: none; }
 .hero { margin-top: 76px; }
 .eyebrow { color: var(--accent); font: 600 12px/1.3 ui-monospace, monospace; letter-spacing: .06em; text-transform: uppercase; }
 h1 { margin: 22px 0 0; font-size: 34px; font-weight: 600; letter-spacing: -0.035em; }
@@ -102,33 +155,30 @@ footer { margin-top: 56px; color: var(--ink-2); font-size: 13px; }
 </head>
 <body>
 <main>
-<div class="top"><span class="wordmark">takoserver</span><div class="locale" role="group" aria-label="Language"><button type="button" data-locale="ja">日本語</button><button type="button" data-locale="en">English</button></div></div>
+<div class="top"><span class="wordmark">takoserver</span><div class="locale" role="group" aria-label="Language"><button type="button" data-locale="ja">日本語</button><button type="button" data-locale="en">English</button>${noScriptLocale_}</div></div>
 <section class="hero">
 <svg viewBox="0 0 34 34" width="44" height="44" shape-rendering="crispEdges" aria-hidden="true"><rect x="9" y="0" width="17" height="8" fill="var(--accent)"/><rect x="8" y="1" width="1" height="30" fill="var(--accent)"/><rect x="26" y="1" width="1" height="33" fill="var(--accent)"/><rect x="7" y="2" width="1" height="30" fill="var(--accent)"/><rect x="27" y="2" width="1" height="30" fill="var(--accent)"/><rect x="6" y="3" width="1" height="31" fill="var(--accent)"/><rect x="28" y="3" width="1" height="22" fill="var(--accent)"/><rect x="29" y="4" width="1" height="20" fill="var(--accent)"/><rect x="5" y="5" width="1" height="29" fill="var(--accent)"/><rect x="4" y="6" width="1" height="15" fill="var(--accent)"/><rect x="30" y="6" width="1" height="17" fill="var(--accent)"/><rect x="3" y="7" width="1" height="13" fill="var(--accent)"/><rect x="31" y="7" width="1" height="15" fill="var(--accent)"/><rect x="2" y="8" width="1" height="9" fill="var(--accent)"/><rect x="9" y="8" width="4" height="23" fill="var(--accent)"/><rect x="15" y="8" width="5" height="3" fill="var(--accent)"/><rect x="22" y="8" width="4" height="23" fill="var(--accent)"/><rect x="32" y="8" width="1" height="13" fill="var(--accent)"/><rect x="1" y="10" width="1" height="4" fill="var(--accent)"/><rect x="13" y="10" width="2" height="21" fill="var(--accent)"/><rect x="20" y="10" width="2" height="24" fill="var(--accent)"/><rect x="33" y="10" width="1" height="10" fill="var(--accent)"/><rect x="17" y="11" width="3" height="20" fill="var(--accent)"/><rect x="16" y="12" width="1" height="1" fill="var(--accent)"/><rect x="15" y="14" width="1" height="20" fill="var(--accent)"/><rect x="16" y="16" width="1" height="18" fill="var(--accent)"/><rect x="0" y="20" width="3" height="2" fill="var(--accent)"/><rect x="1" y="22" width="2" height="2" fill="var(--accent)"/><rect x="3" y="23" width="2" height="8" fill="var(--accent)"/><rect x="2" y="24" width="1" height="2" fill="var(--accent)"/><rect x="28" y="27" width="1" height="4" fill="var(--accent)"/><rect x="29" y="28" width="1" height="3" fill="var(--accent)"/><rect x="2" y="29" width="1" height="2" fill="var(--accent)"/><rect x="30" y="29" width="1" height="2" fill="var(--accent)"/><rect x="1" y="30" width="1" height="1" fill="var(--accent)"/><rect x="31" y="30" width="1" height="1" fill="var(--accent)"/><rect x="10" y="31" width="3" height="1" fill="var(--accent)"/><rect x="17" y="31" width="1" height="1" fill="var(--accent)"/><rect x="22" y="31" width="1" height="1" fill="var(--accent)"/><rect x="25" y="31" width="1" height="3" fill="var(--accent)"/><rect x="10" y="32" width="2" height="2" fill="var(--accent)"/><rect x="13" y="8" width="2" height="2" fill="var(--face)"/><rect x="20" y="8" width="2" height="2" fill="var(--face)"/><rect x="15" y="11" width="2" height="1" fill="var(--face)"/><rect x="15" y="12" width="1" height="2" fill="var(--face)"/><rect x="16" y="13" width="1" height="3" fill="var(--face)"/></svg>
-<p class="eyebrow" data-i18n="eyebrow">Developer cloud</p>
-<h1 data-i18n="headline">Cloud resources, without the cloud maze.</h1>
-<p class="lede" data-i18n="lede">Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for measured usage.</p>
+<p class="eyebrow" data-i18n="eyebrow">${copy.eyebrow}</p>
+<h1 data-i18n="headline">${copy.headline}</h1>
+<p class="lede" data-i18n="lede">${copy.lede}</p>
 ${console_}
 </section>
-<section class="grid" aria-label="Products">
-<article><h2 data-i18n="computeTitle">Compute</h2><p data-i18n="computeBody">Deploy edge services and attach the resources they use.</p></article>
-<article><h2 data-i18n="dataTitle">Data</h2><p data-i18n="dataBody">Databases, key-value storage, queues, and migration-ready state.</p></article>
-<article><h2 data-i18n="storageTitle">Object storage</h2><p data-i18n="storageBody">Portable ObjectBucket resources bound to Workers through the exact edge.objects API.</p></article>
-<article><h2 data-i18n="aiTitle">AI</h2><p data-i18n="aiBody">OpenAI-compatible inference with explicit model prices and usage records.</p></article>
+<section class="grid" aria-label="${copy.products}">
+<article><h2 data-i18n="formTitle">${copy.formTitle}</h2><p data-i18n="formBody">${copy.formBody}</p></article>
+<article><h2 data-i18n="holdTitle">${copy.holdTitle}</h2><p data-i18n="holdBody">${copy.holdBody}</p></article>
+<article><h2 data-i18n="objectTitle">${copy.objectTitle}</h2><p data-i18n="objectBody">${copy.objectBody}</p></article>
+<article><h2 data-i18n="meterTitle">${copy.meterTitle}</h2><p data-i18n="meterBody">${copy.meterBody}</p></article>
 </section>
-<section class="billing"><h2 data-i18n="billingTitle">Usage-based, prepaid billing</h2><p data-i18n="billingBody">Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.</p></section>
+<section class="billing"><h2 data-i18n="billingTitle">${copy.billingTitle}</h2><p data-i18n="billingBody">${copy.billingBody}</p></section>
 <ul>
-<li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">API description</span></a></li>
-<li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">Product discovery</span></a></li>
-<li><a href="${base}/.well-known/takoform/v1"><code>${base}/.well-known/takoform/v1</code><span data-i18n="host">Takoform Host discovery</span></a></li>
+<li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">${copy.api}</span></a></li>
+<li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">${copy.product}</span></a></li>
+<li><a href="${base}/.well-known/takoform/v1"><code>${base}/.well-known/takoform/v1</code><span data-i18n="host">${copy.host}</span></a></li>
 </ul>
 <footer>takoserver.com</footer>
 </main>
 <script>
-const messages={
-en:{description:"A developer cloud for compute, data, storage, and AI.",console:"Open the console",eyebrow:"Developer cloud",headline:"Cloud resources, without the cloud maze.",lede:"Create compute, data, storage, and AI resources through one control plane. Fund a wallet and pay for measured usage.",computeTitle:"Compute",computeBody:"Deploy edge services and attach the resources they use.",dataTitle:"Data",dataBody:"Databases, key-value storage, queues, and migration-ready state.",storageTitle:"Object storage",storageBody:"Portable ObjectBucket resources bound to Workers through the exact edge.objects API.",aiTitle:"AI",aiBody:"OpenAI-compatible inference with explicit model prices and usage records.",billingTitle:"Usage-based, prepaid billing",billingBody:"Measured usage is accumulated at fine precision and settled to your wallet in clear rollups. You can see what was used and charged.",api:"API description",product:"Product discovery",host:"Takoform Host discovery"},
-ja:{description:"コンピュート、データ、ストレージ、AIのための開発者向けクラウド。",console:"コンソールを開く",eyebrow:"開発者向けクラウド",headline:"クラウドを、迷わず使える形に。",lede:"コンピュート、データ、ストレージ、AIを一つのコントロールプレーンから作成できます。ウォレットへ入金し、実際に計測した使用量に応じて支払います。",computeTitle:"コンピュート",computeBody:"エッジサービスをデプロイし、利用するリソースを接続します。",dataTitle:"データ",dataBody:"データベース、KVS、キューと、移行可能な状態管理を提供します。",storageTitle:"オブジェクトストレージ",storageBody:"Host管理の標準S3をsealed native bindingとしてworkloadへ供給します。",aiTitle:"AI",aiBody:"明示されたモデル価格と使用記録を持つOpenAI互換推論です。",billingTitle:"前払い・使用量ベースの課金",billingBody:"細かな単位で利用量を蓄積し、明確な集計としてウォレットへ精算します。利用量と請求額を確認できます。",api:"API仕様",product:"製品ディスカバリー",host:"Takoform Hostディスカバリー"}
-};
+const messages=${JSON.stringify(landingMessages)};
 const localizedPaths=${String(options.apiOrigin !== null)};
 const pathLocale=location.pathname.split("/")[1];
 const setLocale=(locale,updatePath=false)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;document.querySelector('meta[name="description"]').content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]")){const value=messages[lang][node.dataset.i18n];if(value)node.textContent=value}for(const button of document.querySelectorAll("[data-locale]"))button.setAttribute("aria-pressed",String(button.dataset.locale===lang));try{localStorage.setItem("takoserver.locale",lang)}catch{}if(updatePath&&localizedPaths)history.replaceState(null,"","/"+lang+"/")};
