@@ -1771,6 +1771,181 @@ describe("released edge Form placement", () => {
     return { provider, calls };
   }
 
+  function queueDeleteProvider(
+    response: { readonly status: number; readonly body: unknown } | "transport",
+    offering = technical("AtLeastOnceQueue"),
+  ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [offering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        if (response === "transport") throw new TypeError("connection reset");
+        return new Response(JSON.stringify(response.body), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  function queueDeleteInput(
+    offering: ProviderOffering,
+    operationId: string,
+    nativeId = "queue:queue-id",
+  ) {
+    return {
+      operationId,
+      operationMode: "initial" as const,
+      offering,
+      nativeId,
+      identity: { ...IDENTITY, name: "jobs" },
+    };
+  }
+
+  test("settles an exact Queue binding refusal as an operation-bound no-effect delete", async () => {
+    const operationId = "op-queue-delete-referenced";
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider({
+      status: 400,
+      body: {
+        success: false,
+        errors: [
+          {
+            code: 11_005,
+            message: "Cannot delete queue still referenced by binding in a Worker",
+          },
+        ],
+      },
+    });
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "occupied",
+        message:
+          "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
+        retryable: false,
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, "another-operation")).toBe(false);
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("does not prove no mutation for non-exact Queue delete refusals", async () => {
+    const cases: readonly {
+      readonly label: string;
+      readonly response: Parameters<typeof queueDeleteProvider>[0];
+      readonly offering?: ProviderOffering;
+      readonly nativeId?: string;
+    }[] = [
+      {
+        label: "ordinary 400",
+        response: { status: 400, body: { success: false, errors: [{ message: "bad request" }] } },
+      },
+      {
+        label: "wrong status",
+        response: {
+          status: 422,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "other code",
+        response: {
+          status: 400,
+          body: { success: false, errors: [{ code: 11_006, message: "other" }] },
+        },
+      },
+      { label: "transport loss", response: "transport" },
+      {
+        label: "wrong native kind",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+        nativeId: "r2:bucket-id",
+      },
+      {
+        label: "wrong offering kind",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+        offering: BUCKET,
+      },
+      {
+        label: "success contradiction",
+        response: {
+          status: 400,
+          body: {
+            success: true,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "non-null result contradiction",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            result: { deleted: true },
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "malformed error entry",
+        response: { status: 400, body: { success: false, errors: [{ code: 11_005 }] } },
+      },
+      {
+        label: "malformed errors field",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: { code: 11_005, message: "Cannot delete queue still referenced by binding" },
+          },
+        },
+      },
+    ];
+
+    for (const { label, response, offering = technical("AtLeastOnceQueue"), nativeId } of cases) {
+      const operationId = `op-queue-delete-${label.replaceAll(" ", "-")}`;
+      const { provider, calls } = queueDeleteProvider(response, offering);
+      const ticket = await provider.delete(queueDeleteInput(offering, operationId, nativeId));
+
+      expect(ticket, label).toMatchObject({ phase: "failed" });
+      expect(providerFailureProvesNoMutation(ticket, operationId), label).toBe(false);
+      expect(
+        calls.filter((call) => call.method === "DELETE"),
+        label,
+      ).toHaveLength(1);
+    }
+  });
+
   test("delegates readback identity to the backend that owns the selected Queue", () => {
     const offering = technical("AtLeastOnceQueue");
     const input = { offering, nativeId: "queue:logical-queue", identity: IDENTITY };

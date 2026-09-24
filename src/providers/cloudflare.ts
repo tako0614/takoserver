@@ -156,6 +156,7 @@ type CloudflareSqliteMigrationApplyInput = Parameters<
 
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
+const QUEUE_REFERENCED_BY_WORKER_BINDING = 11_005;
 
 /**
  * A DNS zone this deployment may attach customer Workers to.
@@ -1115,6 +1116,20 @@ export class CloudflareProvider implements Provider {
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
     if (!removed.ok && removed.status !== 404) {
+      if (
+        native.kind === "queue" &&
+        providerKind(input.offering) === "AtLeastOnceQueue" &&
+        removed.status === 400 &&
+        removed.providerRefusal === true &&
+        removed.codes.length === 1 &&
+        removed.codes[0] === QUEUE_REFERENCED_BY_WORKER_BINDING
+      ) {
+        return failedWithoutProviderMutation(
+          input.operationId,
+          "occupied",
+          "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
+        );
+      }
       // R2 will not destroy a bucket that still holds objects or unfinished
       // multipart uploads, and only the customer can empty it. Say so, once the
       // bucket is proven to still be there, rather than returning a generic
@@ -2960,6 +2975,7 @@ export class CloudflareProvider implements Provider {
       status: response.status,
       ticket: classify(response.status),
       codes: errorCodes(envelope?.errors),
+      ...(!response.ok && wellFormedProviderRefusal(envelope) ? { providerRefusal: true } : {}),
       ...(method !== "GET" && response.ok && envelope?.success !== false
         ? { indeterminate: true }
         : {}),
@@ -3067,6 +3083,8 @@ type CallResult =
        * vocabulary rather than a generic refusal.
        */
       readonly codes: readonly number[];
+      /** The response was a structurally valid provider refusal envelope. */
+      readonly providerRefusal?: true;
       /** The request may have reached a mutating provider endpoint. */
       readonly indeterminate?: true;
     };
@@ -3256,6 +3274,29 @@ function errorCodes(errors: unknown): readonly number[] {
     .filter((code): code is number => typeof code === "number");
 }
 
+function wellFormedProviderRefusal(envelope: CloudflareResponseEnvelope | null): boolean {
+  if (
+    envelope?.success !== false ||
+    !Array.isArray(envelope.errors) ||
+    envelope.errors.length === 0 ||
+    ("result" in envelope && envelope.result !== null && envelope.result !== undefined) ||
+    ("result_info" in envelope &&
+      envelope.result_info !== null &&
+      envelope.result_info !== undefined)
+  ) {
+    return false;
+  }
+  return envelope.errors.every((entry) => {
+    const error = record(entry);
+    return (
+      error !== undefined &&
+      Number.isSafeInteger(error.code) &&
+      typeof error.message === "string" &&
+      error.message.length > 0
+    );
+  });
+}
+
 function classify(status: number): ProviderTicket {
   if (status === 400 || status === 422)
     return failed("invalid_spec", "the backend rejected the request");
@@ -3266,12 +3307,14 @@ function classify(status: number): ProviderTicket {
   return failed("unavailable", "the backend could not serve the request", status >= 500);
 }
 
-async function readEnvelope(response: Response): Promise<{
+type CloudflareResponseEnvelope = {
   success?: unknown;
   result?: unknown;
   result_info?: unknown;
   errors?: unknown;
-} | null> {
+};
+
+async function readEnvelope(response: Response): Promise<CloudflareResponseEnvelope | null> {
   let bytes: ArrayBuffer;
   try {
     bytes = await response.arrayBuffer();
