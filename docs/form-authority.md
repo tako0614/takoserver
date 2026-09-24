@@ -4,6 +4,13 @@ For the positive-only, multi-Space implementation foundation and its remaining
 deployment integration, see [Managed Space admission](managed-space-admission.md).
 It does not replace or widen the sealed integration operator scope below.
 
+The managed-admission dependency is identified by its exact emitted released-
+Core Form bundle and target closure, not by requiring every dependent Worker to
+carry the same source commit label. When a sponsorship apply selects a different
+commit, it rebuilds the Form authority without uploading it and accepts the
+dependency only if the bundle digest is identical; the policy, named admission
+entrypoint, Version identity, and closure remain independently fenced.
+
 Takoserver’s public Worker, router, and OpenAPI surface are read-only consumers
 of durable Form admission state. They may reach `host-authority.ts` and the
 package reader, but they must not import `admission-store.ts`, `admission.ts`,

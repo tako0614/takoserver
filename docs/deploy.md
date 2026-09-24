@@ -367,8 +367,13 @@ The sponsorship surface accepts only the initial managed-admission addition:
 Version. Both are required and any additional delta is rejected. An absent
 sponsorship Worker uses ordinary first creation, not a predecessor transition.
 The released-Core Form authority must already serve the exact target policy
-and narrow named entrypoint. See [managed Space admission](managed-space-admission.md)
-for the publication order and remaining live acceptance.
+and narrow named entrypoint. Qualification proves that dependency by rebuilding
+the exact released-Core Form artifact and requiring its emitted bundle digest to
+match the served Version; the source commit labels need not be equal when those
+bytes match. The Form closure and dependency identity are re-read before
+registration and upload, and any artifact or closure drift refuses the apply.
+See [managed Space admission](managed-space-admission.md) for the publication
+order and remaining live acceptance.
 
 `--refresh-service-binding=NAME` is integration-only and names an existing
 service binding whose exact service/entrypoint tuple changes. The pinned

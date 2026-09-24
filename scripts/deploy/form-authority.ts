@@ -248,6 +248,62 @@ export interface ReleasedCoreFormAuthorityDependencyInspection {
   readonly artifactDigest: `sha256:${string}`;
 }
 
+/**
+ * Build the released-Core Form authority from the selected source and return
+ * the exact bundle identity without uploading or changing Cloudflare state.
+ *
+ * Dependents use this only when the served Form Version has a different source
+ * commit: a commit difference is admissible if and only if the emitted bytes
+ * are identical. The sealed candidate is checked before its temporary build
+ * directory is removed so callers never receive an unverified digest.
+ */
+export async function buildReleasedCoreFormAuthorityArtifactDigest(input: {
+  readonly target: DeployTarget;
+  readonly commit: string;
+  readonly run: FormAuthorityProcess;
+  readonly environment?: Readonly<Record<string, string>>;
+}): Promise<`sha256:${string}`> {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-dependency-proof-"));
+  try {
+    const invocation: FormAuthorityDeployInvocation = {
+      surface: "takoserver-form-authority-worker",
+      action: "apply",
+      environment: input.target.environment,
+      commit: input.commit,
+    };
+    const selected = selectTarget(invocation, input.target);
+    if (selected.verificationMode !== "released-core") {
+      throw preflightError("released-Core Form authority artifact proof selected another target");
+    }
+    const capabilityManifestJson = canonicalJson(publicFormCapabilityManifest());
+    const prepared = await prepareWorkerArtifact({
+      root,
+      target: input.target,
+      commit: input.commit,
+      run: input.run,
+      environment: input.environment,
+      containersRollout: "none",
+      main: resolve(REPOSITORY, "src/entry-form-authority-worker.ts"),
+      writeConfig: ({ path, main }) =>
+        writeFormAuthorityConfig({
+          path,
+          main,
+          invocation,
+          target: input.target,
+          selected,
+          capabilityManifestJson,
+        }),
+    });
+    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
+    const sealed = prepared.seal();
+    sealed.assertUnchanged();
+    return artifactDigest;
+  } finally {
+    unsealDirectory(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 interface PublicWorkerInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
