@@ -1105,6 +1105,7 @@ function createBinding(
     observe: recovery,
     delete: (input) => initial("delete", input),
     recoverDelete: recovery,
+    convergeDelete: recovery,
     adopt: (input) => initial("adopt", input),
     recoverAdopt: adoptionRecovery,
     verifyNativeAbsence: unused,

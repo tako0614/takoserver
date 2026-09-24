@@ -2325,7 +2325,10 @@ export function createProviderDriver(
         );
       } else {
         if (input.operationMode === "recovery") {
-          const recoverDelete = provider.recoverDelete?.bind(provider);
+          const recoverDelete =
+            input.recoveryAction === "converge"
+              ? provider.convergeDelete?.bind(provider)
+              : provider.recoverDelete?.bind(provider);
           if (!recoverDelete) {
             // A lost DELETE acknowledgement has no safe replay. Only a
             // provider-owned deterministic readback may settle it.
@@ -2335,7 +2338,7 @@ export function createProviderDriver(
           // the entered Provider call so its explicit refusal remains terminal.
           const relations = await resolvedProviderRelations();
           firstTicket = await enteredProviderMutation(() =>
-            recoverDelete({
+              recoverDelete({
               operationId: input.operationId,
               operationMode: "recovery",
               executionAuthority: input.executionAuthority,

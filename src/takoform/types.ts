@@ -356,6 +356,8 @@ export interface TakoformResourceDriver {
     readonly operationId: string;
     /** Durable saga mode; recovery must poll a retained provider handle. */
     readonly operationMode?: "initial" | "recovery";
+    /** Recovery callers are separated so public readback can never converge. */
+    readonly recoveryAction?: "observe" | "converge";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
     readonly providerHandle?: string;
     /** Exact live Host saga lease; provider adapters may project it to a route-less executor. */

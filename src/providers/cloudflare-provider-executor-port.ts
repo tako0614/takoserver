@@ -152,6 +152,9 @@ export type CloudflareProviderDeleteInput = Parameters<Provider["delete"]>[0];
 export type CloudflareProviderRecoverDeleteInput = Parameters<
   NonNullable<Provider["recoverDelete"]>
 >[0];
+export type CloudflareProviderConvergeDeleteInput = Parameters<
+  NonNullable<Provider["convergeDelete"]>
+>[0];
 export type CloudflareProviderAdoptInput = Parameters<NonNullable<Provider["adopt"]>>[0];
 export type CloudflareProviderRecoverAdoptInput = Parameters<
   NonNullable<Provider["recoverAdopt"]>
@@ -208,6 +211,7 @@ export interface CloudflareProviderExecutorRpc {
   observe(input: CloudflareProviderObserveInput): Promise<ProviderTicket>;
   delete(input: CloudflareProviderDeleteInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverDelete(input: CloudflareProviderRecoverDeleteInput): Promise<ProviderTicket>;
+  convergeDelete(input: CloudflareProviderConvergeDeleteInput): Promise<ProviderTicket>;
   adopt(input: CloudflareProviderAdoptInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverAdopt(
     input: CloudflareProviderRecoverAdoptInput,

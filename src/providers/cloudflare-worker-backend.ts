@@ -8,6 +8,7 @@ import type {
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
   ProviderExecutionAuthority,
+  ProviderFailure,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
@@ -121,6 +122,19 @@ export interface CloudflareWorkerDeleteInput {
   readonly relations?: readonly ProviderRelation[];
 }
 
+/** Closed internal result for destructive managed Queue helper retirement. */
+export type CloudflareManagedQueueDestroyPreparation =
+  | {
+      readonly state: "ready";
+      /** A durable marker or helper mutation now belongs to this exact delete. */
+      readonly effectsStarted: boolean;
+    }
+  | {
+      readonly state: "pending" | "refused";
+      readonly effectsStarted: boolean;
+      readonly failure: ProviderFailure;
+    };
+
 /** Adoption identity shared by the Cloudflare provider and its Worker backend. */
 export interface CloudflareWorkerAdoptInput {
   readonly operationId: string;
@@ -164,6 +178,15 @@ export interface CloudflareWorkerBackend {
   recoverAdopt?(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket>;
   delete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
   recoverDelete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
+  convergeDelete?(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
+  /**
+   * Internal-only preparation for a generic AtLeastOnceQueue destroy. The
+   * managed backend does not own the offering in this mode, but it does own
+   * the exact helper closure that must be retired first.
+   */
+  prepareManagedQueueDestroy?(
+    input: CloudflareWorkerDeleteInput,
+  ): Promise<CloudflareManagedQueueDestroyPreparation>;
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor;

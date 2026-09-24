@@ -255,6 +255,12 @@ export class CloudflareProviderProxy implements Provider {
     return this.#binding.recoverDelete(input);
   }
 
+  convergeDelete(
+    input: Parameters<NonNullable<Provider["convergeDelete"]>>[0],
+  ): Promise<ProviderTicket> {
+    return this.#binding.convergeDelete(input);
+  }
+
   async adopt(input: Parameters<NonNullable<Provider["adopt"]>>[0]): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("adopt", input, this.#providerInstallationId);
     return restoreInitialMutationResult(

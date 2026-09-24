@@ -53,6 +53,7 @@ import {
 } from "./cloudflare-runtime-bindings.ts";
 import type {
   ArtifactBytes,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
@@ -1039,11 +1040,16 @@ export class CloudflareProvider implements Provider {
     identity: import("../provider-port.ts").ResourceIdentity;
     spec?: JsonObject;
     relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  }, convergence = false): Promise<ProviderTicket> {
     if (this.#workerBackend?.owns(input.offering)) {
+      if (convergence) {
+        return this.#workerBackend.convergeDelete
+          ? await this.#workerBackend.convergeDelete(input)
+          : await this.#workerBackend.recoverDelete(input);
+      }
       return await this.#workerBackend.delete(input);
     }
-    if (input.operationMode === "recovery" && !input.providerHandle) {
+    if (input.operationMode === "recovery" && !input.providerHandle && !convergence) {
       // Cloudflare exposes no opaque delete handle. A transport close after a
       // DELETE therefore cannot be safely replayed; leave recovery to an
       // operator/readback path rather than sending the mutation twice.
@@ -1053,6 +1059,35 @@ export class CloudflareProvider implements Provider {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
+    let managedQueueEffectsStarted = false;
+    if (
+      native.kind === "queue" &&
+      providerKind(input.offering) === "AtLeastOnceQueue" &&
+      this.#workerBackend?.prepareManagedQueueDestroy
+    ) {
+      let prepared: CloudflareManagedQueueDestroyPreparation;
+      try {
+        prepared = await this.#workerBackend.prepareManagedQueueDestroy(input);
+      } catch {
+        return convergence
+          ? failed("unavailable", "the managed Queue retirement authority is unavailable", true)
+          : failedWithoutProviderMutation(
+              input.operationId,
+              "unavailable",
+              "the managed Queue retirement authority is unavailable",
+            );
+      }
+      managedQueueEffectsStarted = prepared.effectsStarted;
+      if (prepared.state !== "ready") {
+        return !convergence && !prepared.effectsStarted
+          ? failedWithoutProviderMutation(
+              input.operationId,
+              prepared.failure.code,
+              prepared.failure.message,
+            )
+          : { phase: "failed", failure: prepared.failure };
+      }
+    }
     if (
       native.kind === "r2" &&
       (this.#workerBackend?.managedObjectBucketVacancy ||
@@ -1124,11 +1159,17 @@ export class CloudflareProvider implements Provider {
         removed.codes.length === 1 &&
         removed.codes[0] === QUEUE_REFERENCED_BY_WORKER_BINDING
       ) {
-        return failedWithoutProviderMutation(
-          input.operationId,
-          "occupied",
-          "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
-        );
+        return managedQueueEffectsStarted
+          ? failed(
+              "unavailable",
+              "the managed Queue retirement has effects but the Queue is still referenced; reconciliation is required",
+              true,
+            )
+          : failedWithoutProviderMutation(
+              input.operationId,
+              "occupied",
+              "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
+            );
       }
       // R2 will not destroy a bucket that still holds objects or unfinished
       // multipart uploads, and only the customer can empty it. Say so, once the
@@ -1268,6 +1309,13 @@ export class CloudflareProvider implements Provider {
       );
     }
     return observed;
+  }
+
+  /** Mutating delete convergence, reachable only through the maintenance RPC. */
+  async convergeDelete(
+    input: Parameters<NonNullable<Provider["convergeDelete"]>>[0],
+  ): Promise<ProviderTicket> {
+    return await this.delete(input, true);
   }
 
   async adopt(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket> {

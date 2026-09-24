@@ -138,6 +138,8 @@ export interface EngineContext {
     readonly acceptedAuthority?: AcceptedAuthoritySummary;
     /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
     readonly claimOwnerId: string;
+    /** Only the route-less maintenance lane may request provider convergence. */
+    readonly deleteRecoveryAction: "observe" | "converge";
     readonly commit: (mutation: EngineMutationCommit) => Promise<void>;
     readonly commitDefinitiveProviderFailure: (
       failure: EngineDefinitiveProviderFailureCommit,
@@ -2816,6 +2818,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               (await driver.delete({
                 operationId: deleteId,
                 operationMode,
+                ...(operationMode === "recovery"
+                  ? { recoveryAction: context.durableOperation?.deleteRecoveryAction ?? "observe" }
+                  : {}),
                 ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
                 executionAuthority: {
                   tenantId: context.tenantId,

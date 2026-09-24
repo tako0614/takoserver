@@ -282,7 +282,7 @@ export function createDeferredOperations(input: {
       if (isTerminal(operation)) return terminalResponse(operation);
       if (!advanced.acquired) return pendingResponse(operation.id, retryAfterSeconds);
 
-      await execute(operation, leaseToken);
+      await execute(operation, leaseToken, "observe");
       const settled = await input.store.readDeferredOperation(
         operation.tenantId,
         operation.principalId,
@@ -311,7 +311,7 @@ export function createDeferredOperations(input: {
         });
         if (!advanced.acquired || !advanced.operation) continue;
         acquired += 1;
-        await execute(advanced.operation, leaseToken);
+        await execute(advanced.operation, leaseToken, "converge");
         const current = await input.store.readDeferredOperation(
           candidate.tenantId,
           candidate.principalId,
@@ -370,7 +370,7 @@ export function createDeferredOperations(input: {
     // executor reports a repair-needed error. The durable record is the public
     // authority in that case: reread it before answering so a pending repair
     // is tracked by its Operation handle rather than leaking the stale error.
-    await execute(advanced.operation, leaseToken);
+    await execute(advanced.operation, leaseToken, "observe");
     const settled = await input.store.readDeferredOperation(
       record.tenantId,
       record.principalId,
@@ -385,6 +385,7 @@ export function createDeferredOperations(input: {
   async function execute(
     operation: DeferredOperationRecord,
     leaseToken: string,
+    deleteRecoveryAction: "observe" | "converge",
   ): Promise<
     { readonly kind: "settled" } | { readonly kind: "repair"; readonly error: TakoformHostError }
   > {
@@ -416,6 +417,7 @@ export function createDeferredOperations(input: {
           ? { acceptedRevision: operation.acceptedRevision }
           : {}),
         claimOwnerId: leaseToken,
+        deleteRecoveryAction,
         ...(operation.acceptedAuthority ? { acceptedAuthority: operation.acceptedAuthority } : {}),
         commit: async (mutation) => {
           await input.store.commitDeferredMutation({

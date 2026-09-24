@@ -602,6 +602,22 @@ export interface Provider {
     readonly spec?: JsonObject;
     readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
+  /**
+   * Lease-scoped delete convergence for a retained Host saga. Unlike
+   * `recoverDelete`, this capability may perform the next provider mutation,
+   * so it is reachable only from the maintenance repair lane.
+   */
+  convergeDelete?(input: {
+    readonly operationId: string;
+    readonly operationMode: "recovery";
+    readonly providerHandle?: string;
+    readonly executionAuthority: ProviderExecutionAuthority;
+    readonly offering: ProviderOffering;
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+    readonly spec?: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket>;
   /** Adopts an existing native resource. Absent when adoption is impossible. */
   adopt?(input: {
     /** Stable identity and recovery evidence for this adoption. */
