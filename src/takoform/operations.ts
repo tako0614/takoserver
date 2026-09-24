@@ -53,6 +53,15 @@ export interface DeferredOperationsConfiguration {
    * repair remains durable and is resumed by maintenance after process loss.
    */
   readonly executeOnAccept?: boolean;
+  /**
+   * Bounds how long a mutation or poll request waits on inline execution
+   * before answering with the deferred contract (202 for a mutation, a pending
+   * Operation for a poll). The attempt is not cancelled: the durable record
+   * and its lease keep the saga resumable by the next poll or scheduled drain
+   * whether the detached work finishes, keeps running fenced by its lease, or
+   * dies with the isolate. Omit to keep every inline attempt unbounded.
+   */
+  readonly inlineExecuteMilliseconds?: number;
 }
 
 export interface DeferredOperations {
@@ -108,6 +117,15 @@ export function createDeferredOperations(input: {
     3_600_000,
     "leaseMilliseconds",
   );
+  const inlineExecuteMilliseconds =
+    input.configuration.inlineExecuteMilliseconds === undefined
+      ? undefined
+      : boundedInteger(
+          input.configuration.inlineExecuteMilliseconds,
+          1,
+          3_600_000,
+          "inlineExecuteMilliseconds",
+        );
 
   return {
     async accept(context, path, operation) {
@@ -282,7 +300,9 @@ export function createDeferredOperations(input: {
       if (isTerminal(operation)) return terminalResponse(operation);
       if (!advanced.acquired) return pendingResponse(operation.id, retryAfterSeconds);
 
-      await execute(operation, leaseToken, "observe");
+      if (!(await executeInline(operation, leaseToken, "observe"))) {
+        return pendingResponse(operation.id, retryAfterSeconds);
+      }
       const settled = await input.store.readDeferredOperation(
         operation.tenantId,
         operation.principalId,
@@ -370,7 +390,9 @@ export function createDeferredOperations(input: {
     // executor reports a repair-needed error. The durable record is the public
     // authority in that case: reread it before answering so a pending repair
     // is tracked by its Operation handle rather than leaking the stale error.
-    await execute(advanced.operation, leaseToken, "observe");
+    if (!(await executeInline(advanced.operation, leaseToken, "observe"))) {
+      return acceptedResponse(record.id, retryAfterSeconds);
+    }
     const settled = await input.store.readDeferredOperation(
       record.tenantId,
       record.principalId,
@@ -554,6 +576,61 @@ export function createDeferredOperations(input: {
       });
     }
     return { kind: "settled" };
+  }
+
+  /**
+   * Inline execution bounded by the configured millisecond budget. Returns
+   * false when the budget expired first: the attempt is left running under
+   * its lease, so a later poll either finds its commits or re-acquires the
+   * record after lease expiry and resumes the saga from the durable markers.
+   */
+  async function executeInline(
+    operation: DeferredOperationRecord,
+    leaseToken: string,
+    deleteRecoveryAction: "observe" | "converge",
+  ): Promise<boolean> {
+    if (inlineExecuteMilliseconds === undefined) {
+      await execute(operation, leaseToken, deleteRecoveryAction);
+      return true;
+    }
+    // The tracked promise resolves for both outcomes so an abandoned attempt
+    // can never surface as an unhandled rejection after the request answered.
+    const tracked = execute(operation, leaseToken, deleteRecoveryAction).then(
+      () => "settled" as const,
+      (error: unknown) => error,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), inlineExecuteMilliseconds);
+    });
+    const outcome = await Promise.race([tracked, expired]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (outcome === "timeout") {
+      void tracked.then((result) => {
+        if (result !== "settled") {
+          console.error(
+            canonicalJson({
+              event: "takoform.deferred_operation.inline_attempt_failed",
+              operationId: operation.id,
+              operation: operation.operation,
+              errorClass: result instanceof Error ? result.name : "unknown",
+            }),
+          );
+        }
+      });
+      console.error(
+        canonicalJson({
+          event: "takoform.deferred_operation.inline_budget_exceeded",
+          operationId: operation.id,
+          operation: operation.operation,
+          kind: operation.target.kind,
+          budgetMilliseconds: inlineExecuteMilliseconds,
+        }),
+      );
+      return false;
+    }
+    if (outcome !== "settled") throw outcome;
+    return true;
   }
 }
 

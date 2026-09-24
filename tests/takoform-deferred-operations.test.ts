@@ -2891,6 +2891,76 @@ describe("durable deferred Takoform operations", () => {
     ).toEqual({ rows: 0 });
     opened.close();
   });
+
+  test("answers an over-budget inline mutation with the operation contract and settles it for the next poll", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const gate = deferred();
+    const applied = deferred();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport?.(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        await gate.promise;
+        const receipt = await memory.apply(input);
+        applied.resolve();
+        return receipt;
+      },
+      observe: (input) => memory.observe(input),
+      import: (input) => memory.import?.(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+      inlineExecuteMilliseconds: 10,
+    }).open();
+    const desired = desiredResource("inline-budget", "inline");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/inline-budget`;
+    const accepted = await opened.host.handle(
+      request(path, "primary", {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "inline-budget-0001",
+          "if-none-match": "*",
+          "takoform-conformance-probe": "async",
+        },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    // The blocked provider attempt outlives the request: the Host answers
+    // with the durable operation instead of an HTTP timeout.
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("apply returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+
+    // A poll inside the live lease waits instead of dispatching twice.
+    const operationPath = `${lane}/operations/${operationId}`;
+    const waiting = await opened.host.handle(request(operationPath, "primary"));
+    expect(waiting?.status).toBe(200);
+    expect(await waiting?.json()).toMatchObject({ id: operationId, done: false });
+    expect(providerCalls).toBe(1);
+
+    gate.resolve();
+    await applied.promise;
+    let settled: Response | null = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const poll = await opened.host.handle(request(operationPath, "primary"));
+      const body = (await poll?.json()) as { done?: boolean };
+      if (body.done === true) {
+        settled = poll;
+        break;
+      }
+      await Bun.sleep(5);
+    }
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(1);
+    opened.close();
+  });
 });
 
 function persistentHarness(
@@ -2902,6 +2972,7 @@ function persistentHarness(
     readonly shouldDefer?: () => boolean;
     readonly pollsBeforeCommit?: number;
     readonly executeOnAccept?: boolean;
+    readonly inlineExecuteMilliseconds?: number;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));

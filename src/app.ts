@@ -561,6 +561,11 @@ export function buildApp(ports: AppPorts): App {
             // provider and the final durable commit settle in this request.
             // Only an indeterminate command remains for automatic drainage.
             executeOnAccept: true,
+            // Provider transports stop awaiting response headers at 30s, so
+            // an inline attempt that cannot settle inside that window is
+            // answered with the deferred contract instead of an HTTP timeout;
+            // the durable saga resumes on the client's own polls.
+            inlineExecuteMilliseconds: 15_000,
           },
         }
       : {}),
