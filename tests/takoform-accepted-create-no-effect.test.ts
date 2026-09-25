@@ -239,6 +239,53 @@ test("concludes an accepted create before live worker and dependency revisions a
   const originalClaimOwner = originalNonDependencyClaims[0]?.owner_operation_id;
   if (!originalClaimOwner) throw new Error("accepted create retained no original claim owner");
   expect(originalClaimOwner).not.toBe(operationId);
+  const leakedDependencyClaim = database
+    .query(
+      `SELECT claim_key FROM tf_resource_claims
+       WHERE tenant_id = ? AND holder_uid = ? AND state = 'reserved'
+         AND claim_key LIKE 'host-dependency:v1:%'
+       ORDER BY claim_key LIMIT 1`,
+    )
+    .get("tenant-a", saga.resource_uid) as { claim_key: string } | null;
+  if (!leakedDependencyClaim)
+    throw new Error("accepted create retained no reserved dependency claim");
+  database
+    .query(
+      `UPDATE tf_resource_claims SET owner_operation_id = ?
+       WHERE tenant_id = ? AND holder_uid = ? AND claim_key = ?`,
+    )
+    .run(originalClaimOwner, "tenant-a", saga.resource_uid, leakedDependencyClaim.claim_key);
+  const scopedDependencyClaims = [
+    {
+      claimKey: "host-dependency:v1:other-holder",
+      tenantId: "tenant-a",
+      holderUid: "uid_other_holder",
+    },
+    {
+      claimKey: "host-dependency:v1:other-tenant",
+      tenantId: "tenant-b",
+      holderUid: saga.resource_uid,
+    },
+  ] as const;
+  for (const claim of scopedDependencyClaims) {
+    database
+      .query(
+        `INSERT INTO tf_resource_claims
+           (claim_key, tenant_id, holder_space, holder_api_version, holder_kind,
+            holder_name, holder_uid, owner_operation_id, state, expires_at, updated_at)
+         VALUES (?, ?, 'main', ?, ?, 'unrelated', ?, ?, 'reserved', ?, ?)`,
+      )
+      .run(
+        claim.claimKey,
+        claim.tenantId,
+        cronForm.identity.formRef.apiVersion,
+        cronForm.identity.formRef.kind,
+        claim.holderUid,
+        originalClaimOwner,
+        Date.parse("2099-01-01T00:00:00.000Z"),
+        Date.parse("2026-09-23T00:00:00.000Z"),
+      );
+  }
   database
     .query(
       `INSERT INTO tf_resource_claims
@@ -337,9 +384,24 @@ test("concludes an accepted create before live worker and dependency revisions a
   ).toEqual({ rows: 0 });
   expect(
     database
-      .query("SELECT COUNT(*) AS rows FROM tf_resource_claims WHERE holder_uid = ?")
-      .get(saga.resource_uid),
+      .query(
+        "SELECT COUNT(*) AS rows FROM tf_resource_claims WHERE tenant_id = ? AND holder_uid = ?",
+      )
+      .get("tenant-a", saga.resource_uid),
   ).toEqual({ rows: 0 });
+  for (const claim of scopedDependencyClaims) {
+    expect(
+      database
+        .query(
+          "SELECT claim_key, tenant_id, holder_uid FROM tf_resource_claims WHERE claim_key = ?",
+        )
+        .get(claim.claimKey),
+    ).toEqual({
+      claim_key: claim.claimKey,
+      tenant_id: claim.tenantId,
+      holder_uid: claim.holderUid,
+    });
+  }
   expect(
     database
       .query(

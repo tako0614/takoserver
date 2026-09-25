@@ -6574,6 +6574,7 @@ function uncommittedResourceIncarnationRelease(input: {
     input.resourceUid,
     input.effectId,
   ] as const;
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
   return {
     fence,
     fenceParams,
@@ -6583,6 +6584,20 @@ function uncommittedResourceIncarnationRelease(input: {
               WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
                 AND ${fence}`,
         params: [input.tenantId, input.resourceUid, input.effectId, ...fenceParams],
+      },
+      {
+        // Reserved dependency claims are re-owned to the dispatched operation
+        // with the saga's non-expiring repair horizon. When the attempt is
+        // provably uncommitted, every reserved dependency claim on this
+        // incarnation is definitionally leaked — no live operation can hold
+        // one, because a live operation would violate the fence above. The
+        // release paths that run before provider dispatch already cover the
+        // reservation-owner case; this covers the dispatched-owner case.
+        sql: `DELETE FROM tf_resource_claims
+              WHERE tenant_id = ? AND holder_uid = ? AND state = 'reserved'
+                AND claim_key >= ? AND claim_key < ?
+                AND ${fence}`,
+        params: [input.tenantId, input.resourceUid, dependencyStart, dependencyEnd, ...fenceParams],
       },
       {
         sql: `DELETE FROM tf_resource_deletion_attestations
