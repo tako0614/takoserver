@@ -65,6 +65,8 @@ const orgApiKeyInput =
   "read: this surface acts through the Host's own published organization API, not through the provider.";
 const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
+const deployTargetSelectorInput =
+  "`TAKOSERVER_DEPLOY_TARGET_INTEGRATION`, `TAKOSERVER_DEPLOY_TARGET_REHEARSAL`, and `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` each name the path of that environment's reviewed operator-private takoserver.deploy-target@v2 descriptor (absolute, or resolved against the checkout), defaulting to `.deploy/targets/<environment>.json`; the shared entrypoint reads only the one variable matching the selected `--environment`.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -103,6 +105,9 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
         "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
+        "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_DEPLOY_TARGET_REHEARSAL",
       ],
       triggers: [],
       obligations: {
@@ -160,7 +165,9 @@ export const DEPLOY_CONTRACT = {
           "compatibility preflight reads its receipt through TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH, " +
           "and topology reads authenticate through the credential selected by " +
           "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL. " +
-          routineWorkerAuthInput,
+          routineWorkerAuthInput +
+          " " +
+          deployTargetSelectorInput,
       },
     },
     {
@@ -1363,7 +1370,12 @@ export const DEPLOY_CONTRACT = {
       },
     },
   ],
-  otherProviderScripts: [],
+  otherProviderScripts: [
+    {
+      script: "build:exact-artifact-recovery-worker",
+      why: "runs `wrangler deploy --dry-run --strict --outdir` to compile the exact-artifact-recovery Worker bundle locally — the same dry-run build the other build:* scripts perform inside scripts/build-*.ts; it uploads nothing and mutates no provider state",
+    },
+  ],
 } as const;
 
 type DeployContractSurface = (typeof DEPLOY_CONTRACT.surfaces)[number];

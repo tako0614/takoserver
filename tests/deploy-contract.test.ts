@@ -104,7 +104,12 @@ describe("Takoserver split deploy entrypoint", () => {
       SURFACES.map(([surface, triggers]) => [surface, [...triggers]]),
     );
     expect(contract.surfaces.some(({ surface }) => surface === "takoserver-api")).toBe(false);
-    expect(contract.otherProviderScripts).toEqual([]);
+    expect(contract.otherProviderScripts).toEqual([
+      {
+        script: "build:exact-artifact-recovery-worker",
+        why: "runs `wrangler deploy --dry-run --strict --outdir` to compile the exact-artifact-recovery Worker bundle locally — the same dry-run build the other build:* scripts perform inside scripts/build-*.ts; it uploads nothing and mutates no provider state",
+      },
+    ]);
     for (const privateSurface of [
       "takoserver-public-parent-token-retirement",
       "takoserver-managed-object-receipt-authority",
