@@ -11,6 +11,10 @@ describe("Takoserver public site", () => {
     expect(html).toContain("Exact Form identity");
     expect(html).toContain("Prepaid hold / capture");
     expect(html).toContain("edge.objects");
+    expect(html).toContain('"service_forms": <b>true</b>');
+    expect(html).toContain('"api": "https://api.takoserver.example/apis/forms.takoform.com/v1"');
+    expect(html).toContain("bun src/entry-bun.ts");
+    expect(html).toContain("https://github.com/tako0614/takoserver");
     expect(html).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
     expect(html).toContain("コンソールを開く");
     expect(html).toContain("Open the console");
