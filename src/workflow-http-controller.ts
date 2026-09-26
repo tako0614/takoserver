@@ -716,7 +716,7 @@ export function createWorkflowHttpController(): WorkflowHttpController {
         if (reason !== "step_failed" || Object.keys(frame).length !== 3) throw protocolFailure();
         ensureToken(frame.token);
         const error = byToken.get(frame.token);
-        if (!error || error.code !== "step_failed") throw protocolFailure();
+        if (error?.code !== "step_failed") throw protocolFailure();
         completed = true;
         return { kind: "failed", reason: "step_failed", error };
       }

@@ -69,6 +69,8 @@ const integrationServiceBindingRefresh =
   "The `--refresh-service-binding=NAME` delta is integration-only: the exact pinned predecessor must contain exactly one same-name service binding whose observed `service`/`entrypoint` pair differs from the selected target. The successor pair remains target-derived; D1, R2, Durable Object, plain-text and secret bindings cannot use this selector.";
 const ordinaryIntegrationFormCodeGate =
   "An ordinary integration code-only apply to an existing exact closure, with source/Host/dependency identities matched and no bootstrap or declared transition, uses the Form-local gate once: `bun run typecheck`, `bun run typecheck:form-authority-worker`, generated Worker types, imports, corpus and integration-package checks, the surface-specific runtime/deploy tests, then `bun run build:form-authority-worker`. That build dry-runs all four Worker bundles with `--containers-rollout none`; it does not build or publish a Core image. Production, rehearsal, bootstrap and transition paths keep their existing gates.";
+const deployTargetSelectorInput =
+  "`TAKOSERVER_DEPLOY_TARGET_INTEGRATION`, `TAKOSERVER_DEPLOY_TARGET_REHEARSAL`, and `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` each name the path of that environment's reviewed operator-private takoserver.deploy-target@v2 descriptor (absolute, or resolved against the checkout), defaulting to `.deploy/targets/<environment>.json`; the shared entrypoint reads only the one variable matching the selected `--environment`.";
 
 function inputContractWithToken(
   tokenRequirement: string,
@@ -102,7 +104,15 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check", "deploy"],
       requiresTools: ["bun", "wrangler", "flock"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
+        "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL",
+        "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
+        "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_DEPLOY_TARGET_REHEARSAL",
+      ],
       triggers: [],
       obligations: {
         provenance:
@@ -154,7 +164,14 @@ export const DEPLOY_CONTRACT = {
           "A post-upload re-fence failure " +
           "means traffic is indeterminate; this invocation has not started its traffic deployment, but it " +
           "does not infer the uploaded Version's activity or traffic's current owner. " +
-          routineWorkerAuthInput,
+          "A later D1 wave discharges its predecessor-rehearsal obligation through the receipt selected " +
+          "by TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH, the artifact blob I/O quiescence " +
+          "compatibility preflight reads its receipt through TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH, " +
+          "and topology reads authenticate through the credential selected by " +
+          "TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL. " +
+          routineWorkerAuthInput +
+          " " +
+          deployTargetSelectorInput,
       },
     },
     {
@@ -177,7 +194,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/signing.ts",
         "scripts/deploy/wrangler-state.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -234,7 +251,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-surface-transition.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -289,7 +306,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy-extension.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["check", "deploy", "typecheck:worker"],
+      requiresScripts: ["check", "typecheck:worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -395,7 +412,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-state.ts",
         "migrations/0047_sponsorship_cutover_consumption.sql",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -449,7 +466,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-identity-probe.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -522,7 +539,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/integration-storage-generation.ts",
         "scripts/deploy-extension.ts",
       ],
-      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "docker", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -603,7 +620,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy-extension.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -662,7 +679,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-scope-transition.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check", "deploy", "typecheck:form-authority-worker"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -715,7 +732,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -769,7 +786,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -818,7 +835,7 @@ export const DEPLOY_CONTRACT = {
         "src/route-table.ts",
         "src/openapi.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -868,7 +885,7 @@ export const DEPLOY_CONTRACT = {
         "src/entry-worker.ts",
         "migrations/0030_integration_e2e_credential_pairs.sql",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -916,7 +933,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/static.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["build:site", "deploy"],
+      requiresScripts: ["build:site"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN"],
       triggers: [],
@@ -942,7 +959,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/console.ts",
         "scripts/deploy/cloudflare-state.ts",
       ],
-      requiresScripts: ["build:console", "deploy"],
+      requiresScripts: ["build:console"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN"],
       triggers: [],
@@ -972,7 +989,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/d1.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["check:migrations", "deploy"],
+      requiresScripts: ["check:migrations"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["irreversible", "authority"],
@@ -1013,7 +1030,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/cloudflare-state.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["irreversible", "authority"],
@@ -1055,7 +1072,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-state.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1099,7 +1116,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-d1-schema-rehearsal-baseline",
       target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
-      requiresScripts: ["check:migrations", "deploy"],
+      requiresScripts: ["check:migrations"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["irreversible"],
@@ -1134,7 +1151,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
       ],
-      requiresScripts: ["check:migrations", "deploy"],
+      requiresScripts: ["check:migrations"],
       requiresTools: ["bun", "wrangler", "flock"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1255,7 +1272,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-signing-key-register",
       target: "cloudflare-d1:environment-selected-public-signing-key",
       covers: ["scripts/deploy/signing.ts", "scripts/deploy/d1.ts"],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1287,7 +1304,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/worker-state.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1311,7 +1328,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-signing-rotation",
       target: "cloudflare-worker-secret:environment-selected-next-signing-key",
       covers: ["scripts/deploy/signing.ts", "scripts/deploy/worker-live.ts"],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1345,7 +1362,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/worker-state.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["irreversible", "authority"],
@@ -1378,7 +1395,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/sponsorship-cutover-proof.ts",
         "migrations/0047_sponsorship_cutover_consumption.sql",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1420,7 +1437,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/worker-state.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN"],
       triggers: [],
@@ -1451,7 +1468,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy/realized-config.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1496,7 +1513,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy/realized-config.ts",
       ],
-      requiresScripts: ["check", "deploy"],
+      requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -1540,7 +1557,7 @@ export const DEPLOY_CONTRACT = {
         "src/control.ts",
         "src/operator-key.ts",
       ],
-      requiresScripts: ["deploy"],
+      requiresScripts: [],
       requiresTools: ["bun"],
       requiresEnv: [
         "TAKOSERVER_OPERATOR_PRIVATE_JWK_PATH",
@@ -1582,7 +1599,12 @@ export const DEPLOY_CONTRACT = {
       },
     },
   ],
-  otherProviderScripts: [],
+  otherProviderScripts: [
+    {
+      script: "build:exact-artifact-recovery-worker",
+      why: "runs `wrangler deploy --dry-run --strict --outdir` to compile the exact-artifact-recovery Worker bundle locally — the same dry-run build the other build:* scripts perform inside scripts/build-*.ts; it uploads nothing and mutates no provider state",
+    },
+  ],
 } as const;
 
 type DeployContractSurface = (typeof DEPLOY_CONTRACT.surfaces)[number];

@@ -108,7 +108,12 @@ describe("Takoserver split deploy entrypoint", () => {
       SURFACES.map(([surface, triggers]) => [surface, [...triggers]]),
     );
     expect(contract.surfaces.some(({ surface }) => surface === "takoserver-api")).toBe(false);
-    expect(contract.otherProviderScripts).toEqual([]);
+    expect(contract.otherProviderScripts).toEqual([
+      {
+        script: "build:exact-artifact-recovery-worker",
+        why: "runs `wrangler deploy --dry-run --strict --outdir` to compile the exact-artifact-recovery Worker bundle locally — the same dry-run build the other build:* scripts perform inside scripts/build-*.ts; it uploads nothing and mutates no provider state",
+      },
+    ]);
     for (const privateSurface of [
       "takoserver-public-parent-token-retirement",
       "takoserver-managed-object-receipt-authority",
@@ -144,6 +149,12 @@ describe("Takoserver split deploy entrypoint", () => {
     const routineWorker = contract.surfaces.find(({ surface }) => surface === "takoserver-worker");
     const identityProbe = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-form-authority-identity-probe",
+    );
+    const storageDisposal = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-storage-disposal",
+    );
+    const hostRetirement = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-integration-host-retirement",
     );
     const schemaBaseline = contract.surfaces.find(
       ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
@@ -206,9 +217,10 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(identityProbe?.obligations.provenance).toContain("no FORM_AUTHORITY");
     expect(identityProbe?.requiresScripts).toEqual([
       "check",
-      "deploy",
       "typecheck:form-authority-worker",
     ]);
+    expect(storageDisposal?.requiresScripts).toEqual([]);
+    expect(hostRetirement?.requiresScripts).toEqual([]);
     expect(identityProbe?.obligations["post-conditions"]).toContain("publicIdentityRpcReady: true");
     expect(identityProbe?.obligations["post-conditions"]).toContain(
       "coreVerifierConfigured: false",
@@ -259,7 +271,6 @@ describe("Takoserver split deploy entrypoint", () => {
     );
     expect(gateway?.requiresScripts).toEqual([
       "check",
-      "deploy",
       "typecheck:form-authority-worker",
     ]);
     expect(gateway?.obligations["failure-handling"]).toContain(

@@ -195,11 +195,7 @@ test("input_error is accepted only during name or pending preparation and respon
   controller.run(
     driver({
       do: async (prepareName) => {
-        try {
-          await prepareName();
-        } catch (error) {
-          throw error;
-        }
+        await prepareName();
         return undefined;
       },
     }),

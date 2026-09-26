@@ -92,8 +92,9 @@ function renderGenerated(source: string, digest: string): string {
     "// This is the deterministic Host-only ESM bundle for private Workflow execution.",
     "",
     "// biome-ignore format: Keep deterministic JSON string serialization for the artifact check.",
+    `export const WORKFLOW_HTTP_BOOTSTRAP_SOURCE =`,
     "// biome-ignore lint/suspicious/noTemplateCurlyInString: Bundled JavaScript is data, not a template.",
-    `export const WORKFLOW_HTTP_BOOTSTRAP_SOURCE =\n  ${JSON.stringify(source)} as const;`,
+    `  ${JSON.stringify(source)} as const;`,
     `export const WORKFLOW_HTTP_BOOTSTRAP_DIGEST =\n  ${JSON.stringify(digest)} as const;`,
     "",
   ].join("\n")}`;

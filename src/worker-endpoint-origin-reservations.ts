@@ -719,8 +719,7 @@ export function createWorkerEndpointOriginReservations(options: {
     await expire(input.organizationId, input.reservationId);
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
     if (
-      !row ||
-      row.state !== "expired" ||
+      row?.state !== "expired" ||
       row.reservation_format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT ||
       row.endpoint_resource_uid !== null ||
       // A bound row names the Worker it is a reservation *of*; one swept before
@@ -1006,8 +1005,7 @@ export function createWorkerEndpointOriginReservations(options: {
     if (!input.reservationId.startsWith(HOST_MINTED_RESERVATION_PREFIX)) return;
     const row = await readRow(options.sql, input.organizationId, input.reservationId);
     if (
-      !row ||
-      row.state !== "bound" ||
+      row?.state !== "bound" ||
       row.endpoint_resource_uid !== null ||
       row.bound_space !== input.space ||
       row.bound_worker_name !== input.workerName ||

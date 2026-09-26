@@ -76,12 +76,14 @@ sending everything down it.
 
 `scripts/check-imports.ts` proves the public Worker cannot reach the real
 Cloudflare provider, its parent REST backends, or Wasabi credential paths. The
-credential-bearing graph is rooted only at
-`src/entry-cloudflare-provider-executor.ts`, whose named RPC surface is closed
-to the implemented Provider operations and has no `fetch` entrypoint. That
-surface includes import/adoption recovery, exact-Deployment artifact-consumption
-readback, and bounded upstream meters, so none of those capabilities can force
-a parent credential back into the public Worker.
+The public entry is `src/entry-worker.ts`, which imports only the credential-free
+`CloudflareProviderExecutorRpc` contract from
+`src/providers/cloudflare-provider-executor-port.ts`. The credential-bearing
+executor implementation remains outside this public Worker graph. Its named RPC
+surface is closed to the implemented Provider operations and has no `fetch`
+entrypoint. That surface includes import/adoption recovery, exact-Deployment
+artifact-consumption readback, and bounded upstream meters, so none of those
+capabilities can force a parent credential back into the public Worker.
 
 `scripts/build-worker.ts` rejects Cloudflare parent-token/account identifiers,
 Wasabi credential names, and parent REST origins in the public bundle. The

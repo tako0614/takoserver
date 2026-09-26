@@ -410,7 +410,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         ],
       },
       {
-        sql: "DELETE FROM tf_workflow_events WHERE execution_id = ? AND " + cleanupGuard,
+        sql: `DELETE FROM tf_workflow_events WHERE execution_id = ? AND ${cleanupGuard}`,
         params: [
           current.executionId,
           ...instanceParams(current),
@@ -602,7 +602,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
         params: [identity.executionId, identity.createdAt, ...claimParams(identity)],
       },
       {
-        sql: "DELETE FROM tf_workflow_events WHERE execution_id = ? AND " + cleanupGuard,
+        sql: `DELETE FROM tf_workflow_events WHERE execution_id = ? AND ${cleanupGuard}`,
         params: [identity.executionId, ...claimParams(identity)],
       },
     ]);
@@ -1209,7 +1209,7 @@ export function createWorkflowRuntime(options: WorkflowRuntimeOptions): Workflow
   }
 
   async function readStep(identity: WorkflowRunIdentity, name: string): Promise<StepRow | null> {
-    const rows = await sql.query("SELECT * FROM tf_workflow_steps WHERE " + STEP_ID, [
+    const rows = await sql.query(`SELECT * FROM tf_workflow_steps WHERE ${STEP_ID}`, [
       identity.executionId,
       identity.createdAt,
       name,
