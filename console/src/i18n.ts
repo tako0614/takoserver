@@ -57,7 +57,7 @@ export function consoleNavigation(locale: ConsoleLocale): readonly ConsoleNaviga
       items: [{ href: "/", label: ja ? "ホーム" : "Home", glyph: "home" }],
     },
     {
-      group: ja ? "クラウド" : "Cloud",
+      group: "Takoform",
       items: [{ href: "/resources", label: ja ? "リソース" : "Resources", glyph: "layers" }],
     },
     {

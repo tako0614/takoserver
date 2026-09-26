@@ -13,7 +13,7 @@ describe("Takoserver Console locale and navigation", () => {
     expect(consoleNavigation("ja")).toEqual([
       { group: "概要", items: [{ href: "/", label: "ホーム", glyph: "home" }] },
       {
-        group: "クラウド",
+        group: "Takoform",
         items: [{ href: "/resources", label: "リソース", glyph: "layers" }],
       },
       {
