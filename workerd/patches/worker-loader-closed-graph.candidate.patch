@@ -219,7 +219,7 @@ diff --git a/src/workerd/api/tests/worker-loader-test.js b/src/workerd/api/tests
 +        `,
 +      },
 +    });
-+    assert.strictEqual(await appOnlyWorker.getEntrypoint().read(), 'legacy-application');
++    assert.strictEqual(await appOnlyWorker.getEntrypoint().read(null), 'legacy-application');
 +
 +    const registryOptions = [
 +      {},
@@ -275,7 +275,7 @@ diff --git a/src/workerd/api/tests/worker-loader-test.js b/src/workerd/api/tests
 +        },
 +      });
 +
-+      assert.deepStrictEqual(await worker.getEntrypoint().inspect(), {
++      assert.deepStrictEqual(await worker.getEntrypoint().inspect(null), {
 +        applicationSharedIdentity: 'application-shared',
 +        hostPrivateSharedIdentity: 'host-private-shared',
 +        privateValue: 'host-private',

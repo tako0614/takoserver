@@ -23,7 +23,7 @@ const WORKER_LOADER_CANDIDATE_OVERLAY = join(
   "worker-loader-closed-graph.candidate.patch",
 );
 const WORKER_LOADER_CANDIDATE_OVERLAY_SHA256 =
-  "5a65dc6c02b1b444513e670b3b44eaf6cf4ea419a1590c73a39a72cbdc15b7d7";
+  "8bd85fcbcba3aae37b2722d97d27a06f68c46eb9ac94f807078bdd093b05c435";
 const UPSTREAM_ARCHIVE = `https://github.com/cloudflare/workerd/archive/${WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit}.tar.gz`;
 const WORKERD_TARGET = "//src/workerd/server:workerd";
 

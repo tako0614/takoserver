@@ -84,7 +84,7 @@ explicit application-main policy using the same native module boundary as
 static services. Separate dictionaries let the same logical module name exist
 once in each provenance namespace without adding a second role authority to a
 module entry. Its SHA-256 is
-`5a65dc6c02b1b444513e670b3b44eaf6cf4ea419a1590c73a39a72cbdc15b7d7`.
+`8bd85fcbcba3aae37b2722d97d27a06f68c46eb9ac94f807078bdd093b05c435`.
 
 Candidate preparation/build requires a fresh private state root. `--prepare-only`
 downloads or verifies the pinned upstream archive and applies both overlays in
