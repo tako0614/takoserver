@@ -14,11 +14,15 @@ import {
 import { createWorkerdWorkflowExecutionHost } from "../src/selfhost-workflow-execution-host.ts";
 import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
-import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
+import {
+  readWorkerdNativeTestInput,
+  selectWorkerdNativeTestBinary,
+  workerdNativeTestIsEnabled,
+} from "./helpers/workerd-native-candidate.ts";
 
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
+const workerd = readWorkerdNativeTestInput(process.env);
 const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
 const scope = { tenantId: "tenant", workflowResourceUid: "workflow" };
 
@@ -179,17 +183,18 @@ export class Application {
   },
 ] as const;
 
-test.skipIf(workerd === undefined || guardBinary === undefined)(
-  "pinned guarded HTTP class bridge uses canonical env and durable step coordinator",
+test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
+  `${workerd.mode === "candidate" ? "candidate-only" : "pinned"} guarded HTTP class bridge uses canonical env and durable step coordinator`,
   async () => {
     const root = await mkdtemp(join(tmpdir(), "takoserver-native-workflow-http-"));
     try {
-      const artifact = await selectClosedGraphWorkerd({
-        binary: workerd,
+      const binary = await selectWorkerdNativeTestBinary({
+        input: workerd,
         privateRoot: join(root, "artifact"),
       });
-      if (!artifact.binary) throw new Error(artifact.diagnostic ?? "no pinned runtime");
-      const binary = artifact.binary;
+      if (guardBinary === undefined || guardBinary.trim() === "") {
+        throw new Error("TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY is required for native tests");
+      }
       for (const application of applications) {
         const directory = await mkdtemp(join(root, `${application.name}-`));
         const db = new Database(":memory:");
@@ -265,7 +270,7 @@ test.skipIf(workerd === undefined || guardBinary === undefined)(
         let readyChecks = 0;
         let disposed = 0;
         const host = createWorkerdWorkflowExecutionHost({
-          guardBinary: guardBinary as string,
+          guardBinary,
           workerdBinary: binary,
           maximumRegistrations: 4,
           async prepare(identity, input, signal, channel) {
