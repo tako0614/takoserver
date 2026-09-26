@@ -319,12 +319,9 @@ export function createTakoformHostAuthority(
         ? compiledCandidate
         : null;
     const implementationDigest = support.implementationDigest;
-    if (
-      install.implementationDigest !== undefined &&
-      install.implementationDigest !== implementationDigest
-    ) {
-      throw unavailable();
-    }
+    const installSupportImplementationMatch =
+      install.implementationDigest === undefined ||
+      install.implementationDigest === implementationDigest;
     const narrowedOperations = implementationCandidate
       ? implementationCandidate.operations.filter((operation) =>
           support.operations.includes(operation),
@@ -358,6 +355,7 @@ export function createTakoformHostAuthority(
       checkpointCurrent &&
       installCurrent &&
       support.supported &&
+      installSupportImplementationMatch &&
       currentImplementationProfile &&
       implementationCandidate !== null &&
       !form.workerClassRuntime &&

@@ -15,6 +15,7 @@ import type { JsonObject } from "../src/ports.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import type { Provider } from "../src/provider-port.ts";
 import type { TakoformArtifactManifest } from "../src/takoform/artifacts.ts";
+import { memoizeArtifacts } from "../src/takoform/engine.ts";
 import {
   applySqliteMigrationApplication,
   prepareSqliteMigrationApplication,
@@ -109,6 +110,8 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
   let loseFirstAcknowledgement = true;
   const calls: Array<Parameters<typeof memory.sqliteMigrations.applySuffix>[0]> = [];
   const driver: TakoformResourceDriver = {
+    selectApply: (input) => memory.selectApply(input),
+    selectImport: (input) => memory.selectImport(input),
     apply: (input) => memory.apply(input),
     observe: (input) => memory.observe(input),
     delete: (input) => memory.delete(input),
@@ -132,6 +135,15 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
   };
   const value = context(secondSet, driver);
   const prepared = await prepareSqliteMigrationApplication(value);
+  const selection = await driver.selectApply({
+    tenantId: value.tenantId,
+    resourceUid: "uid_application_a",
+    form: value.form,
+    name: "application-a",
+    space: value.space,
+    spec: {},
+    relations: value.relations,
+  });
   const executionAuthority = {
     tenantId: value.tenantId,
     resourceUid: "uid_application_a",
@@ -147,6 +159,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
       executionAuthority,
       prepared,
       driver,
+      selection,
     }),
   ).rejects.toMatchObject({ code: "backend_unavailable", status: 503 });
 
@@ -160,6 +173,7 @@ test("recovery keeps the full intent while deriving a new remainder from an adva
     executionAuthority: { ...executionAuthority, leaseToken: "pmlease-a-recovery" },
     prepared,
     driver,
+    selection,
   });
 
   expect(calls).toHaveLength(2);
@@ -253,14 +267,31 @@ test("the Provider driver binds ledger IO to the exact active database realizati
     fingerprint: "application-a-fingerprint",
   };
   const desired = [{ path: "0001.sql", digest: firstSql, sql: firstSqlBytes }];
+  const selection = await driver.selectApply({
+    tenantId: "tenant-a",
+    resourceUid: "uid-application-a",
+    form: applicationForm,
+    name: "application-a",
+    space: "conformance",
+    spec: {},
+    relations: [
+      {
+        pointer: "/database",
+        relation: "/database",
+        targetUid: database.metadata.uid,
+        resource: database,
+      },
+    ],
+  });
 
-  expect(await sqlite.readLedger({ tenantId: "tenant-a", database })).toEqual([]);
+  expect(await sqlite.readLedger({ tenantId: "tenant-a", database, selection })).toEqual([]);
   await sqlite.applySuffix({
     operationId: "op-application-a",
     operationMode: "recovery",
     executionAuthority,
     tenantId: "tenant-a",
     database,
+    selection,
     desired,
     expectedPrefix: [],
     migrations: desired,
@@ -293,6 +324,41 @@ test("the Provider driver binds ledger IO to the exact active database realizati
       migrations: desired,
     },
   ]);
+
+  await deployments.create({
+    tenantId: "tenant-a",
+    id: "dep-database-b",
+    resourceUid: database.metadata.uid,
+    offeringId: "provider-a.sqlite",
+    providerPackRef: "provider-a",
+    providerInstallationRef: "provider-a.primary",
+    nativeId: "sqlite:database-b",
+    state: "candidate",
+    observed: {},
+    outputs: {},
+  });
+  expect(
+    await deployments.cutover(
+      "tenant-a",
+      database.metadata.uid,
+      "dep-database-a",
+      "dep-database-b",
+    ),
+  ).toBe(true);
+  await expect(
+    sqlite.applySuffix({
+      operationId: "op-application-a",
+      operationMode: "recovery",
+      executionAuthority: { ...executionAuthority, leaseToken: "pmlease-application-a-retry" },
+      tenantId: "tenant-a",
+      database,
+      selection,
+      desired,
+      expectedPrefix: [],
+      migrations: desired,
+    }),
+  ).rejects.toMatchObject({ code: "backend_unavailable", status: 503 });
+  expect(applyCalls).toHaveLength(1);
 });
 
 async function execute(
@@ -301,6 +367,15 @@ async function execute(
   operationMode: "initial" | "recovery",
 ) {
   const prepared = await prepareSqliteMigrationApplication(value);
+  const selection = await value.driver.selectApply({
+    tenantId: value.tenantId,
+    resourceUid: "uid_application",
+    form: value.form,
+    name: "application",
+    space: value.space,
+    spec: {},
+    relations: value.relations,
+  });
   await applySqliteMigrationApplication({
     tenantId: value.tenantId,
     operationId,
@@ -313,6 +388,7 @@ async function execute(
     },
     prepared,
     driver: value.driver,
+    selection,
   });
 }
 
@@ -359,6 +435,7 @@ function relation(pointer: string, target: TakoformStoredResource) {
     targetName: target.metadata.name,
     targetUid: target.metadata.uid,
     targetFormRef: target.form.formRef,
+    resource: target,
   };
 }
 
@@ -408,3 +485,54 @@ function resource(
     },
   };
 }
+
+test("request-scoped artifact memos resolve each digest once", async () => {
+  const manifestCalls: string[] = [];
+  const blobCalls: string[] = [];
+  const scoped = memoizeArtifacts({
+    async resolveManifest(tenantId: string, digest: string) {
+      manifestCalls.push(`${tenantId}:${digest}`);
+      return manifests.get(digest) ?? null;
+    },
+    async resolveBlob(tenantId: string, digest: string) {
+      blobCalls.push(`${tenantId}:${digest}`);
+      return digest === firstSql ? firstSqlBytes : null;
+    },
+  });
+  await scoped.resolveManifest("tenant-a", String(firstSet.spec.manifestDigest));
+  await scoped.resolveManifest("tenant-a", String(firstSet.spec.manifestDigest));
+  await scoped.resolveManifest("tenant-b", String(firstSet.spec.manifestDigest));
+  await scoped.resolveBlob("tenant-a", firstSql);
+  await scoped.resolveBlob("tenant-a", firstSql);
+  await scoped.resolveBlob("tenant-a", secondSql);
+  expect(manifestCalls).toEqual([
+    `tenant-a:${String(firstSet.spec.manifestDigest)}`,
+    `tenant-b:${String(firstSet.spec.manifestDigest)}`,
+  ]);
+  expect(blobCalls).toEqual([`tenant-a:${firstSql}`, `tenant-a:${secondSql}`]);
+});
+
+test("migration preparation resolves the immutable blob set concurrently", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const second = {
+    ...context(secondSet, new InMemoryTakoformResourceDriver()),
+    artifacts: {
+      async resolveManifest(_tenantId: string, digest: string) {
+        return manifests.get(digest) ?? null;
+      },
+      async resolveBlob(_tenantId: string, digest: string) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        if (digest === firstSql) return firstSqlBytes;
+        if (digest === secondSql) return secondSqlBytes;
+        return null;
+      },
+    },
+  };
+  const prepared = await prepareSqliteMigrationApplication(second);
+  expect(prepared?.desired).toHaveLength(2);
+  expect(maxInFlight).toBe(2);
+});

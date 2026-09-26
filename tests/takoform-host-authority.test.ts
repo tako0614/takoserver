@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject, Row, Sql } from "../src/ports.ts";
+import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import {
   type AdmissionDigest,
   type AdmissionHandleClaims,
@@ -14,6 +15,10 @@ import {
   TAKOFORM_REVOCATION_V1_GENESIS_DIGEST,
 } from "../src/takoform/admission.ts";
 import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
+import {
+  parseTakoformApplySelection,
+  TAKOFORM_APPLY_SELECTION_VERSION,
+} from "../src/takoform/apply-selection.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { createFormPackageStore, formPackageKey } from "../src/takoform/form-packages.ts";
 import { createTakoformHost } from "../src/takoform/host.ts";
@@ -69,13 +74,21 @@ function unseeded() {
   };
 }
 
-async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "ModuleWorker") {
-  const fixture = unseeded();
+async function committedAuthority(
+  kind: "ModuleWorker" | "ActorNamespace" | "SQLiteDatabase" = "ModuleWorker",
+  options: { fixture?: ReturnType<typeof unseeded>; publisherKey?: string } = {},
+) {
+  const fixture = options.fixture ?? unseeded();
+  const publisherKey = options.publisherKey ?? "publisher-a";
   const form = fixture.catalog.forms.find((candidate) => candidate.identity.formRef.kind === kind);
   if (!form) throw new Error(`${kind} candidate form missing`);
   const packageDigest = form.identity.packageDigest;
   if (packageDigest === undefined) throw new Error("candidate package digest missing");
-  const packageDirectory = kind === "ActorNamespace" ? "actor-namespace" : "module-worker";
+  const packageDirectory = {
+    ActorNamespace: "actor-namespace",
+    ModuleWorker: "module-worker",
+    SQLiteDatabase: "sqlite-database",
+  }[kind];
   const directory = new URL(
     `./fixtures/takoform-v1/forms/candidates/edge.forms.takoform.com/${packageDirectory}/`,
     import.meta.url,
@@ -101,14 +114,14 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     files,
   };
   const publisher: AdmissionPublisherPin = {
-    publisherKey: "publisher-a",
+    publisherKey,
     policyDigest: digest("1"),
     policy: { apiVersion: "policy.forms.takoform.com/v1alpha1", mode: "reviewed" },
     oidcIssuer: "https://issuer.example.test",
     sourceRepository: "https://github.com/example/forms",
     workflow: ".github/workflows/release.yml",
     ref: "refs/tags/v1.0.0",
-    identity: "publisher-a",
+    identity: publisherKey,
     trustedRootDigest: digest("2"),
     sourceCommit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     workflowCommit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -135,7 +148,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
   const entriesDigest = TAKOFORM_REVOCATION_V1_EMPTY_ENTRIES_DIGEST;
   const checkpoint = await writer.execute({
     kind: "AppendCheckpoint",
-    publisherKey: "publisher-a",
+    publisherKey,
     checkpointApiVersion: TAKOFORM_REVOCATION_V1,
     policyDigest: publisher.policyDigest,
     policyEventDigest: allow.eventDigest,
@@ -192,7 +205,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     operation: "install",
     packageDigest: pkg.packageDigest,
     formRef: pkg.formRef,
-    publisherKey: "publisher-a",
+    publisherKey,
     publisher,
     policyEventDigest: allow.eventDigest,
     checkpointApiVersion: TAKOFORM_REVOCATION_V1,
@@ -202,7 +215,7 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     report,
   };
   const implementationDigest = digest("6");
-  await writer.execute({
+  const install = await writer.execute({
     kind: "InstallPackage",
     package: pkg,
     handle: handles.issue(claims),
@@ -247,6 +260,10 @@ async function committedAuthority(kind: "ModuleWorker" | "ActorNamespace" = "Mod
     audience,
     activation,
     checkpoint,
+    install,
+    handles,
+    claims,
+    pkg,
   };
 }
 
@@ -254,6 +271,7 @@ function countingDriver() {
   const memory = new InMemoryTakoformResourceDriver();
   const calls = { apply: 0, observe: 0, delete: 0, import: 0 };
   const driver: TakoformResourceDriver = {
+    selectApply: (input) => memory.selectApply(input),
     apply: async (input) => {
       calls.apply += 1;
       return memory.apply(input);
@@ -266,6 +284,7 @@ function countingDriver() {
       calls.delete += 1;
       return memory.delete(input);
     },
+    selectImport: (input) => memory.selectImport(input),
     import: async (input) => {
       calls.import += 1;
       return memory.import(input);
@@ -750,6 +769,107 @@ describe("durable read-only Takoform Host authority", () => {
     ).resolves.toMatchObject({ implementationDigest: fixture.implementationDigest });
   });
 
+  test("a valid stale install/support generation does not poison unrelated Form creation", async () => {
+    const stale = await committedAuthority();
+    const healthy = await committedAuthority("SQLiteDatabase", {
+      fixture: stale,
+      publisherKey: "publisher-b",
+    });
+    const counted = countingDriver();
+    const host = createTakoformHost({
+      sql: stale.sql,
+      objects: stale.objects,
+      forms: stale.catalog.forms,
+      bindings: stale.catalog.bindings,
+      authority: stale.authority,
+      driver: counted.driver,
+      authenticate: async () => ({ tenantId: CONTEXT.tenantId, principalId: CONTEXT.principalId }),
+    });
+    const staleReview = await prepareResource(host, stale.form.identity.formRef);
+
+    await stale.writer.execute({
+      kind: "SetActivation",
+      formRef: stale.form.identity.formRef,
+      packageDigest: stale.packageDigest,
+      implementationDigest: stale.implementationDigest,
+      active: false,
+      audience: stale.audience,
+      predecessorDigest: stale.activation.eventDigest,
+      actor: "test-operator",
+      reason: "retire old implementation before replacement",
+    });
+    const before = await stale.authority.catalog(CONTEXT);
+    await stale.writer.execute({
+      kind: "ReplacePackage",
+      package: stale.pkg,
+      handle: stale.handles.issue({
+        ...stale.claims,
+        operation: "replace",
+        report: { ...stale.claims.report, operation: "replace" },
+      }),
+      implementationDigest: digest("a"),
+      predecessorDigest: stale.install.eventDigest,
+      actor: "test-operator",
+      reason: "replace package without granting new implementation support",
+    });
+
+    const after = await stale.authority.catalog(CONTEXT);
+    expect(after.forms).toHaveLength(2);
+    const staleEntry = after.forms.find(
+      (entry) => entry.form.identity.formRef.kind === "ModuleWorker",
+    );
+    expect(staleEntry).toMatchObject({
+      supported: false,
+      availability: { executable: false, activated: false, availableToPrincipal: false },
+    });
+    expect(staleEntry?.headDigest).not.toBe(
+      before.forms.find((entry) => entry.form.identity.formRef.kind === "ModuleWorker")?.headDigest,
+    );
+    expect(
+      after.forms.find((entry) => entry.form.identity.formRef.kind === "SQLiteDatabase"),
+    ).toMatchObject({ supported: true, availability: { executable: true, activated: true } });
+
+    const stalePrepare = await host.handle(
+      new Request("https://host.invalid/apis/forms.takoform.com/v1/resources/prepare", {
+        method: "POST",
+        headers: { authorization: "Bearer test", "content-type": "application/json" },
+        body: JSON.stringify(resourceBody(stale.form.identity.formRef)),
+      }),
+    );
+    expect(stalePrepare?.status).toBe(503);
+
+    const staleCreate = await host.handle(
+      new Request(`https://host.invalid${resourcePath(stale.form.identity.formRef)}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer test",
+          "content-type": "application/json",
+          "idempotency-key": "stale-module-worker-after-replace",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify(resourceBody(stale.form.identity.formRef, staleReview)),
+      }),
+    );
+    expect(staleCreate?.status).toBe(503);
+    expect(counted.calls.apply).toBe(0);
+
+    const review = await prepareResource(host, healthy.form.identity.formRef);
+    const created = await host.handle(
+      new Request(`https://host.invalid${resourcePath(healthy.form.identity.formRef)}`, {
+        method: "PUT",
+        headers: {
+          authorization: "Bearer test",
+          "content-type": "application/json",
+          "idempotency-key": "healthy-form-beside-stale",
+          "if-none-match": "*",
+        },
+        body: JSON.stringify(resourceBody(healthy.form.identity.formRef, review)),
+      }),
+    );
+    expect(created?.status).toBe(201);
+    expect(counted.calls.apply).toBe(1);
+  });
+
   test("refuses support when the semantic implementation changes", async () => {
     const fixture = await committedAuthority();
     const authority = createTakoformHostAuthority({
@@ -868,11 +988,33 @@ describe("durable read-only Takoform Host authority", () => {
     expect(Number((await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_resources"))[0]?.n)).toBe(
       0,
     );
+    const retainedSagas = await fixture.sql.query(
+      `SELECT operation_kind, phase, receipt_json, execution_started_at, selection_json
+       FROM tf_provider_mutation_sagas_selection_v1`,
+    );
+    expect(retainedSagas).toHaveLength(1);
+    expect(retainedSagas[0]).toMatchObject({
+      operation_kind: "apply",
+      phase: "planned",
+      receipt_json: null,
+      execution_started_at: null,
+    });
+    const retainedSelectionJson = retainedSagas[0]?.selection_json;
+    const retainedSelection =
+      typeof retainedSelectionJson === "string"
+        ? parseTakoformApplySelection(retainedSelectionJson)
+        : retainedSelectionJson;
+    expect(retainedSelection).toEqual({
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "intrinsic",
+    });
     expect(
-      Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+      await fixture.sql.query(
+        `SELECT effect_kind, phase
+         FROM tf_resource_provider_effects
+         WHERE effect_kind = 'apply'`,
       ),
-    ).toBe(0);
+    ).toEqual([{ effect_kind: "apply", phase: "planned" }]);
   });
 
   test("a deferred resume reauthorizes fresh heads before any provider side effect", async () => {
@@ -944,9 +1086,198 @@ describe("durable read-only Takoform Host authority", () => {
     expect(counted.calls.apply).toBe(0);
     expect(
       Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+        (
+          await fixture.sql.query(
+            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
+          )
+        )[0]?.n,
       ),
     ).toBe(0);
+  });
+
+  test("retains an accepted apply when explicit implementation reconvergence changes its authority", async () => {
+    const fixture = await committedAuthority();
+    const memory = new InMemoryTakoformResourceDriver();
+    let applyCalls = 0;
+    const applyModes: string[] = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        applyCalls += 1;
+        applyModes.push(input.operationMode ?? "initial");
+        if (applyCalls === 1) throw new ProviderMutationRecoveryError("indeterminate");
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
+      import: (input) => memory.import(input),
+    };
+    const hostOptions = {
+      sql: fixture.sql,
+      objects: fixture.objects,
+      forms: fixture.catalog.forms,
+      bindings: fixture.catalog.bindings,
+      driver,
+      deferredOperations: {
+        shouldDefer: () => true,
+        pollsBeforeCommit: 1,
+        retryAfterSeconds: 0,
+        executeOnAccept: true,
+      },
+      authenticate: async () => ({
+        tenantId: CONTEXT.tenantId,
+        principalId: CONTEXT.principalId,
+      }),
+    } as const;
+    const log = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const initialHost = createTakoformHost({ ...hostOptions, authority: fixture.authority });
+      const review = await prepareResource(initialHost, fixture.form.identity.formRef);
+      const accepted = await initialHost.handle(
+        new Request(`https://host.invalid${resourcePath(fixture.form.identity.formRef)}`, {
+          method: "PUT",
+          headers: {
+            authorization: "Bearer test",
+            "content-type": "application/json",
+            "idempotency-key": "authority-implementation-reconvergence-1",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify(resourceBody(fixture.form.identity.formRef, review)),
+        }),
+      );
+      expect(accepted?.status).toBe(202);
+      if (!accepted) throw new Error("deferred create response missing");
+      const operationId = String(
+        ((await accepted.json()) as { readonly operation: { readonly id: string } }).operation.id,
+      );
+      expect(applyCalls).toBe(1);
+
+      const sagaBefore = await fixture.sql.query(
+        "SELECT * FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        [operationId],
+      );
+      const saga = first(sagaBefore, "accepted provider mutation saga");
+      const resourceUid = String(saga.resource_uid);
+      const effectsBefore = await fixture.sql.query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      const incarnationBefore = await fixture.sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ?`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(effectsBefore).toHaveLength(2);
+      expect(incarnationBefore).toHaveLength(1);
+
+      const newImplementationDigest = digest("a");
+      const deactivation = await fixture.writer.execute({
+        kind: "SetActivation",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: fixture.implementationDigest,
+        active: false,
+        audience: fixture.audience,
+        predecessorDigest: fixture.activation.eventDigest,
+        actor: "test-operator",
+        reason: "retire the old implementation before explicit reconvergence",
+      });
+      await fixture.writer.execute({
+        kind: "ReplacePackage",
+        package: fixture.pkg,
+        handle: fixture.handles.issue({
+          ...fixture.claims,
+          operation: "replace",
+          report: { ...fixture.claims.report, operation: "replace" },
+        }),
+        implementationDigest: newImplementationDigest,
+        predecessorDigest: fixture.install.eventDigest,
+        actor: "test-operator",
+        reason: "admit the replacement implementation",
+      });
+      await fixture.writer.execute({
+        kind: "SetSupport",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: newImplementationDigest,
+        supported: true,
+        profile: {
+          kind: "takoserver.form-support@v1",
+          workerArtifactDigest: PUBLIC_WORKER_ARTIFACT_DIGEST,
+          publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+          capabilityDigest: digest("8"),
+          implementationDigest: newImplementationDigest,
+        },
+        operations: ["create", "read", "delete", "observe"],
+        actor: "test-operator",
+        reason: "support the replacement implementation",
+      });
+      await fixture.writer.execute({
+        kind: "SetActivation",
+        formRef: fixture.form.identity.formRef,
+        packageDigest: fixture.packageDigest,
+        implementationDigest: newImplementationDigest,
+        active: true,
+        audience: fixture.audience,
+        predecessorDigest: deactivation.eventDigest,
+        actor: "test-operator",
+        reason: "activate the replacement implementation",
+      });
+      const currentAuthority = createTakoformHostAuthority({
+        sql: fixture.sql,
+        objects: fixture.objects,
+        hostId: "host-a",
+        publicWorkerVersionId: PUBLIC_WORKER_VERSION_ID,
+        implementationDigest: newImplementationDigest,
+        candidates: fixture.catalog.forms,
+        bindings: fixture.catalog.bindings,
+        technicalAvailability: technicallyAvailable,
+      });
+      const currentGrant = await currentAuthority.authorizeMutation({
+        operation: "create",
+        context: CONTEXT,
+        formRef: fixture.form.identity.formRef,
+      });
+      expect(currentGrant.fence.headDigest).not.toBe(saga.authority_head_digest);
+
+      const recoveredHost = createTakoformHost({ ...hostOptions, authority: currentAuthority });
+      const recovered = await recoveredHost.handle(
+        new Request(`https://host.invalid/apis/forms.takoform.com/v1/operations/${operationId}`, {
+          headers: { authorization: "Bearer test" },
+        }),
+      );
+      expect(recovered?.status).toBe(200);
+      expect(await recovered?.json()).toMatchObject({ id: operationId, done: true });
+      expect(applyCalls).toBe(2);
+      expect(applyModes).toEqual(["initial", "recovery"]);
+      expect(
+        await fixture.sql.query(
+          "SELECT * FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+          [operationId],
+        ),
+      ).toHaveLength(0);
+      const effectsAfter = await fixture.sql.query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY created_at, event_id`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(effectsAfter).toHaveLength(effectsBefore.length + 1);
+      expect(effectsAfter.slice(0, effectsBefore.length).map((row) => row.operation_mode)).toEqual(
+        effectsBefore.map((row) => row.operation_mode),
+      );
+      expect(effectsAfter.at(-1)?.operation_mode).toBe("recovery");
+      const incarnationAfter = await fixture.sql.query(
+        `SELECT * FROM tf_resource_deletion_attestations
+         WHERE tenant_id = ? AND resource_uid = ?`,
+        [CONTEXT.tenantId, resourceUid],
+      );
+      expect(incarnationAfter).toHaveLength(incarnationBefore.length);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test("the final D1 fence rejects a head change that races the provider side effect", async () => {
@@ -954,6 +1285,7 @@ describe("durable read-only Takoform Host authority", () => {
     const memory = new InMemoryTakoformResourceDriver();
     let applyCalls = 0;
     const driver: TakoformResourceDriver = {
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applyCalls += 1;
         const receipt = await memory.apply(input);
@@ -972,6 +1304,7 @@ describe("durable read-only Takoform Host authority", () => {
       },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
+      selectImport: (input) => memory.selectImport(input),
       import: (input) => memory.import(input),
       sqliteMigrations: memory.sqliteMigrations,
     };
@@ -1008,7 +1341,11 @@ describe("durable read-only Takoform Host authority", () => {
     );
     expect(
       Number(
-        (await fixture.sql.query("SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas"))[0]?.n,
+        (
+          await fixture.sql.query(
+            "SELECT COUNT(*) AS n FROM tf_provider_mutation_sagas_selection_v1",
+          )
+        )[0]?.n,
       ),
     ).toBe(1);
   });

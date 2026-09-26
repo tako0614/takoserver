@@ -7,6 +7,7 @@ import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   activePublicJwk,
+  createRemoteSigningDatabase,
   runSigning,
   type SigningDatabase,
   type SigningProcess,
@@ -186,6 +187,51 @@ function workerState(input: {
 }
 
 describe("split signing authority surfaces", () => {
+  test("default signing reader uses the composing owner's Wrangler executable", async () => {
+    const wranglerPath = "/private/runtime/node_modules/.bin/wrangler";
+    const commands: string[][] = [];
+    const publicJwk = JSON.stringify({ kty: "OKP", crv: "Ed25519", x: "A".repeat(43) });
+    const database = createRemoteSigningDatabase(
+      "inspection.jsonc",
+      {},
+      async (command) => {
+        commands.push([...command]);
+        return ok(
+          JSON.stringify([
+            {
+              success: true,
+              results: [
+                {
+                  key_id: "key-current",
+                  public_jwk: publicJwk,
+                  created_at_epoch_seconds: 1_700_000_000,
+                  revoked_at_epoch_seconds: null,
+                },
+              ],
+            },
+          ]),
+        );
+      },
+      (args) => [wranglerPath, ...args],
+    );
+
+    await expect(database.readKey("key-current", "preflight")).resolves.toEqual({
+      keyId: "key-current",
+      publicJwk,
+      createdAtEpochSeconds: 1_700_000_000,
+      revokedAtEpochSeconds: null,
+    });
+    expect(commands).toHaveLength(1);
+    expect(commands[0]?.slice(0, 6)).toEqual([
+      wranglerPath,
+      "d1",
+      "execute",
+      "STATE_DB",
+      "--remote",
+      "--yes",
+    ]);
+  });
+
   test("canonical upload classification accepts either exact upload profile", () => {
     const message = `takoserver-worker:${COMMIT}:${BUNDLE_DIGEST}`;
     for (const triggeredBy of ["upload", "version_upload"] as const) {

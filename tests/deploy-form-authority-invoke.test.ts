@@ -15,7 +15,7 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
 import { verifyFormAuthorityOperatorAssertion } from "../src/form-authority-operator-proof.ts";
 import { INTEGRATION_FORM_PACKAGES } from "../src/generated/takoform-integration-form-packages.ts";
-import { canonicalJson } from "../src/json.ts";
+import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
@@ -23,6 +23,7 @@ import {
   CURRENT_PUBLISHER_REPOSITORY,
 } from "../src/takoform/current-publisher-catalog.ts";
 import { deriveFormAuthorityIdentity } from "../src/takoform/host-admission-endpoint.ts";
+import { takoformActivationAudience } from "../src/takoform/host-authority.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { createIntegrationFormAuthorityComposition } from "../src/takoform/integration-operator-endpoint.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
@@ -31,12 +32,13 @@ const COMMIT = "a".repeat(40);
 const NEXT_COMMIT = "d".repeat(40);
 /** Derived so a Form joining the catalog cannot silently leave a count behind. */
 const PACKAGE_COUNT = INTEGRATION_FORM_PACKAGES.length;
-const IMPLEMENTED_COUNT = 15;
+const IMPLEMENTED_COUNT = Object.keys(publicFormCapabilityManifest().forms).length;
 const NOW = new Date("2026-08-29T02:00:00Z");
 const ARTIFACT = `sha256:${"b".repeat(64)}` as const;
 const PUBLIC_VERSION = "11111111-1111-4111-8111-111111111111";
 const ORIGIN = "https://form-authority.integration.takoserver.com";
 const HOST_ID = "https://api.integration.example.test";
+const UNSUPPORTED_RETAINED_FORM_KIND = "ActorNamespace" as const;
 const TRANSITION_TARGET_SCOPE = {
   tenantId: "tenant-yurucommu-transition-target",
   space: "space-yurucommu-transition-target",
@@ -88,6 +90,26 @@ describe("signed Form authority operator invocation", () => {
     expect(fixture.calls.map(({ action }) => action)).toEqual(["plan", "apply", "readback"]);
     expect(canonicalJson(fixture.calls[1]?.body)).toBe(canonicalJson(fixture.calls[0]?.result));
     expect((result.readback as { forms: unknown[] }).forms).toHaveLength(PACKAGE_COUNT);
+    const readbackForms = (
+      result.readback as {
+        forms: readonly {
+          formRef: { readonly kind: string };
+          installed: boolean;
+          supported: boolean;
+          operations: readonly string[];
+          activationHead: { present: boolean; active: boolean };
+        }[];
+      }
+    ).forms;
+    for (const kind of ["ActorNamespace", "DurableWorkflow"] as const) {
+      const absentImplementation = readbackForms.find((form) => form.formRef.kind === kind);
+      expect(absentImplementation).toMatchObject({
+        installed: true,
+        supported: false,
+        operations: [],
+        activationHead: { present: false, active: false },
+      });
+    }
     expect((result.apply as { receipts: unknown[] }).receipts).toHaveLength(
       2 + PACKAGE_COUNT + IMPLEMENTED_COUNT * 2,
     );
@@ -199,6 +221,147 @@ describe("signed Form authority operator invocation", () => {
     );
     expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
     expect(status).toMatchObject({ action: "status", ready: true, credentialsRedacted: true });
+  });
+
+  test("readiness accepts retained inactive history for a package without an implementation entry", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+    fixture.setReadbackTamper("retained-inactive");
+    const applied = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    expect(applied).toMatchObject({ ready: true, plan: { commandCount: 0 } });
+    const readback = applied.readback as {
+      forms: readonly {
+        formRef: { readonly kind: string };
+        installed: boolean;
+        supported: boolean;
+        operations: readonly string[];
+        activationHead: {
+          present: boolean;
+          active: boolean;
+          implementationDigest: string | null;
+          eventDigest: string | null;
+        };
+      }[];
+    };
+    expect(
+      readback.forms.find((form) => form.formRef.kind === UNSUPPORTED_RETAINED_FORM_KIND),
+    ).toMatchObject({
+      installed: true,
+      supported: false,
+      operations: [],
+      activationHead: {
+        present: true,
+        active: false,
+        implementationDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        eventDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      },
+    });
+
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+    const status = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
+    expect(status).toMatchObject({ ready: true });
+  });
+
+  test("active retained history for an unsupported package makes status not ready", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+    fixture.setReadbackTamper("retained-active");
+    const status = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
+    expect(status).toMatchObject({ ready: false });
+    expect(
+      (
+        status.readback as {
+          forms: readonly {
+            formRef: { readonly kind: string };
+            activationHead: { present: boolean; active: boolean };
+          }[];
+        }
+      ).forms.find((form) => form.formRef.kind === UNSUPPORTED_RETAINED_FORM_KIND),
+    ).toMatchObject({ activationHead: { present: true, active: true } });
+  });
+
+  test("rejects a malformed retained inactive head for an unsupported package", async () => {
+    const fixture = await invocationFixture();
+    await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    );
+    fixture.calls.length = 0;
+    fixture.assertions.length = 0;
+    fixture.setReadbackTamper("retained-malformed");
+    const failure = await runFormAuthorityInvoke(
+      {
+        surface: "takoserver-integration-form-authority",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      fixture.target,
+      fixture.options,
+    ).catch((error) => error);
+    expect(fixture.calls.map(({ action }) => action)).toEqual(["readback"]);
+    expect(failure).toMatchObject({
+      phase: "preflight",
+      message: expect.stringContaining("readback is invalid"),
+    });
   });
 
   test("deactivation uses a distinct surface and reports all executable heads inactive", async () => {
@@ -585,9 +748,13 @@ async function invocationFixture(
       | "extra"
       | "missing"
       | "operations"
-      | "implemented-operations";
+      | "implemented-operations"
+      | "retained-inactive"
+      | "retained-active"
+      | "retained-malformed";
   } = {},
 ) {
+  let tamperReadback = input.tamperReadback;
   let selectedCommit = COMMIT;
   const target = await integrationTarget();
   const capabilities = publicFormCapabilityManifest();
@@ -676,31 +843,89 @@ async function invocationFixture(
         replanRequired: true,
       };
     }
-    if (action === "readback" && input.tamperReadback) {
-      const readback = result as { forms: readonly Record<string, unknown>[] };
-      const first = readback.forms[0] ?? {};
-      const implementedIndex = readback.forms.findIndex(
-        (form) =>
-          (form.formRef as { readonly kind?: unknown } | undefined)?.kind === "StaticAssetBundle",
-      );
-      const tamperIndex =
-        input.tamperReadback === "implemented-operations" && implementedIndex >= 0
-          ? implementedIndex
-          : 0;
-      const target = readback.forms[tamperIndex] ?? first;
-      const malformed =
-        input.tamperReadback === "truthy"
-          ? { ...first, installed: "true" }
-          : input.tamperReadback === "extra"
-            ? { ...first, unexpected: true }
-            : input.tamperReadback === "operations" ||
-                input.tamperReadback === "implemented-operations"
-              ? { ...target, operations: ["read"] }
-              : (({ activationHead: _activationHead, ...missing }) => missing)(first);
-      returned = {
-        ...(result as unknown as Record<string, unknown>),
-        forms: readback.forms.map((form, index) => (index === tamperIndex ? malformed : form)),
-      };
+    if (action === "readback" && tamperReadback) {
+      if (result.kind !== "takoserver.form-authority-readback@v2") {
+        throw new Error("readback action did not return a Form authority readback");
+      }
+      const readback = result;
+      const first = readback.forms[0];
+      if (!first) throw new Error("Form authority readback contains no packages");
+      if (
+        tamperReadback === "retained-inactive" ||
+        tamperReadback === "retained-active" ||
+        tamperReadback === "retained-malformed"
+      ) {
+        const unsupportedIndex = readback.forms.findIndex(
+          (form) =>
+            (form.formRef as { readonly kind?: unknown } | undefined)?.kind ===
+            UNSUPPORTED_RETAINED_FORM_KIND,
+        );
+        const unsupported = readback.forms[unsupportedIndex];
+        if (!unsupported || unsupportedIndex < 0) {
+          throw new Error(
+            `unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} package is missing from readback`,
+          );
+        }
+        const retained = {
+          ...unsupported,
+          activationHead: {
+            present: true,
+            active: tamperReadback === "retained-active",
+            implementationDigest: identity.implementationDigest,
+            eventDigest:
+              tamperReadback === "retained-malformed" ? null : `sha256:${"9".repeat(64)}`,
+          },
+        };
+        const eventDigest = retained.activationHead.eventDigest;
+        const scope = target.formAuthority?.integrationOperatorScope;
+        if (!scope || typeof unsupported.packageDigest !== "string") {
+          throw new Error(`unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} identity is incomplete`);
+        }
+        const audience = takoformActivationAudience("space", scope);
+        const activationKey = `${canonicalJson(unsupported.formRef)}\0${unsupported.packageDigest}\0${audience.value}`;
+        const currentHeads = readback.currentHeads.map((head) =>
+          head.kind === "activation" && head.key === activationKey
+            ? { ...head, eventDigest }
+            : head,
+        );
+        if (
+          !currentHeads.some((head) => head.kind === "activation" && head.key === activationKey)
+        ) {
+          throw new Error(
+            `unsupported ${UNSUPPORTED_RETAINED_FORM_KIND} activation summary is missing`,
+          );
+        }
+        returned = {
+          ...(result as unknown as Record<string, unknown>),
+          currentHeads,
+          currentHeadDigest: await canonicalDigest(currentHeads),
+          forms: readback.forms.map((form, index) =>
+            index === unsupportedIndex ? retained : form,
+          ),
+        };
+      } else {
+        const implementedIndex = readback.forms.findIndex(
+          (form) =>
+            (form.formRef as { readonly kind?: unknown } | undefined)?.kind === "StaticAssetBundle",
+        );
+        const tamperIndex =
+          tamperReadback === "implemented-operations" && implementedIndex >= 0
+            ? implementedIndex
+            : 0;
+        const target = readback.forms[tamperIndex] ?? first;
+        const malformed =
+          tamperReadback === "truthy"
+            ? { ...first, installed: "true" }
+            : tamperReadback === "extra"
+              ? { ...first, unexpected: true }
+              : tamperReadback === "operations" || tamperReadback === "implemented-operations"
+                ? { ...target, operations: ["read"] }
+                : (({ activationHead: _activationHead, ...missing }) => missing)(first);
+        returned = {
+          ...(result as unknown as Record<string, unknown>),
+          forms: readback.forms.map((form, index) => (index === tamperIndex ? malformed : form)),
+        };
+      }
     }
     const last = calls.at(-1);
     if (last) last.result = returned;
@@ -755,6 +980,9 @@ async function invocationFixture(
       review: "independent-reviewer",
     } satisfies FormAuthorityInvokeOptions,
     gatewayStatus,
+    setReadbackTamper(value: typeof tamperReadback) {
+      tamperReadback = value;
+    },
     selectCommit(commit: string) {
       selectedCommit = commit;
     },

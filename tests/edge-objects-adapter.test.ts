@@ -1008,6 +1008,41 @@ test("provider-private adapters reject malformed list framing", async () => {
   await expect(s3.list()).rejects.toMatchObject({ name: "backend_unavailable" });
 });
 
+test("private S3 refuses oversized list bodies while they are still streaming", async () => {
+  const chunk = new Uint8Array(64 * 1024);
+  const totalBytes = 4 * 1024 * 1024;
+  let deliveredBytes = 0;
+  let cancelled = false;
+  const s3 = createPrivateS3EdgeObjects({
+    endpoint: "https://s3.internal.test",
+    bucketName: "private-bucket",
+    region: "ap-northeast-1",
+    credentials: { accessKeyId: "AKID", secretAccessKey: "private-secret" },
+    fetch: async () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (deliveredBytes >= totalBytes) {
+              controller.close();
+              return;
+            }
+            deliveredBytes += chunk.byteLength;
+            controller.enqueue(chunk);
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 },
+      ),
+    now: () => new Date("2026-09-01T00:00:00.000Z"),
+  });
+
+  await expect(s3.list()).rejects.toMatchObject({ name: "backend_unavailable" });
+  expect(deliveredBytes).toBeLessThan(totalBytes);
+  expect(cancelled).toBe(true);
+});
+
 function bodyStream(value: string): ReadableStream<Uint8Array> {
   const encoded = new TextEncoder().encode(value);
   return new ReadableStream({

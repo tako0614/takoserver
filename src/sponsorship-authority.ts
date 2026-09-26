@@ -1,10 +1,11 @@
 import { canonicalDigest } from "./json.ts";
-import type { Clock, Sql } from "./ports.ts";
+import type { Clock, Sql, SqlWrite } from "./ports.ts";
 import type { SponsorshipCredentialIssuer } from "./sponsorship-credential.ts";
 import type {
   SponsorshipIssuanceReceiptIssuer,
   SponsorshipReceiptChannel,
 } from "./sponsorship-issuance-receipt.ts";
+import { isSpaceId } from "./takoform/space-id.ts";
 
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
@@ -21,6 +22,11 @@ export interface SponsorshipAuthorityCredential {
 
 export interface SponsorshipAuthority {
   issueTenantRunCredential(input: unknown): Promise<SponsorshipAuthorityCredential>;
+}
+
+export interface SponsorshipManagedSpaceAdmission {
+  readonly policyDigest: `sha256:${string}`;
+  ensureTenantSpaceAdmission(input: { readonly tenantRef: string }): Promise<unknown>;
 }
 
 export type SponsorshipAuthorityErrorCode =
@@ -40,11 +46,10 @@ export class SponsorshipAuthorityError extends Error {
  * One narrow Hosted authority operation.
  *
  * The deployment, not the caller, selects the Takoserver organization. The
- * guarded INSERT is the complete admission decision: it binds a previously
- * unseen opaque tenant only while the pinned organization's wallet satisfies
- * the requested floor, accepts an exact replay for that same organization,
- * and changes zero rows for a conflicting owner or unavailable credit. Only a
- * successful decision reaches the signing authority.
+ * unmanaged lane keeps its guarded issuance INSERT as the admission decision.
+ * The managed lane first claims the opaque tenant under the same wallet and
+ * ownership guard, then performs narrow Form admission before its guarded
+ * issuance INSERT. Only a successful decision reaches the signing authority.
  */
 export function createSponsorshipAuthority(options: {
   readonly sql: Sql;
@@ -65,20 +70,21 @@ export function createSponsorshipAuthority(options: {
     readonly receiptKeyId: string;
   };
   readonly clock: Clock;
+  readonly managedSpaceAdmission?: SponsorshipManagedSpaceAdmission;
 }): SponsorshipAuthority {
   const organizationId = reference(options.organizationId);
   const issuanceAuthority = exactIssuanceAuthority(options.issuanceAuthority);
+  const managedSpaceAdmission =
+    options.managedSpaceAdmission === undefined
+      ? undefined
+      : exactManagedSpaceAdmission(options.managedSpaceAdmission);
 
   return {
     async issueTenantRunCredential(value) {
       const input = credentialInput(value);
-      const now = options.clock();
-      const issuedAtEpochSeconds = Math.floor(now.getTime() / 1_000);
-      if (!Number.isSafeInteger(issuedAtEpochSeconds)) {
-        throw new SponsorshipAuthorityError("authority_denied");
-      }
-      const expiresAtEpochSeconds = issuedAtEpochSeconds + CREDENTIAL_TTL_SECONDS;
-      const createdAt = new Date(issuedAtEpochSeconds * 1_000).toISOString();
+      if (managedSpaceAdmission !== undefined) assertManagedScope(input);
+      const unmanagedTime =
+        managedSpaceAdmission === undefined ? issuanceTime(options.clock()) : undefined;
       const requestNonceSha256 = await digestText(input.channel.requestNonce);
       const expectedOperationId = await canonicalDigest({
         kind: "takosumi-hosted.sponsorship-issuance-operation@v1",
@@ -90,156 +96,141 @@ export function createSponsorshipAuthority(options: {
       const { issuanceOperationId: _issuanceOperationId, ...logicalChannel } = input.channel;
       const inputSha256 = await canonicalDigest({
         organizationId,
+        ...(managedSpaceAdmission === undefined
+          ? {}
+          : {
+              managedSpaceAdmission: {
+                policyDigest: managedSpaceAdmission.policyDigest,
+              },
+            }),
         request: { ...input, channel: logicalChannel },
       });
       const tokenId = `tok_sponsor_${input.channel.issuanceOperationId.slice(7)}`;
-      await options.sql.run(
-        `WITH wallet AS (
-           SELECT
-             organization.id AS org_id,
-             COALESCE((
-               SELECT SUM(CASE
-                 WHEN lot.expires_at IS NULL OR lot.expires_at > ? THEN
-                   lot.amount_minor - COALESCE((
-                     SELECT SUM(allocation.amount_minor)
-                     FROM wallet_credit_allocations AS allocation
-                     WHERE allocation.org_id = lot.org_id
-                       AND allocation.lot_ref = lot.ref
-                       AND allocation.debit_type IN ('capture', 'usage_debit')
-                   ), 0)
-                 ELSE COALESCE((
-                   SELECT SUM(allocation.amount_minor)
-                   FROM wallet_credit_allocations AS allocation
-                   WHERE allocation.org_id = lot.org_id
-                     AND allocation.lot_ref = lot.ref
-                     AND allocation.debit_type = 'hold'
-                 ), 0)
-               END)
-               FROM wallet_credit_lots AS lot
-               WHERE lot.org_id = organization.id
-             ), 0) AS settled_minor,
-             COALESCE((
-               SELECT SUM(entry.held_delta)
-               FROM ledger AS entry
-               WHERE entry.org_id = organization.id
-             ), 0) AS held_minor,
-             COALESCE((
-               SELECT SUM(allocation.amount_minor)
-               FROM wallet_credit_allocations AS allocation
-               WHERE allocation.org_id = organization.id
-                 AND allocation.debit_type = 'hold'
-             ), 0) AS allocated_held_minor
-           FROM orgs AS organization
-           WHERE organization.id = ?
-         )
-         INSERT INTO sponsorship_credential_issuance_operations
-           (issuance_operation_id, input_sha256, request_sha256,
-            request_nonce_sha256, tenant_ref, org_id, hosted_version_id,
-            issued_at_epoch_seconds, expires_at_epoch_seconds, token_id,
-            credential_key_id, receipt_key_id, authority_version_id,
-            authority_source_commit, authority_artifact_sha256, created_at)
-         SELECT ?, ?, ?, ?, ?, org_id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         FROM wallet
-         WHERE settled_minor >= 0
-           AND held_minor >= 0
-           AND allocated_held_minor = held_minor
-           AND settled_minor - held_minor >= ?
-           AND (
-             NOT EXISTS (
-               SELECT 1 FROM sponsorship_tenants WHERE tenant_ref = ?
-             ) OR EXISTS (
-               SELECT 1 FROM sponsorship_tenants
-               WHERE tenant_ref = ? AND org_id = wallet.org_id
-             )
-           )
-         ON CONFLICT DO NOTHING`,
-        [
-          now.toISOString(),
-          organizationId,
+      if (managedSpaceAdmission !== undefined) {
+        const existing = await readIssuanceOperation(
+          options.sql,
           input.channel.issuanceOperationId,
-          inputSha256,
-          input.channel.requestSha256,
-          requestNonceSha256,
+        );
+        if (existing !== null) {
+          assertOperationMatches({
+            operation: existing,
+            input,
+            inputSha256,
+            requestNonceSha256,
+            organizationId,
+            issuanceAuthority,
+            tokenId,
+          });
+          return issueFromOperation(existing, input);
+        }
+
+        const claimTime = issuanceTime(options.clock());
+        const claim = await claimManagedTenant({
+          sql: options.sql,
+          organizationId,
+          tenantRef: input.tenantRef,
+          requiredAvailableMinor: input.requiredAvailableMinor,
+          time: claimTime,
+        });
+        if (claim.changes !== 1) {
+          throw new SponsorshipAuthorityError("authority_denied");
+        }
+
+        let ready: unknown;
+        try {
+          ready = await managedSpaceAdmission.ensureTenantSpaceAdmission({
+            tenantRef: input.tenantRef,
+          });
+        } catch (error) {
+          if (error instanceof SponsorshipAuthorityError) throw error;
+          throw new SponsorshipAuthorityError("authority_denied");
+        }
+        assertManagedReady(
+          ready,
+          organizationId,
           input.tenantRef,
-          input.channel.hostedVersionId,
-          issuedAtEpochSeconds,
-          expiresAtEpochSeconds,
-          tokenId,
-          issuanceAuthority.credentialKeyId,
-          issuanceAuthority.receiptKeyId,
-          issuanceAuthority.versionId,
-          issuanceAuthority.sourceCommit,
-          issuanceAuthority.artifactSha256,
-          createdAt,
-          input.requiredAvailableMinor,
-          input.tenantRef,
-          input.tenantRef,
-        ],
-      );
+          managedSpaceAdmission.policyDigest,
+        );
+      } else if (unmanagedTime === undefined) {
+        throw new SponsorshipAuthorityError("authority_denied");
+      }
+
+      const time =
+        managedSpaceAdmission === undefined ? unmanagedTime : issuanceTime(options.clock());
+      if (!time) throw new SponsorshipAuthorityError("authority_denied");
+      await insertIssuanceOperation({
+        sql: options.sql,
+        organizationId,
+        input,
+        inputSha256,
+        requestNonceSha256,
+        tokenId,
+        issuanceAuthority,
+        time,
+        managed: managedSpaceAdmission !== undefined,
+      });
       const operation = await readIssuanceOperation(options.sql, input.channel.issuanceOperationId);
       if (operation === null) {
         throw new SponsorshipAuthorityError("authority_denied");
       }
-      if (
-        operation.inputSha256 !== inputSha256 ||
-        operation.requestSha256 !== input.channel.requestSha256 ||
-        operation.requestNonceSha256 !== requestNonceSha256 ||
-        operation.tenantRef !== input.tenantRef ||
-        operation.organizationId !== organizationId ||
-        operation.hostedVersionId !== input.channel.hostedVersionId ||
-        operation.tokenId !== tokenId ||
-        operation.credentialKeyId !== issuanceAuthority.credentialKeyId ||
-        operation.receiptKeyId !== issuanceAuthority.receiptKeyId ||
-        operation.authorityVersionId !== issuanceAuthority.versionId ||
-        operation.authoritySourceCommit !== issuanceAuthority.sourceCommit ||
-        operation.authorityArtifactSha256 !== issuanceAuthority.artifactSha256 ||
-        operation.expiresAtEpochSeconds - operation.issuedAtEpochSeconds !== CREDENTIAL_TTL_SECONDS
-      ) {
-        throw new SponsorshipAuthorityError("operation_conflict");
-      }
-
-      const credential = await options.credentialIssuer.issue({
+      assertOperationMatches({
+        operation,
+        input,
+        inputSha256,
+        requestNonceSha256,
         organizationId,
-        tenantRef: input.tenantRef,
-        spaceRef: input.spaceRef,
-        runRef: input.runRef,
-        ...(input.workerEndpointOriginReservationId === undefined
-          ? {}
-          : {
-              workerEndpointOriginReservationId: input.workerEndpointOriginReservationId,
-            }),
-        ttlSeconds: CREDENTIAL_TTL_SECONDS,
-        issuedAtEpochSeconds: operation.issuedAtEpochSeconds,
-        tokenId: operation.tokenId,
+        issuanceAuthority,
+        tokenId,
       });
-      const issuedAt = new Date(operation.issuedAtEpochSeconds * 1_000);
-      const validated = validatedCredential(credential, issuedAt);
-      const issuanceReceipt = await options.receipts.issue({
-        channel: input.channel,
-        token: validated.token,
-        issuedAt,
-        expiresAt: validated.expiresAt,
-        credentialPublicJwk: options.credentialPublicJwk,
-        organizationId,
-        tenantRef: input.tenantRef,
-        spaceRef: input.spaceRef,
-        runRef: input.runRef,
-        requiredAvailableMinor: input.requiredAvailableMinor,
-        ...(input.workerEndpointOriginReservationId === undefined
-          ? {}
-          : { workerEndpointOriginReservationId: input.workerEndpointOriginReservationId }),
-      });
-      if (
-        typeof issuanceReceipt !== "string" ||
-        issuanceReceipt.length < 16 ||
-        issuanceReceipt.length > 16_384 ||
-        !/^[A-Za-z0-9._-]+$/u.test(issuanceReceipt)
-      ) {
-        throw new SponsorshipAuthorityError("invalid_credential");
-      }
-      return { ...validated, issuanceReceipt };
+      return issueFromOperation(operation, input);
     },
   };
+
+  async function issueFromOperation(
+    operation: SponsorshipCredentialIssuanceOperation,
+    input: CredentialInput,
+  ): Promise<SponsorshipAuthorityCredential> {
+    const credential = await options.credentialIssuer.issue({
+      organizationId,
+      tenantRef: input.tenantRef,
+      spaceRef: input.spaceRef,
+      runRef: input.runRef,
+      ...(input.workerEndpointOriginReservationId === undefined
+        ? {}
+        : {
+            workerEndpointOriginReservationId: input.workerEndpointOriginReservationId,
+          }),
+      ttlSeconds: CREDENTIAL_TTL_SECONDS,
+      issuedAtEpochSeconds: operation.issuedAtEpochSeconds,
+      tokenId: operation.tokenId,
+    });
+    const issuedAt = new Date(operation.issuedAtEpochSeconds * 1_000);
+    const validated = validatedCredential(credential, issuedAt);
+    const issuanceReceipt = await options.receipts.issue({
+      channel: input.channel,
+      token: validated.token,
+      issuedAt,
+      expiresAt: validated.expiresAt,
+      credentialPublicJwk: options.credentialPublicJwk,
+      organizationId,
+      tenantRef: input.tenantRef,
+      spaceRef: input.spaceRef,
+      runRef: input.runRef,
+      requiredAvailableMinor: input.requiredAvailableMinor,
+      ...(input.workerEndpointOriginReservationId === undefined
+        ? {}
+        : { workerEndpointOriginReservationId: input.workerEndpointOriginReservationId }),
+    });
+    if (
+      typeof issuanceReceipt !== "string" ||
+      issuanceReceipt.length < 16 ||
+      issuanceReceipt.length > 16_384 ||
+      !/^[A-Za-z0-9._-]+$/u.test(issuanceReceipt)
+    ) {
+      throw new SponsorshipAuthorityError("invalid_credential");
+    }
+    return { ...validated, issuanceReceipt };
+  }
 }
 
 interface CredentialInput {
@@ -266,6 +257,267 @@ interface SponsorshipCredentialIssuanceOperation {
   readonly authorityVersionId: string;
   readonly authoritySourceCommit: string;
   readonly authorityArtifactSha256: string;
+}
+
+interface IssuanceTime {
+  readonly now: Date;
+  readonly issuedAtEpochSeconds: number;
+  readonly expiresAtEpochSeconds: number;
+  readonly createdAt: string;
+}
+
+const WALLET_CTE = `WITH wallet AS (
+  SELECT
+    organization.id AS org_id,
+    COALESCE((
+      SELECT SUM(CASE
+        WHEN lot.expires_at IS NULL OR lot.expires_at > ? THEN
+          lot.amount_minor - COALESCE((
+            SELECT SUM(allocation.amount_minor)
+            FROM wallet_credit_allocations AS allocation
+            WHERE allocation.org_id = lot.org_id
+              AND allocation.lot_ref = lot.ref
+              AND allocation.debit_type IN ('capture', 'usage_debit')
+          ), 0)
+        ELSE COALESCE((
+          SELECT SUM(allocation.amount_minor)
+          FROM wallet_credit_allocations AS allocation
+          WHERE allocation.org_id = lot.org_id
+            AND allocation.lot_ref = lot.ref
+            AND allocation.debit_type = 'hold'
+        ), 0)
+      END)
+      FROM wallet_credit_lots AS lot
+      WHERE lot.org_id = organization.id
+    ), 0) AS settled_minor,
+    COALESCE((
+      SELECT SUM(entry.held_delta)
+      FROM ledger AS entry
+      WHERE entry.org_id = organization.id
+    ), 0) AS held_minor,
+    COALESCE((
+      SELECT SUM(allocation.amount_minor)
+      FROM wallet_credit_allocations AS allocation
+      WHERE allocation.org_id = organization.id
+        AND allocation.debit_type = 'hold'
+    ), 0) AS allocated_held_minor
+  FROM orgs AS organization
+  WHERE organization.id = ?
+)`;
+
+const WALLET_ELIGIBILITY = `settled_minor >= 0
+  AND held_minor >= 0
+  AND allocated_held_minor = held_minor
+  AND settled_minor - held_minor >= ?`;
+
+function issuanceTime(now: Date): IssuanceTime {
+  const issuedAtEpochSeconds = Math.floor(now.getTime() / 1_000);
+  if (!Number.isSafeInteger(issuedAtEpochSeconds) || issuedAtEpochSeconds < 0) {
+    throw new SponsorshipAuthorityError("authority_denied");
+  }
+  return {
+    now,
+    issuedAtEpochSeconds,
+    expiresAtEpochSeconds: issuedAtEpochSeconds + CREDENTIAL_TTL_SECONDS,
+    createdAt: new Date(issuedAtEpochSeconds * 1_000).toISOString(),
+  };
+}
+
+function exactManagedSpaceAdmission(
+  value: SponsorshipManagedSpaceAdmission,
+): SponsorshipManagedSpaceAdmission {
+  if (
+    !record(value) ||
+    typeof value.policyDigest !== "string" ||
+    !SHA256.test(value.policyDigest) ||
+    typeof value.ensureTenantSpaceAdmission !== "function"
+  ) {
+    throw new TypeError("managed Space admission authority is invalid");
+  }
+  return value;
+}
+
+function assertManagedScope(input: CredentialInput): void {
+  if (
+    input.tenantRef !== input.spaceRef ||
+    [...input.spaceRef].length < 3 ||
+    !isSpaceId(input.spaceRef)
+  ) {
+    invalidInput();
+  }
+}
+
+function assertManagedReady(
+  value: unknown,
+  organizationId: string,
+  tenantRef: string,
+  policyDigest: string,
+): void {
+  if (!record(value)) throw new SponsorshipAuthorityError("authority_denied");
+  const keys = Object.keys(value).sort();
+  if (
+    JSON.stringify(keys) !==
+    JSON.stringify(["organizationId", "policyDigest", "ready", "spaceRef", "tenantRef"])
+  ) {
+    throw new SponsorshipAuthorityError("authority_denied");
+  }
+  if (
+    value.organizationId !== organizationId ||
+    value.tenantRef !== tenantRef ||
+    value.spaceRef !== tenantRef ||
+    value.policyDigest !== policyDigest ||
+    value.ready !== true
+  ) {
+    throw new SponsorshipAuthorityError("authority_denied");
+  }
+}
+
+function assertOperationMatches(input: {
+  readonly operation: SponsorshipCredentialIssuanceOperation;
+  readonly input: CredentialInput;
+  readonly inputSha256: string;
+  readonly requestNonceSha256: string;
+  readonly organizationId: string;
+  readonly issuanceAuthority: {
+    readonly versionId: string;
+    readonly sourceCommit: string;
+    readonly artifactSha256: string;
+    readonly credentialKeyId: string;
+    readonly receiptKeyId: string;
+  };
+  readonly tokenId: string;
+}): void {
+  const {
+    operation,
+    input: credential,
+    inputSha256,
+    requestNonceSha256,
+    organizationId,
+    issuanceAuthority,
+    tokenId,
+  } = input;
+  if (
+    operation.inputSha256 !== inputSha256 ||
+    operation.requestSha256 !== credential.channel.requestSha256 ||
+    operation.requestNonceSha256 !== requestNonceSha256 ||
+    operation.tenantRef !== credential.tenantRef ||
+    operation.organizationId !== organizationId ||
+    operation.hostedVersionId !== credential.channel.hostedVersionId ||
+    operation.tokenId !== tokenId ||
+    operation.credentialKeyId !== issuanceAuthority.credentialKeyId ||
+    operation.receiptKeyId !== issuanceAuthority.receiptKeyId ||
+    operation.authorityVersionId !== issuanceAuthority.versionId ||
+    operation.authoritySourceCommit !== issuanceAuthority.sourceCommit ||
+    operation.authorityArtifactSha256 !== issuanceAuthority.artifactSha256 ||
+    operation.expiresAtEpochSeconds - operation.issuedAtEpochSeconds !== CREDENTIAL_TTL_SECONDS
+  ) {
+    throw new SponsorshipAuthorityError("operation_conflict");
+  }
+}
+
+async function claimManagedTenant(input: {
+  readonly sql: Sql;
+  readonly organizationId: string;
+  readonly tenantRef: string;
+  readonly requiredAvailableMinor: number;
+  readonly time: IssuanceTime;
+}): Promise<SqlWrite> {
+  return input.sql.run(
+    `${WALLET_CTE}
+     INSERT INTO sponsorship_tenants (tenant_ref, org_id, created_at)
+     SELECT ?, org_id, ?
+     FROM wallet
+     WHERE ${WALLET_ELIGIBILITY}
+       AND (
+         NOT EXISTS (
+           SELECT 1 FROM sponsorship_tenants WHERE tenant_ref = ?
+         ) OR EXISTS (
+           SELECT 1 FROM sponsorship_tenants
+           WHERE tenant_ref = ? AND org_id = wallet.org_id
+         )
+       )
+     ON CONFLICT(tenant_ref) DO UPDATE SET org_id = excluded.org_id
+       WHERE sponsorship_tenants.org_id = excluded.org_id`,
+    [
+      input.time.now.toISOString(),
+      input.organizationId,
+      input.tenantRef,
+      input.time.createdAt,
+      input.requiredAvailableMinor,
+      input.tenantRef,
+      input.tenantRef,
+    ],
+  );
+}
+
+async function insertIssuanceOperation(input: {
+  readonly sql: Sql;
+  readonly organizationId: string;
+  readonly input: CredentialInput;
+  readonly inputSha256: string;
+  readonly requestNonceSha256: string;
+  readonly tokenId: string;
+  readonly issuanceAuthority: {
+    readonly versionId: string;
+    readonly sourceCommit: string;
+    readonly artifactSha256: string;
+    readonly credentialKeyId: string;
+    readonly receiptKeyId: string;
+  };
+  readonly time: IssuanceTime;
+  readonly managed: boolean;
+}): Promise<SqlWrite> {
+  const tenantGuard = input.managed
+    ? `EXISTS (
+         SELECT 1 FROM sponsorship_tenants
+         WHERE tenant_ref = ? AND org_id = wallet.org_id
+       )`
+    : `(
+         NOT EXISTS (
+           SELECT 1 FROM sponsorship_tenants WHERE tenant_ref = ?
+         ) OR EXISTS (
+           SELECT 1 FROM sponsorship_tenants
+           WHERE tenant_ref = ? AND org_id = wallet.org_id
+         )
+       )`;
+  const tenantParams = input.managed
+    ? [input.input.tenantRef]
+    : [input.input.tenantRef, input.input.tenantRef];
+  return input.sql.run(
+    `${WALLET_CTE}
+     INSERT INTO sponsorship_credential_issuance_operations
+       (issuance_operation_id, input_sha256, request_sha256,
+        request_nonce_sha256, tenant_ref, org_id, hosted_version_id,
+        issued_at_epoch_seconds, expires_at_epoch_seconds, token_id,
+        credential_key_id, receipt_key_id, authority_version_id,
+        authority_source_commit, authority_artifact_sha256, created_at)
+     SELECT ?, ?, ?, ?, ?, org_id, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     FROM wallet
+     WHERE ${WALLET_ELIGIBILITY}
+       AND ${tenantGuard}
+     ON CONFLICT DO NOTHING`,
+    [
+      input.time.now.toISOString(),
+      input.organizationId,
+      input.input.channel.issuanceOperationId,
+      input.inputSha256,
+      input.input.channel.requestSha256,
+      input.requestNonceSha256,
+      input.input.tenantRef,
+      input.input.channel.hostedVersionId,
+      input.time.issuedAtEpochSeconds,
+      input.time.expiresAtEpochSeconds,
+      input.tokenId,
+      input.issuanceAuthority.credentialKeyId,
+      input.issuanceAuthority.receiptKeyId,
+      input.issuanceAuthority.versionId,
+      input.issuanceAuthority.sourceCommit,
+      input.issuanceAuthority.artifactSha256,
+      input.time.createdAt,
+      input.input.requiredAvailableMinor,
+      ...tenantParams,
+    ],
+  );
 }
 
 function credentialInput(value: unknown): CredentialInput {

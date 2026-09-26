@@ -61,7 +61,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|error-envelope|route-table|public-host-identity|form-ref|interface-ref|standard-service-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|cron|error-envelope|route-table|public-host-identity|form-ref|interface-ref|standard-service-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.

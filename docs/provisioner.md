@@ -19,6 +19,13 @@ Most providers will not need this. One that reaches its backend by calling an
 HTTP API with a credential fits a Worker exactly, and adding it means adding a
 module rather than a machine.
 
+Local database upgrades use recorded, forward-only transactions. Migration
+0058 expands a private receipt kind while preserving existing receipts,
+version material and sealed values. Keep the usual database backup and allow
+space for the transaction's temporary copies; an older build refuses a database
+with this newer lineage. This local upgrade is not qualification for a
+protected Cloudflare D1 upgrade; see the [0058 deploy boundary](deploy.md#0058-domain-receipt-schema-protected-wave-unavailable).
+
 ## Ordinary stable mode
 
 The normal `bun src/entry-bun.ts` process uses the stable self-host Provider3
@@ -233,6 +240,211 @@ current invocation, never an older operation's uncertain side effects.
 The [Workflow implementation note](workflow-runtime.md) separates the internal
 instance store from the execution and binding work still required for support.
 
+A create convergence result may carry the separate, identity-bound
+whole-operation no-effect proof, but only after the provider durably fences the
+exact operation against late initial effects. The Cloudflare service-binding
+transport carries this existing path as `executorApplyAbort` (`action:
+convergeApply`), bound to the operation, installation, tenant, resource UID,
+fingerprint, and current execution lease. The proxy snapshots that context
+before awaiting RPC, validates the closed envelope, and restores a non-wire
+proof. Initial calls, read-only recovery, polling, updates, and mixed
+adoption/apply evidence cannot use this proof.
+
+An accepted create with a dispatched, indeterminate saga, no receipt, no
+provider handle, no incumbent, and an immutable accepted provider selection may
+instead enter the dedicated `concludeApplyNoEffect` capability before current
+relation and readiness projections are revalidated. Its closed input contains
+only the exact operation, installation, Offering, resource identity, and
+current execution authority; it does not send desired spec, relations, runtime
+inputs, service material, or migration state. Cloudflare carries the result as
+`executorApplyNoEffect`. Only its exact lease-bound whole-operation proof may
+fail the original operation. An exact `unsupported` envelope means the
+provider did not enter the conclusion attempt and permits the existing
+convergence path; a throw, malformed response, ordinary ticket, or uncertain
+attempt remains held. A selected provider that does not implement the optional
+capability is likewise unsupported before invocation, while a missing selected
+provider remains indeterminate.
+
+The Host never asks for that conclusion when a separately prepared SQLite
+migration or declared standard-service slot could have produced an effect. A
+provider-only proof does not cover service material issued before the provider
+was called. An accepted runtime Binding route and a `WorkerEndpoint` also use
+the ordinary convergence path: extension callbacks or Host-owned endpoint
+reservation/assignment work may have preceded the provider invocation, so a
+provider-only conclusion cannot prove the whole attempt idle. A conclusive
+result atomically fails the deferred operation and retires only its saga,
+effect, dependency and holder claims, and uncommitted incarnation; it is not a
+successful create. Priced and zero-price conclusions use the same atomic
+lifecycle batch, with any priced hold released in that batch. This internal
+recovery contract changes no Form, public API, or database schema.
+
+Accepted, unresolved applies are future-portable only when admission stored the
+closed accepted-authority summary introduced by migration 0061. A resume still
+requires a fresh current mutation grant for the same FormRef, package digest,
+and create/update lifecycle; the implementation digest may rotate. The saved
+accepted head remains the saga, review, and receipt identity, while the fresh
+current fence is checked immediately before provider work and again at the
+final commit. Deactivation, package drift, selection drift, or a changed Form
+keeps the operation held before provider effects. Explicit `unfenced` summaries
+used by no-authority fixtures never gain a mutation fence. Pre-0061 NULL rows
+remain on their exact-head-only behavior and are never inferred or backfilled;
+the whole-operation proof above does not bypass those checks.
+
+### Accepted apply placement
+
+The Host retains the initial apply selection on its mutation saga before
+effectful preparation or provider dispatch. The driver's side-effect-free
+selection step identifies the provider pack and installation, exact technical
+Offering, applicable sale and price terms, and participating relation
+Deployments and Bindings. This includes the target of a SQLite migration,
+whose database effects run before the ordinary Resource apply. Credentials and
+materialized runtime values do not belong to this snapshot.
+
+Acceptance is fenced by the current execution lease and operation identity.
+Once accepted, the selection cannot be replaced. Recovery uses that record;
+current configuration may verify equality and availability but cannot supply a
+different destination. An unavailable or changed selection stops before
+effectful extension callbacks or native effects. A persistence
+error does not authorize continuing without confirmed durable acceptance.
+Uncertainty retains the selection alongside the existing operation, claims and
+any priced hold; recording a destination is not proof that its effect happened.
+Accepting the selection atomically gives the saga and its matching committing
+deferred apply the non-expiring repair horizon, before preparation callbacks.
+Ordinary plan expiry is not evidence that a callback never acted. This extends
+neither execution lease and does not authorize a stale executor or a different
+selection. A database failure rolls back both updates; a lost response requires
+durable readback and never authorizes assuming that acceptance failed.
+
+Pure validation, read-only SQLite preparation, and any provision-claim
+satisfiability check run before the durable dispatch marker. The internal
+`beforeCreate` authority callback also runs before that marker and must be
+retry-safe for the same exact request and claim token. A lost acknowledgement
+retains the bound selection and claims; the same caller may retry that claim,
+but recovery must not skip an unconfirmed claim by treating it as provider
+dispatch. Provision redemption remains synchronous and is not enrolled in the
+deferred-operation repair scheduler.
+
+Standard-service material is resolved only on the initial execution after the
+dispatch marker and before SQLite or provider effects. Recovery does not issue
+that material again. Once placement is bound, a preparation failure cannot
+abandon the saga or release its claims merely because provider dispatch has
+not started. Cleanup requires a successful guarded abandonment or proof that
+the whole attempt was idle; a provider-only refusal is insufficient when a
+standard-service slot could already have produced material.
+
+The internal schema additions do not backfill older attempts. Planned and
+dispatched effect records from those builds omit the destination, while a
+successful receipt can retain it. Today's catalog and a provider-specific
+intent record cannot replace missing Host-wide initial evidence. An unresolved
+historical apply without its saved provider selection remains unavailable for
+automatic continuation, even if the authority head is unchanged. An operation
+with that saved selection but without the accepted-authority summary retains
+only its exact-head path; it cannot continue across an authority-head change.
+Do not rewrite either missing record, relax the applicable authority checks,
+or settle an operation using a newly selected provider's absence proof.
+
+This placement fence prevents new ambiguity; migration 0061 adds only
+future accepted-authority provenance and a permanent guard against old apply
+inserts. It changes no public API or Form. The database upgrade is forward-only.
+The 0059 dispatch check alone cannot fence preparation callbacks in older
+binaries that run before dispatch; an older Worker is not a supported serving
+rollback.
+The runtime preparation/cleanup repair likewise applies only to invocations
+executing the repaired build. It adds no database fence against an older
+in-flight callback's deletion path. Publishing a new Version alone is not
+proof that those invocations have drained; a rollout that claims overlap
+safety needs owner-backed quiescence evidence, not elapsed time or a source
+label. Otherwise that historical overlap risk remains explicit.
+Previously accepted side effects remain subject to their existing recovery and
+whole-attempt-idle checks.
+
+A provider receipt that cannot satisfy the frozen Form output constraints is
+still evidence of a real mutation. The Host retains the executed saga and full
+receipt in a nonterminal repair operation; the same caller key cannot create a
+fresh operation or dispatch again. Changing Host configuration alone does not
+authorize discarding that receipt. An explicit adopt-or-compensate recovery
+would be needed to release it; that recovery is not yet implemented. Conversely,
+a proven whole-attempt-idle refusal atomically closes its effect as cancelled
+when retiring its saga, so a legitimate new attempt is not blocked by an orphan
+open effect. See [the ADR 0008 correction](adr/0008-a-settled-refusal-about-the-host-is-re-attempted.md#correction--2026-09-20-an-unpublishable-receipt-is-still-a-real-effect).
+
+### Accepted import placement
+
+Import retains a separate `takoserver.takoform-import-selection@v1` snapshot;
+it does not use apply's commercial selection or create a charge. Every snapshot
+pins the requested native identity. Provider-backed imports also pin the
+Provider Pack, installation, technical Offering, catalog-versus-inherited
+placement, incumbent Deployment (including its native-claim state), and exact
+relation projections. SQLite migration imports pin their database Deployment
+before reading or applying its migration ledger.
+
+Native ownership is installation-wide, not tenant-local. Selection refuses an
+object governed by another live Deployment; only the exact selected active
+incumbent is exempt, not another candidate for the same Resource. Binding also
+atomically checks existing ownership and reserves the installation/native pair
+with a unique saga index. Competing imports cannot both enter the provider.
+The reservation survives an executed-but-unpublished receipt and ends with the
+existing atomic Deployment publication and saga retirement.
+
+The Host resolves and verifies placement without provider effects, then binds
+the canonical snapshot under the current saga lease, marks dispatch, and only
+then projects service material or invokes the provider. A retry verifies the same snapshot under its
+new lease. Changed provider placement or relation state holds the same operation;
+it never authorizes a new provider's adoption, polling, or absence proof.
+
+Migration 0062 adds import-only columns to the current-generation saga table.
+Existing values remain NULL. An undispatched attempt may bind once under its
+initial lease; a previously dispatched import without that evidence stays held.
+The private executor checks that the retained import snapshot was verified by
+its exact current lease before adoption or adoption polling. The RPC and
+published API/Form contracts are unchanged.
+
+Binding atomically retains the saga and its matching committing deferred import
+without extending either execution lease. A failed or lost bind acknowledgement
+does not authorize deleting the accepted snapshot, planned effect, or resource
+incarnation. Undispatched imports with bound placement participate in the same
+repair scheduler. Only an exact guarded abandonment of an unbound plan, or
+existing whole-attempt-idle proof, permits cleanup. This does not add explicit
+adopt-or-compensate repair for historical uncertainty.
+
+A provider-only refusal cannot prove an import with declared standard-service
+slots idle: the service resolver may already have issued material. This remains
+true after restart; recovery does not reissue that material or erase its uncertain
+effect based on an adoption refusal alone.
+
+These are implementation requirements, not evidence of a live rollout. Existing
+deployments need the owning schema transition before upgrading the private
+executor and Host; a new local migration file does not qualify a live database.
+
+### Internal operation generations
+
+0060 separates current saga and deferred-operation storage from the physical
+tables older binaries use. Both halves belong to one internal generation;
+apply, import and delete are explicit operation kinds. Current apply dispatch
+requires its immutable selection to be verified by the active lease. Import
+and delete cannot carry an apply selection. These are private persistence
+identities, not a new Takoform API or Form version.
+
+Legacy rows are not copied, backfilled, or adopted by the current executor.
+Legacy insertion is frozen; an older invocation already associated with a
+retained row can finish, but its cleanup cannot delete an unresolved planned
+saga or nonterminal deferred request. Current acceptance must reject conflicting legacy operation, replay,
+Resource UID or target identities before reserving claims. It also checks open
+apply/import/delete effects and their retained incarnation address, even when
+an older TTL sweep already removed the control row. Only terminal evidence for
+that exact effect closes the conflict. Historical operation
+readback does not authorize execution or mutation of that legacy record.
+
+This quarantine preserves missing evidence rather than repairing it. Its
+removal requires a separate proven legacy retirement, not elapsed time or an
+empty current-generation table. The additive existing-data integration cutover
+requires exact 0058/0059 predecessor and retained-effect integrity through the
+[owning schema surface](deploy.md#00590060-additive-existing-data-integration-cutover).
+Neither local compatibility tests nor a fresh database demonstrate recovery
+of historical unresolved operations.
+
+### Runtime-specific support
+
 Vector has an explicit development-only self-host integration. It requires a
 matching VectorIndex Offering, the exact candidate Interface and Binding, and
 an injected `vectorIndexStore` for both provisioning and the data plane. The
@@ -444,15 +656,28 @@ asset stage also misses. A Version without assets goes straight to the Worker.
 
 Asset lookup starts from the runtime URL `pathname`, ignores query and fragment,
 strictly decodes percent escapes once, and strips exactly one leading slash.
-The decoded logical path is at most 240 characters, and each nonempty segment
-starts with an ASCII letter, digit, or underscore, as required by the frozen
-artifact manifest grammar. The root pathname remains the canonical empty miss.
-Encoded separators, repeated or empty segments, dot segments, backslashes,
-controls, Unicode noncharacters, malformed escapes, and invalid UTF-8 fail
-closed when asset lookup occurs and never enter SPA fallback. The declared
-asset-first or Worker-first ordering still decides when that lookup occurs. SPA
+The artifact manifest's filename grammar and 240-character limit constrain
+declared files, not application URLs. Each declared file segment starts with
+an ASCII letter, digit, or underscore; dot-prefixed files cannot enter an
+artifact manifest. Valid URL misses, including dot-prefixed paths, Unicode
+paths, trailing or repeated slashes, and paths
+longer than a manifest filename, follow the selected none/SPA fallback policy;
+they never become filesystem paths. The root pathname is an empty miss.
+Encoded separators, literal or encoded dot/dotdot segments still visible at
+the asset lookup boundary, backslashes, controls, Unicode noncharacters,
+malformed escapes, and invalid UTF-8 fail closed and never enter SPA fallback.
+HTTP ingress can already have canonicalized a dot segment; the asset layer
+does not recover a spelling that the runtime no longer exposes. The declared
+asset-first or Worker-first ordering still decides when lookup occurs. SPA
 publication is refused before materialization and before any sensitive-input
 lease when the manifest has no exact `index.html`.
+
+Previously accepted manifests with dot-prefixed filenames are outside the
+frozen artifact schema. Stored artifacts are not rewritten, but new consumption
+and materialization reject them. A retained self-host snapshot containing such
+paths is unavailable on inspection or restart; republish the affected Version
+with valid filenames before upgrading. This is not a backward-compatible
+reinterpretation of those manifests or an automatic data migration.
 
 The immutable Version materialization persists `runWorkerFirst`, every declared
 media type, and its flat physical-layout discriminator, and includes all of
@@ -714,10 +939,14 @@ so is an expression this Host cannot read — at apply, rather than by recording
 trigger that would never fire.
 
 When day-of-month and day-of-week are both *restricted* a day matches if either
-selects it; when only one is, only that one constrains the day. Restricted is
-decided from the field's first character, which is the historical rule: `*/2` in
-a day field restricts nothing, so `0 0 */2 * 1` is Mondays and `0 0 1 * */1` is
-the 1st of each month.
+selects it; when only one is, only that one constrains the day. The frozen Form
+does not define whether a day field beginning with `*/step` is restricted.
+This Host currently decides from the first character: `*/2` in a day field
+restricts nothing, so `0 0 */2 * 1` is Mondays, `0 0 1 * */1` is the 1st of each
+month, and `0 0 */2 * *` fires daily. These examples describe existing Host
+behavior, not an additional rule imposed on other hosts. The shared library
+preserves this behavior; resolving the contract ambiguity must not silently
+reinterpret the published definition or be claimed as completed interoperability.
 
 **A missed run is not made up.** A match is fired only while the minute it
 belongs to is still the current one; a machine that was down, or whose previous

@@ -13,6 +13,7 @@ import {
 } from "../scripts/deploy/worker-artifact.ts";
 import { YURUCOMMU_IDENTITY_CAPABILITY_KINDS } from "../src/takoform/implementation-catalog.ts";
 import { cloudflareProviderExecutorTarget } from "./helpers/hosted-supply-fixtures.ts";
+import { wranglerPathForTests } from "./helpers/wrangler-path.ts";
 
 const COMMIT = "a".repeat(40);
 const target = {
@@ -34,6 +35,7 @@ async function build(root: string) {
     root,
     target,
     commit: COMMIT,
+    wranglerPath: wranglerPathForTests(),
     run: runCommand,
   });
   const bytes = readFileSync(prepared.bundlePath);
@@ -46,6 +48,38 @@ async function build(root: string) {
 }
 
 describe("hermetic Worker bundle identity", () => {
+  test("adds the explicit no-container-rollout option only when requested", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-container-rollout-"));
+    try {
+      const commands: string[][] = [];
+      const prepare = async (directory: string, containersRollout?: "none") =>
+        await prepareWorkerArtifact({
+          root: join(root, directory),
+          target,
+          commit: COMMIT,
+          ...(containersRollout === undefined ? {} : { containersRollout }),
+          run: async (command) => {
+            commands.push([...command]);
+            const outdir = command[command.indexOf("--outdir") + 1];
+            if (!outdir) throw new Error("dry-run outdir missing");
+            mkdirSync(outdir, { recursive: true });
+            writeFileSync(join(outdir, "worker.js"), "export default {};\n");
+            return { exitCode: 0, stdout: "built\n", stderr: "" };
+          },
+        });
+
+      await prepare("default");
+      await prepare("reuse-image", "none");
+
+      expect(commands[0]).not.toContain("--containers-rollout");
+      expect(commands[1]).toContain("--containers-rollout");
+      const rolloutIndex = commands[1]?.indexOf("--containers-rollout") ?? -1;
+      expect(commands[1]?.[rolloutIndex + 1]).toBe("none");
+    } finally {
+      removeArtifactTree(root);
+    }
+  });
+
   test("seals a separate Form runtime payload before embedding its semantic digest", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-form-payload-"));
     const formTarget = {

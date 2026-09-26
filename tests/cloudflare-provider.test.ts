@@ -831,7 +831,7 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     });
     expect(ticket).toMatchObject({
       phase: "failed",
-      failure: { code: "conflict", retryable: false },
+      failure: { code: "occupied", retryable: false },
     });
     if (ticket.phase !== "failed") throw new Error("expected failure");
     expect(ticket.failure.message).toContain("empty it and destroy again");
@@ -871,6 +871,622 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
       failure: { code: "invalid_spec", retryable: false },
     });
     expect(calls).toEqual([]);
+  });
+});
+
+describe("managed ObjectBucket deletion vacancy gate", () => {
+  const MANAGED_IDENTITY = {
+    ...IDENTITY,
+    uid: "res_media_managed",
+    incarnationId: "dep_media_managed",
+    generation: "1",
+  } as const;
+  const MANAGED_NATIVE_ID = "r2:ts-managed-bucket";
+
+  function managedBackend(
+    overrides: Partial<CloudflareWorkerBackend> = {},
+  ): CloudflareWorkerBackend {
+    const unavailable = () => ({
+      phase: "failed" as const,
+      failure: { code: "unavailable" as const, message: "unused backend stub", retryable: true },
+    });
+    return {
+      kind: "workers-for-platforms",
+      deriveOrigin: async () => ({ canonicalPublicOrigin: "https://managed.example.test" }),
+      owns: () => false,
+      apply: async () => unavailable(),
+      recoverApply: async () => unavailable(),
+      convergeApply: async () => unavailable(),
+      observe: async () => unavailable(),
+      delete: async () => unavailable(),
+      recoverDelete: async () => unavailable(),
+      createNativeReadbackDescriptor: () => ({
+        apiVersion: "providers.takoserver.com/readback/v1",
+        provider: "cloudflare.test",
+        kind: "ObjectBucket",
+        nativeId: MANAGED_NATIVE_ID,
+        data: {},
+      }),
+      verifyNativeAbsence: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+      verifyArtifactConsumption: async () => ({
+        outcome: "absent" as const,
+        evidence: { state: "absent" },
+      }),
+      ...overrides,
+    };
+  }
+
+  function managedProvider(
+    backend: CloudflareWorkerBackend,
+    fetch: (request: Request) => Promise<Response>,
+  ): CloudflareProvider {
+    return new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [BUCKET],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      workerBackend: { kind: "workers-for-platforms", create: () => backend },
+      fetch,
+    });
+  }
+
+  test("refuses an occupied bucket before prepare or native delete", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async (input) => {
+        events.push("vacancy");
+        expect(input.identity).toEqual(MANAGED_IDENTITY);
+        return { ok: true, value: { empty: false } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("occupied vacancy gate must not call Cloudflare");
+    });
+    const operationId = "op-managed-bucket-occupied";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "occupied",
+        retryable: false,
+        message:
+          "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual(["vacancy"]);
+  });
+
+  test("projects a vacancy authority failure as a no-mutation refusal", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return {
+          ok: false,
+          failure: {
+            code: "unavailable" as const,
+            message: "the managed ObjectBucket vacancy authority is unavailable",
+            retryable: true,
+          },
+        };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("vacancy failure must not call Cloudflare");
+    });
+    const operationId = "op-managed-bucket-vacancy-unavailable";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "unavailable",
+        message: "the managed ObjectBucket vacancy authority is unavailable",
+        retryable: false,
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual(["vacancy"]);
+  });
+
+  test("requires commit authority before an initial managed delete can mutate", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("missing commit authority must prevent native mutation");
+    });
+    const operationId = "op-managed-bucket-missing-commit";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: false },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(events).toEqual([]);
+  });
+
+  test("retains a prepare handle when R2 refuses an occupied bucket", async () => {
+    const events: string[] = [];
+    let present = true;
+    let deletes = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      if (request.method === "DELETE") {
+        deletes += 1;
+        return Response.json(
+          deletes === 1
+            ? { success: false, errors: [{ message: "bucket not empty" }] }
+            : { success: true, errors: [], result: {} },
+          { status: deletes === 1 ? 400 : 200 },
+        );
+      }
+      return present
+        ? Response.json({ success: true, errors: [], result: { name: "ts-managed-bucket" } })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-race";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET"]);
+
+    const commit = backend.commitManagedObjectBucketDestroy;
+    if (!commit) throw new Error("expected commit authority");
+    Reflect.deleteProperty(backend, "commitManagedObjectBucketDestroy");
+    const held = await provider.poll({ operationId, handle: refused.handle });
+    expect(held).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: false },
+    });
+    if (held.phase !== "failed") throw new Error("expected retained handle failure");
+    expect(held.handle).toBe(refused.handle);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET"]);
+    backend.commitManagedObjectBucketDestroy = commit;
+
+    present = false;
+    const finished = await provider.poll({ operationId, handle: refused.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual([
+      "vacancy",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
+  });
+
+  test("retains a prepare handle for a definitive native refusal", async () => {
+    const events: string[] = [];
+    let refused = true;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      if (request.method === "DELETE" && refused) {
+        return Response.json(
+          { success: false, errors: [{ message: "forbidden" }] },
+          { status: 403 },
+        );
+      }
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-definitive-refusal";
+    const ticket = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    if (ticket.phase !== "failed" || !ticket.handle) throw new Error("expected retained handle");
+    expect(ticket.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE"]);
+
+    refused = false;
+    const finished = await provider.poll({ operationId, handle: ticket.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual([
+      "vacancy",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
+  });
+
+  test("retains a commit handle for a nonretryable authority refusal", async () => {
+    const events: string[] = [];
+    let commits = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        commits += 1;
+        return commits === 1
+          ? {
+              ok: false,
+              failure: {
+                code: "denied" as const,
+                message: "the managed ObjectBucket commit was refused",
+                retryable: false,
+              },
+            }
+          : { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const operationId = "op-managed-bucket-commit-refusal";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "denied",
+        message: "the managed ObjectBucket commit was refused",
+        retryable: false,
+      },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(refused.handle.startsWith("tsobjd1.")).toBe(true);
+    expect(providerFailureProvesNoMutation(refused, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET", "commit"]);
+
+    const finished = await provider.poll({ operationId, handle: refused.handle });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "DELETE", "GET", "commit", "commit"]);
+  });
+
+  test("rechecks vacancy before replaying an occupied prepare handle", async () => {
+    const events: string[] = [];
+    let vacancyReads = 0;
+    const backend = managedBackend({
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        vacancyReads += 1;
+        return { ok: true, value: { empty: vacancyReads === 1 } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("occupied vacancy must prevent every native delete");
+    });
+    const operationId = "op-managed-bucket-replayed-occupied";
+    const refused = await provider.delete({
+      operationId,
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(refused).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (refused.phase !== "failed" || !refused.handle) throw new Error("expected retained handle");
+    expect(providerFailureProvesNoMutation(refused, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy"]);
+
+    const held = await provider.poll({ operationId, handle: refused.handle });
+    expect(held).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (held.phase !== "failed") throw new Error("expected retained occupied handle");
+    expect(held.handle).toBe(refused.handle);
+    expect(providerFailureProvesNoMutation(held, operationId)).toBe(false);
+    expect(events).toEqual(["vacancy", "prepare", "vacancy", "prepare", "vacancy"]);
+  });
+
+  test("does not recover a no-handle delete from an active receipt", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "active" as const,
+            receiptCount: 0,
+            operatorReconciliationRequired: 0,
+            repairRequired: false,
+            nextActionAt: null,
+          },
+        };
+      },
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty: true } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        throw new Error("active receipt must not prepare");
+      },
+      commitManagedObjectBucketDestroy: async () => ({ ok: true, value: { destroyed: true } }),
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("active receipt must not call Cloudflare");
+    });
+    const recovered = await provider.recoverDelete({
+      operationId: "op-managed-bucket-active-recovery",
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(events).toEqual(["status"]);
+  });
+
+  test("does not recover a destroying delete when commit authority is incomplete", async () => {
+    const events: string[] = [];
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "destroying" as const,
+            receiptCount: 0,
+            operatorReconciliationRequired: 0,
+            repairRequired: true,
+            nextActionAt: null,
+          },
+        };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        throw new Error("missing commit authority must prevent prepare");
+      },
+    });
+    const provider = managedProvider(backend, async () => {
+      events.push("native");
+      throw new Error("missing commit authority must prevent native mutation");
+    });
+    const operationId = "op-managed-bucket-missing-commit-recovery";
+    const recovered = await provider.recoverDelete({
+      operationId,
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(recovered, operationId)).toBe(false);
+    expect(events).toEqual([]);
+  });
+
+  test("does not replay a destroying recovery while the bucket is occupied", async () => {
+    const events: string[] = [];
+    let empty = false;
+    const backend = managedBackend({
+      managedObjectBucketReceiptStatus: async () => {
+        events.push("status");
+        return {
+          ok: true,
+          value: {
+            lifecycle: "destroying" as const,
+            receiptCount: 2,
+            operatorReconciliationRequired: 1,
+            repairRequired: true,
+            nextActionAt: null,
+          },
+        };
+      },
+      managedObjectBucketVacancy: async () => {
+        events.push("vacancy");
+        return { ok: true, value: { empty } };
+      },
+      prepareManagedObjectBucketDestroy: async () => {
+        events.push("prepare");
+        return {
+          ok: true,
+          value: { state: "prepared" as const, authorityProof: "A".repeat(43) },
+        };
+      },
+      commitManagedObjectBucketDestroy: async () => {
+        events.push("commit");
+        return { ok: true, value: { destroyed: true } };
+      },
+    });
+    const provider = managedProvider(backend, async (request) => {
+      events.push(request.method);
+      return request.method === "DELETE"
+        ? Response.json({ success: true, errors: [], result: {} })
+        : Response.json({ success: false, errors: [] }, { status: 404 });
+    });
+    const recovered = await provider.recoverDelete({
+      operationId: "op-managed-bucket-destroying-recovery",
+      operationMode: "recovery",
+      offering: BUCKET,
+      nativeId: MANAGED_NATIVE_ID,
+      identity: MANAGED_IDENTITY,
+    });
+    expect(recovered).toMatchObject({
+      phase: "failed",
+      failure: { code: "occupied", retryable: false },
+    });
+    if (recovered.phase !== "failed" || !recovered.handle) {
+      throw new Error("expected retained occupied recovery handle");
+    }
+    expect(
+      providerFailureProvesNoMutation(recovered, "op-managed-bucket-destroying-recovery"),
+    ).toBe(false);
+    expect(events).toEqual(["status", "prepare", "vacancy"]);
+
+    empty = true;
+    const finished = await provider.poll({
+      operationId: "op-managed-bucket-destroying-recovery",
+      handle: recovered.handle,
+    });
+    expect(finished).toMatchObject({
+      phase: "succeeded",
+      result: { nativeId: MANAGED_NATIVE_ID, disposition: "deleted" },
+    });
+    expect(events).toEqual([
+      "status",
+      "prepare",
+      "vacancy",
+      "prepare",
+      "vacancy",
+      "DELETE",
+      "GET",
+      "commit",
+    ]);
   });
 });
 
@@ -1157,6 +1773,276 @@ describe("released edge Form placement", () => {
     });
     return { provider, calls };
   }
+
+  function queueDeleteProvider(
+    response: { readonly status: number; readonly body: unknown } | "transport",
+    offering = technical("AtLeastOnceQueue"),
+    backend?: CloudflareWorkerBackend,
+  ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
+    const calls: Call[] = [];
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [offering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      ...(backend
+        ? { workerBackend: { kind: "workers-for-platforms" as const, create: () => backend } }
+        : {}),
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        if (response === "transport") throw new TypeError("connection reset");
+        return new Response(JSON.stringify(response.body), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  function queueDeleteInput(
+    offering: ProviderOffering,
+    operationId: string,
+    nativeId = "queue:queue-id",
+  ) {
+    return {
+      operationId,
+      operationMode: "initial" as const,
+      offering,
+      nativeId,
+      identity: { ...IDENTITY, name: "jobs" },
+    };
+  }
+
+  test("settles an exact Queue binding refusal as an operation-bound no-effect delete", async () => {
+    const operationId = "op-queue-delete-referenced";
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider({
+      status: 400,
+      body: {
+        success: false,
+        errors: [
+          {
+            code: 11_005,
+            message: "Cannot delete queue still referenced by binding in a Worker",
+          },
+        ],
+      },
+    });
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "occupied",
+        message:
+          "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
+        retryable: false,
+      },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(true);
+    expect(providerFailureProvesNoMutation(ticket, "another-operation")).toBe(false);
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("never proves no mutation when managed Queue preparation throws after an effect", async () => {
+    const operationId = "op-queue-retirement-preparation-lost-ack";
+    let markerPersisted = false;
+    const backend = {
+      ...managedBackendThatDoesNotOwnQueues(),
+      async prepareManagedQueueDestroy() {
+        markerPersisted = true;
+        throw new TypeError("retirement acknowledgement lost");
+      },
+    } satisfies CloudflareWorkerBackend;
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      { status: 204, body: { success: true, errors: [], result: null } },
+      offering,
+      backend,
+    );
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(markerPersisted).toBe(true);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("fails closed when managed Queue convergence has no retirement capability", async () => {
+    const operationId = "op-queue-retirement-missing-capability";
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      { status: 204, body: { success: true, errors: [], result: null } },
+      offering,
+      managedBackendThatDoesNotOwnQueues(),
+    );
+    const ticket = await provider.convergeDelete({
+      ...queueDeleteInput(offering, operationId),
+      operationMode: "recovery",
+      identity: {
+        ...IDENTITY,
+        name: "jobs",
+        uid: "resource-missing-retirement-capability",
+        incarnationId: "deployment-missing-retirement-capability",
+        generation: "1",
+      },
+      executionAuthority: {
+        tenantId: IDENTITY.tenantRef,
+        resourceUid: "resource-missing-retirement-capability",
+        leaseToken: "lease-missing-retirement-capability",
+        fingerprint: "missing-retirement-capability",
+      },
+    });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("keeps exact Queue 11005 indeterminate after retirement effects started", async () => {
+    const operationId = "op-queue-retirement-referenced-after-effects";
+    const backend = {
+      ...managedBackendThatDoesNotOwnQueues(),
+      async prepareManagedQueueDestroy() {
+        return { state: "ready" as const, effectsStarted: true };
+      },
+    } satisfies CloudflareWorkerBackend;
+    const offering = technical("AtLeastOnceQueue");
+    const { provider, calls } = queueDeleteProvider(
+      {
+        status: 400,
+        body: {
+          success: false,
+          errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+        },
+      },
+      offering,
+      backend,
+    );
+    const ticket = await provider.delete(queueDeleteInput(offering, operationId));
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(providerFailureProvesNoMutation(ticket, operationId)).toBe(false);
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("does not prove no mutation for non-exact Queue delete refusals", async () => {
+    const cases: readonly {
+      readonly label: string;
+      readonly response: Parameters<typeof queueDeleteProvider>[0];
+      readonly offering?: ProviderOffering;
+      readonly nativeId?: string;
+    }[] = [
+      {
+        label: "ordinary 400",
+        response: { status: 400, body: { success: false, errors: [{ message: "bad request" }] } },
+      },
+      {
+        label: "wrong status",
+        response: {
+          status: 422,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "other code",
+        response: {
+          status: 400,
+          body: { success: false, errors: [{ code: 11_006, message: "other" }] },
+        },
+      },
+      { label: "transport loss", response: "transport" },
+      {
+        label: "wrong native kind",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+        nativeId: "r2:bucket-id",
+      },
+      {
+        label: "wrong offering kind",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+        offering: BUCKET,
+      },
+      {
+        label: "success contradiction",
+        response: {
+          status: 400,
+          body: {
+            success: true,
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "non-null result contradiction",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            result: { deleted: true },
+            errors: [{ code: 11_005, message: "Cannot delete queue still referenced by binding" }],
+          },
+        },
+      },
+      {
+        label: "malformed error entry",
+        response: { status: 400, body: { success: false, errors: [{ code: 11_005 }] } },
+      },
+      {
+        label: "malformed errors field",
+        response: {
+          status: 400,
+          body: {
+            success: false,
+            errors: { code: 11_005, message: "Cannot delete queue still referenced by binding" },
+          },
+        },
+      },
+    ];
+
+    for (const { label, response, offering = technical("AtLeastOnceQueue"), nativeId } of cases) {
+      const operationId = `op-queue-delete-${label.replaceAll(" ", "-")}`;
+      const { provider, calls } = queueDeleteProvider(response, offering);
+      const ticket = await provider.delete(queueDeleteInput(offering, operationId, nativeId));
+
+      expect(ticket, label).toMatchObject({ phase: "failed" });
+      expect(providerFailureProvesNoMutation(ticket, operationId), label).toBe(false);
+      expect(
+        calls.filter((call) => call.method === "DELETE"),
+        label,
+      ).toHaveLength(1);
+    }
+  });
 
   test("delegates readback identity to the backend that owns the selected Queue", () => {
     const offering = technical("AtLeastOnceQueue");

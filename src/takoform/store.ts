@@ -12,6 +12,18 @@ import {
   type ResourceExecutionEvidenceResponse,
 } from "../resource-execution-evidence.ts";
 import {
+  type AcceptedAuthoritySummary,
+  assertAcceptedAuthorityRecord,
+  encodeAcceptedAuthority,
+  parseAcceptedAuthority,
+  unfencedAcceptedAuthority,
+} from "./accepted-authority.ts";
+import {
+  encodeTakoformApplySelection,
+  parseTakoformApplySelection,
+  type TakoformApplySelection,
+} from "./apply-selection.ts";
+import {
   decodeResourceDependencySet,
   isResourceDependencyClaimKey,
   RESOURCE_DEPENDENCY_PRIVATE_HOLDER,
@@ -21,6 +33,11 @@ import {
   resourceDependencyTargetClaimRange,
 } from "./dependency-fence.ts";
 import type { TakoformAuthorityFence } from "./host-authority.ts";
+import {
+  encodeTakoformImportSelection,
+  parseTakoformImportSelection,
+  type TakoformImportSelection,
+} from "./import-selection.ts";
 import {
   OPERATION_TTL_MILLISECONDS,
   PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS,
@@ -35,6 +52,20 @@ import {
   type TakoformStoredResource,
   type TakoformV1Alpha3FormRef,
 } from "./types.ts";
+
+const PROVIDER_APPLY_COMPENSATION_TARGET = Object.freeze({
+  schema: "takoserver.provider-apply-compensation@v1",
+  disposition: "compensated",
+}) satisfies JsonObject;
+
+const OPERATION_PROTOCOL_GENERATION = 1;
+const PROVIDER_MUTATION_SAGA_TABLE = "tf_provider_mutation_sagas_selection_v1";
+const DEFERRED_OPERATION_TABLE = "tf_deferred_operations_selection_v1";
+const LEGACY_PROVIDER_MUTATION_SAGA_TABLE = "tf_provider_mutation_sagas";
+const LEGACY_DEFERRED_OPERATION_TABLE = "tf_deferred_operations";
+
+/** Internal classification used to retain a new command behind legacy evidence. */
+export const LEGACY_OPERATION_GENERATION_CONFLICT = "LEGACY_OPERATION_GENERATION_CONFLICT";
 
 /**
  * Durable Takoform state.
@@ -150,6 +181,8 @@ export interface DeferredOperationRecord {
     readonly name: string;
     readonly formRef: TakoformV1Alpha3FormRef;
   };
+  /** Closed authority accepted with a future deferred apply; absent only on legacy rows. */
+  readonly acceptedAuthority?: AcceptedAuthoritySummary;
   readonly acceptedUid?: string;
   readonly acceptedGeneration?: string;
   readonly acceptedRevision?: string;
@@ -197,6 +230,7 @@ export interface DeferredResourceCommit extends ResourceMutationCommit {
 
 export interface ProviderMutationSaga {
   readonly operationId: string;
+  readonly operationKind: "apply" | "import" | "delete";
   readonly replayKey: string;
   readonly tenantId: string;
   readonly fingerprint: string;
@@ -209,13 +243,28 @@ export interface ProviderMutationSaga {
   readonly receipt?: TakoformDriverReceipt;
 }
 
-/** One no-effect provider refusal committed with its exact priced hold. */
+interface OperationGenerationIdentity {
+  readonly operationId: string;
+  readonly replayKey: string;
+  readonly tenantId: string;
+  readonly resourceUid: string;
+  readonly target: ResourceAddress;
+}
+
+/** One definitive no-effect or compensated failure, with its exact optional priced hold. */
 export interface DefinitiveProviderMutationFailureCommit {
+  /** Set only after a dedicated recovery seam restores its exact proof. */
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect" | "compensateApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly claimOwnerId: string;
   readonly operation: "create" | "update";
-  readonly charge: LedgerHeldCharge;
+  readonly charge?: LedgerHeldCharge;
+  /** Immutable accepted authority retained only for compensated create settlement. */
+  readonly compensation?: {
+    readonly selection: TakoformApplySelection;
+    readonly dependencies: ResourceDependencySet;
+  };
   readonly hostOperation:
     | { readonly kind: "immediate"; readonly createdAt: string }
     | {
@@ -230,6 +279,10 @@ export type ProviderMutationExecution =
   | {
       readonly kind: "acquired";
       readonly mode: "initial" | "recovery";
+      /** Immutable selection retained before this apply first crossed dispatch. */
+      readonly applySelection?: TakoformApplySelection;
+      /** Import placement is distinct from apply's commercial selection. */
+      readonly importSelection?: TakoformImportSelection;
       /** Opaque provider handle from the last accepted dispatch, if any. */
       readonly providerHandle?: string;
       /** Whether the accepted dispatch is still running or indeterminate. */
@@ -434,6 +487,16 @@ export interface TakoformStore {
   acceptProviderMutationSaga(record: ProviderMutationSaga): Promise<ProviderMutationSaga>;
   /** Read-only proof that this exact command already crossed Host review. */
   establishedProviderMutationSaga(record: ProviderMutationSaga): Promise<boolean>;
+  /**
+   * Cheap routing predicate for the one recovery state eligible to ask for an
+   * apply no-effect conclusion. The authoritative selection and mutation
+   * state are still restored only after acquiring the current saga lease.
+   */
+  isProviderMutationApplyNoEffectCandidate(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+  }): Promise<boolean>;
   acquireProviderMutationExecution(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -441,6 +504,30 @@ export interface TakoformStore {
     readonly leaseToken: string;
     readonly leaseUntil: number;
   }): Promise<ProviderMutationExecution>;
+  /**
+   * Binds or re-verifies one immutable apply selection under the exact current
+   * saga lease. Initial retries may repeat the same value; recovery may never
+   * fill a historical NULL or replace an accepted value.
+   */
+  bindProviderMutationApplySelection(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly fingerprint: string;
+    readonly leaseToken: string;
+    readonly mode: "initial" | "recovery";
+    readonly selection: TakoformApplySelection;
+  }): Promise<TakoformApplySelection | null>;
+  /** Binds import placement before effects; dispatched historical NULL stays held. */
+  bindProviderMutationImportSelection(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly fingerprint: string;
+    readonly leaseToken: string;
+    readonly mode: "initial" | "recovery";
+    readonly selection: TakoformImportSelection;
+  }): Promise<TakoformImportSelection | null>;
   markProviderMutationDispatch(input: {
     readonly tenantId: string;
     readonly operationId: string;
@@ -460,16 +547,29 @@ export interface TakoformStore {
     readonly outcome: "running" | "indeterminate";
     readonly providerHandle?: string;
   }): Promise<boolean>;
-  /** Terminalizes a failure proven to have happened before provider dispatch. */
+  /** Retires a proven no-effect refusal; recovery requires a whole-operation fence. */
   settleProviderMutationPreconditionFailure(input: {
+    readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect";
     readonly tenantId: string;
     readonly operationId: string;
     readonly resourceUid: string;
     readonly leaseToken: string;
   }): Promise<boolean>;
   /**
-   * Atomically terminalizes a proven no-effect provider attempt and releases
-   * its exact wallet hold. A lost fence returns false with both still durable.
+   * Classifies an exact leased accepted dependency set. Missing or malformed
+   * authority is null; only an intact set with a monotonic target mismatch is
+   * changed.
+   */
+  providerMutationDependencyStatus(input: {
+    readonly tenantId: string;
+    readonly operationId: string;
+    readonly resourceUid: string;
+    readonly leaseToken: string;
+  }): Promise<"current" | "changed" | null>;
+  /**
+   * Atomically terminalizes either whole-operation no-effect or a tagged,
+   * retained compensation history, while releasing the exact wallet hold. A
+   * lost fence returns false with both lifecycle and hold still durable.
    */
   commitDefinitiveProviderMutationFailure(
     input: DefinitiveProviderMutationFailureCommit,
@@ -496,13 +596,13 @@ export interface TakoformStore {
     readonly replayKey: string;
     readonly resourceUid: string;
   }): Promise<boolean>;
-  settleDefinitiveProviderImportConflict(input: {
+  settleDefinitiveProviderImportFailure(input: {
     readonly tenantId: string;
     readonly operationId: string;
     readonly replayKey: string;
     readonly resourceUid: string;
     readonly leaseToken: string;
-    readonly outcome: "import_conflict";
+    readonly outcome: "import_conflict" | "adoption_aborted";
   }): Promise<boolean>;
   recordProviderMutationReceipt(input: {
     readonly tenantId: string;
@@ -525,7 +625,10 @@ export interface TakoformStore {
     readonly mutation: ResourceMutationCommit;
   }): Promise<void>;
 
-  acceptDeferredOperation(record: DeferredOperationRecord): Promise<DeferredOperationRecord>;
+  acceptDeferredOperation(
+    record: DeferredOperationRecord,
+    authorityFence?: TakoformAuthorityFence,
+  ): Promise<DeferredOperationRecord>;
   readDeferredOperation(
     tenantId: string,
     principalId: string,
@@ -552,23 +655,6 @@ export interface TakoformStore {
     readonly id: string;
     readonly terminalJson: string;
   }): Promise<"cancelled" | "settled" | "too_late" | "not_found">;
-  /**
-   * Ends a held provider repair whose receipt the Form can never carry.
-   *
-   * The ordinary hold is right where a native object exists and the exact Host
-   * command is the only thing that can reconcile it. This one cannot be
-   * reconciled by anything: the receipt is durable and the Form is frozen, so
-   * the command answers the same refusal for ever and owns the caller's replay
-   * key while it does. It is settled as a refusal about this Host — which
-   * ADR 0008 re-attempts — and the executed saga is dropped with it, because a
-   * fresh attempt on the same target would otherwise adopt it and re-project
-   * the same answer.
-   */
-  retireUnpublishableProviderMutation(input: {
-    readonly operation: DeferredOperationRecord;
-    readonly leaseToken: string;
-    readonly terminalJson: string;
-  }): Promise<boolean>;
   settleDeferredFailure(input: {
     readonly operation: DeferredOperationRecord;
     readonly leaseToken: string;
@@ -684,6 +770,101 @@ export interface TakoformStore {
   deleteReplay(key: string): Promise<void>;
 }
 
+function legacyOperationConflictFence(input: OperationGenerationIdentity): {
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+} {
+  // A pre-generation runtime could sweep its planned saga while provider
+  // preparation was still in flight. Its append-only effect and incarnation
+  // attestations outlive that control row, so unresolved retained effects are
+  // part of the same cutover fence. A terminal event closes only its exact
+  // (tenant, Resource UID, effect id) attempt.
+  return {
+    sql: `(
+      EXISTS (
+        SELECT 1 FROM ${LEGACY_PROVIDER_MUTATION_SAGA_TABLE} AS legacy_saga
+        WHERE legacy_saga.operation_id = ? OR legacy_saga.replay_key = ?
+          OR (legacy_saga.tenant_id = ? AND (
+            legacy_saga.resource_uid = ? OR (
+              legacy_saga.target_space = ? AND legacy_saga.target_api_version = ?
+              AND legacy_saga.target_kind = ? AND legacy_saga.target_name = ?
+            )
+          ))
+      ) OR EXISTS (
+        SELECT 1 FROM ${LEGACY_DEFERRED_OPERATION_TABLE} AS legacy_operation
+        WHERE legacy_operation.phase IN ('pending', 'committing') AND (
+          legacy_operation.id = ? OR legacy_operation.replay_key = ?
+          OR (legacy_operation.tenant_id = ? AND (
+            legacy_operation.resource_uid = ? OR (
+              legacy_operation.target_space = ? AND legacy_operation.target_api_version = ?
+              AND legacy_operation.target_kind = ? AND legacy_operation.target_name = ?
+            )
+          ))
+        )
+      ) OR EXISTS (
+        SELECT 1 FROM tf_resource_provider_effects AS retained_effect
+        WHERE retained_effect.tenant_id = ?
+          AND retained_effect.effect_kind IN ('apply', 'import', 'delete')
+          AND retained_effect.phase IN ('planned', 'dispatched')
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+            WHERE terminal_effect.tenant_id = retained_effect.tenant_id
+              AND terminal_effect.resource_uid = retained_effect.resource_uid
+              AND terminal_effect.effect_id = retained_effect.effect_id
+              AND terminal_effect.phase IN ('succeeded', 'cancelled')
+          )
+          AND (
+            retained_effect.effect_id = ? OR retained_effect.resource_uid = ?
+            OR EXISTS (
+              SELECT 1 FROM tf_resource_deletion_attestations AS retained_incarnation
+              WHERE retained_incarnation.tenant_id = retained_effect.tenant_id
+                AND retained_incarnation.resource_uid = retained_effect.resource_uid
+                AND retained_incarnation.space = ?
+                AND retained_incarnation.api_version = ?
+                AND retained_incarnation.kind = ?
+                AND retained_incarnation.name = ?
+            )
+          )
+      )
+    )`,
+    params: [
+      input.operationId,
+      input.replayKey,
+      input.tenantId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+      input.operationId,
+      input.replayKey,
+      input.tenantId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+      input.tenantId,
+      input.operationId,
+      input.resourceUid,
+      input.target.space,
+      input.target.apiVersion,
+      input.target.kind,
+      input.target.name,
+    ],
+  };
+}
+
+function legacyOperationConflictError(): TakoformHostError {
+  return new TakoformHostError(
+    "resource_busy",
+    409,
+    undefined,
+    undefined,
+    LEGACY_OPERATION_GENERATION_CONFLICT,
+  );
+}
+
 export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   const now = (): number => clock().getTime();
 
@@ -691,11 +872,29 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     column: "replay_key",
     value: string,
   ): Promise<DeferredOperationRecord | null> => {
-    const rows = await sql.query(
-      `SELECT * FROM tf_deferred_operations WHERE ${column} = ? AND expires_at > ?`,
+    const current = await sql.query(
+      `SELECT * FROM ${DEFERRED_OPERATION_TABLE}
+       WHERE ${column} = ? AND (phase IN ('pending', 'committing') OR expires_at > ?) LIMIT 2`,
       [value, now()],
     );
-    return rows[0] ? deferredOperation(rows[0]) : null;
+    if (current.length > 1) throw new Error("deferred_operation_ambiguous");
+    if (current[0]) return deferredOperation(current[0]);
+    const legacy = await sql.query(
+      `SELECT * FROM ${LEGACY_DEFERRED_OPERATION_TABLE} WHERE ${column} = ? LIMIT 2`,
+      [value],
+    );
+    if (legacy.length > 1) throw new Error("legacy_deferred_operation_ambiguous");
+    return legacy[0] ? deferredOperation(legacy[0]) : null;
+  };
+
+  const hasLegacyOperationConflict = async (
+    identity: OperationGenerationIdentity,
+  ): Promise<boolean> => {
+    const fence = legacyOperationConflictFence(identity);
+    const rows = await sql.query(`SELECT CASE WHEN ${fence.sql} THEN 1 ELSE 0 END AS conflict`, [
+      ...fence.params,
+    ]);
+    return Number(rows[0]?.conflict ?? 0) === 1;
   };
 
   /**
@@ -729,9 +928,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
     leaseToken: string,
   ): Promise<TakoformHostError> => {
     const liveOperation = await sql.query(
-      `SELECT phase, lease_token FROM tf_deferred_operations
-       WHERE id = ? AND tenant_id = ? AND principal_id = ? AND expires_at > ?`,
-      [operation.id, operation.tenantId, operation.principalId, now()],
+      `SELECT phase, lease_token FROM ${DEFERRED_OPERATION_TABLE}
+       WHERE id = ? AND tenant_id = ? AND principal_id = ?`,
+      [operation.id, operation.tenantId, operation.principalId],
     );
     if (
       liveOperation.length !== 1 ||
@@ -1609,22 +1808,21 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async acceptProviderMutationSaga(record) {
       const timestamp = now();
+      const legacyFence = legacyOperationConflictFence(record);
       await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas WHERE rowid IN (
-           SELECT rowid FROM tf_provider_mutation_sagas
-           WHERE phase = 'planned' AND expires_at <= ? ORDER BY expires_at LIMIT ?
-         )`,
-        [timestamp, SWEEP_ROW_LIMIT],
-      );
-      await sql.run(
-        `INSERT OR IGNORE INTO tf_provider_mutation_sagas
-           (operation_id, replay_key, tenant_id, fingerprint, resource_uid,
-            target_space, target_api_version, target_kind, target_name,
-            accepted_uid, accepted_generation, accepted_revision, phase,
-            receipt_json, authority_head_digest, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?)`,
+        `INSERT OR IGNORE INTO ${PROVIDER_MUTATION_SAGA_TABLE}
+           (operation_id, protocol_generation, operation_kind, replay_key,
+           tenant_id, fingerprint, resource_uid,
+           target_space, target_api_version, target_kind, target_name,
+           accepted_uid, accepted_generation, accepted_revision, phase,
+            receipt_json, authority_head_digest, import_selection_protocol,
+            created_at, updated_at, expires_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, ?, ?, ?, ?, ?
+         WHERE NOT ${legacyFence.sql}`,
         [
           record.operationId,
+          OPERATION_PROTOCOL_GENERATION,
+          record.operationKind,
           record.replayKey,
           record.tenantId,
           record.fingerprint,
@@ -1637,19 +1835,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.acceptedGeneration ?? null,
           record.acceptedRevision ?? null,
           record.authorityHeadDigest ?? null,
+          record.operationKind === "import" ? 1 : null,
           timestamp,
           timestamp,
-          timestamp + OPERATION_TTL_MILLISECONDS,
+          253_402_300_799_999,
+          ...legacyFence.params,
         ],
       );
       const rows = await sql.query(
-        `SELECT * FROM tf_provider_mutation_sagas
+        `SELECT * FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE (
              replay_key = ? OR
              (tenant_id = ? AND target_space = ? AND target_api_version = ?
                AND target_kind = ? AND target_name = ?)
-           )
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 3`,
+           ) LIMIT 3`,
         [
           record.replayKey,
           record.tenantId,
@@ -1657,7 +1856,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           record.target.apiVersion,
           record.target.kind,
           record.target.name,
-          timestamp,
         ],
       );
       const stored = rows[0] ? providerMutationSaga(rows[0]) : null;
@@ -1668,15 +1866,17 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ? sameProviderMutationSaga(record, stored)
           : sameProviderMutationTarget(record, stored))
       ) {
+        if (!stored && (await hasLegacyOperationConflict(record))) {
+          throw legacyOperationConflictError();
+        }
         throw new TakoformHostError("resource_busy", 409);
       }
       if (stored.replayKey === record.replayKey) return stored;
       const rotated = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET replay_key = ?, updated_at = ?
          WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
-           AND fingerprint = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?)`,
+           AND fingerprint = ? AND resource_uid = ?`,
         [
           record.replayKey,
           timestamp,
@@ -1685,7 +1885,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           stored.tenantId,
           stored.fingerprint,
           stored.resourceUid,
-          timestamp,
         ],
       );
       if (rotated.changes !== 1) throw new TakoformHostError("resource_busy", 409);
@@ -1694,10 +1893,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async establishedProviderMutationSaga(record) {
       const rows = await sql.query(
-        `SELECT * FROM tf_provider_mutation_sagas
-         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
-        [record.operationId, record.tenantId, record.resourceUid, now()],
+        `SELECT * FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ? LIMIT 2`,
+        [record.operationId, record.tenantId, record.resourceUid],
       );
       if (rows.length === 0) return false;
       if (rows.length !== 1) throw new TakoformHostError("resource_busy", 409);
@@ -1710,16 +1908,34 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return true;
     },
 
+    async isProviderMutationApplyNoEffectCandidate(input) {
+      const rows = await sql.query(
+        `SELECT 1 AS candidate
+         FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
+           AND operation_kind = 'apply'
+           AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_started_at IS NOT NULL
+           AND provider_handle IS NULL AND provider_outcome = 'indeterminate'
+           AND selection_json IS NOT NULL AND import_selection_json IS NULL
+         LIMIT 2`,
+        [input.operationId, input.tenantId, input.resourceUid],
+      );
+      if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
+      return rows.length === 1;
+    },
+
     async acquireProviderMutationExecution(input) {
       const timestamp = now();
       if (input.leaseUntil <= timestamp)
         throw new TypeError("provider lease must be in the future");
       const initial = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = ?, execution_lease_until = ?,
              updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND phase = 'planned' AND receipt_json IS NULL
            AND execution_started_at IS NULL
            AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
         [
@@ -1730,16 +1946,29 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.operationId,
           input.resourceUid,
           timestamp,
-          timestamp,
         ],
       );
-      if (initial.changes === 1) return { kind: "acquired", mode: "initial" };
+      if (initial.changes === 1) {
+        const stateRows = await sql.query(
+          `SELECT selection_json, import_selection_json
+           FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+           WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+             AND execution_lease_token = ? LIMIT 1`,
+          [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
+        );
+        return {
+          kind: "acquired",
+          mode: "initial",
+          ...providerMutationApplySelectionState(stateRows[0]),
+          ...providerMutationImportSelectionState(stateRows[0]),
+        };
+      }
 
       const recovery = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = ?, execution_lease_until = ?, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+           AND phase = 'planned' AND receipt_json IS NULL
            AND execution_started_at IS NOT NULL
            AND (execution_lease_token IS NULL OR execution_lease_until <= ?)`,
         [
@@ -1750,13 +1979,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.operationId,
           input.resourceUid,
           timestamp,
-          timestamp,
         ],
       );
       if (recovery.changes === 1) {
         const stateRows = await sql.query(
-          `SELECT provider_handle, provider_outcome
-           FROM tf_provider_mutation_sagas
+          `SELECT provider_handle, provider_outcome, selection_json, import_selection_json
+           FROM ${PROVIDER_MUTATION_SAGA_TABLE}
            WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
              AND execution_lease_token = ? LIMIT 1`,
           [input.tenantId, input.operationId, input.resourceUid, input.leaseToken],
@@ -1769,10 +1997,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
 
       const rows = await sql.query(
-        `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
-         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND (phase = 'executed' OR expires_at > ?) LIMIT 2`,
-        [input.tenantId, input.operationId, input.resourceUid, timestamp],
+        `SELECT phase, receipt_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid],
       );
       if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
       const row = rows[0];
@@ -1780,6 +2007,185 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         return { kind: "executed", receipt: providerReceipt(row.receipt_json) };
       }
       return { kind: "busy" };
+    },
+
+    async bindProviderMutationApplySelection(input) {
+      const timestamp = now();
+      const selectionJson = encodeTakoformApplySelection(input.selection);
+      // Preparation can already cross effectful extension boundaries after
+      // this acceptance. Keep its exact destination and deferred command as
+      // one repair unit even if the invocation never reaches dispatch.
+      const [bound] = await sql.batch([
+        {
+          sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
+         SET selection_json = COALESCE(selection_json, ?),
+             selection_verified_lease_token = ?, updated_at = ?, expires_at = 253402300799999
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND operation_kind = 'apply'
+           AND phase = 'planned' AND receipt_json IS NULL
+           AND execution_lease_token = ? AND execution_lease_until > ?
+           AND execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+           AND ${
+             input.mode === "initial"
+               ? "(selection_json IS NULL OR selection_json = ?)"
+               : "selection_json = ?"
+}`,
+          params: [
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            input.fingerprint,
+            input.leaseToken,
+            timestamp,
+            selectionJson,
+          ],
+        },
+        {
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND operation = 'apply' AND phase = 'committing'
+                  AND EXISTS (
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                    WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                      AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                      AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
+                      AND saga.fingerprint = ? AND saga.selection_json = ?
+                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                      AND saga.execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                      AND saga.execution_lease_token = ? AND saga.execution_lease_until > ?
+                      AND saga.selection_verified_lease_token = saga.execution_lease_token
+                  )`,
+          params: [
+            timestamp,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            input.fingerprint,
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+      ]);
+      if (bound?.changes !== 1) return null;
+      const rows = await sql.query(
+        `SELECT selection_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND execution_lease_token = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.fingerprint, input.leaseToken],
+      );
+      if (rows.length !== 1 || typeof rows[0]?.selection_json !== "string") return null;
+      return parseTakoformApplySelection(rows[0].selection_json);
+    },
+
+    async bindProviderMutationImportSelection(input) {
+      const timestamp = now();
+      const selectionJson = encodeTakoformImportSelection(input.selection);
+      // The read-only selector is not a reservation: different tenants can
+      // select the same native object concurrently. Fence existing owners and
+      // pending imports in this atomic write; 0062's unique index is the final
+      // cross-tenant guard through receipt publication.
+      const nativeFence =
+        input.selection.kind === "provider"
+          ? {
+              sql: `AND NOT EXISTS (
+                SELECT 1 FROM tf_resource_deployments AS deployment
+                WHERE deployment.provider_installation_ref = ? AND deployment.native_id = ?
+                  AND deployment.state IN ('provisioning', 'candidate', 'active', 'draining')
+                  AND NOT (deployment.tenant_id = ? AND deployment.resource_uid = ? AND deployment.id IS ?)
+              ) AND NOT EXISTS (
+                SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS contender
+                WHERE contender.operation_kind = 'import'
+                  AND json_extract(contender.import_selection_json, '$.kind') = 'provider'
+                  AND json_extract(contender.import_selection_json, '$.providerInstallationRef') = ?
+                  AND json_extract(contender.import_selection_json, '$.nativeId') = ?
+                  AND contender.operation_id <> ?
+              )`,
+              params: [
+                input.selection.providerInstallationRef,
+                input.selection.nativeId,
+                input.tenantId,
+                input.resourceUid,
+                input.selection.incumbent?.id ?? null,
+                input.selection.providerInstallationRef,
+                input.selection.nativeId,
+                input.operationId,
+              ],
+            }
+          : { sql: "", params: [] };
+      // Retain both halves atomically before any projection or provider effect.
+      // A lost acknowledgement must leave the same non-expiring repair unit.
+      const [bound] = await sql.batch([
+        {
+          sql: `UPDATE OR IGNORE ${PROVIDER_MUTATION_SAGA_TABLE}
+                SET import_selection_json = COALESCE(import_selection_json, ?),
+                    import_selection_verified_lease_token = ?, updated_at = ?,
+                    expires_at = 253402300799999
+                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+                  AND fingerprint = ? AND operation_kind = 'import'
+                  AND phase = 'planned' AND receipt_json IS NULL
+                  AND import_selection_protocol = 1
+                  AND execution_lease_token = ? AND execution_lease_until > ?
+                  AND execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                  AND ${input.mode === "initial" ? "(import_selection_json IS NULL OR import_selection_json = ?)" : "import_selection_json = ?"}
+                  ${nativeFence.sql}`,
+          params: [
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+            input.tenantId,
+            input.operationId,
+            input.resourceUid,
+            input.fingerprint,
+            input.leaseToken,
+            timestamp,
+            selectionJson,
+            ...nativeFence.params,
+          ],
+        },
+        {
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
+                SET expires_at = 253402300799999, updated_at = ?
+                WHERE id = ? AND tenant_id = ? AND resource_uid = ?
+                  AND operation = 'import' AND phase = 'committing'
+                  AND EXISTS (
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                    WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                      AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                      AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
+                      AND saga.fingerprint = ? AND saga.import_selection_json = ?
+                      AND saga.operation_kind = 'import'
+                      AND saga.import_selection_protocol = 1
+                      AND saga.phase = 'planned' AND saga.receipt_json IS NULL
+                      AND saga.execution_started_at IS ${input.mode === "initial" ? "NULL" : "NOT NULL"}
+                      AND saga.execution_lease_token = ? AND saga.execution_lease_until > ?
+                      AND saga.import_selection_verified_lease_token = saga.execution_lease_token
+                  )`,
+          params: [
+            timestamp,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            input.fingerprint,
+            selectionJson,
+            input.leaseToken,
+            timestamp,
+          ],
+        },
+      ]);
+      if (bound?.changes !== 1) return null;
+      const rows = await sql.query(
+        `SELECT import_selection_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+         WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND fingerprint = ? AND execution_lease_token = ? LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.fingerprint, input.leaseToken],
+      );
+      if (rows.length !== 1 || typeof rows[0]?.import_selection_json !== "string") return null;
+      return parseTakoformImportSelection(rows[0].import_selection_json);
     },
 
     async markProviderMutationDispatch(input) {
@@ -1808,9 +2214,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         {
           sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                 SELECT ?, CASE WHEN EXISTS (
-                  SELECT 1 FROM tf_provider_mutation_sagas
+                  SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                   WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND phase = 'planned' AND receipt_json IS NULL
                     AND execution_lease_token = ? AND execution_lease_until > ?
                     AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}
                 )${
@@ -1837,7 +2243,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             input.tenantId,
             input.operationId,
             input.resourceUid,
-            timestamp,
             input.leaseToken,
             timestamp,
             ...(dependencies
@@ -1905,7 +2310,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const sagaStatementIndex = statements.length;
       statements.push({
-        sql: `UPDATE tf_provider_mutation_sagas
+        sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
               SET execution_started_at = COALESCE(execution_started_at, ?),
                   provider_outcome = CASE
                     WHEN execution_started_at IS NULL THEN 'running'
@@ -1913,7 +2318,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   END,
                   updated_at = ?, expires_at = 253402300799999
               WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-                AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                AND phase = 'planned' AND receipt_json IS NULL
                 AND execution_lease_token = ? AND execution_lease_until > ?
                 AND execution_started_at IS ${mode === "initial" ? "NULL" : "NOT NULL"}`,
         params: [
@@ -1922,7 +2327,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.tenantId,
           input.operationId,
           input.resourceUid,
-          timestamp,
           input.leaseToken,
           timestamp,
         ],
@@ -1959,15 +2363,15 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         // A deferred Host command and its dispatched provider saga become one
         // non-expiring repair unit in this transactional batch. An immediate
         // mutation simply matches no Host row.
-        sql: `UPDATE tf_deferred_operations
+        sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
               SET expires_at = 253402300799999, updated_at = ?
               WHERE id = ? AND tenant_id = ? AND resource_uid = ?
                 AND phase = 'committing'
                 AND EXISTS (
-                  SELECT 1 FROM tf_provider_mutation_sagas AS saga
-                  WHERE saga.operation_id = tf_deferred_operations.id
-                    AND saga.tenant_id = tf_deferred_operations.tenant_id
-                    AND saga.resource_uid = tf_deferred_operations.resource_uid
+                  SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                  WHERE saga.operation_id = ${DEFERRED_OPERATION_TABLE}.id
+                    AND saga.tenant_id = ${DEFERRED_OPERATION_TABLE}.tenant_id
+                    AND saga.resource_uid = ${DEFERRED_OPERATION_TABLE}.resource_uid
                     AND saga.phase = 'planned' AND saga.receipt_json IS NULL
                     AND saga.execution_started_at IS NOT NULL
                     AND saga.execution_lease_token = ?
@@ -2017,7 +2421,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
       const timestamp = now();
       const recorded = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET provider_handle = ?, provider_outcome = ?, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
@@ -2037,28 +2441,247 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return recorded.changes === 1;
     },
 
-    async settleProviderMutationPreconditionFailure(input) {
-      const settled = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+    async providerMutationDependencyStatus(input) {
+      const timestamp = now();
+      const sagaRows = await sql.query(
+        `SELECT selection_json, target_space
+         FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
+           AND protocol_generation = 1 AND operation_kind = 'apply'
+           AND accepted_uid IS NULL AND accepted_generation IS NULL AND accepted_revision IS NULL
            AND phase = 'planned' AND receipt_json IS NULL
-           AND provider_handle IS NULL AND provider_outcome = 'running'
+           AND import_selection_json IS NULL AND selection_json IS NOT NULL
+           AND selection_verified_lease_token = execution_lease_token
+           AND provider_handle IS NULL AND provider_outcome = 'indeterminate'
            AND execution_started_at IS NOT NULL
-           AND execution_lease_token = ? AND execution_lease_until > ?`,
-        [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, now()],
+           AND execution_lease_token = ? AND execution_lease_until > ?
+         LIMIT 2`,
+        [input.tenantId, input.operationId, input.resourceUid, input.leaseToken, timestamp],
       );
-      return settled.changes === 1;
+      if (sagaRows.length !== 1 || !sagaRows[0]) return null;
+      let selection: TakoformApplySelection;
+      try {
+        selection = parseTakoformApplySelection(text(sagaRows[0].selection_json));
+      } catch {
+        return null;
+      }
+      if (selection.kind !== "provider" || selection.incumbent !== undefined) return null;
+
+      const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const claimRows = await sql.query(
+        `SELECT claim_key FROM tf_resource_claims
+         WHERE tenant_id = ? AND holder_uid = ? AND owner_operation_id = ?
+           AND holder_space = ? AND holder_api_version = ?
+           AND holder_kind = ? AND holder_name = ?
+           AND claim_key >= ? AND claim_key < ?
+           AND (state = 'committed' OR expires_at > ?)
+         ORDER BY claim_key`,
+        [
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+          dependencyStart,
+          dependencyEnd,
+          timestamp,
+        ],
+      );
+      let dependencies: ResourceDependencySet | null;
+      try {
+        dependencies = await decodeResourceDependencySet(
+          claimRows.map((row) => text(row.claim_key)),
+          input.tenantId,
+          input.resourceUid,
+          input.operationId,
+        );
+      } catch {
+        return null;
+      }
+      if (!dependencies) return null;
+      if (
+        !compensationSelectionMatchesDependencies(
+          selection,
+          dependencies,
+          text(sagaRows[0].target_space),
+        )
+      ) {
+        return null;
+      }
+      return (await resourceDependencyTargetsStillCurrent(sql, input.tenantId, dependencies))
+        ? "current"
+        : "changed";
+    },
+
+    async settleProviderMutationPreconditionFailure(input) {
+      if (
+        input.recoveryAction !== undefined &&
+        input.recoveryAction !== "convergeApply" &&
+        input.recoveryAction !== "concludeApplyNoEffect"
+      ) {
+        throw new TypeError("invalid provider refusal recovery action");
+      }
+      const timestamp = now();
+      const eventId = `${input.operationId}:cancelled`;
+      const guard = boundedGuard(`precondition_failure_${input.operationId}_${input.leaseToken}`);
+      const sagaFence = (alias: string): string => `${alias}.tenant_id = ?
+        AND ${alias}.operation_id = ? AND ${alias}.resource_uid = ?
+        AND ${alias}.phase = 'planned' AND ${alias}.receipt_json IS NULL
+        AND ${alias}.provider_handle IS NULL
+        AND ${alias}.provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
+        ${input.recoveryAction ? `AND ${alias}.accepted_uid IS NULL AND ${alias}.accepted_generation IS NULL AND ${alias}.accepted_revision IS NULL` : ""}
+        AND ${alias}.execution_started_at IS NOT NULL
+        AND ${alias}.execution_lease_token = ? AND ${alias}.execution_lease_until > ?`;
+      const sagaFenceParams = (): readonly SqlParam[] => [
+        input.tenantId,
+        input.operationId,
+        input.resourceUid,
+        input.leaseToken,
+        timestamp,
+      ];
+      const [, , , settled] = await sql.batch([
+        {
+          sql: `INSERT INTO tf_operation_commit_guards (token, valid)
+                SELECT ?, 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                WHERE ${sagaFence("saga")}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_deletion_attestations AS incarnation
+                    WHERE incarnation.tenant_id = saga.tenant_id
+                      AND incarnation.resource_uid = saga.resource_uid
+                      AND incarnation.state IN ('live', 'pending')
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS open_effect
+                    WHERE open_effect.tenant_id = saga.tenant_id
+                      AND open_effect.resource_uid = saga.resource_uid
+                      AND open_effect.effect_id = saga.operation_id
+                      AND open_effect.effect_kind = saga.operation_kind
+                      AND open_effect.phase = 'planned'
+                      AND open_effect.operation_mode = 'initial'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                    WHERE terminal_effect.tenant_id = saga.tenant_id
+                      AND terminal_effect.resource_uid = saga.resource_uid
+                      AND terminal_effect.effect_id = saga.operation_id
+                      AND terminal_effect.phase IN ('succeeded', 'cancelled')
+                  )`,
+          params: [guard, ...sagaFenceParams()],
+        },
+        {
+          sql: `INSERT INTO tf_resource_provider_effects
+                  (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+                   operation_mode, provider_pack_ref, provider_installation_ref,
+                   native_id, target_json, created_at)
+                SELECT saga.tenant_id, saga.resource_uid, ?, saga.operation_id,
+                       saga.operation_kind, 'cancelled', 'initial',
+                       NULL, NULL, NULL, NULL, ?
+                FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                WHERE ${sagaFence("saga")}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )`,
+          params: [eventId, timestamp, ...sagaFenceParams(), guard],
+        },
+        {
+          sql: `UPDATE tf_resource_deletion_attestations
+                SET closure_fence = closure_fence + 1,
+                    effects_json = json_insert(
+                      effects_json, '$[#]', json_object(
+                        'eventId', ?, 'operationId', ?,
+                        'kind', (
+                          SELECT effect_kind FROM tf_resource_provider_effects
+                          WHERE tenant_id = ? AND resource_uid = ? AND event_id = ?
+                        ),
+                        'phase', 'cancelled', 'operationMode', 'initial'
+                      )
+                    ),
+                    evidence_json = NULL, evidence_ref = NULL,
+                    evidence_effect_digest = NULL, evidence_checked_at = NULL,
+                    evidence_status = NULL, updated_at = ?
+                WHERE tenant_id = ? AND resource_uid = ? AND state IN ('live', 'pending')
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM json_each(effects_json) AS recorded
+                    WHERE json_extract(recorded.value, '$.eventId') = ?
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM tf_resource_provider_effects AS terminal_effect
+                    INNER JOIN ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
+                      ON saga.tenant_id = terminal_effect.tenant_id
+                     AND saga.resource_uid = terminal_effect.resource_uid
+                     AND saga.operation_id = terminal_effect.effect_id
+                     AND saga.operation_kind = terminal_effect.effect_kind
+                    WHERE terminal_effect.tenant_id = ?
+                      AND terminal_effect.resource_uid = ?
+                      AND terminal_effect.effect_id = ?
+                      AND terminal_effect.event_id = ?
+                      AND terminal_effect.phase = 'cancelled'
+                      AND terminal_effect.operation_mode = 'initial'
+                      AND ${sagaFence("saga")}
+                  )`,
+          params: [
+            eventId,
+            input.operationId,
+            input.tenantId,
+            input.resourceUid,
+            eventId,
+            timestamp,
+            input.tenantId,
+            input.resourceUid,
+            guard,
+            eventId,
+            input.tenantId,
+            input.resourceUid,
+            input.operationId,
+            eventId,
+            ...sagaFenceParams(),
+          ],
+        },
+        {
+          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
+                WHERE ${sagaFence(PROVIDER_MUTATION_SAGA_TABLE)}
+                  AND EXISTS (
+                    SELECT 1 FROM tf_operation_commit_guards WHERE token = ?
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM tf_resource_provider_effects AS terminal_effect
+                    WHERE terminal_effect.tenant_id = ${PROVIDER_MUTATION_SAGA_TABLE}.tenant_id
+                      AND terminal_effect.resource_uid = ${PROVIDER_MUTATION_SAGA_TABLE}.resource_uid
+                      AND terminal_effect.effect_id = ${PROVIDER_MUTATION_SAGA_TABLE}.operation_id
+                      AND terminal_effect.effect_kind = ${PROVIDER_MUTATION_SAGA_TABLE}.operation_kind
+                      AND terminal_effect.event_id = ?
+                      AND terminal_effect.phase = 'cancelled'
+                      AND terminal_effect.operation_mode = 'initial'
+                  )`,
+          params: [...sagaFenceParams(), guard, eventId],
+        },
+        {
+          sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
+          params: [guard],
+        },
+      ]);
+      return (settled?.changes ?? 0) === 1;
     },
 
     async commitDefinitiveProviderMutationFailure(input) {
       assertDefinitiveProviderMutationFailure(input);
       const timestamp = now();
-      const releaseIdentity = {
-        organizationId: input.saga.tenantId,
-        reference: input.charge.reference,
-        amountMinor: input.charge.amountMinor,
-      };
-      const releaseFence = ledgerHoldReleaseCommittedFence(releaseIdentity);
+      const releaseIdentity = input.charge
+        ? {
+            organizationId: input.saga.tenantId,
+            reference: input.charge.reference,
+            amountMinor: input.charge.amountMinor,
+          }
+        : undefined;
+      const releaseFence = releaseIdentity
+        ? ledgerHoldReleaseCommittedFence(releaseIdentity)
+        : { sql: "1 = 1", params: [] as const };
       const committedFence = definitiveProviderFailureCommittedFence(input, releaseFence);
       const committed = async (): Promise<boolean> => {
         const rows = await sql.query(
@@ -2074,7 +2697,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       // after commit would look like a conservation failure on retry.
       if (await committed()) return true;
 
-      const release = await prepareLedgerHoldRelease(sql, clock, releaseIdentity);
+      const release = releaseIdentity
+        ? await prepareLedgerHoldRelease(sql, clock, releaseIdentity)
+        : { statements: [] as const, committedFence: releaseFence };
       const initialFence = definitiveProviderFailureInitialFence(input, timestamp);
       const initialGuard = boundedGuard(
         `definitive_failure_start_${input.saga.operationId}_${input.providerLeaseToken}`,
@@ -2083,15 +2708,19 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         `definitive_failure_result_${input.saga.operationId}_${input.providerLeaseToken}`,
       );
       const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+      const compensationTargetJson = input.compensation
+        ? canonicalJson(PROVIDER_APPLY_COMPENSATION_TARGET)
+        : null;
       const cancelledEvent = canonicalJson({
         eventId: `${input.saga.operationId}:cancelled`,
         operationId: input.saga.operationId,
         kind: "apply",
         phase: "cancelled",
         operationMode: "initial",
+        ...(input.compensation ? { target: PROVIDER_APPLY_COMPENSATION_TARGET } : {}),
       });
       const incarnationRelease =
-        input.operation === "create"
+        input.operation === "create" && !input.compensation
           ? uncommittedResourceIncarnationRelease({
               tenantId: input.saga.tenantId,
               resourceUid: input.saga.resourceUid,
@@ -2117,18 +2746,20 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
                    operation_mode, provider_pack_ref, provider_installation_ref,
                    native_id, target_json, created_at)
-                VALUES (?, ?, ?, ?, 'apply', 'cancelled', 'initial', NULL, NULL, NULL, NULL, ?)`,
+                VALUES (?, ?, ?, ?, 'apply', 'cancelled', 'initial', NULL, NULL, NULL, ?, ?)`,
           params: [
             input.saga.tenantId,
             input.saga.resourceUid,
             `${input.saga.operationId}:cancelled`,
             input.saga.operationId,
+            compensationTargetJson,
             timestamp,
           ],
         },
         {
           sql: `UPDATE tf_resource_deletion_attestations
-                SET closure_fence = closure_fence + 1,
+                SET state = ${input.compensation ? "'cancelled'" : "state"},
+                    closure_fence = closure_fence + 1,
                     effects_json = json_insert(effects_json, '$[#]', json(?)),
                     evidence_json = NULL, evidence_ref = NULL,
                     evidence_effect_digest = NULL, evidence_checked_at = NULL,
@@ -2138,11 +2769,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         },
         {
           sql: `DELETE FROM tf_resource_claims
-                WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+                WHERE ${input.operation === "create" ? "" : "owner_operation_id = ? AND "}tenant_id = ? AND holder_uid = ?
                   AND state = 'reserved'
                   AND NOT (claim_key >= ? AND claim_key < ?)`,
           params: [
-            input.claimOwnerId,
+            ...(input.operation === "create" ? [] : [input.claimOwnerId]),
             input.saga.tenantId,
             input.saga.resourceUid,
             dependencyStart,
@@ -2165,7 +2796,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...(hostOperation.kind === "deferred"
           ? [
               {
-                sql: `UPDATE tf_deferred_operations
+                sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                       SET phase = 'failed', terminal_json = ?, committed_uid = NULL,
                           lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
                       WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -2196,10 +2827,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ],
         },
         {
-          sql: `DELETE FROM tf_provider_mutation_sagas
+          sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                 WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                   AND phase = 'planned' AND receipt_json IS NULL
-                  AND provider_handle IS NULL AND provider_outcome = 'running'
+                  AND provider_handle IS NULL AND provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
                   AND execution_started_at IS NOT NULL
                   AND execution_lease_token = ? AND execution_lease_until > ?`,
           params: [
@@ -2232,7 +2863,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async releaseProviderMutationExecution(input) {
       const released = await sql.run(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
          SET execution_lease_token = NULL, execution_lease_until = NULL, updated_at = ?
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'planned' AND receipt_json IS NULL
@@ -2244,7 +2875,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async readProviderMutationReceipt(tenantId, operationId, resourceUid) {
       const rows = await sql.query(
-        `SELECT receipt_json FROM tf_provider_mutation_sagas
+        `SELECT receipt_json FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
            AND phase = 'executed' LIMIT 2`,
         [tenantId, operationId, resourceUid],
@@ -2255,10 +2886,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async providerMutationPlanExists(tenantId, operationId, resourceUid) {
       const rows = await sql.query(
-        `SELECT 1 AS found FROM tf_provider_mutation_sagas
+        `SELECT 1 AS found FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
-           AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ? LIMIT 2`,
-        [tenantId, operationId, resourceUid, now()],
+           AND phase = 'planned' AND receipt_json IS NULL LIMIT 2`,
+        [tenantId, operationId, resourceUid],
       );
       if (rows.length > 1) throw new Error("provider_mutation_saga_ambiguous");
       return rows.length === 1;
@@ -2266,24 +2897,35 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async abandonProviderMutationPlan(input) {
       const removed = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND protocol_generation = 1
            AND phase = 'planned' AND receipt_json IS NULL
+           AND (
+             operation_kind <> 'import' OR
+             (import_selection_protocol = 1 AND import_selection_json IS NULL)
+           )
+           AND (
+             operation_kind <> 'apply' OR
+             selection_json IS NULL
+           )
            AND execution_lease_token IS NULL AND execution_started_at IS NULL`,
         [input.tenantId, input.operationId, input.replayKey, input.resourceUid],
       );
       return removed.changes === 1;
     },
 
-    async settleDefinitiveProviderImportConflict(input) {
-      if (input.outcome !== "import_conflict") {
-        throw new TypeError("provider import outcome must be import_conflict");
+    async settleDefinitiveProviderImportFailure(input) {
+      if (input.outcome !== "import_conflict" && input.outcome !== "adoption_aborted") {
+        throw new TypeError("provider import outcome must be definitive");
       }
       const timestamp = now();
       const removed = await sql.run(
-        `DELETE FROM tf_provider_mutation_sagas
+        `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
          WHERE tenant_id = ? AND operation_id = ? AND replay_key = ? AND resource_uid = ?
+           AND protocol_generation = 1 AND operation_kind = 'import'
            AND phase = 'planned' AND receipt_json IS NULL
+           AND import_selection_protocol = 1
            AND execution_lease_token = ? AND execution_lease_until > ?
            AND execution_started_at IS NOT NULL`,
         [
@@ -2308,10 +2950,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           {
             sql: `INSERT INTO tf_operation_commit_guards (token, valid)
                   SELECT ?, CASE WHEN EXISTS (
-                    SELECT 1 FROM tf_provider_mutation_sagas
+                    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                     WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                       AND authority_head_digest IS ?
-                      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                      AND phase = 'planned' AND receipt_json IS NULL
                       AND execution_lease_token = ? AND execution_lease_until > ?
                       AND execution_started_at IS NOT NULL
                   ) THEN 1 ELSE 0 END`,
@@ -2321,19 +2963,18 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               input.operationId,
               input.resourceUid,
               input.authorityHeadDigest ?? null,
-              timestamp,
               input.leaseToken,
               timestamp,
             ],
           },
           {
-            sql: `UPDATE tf_provider_mutation_sagas
+            sql: `UPDATE ${PROVIDER_MUTATION_SAGA_TABLE}
                   SET phase = 'executed', receipt_json = ?, updated_at = ?, expires_at = NULL,
                       execution_lease_token = NULL, execution_lease_until = NULL,
                       provider_handle = NULL, provider_outcome = 'planned'
                   WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?
                     AND authority_head_digest IS ?
-                    AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
+                    AND phase = 'planned' AND receipt_json IS NULL
                     AND execution_lease_token = ? AND execution_lease_until > ?
                     AND execution_started_at IS NOT NULL`,
             params: [
@@ -2343,7 +2984,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
               input.operationId,
               input.resourceUid,
               input.authorityHeadDigest ?? null,
-              timestamp,
               input.leaseToken,
               timestamp,
             ],
@@ -2366,7 +3006,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   ],
                 },
                 {
-                  sql: `UPDATE tf_deferred_operations
+                  sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                         SET expires_at = 253402300799999, updated_at = ?
                         WHERE id = ? AND tenant_id = ? AND resource_uid = ?
                           AND phase = 'committing' AND lease_token = ?`,
@@ -2432,7 +3072,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           ? (Number.isFinite(accepted) ? accepted : now()) + PROVIDER_REPAIR_HOLD_TTL_MILLISECONDS
           : 253_402_300_799_999;
       const held = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET lease_token = NULL, lease_until = NULL,
              expires_at = ?, updated_at = ?
          WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -2500,73 +3140,130 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       }
     },
 
-    async acceptDeferredOperation(record): Promise<DeferredOperationRecord> {
+    async acceptDeferredOperation(record, authorityFence): Promise<DeferredOperationRecord> {
+      const acceptedAuthority =
+        record.operation === "apply"
+          ? (record.acceptedAuthority ?? unfencedAcceptedAuthority())
+          : undefined;
+      if (acceptedAuthority) {
+        assertAcceptedAuthorityRecord({
+          summary: acceptedAuthority,
+          operation: record.operation,
+          formRef: record.target.formRef,
+          ...(record.acceptedUid !== undefined ? { acceptedUid: record.acceptedUid } : {}),
+          ...(authorityFence !== undefined ? { fence: authorityFence } : {}),
+          requireFence: true,
+        });
+      } else if (authorityFence !== undefined) {
+        throw new TypeError("only an apply may carry an authority fence");
+      }
+      const storedRecord = acceptedAuthority ? { ...record, acceptedAuthority } : record;
+      const acceptedAuthorityJson = acceptedAuthority
+        ? encodeAcceptedAuthority(acceptedAuthority)
+        : null;
+      const authority = authorityFence ? await authorityFenceSql(authorityFence) : undefined;
       await sql.run(
-        `DELETE FROM tf_deferred_operations WHERE rowid IN (
-           SELECT rowid FROM tf_deferred_operations
-           WHERE expires_at <= ?
+        `DELETE FROM ${DEFERRED_OPERATION_TABLE} WHERE rowid IN (
+           SELECT rowid FROM ${DEFERRED_OPERATION_TABLE}
+           WHERE phase IN ('succeeded', 'failed', 'cancelled') AND expires_at <= ?
            ORDER BY expires_at LIMIT ?
          )`,
         [now(), SWEEP_ROW_LIMIT],
       );
-      await sql.run(
-        `INSERT OR IGNORE INTO tf_deferred_operations
-           (id, tenant_id, principal_id, operation, phase, request_path, request_query,
+      const identity: OperationGenerationIdentity = {
+        operationId: storedRecord.id,
+        replayKey: storedRecord.replayKey,
+        tenantId: storedRecord.tenantId,
+        resourceUid: storedRecord.resourceUid,
+        target: { tenantId: storedRecord.tenantId, ...storedRecord.target },
+      };
+      const legacyFence = legacyOperationConflictFence(identity);
+      const inserted = await sql.run(
+        `INSERT OR IGNORE INTO ${DEFERRED_OPERATION_TABLE}
+           (id, protocol_generation, tenant_id, principal_id, operation, phase,
+            request_path, request_query,
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
-            target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+            target_form_ref_json, accepted_authority_json,
+            accepted_uid, accepted_generation, accepted_revision,
             resource_uid, worker_endpoint_origin_reservation_id, polls_remaining,
             lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
-         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 NULL, NULL, NULL, NULL, ?, ?, ?)`,
+         SELECT ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                NULL, NULL, NULL, NULL, ?, ?, ?
+         WHERE NOT ${legacyFence.sql}${authority ? ` AND (${authority.sql})` : ""}`,
         [
-          record.id,
-          record.tenantId,
-          record.principalId,
-          record.operation,
-          record.requestPath,
-          record.requestQuery,
-          JSON.stringify(record.requestHeaders),
-          record.requestBody ?? null,
-          record.fingerprint,
-          record.replayKey,
-          record.target.space,
-          record.target.apiVersion,
-          record.target.kind,
-          record.target.name,
-          JSON.stringify(record.target.formRef),
-          record.acceptedUid ?? null,
-          record.acceptedGeneration ?? null,
-          record.acceptedRevision ?? null,
-          record.resourceUid,
-          record.workerEndpointOriginReservationId ?? null,
-          record.pollsRemaining,
-          record.createdAt,
+          storedRecord.id,
+          OPERATION_PROTOCOL_GENERATION,
+          storedRecord.tenantId,
+          storedRecord.principalId,
+          storedRecord.operation,
+          storedRecord.requestPath,
+          storedRecord.requestQuery,
+          JSON.stringify(storedRecord.requestHeaders),
+          storedRecord.requestBody ?? null,
+          storedRecord.fingerprint,
+          storedRecord.replayKey,
+          storedRecord.target.space,
+          storedRecord.target.apiVersion,
+          storedRecord.target.kind,
+          storedRecord.target.name,
+          JSON.stringify(storedRecord.target.formRef),
+          acceptedAuthorityJson,
+          storedRecord.acceptedUid ?? null,
+          storedRecord.acceptedGeneration ?? null,
+          storedRecord.acceptedRevision ?? null,
+          storedRecord.resourceUid,
+          storedRecord.workerEndpointOriginReservationId ?? null,
+          storedRecord.pollsRemaining,
+          storedRecord.createdAt,
           now(),
-          now() + OPERATION_TTL_MILLISECONDS,
+          253_402_300_799_999,
+          ...legacyFence.params,
+          ...(authority?.params ?? []),
         ],
       );
-      const stored = await readDeferredBy("replay_key", record.replayKey);
-      if (!stored) throw new SqlError("constraint", "deferred operation identity collision");
-      return stored;
+      const rows = await sql.query(
+        `SELECT * FROM ${DEFERRED_OPERATION_TABLE} WHERE replay_key = ? LIMIT 2`,
+        [storedRecord.replayKey],
+      );
+      if (rows.length > 1) throw new Error("deferred_operation_ambiguous");
+      if (rows[0]) return deferredOperation(rows[0]);
+      if (await hasLegacyOperationConflict(identity)) throw legacyOperationConflictError();
+      if (authority && inserted.changes === 0) {
+        throw new TakoformHostError("form_unavailable", 503);
+      }
+      throw new SqlError("constraint", "deferred operation identity collision");
     },
 
     async readDeferredOperation(tenantId, principalId, id) {
-      const rows = await sql.query(
-        `SELECT * FROM tf_deferred_operations
-         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?`,
+      const current = await sql.query(
+        `SELECT * FROM ${DEFERRED_OPERATION_TABLE}
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
+           AND (phase IN ('pending', 'committing') OR expires_at > ?) LIMIT 2`,
         [tenantId, principalId, id, now()],
       );
-      return rows[0] ? deferredOperation(rows[0]) : null;
+      if (current.length > 1) throw new Error("deferred_operation_ambiguous");
+      if (current[0]) return deferredOperation(current[0]);
+      const legacy = await sql.query(
+        `SELECT * FROM ${LEGACY_DEFERRED_OPERATION_TABLE}
+         WHERE tenant_id = ? AND principal_id = ? AND id = ? LIMIT 2`,
+        [tenantId, principalId, id],
+      );
+      if (legacy.length > 1) throw new Error("legacy_deferred_operation_ambiguous");
+      return legacy[0] ? deferredOperation(legacy[0]) : null;
     },
 
     async deferredOperationExists(id) {
       const rows = await sql.query(
-        "SELECT 1 AS found FROM tf_deferred_operations WHERE id = ? AND expires_at > ? LIMIT 1",
-        [id, now()],
+        `SELECT 1 AS found FROM ${DEFERRED_OPERATION_TABLE}
+         WHERE id = ? AND (phase IN ('pending', 'committing') OR expires_at > ?)
+         UNION ALL
+         SELECT 1 AS found FROM ${LEGACY_DEFERRED_OPERATION_TABLE} WHERE id = ?
+         LIMIT 2`,
+        [id, now(), id],
       );
-      return rows.length === 1;
+      return rows.length > 0;
     },
 
     async readDeferredOperationByReplay(replayKey) {
@@ -2575,7 +3272,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async retireDeferredOperation(id, replayKey) {
       const removed = await sql.run(
-        `DELETE FROM tf_deferred_operations
+        `DELETE FROM ${DEFERRED_OPERATION_TABLE}
          WHERE id = ? AND replay_key = ? AND phase IN ('succeeded', 'failed', 'cancelled')`,
         [id, replayKey],
       );
@@ -2584,11 +3281,11 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async advanceDeferredOperation(input) {
       const decremented = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET polls_remaining = polls_remaining - 1, updated_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND polls_remaining > 1 AND expires_at > ?`,
-        [now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending' AND polls_remaining > 1`,
+        [now(), input.tenantId, input.principalId, input.id],
       );
       if (decremented.changes === 1) {
         return {
@@ -2601,12 +3298,12 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       // the durable commit intent, and a restarted process can resume that
       // intent without guessing whether cancellation was still possible.
       const armed = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'committing', polls_remaining = 0,
              lease_token = NULL, lease_until = NULL, updated_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND polls_remaining <= 1 AND expires_at > ?`,
-        [now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending' AND polls_remaining <= 1`,
+        [now(), input.tenantId, input.principalId, input.id],
       );
       if (armed.changes === 1) {
         return {
@@ -2615,9 +3312,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         };
       }
       const acquired = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET lease_token = ?, lease_until = ?, updated_at = ?
-         WHERE tenant_id = ? AND principal_id = ? AND id = ? AND expires_at > ?
+         WHERE tenant_id = ? AND principal_id = ? AND id = ?
            AND phase = 'committing' AND (lease_until IS NULL OR lease_until <= ?)`,
         [
           input.leaseToken,
@@ -2626,7 +3323,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           input.tenantId,
           input.principalId,
           input.id,
-          now(),
           now(),
         ],
       );
@@ -2643,34 +3339,56 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const timestamp = now();
       const rows = await sql.query(
         `SELECT operation.*
-         FROM tf_deferred_operations AS operation
-         INNER JOIN tf_provider_mutation_sagas AS saga
+         FROM ${DEFERRED_OPERATION_TABLE} AS operation
+         INNER JOIN ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
            ON saga.operation_id = operation.id
+          AND saga.protocol_generation = operation.protocol_generation
+          AND saga.operation_kind = operation.operation
           AND saga.tenant_id = operation.tenant_id
+          AND saga.fingerprint = operation.fingerprint
           AND saga.resource_uid = operation.resource_uid
+          AND saga.target_space = operation.target_space
+          AND saga.target_api_version = operation.target_api_version
+          AND saga.target_kind = operation.target_kind
+          AND saga.target_name = operation.target_name
+          AND saga.accepted_uid IS operation.accepted_uid
+          AND saga.accepted_generation IS operation.accepted_generation
+          AND saga.accepted_revision IS operation.accepted_revision
          WHERE operation.phase = 'committing'
+           AND operation.protocol_generation = 1
            AND operation.terminal_json IS NULL
-           AND operation.expires_at > ?
            AND (operation.lease_until IS NULL OR operation.lease_until <= ?)
            AND saga.phase = 'planned'
            AND saga.receipt_json IS NULL
-           AND saga.execution_started_at IS NOT NULL
+           AND (saga.execution_started_at IS NOT NULL
+             OR (
+               saga.operation_kind = 'import' AND
+               saga.import_selection_protocol = 1 AND
+               saga.import_selection_json IS NOT NULL
+             ))
            AND (saga.execution_lease_until IS NULL OR saga.execution_lease_until <= ?)
          ORDER BY operation.updated_at, operation.id
          LIMIT ?`,
-        [timestamp, timestamp, timestamp, limit],
+        [timestamp, timestamp, limit],
       );
       return rows.map(deferredOperation);
     },
 
     async cancelDeferredOperation(input) {
       const cancelled = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'cancelled', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-             updated_at = ?
+             updated_at = ?, expires_at = ?
          WHERE tenant_id = ? AND principal_id = ? AND id = ?
-           AND phase = 'pending' AND expires_at > ?`,
-        [input.terminalJson, now(), input.tenantId, input.principalId, input.id, now()],
+           AND phase = 'pending'`,
+        [
+          input.terminalJson,
+          now(),
+          now() + OPERATION_TTL_MILLISECONDS,
+          input.tenantId,
+          input.principalId,
+          input.id,
+        ],
       );
       if (cancelled.changes === 1) {
         await this.putOperation(input.tenantId, {
@@ -2686,71 +3404,21 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       return terminalPhase(record.phase) ? "settled" : "too_late";
     },
 
-    async retireUnpublishableProviderMutation(input) {
-      const timestamp = now();
-      const [settled] = await sql.batch([
-        {
-          sql: `UPDATE tf_deferred_operations
-                SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-                    expires_at = ?, updated_at = ?
-                WHERE id = ? AND tenant_id = ? AND principal_id = ?
-                  AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
-          params: [
-            input.terminalJson,
-            timestamp + OPERATION_TTL_MILLISECONDS,
-            timestamp,
-            input.operation.id,
-            input.operation.tenantId,
-            input.operation.principalId,
-            input.leaseToken,
-            timestamp,
-          ],
-        },
-        {
-          sql: `DELETE FROM tf_provider_mutation_sagas
-                WHERE operation_id = ? AND tenant_id = ? AND resource_uid = ?
-                  AND phase = 'executed'
-                  AND EXISTS (
-                    SELECT 1 FROM tf_deferred_operations
-                    WHERE id = ? AND tenant_id = ? AND phase = 'failed'
-                  )`,
-          params: [
-            input.operation.id,
-            input.operation.tenantId,
-            input.operation.resourceUid,
-            input.operation.id,
-            input.operation.tenantId,
-          ],
-        },
-      ]);
-      if ((settled?.changes ?? 0) !== 1) return false;
-      // The durable record of the refusal. It outlives the command row that
-      // ADR 0008 retires on the next presentation of the same key, and it is
-      // what a reservation repair reads to know this effect settled.
-      await this.putOperation(input.operation.tenantId, {
-        id: input.operation.id,
-        operation: input.operation.operation,
-        state: "failed",
-        createdAt: input.operation.createdAt,
-      });
-      return true;
-    },
-
     async settleDeferredFailure(input) {
       const settled = await sql.run(
-        `UPDATE tf_deferred_operations
+        `UPDATE ${DEFERRED_OPERATION_TABLE}
          SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL,
-             updated_at = ?
+             updated_at = ?, expires_at = ?
          WHERE id = ? AND tenant_id = ? AND principal_id = ?
-           AND phase = 'committing' AND lease_token = ? AND expires_at > ?`,
+           AND phase = 'committing' AND lease_token = ?`,
         [
           input.terminalJson,
           now(),
+          now() + OPERATION_TTL_MILLISECONDS,
           input.operation.id,
           input.operation.tenantId,
           input.operation.principalId,
           input.leaseToken,
-          now(),
         ],
       );
       if (settled.changes === 1) {
@@ -2785,9 +3453,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         target.name,
       ];
       const operationFence = `EXISTS (
-        SELECT 1 FROM tf_deferred_operations
+        SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
         WHERE id = ? AND tenant_id = ? AND principal_id = ?
-          AND phase = 'committing' AND lease_token = ? AND expires_at > ?
+          AND phase = 'committing' AND lease_token = ?
       )`;
       // A delete is fenced by incarnation and generation, never by revision.
       // See `deleteFencesRevision`.
@@ -2853,9 +3521,10 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
       const providerSagaFence = receiptJson
         ? `EXISTS (
-        SELECT 1 FROM tf_provider_mutation_sagas
+        SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
         WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
-          AND fingerprint = ? AND resource_uid = ? AND phase = 'executed'
+          AND fingerprint = ? AND resource_uid = ?
+          AND protocol_generation = 1 AND operation_kind = ? AND phase = 'executed'
           AND receipt_json = ?
       )`
         : "1 = 1";
@@ -2875,7 +3544,6 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             operation.tenantId,
             operation.principalId,
             leaseToken,
-            timestamp,
             ...resourceFenceParameters,
             ...(claimKeys.length === 0
               ? []
@@ -2893,6 +3561,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                   operation.tenantId,
                   mutation.replay.fingerprint,
                   mutation.resourceUid,
+                  operation.operation,
                   receiptJson,
                 ]
               : []),
@@ -2996,7 +3665,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
           timestamp,
         }),
         {
-          sql: `UPDATE tf_deferred_operations
+          sql: `UPDATE ${DEFERRED_OPERATION_TABLE}
                 SET phase = 'succeeded', terminal_json = ?, committed_uid = ?,
                     lease_token = NULL, lease_until = NULL, updated_at = ?, expires_at = ?
                 WHERE id = ? AND tenant_id = ? AND principal_id = ?
@@ -3028,7 +3697,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...(receiptJson
           ? [
               {
-                sql: `DELETE FROM tf_provider_mutation_sagas
+                sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                       WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
                 params: [operation.id, operation.tenantId, receiptJson],
               },
@@ -3841,11 +4510,54 @@ interface StoreSqlFence {
   readonly params: readonly SqlParam[];
 }
 
+function definitiveProviderFailureOutcomeSql(
+  action: DefinitiveProviderMutationFailureCommit["recoveryAction"],
+): string {
+  if (action === "concludeApplyNoEffect" || action === "compensateApply") {
+    return "= 'indeterminate'";
+  }
+  if (action === "convergeApply") return "IN ('running', 'indeterminate')";
+  return "= 'running'";
+}
+
 function assertDefinitiveProviderMutationFailure(
   input: DefinitiveProviderMutationFailureCommit,
 ): void {
   const { saga } = input;
-  if (input.charge.reference !== saga.operationId) {
+  if (saga.operationKind !== "apply") {
+    throw new TypeError("provider failure has the wrong mutation kind");
+  }
+  if (
+    input.recoveryAction !== undefined &&
+    ((input.recoveryAction !== "convergeApply" &&
+      input.recoveryAction !== "concludeApplyNoEffect" &&
+      input.recoveryAction !== "compensateApply") ||
+      input.operation !== "create" ||
+      saga.acceptedUid !== undefined ||
+      saga.acceptedGeneration !== undefined ||
+      saga.acceptedRevision !== undefined)
+  ) {
+    throw new TypeError("invalid provider refusal recovery action");
+  }
+  if ((input.recoveryAction === "compensateApply") !== (input.compensation !== undefined)) {
+    throw new TypeError("provider compensation authority is incomplete");
+  }
+  if (input.compensation) {
+    if (
+      input.hostOperation.kind !== "deferred" ||
+      input.compensation.selection.kind !== "provider" ||
+      input.compensation.selection.incumbent !== undefined ||
+      input.compensation.dependencies.operationId !== saga.operationId ||
+      !compensationSelectionMatchesDependencies(
+        input.compensation.selection,
+        input.compensation.dependencies,
+        saga.target.space,
+      )
+    ) {
+      throw new TypeError("invalid provider compensation authority");
+    }
+  }
+  if (input.charge && input.charge.reference !== saga.operationId) {
     throw new TypeError("provider failure charge has the wrong operation identity");
   }
   if ((input.operation === "create") !== (saga.acceptedUid === undefined)) {
@@ -3890,13 +4602,15 @@ function definitiveProviderFailureInitialFence(
 ): StoreSqlFence {
   const { saga } = input;
   const sagaFence = `EXISTS (
-    SELECT 1 FROM tf_provider_mutation_sagas
+    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
     WHERE operation_id = ? AND replay_key = ? AND tenant_id = ?
       AND fingerprint = ? AND resource_uid = ? AND authority_head_digest IS ?
       AND target_space = ? AND target_api_version = ? AND target_kind = ? AND target_name = ?
       AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
-      AND phase = 'planned' AND receipt_json IS NULL AND expires_at > ?
-      AND provider_handle IS NULL AND provider_outcome = 'running'
+      AND protocol_generation = 1 AND operation_kind = 'apply'
+      AND phase = 'planned' AND receipt_json IS NULL
+      AND provider_handle IS NULL AND provider_outcome ${definitiveProviderFailureOutcomeSql(input.recoveryAction)}
+      ${input.compensation ? "AND selection_json = ? AND import_selection_json IS NULL AND selection_verified_lease_token = execution_lease_token" : ""}
       AND execution_started_at IS NOT NULL
       AND execution_lease_token = ? AND execution_lease_until > ?
   )`;
@@ -3914,7 +4628,7 @@ function definitiveProviderFailureInitialFence(
     saga.acceptedUid ?? null,
     saga.acceptedGeneration ?? null,
     saga.acceptedRevision ?? null,
-    timestamp,
+    ...(input.compensation ? [encodeTakoformApplySelection(input.compensation.selection)] : []),
     input.providerLeaseToken,
     timestamp,
   ];
@@ -3922,18 +4636,18 @@ function definitiveProviderFailureInitialFence(
   const hostFence =
     hostOperation.kind === "deferred"
       ? `EXISTS (
-          SELECT 1 FROM tf_deferred_operations
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
           WHERE id = ? AND tenant_id = ? AND principal_id = ?
-            AND operation = 'apply' AND phase = 'committing'
+            AND protocol_generation = 1 AND operation = 'apply' AND phase = 'committing'
             AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
             AND target_space = ? AND target_api_version = ?
             AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
             AND accepted_uid IS ? AND accepted_generation IS ? AND accepted_revision IS ?
             AND terminal_json IS NULL AND committed_uid IS NULL
-            AND lease_token = ? AND lease_until > ? AND expires_at > ?
+            AND lease_token = ? AND lease_until > ?
         )`
       : `NOT EXISTS (
-          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE} WHERE id = ?
         )`;
   const hostParams: readonly SqlParam[] =
     hostOperation.kind === "deferred"
@@ -3954,7 +4668,6 @@ function definitiveProviderFailureInitialFence(
           hostOperation.operation.acceptedRevision ?? null,
           hostOperation.leaseToken,
           timestamp,
-          timestamp,
         ]
       : [saga.operationId];
   const target = [
@@ -3965,7 +4678,7 @@ function definitiveProviderFailureInitialFence(
     saga.target.name,
   ] as const;
   const incarnationRelease =
-    input.operation === "create"
+    input.operation === "create" && !input.compensation
       ? uncommittedResourceIncarnationRelease({
           tenantId: saga.tenantId,
           resourceUid: saga.resourceUid,
@@ -3974,10 +4687,22 @@ function definitiveProviderFailureInitialFence(
       : undefined;
   const resourceFence =
     input.operation === "create"
-      ? `NOT EXISTS (
-          SELECT 1 FROM tf_resources
-          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-        ) AND (${incarnationRelease?.fence ?? "0 = 1"})`
+      ? input.compensation
+        ? `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ?
+          )`
+        : `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          ) AND (${incarnationRelease?.fence ?? "0 = 1"})`
       : `EXISTS (
           SELECT 1 FROM tf_resources
           WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
@@ -3985,7 +4710,9 @@ function definitiveProviderFailureInitialFence(
         )`;
   const resourceParams: readonly SqlParam[] =
     input.operation === "create"
-      ? [...target, ...(incarnationRelease?.fenceParams ?? [])]
+      ? input.compensation
+        ? [...target, saga.tenantId, saga.resourceUid, saga.tenantId, saga.resourceUid]
+        : [...target, ...(incarnationRelease?.fenceParams ?? [])]
       : [
           ...target,
           saga.acceptedUid ?? "",
@@ -4035,13 +4762,65 @@ function definitiveProviderFailureInitialFence(
     saga.resourceUid,
     saga.operationId,
   ];
+  const dependencyFence = input.compensation
+    ? `AND (
+        SELECT COUNT(*) FROM tf_resource_claims
+        WHERE owner_operation_id = ? AND tenant_id = ? AND holder_uid = ?
+          AND claim_key >= ? AND claim_key < ?
+          AND (state = 'committed' OR expires_at > ?)
+      ) = json_array_length(?)
+      AND NOT EXISTS (
+        SELECT 1 FROM json_each(?) AS expected
+        WHERE NOT EXISTS (
+          SELECT 1 FROM tf_resource_claims AS dependency
+          WHERE dependency.claim_key = CAST(expected.value AS TEXT)
+            AND dependency.owner_operation_id = ?
+            AND dependency.tenant_id = ? AND dependency.holder_uid = ?
+            AND dependency.holder_space = ? AND dependency.holder_api_version = ?
+            AND dependency.holder_kind = ? AND dependency.holder_name = ?
+            AND (dependency.state = 'committed' OR dependency.expires_at > ?)
+        )
+      )`
+    : "";
+  const dependencyParams: readonly SqlParam[] = input.compensation
+    ? (() => {
+        const keysJson = resourceDependencyKeysJson(input.compensation.dependencies);
+        const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
+        return [
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          dependencyStart,
+          dependencyEnd,
+          timestamp,
+          keysJson,
+          keysJson,
+          saga.operationId,
+          saga.tenantId,
+          saga.resourceUid,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.space,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.apiVersion,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.kind,
+          RESOURCE_DEPENDENCY_PRIVATE_HOLDER.name,
+          timestamp,
+        ];
+      })()
+    : [];
   return {
     sql: `${sagaFence}
       AND NOT EXISTS (SELECT 1 FROM tf_operations WHERE id = ?)
       AND ${hostFence}
       AND ${resourceFence}
-      AND ${attemptFence}`,
-    params: [...sagaParams, saga.operationId, ...hostParams, ...resourceParams, ...attemptParams],
+      AND ${attemptFence}
+      ${dependencyFence}`,
+    params: [
+      ...sagaParams,
+      saga.operationId,
+      ...hostParams,
+      ...resourceParams,
+      ...attemptParams,
+      ...dependencyParams,
+    ],
   };
 }
 
@@ -4061,9 +4840,9 @@ function definitiveProviderFailureCommittedFence(
   const hostFence =
     input.hostOperation.kind === "deferred"
       ? `EXISTS (
-          SELECT 1 FROM tf_deferred_operations
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE}
           WHERE id = ? AND tenant_id = ? AND principal_id = ?
-            AND operation = 'apply' AND phase = 'failed'
+            AND protocol_generation = 1 AND operation = 'apply' AND phase = 'failed'
             AND fingerprint = ? AND replay_key = ? AND resource_uid = ?
             AND target_space = ? AND target_api_version = ?
             AND target_kind = ? AND target_name = ? AND target_form_ref_json = ?
@@ -4072,7 +4851,7 @@ function definitiveProviderFailureCommittedFence(
             AND lease_token IS NULL AND lease_until IS NULL
         )`
       : `NOT EXISTS (
-          SELECT 1 FROM tf_deferred_operations WHERE id = ?
+          SELECT 1 FROM ${DEFERRED_OPERATION_TABLE} WHERE id = ?
         )`;
   const hostParams: readonly SqlParam[] =
     input.hostOperation.kind === "deferred"
@@ -4133,27 +4912,100 @@ function definitiveProviderFailureCommittedFence(
     saga.target.kind,
     saga.target.name,
   ] as const;
+  const compensationEffectsJson = input.compensation
+    ? canonicalJson([
+        {
+          eventId: `${saga.operationId}:planned`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "planned",
+          operationMode: "initial",
+        },
+        {
+          eventId: `${saga.operationId}:dispatched`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "dispatched",
+          operationMode: "initial",
+        },
+        {
+          eventId: `${saga.operationId}:cancelled`,
+          operationId: saga.operationId,
+          kind: "apply",
+          phase: "cancelled",
+          operationMode: "initial",
+          target: PROVIDER_APPLY_COMPENSATION_TARGET,
+        },
+      ])
+    : undefined;
   const attemptFence =
     input.operation === "create"
-      ? `NOT EXISTS (
-          SELECT 1 FROM tf_resources
-          WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_deployments
-          WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_provider_effects
-          WHERE tenant_id = ? AND resource_uid = ?
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM tf_resource_deletion_attestations
-          WHERE tenant_id = ? AND resource_uid = ?
-        )`
+      ? input.compensation
+        ? `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ?
+          )
+          AND (
+            SELECT COUNT(*) FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+          ) = 3
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'planned' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json IS NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'dispatched' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json IS NULL
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ? AND effect_id = ?
+              AND effect_kind = 'apply' AND phase = 'cancelled' AND operation_mode = 'initial'
+              AND provider_pack_ref IS NULL AND provider_installation_ref IS NULL
+              AND native_id IS NULL AND target_json = ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM tf_resource_deletion_attestations
+            WHERE tenant_id = ? AND resource_uid = ?
+              AND space = ? AND api_version = ? AND kind = ? AND name = ?
+              AND form_ref_json = ? AND state = 'cancelled' AND closure_fence = 4
+              AND effects_json = ?
+              AND evidence_json IS NULL AND evidence_ref IS NULL
+              AND evidence_effect_digest IS NULL
+              AND evidence_checked_at IS NULL AND evidence_status IS NULL
+          )`
+        : `NOT EXISTS (
+            SELECT 1 FROM tf_resources
+            WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resources WHERE tenant_id = ? AND uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deployments
+            WHERE tenant_id = ? AND resource_uid = ? AND state NOT IN ('deleted', 'failed')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_provider_effects
+            WHERE tenant_id = ? AND resource_uid = ?
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM tf_resource_deletion_attestations
+            WHERE tenant_id = ? AND resource_uid = ?
+          )`
       : `EXISTS (
           SELECT 1 FROM tf_resources
           WHERE tenant_id = ? AND space = ? AND api_version = ? AND kind = ? AND name = ?
@@ -4184,17 +5036,53 @@ function definitiveProviderFailureCommittedFence(
         )`;
   const attemptParams: readonly SqlParam[] =
     input.operation === "create"
-      ? [
-          ...target,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-          saga.tenantId,
-          saga.resourceUid,
-        ]
+      ? input.compensation
+        ? [
+            ...target,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:planned`,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:dispatched`,
+            saga.operationId,
+            saga.tenantId,
+            saga.resourceUid,
+            `${saga.operationId}:cancelled`,
+            saga.operationId,
+            canonicalJson(PROVIDER_APPLY_COMPENSATION_TARGET),
+            saga.tenantId,
+            saga.resourceUid,
+            saga.target.space,
+            saga.target.apiVersion,
+            saga.target.kind,
+            saga.target.name,
+            canonicalJson(
+              input.hostOperation.kind === "deferred"
+                ? input.hostOperation.operation.target.formRef
+                : {},
+            ),
+            compensationEffectsJson ?? "",
+          ]
+        : [
+            ...target,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+            saga.tenantId,
+            saga.resourceUid,
+          ]
       : [
           ...target,
           saga.acceptedUid ?? "",
@@ -4221,7 +5109,7 @@ function definitiveProviderFailureCommittedFence(
           AND resource_json IS NULL AND created_at = ?
       )
       AND NOT EXISTS (
-        SELECT 1 FROM tf_provider_mutation_sagas WHERE operation_id = ?
+        SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} WHERE operation_id = ?
       )
       AND ${hostFence}
       AND ${claimFence}
@@ -4251,6 +5139,7 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
     typeof row.receipt_json === "string" ? providerReceipt(row.receipt_json) : undefined;
   return {
     operationId: text(row.operation_id),
+    operationKind: providerMutationOperationKind(row.operation_kind),
     replayKey: text(row.replay_key),
     tenantId: text(row.tenant_id),
     fingerprint: text(row.fingerprint),
@@ -4277,6 +5166,8 @@ function providerMutationSaga(row: Row): ProviderMutationSaga {
 }
 
 function providerMutationExecutionState(row: Row | undefined): {
+  readonly applySelection?: TakoformApplySelection;
+  readonly importSelection?: TakoformImportSelection;
   readonly providerHandle?: string;
   readonly providerOutcome?: "running" | "indeterminate";
 } {
@@ -4287,11 +5178,35 @@ function providerMutationExecutionState(row: Row | undefined): {
       ? row.provider_outcome
       : undefined;
   return {
+    ...providerMutationApplySelectionState(row),
+    ...providerMutationImportSelectionState(row),
     ...(providerHandle ? { providerHandle } : {}),
     ...(providerOutcome === "indeterminate" || (providerOutcome === "running" && providerHandle)
       ? { providerOutcome }
       : {}),
   };
+}
+
+function providerMutationApplySelectionState(row: Row | undefined): {
+  readonly applySelection?: TakoformApplySelection;
+} {
+  if (!row) throw new Error("provider_mutation_saga_missing_after_lease");
+  if (row.selection_json === null || row.selection_json === undefined) return {};
+  if (typeof row.selection_json !== "string") {
+    throw new Error("provider_mutation_apply_selection_invalid");
+  }
+  return { applySelection: parseTakoformApplySelection(row.selection_json) };
+}
+
+function providerMutationImportSelectionState(row: Row | undefined): {
+  readonly importSelection?: TakoformImportSelection;
+} {
+  if (!row) throw new Error("provider_mutation_saga_missing_after_lease");
+  if (row.import_selection_json === null || row.import_selection_json === undefined) return {};
+  if (typeof row.import_selection_json !== "string") {
+    throw new Error("provider_mutation_import_selection_invalid");
+  }
+  return { importSelection: parseTakoformImportSelection(row.import_selection_json) };
 }
 
 function sameProviderMutationSaga(
@@ -4312,6 +5227,7 @@ function sameProviderMutationTarget(
   right: ProviderMutationSaga,
 ): boolean {
   return (
+    left.operationKind === right.operationKind &&
     left.tenantId === right.tenantId &&
     left.fingerprint === right.fingerprint &&
     left.authorityHeadDigest === right.authorityHeadDigest &&
@@ -4324,6 +5240,11 @@ function sameProviderMutationTarget(
     left.acceptedGeneration === right.acceptedGeneration &&
     left.acceptedRevision === right.acceptedRevision
   );
+}
+
+function providerMutationOperationKind(value: unknown): ProviderMutationSaga["operationKind"] {
+  if (value === "apply" || value === "import" || value === "delete") return value;
+  throw new TypeError("invalid provider mutation operation kind");
 }
 
 function providerReceipt(value: unknown): TakoformDriverReceipt {
@@ -4729,6 +5650,8 @@ function providerMutationCommitStatements(input: {
   const receiptJson = mutation.providerReceipt
     ? canonicalJson(mutation.providerReceipt)
     : undefined;
+  const sagaOperationKind =
+    input.operation === "import" || input.operation === "delete" ? input.operation : "apply";
   const claimKeys = mutation.claimKeys ?? [];
   const claimFence =
     claimKeys.length === 0
@@ -4756,9 +5679,10 @@ function providerMutationCommitStatements(input: {
   });
   const sagaFence = receiptJson
     ? `EXISTS (
-    SELECT 1 FROM tf_provider_mutation_sagas AS saga
+    SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE} AS saga
     WHERE saga.operation_id = ? AND saga.replay_key = ? AND saga.tenant_id = ?
       AND saga.fingerprint = ? AND saga.resource_uid = ?
+      AND saga.protocol_generation = 1 AND saga.operation_kind = ?
       AND saga.target_space = ? AND saga.target_api_version = ?
       AND saga.target_kind = ? AND saga.target_name = ?
       AND saga.accepted_revision IS ?
@@ -4800,6 +5724,7 @@ function providerMutationCommitStatements(input: {
               input.tenantId,
               mutation.replay.fingerprint,
               mutation.resourceUid,
+              sagaOperationKind,
               address.space,
               address.apiVersion,
               address.kind,
@@ -4934,7 +5859,7 @@ function providerMutationCommitStatements(input: {
     ...(receiptJson
       ? [
           {
-            sql: `DELETE FROM tf_provider_mutation_sagas
+            sql: `DELETE FROM ${PROVIDER_MUTATION_SAGA_TABLE}
                   WHERE operation_id = ? AND tenant_id = ? AND receipt_json = ?`,
             params: [input.operationId, input.tenantId, receiptJson],
           },
@@ -5003,9 +5928,11 @@ function providerEffectSql(
       ? providerMutation.providerInstallationRef
       : undefined;
   const nativeId =
-    providerMutation && "expectedNativeId" in providerMutation
-      ? providerMutation.expectedNativeId
-      : undefined;
+    providerMutation?.kind === "replace"
+      ? providerMutation.nativeId
+      : providerMutation && "expectedNativeId" in providerMutation
+        ? providerMutation.expectedNativeId
+        : undefined;
   const target = {
     resourceUid: mutation.resourceUid,
     address: {
@@ -5178,6 +6105,30 @@ function deploymentMutationSql(
     WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'
   )`;
   const commonParams = [mutation.tenantId, mutation.deploymentId, mutation.expectedNativeId];
+  if (mutation.kind === "replace") {
+    return {
+      fence: `${commonFence} AND EXISTS (
+        SELECT 1 FROM tf_resource_deployments
+        WHERE tenant_id = ? AND id = ? AND native_id = ? AND native_claimed = 0
+      )`,
+      fenceParams: [...commonParams, ...commonParams],
+      statements: [
+        {
+          sql: `UPDATE tf_resource_deployments
+                SET native_id = ?, observed_json = ?, outputs_json = ?, updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ?
+                  AND native_claimed = 0 AND state = 'active'`,
+          params: [
+            mutation.nativeId,
+            JSON.stringify(mutation.observed),
+            JSON.stringify(mutation.outputs),
+            timestamp,
+            ...commonParams,
+          ],
+        },
+      ],
+    };
+  }
   if (mutation.kind === "refresh") {
     return {
       fence: commonFence,
@@ -5260,38 +6211,43 @@ function deploymentMutationSql(
       ],
     };
   }
-  return {
-    fence: commonFence,
-    fenceParams: commonParams,
-    statements: [
-      {
-        sql: mutation.operationId
-          ? `UPDATE tf_resource_deployments
-              SET state = 'deleted',
-                    outputs_json = json_set(
-                    outputs_json,
-                    '$.__takoserver.deleteOperationId', ?,
-                    '$.__takoserver.resourceUid', ?,
-                    '$.__takoserver.space', ?,
-                    '$.__takoserver.name', ?
-                  ),
-                  updated_at = ?
-              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
-          : `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
-              WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
-        params: mutation.operationId
-          ? [
-              mutation.operationId,
-              mutation.resourceUid ?? "",
-              mutation.space ?? "",
-              mutation.name ?? "",
-              timestamp,
-              ...commonParams,
-            ]
-          : [timestamp, ...commonParams],
-      },
-    ],
-  };
+  if (mutation.kind === "delete") {
+    return {
+      fence: commonFence,
+      fenceParams: commonParams,
+      statements: [
+        {
+          sql: mutation.operationId
+            ? `UPDATE tf_resource_deployments
+                SET state = 'deleted',
+                      outputs_json = json_set(
+                      outputs_json,
+                      '$.__takoserver.deleteOperationId', ?,
+                      '$.__takoserver.resourceUid', ?,
+                      '$.__takoserver.space', ?,
+                      '$.__takoserver.name', ?
+                    ),
+                    updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`
+            : `UPDATE tf_resource_deployments SET state = 'deleted', updated_at = ?
+                WHERE tenant_id = ? AND id = ? AND native_id = ? AND state = 'active'`,
+          params: mutation.operationId
+            ? [
+                mutation.operationId,
+                mutation.resourceUid ?? "",
+                mutation.space ?? "",
+                mutation.name ?? "",
+                timestamp,
+                ...commonParams,
+              ]
+            : [timestamp, ...commonParams],
+        },
+      ],
+    };
+  }
+  const exhaustive: never = mutation;
+  void exhaustive;
+  throw new TypeError("unknown resource deployment mutation kind");
 }
 
 function deferredOperation(row: Row): DeferredOperationRecord {
@@ -5313,6 +6269,19 @@ function deferredOperation(row: Row): DeferredOperationRecord {
   if (operation !== "apply" && operation !== "import" && operation !== "delete") {
     throw new TypeError("invalid stored deferred operation kind");
   }
+  const acceptedAuthority =
+    typeof row.accepted_authority_json === "string"
+      ? parseAcceptedAuthority(row.accepted_authority_json)
+      : undefined;
+  const acceptedUid = typeof row.accepted_uid === "string" ? row.accepted_uid : undefined;
+  if (acceptedAuthority) {
+    assertAcceptedAuthorityRecord({
+      summary: acceptedAuthority,
+      operation,
+      formRef: formRef as unknown as TakoformV1Alpha3FormRef,
+      ...(acceptedUid !== undefined ? { acceptedUid } : {}),
+    });
+  }
   return {
     id: text(row.id),
     tenantId: text(row.tenant_id),
@@ -5332,7 +6301,8 @@ function deferredOperation(row: Row): DeferredOperationRecord {
       name: text(row.target_name),
       formRef: formRef as unknown as TakoformV1Alpha3FormRef,
     },
-    ...(typeof row.accepted_uid === "string" ? { acceptedUid: row.accepted_uid } : {}),
+    ...(acceptedAuthority ? { acceptedAuthority } : {}),
+    ...(acceptedUid !== undefined ? { acceptedUid } : {}),
     ...(typeof row.accepted_generation === "string"
       ? { acceptedGeneration: row.accepted_generation }
       : {}),
@@ -5604,6 +6574,7 @@ function uncommittedResourceIncarnationRelease(input: {
     input.resourceUid,
     input.effectId,
   ] as const;
+  const [dependencyStart, dependencyEnd] = resourceDependencyClaimRange();
   return {
     fence,
     fenceParams,
@@ -5613,6 +6584,20 @@ function uncommittedResourceIncarnationRelease(input: {
               WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
                 AND ${fence}`,
         params: [input.tenantId, input.resourceUid, input.effectId, ...fenceParams],
+      },
+      {
+        // Reserved dependency claims are re-owned to the dispatched operation
+        // with the saga's non-expiring repair horizon. When the attempt is
+        // provably uncommitted, every reserved dependency claim on this
+        // incarnation is definitionally leaked — no live operation can hold
+        // one, because a live operation would violate the fence above. The
+        // release paths that run before provider dispatch already cover the
+        // reservation-owner case; this covers the dispatched-owner case.
+        sql: `DELETE FROM tf_resource_claims
+              WHERE tenant_id = ? AND holder_uid = ? AND state = 'reserved'
+                AND claim_key >= ? AND claim_key < ?
+                AND ${fence}`,
+        params: [input.tenantId, input.resourceUid, dependencyStart, dependencyEnd, ...fenceParams],
       },
       {
         sql: `DELETE FROM tf_resource_deletion_attestations
@@ -5648,6 +6633,36 @@ function resourceDependencyFencesJson(dependencies: ResourceDependencySet): stri
   );
 }
 
+function compensationSelectionMatchesDependencies(
+  selection: TakoformApplySelection,
+  dependencies: ResourceDependencySet,
+  targetSpace: string,
+): boolean {
+  if (selection.kind !== "provider" || selection.incumbent !== undefined) return false;
+  if (
+    selection.relations.some(
+      (relation) =>
+        relation.targetUid !== relation.resource.uid || relation.resource.space !== targetSpace,
+    )
+  ) {
+    return false;
+  }
+  const selectedRelations: readonly TakoformStoredRelation[] = selection.relations.map(
+    (relation) => ({
+      pointer: relation.pointer,
+      relation: relation.relation,
+      targetApiVersion: relation.resource.apiVersion,
+      targetKind: relation.resource.kind,
+      targetName: relation.resource.name,
+      targetUid: relation.targetUid,
+      targetRevision: relation.resource.revision,
+      targetFormRef: structuredClone(relation.resource.formRef),
+      ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+    }),
+  );
+  return canonicalJson(selectedRelations) === canonicalJson(dependencies.relations);
+}
+
 /** D1 bounds each string parameter at 2,000,000 bytes, including JSON1 inputs. */
 function boundedResourceDependencyJson(value: unknown, label: string): string {
   const serialized = canonicalJson(value);
@@ -5681,6 +6696,14 @@ async function resourceDependenciesStillCurrent(
   if (canonicalJson(rows.map((row) => text(row.claim_key))) !== canonicalJson(expectedKeys)) {
     return false;
   }
+  return await resourceDependencyTargetsStillCurrent(sql, input.tenantId, input.dependencies);
+}
+
+async function resourceDependencyTargetsStillCurrent(
+  sql: Sql,
+  tenantId: string,
+  dependencies: ResourceDependencySet,
+): Promise<boolean> {
   const targets = await sql.query(
     `SELECT CASE WHEN NOT EXISTS (
        SELECT 1 FROM json_each(?) AS fence
@@ -5705,7 +6728,7 @@ async function resourceDependenciesStillCurrent(
            )
        )
      ) THEN 1 ELSE 0 END AS current`,
-    [resourceDependencyFencesJson(input.dependencies), input.tenantId],
+    [resourceDependencyFencesJson(dependencies), tenantId],
   );
   return targets.length === 1 && targets[0]?.current === 1;
 }

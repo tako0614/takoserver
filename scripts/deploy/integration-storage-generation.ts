@@ -1,16 +1,12 @@
-import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  applicationSchemaMatches,
+  canonicalApplicationShape,
+  deriveExpectedApplicationShape,
+} from "./application-schema-shape.ts";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
@@ -20,7 +16,7 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
-import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
+import { type D1SchemaState, readD1SchemaState } from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -97,6 +93,12 @@ export interface IntegrationStorageGenerationProvider {
   createR2(name: string): Promise<IntegrationStorageR2Bucket>;
 }
 
+/** Read-only provider authority used when a generated target is admitted for publication. */
+export interface IntegrationStorageTargetReadProvider {
+  getD1(databaseId: string): Promise<IntegrationStorageD1Database>;
+  getR2(name: string): Promise<IntegrationStorageR2Bucket>;
+}
+
 export type IntegrationStorageFetcher = (request: Request) => Promise<Response>;
 
 export type IntegrationStorageGenerationProcess = (
@@ -133,6 +135,39 @@ export interface IntegrationStorageGenerationOptions {
   readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
 }
 
+export interface IntegrationStorageGenerationTargetProof {
+  readonly generation: string;
+  readonly d1: { readonly databaseId: string; readonly databaseName: string };
+  readonly r2: { readonly bucketName: string };
+  readonly migrationDigest: string;
+  readonly appliedMigrations: readonly string[];
+  readonly schemaShapeDigest: string;
+}
+
+/**
+ * Narrow read-only seam for proving that the selected integration Worker
+ * target names one existing generated storage pair with the exact audited D1
+ * schema. It intentionally exposes no create/delete/update capability.
+ */
+export interface IntegrationStorageGenerationTargetVerificationOptions {
+  readonly run?: IntegrationStorageGenerationProcess;
+  /** Wrangler executable selected by the composing owner. */
+  readonly wranglerPath?: string;
+  readonly cloudflareEnvironment?: Readonly<Record<string, string>>;
+  readonly provider?: IntegrationStorageTargetReadProvider;
+  readonly fetcher?: IntegrationStorageFetcher;
+  readonly reader?: IntegrationStorageGenerationStateReader | Pick<SchemaReader, "read">;
+  readonly readD1State?: IntegrationStorageGenerationOptions["readD1State"];
+  readonly migrationDirectory?: string;
+  readonly outputDirectory?: string;
+  readonly wranglerCommand?: IntegrationStorageGenerationOptions["wranglerCommand"];
+}
+
+type IntegrationStorageGeneratedStateOptions = Pick<
+  IntegrationStorageGenerationOptions,
+  "readD1State" | "reader" | "wranglerCommand"
+> & { readonly wranglerPath?: string };
+
 /**
  * Read-only/status and one-way fresh-storage bootstrap for integration.
  *
@@ -153,9 +188,161 @@ export async function runIntegrationStorageGeneration(
   return await applyStorageGeneration(invocation, target, names, options);
 }
 
+/**
+ * Proves, without provider mutation, the exact generated storage pair selected
+ * by an integration target. The D1 binding ID, resource name, R2 name, audited
+ * migration lineage and canonical application schema all participate in the
+ * returned proof so callers can compare two fences exactly.
+ */
+export async function verifyIntegrationStorageGenerationTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<IntegrationStorageGenerationTargetProof> {
+  const generated = generatedStorageTarget(target, environment);
+  const providerContext = await resolveTargetReadProvider(target, environment, options);
+  const d1 = await providerCall("preflight", "generated target D1 identity readback failed", () =>
+    providerContext.provider.getD1(generated.databaseId),
+  );
+  let verifiedD1: IntegrationStorageD1Database;
+  try {
+    verifiedD1 = validateD1Summary(d1, "generated target D1 identity readback");
+  } catch {
+    throw preflightError("generated target D1 identity readback returned a malformed identity");
+  }
+  if (verifiedD1.uuid !== generated.databaseId || verifiedD1.name !== generated.databaseName) {
+    throw preflightError(
+      "generated target D1 identity readback does not match the exact target ID and name",
+      `databaseId=${generated.databaseId}`,
+    );
+  }
+
+  const r2 = await providerCall("preflight", "generated target R2 identity readback failed", () =>
+    providerContext.provider.getR2(generated.bucketName),
+  );
+  let verifiedR2: IntegrationStorageR2Bucket;
+  try {
+    verifiedR2 = validateR2Summary(r2, "generated target R2 identity readback");
+  } catch {
+    throw preflightError("generated target R2 identity readback returned a malformed identity");
+  }
+  if (verifiedR2.name !== generated.bucketName) {
+    throw preflightError(
+      "generated target R2 identity readback does not match the exact target name",
+    );
+  }
+
+  const sourceArtifact = readAuditedMigrationArtifact(
+    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+  );
+  const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
+  const temporary = options.outputDirectory === undefined;
+  const root =
+    options.outputDirectory ??
+    mkdtempSync(join(tmpdir(), "takoserver-integration-storage-verify-"));
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const configPath = join(root, "read-wrangler.jsonc");
+  try {
+    if (existsSync(configPath)) {
+      throw preflightError("generated target verification output directory is already in use");
+    }
+    writeGenerationConfig(
+      configPath,
+      target.accountId,
+      generated.databaseName,
+      generated.databaseId,
+    );
+    const migrationState = await readGeneratedState(
+      "preflight",
+      configPath,
+      {
+        accountId: target.accountId,
+        databaseName: generated.databaseName,
+        databaseId: generated.databaseId,
+      },
+      providerContext.environment,
+      options.run ?? runCommand,
+      {
+        ...(options.readD1State === undefined ? {} : { readD1State: options.readD1State }),
+        ...(options.reader === undefined ? {} : { reader: options.reader }),
+        ...(options.wranglerCommand === undefined
+          ? {}
+          : { wranglerCommand: options.wranglerCommand }),
+        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+      },
+    );
+    assertCompleteDatabase(
+      migrationState,
+      sourceArtifact.names,
+      sourceArtifact.digest,
+      expectedApplicationShape,
+      generated.databaseId,
+      "preflight",
+    );
+    return {
+      generation: generated.generation,
+      d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
+      r2: { bucketName: generated.bucketName },
+      migrationDigest: sourceArtifact.digest,
+      appliedMigrations: [...migrationState.applied],
+      schemaShapeDigest: migrationState.shapeDigest,
+    };
+  } finally {
+    if (temporary) rmSync(root, { recursive: true, force: true });
+  }
+}
+
 interface StorageNames {
   readonly databaseName: string;
   readonly bucketName: string;
+}
+
+interface GeneratedStorageTarget {
+  readonly generation: string;
+  readonly accountId: string;
+  readonly databaseName: string;
+  readonly databaseId: string;
+  readonly bucketName: string;
+}
+
+function generatedStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+): GeneratedStorageTarget {
+  if (environment !== "integration" || target.environment !== environment) {
+    throw preflightError("generated storage target verification is integration-only");
+  }
+  if (!ACCOUNT_ID.test(target.accountId)) {
+    throw preflightError("generated storage target verification requires one exact account id");
+  }
+  const databaseName = target.d1.databaseName;
+  const bucketName = target.r2.bucketName;
+  const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
+  if (generated === null || bucketName !== databaseName || !UUID.test(target.d1.databaseId)) {
+    throw preflightError(
+      "integration target must select one exact matching generated D1/R2 storage pair",
+    );
+  }
+  return {
+    generation: generated[1] as string,
+    accountId: target.accountId,
+    databaseName,
+    databaseId: target.d1.databaseId,
+    bucketName,
+  };
+}
+
+/** Purely identifies whether a selected environment target is this surface's generated pair. */
+export function isGeneratedIntegrationStorageTarget(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+): boolean {
+  try {
+    generatedStorageTarget(target, environment);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function validateInvocation(
@@ -254,6 +441,34 @@ async function resolveProvider(
   const credential = await resolveCloudflareCredential("integration", {
     cloudflareEnvironment: options.cloudflareEnvironment,
     run,
+  });
+  return {
+    provider: new CloudflareIntegrationStorageProvider(target.accountId, credential.token, {
+      ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+    }),
+    environment: credential.childEnvironment,
+  };
+}
+
+async function resolveTargetReadProvider(
+  target: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions,
+): Promise<{
+  readonly provider: IntegrationStorageTargetReadProvider;
+  readonly environment: Readonly<Record<string, string>>;
+}> {
+  if (options.provider !== undefined) {
+    return {
+      provider: options.provider,
+      environment: options.cloudflareEnvironment ?? {},
+    };
+  }
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential(environment, {
+    cloudflareEnvironment: options.cloudflareEnvironment,
+    run,
+    ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
   });
   return {
     provider: new CloudflareIntegrationStorageProvider(target.accountId, credential.token, {
@@ -504,33 +719,6 @@ async function checkedMigrationGate(run: IntegrationStorageGenerationProcess): P
   }
 }
 
-type MigrationArtifactFile = ReturnType<typeof readAuditedMigrationArtifact>["files"][number];
-
-/**
- * Reconstruct the schema expected from the sealed SQL before any provider
- * mutation.  The comparison deliberately ignores only the platform-owned
- * migration/KV metadata rows that do not belong to the application schema.
- */
-function deriveExpectedApplicationShape(files: readonly MigrationArtifactFile[]): string {
-  const database = new Database(":memory:");
-  try {
-    for (const file of files) {
-      database.exec(readFileSync(file.path, "utf8"));
-    }
-    const rows = database
-      .query(
-        "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
-          "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
-      )
-      .all() as Record<string, unknown>[];
-    return canonicalSchemaShape(rows.filter((row) => !isPlatformSchemaMetadata(row)));
-  } catch {
-    throw preflightError("audited migrations could not reconstruct the expected canonical schema");
-  } finally {
-    database.close();
-  }
-}
-
 interface GeneratedD1Target {
   readonly accountId: string;
   readonly databaseName: string;
@@ -618,7 +806,7 @@ async function readGeneratedState(
   target: GeneratedD1Target,
   environment: Readonly<Record<string, string>>,
   run: IntegrationStorageGenerationProcess,
-  options: IntegrationStorageGenerationOptions,
+  options: IntegrationStorageGeneratedStateOptions,
 ): Promise<D1SchemaState> {
   if (options.readD1State !== undefined) {
     return await options.readD1State(phase, {
@@ -630,13 +818,28 @@ async function readGeneratedState(
     });
   }
   if (options.reader !== undefined) return await options.reader.read(phase);
-  return await readD1SchemaState(new RemoteD1(configPath, { environment, run }), phase);
+  return await readD1SchemaState(
+    new RemoteD1(configPath, {
+      environment,
+      run,
+      wranglerCommand: generatedStateWranglerCommand(options),
+    }),
+    phase,
+  );
+}
+
+function generatedStateWranglerCommand(
+  options: IntegrationStorageGeneratedStateOptions,
+): (args: readonly string[]) => readonly string[] {
+  if (options.wranglerCommand !== undefined) return options.wranglerCommand;
+  const wranglerPath = options.wranglerPath;
+  return wranglerPath === undefined ? wranglerCommand : (args) => [wranglerPath, ...args];
 }
 
 function assertEmptyDatabase(state: D1SchemaState, databaseId: string): void {
   let applicationShape: string;
   try {
-    applicationShape = assertCanonicalShape(state, databaseId);
+    applicationShape = canonicalApplicationShape(state);
   } catch {
     throw mutationError(
       "new D1 empty readback is not a canonical schema shape; migration is withheld",
@@ -667,11 +870,12 @@ function assertCompleteDatabase(
   migrationDigest: string,
   expectedApplicationShape: string,
   databaseId: string,
+  phase: "preflight" | "verification" = "verification",
 ): void {
   if (JSON.stringify(state.applied) !== JSON.stringify(expectedMigrations)) {
-    throw verificationError(
-      "D1 migration readback does not contain the exact audited 0001-0057 lineage; " +
-        "R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "does not contain the exact audited 0001-0063 lineage",
       JSON.stringify({ databaseId, expectedMigrations, appliedMigrations: state.applied }),
     );
   }
@@ -680,90 +884,39 @@ function assertCompleteDatabase(
     !SHA256.test(state.shapeDigest) ||
     state.shapeDigest !== digestShape(state.shape)
   ) {
-    throw verificationError(
-      "D1 migration readback has an invalid canonical schema digest; R2 creation is withheld",
+    throw completeDatabaseReadbackError(
+      phase,
+      "has an invalid canonical schema digest",
       `databaseId=${databaseId}`,
     );
   }
-  const applicationShape = assertCanonicalShape(state, databaseId);
-  if (applicationShape !== expectedApplicationShape) {
-    throw verificationError(
-      "D1 migration readback differs from the exact audited application schema; " +
-        "R2 creation is withheld",
+  try {
+    canonicalApplicationShape(state);
+  } catch {
+    throw completeDatabaseReadbackError(
+      phase,
+      "is not a canonical schema shape",
+      `databaseId=${databaseId}`,
+    );
+  }
+  if (!applicationSchemaMatches(state, expectedApplicationShape)) {
+    throw completeDatabaseReadbackError(
+      phase,
+      "differs from the exact audited application schema",
       `databaseId=${databaseId}`,
     );
   }
 }
 
-function assertCanonicalShape(state: D1SchemaState, databaseId: string): string {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(state.shape);
-  } catch {
-    throw verificationError(
-      "D1 migration readback is not a canonical schema shape; R2 creation is withheld",
-      `databaseId=${databaseId}`,
-    );
+function completeDatabaseReadbackError(
+  phase: "preflight" | "verification",
+  reason: string,
+  detail: string,
+): DeployError {
+  if (phase === "preflight") {
+    return preflightError(`Existing generated D1 schema readback ${reason}`, detail);
   }
-  if (!Array.isArray(parsed)) {
-    throw verificationError(
-      "D1 migration readback is not a canonical schema shape; R2 creation is withheld",
-      `databaseId=${databaseId}`,
-    );
-  }
-  const rows = parsed.map((entry) => {
-    if (!isRecord(entry)) {
-      throw verificationError(
-        "D1 migration readback contains a malformed canonical schema row; R2 creation is withheld",
-        `databaseId=${databaseId}`,
-      );
-    }
-    const keys = Object.keys(entry).sort();
-    if (JSON.stringify(keys) !== JSON.stringify(["name", "sql", "table", "type"])) {
-      throw verificationError(
-        "D1 migration readback contains an unexpected canonical schema row; " +
-          "R2 creation is withheld",
-        `databaseId=${databaseId}`,
-      );
-    }
-    if (
-      typeof entry.type !== "string" ||
-      typeof entry.name !== "string" ||
-      typeof entry.table !== "string" ||
-      typeof entry.sql !== "string"
-    ) {
-      throw verificationError(
-        "D1 migration readback contains a malformed canonical schema row; R2 creation is withheld",
-        `databaseId=${databaseId}`,
-      );
-    }
-    return {
-      type: entry.type,
-      name: entry.name,
-      tbl_name: entry.table,
-      sql: entry.sql,
-    };
-  });
-  try {
-    if (canonicalSchemaShape(rows) !== state.shape) {
-      throw new Error("noncanonical");
-    }
-  } catch {
-    throw verificationError(
-      "D1 migration readback is not canonically ordered; R2 creation is withheld",
-      `databaseId=${databaseId}`,
-    );
-  }
-  return canonicalSchemaShape(rows.filter((row) => !isPlatformSchemaMetadata(row)));
-}
-
-function isPlatformSchemaMetadata(row: Record<string, unknown>): boolean {
-  return (
-    row.name === "d1_migrations" ||
-    row.tbl_name === "d1_migrations" ||
-    row.name === "_cf_KV" ||
-    row.tbl_name === "_cf_KV"
-  );
+  return verificationError(`D1 migration readback ${reason}; R2 creation is withheld`, detail);
 }
 
 function digestShape(shape: string): string {

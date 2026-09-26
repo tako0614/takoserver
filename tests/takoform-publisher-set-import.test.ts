@@ -47,13 +47,13 @@ const CAPABILITIES = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAP
 const EXPECTED_REPOSITORY = "https://github.com/tako0614/takoform-forms.git";
 const EXPECTED_REPOSITORY_COMMIT = "3231633605b737ce5279d7fc020b4780568e7091";
 const EXPECTED_SET_ID = "e7f8a39311dd011b8467e97e7f300cabb9a6b06c";
-const IMPLEMENTED_KINDS = [...Object.keys(YURUCOMMU_FORM_VERSIONS), "WorkerCustomDomain"].sort();
+const IMPLEMENTED_KINDS = Object.keys(YURUCOMMU_FORM_VERSIONS).sort();
 /** Core attests the exact raw policy bytes; the Host pins the canonical digest. */
 const RAW_POLICY_DIGEST = await bytesDigest(
   new TextEncoder().encode(TAKOFORM_PUBLISHER_SET_AUTHORITY_CLOSURE.core.publisherPolicy),
 );
-/** These publisher Forms have no concrete Takoserver handler yet. */
-const UNIMPLEMENTED_KINDS = ["ActorNamespace", "DurableWorkflow"];
+/** These publisher Forms lack a declared capability or concrete runtime handler. */
+const UNIMPLEMENTED_KINDS = ["ActorNamespace", "DurableWorkflow", "WorkerCustomDomain"];
 
 describe("exact publisher-set import", () => {
   test("binds one exact import identity and a closed 17-package evidence set", async () => {
@@ -133,7 +133,7 @@ describe("exact publisher-set import", () => {
     ).rejects.toMatchObject({ code: "package_unavailable" });
   });
 
-  test("plans the complete import but supports and activates only forms with handlers", async () => {
+  test("plans the complete import but supports and activates only declared capabilities with handlers", async () => {
     const fixture = await productionFixture(fakeContainer());
     const plan = await fixture.composition.endpoint.plan(fixture.request);
 
@@ -233,9 +233,9 @@ describe("exact publisher-set import", () => {
     );
     expect(customDomain).toMatchObject({
       installed: true,
-      supported: true,
+      supported: false,
       operations: [],
-      activationHead: { present: true, active: true },
+      activationHead: { present: false, active: false },
     });
     // ADR 0007 moved ObjectBucket into the code-owned implementation catalog,
     // so the exact current package is now installed, supported, and active

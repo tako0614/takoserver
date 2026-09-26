@@ -29,6 +29,7 @@ export {
 } from "./actor-class-execution.ts";
 
 export { createCloudflareProviderSurface } from "./cloudflare-provider-surface.ts";
+export { parseWorkerCron, type WorkerCronSchedule } from "./cron.ts";
 export { buildEdgeForms } from "./edge-forms.ts";
 export { isEdgeFormsApiVersion } from "./form-ref.ts";
 export {
@@ -58,12 +59,19 @@ export { createProviderPack, type ProviderPackDefinition } from "./provider-pack
 export {
   type ApplyInput,
   failed,
+  failedAfterProviderOperationCompensation,
   failedWithoutProviderMutation,
+  failedWithoutProviderOperationMutation,
   PROVIDER_READBACK_API_VERSION,
   type Provider,
+  type ProviderApplyCompensationInput,
+  type ProviderApplyCompensationResult,
+  type ProviderApplyNoEffectConclusionInput,
+  type ProviderApplyNoEffectConclusionResult,
   type ProviderArtifactConsumption,
   type ProviderArtifactConsumptionInput,
   type ProviderExecutionAuthority,
+  type ProviderFailure,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
@@ -75,6 +83,9 @@ export {
   type ProviderSqliteMigrationIdentity,
   type ProviderTicket,
   type ProviderValue,
+  providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationCompensated,
+  providerFailureProvesWholeOperationNoMutation,
   type ResourceIdentity,
   succeeded,
 } from "./provider-port.ts";
@@ -113,8 +124,20 @@ export {
 } from "./providers/cloudflare-provider-executor-codec.ts";
 export type {
   CloudflareProviderAdoptInput,
+  CloudflareProviderAdoptionRecoveryResult,
+  CloudflareProviderApplyCompensationResult,
+  CloudflareProviderApplyConvergenceResult,
+  CloudflareProviderApplyNoEffectConclusionResult,
   CloudflareProviderDeleteInput,
+  CloudflareProviderExecutorAdoptionAbortEvidence,
+  CloudflareProviderExecutorApplyAbortEvidence,
+  CloudflareProviderExecutorApplyCompensationEvidence,
+  CloudflareProviderExecutorApplyCompensationUnsupportedEvidence,
+  CloudflareProviderExecutorApplyNoEffectEvidence,
+  CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence,
+  CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
+  CloudflareProviderInitialMutationResult,
   CloudflareProviderMeterReadInput,
   CloudflareProviderObserveInput,
   CloudflareProviderPollInput,
@@ -122,6 +145,13 @@ export type {
   CloudflareProviderSqliteMigrationReadInput,
   CloudflareProviderVerifyArtifactConsumptionInput,
   CloudflareProviderVerifyNativeAbsenceInput,
+} from "./providers/cloudflare-provider-executor-port.ts";
+export {
+  CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CloudflareProviderProxy,
@@ -143,9 +173,11 @@ export {
 export type {
   ArtifactBytes,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackend,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerDeleteInput,
@@ -218,6 +250,7 @@ export {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export { isSpaceId } from "./takoform/space-id.ts";
 export {
   parseVectorIndexConfig,
   type VectorIndexConfig,

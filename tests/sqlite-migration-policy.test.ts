@@ -6,6 +6,7 @@ import {
   MigrationSqlCapacityError,
   prepareMigrationSql,
 } from "../src/providers/sqlite-migration-policy.ts";
+import { miniflareServiceBinding } from "./helpers/miniflare-service-binding.ts";
 
 const utf8 = (value: string): number => new TextEncoder().encode(value).byteLength;
 
@@ -231,9 +232,11 @@ test("prepared boundaries agree with the pinned workerd SQLite completion FSM", 
           exports: { CompleteOracle: { type: "durable-object", storage: "sqlite" } },
           env: {
             ORACLES: {
-              type: "durable-object",
-              workerName: "sqlite-complete-oracle",
-              exportName: "CompleteOracle",
+              ...miniflareServiceBinding(
+                "durable-object",
+                "sqlite-complete-oracle",
+                "CompleteOracle",
+              ),
             },
           },
           triggers: [],

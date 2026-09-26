@@ -864,7 +864,7 @@ async function publishWranglerVersionWhileLeased(
   if (upload.exitCode !== 0) {
     throw mutationError(
       "Worker Version upload acknowledgement is indeterminate; do not retry before --status",
-      `exit=${upload.exitCode}`,
+      safeWranglerFailureDetail(upload),
     );
   }
   let uploaded: { readonly versionId: string };
@@ -921,7 +921,7 @@ async function publishWranglerVersionWhileLeased(
   if (deployed.exitCode !== 0) {
     throw mutationError(
       "Worker Version deployment acknowledgement is indeterminate; do not retry before --status",
-      `exit=${deployed.exitCode}`,
+      safeWranglerFailureDetail(deployed),
     );
   }
   let deployment: { readonly deploymentId: string };
@@ -994,7 +994,7 @@ export async function deployExistingWranglerVersion(input: {
   if (deployed.exitCode !== 0) {
     throw mutationError(
       "Worker rollback deployment acknowledgement is indeterminate; run --status before repair",
-      `exit=${deployed.exitCode}`,
+      safeWranglerFailureDetail(deployed),
     );
   }
   let deployment: { readonly deploymentId: string };
@@ -1034,7 +1034,7 @@ async function runPublicationCommand(
 }
 
 /**
- * Keep lifecycle publication failures useful without replaying Wrangler's
+ * Keep Wrangler publication failures useful without replaying Wrangler's
  * account, credential, target, URL, or arbitrary diagnostic text. The only
  * provider values retained are exact bounded `[code: N]` markers and the
  * small fixed set of network categories that Wrangler/Node emits.

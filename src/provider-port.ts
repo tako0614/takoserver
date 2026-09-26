@@ -205,6 +205,60 @@ export interface ProviderExecutionAuthority {
   readonly fingerprint: string;
 }
 
+/**
+ * Closed authority for concluding one already-dispatched create as no-effect.
+ *
+ * This input deliberately cannot describe a provider mutation. In particular,
+ * it carries no desired spec, relations, previous native identity, provider
+ * handle, runtime material, standard-service projection, or migration bytes.
+ * A provider may use it only to fence its own exact operation record against a
+ * late initial invocation and return operation-wide no-effect proof.
+ */
+export interface ProviderApplyNoEffectConclusionInput {
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+  readonly offering: ProviderOffering;
+  readonly identity: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly name: string;
+    readonly uid: string;
+  };
+}
+
+/**
+ * `unsupported` is a trusted pre-attempt answer: the provider did not begin a
+ * conclusion or mutate its abort fence. Every other non-proof result remains
+ * an ordinary ProviderTicket and therefore leaves the accepted saga held.
+ */
+export type ProviderApplyNoEffectConclusionResult =
+  | ProviderTicket
+  | { readonly phase: "unsupported" };
+
+/**
+ * Closed authority for compensating one already-dispatched accepted create.
+ *
+ * Compensation is a provider mutation, not no-effect proof. This envelope is
+ * deliberately limited to immutable operation, placement, resource identity,
+ * and the current Host lease; it cannot describe a new desired apply.
+ */
+export interface ProviderApplyCompensationInput {
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+  readonly offering: ProviderOffering;
+  readonly identity: {
+    readonly tenantRef: string;
+    readonly space: string;
+    readonly name: string;
+    readonly uid: string;
+  };
+}
+
+/** `unsupported` is valid only before the compensation attempt begins. */
+export type ProviderApplyCompensationResult = ProviderTicket | { readonly phase: "unsupported" };
+
 export interface ApplyInput extends ProviderMutationInput {
   readonly offering: ProviderOffering;
   readonly identity: ResourceIdentity;
@@ -480,6 +534,21 @@ export interface Provider {
    */
   recoverApply?(input: ApplyInput): Promise<ProviderTicket>;
   /**
+   * Durably fences one accepted create against every provider effect and, only
+   * then, may return whole-operation no-effect proof. This is neither read-only
+   * recovery nor mutation convergence: it cannot observe/adopt/create a native
+   * resource and cannot be used for updates or handled operations.
+   */
+  concludeApplyNoEffect?(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<ProviderApplyNoEffectConclusionResult>;
+  /**
+   * Reverses and durably fences provider effects for one exact accepted create.
+   * A conclusive failure is distinct from no-effect proof because the original
+   * effect and its compensation must remain visible in the Host lifecycle.
+   */
+  compensateApply?(input: ProviderApplyCompensationInput): Promise<ProviderApplyCompensationResult>;
+  /**
    * Mutating convergence for an apply command whose durable Host dispatch may
    * already have crossed the provider boundary. The Host calls this only while
    * holding the exact operation lease. Implementations must key every effect
@@ -527,6 +596,22 @@ export interface Provider {
     readonly operationMode?: "initial" | "recovery";
     readonly providerHandle?: string;
     readonly executionAuthority?: ProviderExecutionAuthority;
+    readonly offering: ProviderOffering;
+    readonly nativeId: string;
+    readonly identity: ResourceIdentity;
+    readonly spec?: JsonObject;
+    readonly relations?: readonly ProviderRelation[];
+  }): Promise<ProviderTicket>;
+  /**
+   * Lease-scoped delete convergence for a retained Host saga. Unlike
+   * `recoverDelete`, this capability may perform the next provider mutation,
+   * so it is reachable only from the maintenance repair lane.
+   */
+  convergeDelete?(input: {
+    readonly operationId: string;
+    readonly operationMode: "recovery";
+    readonly providerHandle?: string;
+    readonly executionAuthority: ProviderExecutionAuthority;
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
@@ -606,6 +691,26 @@ export function failed(
  */
 const mutationFreeProviderRefusals = new WeakMap<object, string>();
 
+/**
+ * Non-wire proof that recovery durably concluded the whole named operation
+ * without any provider mutation, including every earlier invocation.
+ *
+ * This is deliberately a separate identity-bound capability from the
+ * invocation-only proof above. It may be minted only after recovery has
+ * durably closed the exact operation's provider reservation/receipt, and it
+ * cannot survive cloning or an untrusted RPC boundary.
+ */
+const wholeOperationMutationFreeProviderRefusals = new WeakMap<object, string>();
+
+/**
+ * Non-wire proof that the named operation's provider effects were durably
+ * compensated and fenced against later completion. Effects did happen: this
+ * proof must never be consumed as an invocation- or operation-wide no-mutation
+ * refusal. Producers retain the original effect and compensation evidence in
+ * their own durable authority before minting this identity-bound ticket.
+ */
+const compensatedProviderOperationFailures = new WeakMap<object, string>();
+
 export function failedWithoutProviderMutation(
   operationId: string,
   code: ProviderFailure["code"],
@@ -625,6 +730,50 @@ export function providerFailureProvesNoMutation(
     ticket.phase === "failed" &&
     !ticket.failure.retryable &&
     mutationFreeProviderRefusals.get(ticket) === operationId
+  );
+}
+
+export function failedWithoutProviderOperationMutation(
+  operationId: string,
+  code: ProviderFailure["code"],
+  message: string,
+): ProviderTicket {
+  const ticket = failed(code, message, false);
+  wholeOperationMutationFreeProviderRefusals.set(ticket, operationId);
+  return ticket;
+}
+
+/** Host-internal consumer for the whole-operation recovery proof above. */
+export function providerFailureProvesWholeOperationNoMutation(
+  ticket: ProviderTicket,
+  operationId: string,
+): boolean {
+  return (
+    ticket.phase === "failed" &&
+    !ticket.failure.retryable &&
+    wholeOperationMutationFreeProviderRefusals.get(ticket) === operationId
+  );
+}
+
+export function failedAfterProviderOperationCompensation(
+  operationId: string,
+  code: ProviderFailure["code"],
+  message: string,
+): ProviderTicket {
+  const ticket = failed(code, message, false);
+  compensatedProviderOperationFailures.set(ticket, operationId);
+  return ticket;
+}
+
+/** Only the dedicated compensation recovery seam may consume this proof. */
+export function providerFailureProvesWholeOperationCompensated(
+  ticket: ProviderTicket,
+  operationId: string,
+): boolean {
+  return (
+    ticket.phase === "failed" &&
+    !ticket.failure.retryable &&
+    compensatedProviderOperationFailures.get(ticket) === operationId
   );
 }
 

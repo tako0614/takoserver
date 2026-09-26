@@ -15,6 +15,10 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  applicationSchemaMatches,
+  deriveExpectedApplicationShape,
+} from "./application-schema-shape.ts";
+import {
   type ArtifactBlobIoDeploymentCompatibility,
   inspectArtifactBlobIoDeploymentCompatibility,
 } from "./artifact-blob-io-compatibility.ts";
@@ -117,6 +121,12 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0055_queue_custody_transfer_notices.sql",
   "0056_vector_index_storage.sql",
   "0057_cloudflare_managed_worker_version_execution_material.sql",
+  "0058_cloudflare_managed_worker_domain_receipts.sql",
+  "0059_takoform_apply_provider_selection.sql",
+  "0060_takoform_operation_generation.sql",
+  "0061_takoform_accepted_authority_continuity.sql",
+  "0062_takoform_import_provider_selection.sql",
+  "0063_cloudflare_managed_queue_retirement.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -234,7 +244,26 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:08f4c00798d4c8d377ba73abcd8e063d6e3e896f2f4b2d89c7e3830e1e11442a",
   "0057_cloudflare_managed_worker_version_execution_material.sql":
     "sha256:37ed54cda2385be78cbcb288683c1ce5896a902e49a5d9abe9231a825a6869d3",
+  "0058_cloudflare_managed_worker_domain_receipts.sql":
+    "sha256:11460e5d365ba0c5021b8432220e20acbbfe0104af3ca8fc921d3e8fc3824412",
+  "0059_takoform_apply_provider_selection.sql":
+    "sha256:c0af2dc82b77578496efe16e760d6a83727adf12385dda289637de142b3473eb",
+  "0060_takoform_operation_generation.sql":
+    "sha256:4d5c04322a3eee95669a8ad83186ad0bf4a69ca192110c6e05d07bebc5ca99c2",
+  "0061_takoform_accepted_authority_continuity.sql":
+    "sha256:63d2029fa680130f4af59fae2f1f613a7d9ea220816eb224576521b59943ad88",
+  "0062_takoform_import_provider_selection.sql":
+    "sha256:1ba57124b32b621eda2a7ba08a461731aead99ce956e82de59726cdb3c365c3e",
+  "0063_cloudflare_managed_queue_retirement.sql":
+    "sha256:fb247f28b621ebe800711013ff3ea4b11fa276c41f1a5c6ffc4344a51dd2cc66",
 };
+const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
+const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(
+  OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.map((name) => [
+    name,
+    AUDITED_MIGRATION_SHA256[name],
+  ]),
+) as Readonly<Record<string, string>>;
 export const SCHEMA_WAVE_BOUNDARIES = [
   LEGACY_PRODUCTION_CATCHUP_BOUNDARY,
   "0028",
@@ -394,6 +423,11 @@ const RUNTIME_INPUT_PREPARATION_MIGRATION = "0032_worker_runtime_input_preparati
 const RUNTIME_INPUT_PREPARATION_V2_MIGRATION = "0037_worker_runtime_input_preparation_v2.sql";
 const LIVE_NATIVE_CLAIM_MIGRATION = "0039_takoform_live_native_claim_across_tenants.sql";
 const ARTIFACT_BLOB_IO_FENCE_MIGRATION = "0043_artifact_blob_io_fences.sql";
+const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
+const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
+const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
+const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
+const MANAGED_QUEUE_RETIREMENT_MIGRATION = "0063_cloudflare_managed_queue_retirement.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -413,6 +447,12 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Open effects need their retained resource identity; unresolved work itself is allowed. */
+  orphanOpenProviderEffectCount?(phase: DeployPhase): Promise<number>;
+  /** Old import preparation may have effects; 0062 must fence every planned import. */
+  plannedImportSagaCount?(phase: DeployPhase): Promise<number>;
+  /** Post-0062 only; concurrent new-protocol imports are not legacy evidence. */
+  historicalPlannedImportSagaCount?(phase: DeployPhase): Promise<number>;
   /** Fixed 0016->0022 catch-up snapshot; counts bind rehearsal to production. */
   legacyProductionCatchupDataIntegrity?(phase: DeployPhase): Promise<{
     readonly ledgerRowCount: number;
@@ -764,6 +804,39 @@ export async function runD1Schema(
       options.reader,
     );
     const wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
+    const inspectSelectionCutover = (
+      state: D1SchemaState,
+      selected: SelectedSchemaWave,
+      phase: DeployPhase,
+      configPath: string,
+    ) =>
+      inspectApplyProviderSelectionCutover({
+        invocation,
+        wave: selected,
+        state,
+        artifact: sourceMigrations,
+        phase,
+        configPath,
+        environment,
+        run,
+        injected: options.reader,
+      });
+    const applyProviderSelectionCutover = await inspectSelectionCutover(
+      initial,
+      wave,
+      "preflight",
+      inspectionConfig,
+    );
+    const managedQueueRetirementCutover = inspectManagedQueueRetirementCutover({
+      invocation,
+      wave,
+      state: initial,
+      artifact: sourceMigrations,
+    });
+    if (invocation.action === "apply") {
+      assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
+      assertManagedQueueRetirementCutoverReady(managedQueueRetirementCutover);
+    }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: wave.pending,
@@ -827,6 +900,8 @@ export async function runD1Schema(
               : null,
         },
         artifactBlobIoCompatibility,
+        applyProviderSelectionCutover,
+        managedQueueRetirementCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -836,7 +911,11 @@ export async function runD1Schema(
                 legacyCatchupApplicationShapeDigest ===
                   CANONICAL_0016_APPLICATION_SCHEMA_SHAPE_DIGEST))) &&
           (artifactBlobIoCompatibility.status === "ready" ||
-            artifactBlobIoCompatibility.status === "not_pending"),
+            artifactBlobIoCompatibility.status === "not_pending") &&
+          (applyProviderSelectionCutover.status === "not_pending" ||
+            applyProviderSelectionCutover.status === "ready") &&
+          (managedQueueRetirementCutover.status === "not_pending" ||
+            managedQueueRetirementCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -872,6 +951,29 @@ export async function runD1Schema(
     if (rehearsalReceiptAlreadyExists && wave.pending.length > 0) {
       throw preflightError("rehearsal receipt already exists and will not be overwritten");
     }
+    if (wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
+      await checked(run, "preflight", "accepted-authority transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-accepted-authority.test.ts",
+        "tests/takoform-accepted-authority-migration.test.ts",
+      ]);
+    }
+    if (wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+      await checked(run, "preflight", "import-selection transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-import-selection.test.ts",
+        "tests/takoform-import-selection-schema.test.ts",
+      ]);
+    }
+    if (wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+      await checked(run, "preflight", "managed Queue retirement transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-managed-queue-retirement.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -894,6 +996,11 @@ export async function runD1Schema(
     ) {
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
+    const additiveCutoverPostShape =
+      applyProviderSelectionCutover.status === "ready" ||
+      managedQueueRetirementCutover.status === "ready"
+        ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
+        : null;
     const migrationImport =
       wave.selector === "0047"
         ? buildD1MigrationImport(
@@ -922,6 +1029,17 @@ export async function runD1Schema(
     if (JSON.stringify(requalifiedWave.pending) !== JSON.stringify(wave.pending)) {
       throw preflightError("D1 selected wave suffix changed during qualification");
     }
+    assertApplyProviderSelectionCutoverReady(
+      await inspectSelectionCutover(requalified, requalifiedWave, "preflight", configPath),
+    );
+    assertManagedQueueRetirementCutoverReady(
+      inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: requalifiedWave,
+        state: requalified,
+        artifact: sourceMigrations,
+      }),
+    );
     const requalifiedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: requalifiedWave.pending,
@@ -990,6 +1108,17 @@ export async function runD1Schema(
     const fenced = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(requalified, fenced);
     const fencedWave = selectSchemaWave(sourceMigrations, fenced.applied, invocation);
+    assertApplyProviderSelectionCutoverReady(
+      await inspectSelectionCutover(fenced, fencedWave, "preflight", configPath),
+    );
+    assertManagedQueueRetirementCutoverReady(
+      inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: fencedWave,
+        state: fenced,
+        artifact: sourceMigrations,
+      }),
+    );
     const fencedDataPreflights = await inspectDataPreflights({
       phase: "preflight",
       pending: fencedWave.pending,
@@ -1183,6 +1312,33 @@ export async function runD1Schema(
         run,
         injected: options.reader,
       });
+      // Keep the retained-effect integrity read immediately before the one
+      // migration request. Old writers may finish; they need not be drained.
+      assertApplyProviderSelectionCutoverReady(
+        await inspectSelectionCutover(fenced, fencedWave, "mutation", configPath),
+      );
+      if (fencedWave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+        const immediateManagedQueueRetirementState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(
+          fenced,
+          immediateManagedQueueRetirementState,
+          "at the immediate 0063 managed Queue retirement migration fence",
+        );
+        assertManagedQueueRetirementCutoverReady(
+          inspectManagedQueueRetirementCutover({
+            invocation,
+            wave: fencedWave,
+            state: immediateManagedQueueRetirementState,
+            artifact: sourceMigrations,
+          }),
+        );
+      }
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1297,6 +1453,56 @@ export async function runD1Schema(
         "D1 post-readback still has migrations pending within the selected wave",
       );
     }
+    if (additiveCutoverPostShape !== null) {
+      const cutoverName = wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+        ? "managed Queue retirement"
+        : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+          ? "import-selection"
+          : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+            ? "accepted-authority"
+            : "operation-generation";
+      const cutoverBoundary = wave.throughMigration.slice(0, 4);
+      if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
+        throw verificationError(
+          `${cutoverName} cutover post-shape differs from the exact audited ${cutoverBoundary} schema; repair forward`,
+        );
+      }
+      if (applyProviderSelectionCutover.status === "ready") {
+        const orphanCount = await readOrphanOpenProviderEffectCount({
+          phase: "verification",
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        });
+        if (orphanCount !== 0) {
+          throw verificationError(
+            `${cutoverName} cutover has orphan open provider effects after migration; repair forward`,
+            JSON.stringify({ orphanOpenProviderEffectCount: orphanCount }),
+          );
+        }
+      }
+      if (
+        applyProviderSelectionCutover.status === "ready" &&
+        wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+      ) {
+        const historicalPlannedCount = await readPlannedImportSagaCount(
+          {
+            phase: "verification",
+            configPath,
+            environment,
+            run,
+            injected: options.reader,
+          },
+          true,
+        );
+        if (historicalPlannedCount !== 0) {
+          throw verificationError(
+            "import-selection cutover has historical planned imports after migration; repair forward",
+          );
+        }
+      }
+    }
     if (
       fencedReceiptEvidence &&
       post.shapeDigest !== fencedReceiptEvidence.receipt.postShapeDigest
@@ -1384,6 +1590,8 @@ export async function runD1Schema(
             : null,
       },
       artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
+      applyProviderSelectionCutover,
+      managedQueueRetirementCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1442,26 +1650,57 @@ function selectSchemaWave(
         "rehearsal and production D1 schema invocations require one fixed --through-migration boundary",
       );
     }
-    const migrationFiles = artifact.files.slice(applied.length);
+    // Keep independent availability transitions separate even when the source
+    // contains a newer audited tail. Never accept a truncated or invented tail
+    // merely because only its older prefix would be uploaded.
+    const hasAvailabilityCutover = artifact.names.some((name) =>
+      [
+        APPLY_PROVIDER_SELECTION_MIGRATION,
+        OPERATION_GENERATION_MIGRATION,
+        ACCEPTED_AUTHORITY_MIGRATION,
+        IMPORT_PROVIDER_SELECTION_MIGRATION,
+        MANAGED_QUEUE_RETIREMENT_MIGRATION,
+      ].includes(name),
+    );
+    if (hasAvailabilityCutover) {
+      if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+        throw preflightError(
+          "integration D1 cutover requires the exact audited source inventory 0001-0063",
+        );
+      }
+      assertAuditedMigrationHashes(artifact.files);
+    }
+    const throughCount = hasAvailabilityCutover
+      ? applied.length < 60
+        ? 60
+        : applied.length === 60
+          ? 61
+          : applied.length === 61
+            ? 62
+            : 63
+      : artifact.names.length;
+    const throughPrefixNames = artifact.names.slice(0, throughCount);
+    const throughPrefixFiles = artifact.files.slice(0, throughCount);
+    const migrationFiles = throughPrefixFiles.slice(applied.length);
     return {
       selector: null,
       fromMigration: last(applied),
-      throughMigration: artifact.names.at(-1) as string,
+      throughMigration: throughPrefixNames.at(-1) as string,
       fromPrefixNames: [...applied],
-      throughPrefixNames: artifact.names,
+      throughPrefixNames,
       migrationFiles,
-      throughPrefixFiles: artifact.files,
+      throughPrefixFiles,
       migrationDigest: digestMigrationFiles(migrationFiles),
       migrationBytes: migrationFiles.reduce((total, file) => total + file.bytes, 0),
-      throughPrefixDigest: artifact.digest,
-      pending: artifact.names.slice(applied.length),
+      throughPrefixDigest: digestMigrationFiles(throughPrefixFiles),
+      pending: throughPrefixNames.slice(applied.length),
     };
   }
 
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0057",
+      "selected D1 wave requires the exact audited source inventory 0001-0063",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1491,32 +1730,53 @@ function selectSchemaWave(
   };
 }
 
-function assertAuditedMigrationHashes(
+function assertMigrationHashes(
   files: readonly MigrationArtifactFile[],
-  count: number = AUDITED_MIGRATION_LINEAGE.length,
+  lineage: readonly string[],
+  hashes: Readonly<Record<string, string>>,
+  count: number = lineage.length,
 ): void {
-  for (const [index, name] of AUDITED_MIGRATION_LINEAGE.slice(0, count).entries()) {
+  for (const [index, name] of lineage.slice(0, count).entries()) {
     const file = files[index];
     const body = file === undefined ? null : readFileSync(file.path);
     const actualDigest = body === null ? "missing" : digestBytes(body);
     if (
       file?.name !== name ||
-      file.digest !== AUDITED_MIGRATION_SHA256[name] ||
-      actualDigest !== AUDITED_MIGRATION_SHA256[name] ||
+      file.digest !== hashes[name] ||
+      actualDigest !== hashes[name] ||
       file?.bytes !== body?.byteLength
     ) {
       throw preflightError(
         `selected D1 wave requires the exact audited migration SHA-256 for every 0001-${String(
           count,
         ).padStart(4, "0")} file`,
-        `position=${index + 1} name=${name} expected=${AUDITED_MIGRATION_SHA256[name]} actual=${actualDigest}`,
+        `position=${index + 1} name=${name} expected=${hashes[name]} actual=${actualDigest}`,
       );
     }
   }
 }
 
+function assertAuditedMigrationHashes(
+  files: readonly MigrationArtifactFile[],
+  count: number = AUDITED_MIGRATION_LINEAGE.length,
+): void {
+  assertMigrationHashes(files, AUDITED_MIGRATION_LINEAGE, AUDITED_MIGRATION_SHA256, count);
+}
+
+function assertOperationGenerationMigrationHashes(
+  files: readonly MigrationArtifactFile[],
+  count: number = OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.length,
+): void {
+  assertMigrationHashes(
+    files,
+    OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE,
+    OPERATION_GENERATION_AUDITED_MIGRATION_SHA256,
+    count,
+  );
+}
+
 /**
- * Reads the current audited 0001-0057 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0063 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1527,11 +1787,34 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0057",
+      "audited migration lineage must contain exactly 0001-0063",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
   assertAuditedMigrationHashes(artifact.files);
+  return artifact;
+}
+
+/**
+ * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
+ * intentionally separate from the current 0001-0063 source inventory: the
+ * operation-generation cutover is historical evidence, not a claim about the
+ * current migration tail.
+ */
+export function readOperationGenerationMigrationArtifact(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !==
+    JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE)
+  ) {
+    throw preflightError(
+      "operation-generation cutover requires the exact audited 0001-0060 inventory",
+      `actual=${JSON.stringify(artifact.names)}`,
+    );
+  }
+  assertOperationGenerationMigrationHashes(artifact.files);
   return artifact;
 }
 
@@ -1772,6 +2055,29 @@ interface ArtifactBlobIoFencePreflight {
   readonly activeRootDeletingCandidateConflictCount: number;
 }
 
+interface ApplyProviderSelectionCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "orphan_open_effects_repair_required"
+    | "old_apply_writers_quiescence_unproven"
+    | "operation_generation_cutover_unqualified"
+    | "accepted_authority_cutover_unqualified"
+    | "import_selection_cutover_unqualified"
+    | "planned_imports_require_settlement";
+  readonly orphanOpenProviderEffectCount?: number;
+  readonly plannedImportSagaCount?: number;
+}
+
+interface ManagedQueueRetirementCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "managed_queue_retirement_cutover_unqualified";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -1849,6 +2155,250 @@ function assertArtifactBlobIoCompatibilityReady(
     throw preflightError(
       `0043 artifact blob I/O deployment compatibility requires operator action ${when}`,
       JSON.stringify(preflight),
+    );
+  }
+}
+
+function inspectManagedQueueRetirementCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+}): ManagedQueueRetirementCutover {
+  if (!input.wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
+    return { status: "not_pending" };
+  }
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    input.state.applied.length !== 62 ||
+    JSON.stringify(input.wave.pending) !== JSON.stringify([MANAGED_QUEUE_RETIREMENT_MIGRATION])
+  ) {
+    return { status: "managed_queue_retirement_cutover_unqualified" };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0063",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  return applicationSchemaMatches(
+    input.state,
+    deriveExpectedApplicationShape(input.artifact.files.slice(0, 62)),
+  )
+    ? { status: "ready" }
+    : { status: "predecessor_schema_mismatch" };
+}
+
+function assertManagedQueueRetirementCutoverReady(cutover: ManagedQueueRetirementCutover): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `managed Queue retirement cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
+async function inspectApplyProviderSelectionCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<ApplyProviderSelectionCutover> {
+  const { pending } = input.wave;
+  if (pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)) {
+    if (
+      input.invocation.environment !== "integration" ||
+      input.invocation.throughMigration !== undefined ||
+      input.state.applied.length !== 61 ||
+      JSON.stringify(pending) !== JSON.stringify([IMPORT_PROVIDER_SELECTION_MIGRATION])
+    ) {
+      return { status: "import_selection_cutover_unqualified" };
+    }
+    if (
+      !applicationSchemaMatches(
+        input.state,
+        deriveExpectedApplicationShape(input.artifact.files.slice(0, 61)),
+      )
+    ) {
+      return { status: "predecessor_schema_mismatch" };
+    }
+    const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+    const plannedImportSagaCount = await readPlannedImportSagaCount(input);
+    return {
+      status:
+        orphanOpenProviderEffectCount !== 0
+          ? "orphan_open_effects_repair_required"
+          : plannedImportSagaCount !== 0
+            ? "planned_imports_require_settlement"
+            : "ready",
+      orphanOpenProviderEffectCount,
+      plannedImportSagaCount,
+    };
+  }
+  // This additive transition fences new old-writer apply admission, not the
+  // recovery of historical rows. It is intentionally separate from the frozen
+  // 0058/0059 -> 0060 lane: never bundle the two availability boundaries.
+  if (pending.includes(ACCEPTED_AUTHORITY_MIGRATION)) {
+    if (
+      input.invocation.environment !== "integration" ||
+      input.invocation.throughMigration !== undefined ||
+      input.state.applied.length !== 60 ||
+      JSON.stringify(pending) !== JSON.stringify([ACCEPTED_AUTHORITY_MIGRATION])
+    ) {
+      return { status: "accepted_authority_cutover_unqualified" };
+    }
+    if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+      throw preflightError(
+        "accepted-authority cutover requires the exact audited source inventory 0001-0063",
+      );
+    }
+    assertAuditedMigrationHashes(input.artifact.files);
+    if (
+      !applicationSchemaMatches(
+        input.state,
+        deriveExpectedApplicationShape(input.artifact.files.slice(0, 60)),
+      )
+    ) {
+      return { status: "predecessor_schema_mismatch" };
+    }
+    const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+    return {
+      status: orphanOpenProviderEffectCount === 0 ? "ready" : "orphan_open_effects_repair_required",
+      orphanOpenProviderEffectCount,
+    };
+  }
+  if (
+    !pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION) &&
+    !pending.includes(OPERATION_GENERATION_MIGRATION)
+  ) {
+    return { status: "not_pending" };
+  }
+  // No new protected selector and no arbitrary integration suffix adoption:
+  // only the two additive transitions from an already complete 0058/0059.
+  const count = input.state.applied.length;
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    (count !== 58 && count !== 59) ||
+    JSON.stringify(pending) !==
+      JSON.stringify(OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE.slice(count))
+  ) {
+    return {
+      status: pending.includes(APPLY_PROVIDER_SELECTION_MIGRATION)
+        ? "old_apply_writers_quiescence_unproven"
+        : "operation_generation_cutover_unqualified",
+    };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "operation-generation cutover requires the exact audited source inventory 0001-0063",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  if (
+    !applicationSchemaMatches(
+      input.state,
+      deriveExpectedApplicationShape(input.artifact.files.slice(0, count)),
+    )
+  ) {
+    return { status: "predecessor_schema_mismatch" };
+  }
+  const orphanOpenProviderEffectCount = await readOrphanOpenProviderEffectCount(input);
+  return {
+    status: orphanOpenProviderEffectCount === 0 ? "ready" : "orphan_open_effects_repair_required",
+    orphanOpenProviderEffectCount,
+  };
+}
+
+function assertApplyProviderSelectionCutoverReady(cutover: ApplyProviderSelectionCutover): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `apply-provider-selection cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
+async function readPlannedImportSagaCount(
+  input: {
+    readonly phase: DeployPhase;
+    readonly configPath: string;
+    readonly environment: Readonly<Record<string, string>>;
+    readonly run: SchemaProcess;
+    readonly injected: SchemaReader | undefined;
+  },
+  historicalOnly = false,
+): Promise<number> {
+  try {
+    const count = input.injected
+      ? historicalOnly
+        ? await input.injected.historicalPlannedImportSagaCount?.(input.phase)
+        : await input.injected.plannedImportSagaCount?.(input.phase)
+      : await readSingleCount(
+          new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+          input.phase,
+          "import-selection pending old-writer preparation",
+          `SELECT COUNT(*) AS row_count FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_kind = 'import' AND phase = 'planned'
+             ${historicalOnly ? "AND import_selection_protocol IS NULL" : ""}`,
+          "row_count",
+        );
+    return exactNonnegativeCount(count, "import-selection planned import sagas");
+  } catch (error) {
+    if (error instanceof DeployError && error.phase === input.phase) throw error;
+    throw new DeployError(
+      input.phase,
+      error instanceof Error ? error.message : "invalid planned import saga count",
+    );
+  }
+}
+
+async function readOrphanOpenProviderEffectCount(input: {
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<number> {
+  try {
+    const count = input.injected
+      ? await input.injected.orphanOpenProviderEffectCount?.(input.phase)
+      : await readSingleCount(
+          new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+          input.phase,
+          "operation-generation retained effect identity",
+          `SELECT COUNT(*) AS row_count FROM tf_resource_provider_effects AS effect
+         WHERE effect.effect_kind IN ('apply', 'import', 'delete')
+           AND effect.phase IN ('planned', 'dispatched')
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resource_provider_effects AS terminal
+             WHERE terminal.tenant_id = effect.tenant_id
+               AND terminal.resource_uid = effect.resource_uid
+               AND terminal.effect_id = effect.effect_id
+               AND terminal.phase IN ('succeeded', 'cancelled')
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM tf_resource_deletion_attestations AS identity
+             WHERE identity.tenant_id = effect.tenant_id
+               AND identity.resource_uid = effect.resource_uid
+               AND identity.state IN ('live', 'pending')
+           )`,
+          "row_count",
+        );
+    return exactNonnegativeCount(count, "operation-generation orphan open provider effects");
+  } catch (error) {
+    // A malformed post-mutation response must never claim the target was
+    // untouched merely because the shared count parser is a preflight helper.
+    if (error instanceof DeployError && error.phase === input.phase) throw error;
+    throw new DeployError(
+      input.phase,
+      error instanceof Error ? error.message : "invalid operation-generation effect count",
     );
   }
 }
@@ -2565,13 +3115,17 @@ function writeD1Config(path: string, target: DeployTarget, migrationDirectory: s
   return path;
 }
 
-function assertSamePreState(left: D1SchemaState, right: D1SchemaState): void {
+function assertSamePreState(
+  left: D1SchemaState,
+  right: D1SchemaState,
+  when = "during qualification",
+): void {
   if (
     JSON.stringify(left.applied) !== JSON.stringify(right.applied) ||
     left.shapeDigest !== right.shapeDigest ||
     left.shape !== right.shape
   ) {
-    throw preflightError("D1 lineage or schema shape changed during qualification");
+    throw preflightError(`D1 lineage or schema shape changed ${when}`);
   }
 }
 

@@ -28,6 +28,7 @@ import {
   verificationError,
 } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
+import { runFormAuthorityCodeGate } from "./form-authority-gate.ts";
 import {
   readPublicHostIdentityProbe,
   runFormAuthorityIdentityProbe,
@@ -37,6 +38,11 @@ import {
   type FormAuthorityScope,
   type LoadedFormAuthorityScopeTransition,
 } from "./form-authority-scope-transition.ts";
+import {
+  type IntegrationStorageGenerationTargetVerificationOptions,
+  isGeneratedIntegrationStorageTarget,
+  verifyIntegrationStorageGenerationTarget,
+} from "./integration-storage-generation.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -69,8 +75,11 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
+  assertServiceBindingRefreshIntegrationOnly,
+  assertStorageRebindIntegrationOnly,
   type BindingDifference,
   describeBindingDrift,
+  normalizedWorkerClosureDelta,
   surfaceTransitionAdmits,
   type WorkerBindingDrift,
   type WorkerSurfaceTransition,
@@ -168,6 +177,11 @@ export interface FormAuthorityDeployOptions {
   readonly fetcher?: (input: string, init?: RequestInit) => Promise<Response>;
   /** Operator-private descriptor path adoption re-reads; defaults to the selected target path. */
   readonly targetDescriptorPath?: string;
+  /** Read-only generated-storage verifier seam for focused portable tests. */
+  readonly integrationStorageVerification?: Omit<
+    IntegrationStorageGenerationTargetVerificationOptions,
+    "run" | "cloudflareEnvironment"
+  >;
 }
 
 export interface FormAuthorityCoreVerifierReadbackExpectation {
@@ -223,6 +237,73 @@ interface FormAuthorityInspection {
   readonly drift: readonly BindingDifference[];
 }
 
+/**
+ * Minimal immutable identity readback consumed by dependent authority
+ * surfaces. The dependency must be the exact released-Core Form Version; a
+ * same-name service binding by itself is not an admission proof.
+ */
+export interface ReleasedCoreFormAuthorityDependencyInspection {
+  readonly history: WorkerDeploymentHistory;
+  readonly commit: string;
+  readonly artifactDigest: `sha256:${string}`;
+}
+
+/**
+ * Build the released-Core Form authority from the selected source and return
+ * the exact bundle identity without uploading or changing Cloudflare state.
+ *
+ * Dependents use this only when the served Form Version has a different source
+ * commit: a commit difference is admissible if and only if the emitted bytes
+ * are identical. The sealed candidate is checked before its temporary build
+ * directory is removed so callers never receive an unverified digest.
+ */
+export async function buildReleasedCoreFormAuthorityArtifactDigest(input: {
+  readonly target: DeployTarget;
+  readonly commit: string;
+  readonly run: FormAuthorityProcess;
+  readonly environment?: Readonly<Record<string, string>>;
+}): Promise<`sha256:${string}`> {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-form-authority-dependency-proof-"));
+  try {
+    const invocation: FormAuthorityDeployInvocation = {
+      surface: "takoserver-form-authority-worker",
+      action: "apply",
+      environment: input.target.environment,
+      commit: input.commit,
+    };
+    const selected = selectTarget(invocation, input.target);
+    if (selected.verificationMode !== "released-core") {
+      throw preflightError("released-Core Form authority artifact proof selected another target");
+    }
+    const capabilityManifestJson = canonicalJson(publicFormCapabilityManifest());
+    const prepared = await prepareWorkerArtifact({
+      root,
+      target: input.target,
+      commit: input.commit,
+      run: input.run,
+      environment: input.environment,
+      containersRollout: "none",
+      main: resolve(REPOSITORY, "src/entry-form-authority-worker.ts"),
+      writeConfig: ({ path, main }) =>
+        writeFormAuthorityConfig({
+          path,
+          main,
+          invocation,
+          target: input.target,
+          selected,
+          capabilityManifestJson,
+        }),
+    });
+    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
+    const sealed = prepared.seal();
+    sealed.assertUnchanged();
+    return artifactDigest;
+  } finally {
+    unsealDirectory(root);
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 interface PublicWorkerInspection {
   readonly history: WorkerDeploymentHistory;
   readonly commit: string;
@@ -264,6 +345,27 @@ export async function runFormAuthority(
   }
   if (target.environment !== invocation.environment) {
     throw preflightError("Form authority invocation and target environments differ");
+  }
+  const transitionDelta =
+    invocation.transition === undefined
+      ? null
+      : normalizedWorkerClosureDelta(invocation.transition.delta);
+  if (transitionDelta !== null) {
+    assertStorageRebindIntegrationOnly("preflight", invocation.environment, transitionDelta);
+    assertServiceBindingRefreshIntegrationOnly(
+      "preflight",
+      invocation.environment,
+      transitionDelta,
+    );
+  }
+  if (
+    transitionDelta?.storageRebind !== undefined &&
+    invocation.surface !== "takoserver-form-authority-worker" &&
+    invocation.surface !== "takoserver-integration-form-authority-worker"
+  ) {
+    throw preflightError(
+      "Form authority storage rebind is supported only by the two route-less authority Workers",
+    );
   }
   assertPublicFormCapabilityTarget(target);
   if (invocation.scopeTransition) {
@@ -324,6 +426,19 @@ export async function runFormAuthority(
           run,
         });
   const environment = credential?.childEnvironment ?? {};
+  const initialStorageProof =
+    transitionDelta?.storageRebind === undefined
+      ? null
+      : await verifyIntegrationStorageGenerationTarget(target, invocation.environment, {
+          run,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
+          ...options.integrationStorageVerification,
+        });
+  let routineIntegrationStorageProof: Awaited<
+    ReturnType<typeof verifyIntegrationStorageGenerationTarget>
+  > | null = null;
   const state =
     options.state ??
     new CloudflareState({
@@ -589,6 +704,40 @@ export async function runFormAuthority(
     }
   }
 
+  const routineExactTargetCoreVerifierReuse =
+    before !== null &&
+    invocation.transition === undefined &&
+    invocation.scopeTransition === undefined &&
+    !bootstrapVerifierBridge &&
+    before.scopeBindingProfile === "exact-target" &&
+    before.bindingTransitionProfile === "none";
+  const declaredTransitionCoreVerifierReuse =
+    before !== null &&
+    invocation.transition !== undefined &&
+    before.bindingTransitionProfile === "declared-delta-predecessor";
+  const coreVerifierReusePredecessorVersionId =
+    invocation.action === "apply" &&
+    invocation.environment === "integration" &&
+    selected.kind === "authority" &&
+    selected.verificationMode === "released-core" &&
+    before !== null &&
+    (routineExactTargetCoreVerifierReuse || declaredTransitionCoreVerifierReuse)
+      ? before.history.versionId
+      : null;
+  const initialCoreVerifierReadback =
+    coreVerifierReusePredecessorVersionId !== null
+      ? await readFormAuthorityCoreVerifierIdentityProbe(
+          {
+            probeOrigin: requiredIdentityProbeOrigin(target),
+            authorityWorkerVersionId: coreVerifierReusePredecessorVersionId,
+            artifactDigest: takoformCoreVerifierArtifactDigest(),
+          },
+          options.fetcher ?? fetch,
+        )
+      : null;
+  const reusableCoreVerifierIdentity =
+    initialCoreVerifierReadback?.ready === true ? initialCoreVerifierReadback.identity : null;
+
   if (invocation.scopeTransition) {
     if (before?.scopeBindingProfile === "exact-target") {
       throw preflightError(
@@ -632,7 +781,96 @@ export async function runFormAuthority(
       "served integration Form authority Worker differs from the operator gateway source commit",
     );
   }
-  await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+
+  const exactSelectedHost =
+    target.formAuthority?.hostId === selected.hostId &&
+    publicIdentityReadback.identity?.hostId === selected.hostId;
+  const exactCurrentFormAuthority =
+    before !== null &&
+    before.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+    before.scopeBindingProfile === "exact-target" &&
+    before.bindingTransitionProfile === "none" &&
+    before.drift.length === 0;
+  const exactCurrentGatewayDependency =
+    selected.kind === "authority" ||
+    (dependencySelected !== null &&
+      dependencyBefore !== null &&
+      selected.authorityWorkerName !== undefined &&
+      dependencySelected.workerName === selected.authorityWorkerName &&
+      dependencySelected.hostId === selected.hostId &&
+      dependencyBefore.commit === source.commit &&
+      dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
+      dependencyBefore.scopeBindingProfile === "exact-target" &&
+      dependencyBefore.bindingTransitionProfile === "none" &&
+      dependencyBefore.drift.length === 0);
+  const hasGeneratedAuthorityStorageTarget =
+    selected.kind !== "authority" ||
+    isGeneratedIntegrationStorageTarget(target, invocation.environment);
+  const releasedCoreVerifierAlreadyReusable =
+    selected.verificationMode !== "released-core" || reusableCoreVerifierIdentity !== null;
+  const routineIntegrationCodeGateEligible =
+    invocation.action === "apply" &&
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    invocation.scopeTransition === undefined &&
+    transitionDelta === null &&
+    !bootstrapVerifierBridge &&
+    invocation.adoptLivePath === undefined &&
+    exactSelectedHost &&
+    exactCurrentFormAuthority &&
+    exactCurrentGatewayDependency &&
+    hasGeneratedAuthorityStorageTarget &&
+    releasedCoreVerifierAlreadyReusable;
+
+  if (routineIntegrationCodeGateEligible && selected.kind === "authority") {
+    routineIntegrationStorageProof = await verifyIntegrationStorageGenerationTarget(
+      target,
+      invocation.environment,
+      {
+        run,
+        ...(options.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: options.cloudflareEnvironment }),
+        ...options.integrationStorageVerification,
+      },
+    );
+  }
+
+  if (transitionDelta?.storageRebind !== undefined) {
+    await checked(run, "integration Form authority storage-rebind typecheck", [
+      "bun",
+      "run",
+      "typecheck:form-authority-worker",
+    ]);
+    await checked(run, "focused integration Form authority storage-rebind deploy tests", [
+      "bun",
+      "test",
+      "--test-name-pattern=storage rebind",
+      "tests/deploy-form-authority.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-integration-storage-generation.test.ts",
+    ]);
+  } else if (
+    invocation.environment === "integration" &&
+    (transitionDelta?.refreshedServiceBindings?.length ?? 0) > 0
+  ) {
+    await checked(run, "integration Form authority service-binding-refresh typecheck", [
+      "bun",
+      "run",
+      "typecheck:form-authority-worker",
+    ]);
+    await checked(run, "focused integration Form authority service-binding-refresh deploy tests", [
+      "bun",
+      "test",
+      "tests/deploy-form-authority.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-contract.test.ts",
+    ]);
+  } else if (routineIntegrationCodeGateEligible) {
+    await runFormAuthorityCodeGate(run, invocation.surface);
+  } else {
+    await checked(run, "scoped Form authority owner gate `bun run check`", ["bun", "run", "check"]);
+  }
 
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-form-authority-"));
@@ -661,6 +899,7 @@ export async function runFormAuthority(
       commit: source.commit,
       run,
       environment,
+      ...(reusableCoreVerifierIdentity === null ? {} : { containersRollout: "none" as const }),
       main: resolve(REPOSITORY, selected.main),
       writeConfig: ({ path, main }) =>
         writeFormAuthorityConfig({
@@ -723,7 +962,46 @@ export async function runFormAuthority(
       "--strict",
       "--message",
       message(invocation.surface, source.commit, authorityArtifactDigest),
+      ...(reusableCoreVerifierIdentity === null ? [] : ["--containers-rollout", "none"]),
     ]);
+    if (reusableCoreVerifierIdentity !== null && coreVerifierReusePredecessorVersionId !== null) {
+      const finalCoreVerifierReadback = await readFormAuthorityCoreVerifierIdentityProbe(
+        {
+          probeOrigin: requiredIdentityProbeOrigin(target),
+          authorityWorkerVersionId: coreVerifierReusePredecessorVersionId,
+          artifactDigest: takoformCoreVerifierArtifactDigest(),
+        },
+        options.fetcher ?? fetch,
+      );
+      if (
+        finalCoreVerifierReadback.ready !== true ||
+        canonicalJson(finalCoreVerifierReadback.identity) !==
+          canonicalJson(reusableCoreVerifierIdentity)
+      ) {
+        throw preflightError(
+          "released Core verifier identity changed before same-image Form authority publication",
+        );
+      }
+    }
+    const storageProofForFinalFence = initialStorageProof ?? routineIntegrationStorageProof;
+    if (storageProofForFinalFence !== null) {
+      const finalStorageProof = await verifyIntegrationStorageGenerationTarget(
+        target,
+        invocation.environment,
+        {
+          run,
+          ...(options.cloudflareEnvironment === undefined
+            ? {}
+            : { cloudflareEnvironment: options.cloudflareEnvironment }),
+          ...options.integrationStorageVerification,
+        },
+      );
+      if (JSON.stringify(storageProofForFinalFence) !== JSON.stringify(finalStorageProof)) {
+        throw preflightError(
+          "generated integration storage target or schema changed before publication",
+        );
+      }
+    }
     mutationPhase = "mutation";
     const upload = await run(uploadCommand, { env: environment });
     if (upload.exitCode !== 0) {
@@ -947,6 +1225,10 @@ export function writeFormAuthorityConfig(input: {
     input.selected.verificationMode === "released-core"
       ? takoformCoreVerifierArtifactDigest()
       : null;
+  const managedSpaceAdmissionPolicy =
+    input.selected.kind === "authority" && input.selected.verificationMode === "released-core"
+      ? input.target.formAuthority?.managedSpaceAdmissionPolicy
+      : undefined;
   const configuration =
     input.selected.kind === "operator-gateway"
       ? operatorGatewayConfiguration(input, shared)
@@ -960,6 +1242,13 @@ export function writeFormAuthorityConfig(input: {
               ? {}
               : {
                   TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+                }),
+            ...(managedSpaceAdmissionPolicy === undefined
+              ? {}
+              : {
+                  TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: canonicalJson(
+                    managedSpaceAdmissionPolicy,
+                  ),
                 }),
             ...(input.invocation.surface === "takoserver-integration-form-authority-worker"
               ? {
@@ -1165,6 +1454,53 @@ async function inspectFormAuthority(
   return { history, ...identity, ...binding };
 }
 
+/**
+ * Reuse the Form-authority owner's complete readback for narrow dependents.
+ * This deliberately proves the public composition, exact released-Core
+ * closure (including any operator policy), and immutable Version identity
+ * before a dependent surface may bind the named narrow entrypoint.
+ */
+export async function inspectReleasedCoreFormAuthorityDependency(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: FormAuthorityDeployState,
+): Promise<ReleasedCoreFormAuthorityDependencyInspection | null> {
+  const invocation: FormAuthorityDeployInvocation = {
+    surface: "takoserver-form-authority-worker",
+    action: "status",
+    environment: target.environment,
+    commit: "0".repeat(40),
+  };
+  const selected = selectTarget(invocation, target);
+  const publicWorker = await inspectPublicWorker(phase, target, state);
+  const inspection = await inspectFormAuthority(
+    phase,
+    invocation,
+    target,
+    selected,
+    publicWorker,
+    canonicalJson(publicFormCapabilityManifest()),
+    state,
+  );
+  if (inspection === null) return null;
+  if (
+    inspection.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
+    inspection.scopeBindingProfile !== "exact-target" ||
+    inspection.bindingTransitionProfile !== "none" ||
+    inspection.drift.length !== 0
+  ) {
+    throw phaseError(
+      phase,
+      "released-Core Form authority dependency is not at its exact target closure",
+    );
+  }
+  return {
+    history: inspection.history,
+    commit: inspection.commit,
+    artifactDigest: inspection.authorityArtifactDigest,
+  };
+}
+
 async function classifyPublicWorkerBinding(
   phase: DeployPhase,
   invocation: FormAuthorityDeployInvocation,
@@ -1240,6 +1576,7 @@ async function classifyPublicWorkerBinding(
     declared.predecessorVersionId === authorityVersionId &&
     surfaceTransitionAdmits(phase, authorityVersionId, authorityVersion, {
       delta: declared.delta,
+      environment: invocation.environment,
       targetClosure: targetExpected,
     })
   ) {
@@ -1626,6 +1963,18 @@ function expectedBindings(
           TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: {
             type: "plain_text",
             fields: { text: takoformCoreVerifierArtifactDigest() },
+          },
+        }
+      : {}),
+    ...(selected.kind === "authority" &&
+    selected.verificationMode === "released-core" &&
+    target.formAuthority?.managedSpaceAdmissionPolicy !== undefined
+      ? {
+          TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: {
+            type: "plain_text",
+            fields: {
+              text: canonicalJson(target.formAuthority.managedSpaceAdmissionPolicy),
+            },
           },
         }
       : {}),

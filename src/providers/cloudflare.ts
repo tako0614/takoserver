@@ -54,8 +54,10 @@ import {
 import type {
   ArtifactBytes,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackend,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
@@ -65,9 +67,11 @@ import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migrati
 export type {
   ArtifactBytes,
   CloudflareManagedObjectBucketReceiptStatus,
+  CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
   CloudflareManagedScheduleReconciliationStatus,
   CloudflareOrdinaryWorkerBackendOptions,
+  CloudflareWorkerAdoptInput,
   CloudflareWorkerBackendFactoryContext,
   CloudflareWorkerBackendOptions,
   CloudflareWorkersForPlatformsBackendFactoryOptions,
@@ -164,6 +168,7 @@ type CloudflareSqliteMigrationApplyInput = Parameters<
 
 /** Cloudflare's code for "that hostname already resolves to something else". */
 const DNS_RECORDS_PRESENT = 100_117;
+const QUEUE_REFERENCED_BY_WORKER_BINDING = 11_005;
 
 /**
  * A DNS zone this deployment may attach customer Workers to.
@@ -244,6 +249,8 @@ export class CloudflareProvider implements Provider {
     Provider["workerEndpointOriginReservations"]
   >;
   readonly runtimeInputCapabilities?: { readonly maximumBindings: number };
+  readonly concludeApplyNoEffect?: NonNullable<Provider["concludeApplyNoEffect"]>;
+  readonly compensateApply?: NonNullable<Provider["compensateApply"]>;
   readonly #accountId: string;
   readonly #origin: string;
   readonly #artifacts: ArtifactBytes;
@@ -301,8 +308,32 @@ export class CloudflareProvider implements Provider {
             offerings: structuredClone(this.offerings),
             ...(this.#runtimeInputs === undefined ? {} : { runtimeInputs: this.#runtimeInputs }),
             workerCompatibilityDate: this.#workerCompatibilityDate,
+            zoneFor: (hostname, tenantRef) => this.#zoneFor(hostname, tenantRef),
           })
         : undefined;
+    const noEffectBackend = this.#workerBackend;
+    const concludeApplyNoEffect = noEffectBackend?.concludeApplyNoEffect;
+    if (noEffectBackend && concludeApplyNoEffect) {
+      this.concludeApplyNoEffect = async (input) => {
+        if (!noEffectBackend.owns(input.offering)) {
+          // No managed conclusion call was entered. Preserve the provider's
+          // existing convergence behavior for ordinary Cloudflare offerings.
+          return { phase: "unsupported" };
+        }
+        return await concludeApplyNoEffect.call(noEffectBackend, input);
+      };
+    }
+    const compensateApply = noEffectBackend?.compensateApply;
+    if (noEffectBackend && compensateApply) {
+      this.compensateApply = async (input) => {
+        if (!noEffectBackend.owns(input.offering)) {
+          // The managed compensation seam has not been entered. Ordinary
+          // Cloudflare offerings retain their existing convergence behavior.
+          return { phase: "unsupported" };
+        }
+        return await compensateApply.call(noEffectBackend, input);
+      };
+    }
     this.workerEndpointOriginReservations = {
       derive: async (input) => {
         if (this.#workerBackend) return await this.#workerBackend.deriveOrigin(input);
@@ -1045,21 +1076,29 @@ export class CloudflareProvider implements Provider {
     });
   }
 
-  async delete(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    executionAuthority?: ProviderExecutionAuthority;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: import("../provider-port.ts").ResourceIdentity;
-    spec?: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  async delete(
+    input: {
+      operationId: string;
+      operationMode?: "initial" | "recovery";
+      providerHandle?: string;
+      executionAuthority?: ProviderExecutionAuthority;
+      offering: ProviderOffering;
+      nativeId: string;
+      identity: import("../provider-port.ts").ResourceIdentity;
+      spec?: JsonObject;
+      relations?: readonly ProviderRelation[];
+    },
+    convergence = false,
+  ): Promise<ProviderTicket> {
     if (this.#workerBackend?.owns(input.offering)) {
+      if (convergence) {
+        return this.#workerBackend.convergeDelete
+          ? await this.#workerBackend.convergeDelete(input)
+          : await this.#workerBackend.recoverDelete(input);
+      }
       return await this.#workerBackend.delete(input);
     }
-    if (input.operationMode === "recovery" && !input.providerHandle) {
+    if (input.operationMode === "recovery" && !input.providerHandle && !convergence) {
       // Cloudflare exposes no opaque delete handle. A transport close after a
       // DELETE therefore cannot be safely replayed; leave recovery to an
       // operator/readback path rather than sending the mutation twice.
@@ -1069,7 +1108,51 @@ export class CloudflareProvider implements Provider {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
-    if (native.kind === "r2" && this.#workerBackend?.prepareManagedObjectBucketDestroy) {
+    let managedQueueEffectsStarted = false;
+    if (
+      native.kind === "queue" &&
+      providerKind(input.offering) === "AtLeastOnceQueue" &&
+      this.#workerBackend &&
+      !this.#workerBackend.prepareManagedQueueDestroy
+    ) {
+      return convergence
+        ? failed("unavailable", "the managed Queue retirement authority is unavailable", true)
+        : failedWithoutProviderMutation(
+            input.operationId,
+            "unavailable",
+            "the managed Queue retirement authority is unavailable",
+          );
+    }
+    if (
+      native.kind === "queue" &&
+      providerKind(input.offering) === "AtLeastOnceQueue" &&
+      this.#workerBackend?.prepareManagedQueueDestroy
+    ) {
+      let prepared: CloudflareManagedQueueDestroyPreparation;
+      try {
+        prepared = await this.#workerBackend.prepareManagedQueueDestroy(input);
+      } catch {
+        // The closed hook may have persisted a marker or issued a helper
+        // mutation before its acknowledgement was lost. Only its explicit
+        // `effectsStarted: false` envelope may prove an initial call idle.
+        return failed("unavailable", "the managed Queue retirement authority is unavailable", true);
+      }
+      managedQueueEffectsStarted = prepared.effectsStarted;
+      if (prepared.state !== "ready") {
+        return !convergence && !prepared.effectsStarted
+          ? failedWithoutProviderMutation(
+              input.operationId,
+              prepared.failure.code,
+              prepared.failure.message,
+            )
+          : { phase: "failed", failure: prepared.failure };
+      }
+    }
+    if (
+      native.kind === "r2" &&
+      (this.#workerBackend?.managedObjectBucketVacancy ||
+        this.#workerBackend?.prepareManagedObjectBucketDestroy)
+    ) {
       return await this.#beginManagedObjectBucketDestroy(input, native.name);
     }
     if (native.kind === "version") {
@@ -1128,6 +1211,26 @@ export class CloudflareProvider implements Provider {
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
     if (!removed.ok && removed.status !== 404) {
+      if (
+        native.kind === "queue" &&
+        providerKind(input.offering) === "AtLeastOnceQueue" &&
+        removed.status === 400 &&
+        removed.providerRefusal === true &&
+        removed.codes.length === 1 &&
+        removed.codes[0] === QUEUE_REFERENCED_BY_WORKER_BINDING
+      ) {
+        return managedQueueEffectsStarted
+          ? failed(
+              "unavailable",
+              "the managed Queue retirement has effects but the Queue is still referenced; reconciliation is required",
+              true,
+            )
+          : failedWithoutProviderMutation(
+              input.operationId,
+              "occupied",
+              "the Queue is still referenced by a Worker binding; remove the binding and destroy again",
+            );
+      }
       // R2 will not destroy a bucket that still holds objects or unfinished
       // multipart uploads, and only the customer can empty it. Say so, once the
       // bucket is proven to still be there, rather than returning a generic
@@ -1138,7 +1241,7 @@ export class CloudflareProvider implements Provider {
         (await this.#r2BucketPresent(native.name)) === true
       ) {
         return failed(
-          "conflict",
+          "occupied",
           "the bucket was refused and is still present; R2 does not destroy a bucket that " +
             "still holds objects or unfinished multipart uploads, so empty it and destroy again",
         );
@@ -1161,22 +1264,40 @@ export class CloudflareProvider implements Provider {
       return failed("unavailable", "the Cloudflare provider handle is unavailable", false);
     }
     if (
+      !this.#workerBackend?.managedObjectBucketVacancy ||
       !this.#workerBackend?.prepareManagedObjectBucketDestroy ||
       !this.#workerBackend.commitManagedObjectBucketDestroy
     ) {
-      return failed(
-        "unavailable",
-        "the managed ObjectBucket destroy authority is unavailable",
-        false,
-      );
+      return {
+        phase: "failed",
+        failure: {
+          code: "unavailable",
+          message: "the managed ObjectBucket destroy authority is unavailable",
+          retryable: false,
+        },
+        handle: input.handle,
+      };
     }
     if (handle.stage === "prepare") {
-      const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
-        identity: handle.identity,
-        bucketName: handle.bucketName,
-        authorityProof: handle.authorityProof,
-      });
-      if (!prepared.ok) return providerValueTicket(prepared, handle);
+      let prepared: ProviderValue<{
+        readonly state: "draining" | "prepared";
+        readonly authorityProof: string;
+      }>;
+      try {
+        prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+          identity: handle.identity,
+          bucketName: handle.bucketName,
+          authorityProof: handle.authorityProof,
+        });
+      } catch {
+        return managedObjectDestroyTicketWithHandle(
+          failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", true),
+          { ...handle, stage: "prepare" },
+        );
+      }
+      if (!prepared.ok) {
+        return providerValueTicket(prepared, { ...handle, stage: "prepare" });
+      }
       const next = { ...handle, authorityProof: prepared.value.authorityProof };
       return prepared.value.state === "draining"
         ? running(managedObjectDestroyHandleValue(next), 2_000)
@@ -1220,6 +1341,16 @@ export class CloudflareProvider implements Provider {
     if (input.providerHandle) {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     }
+    const native = parseNativeId(input.nativeId);
+    if (
+      native?.kind === "r2" &&
+      (providerKind(input.offering) === "ObjectBucket" ||
+        providerKind(input.offering) === "object_bucket") &&
+      (this.#workerBackend?.managedObjectBucketReceiptStatus ||
+        this.#workerBackend?.prepareManagedObjectBucketDestroy)
+    ) {
+      return await this.#recoverManagedObjectBucketDestroy(input, native.name);
+    }
     const observed = await this.observe({
       offering: input.offering,
       nativeId: input.nativeId,
@@ -1240,16 +1371,20 @@ export class CloudflareProvider implements Provider {
     return observed;
   }
 
-  async adopt(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: ResourceIdentity;
-    spec: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  /** Mutating delete convergence, reachable only through the maintenance RPC. */
+  async convergeDelete(
+    input: Parameters<NonNullable<Provider["convergeDelete"]>>[0],
+  ): Promise<ProviderTicket> {
+    return await this.delete(input, true);
+  }
+
+  async adopt(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      if (!this.#workerBackend.adopt) {
+        return failed("unavailable", "the managed Worker backend does not support adoption");
+      }
+      return await this.#workerBackend.adopt(input);
+    }
     if (input.operationMode === "recovery" && !input.providerHandle) {
       return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
     }
@@ -1265,16 +1400,16 @@ export class CloudflareProvider implements Provider {
   }
 
   /** Read-only adoption recovery through the provider's observe path. */
-  async recoverAdopt(input: {
-    operationId: string;
-    operationMode?: "initial" | "recovery";
-    providerHandle?: string;
-    offering: ProviderOffering;
-    nativeId: string;
-    identity: ResourceIdentity;
-    spec: JsonObject;
-    relations?: readonly ProviderRelation[];
-  }): Promise<ProviderTicket> {
+  async recoverAdopt(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket> {
+    if (this.#workerBackend?.owns(input.offering)) {
+      if (!this.#workerBackend.recoverAdopt) {
+        return failed(
+          "unavailable",
+          "the managed Worker backend does not support adoption recovery",
+        );
+      }
+      return await this.#workerBackend.recoverAdopt(input);
+    }
     if (input.providerHandle) {
       return failed("unavailable", "Cloudflare adoption recovery cannot poll this handle", true);
     }
@@ -1388,8 +1523,121 @@ export class CloudflareProvider implements Provider {
     bucketName: string,
   ): Promise<ProviderTicket> {
     const identity = exactManagedObjectDestroyIdentity(input.identity);
-    if (!identity || !this.#workerBackend?.prepareManagedObjectBucketDestroy) {
-      return failed("invalid_spec", "the managed ObjectBucket destruction identity is incomplete");
+    if (
+      !identity ||
+      !this.#workerBackend?.managedObjectBucketVacancy ||
+      !this.#workerBackend.prepareManagedObjectBucketDestroy ||
+      !this.#workerBackend.commitManagedObjectBucketDestroy
+    ) {
+      return identity
+        ? failedWithoutProviderMutation(
+            input.operationId,
+            "unavailable",
+            "the managed ObjectBucket destroy authority is unavailable",
+          )
+        : failed("invalid_spec", "the managed ObjectBucket destruction identity is incomplete");
+    }
+    let vacancy: ProviderValue<{ readonly empty: boolean }>;
+    try {
+      vacancy = await this.#workerBackend.managedObjectBucketVacancy({
+        identity,
+        bucketName,
+      });
+    } catch {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "unavailable",
+        "the managed ObjectBucket vacancy authority is unavailable",
+      );
+    }
+    if (!vacancy.ok) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        vacancy.failure.code,
+        vacancy.failure.message,
+      );
+    }
+    const empty = managedObjectBucketVacancyValue(vacancy.value);
+    if (empty === null) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "provider_error",
+        "the managed ObjectBucket vacancy readback is malformed",
+      );
+    }
+    if (!empty) {
+      return failedWithoutProviderMutation(
+        input.operationId,
+        "occupied",
+        "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+          "delete its contents and destroy again",
+      );
+    }
+    const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
+      identity,
+      bucketName,
+    });
+    if (!prepared.ok) return providerValueTicket(prepared);
+    const handle: ManagedObjectDestroyHandle = {
+      schema: MANAGED_OBJECT_DESTROY_HANDLE_SCHEMA,
+      stage: "prepare",
+      operationId: input.operationId,
+      nativeId: input.nativeId,
+      bucketName,
+      authorityProof: prepared.value.authorityProof,
+      identity,
+    };
+    return prepared.value.state === "draining"
+      ? running(managedObjectDestroyHandleValue(handle), 2_000)
+      : await this.#deletePreparedManagedObjectBucket({ ...handle, stage: "confirm" });
+  }
+
+  async #recoverManagedObjectBucketDestroy(
+    input: {
+      readonly operationId: string;
+      readonly nativeId: string;
+      readonly identity: ResourceIdentity;
+    },
+    bucketName: string,
+  ): Promise<ProviderTicket> {
+    const identity = exactManagedObjectDestroyIdentity(input.identity);
+    if (
+      !identity ||
+      !this.#workerBackend?.managedObjectBucketReceiptStatus ||
+      !this.#workerBackend.managedObjectBucketVacancy ||
+      !this.#workerBackend.prepareManagedObjectBucketDestroy ||
+      !this.#workerBackend.commitManagedObjectBucketDestroy
+    ) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
+    }
+    let status: ProviderValue<CloudflareManagedObjectBucketReceiptStatus>;
+    try {
+      status = await this.#workerBackend.managedObjectBucketReceiptStatus({
+        identity,
+        bucketName,
+      });
+    } catch {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
+    }
+    if (
+      !status.ok ||
+      !managedObjectBucketReceiptStatusValue(status.value) ||
+      status.value.lifecycle !== "destroying" ||
+      !status.value.repairRequired
+    ) {
+      return failed(
+        "unavailable",
+        "the managed ObjectBucket delete outcome is not recoverable; operator reconciliation is required",
+        true,
+      );
     }
     const prepared = await this.#workerBackend.prepareManagedObjectBucketDestroy({
       identity,
@@ -1413,6 +1661,45 @@ export class CloudflareProvider implements Provider {
   async #deletePreparedManagedObjectBucket(
     handle: ManagedObjectDestroyHandle,
   ): Promise<ProviderTicket> {
+    const backend = this.#workerBackend;
+    if (!backend?.managedObjectBucketVacancy) {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket vacancy authority is unavailable"),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    let vacancy: ProviderValue<{ readonly empty: boolean }>;
+    try {
+      vacancy = await backend.managedObjectBucketVacancy({
+        identity: handle.identity,
+        bucketName: handle.bucketName,
+      });
+    } catch {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket vacancy authority is unavailable", true),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    if (!vacancy.ok) {
+      return providerValueTicket(vacancy, { ...handle, stage: "prepare" });
+    }
+    const empty = managedObjectBucketVacancyValue(vacancy.value);
+    if (empty === null) {
+      return managedObjectDestroyTicketWithHandle(
+        failed("provider_error", "the managed ObjectBucket vacancy readback is malformed"),
+        { ...handle, stage: "prepare" },
+      );
+    }
+    if (!empty) {
+      return managedObjectDestroyTicketWithHandle(
+        failed(
+          "occupied",
+          "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+            "delete its contents and destroy again",
+        ),
+        { ...handle, stage: "prepare" },
+      );
+    }
     const path = `/accounts/${this.#accountId}/r2/buckets/${encodeURIComponent(handle.bucketName)}`;
     const removed = await this.#call("DELETE", path);
     if (!removed.ok && removed.status !== 404) {
@@ -1423,12 +1710,22 @@ export class CloudflareProvider implements Provider {
         (removed.status === 400 || removed.status === 409) &&
         (await this.#r2BucketPresent(handle.bucketName)) === true
       ) {
-        return failed(
-          "conflict",
-          "the bucket is still present and contains objects; empty it and destroy again",
-        );
+        return {
+          phase: "failed",
+          failure: {
+            code: "occupied",
+            message:
+              "the bucket still holds objects, and this Host does not empty a bucket for you; " +
+              "delete its contents and destroy again",
+            retryable: false,
+          },
+          handle: managedObjectDestroyHandleValue({ ...handle, stage: "prepare" }),
+        };
       }
-      return removed.ticket;
+      return managedObjectDestroyTicketWithHandle(removed.ticket, {
+        ...handle,
+        stage: "prepare",
+      });
     }
     const present = await this.#r2BucketPresent(handle.bucketName);
     if (present === null || present === true) {
@@ -1441,17 +1738,24 @@ export class CloudflareProvider implements Provider {
     handle: ManagedObjectDestroyHandle,
   ): Promise<ProviderTicket> {
     if (!this.#workerBackend?.commitManagedObjectBucketDestroy) {
-      return failed(
-        "unavailable",
-        "the managed ObjectBucket destroy authority is unavailable",
-        false,
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", false),
+        { ...handle, stage: "commit" },
       );
     }
-    const committed = await this.#workerBackend.commitManagedObjectBucketDestroy({
-      identity: handle.identity,
-      bucketName: handle.bucketName,
-      authorityProof: handle.authorityProof,
-    });
+    let committed: ProviderValue<{ readonly destroyed: true }>;
+    try {
+      committed = await this.#workerBackend.commitManagedObjectBucketDestroy({
+        identity: handle.identity,
+        bucketName: handle.bucketName,
+        authorityProof: handle.authorityProof,
+      });
+    } catch {
+      return managedObjectDestroyTicketWithHandle(
+        failed("unavailable", "the managed ObjectBucket destroy authority is unavailable", true),
+        { ...handle, stage: "commit" },
+      );
+    }
     if (!committed.ok) {
       return providerValueTicket(committed, { ...handle, stage: "commit" });
     }
@@ -2779,6 +3083,7 @@ export class CloudflareProvider implements Provider {
       status: response.status,
       ticket: classify(response.status),
       codes: errorCodes(envelope?.errors),
+      ...(!response.ok && wellFormedProviderRefusal(envelope) ? { providerRefusal: true } : {}),
       ...(method !== "GET" && response.ok && envelope?.success !== false
         ? { indeterminate: true }
         : {}),
@@ -2823,11 +3128,18 @@ const REQUIRED_WORKER_BACKEND_METHODS = [
 ] as const;
 
 const OPTIONAL_WORKER_BACKEND_METHODS = [
+  "concludeApplyNoEffect",
+  "compensateApply",
+  "adopt",
+  "recoverAdopt",
+  "convergeDelete",
+  "prepareManagedQueueDestroy",
   "readSqliteMigrationLedger",
   "applySqliteMigrationSuffix",
   "managedScheduleReconciliationStatus",
   "reconcileManagedSchedules",
   "managedObjectBucketReceiptStatus",
+  "managedObjectBucketVacancy",
   "prepareManagedObjectBucketDestroy",
   "commitManagedObjectBucketDestroy",
 ] as const;
@@ -2881,6 +3193,8 @@ type CallResult =
        * vocabulary rather than a generic refusal.
        */
       readonly codes: readonly number[];
+      /** The response was a structurally valid provider refusal envelope. */
+      readonly providerRefusal?: true;
       /** The request may have reached a mutating provider endpoint. */
       readonly indeterminate?: true;
     };
@@ -3070,6 +3384,29 @@ function errorCodes(errors: unknown): readonly number[] {
     .filter((code): code is number => typeof code === "number");
 }
 
+function wellFormedProviderRefusal(envelope: CloudflareResponseEnvelope | null): boolean {
+  if (
+    envelope?.success !== false ||
+    !Array.isArray(envelope.errors) ||
+    envelope.errors.length === 0 ||
+    ("result" in envelope && envelope.result !== null && envelope.result !== undefined) ||
+    ("result_info" in envelope &&
+      envelope.result_info !== null &&
+      envelope.result_info !== undefined)
+  ) {
+    return false;
+  }
+  return envelope.errors.every((entry) => {
+    const error = record(entry);
+    return (
+      error !== undefined &&
+      Number.isSafeInteger(error.code) &&
+      typeof error.message === "string" &&
+      error.message.length > 0
+    );
+  });
+}
+
 function classify(status: number): ProviderTicket {
   if (status === 400 || status === 422)
     return failed("invalid_spec", "the backend rejected the request");
@@ -3080,12 +3417,14 @@ function classify(status: number): ProviderTicket {
   return failed("unavailable", "the backend could not serve the request", status >= 500);
 }
 
-async function readEnvelope(response: Response): Promise<{
+type CloudflareResponseEnvelope = {
   success?: unknown;
   result?: unknown;
   result_info?: unknown;
   errors?: unknown;
-} | null> {
+};
+
+async function readEnvelope(response: Response): Promise<CloudflareResponseEnvelope | null> {
   let bytes: ArrayBuffer;
   try {
     bytes = await response.arrayBuffer();
@@ -3965,17 +4304,64 @@ function managedObjectBucketValue(value: unknown): value is string {
   );
 }
 
+function managedObjectBucketVacancyValue(value: unknown): boolean | null {
+  const object = record(value);
+  if (!object || Object.keys(object).length !== 1 || typeof object.empty !== "boolean") {
+    return null;
+  }
+  return object.empty;
+}
+
+function managedObjectBucketReceiptStatusValue(
+  value: unknown,
+): value is CloudflareManagedObjectBucketReceiptStatus {
+  const object = record(value);
+  if (
+    !object ||
+    Object.keys(object).sort().join(",") !==
+      "lifecycle,nextActionAt,operatorReconciliationRequired,receiptCount,repairRequired" ||
+    (object.lifecycle !== "active" && object.lifecycle !== "destroying") ||
+    !Number.isSafeInteger(object.receiptCount) ||
+    Number(object.receiptCount) < 0 ||
+    !Number.isSafeInteger(object.operatorReconciliationRequired) ||
+    Number(object.operatorReconciliationRequired) < 0 ||
+    typeof object.repairRequired !== "boolean" ||
+    (object.nextActionAt !== null &&
+      (!Number.isSafeInteger(object.nextActionAt) || Number(object.nextActionAt) < 0))
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function providerValueTicket<T>(
   value: Extract<ProviderValue<T>, { readonly ok: false }>,
   handle?: ManagedObjectDestroyHandle,
 ): ProviderTicket {
-  return value.failure.retryable && handle
+  return handle
     ? {
         phase: "failed",
         failure: value.failure,
         handle: managedObjectDestroyHandleValue(handle),
       }
     : { phase: "failed", failure: value.failure };
+}
+
+function managedObjectDestroyTicketWithHandle(
+  ticket: ProviderTicket,
+  handle: ManagedObjectDestroyHandle,
+): ProviderTicket {
+  return ticket.phase === "failed"
+    ? { ...ticket, handle: managedObjectDestroyHandleValue(handle) }
+    : {
+        phase: "failed",
+        failure: {
+          code: "unavailable",
+          message: "the managed ObjectBucket delete outcome is indeterminate",
+          retryable: true,
+        },
+        handle: managedObjectDestroyHandleValue(handle),
+      };
 }
 
 function base64(bytes: Uint8Array): string {

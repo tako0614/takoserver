@@ -57,6 +57,16 @@ export type ResourceDeploymentMutation =
       readonly outputs: JsonObject;
     }
   | {
+      /** Provider-created replacement of a Host-minted, never-adopted object. */
+      readonly kind: "replace";
+      readonly tenantId: string;
+      readonly deploymentId: string;
+      readonly expectedNativeId: string;
+      readonly nativeId: string;
+      readonly observed: JsonObject;
+      readonly outputs: JsonObject;
+    }
+  | {
       readonly kind: "claim";
       readonly tenantId: string;
       readonly deploymentId: string;
@@ -102,6 +112,15 @@ export interface ResourceDeploymentStore {
     providerInstallationRef: string,
     nativeId: string,
   ): Promise<ResourceDeployment | null>;
+  /**
+   * Finds the live owner of a native object across all tenants. Migration
+   * 0039 makes this pair installation-wide, so import preflight must use the
+   * same scope before a provider callback can claim it.
+   */
+  findNativeClaim(
+    providerInstallationRef: string,
+    nativeId: string,
+  ): Promise<ResourceDeployment | null>;
   active(tenantId: string, resourceUid: string): Promise<ResourceDeployment | null>;
   forResource(tenantId: string, resourceUid: string): Promise<readonly ResourceDeployment[]>;
   meteringCandidates(limit: number): Promise<readonly ResourceDeployment[]>;
@@ -112,6 +131,21 @@ export interface ResourceDeploymentStore {
     observed: JsonObject,
     outputs: JsonObject,
   ): Promise<boolean>;
+  /**
+   * Replace one Host-minted native object after a provider update.
+   *
+   * An imported object is a customer claim, not replaceable provider scratch.
+   * Keep the old identity, active state and unclaimed bit in the same CAS so a
+   * stale executor can neither move a claim nor overwrite a newer realization.
+   */
+  replaceNative(input: {
+    readonly tenantId: string;
+    readonly deploymentId: string;
+    readonly expectedNativeId: string;
+    readonly nativeId: string;
+    readonly observed: JsonObject;
+    readonly outputs: JsonObject;
+  }): Promise<boolean>;
   /**
    * Record the first adoption of one live deployment: point it at the named
    * object and mark it claimed. It applies only while the deployment is
@@ -214,6 +248,20 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
       return one(rows);
     },
 
+    async findNativeClaim(providerInstallationRef, nativeId) {
+      // Migration 0039 deliberately fences this pair across tenants. Keep
+      // the lookup's scope aligned with that unique index; a tenant-scoped
+      // read could otherwise dispatch an adoption that only fails after the
+      // final Deployment insert hits the cross-tenant constraint.
+      const rows = await sql.query(
+        `SELECT * FROM tf_resource_deployments
+         WHERE provider_installation_ref = ? AND native_id = ?
+           AND state IN ('provisioning', 'candidate', 'active', 'draining') LIMIT 2`,
+        [providerInstallationRef, nativeId],
+      );
+      return one(rows);
+    },
+
     async active(tenantId, resourceUid): Promise<ResourceDeployment | null> {
       const rows = await sql.query(
         `SELECT * FROM tf_resource_deployments
@@ -269,6 +317,25 @@ export function createResourceDeploymentStore(sql: Sql, clock: Clock): ResourceD
           tenantId,
           deploymentId,
           expectedNativeId,
+        ],
+      );
+      return changed.changes === 1;
+    },
+
+    async replaceNative(input) {
+      const changed = await sql.run(
+        `UPDATE tf_resource_deployments
+         SET native_id = ?, observed_json = ?, outputs_json = ?, updated_at = ?
+         WHERE tenant_id = ? AND id = ? AND native_id = ? AND native_claimed = 0
+           AND state = 'active'`,
+        [
+          input.nativeId,
+          JSON.stringify(input.observed),
+          JSON.stringify(input.outputs),
+          now(),
+          input.tenantId,
+          input.deploymentId,
+          input.expectedNativeId,
         ],
       );
       return changed.changes === 1;

@@ -4,8 +4,13 @@ import type { JsonObject } from "../ports.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "../standard-service-port.ts";
+import type { TakoformApplySelection } from "./apply-selection.ts";
+import type { TakoformImportSelection } from "./import-selection.ts";
 
 export type { TakoformBindingRef, TakoformInterfaceRef, TakoformV1Alpha3FormRef };
+
+/** An immutable snapshot accepted for a provider or intrinsic SQLite mutation. */
+export type TakoformSqliteMigrationSelection = TakoformApplySelection | TakoformImportSelection;
 
 /**
  * The Takoform Host wire vocabulary.
@@ -171,6 +176,11 @@ export interface TakoformDriverReceipt {
    * host-side status transition without pretending desired state changed.
    */
   readonly conditions?: readonly TakoformCondition[];
+  /**
+   * Host-internal provenance for the durable provider mutation execution.
+   * Historical receipts may omit it; callers retain the legacy initial default.
+   */
+  readonly providerExecutionMode?: "initial" | "recovery";
   /** Host-internal provider realization; never rendered into a Resource. */
   readonly deploymentMutation?: ResourceDeploymentMutation;
 }
@@ -237,6 +247,69 @@ export interface TakoformStandardServiceResolver {
 
 export interface TakoformResourceDriver {
   readonly runtimeInputPolicy?: TakoformRuntimeInputPolicy;
+  /**
+   * Pure, bounded placement decision persisted by the Host before callbacks or
+   * provider effects. Recovery may verify current availability against it but
+   * must never replace it with a newly selected destination.
+   */
+  selectApply(input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+    readonly previous?: TakoformStoredResource;
+  }): Promise<TakoformApplySelection>;
+  /**
+   * Pure, bounded import/adoption decision persisted before any provider
+   * callback. Unlike apply selection this input has no commercial authority.
+   */
+  readonly selectImport?: (input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly spec: JsonObject;
+    readonly nativeId: string;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly previous?: TakoformStoredResource;
+  }) => Promise<TakoformImportSelection>;
+  /**
+   * Attempts only to close an already-dispatched accepted create as no-effect.
+   * Implementations return no receipt: conclusive proof is raised as the
+   * driver's whole-operation refusal, while every other result remains held.
+   */
+  readonly concludeApplyNoEffect?: (input: {
+    readonly operationId: string;
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly selection: TakoformApplySelection;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+  }) => Promise<void>;
+  /**
+   * Compensates provider effects for one exact accepted create. This has the
+   * same closed Host authority as no-effect conclusion, but it never proves
+   * the original attempt idle and therefore retains compensated history.
+   */
+  readonly compensateApply?: (input: {
+    readonly operationId: string;
+    readonly executionAuthority: TakoformProviderExecutionAuthority;
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly selection: TakoformApplySelection;
+    readonly commercialAuthority?: TakoformCommercialAuthority;
+  }) => Promise<void>;
   apply(input: {
     readonly operationId: string;
     /** Caller-chosen Host idempotency identity, retained across operation recovery. */
@@ -256,6 +329,8 @@ export interface TakoformResourceDriver {
     /** Host-selected incoming desired generation, not the current/precondition generation. */
     readonly desiredGeneration?: string;
     readonly relations: readonly TakoformDriverRelation[];
+    /** Immutable Host-retained selection accepted before the initial dispatch. */
+    readonly selection: TakoformApplySelection;
     readonly commercialAuthority?: TakoformCommercialAuthority;
     /** Private Host context. The driver resolves it before provider dispatch. */
     readonly workerEndpointOriginReservationId?: string;
@@ -281,6 +356,8 @@ export interface TakoformResourceDriver {
     readonly operationId: string;
     /** Durable saga mode; recovery must poll a retained provider handle. */
     readonly operationMode?: "initial" | "recovery";
+    /** Recovery callers are separated so public readback can never converge. */
+    readonly recoveryAction?: "observe" | "converge";
     /** Opaque provider-owned handle retained by the saga for recovery polling. */
     readonly providerHandle?: string;
     /** Exact live Host saga lease; provider adapters may project it to a route-less executor. */
@@ -319,6 +396,8 @@ export interface TakoformResourceDriver {
     readonly spec: JsonObject;
     readonly nativeId: string;
     readonly relations: readonly TakoformDriverRelation[];
+    /** Immutable Host-retained selection accepted before the initial import. */
+    readonly selection: TakoformImportSelection;
     readonly standardServices?: readonly TakoformStandardServiceProjection[];
     readonly previous?: TakoformStoredResource;
     /** Commit the Deployment realization with the portable Resource. */
@@ -334,6 +413,8 @@ export interface TakoformResourceDriver {
     readLedger(input: {
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      /** Present while an accepted apply or import is executing; observation has no selection. */
+      readonly selection?: TakoformSqliteMigrationSelection;
     }): Promise<readonly TakoformSqliteMigrationIdentity[]>;
     applySuffix(input: {
       /** Stable application Resource saga identity, never a portable migration-ledger field. */
@@ -344,6 +425,8 @@ export interface TakoformResourceDriver {
       readonly executionAuthority: TakoformProviderExecutionAuthority;
       readonly tenantId: string;
       readonly database: TakoformStoredResource;
+      /** Every mutation pins its accepted apply or import snapshot. */
+      readonly selection: TakoformSqliteMigrationSelection;
       /** Stable full desired history; recovery derives a fresh suffix from this exact intent. */
       readonly desired: readonly TakoformSqliteMigration[];
       readonly expectedPrefix: readonly TakoformSqliteMigrationIdentity[];
@@ -487,8 +570,9 @@ export class TakoformHostError extends Error {
      * `STABLE_ERROR_HTTP_STATUS` is read by the provider as an opaque
      * rejection carrying no classification at all. `hostCode` is the seam the
      * released contract already leaves for a Host that knows something the
-     * taxonomy cannot say, and `CROSS_RESOURCE_PRECONDITION` is the one value
-     * this Host uses it for.
+     * taxonomy cannot say. This Host uses it for cross-resource refusals and
+     * for a temporary operation-generation quarantine; neither invents a new
+     * portable error code or mutation authority.
      */
     readonly hostCode?: string,
   ) {

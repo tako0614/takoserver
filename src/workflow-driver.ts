@@ -58,7 +58,17 @@ function defineErrorName(target: object, name: string): void {
  * subclass with fixed own methods keeps helper-created Promises usable after
  * tenant startup without changing or freezing the tenant's globals.
  */
-class WorkflowPromise<T> extends SafePromise<T> {}
+class WorkflowPromise<T> extends SafePromise<T> {
+  // biome-ignore lint/complexity/noUselessConstructor: Bun's synthesized constructor consults poisoned realm intrinsics; keep explicit super.
+  constructor(
+    executor: (
+      resolve: (value: T | PromiseLike<T>) => void,
+      reject: (reason?: unknown) => void,
+    ) => void,
+  ) {
+    super(executor);
+  }
+}
 
 function defineFixed(target: object, key: PropertyKey, value: unknown): void {
   SafeReflectApply(SafeObjectDefineProperty, SafeObject, [

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, constants as fsConstants, lstatSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { parseWorkerCron } from "../cron.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject, JsonValue } from "../ports.ts";
 import {
@@ -79,7 +80,6 @@ import {
   type WorkerdSite,
 } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
-import { parseSelfhostCron } from "./selfhost-cron.ts";
 import { SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND } from "./selfhost-events.ts";
 import {
   SELFHOST_EDGE_OBJECTS_BINDING_REF,
@@ -3001,7 +3001,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (!worker || !cron) return failed("invalid_spec", "the cron trigger is incomplete");
     // Parsed here rather than at the first tick, because a schedule this Host
     // cannot read is a trigger that would be recorded and never fire.
-    if (!parseSelfhostCron(cron)) {
+    if (!parseWorkerCron(cron)) {
       return failed(
         "invalid_spec",
         "the cron expression is not five UTC fields this Host can read",

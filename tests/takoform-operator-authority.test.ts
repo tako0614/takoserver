@@ -209,6 +209,7 @@ async function fixture(
   };
   return {
     operator,
+    catalog,
     request,
     sql,
     objects,
@@ -223,6 +224,26 @@ async function fixture(
 }
 
 type CoordinatorFixture = Awaited<ReturnType<typeof fixture>>;
+
+function unsupportedCoordinator(f: CoordinatorFixture, admission: FormAdmissionHost = f.durable) {
+  return createHostAdmissionCoordinator({
+    identity: f.identity,
+    catalog: { ...f.catalog, entries: [] },
+    packageSet: [{ formRef: f.pkg.formRef, packageDigest: f.pkg.packageDigest }],
+    packages: {
+      async load() {
+        throw new Error("deactivation must not load package bytes");
+      },
+    },
+    storedPackages: createFormPackageStore(f.objects),
+    admission,
+    handles: f.handles,
+    verifier: createIntegrationFixtureEvidenceVerifier({
+      packages: [{ formRef: f.pkg.formRef, packageDigest: f.pkg.packageDigest }],
+    }),
+    assertMutationAuthority: async () => {},
+  });
+}
 
 async function expectInstallIdentityRepair(
   f: CoordinatorFixture,
@@ -821,6 +842,120 @@ describe("route-less Takoserver Host admission coordinator", () => {
         (command) => command.kind,
       ),
     );
+  });
+
+  test("tracks and explicitly deactivates active heads without an implementation entry", async () => {
+    const f = await fixture();
+    const unsupportedOperator = unsupportedCoordinator(f);
+    const inactiveRequest: FormAuthorityPlanRequest = {
+      ...f.request,
+      activation: { ...f.request.activation, desiredActive: false },
+    };
+
+    expect((await f.operator.apply(await f.operator.plan(f.request))).status).toBe("converged");
+    const firstDeactivation = await f.operator.plan(inactiveRequest);
+    expect((await f.operator.apply(firstDeactivation)).status).toBe("converged");
+    const before = await unsupportedOperator.readback(f.request);
+    const inactiveHead = before.forms[0]?.activationHead;
+    expect(inactiveHead).toMatchObject({ present: true, active: false });
+
+    const reactivated = await f.durable.execute({
+      kind: "SetActivation",
+      formRef: f.pkg.formRef,
+      packageDigest: f.pkg.packageDigest,
+      active: true,
+      audience: takoformActivationAudience("space", {
+        tenantId: f.request.activation.tenantId,
+        space: f.request.activation.space,
+      }),
+      implementationDigest: f.identity.implementationDigest,
+      actor: "integration-operator",
+      reason: "reproduce a durable active head after its handler leaves the runtime catalog",
+    });
+    const active = await unsupportedOperator.readback(f.request);
+    expect(active.currentHeadDigest).not.toBe(before.currentHeadDigest);
+    expect(active.forms[0]?.activationHead).toEqual({
+      present: true,
+      active: true,
+      implementationDigest: f.identity.implementationDigest,
+      eventDigest: reactivated.eventDigest,
+    });
+
+    const activeHistoryBeforePlan = await f.sql.query(
+      "SELECT event_digest, active FROM tf_form_activation_events ORDER BY event_at, id",
+    );
+    await expect(unsupportedOperator.plan(f.request)).rejects.toMatchObject({
+      code: "authority_state_conflict",
+    });
+    expect(
+      await f.sql.query(
+        "SELECT event_digest, active FROM tf_form_activation_events ORDER BY event_at, id",
+      ),
+    ).toEqual(activeHistoryBeforePlan);
+
+    const deactivation = await unsupportedOperator.plan(inactiveRequest);
+    expect(deactivation.commands).toEqual([
+      expect.objectContaining({
+        kind: "SetActivation",
+        formRef: f.pkg.formRef,
+        packageDigest: f.pkg.packageDigest,
+        active: false,
+        implementationDigest: f.identity.implementationDigest,
+        predecessorDigest: reactivated.eventDigest,
+      }),
+    ]);
+    const loadsBeforeDeactivation = f.packageLoads.count;
+    const applied = await unsupportedOperator.apply(deactivation);
+    expect(applied.status).toBe("converged");
+    expect(applied.receipts).toMatchObject([
+      { kind: "SetActivation", state: "inactive", changed: true },
+    ]);
+    expect(applied.readback.forms[0]).toMatchObject({
+      installed: true,
+      supported: false,
+      operations: [],
+      activationHead: {
+        present: true,
+        active: false,
+        implementationDigest: f.identity.implementationDigest,
+        eventDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      },
+    });
+    expect(f.packageLoads.count).toBe(loadsBeforeDeactivation);
+  });
+
+  test("rejects malformed and multiple activation heads without an implementation entry", async () => {
+    const malformed = await fixture();
+    expect(
+      (await malformed.operator.apply(await malformed.operator.plan(malformed.request))).status,
+    ).toBe("converged");
+    await malformed.sql.run("UPDATE tf_form_activation_events SET implementation_digest = ?", [
+      digest("9"),
+    ]);
+    await expect(
+      unsupportedCoordinator(malformed).readback(malformed.request),
+    ).rejects.toMatchObject({
+      code: "authority_state_conflict",
+    });
+
+    const forked = await fixture();
+    expect((await forked.operator.apply(await forked.operator.plan(forked.request))).status).toBe(
+      "converged",
+    );
+    const duplicateActivationHistory: FormAdmissionHost = {
+      async inspect(query) {
+        const view = await forked.durable.inspect(query);
+        if (query.kind !== "History" || query.chain !== "activation") return view;
+        const [first] = view.events ?? [];
+        return first ? { ...view, events: [...(view.events ?? []), first] } : view;
+      },
+      execute(command) {
+        return forked.durable.execute(command);
+      },
+    };
+    await expect(
+      unsupportedCoordinator(forked, duplicateActivationHistory).readback(forked.request),
+    ).rejects.toMatchObject({ code: "authority_state_conflict" });
   });
 
   test("deactivates an active head with its durable implementation and no package verification", async () => {

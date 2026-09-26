@@ -1,14 +1,20 @@
 import type { JsonObject } from "../ports.ts";
 import type {
   ApplyInput,
+  ProviderApplyCompensationInput,
+  ProviderApplyCompensationResult,
+  ProviderApplyNoEffectConclusionInput,
+  ProviderApplyNoEffectConclusionResult,
   ProviderArtifactConsumption,
   ProviderArtifactConsumptionInput,
   ProviderExecutionAuthority,
+  ProviderFailure,
   ProviderNativeAbsence,
   ProviderNativeReadbackDescriptor,
   ProviderNativeReadbackInput,
   ProviderOffering,
   ProviderReadAuthorityTarget,
+  ProviderRelation,
   ProviderSqliteMigration,
   ProviderSqliteMigrationIdentity,
   ProviderTicket,
@@ -16,6 +22,7 @@ import type {
   ResourceIdentity,
 } from "../provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../provider-runtime-input-port.ts";
+import type { CloudflareZone } from "./cloudflare.ts";
 
 export interface CloudflareOrdinaryWorkerBackendOptions {
   readonly kind: "ordinary-workers";
@@ -36,27 +43,48 @@ export interface CloudflareManagedObjectBucketReceiptStatus {
 }
 
 export interface CloudflareManagedScheduleReconciliationStatus {
-  readonly state: "idle" | "leased" | "operator_reconciliation_required" | "absent";
+  readonly state:
+    | "idle"
+    | "leased"
+    | "operator_reconciliation_required"
+    | "portable_clock_cutover_required"
+    | "absent";
   readonly desiredGeneration: number | null;
   readonly appliedGeneration: number | null;
   readonly appliedDigest: `sha256:${string}` | null;
   readonly desiredSchedules: readonly string[];
   readonly actualSchedules: readonly string[];
   readonly actualDigest: `sha256:${string}`;
+  /** Null when a bounded read cannot prove the complete, valid inventory. */
+  readonly membershipCount: number | null;
+  readonly membershipCapacity: number;
+  readonly nativeProjectionSchedules: readonly string[];
+  readonly routeAuthorityDigest: `sha256:${string}` | null;
+  readonly nativeProjectionDigest: `sha256:${string}` | null;
+  readonly clockClosure: "legacy-v1" | "portable-v2" | "unresolved";
   readonly leaseToken: string | null;
   readonly leaseUntil: number | null;
   readonly ambiguousGeneration: number | null;
   readonly ambiguityReason: "lease_expired" | "mutation_indeterminate" | null;
 }
 
-export interface CloudflareManagedScheduleOperatorProof {
-  readonly operatorAcknowledgement: string;
-  readonly leaseToken: string;
-  readonly ambiguousGeneration: number;
-  readonly desiredGeneration: number;
-  readonly actualDigest: `sha256:${string}`;
-  readonly action: "accept-provider-state" | "replace-with-desired";
-}
+/** Provider/operator library contract only; not part of the portable Host API. */
+export type CloudflareManagedScheduleOperatorProof =
+  | {
+      readonly operatorAcknowledgement: string;
+      readonly leaseToken: string;
+      readonly ambiguousGeneration: number;
+      readonly desiredGeneration: number;
+      readonly actualDigest: `sha256:${string}`;
+      readonly action: "accept-provider-state" | "replace-with-desired";
+    }
+  | {
+      readonly action: "cutover-portable-clock";
+      readonly operatorAcknowledgement: string;
+      readonly desiredGeneration: number;
+      readonly legacyAppliedDigest: `sha256:${string}`;
+      readonly actualDigest: `sha256:${string}`;
+    };
 
 export type CloudflareWorkerBackendOptions =
   | CloudflareOrdinaryWorkerBackendOptions
@@ -93,7 +121,32 @@ export interface CloudflareWorkerDeleteInput {
   readonly nativeId: string;
   readonly identity: ResourceIdentity;
   readonly spec?: JsonObject;
-  readonly relations?: readonly import("../provider-port.ts").ProviderRelation[];
+  readonly relations?: readonly ProviderRelation[];
+}
+
+/** Closed internal result for destructive managed Queue helper retirement. */
+export type CloudflareManagedQueueDestroyPreparation =
+  | {
+      readonly state: "ready";
+      /** A durable marker or helper mutation now belongs to this exact delete. */
+      readonly effectsStarted: boolean;
+    }
+  | {
+      readonly state: "pending" | "refused";
+      readonly effectsStarted: boolean;
+      readonly failure: ProviderFailure;
+    };
+
+/** Adoption identity shared by the Cloudflare provider and its Worker backend. */
+export interface CloudflareWorkerAdoptInput {
+  readonly operationId: string;
+  readonly operationMode?: "initial" | "recovery";
+  readonly providerHandle?: string;
+  readonly offering: ProviderOffering;
+  readonly nativeId: string;
+  readonly identity: ResourceIdentity;
+  readonly spec: JsonObject;
+  readonly relations?: readonly ProviderRelation[];
 }
 
 /** One complete Worker placement lifecycle behind the Cloudflare adapter. */
@@ -108,15 +161,34 @@ export interface CloudflareWorkerBackend {
   apply(input: ApplyInput): Promise<ProviderTicket>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<ProviderTicket>;
+  /** Optional closed create-abort authority owned by the managed backend. */
+  concludeApplyNoEffect?(
+    input: ProviderApplyNoEffectConclusionInput,
+  ): Promise<ProviderApplyNoEffectConclusionResult>;
+  /** Optional closed compensation authority owned by the managed backend. */
+  compensateApply?(input: ProviderApplyCompensationInput): Promise<ProviderApplyCompensationResult>;
   observe(input: {
     readonly offering: ProviderOffering;
     readonly nativeId: string;
     readonly identity: ResourceIdentity;
     readonly spec: JsonObject;
-    readonly relations?: readonly import("../provider-port.ts").ProviderRelation[];
+    readonly relations?: readonly ProviderRelation[];
   }): Promise<ProviderTicket>;
+  /** Optional backend-owned adoption; omission refuses without ordinary fallback. */
+  adopt?(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket>;
+  /** Optional read-only adoption recovery; omission refuses without ordinary fallback. */
+  recoverAdopt?(input: CloudflareWorkerAdoptInput): Promise<ProviderTicket>;
   delete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
   recoverDelete(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
+  convergeDelete?(input: CloudflareWorkerDeleteInput): Promise<ProviderTicket>;
+  /**
+   * Internal-only preparation for a generic AtLeastOnceQueue destroy. The
+   * managed backend does not own the offering in this mode, but it does own
+   * the exact helper closure that must be retired first.
+   */
+  prepareManagedQueueDestroy?(
+    input: CloudflareWorkerDeleteInput,
+  ): Promise<CloudflareManagedQueueDestroyPreparation>;
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor;
@@ -147,6 +219,11 @@ export interface CloudflareWorkerBackend {
     readonly identity: ResourceIdentity;
     readonly bucketName: string;
   }): Promise<ProviderValue<CloudflareManagedObjectBucketReceiptStatus>>;
+  /** Read-only vacancy proof required before a managed ObjectBucket destroy. */
+  managedObjectBucketVacancy?(input: {
+    readonly identity: ResourceIdentity;
+    readonly bucketName: string;
+  }): Promise<ProviderValue<{ readonly empty: boolean }>>;
   prepareManagedObjectBucketDestroy?(input: {
     readonly identity: ResourceIdentity;
     readonly bucketName: string;
@@ -182,6 +259,7 @@ export interface CloudflareWorkerBackendFactoryContext {
   readonly offerings: readonly ProviderOffering[];
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
   readonly workerCompatibilityDate: string;
+  readonly zoneFor: (hostname: string, tenantRef: string) => CloudflareZone | undefined;
 }
 
 /** In-process managed backend composition; never a wire or public Form DTO. */

@@ -25,6 +25,7 @@ try {
         "CORE_VERIFIER",
         "WORKER_VERSION",
         "TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST",
+        "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY",
       ],
       [],
     ],
@@ -98,6 +99,26 @@ try {
     }
     if (source.includes("/admin") || source.includes("CLOUDFLARE_API_TOKEN")) {
       throw new Error(`${name} bundle contains a public-admin or credential surface`);
+    }
+    const managedEntrypoint = "TenantSpaceAdmissionEntrypoint";
+    if (source.includes(managedEntrypoint) !== (name === "production")) {
+      throw new Error(`${name} bundle has an incorrect managed Space authority boundary`);
+    }
+    if (name === "production") {
+      for (const [entrypointName, expectedMethods] of [
+        ["FormAuthorityEntrypoint", ["verifierIdentity", "plan", "apply", "readback"]],
+        [managedEntrypoint, ["ensureTenantSpaceAdmission"]],
+      ] as const) {
+        const start = source.indexOf(`${entrypointName} = class extends WorkerEntrypoint`);
+        const end = source.indexOf("\n};", start);
+        const entrypoint = start < 0 || end < 0 ? "" : source.slice(start, end);
+        const methods = [
+          ...entrypoint.matchAll(/\n {2}(?:async )?([A-Za-z_$][A-Za-z0-9_$]*)\([^)]*\) \{/gu),
+        ].map((match) => match[1]);
+        if (JSON.stringify(methods) !== JSON.stringify(expectedMethods)) {
+          throw new Error(`${entrypointName} must export only its intended authority operations`);
+        }
+      }
     }
     // The generated corpus export is the bundle-level witness that the
     // integration Worker carries the exact fixture package closure. Keep the

@@ -12,23 +12,47 @@ import {
 } from "../src/takoform/implementation-catalog.ts";
 
 const artifact = (hex: string) => `sha256:${hex.repeat(64)}` as const;
+const WORKER_CUSTOM_DOMAIN_IDENTITY = {
+  formRef: {
+    apiVersion: "edge.forms.takoform.com",
+    kind: "WorkerCustomDomain",
+    definitionVersion: "0.1.0",
+    schemaDigest: "sha256:1e4ae27dd53dfb8db977e3627e0b14f0d5e284703e9c435f48af31bd8e474110",
+  },
+  packageDigest: "sha256:94453c8f24eccf11e2a7142fb8711b47a8b039a7124a9498c498ec466c0574ed",
+} as const;
 
 describe("public Worker semantic implementation identity", () => {
-  test("derives support from all publisher identities and concrete handlers", async () => {
+  test("admits the exact published WorkerCustomDomain operations without update", async () => {
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities: publicFormCapabilityManifest(),
+    });
+
+    expect(catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")).toEqual({
+      ...WORKER_CUSTOM_DOMAIN_IDENTITY,
+      operations: ["create", "read", "delete", "import", "observe"],
+    });
+  });
+
+  test("derives support only from declared capabilities and concrete handlers", async () => {
     const catalog = await deriveRuntimeImplementationCatalog({
       implementationPayloadDigest: artifact("1"),
       capabilities: publicFormCapabilityManifest(),
     });
     const kinds = catalog.entries.map((entry) => entry.formRef.kind);
     expect(kinds).toHaveLength(15);
-    expect(kinds).toEqual(expect.arrayContaining(["StaticAssetBundle", "WorkerCustomDomain"]));
-    expect(kinds).not.toEqual(expect.arrayContaining(["ActorNamespace", "DurableWorkflow"]));
+    expect(kinds).toContain("StaticAssetBundle");
+    expect(kinds).toContain("WorkerCustomDomain");
+    for (const kind of ["ActorNamespace", "DurableWorkflow"]) {
+      expect(kinds).not.toContain(kind);
+    }
     expect(
       catalog.entries.find((entry) => entry.formRef.kind === "StaticAssetBundle")?.operations,
     ).toEqual(["create", "read", "delete", "import", "observe"]);
     expect(
       catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
-    ).toEqual([]);
+    ).toEqual(["create", "read", "delete", "import", "observe"]);
   });
 
   test("keeps intrinsic asset support independent of identity supply and domain configuration", async () => {
@@ -50,7 +74,32 @@ describe("public Worker semantic implementation identity", () => {
     ).toEqual(["create", "read", "delete", "import", "observe"]);
     expect(
       catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
+    ).toBeUndefined();
+  });
+
+  test("preserves an explicitly declared supported-empty identity", async () => {
+    const base = publicFormCapabilityManifest();
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities: { ...base, forms: { ...base.forms, WorkerCustomDomain: [] } },
+    });
+    expect(catalog.entries).toHaveLength(15);
+    expect(
+      catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
     ).toEqual([]);
+  });
+
+  test("never derives support from an inherited capability declaration", async () => {
+    const base = publicFormCapabilityManifest();
+    const declaredForms = Object.fromEntries(
+      Object.entries(base.forms).filter(([kind]) => kind !== "WorkerCustomDomain"),
+    );
+    const forms = Object.assign(Object.create({ WorkerCustomDomain: [] }), declaredForms);
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities: { ...base, forms },
+    });
+    expect(catalog.entries.map((entry) => entry.formRef.kind)).not.toContain("WorkerCustomDomain");
   });
 
   test("ignores unrelated outer Worker bytes but changes for payload or capability bytes", async () => {

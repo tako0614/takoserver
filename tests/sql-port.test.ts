@@ -217,7 +217,7 @@ describe("ObjectStore port", () => {
 });
 
 describe("artifact paths", () => {
-  test("accepts a standard hidden web directory but never traversal", async () => {
+  test("accepts frozen artifact filenames but rejects dot-prefixed paths and traversal", async () => {
     const { createTakoformArtifacts } = await import("../src/takoform/artifacts.ts");
     const { createEphemeralSql } = await import("../src/compat.ts");
     const { createMemoryObjectStore } = await import("../src/objects-mem.ts");
@@ -250,13 +250,12 @@ describe("artifact paths", () => {
         (code, status) => Response.json({ error: { code } }, { status }),
       );
 
-    // `.well-known` is a standard path; refusing it would make a whole class of
-    // real sites undeployable.
-    expect((await start(".well-known/nodeinfo"))?.status).toBe(201);
-    // Traversal is refused at parse time, before anything is recorded. The
+    // Manifest filenames follow the frozen artifact schema, not URL routing.
+    expect((await start("_well-known/nodeinfo.v1.json"))?.status).toBe(201);
+    // Invalid paths are refused at parse time, before anything is recorded. The
     // transport raises rather than answering; the router is what turns that
     // into a 400 for a caller.
-    for (const path of ["../escape", "a/../b", "./here"]) {
+    for (const path of [".well-known/nodeinfo", "dir/.hidden", "../escape", "a/../b", "./here"]) {
       await expect(start(path)).rejects.toMatchObject({ code: "artifact_invalid" });
     }
   });

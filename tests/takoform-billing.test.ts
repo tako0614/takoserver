@@ -17,6 +17,7 @@ import { createProviderDriver, ProviderMutationRecoveryError } from "../src/prov
 import {
   failed,
   failedWithoutProviderMutation,
+  failedWithoutProviderOperationMutation,
   type Provider,
   type ProviderOffering,
   type ProviderReadAuthorityTarget,
@@ -25,6 +26,7 @@ import {
 } from "../src/provider-port.ts";
 import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const fakeReadback = {
@@ -308,7 +310,7 @@ describe("Takoform apply on a real backend", () => {
 
     let firstError: unknown;
     try {
-      await makeDriver().apply(input);
+      await applyWithSelection(makeDriver(), input);
     } catch (error) {
       firstError = error;
     }
@@ -328,7 +330,7 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.sideEffectCount).toBe(1);
 
     const restarted = makeDriver();
-    const settled = await restarted.apply({
+    const settled = await applyWithSelection(restarted, {
       ...input,
       operationMode: "recovery",
       providerHandle,
@@ -394,7 +396,7 @@ describe("Takoform apply on a real backend", () => {
       relations: [],
     } as const;
 
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "running",
       providerHandle: "handle_op_poll_lost",
     });
@@ -402,7 +404,7 @@ describe("Takoform apply on a real backend", () => {
     // executor can then carry it back through the recovery-only path.
     expect(pollCalls).toBe(0);
     failNextPoll = false;
-    const recovered = await makeDriver().apply({
+    const recovered = await applyWithSelection(makeDriver(), {
       ...input,
       operationMode: "recovery",
       providerHandle: "handle_op_poll_lost",
@@ -466,7 +468,7 @@ describe("Takoform apply on a real backend", () => {
       relations: [],
     } as const;
 
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "indeterminate",
     });
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
@@ -474,11 +476,11 @@ describe("Takoform apply on a real backend", () => {
       heldMinor: 500,
       availableMinor: 1_500,
     });
-    await expect(makeDriver().apply({ ...input, operationMode: "recovery" })).rejects.toMatchObject(
-      {
-        providerOutcome: "indeterminate",
-      },
-    );
+    await expect(
+      applyWithSelection(makeDriver(), { ...input, operationMode: "recovery" }),
+    ).rejects.toMatchObject({
+      providerOutcome: "indeterminate",
+    });
     expect(attempts).toBe(1);
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
       settledMinor: 2_000,
@@ -553,10 +555,13 @@ describe("Takoform apply on a real backend", () => {
       spec: { location: "apac" },
       relations: [],
     } as const;
-    await expect(makeDriver().apply(input)).rejects.toMatchObject({
+    await expect(applyWithSelection(makeDriver(), input)).rejects.toMatchObject({
       providerOutcome: "indeterminate",
     });
-    const recovered = await makeDriver().apply({ ...input, operationMode: "recovery" });
+    const recovered = await applyWithSelection(makeDriver(), {
+      ...input,
+      operationMode: "recovery",
+    });
     expect(recovered.observed).toEqual(input.spec);
     expect(applyCalls).toBe(1);
     expect(readOnlyRecoverCalls).toBe(0);
@@ -613,7 +618,7 @@ describe("Takoform apply on a real backend", () => {
     expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'tick-repair'`,
         [organizationId],
       ),
@@ -756,14 +761,14 @@ describe("Takoform apply on a real backend", () => {
       });
       expect(
         await sql.query(
-          `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas
+          `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
            WHERE tenant_id = ? AND operation_id = ?`,
           [organizationId, operationId],
         ),
       ).toEqual([{ phase: "planned", provider_outcome: scenario.initialOutcome }]);
       expect(
         await sql.query(
-          `SELECT id, phase FROM tf_deferred_operations
+          `SELECT id, phase FROM tf_deferred_operations_selection_v1
            WHERE tenant_id = ? AND id = ?`,
           [organizationId, operationId],
         ),
@@ -778,7 +783,7 @@ describe("Takoform apply on a real backend", () => {
         expect(pollCalls).toBe(1);
         expect(
           await sql.query(
-            `SELECT phase, provider_handle, provider_outcome FROM tf_provider_mutation_sagas
+            `SELECT phase, provider_handle, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
              WHERE tenant_id = ? AND operation_id = ?`,
             [organizationId, operationId],
           ),
@@ -802,7 +807,7 @@ describe("Takoform apply on a real backend", () => {
         expect(pollCalls).toBe(2);
         expect(
           await sql.query(
-            `SELECT provider_handle, provider_outcome FROM tf_provider_mutation_sagas
+            `SELECT provider_handle, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
              WHERE tenant_id = ? AND operation_id = ?`,
             [organizationId, operationId],
           ),
@@ -813,6 +818,213 @@ describe("Takoform apply on a real backend", () => {
           },
         ]);
       }
+    }
+  });
+
+  test("whole-operation apply abort settles the indeterminate operation and its exact held money", async () => {
+    for (const scenario of [
+      "priced",
+      "free",
+      "free-lost-ack",
+      "stale",
+      "rollback",
+      "lost-ack",
+    ] as const) {
+      const amountMinor = scenario === "free" || scenario === "free-lost-ack" ? 0 : 500;
+      const durable = createEphemeralSql();
+      let injected = false;
+      const sql: Sql = {
+        query: (statement, params) => durable.query(statement, params),
+        run: (statement, params) => durable.run(statement, params),
+        async batch(statements) {
+          const terminalDeferredFailure = statements.some(
+            ({ sql: statement }) =>
+              statement.includes("UPDATE tf_deferred_operations_selection_v1") &&
+              statement.includes("SET phase = 'failed'"),
+          );
+          if (!injected && scenario === "free-lost-ack" && terminalDeferredFailure) {
+            injected = true;
+            await durable.batch(statements);
+            throw new SqlError("unavailable", "lost free abort settlement acknowledgement");
+          }
+          const releaseIndex = statements.findIndex(
+            ({ sql: statement, params }) =>
+              statement.includes("INSERT INTO ledger") && params?.[2] === "release",
+          );
+          if (
+            releaseIndex >= 0 &&
+            !injected &&
+            (scenario === "rollback" || scenario === "lost-ack")
+          ) {
+            injected = true;
+            if (scenario === "rollback")
+              return durable.batch([
+                ...statements.slice(0, releaseIndex + 1),
+                {
+                  sql: "INSERT INTO tf_operation_commit_guards (token, valid) VALUES (?, 0)",
+                  params: ["abort-rollback"],
+                },
+                ...statements.slice(releaseIndex + 1),
+              ]);
+            await durable.batch(statements);
+            throw new SqlError("unavailable", "lost abort settlement acknowledgement");
+          }
+          return durable.batch(statements);
+        },
+      };
+      let now = Date.parse("2026-09-20T00:00:00.000Z");
+      const clock = () => new Date(now);
+      let applyCalls = 0;
+      let unrelatedConclusionCalls = 0;
+      let initialAuthority: Parameters<Provider["apply"]>[0]["executionAuthority"];
+      const provider: Provider = {
+        id: "fake",
+        offerings: [PROVIDER_OFFERING],
+        ...fakeReadback,
+        async apply(input) {
+          applyCalls += 1;
+          initialAuthority = input.executionAuthority;
+          return failed("unavailable", "initial response lost before durable claim", true);
+        },
+        async convergeApply(input) {
+          if (scenario === "stale" && !injected) {
+            injected = true;
+            now += 60_000;
+          }
+          return failedWithoutProviderOperationMutation(
+            input.operationId,
+            "conflict",
+            "the exact operation was durably fenced before effects",
+          );
+        },
+        async observe() {
+          return failed("not_found", "not found");
+        },
+        async delete() {
+          return failed("not_found", "not found");
+        },
+      };
+      const proofOnlyProvider: Provider = {
+        id: "proof-only",
+        offerings: [],
+        ...fakeReadback,
+        async apply() {
+          return failed("unavailable", "not selected", true);
+        },
+        async concludeApplyNoEffect() {
+          unrelatedConclusionCalls += 1;
+          return { phase: "unsupported" };
+        },
+        async observe() {
+          return failed("not_found", "not found");
+        },
+        async delete() {
+          return failed("not_found", "not found");
+        },
+      };
+      const app = buildApp({
+        sql,
+        objects: createMemoryObjectStore(),
+        identity,
+        settlement,
+        clock,
+        publicOrigin: "https://api.takoserver.com",
+        forms: [FORM],
+        hostForms: [FORM],
+        takoformHostFactory: createStaticStableTestTakoformHost,
+        providers: [provider, proofOnlyProvider],
+        offerings: [
+          {
+            ...SOLD,
+            pricePlan: {
+              ...SOLD.pricePlan,
+              provisioning: { meter: "resource.create", amountMinor },
+            },
+          },
+        ],
+      });
+      const { organizationId, provider: auth } = await tenant(app.fetch);
+      const initial = await applyBucket(
+        app.fetch,
+        auth,
+        `abort-${amountMinor}`,
+        {},
+        `abort-${amountMinor}-0001`,
+      );
+      expect(initial.status).toBe(202);
+      const operationId = String((initial.body.operation as { id?: string }).id);
+      expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
+        heldMinor: amountMinor,
+      });
+      const firstRecovery = (await app.tick()).providerRepairs;
+      if (scenario === "stale" || scenario === "rollback") {
+        expect(firstRecovery).toMatchObject({ settled: 0, pending: 1 });
+        expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
+          heldMinor: amountMinor,
+        });
+        expect(
+          await sql.query("SELECT id FROM ledger WHERE org_id = ? AND type = 'release'", [
+            organizationId,
+          ]),
+        ).toEqual([]);
+        expect(
+          await sql.query(
+            "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+            [operationId],
+          ),
+        ).toEqual([{ provider_outcome: "indeterminate" }]);
+        now += 60_000;
+        expect((await app.tick()).providerRepairs).toMatchObject({ settled: 1, pending: 0 });
+      } else expect(firstRecovery).toMatchObject({ settled: 1, pending: 0 });
+      expect(applyCalls).toBe(1);
+      expect(unrelatedConclusionCalls).toBe(0);
+      if (scenario === "lost-ack" || scenario === "free-lost-ack") {
+        expect(injected).toBe(true);
+      }
+      expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
+        heldMinor: 0,
+        settledMinor: 2_000,
+      });
+      expect(
+        await sql.query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+          [operationId],
+        ),
+      ).toEqual([]);
+      expect(
+        await sql.query("SELECT uid FROM tf_resources WHERE tenant_id = ?", [organizationId]),
+      ).toEqual([]);
+      expect(
+        await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+          operationId,
+        ]),
+      ).toEqual([{ phase: "failed" }]);
+      expect(
+        await sql.query(
+          "SELECT resource_uid FROM tf_resource_deletion_attestations WHERE tenant_id = ?",
+          [organizationId],
+        ),
+      ).toEqual([]);
+      expect(
+        await sql.query("SELECT effect_id FROM tf_resource_provider_effects WHERE tenant_id = ?", [
+          organizationId,
+        ]),
+      ).toEqual([]);
+      if (!initialAuthority) throw new Error("initial authority missing");
+      await expect(
+        createTakoformStore(sql, clock).recordProviderMutationReceipt({
+          tenantId: initialAuthority.tenantId,
+          resourceUid: initialAuthority.resourceUid,
+          operationId,
+          leaseToken: initialAuthority.leaseToken,
+          receipt: { observed: { late: true } },
+        }),
+      ).rejects.toMatchObject({ code: "resource_busy" });
+      expect(
+        await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+          operationId,
+        ]),
+      ).toEqual([{ phase: "failed" }]);
     }
   });
 
@@ -885,7 +1097,7 @@ describe("Takoform apply on a real backend", () => {
     expect(convergeCalls).toBe(1);
     expect(
       await sql.query(
-        `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas
+        `SELECT phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
          WHERE tenant_id = ? AND operation_id = ?`,
         [organizationId, operationId],
       ),
@@ -901,6 +1113,312 @@ describe("Takoform apply on a real backend", () => {
     expect(await createLedger(sql, () => new Date()).wallet(organizationId)).toMatchObject({
       heldMinor: 500,
     });
+  });
+
+  test("never reroutes an accepted apply to a different provider after restart", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    let initialCalls = 0;
+    const initialProvider: Provider = {
+      id: "fake-initial",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        initialCalls += 1;
+        throw new Error("initial provider acknowledgement lost");
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const initialOffering: Offering = {
+      ...SOLD,
+      providerPackRef: initialProvider.id,
+      providerInstallationRef: "fake-initial.primary",
+    };
+    const app = buildApp({
+      sql,
+      objects,
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [initialProvider],
+      offerings: [initialOffering],
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await applyBucket(
+      app.fetch,
+      auth,
+      "selection-restart",
+      {},
+      "selection-restart-0001",
+    );
+    expect(accepted.status).toBe(202);
+    expect(initialCalls).toBe(1);
+
+    let reroutedCalls = 0;
+    const reroutedProvider: Provider = {
+      id: "fake-rerouted",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("recovery must not issue an initial apply");
+      },
+      async convergeApply(input) {
+        reroutedCalls += 1;
+        return succeeded({
+          nativeId: `rerouted:${input.operationId}`,
+          observed: input.spec,
+          outputs: {},
+        });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const restarted = buildApp({
+      sql,
+      objects,
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [FORM],
+      hostForms: [FORM],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [reroutedProvider],
+      offerings: [
+        {
+          ...SOLD,
+          providerPackRef: reroutedProvider.id,
+          providerInstallationRef: "fake-rerouted.primary",
+        },
+      ],
+    });
+
+    expect((await restarted.tick()).providerRepairs).toMatchObject({ pending: 1, settled: 0 });
+    expect(reroutedCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT phase, selection_json FROM tf_provider_mutation_sagas_selection_v1
+         WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual([
+      {
+        phase: "planned",
+        selection_json: expect.stringContaining('"providerPackRef":"fake-initial"'),
+      },
+    ]);
+    expect(
+      await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects
+         WHERE tenant_id = ? ORDER BY phase`,
+        [organizationId],
+      ),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+    expect(
+      await sql.query(`SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ state: "live" }]);
+  });
+
+  test("never reroutes an accepted import to a different provider after restart", async () => {
+    const sql = createEphemeralSql();
+    const objects = createMemoryObjectStore();
+    const importForm: InstalledTakoformForm = {
+      ...FORM,
+      operations: [...FORM.operations, "import"],
+    };
+    let initialCalls = 0;
+    let recoveryCalls = 0;
+    const provider: Provider = {
+      id: "fake-initial",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("not an apply");
+      },
+      async adopt() {
+        initialCalls += 1;
+        throw new Error("import acknowledgement lost");
+      },
+      async recoverAdopt(input) {
+        recoveryCalls += 1;
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const open = (selected: Provider) =>
+      buildApp({
+        sql,
+        objects,
+        identity,
+        settlement,
+        publicOrigin: "https://api.takoserver.com",
+        forms: [importForm],
+        hostForms: [importForm],
+        takoformHostFactory: createStaticStableTestTakoformHost,
+        providers: [selected],
+        offerings: [
+          {
+            ...SOLD,
+            providerPackRef: selected.id,
+            providerInstallationRef: `${selected.id}.primary`,
+          },
+        ],
+      });
+    const app = open(provider);
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await call(
+      app.fetch,
+      "POST",
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/import-selection-restart/import`,
+      {
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        form: { formRef: FORM_REF },
+        metadata: { name: "import-selection-restart", space: "default" },
+        nativeId: "native-import-restart",
+        spec: {},
+      },
+      { ...auth, "idempotency-key": "import-selection-restart-0001", "if-none-match": "*" },
+    );
+    expect(accepted.status).toBe(202);
+    expect(initialCalls).toBe(1);
+    const selected = await sql.query(
+      `SELECT import_selection_json FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+      [organizationId],
+    );
+    expect(selected).toEqual([
+      { import_selection_json: expect.stringContaining('"providerPackRef":"fake-initial"') },
+    ]);
+    const restarted = open({ ...provider, id: "fake-rerouted" });
+    expect((await restarted.tick()).providerRepairs).toMatchObject({ pending: 1, settled: 0 });
+    expect(initialCalls).toBe(1);
+    expect(recoveryCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT import_selection_json FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual(selected);
+    expect(
+      await sql.query(
+        `SELECT phase FROM tf_resource_provider_effects WHERE tenant_id = ? ORDER BY phase`,
+        [organizationId],
+      ),
+    ).toEqual([{ phase: "dispatched" }, { phase: "planned" }]);
+  });
+
+  test("retains accepted import placement when its bind acknowledgement is lost", async () => {
+    const baseSql = createEphemeralSql();
+    let lost = false;
+    const sql: Sql = {
+      ...baseSql,
+      async batch(statements) {
+        const result = await baseSql.batch(statements);
+        if (
+          !lost &&
+          statements.some((statement) => statement.sql.includes("SET import_selection_json"))
+        ) {
+          lost = true;
+          throw new Error("bind acknowledgement lost after commit");
+        }
+        return result;
+      },
+    };
+    let providerCalls = 0;
+    const provider: Provider = {
+      id: "fake",
+      offerings: [PROVIDER_OFFERING],
+      ...fakeReadback,
+      async apply() {
+        throw new Error("not an apply");
+      },
+      async adopt(input) {
+        providerCalls += 1;
+        return succeeded({ nativeId: input.nativeId, observed: input.spec, outputs: {} });
+      },
+      async observe() {
+        return failed("not_found", "not found");
+      },
+      async delete() {
+        return failed("not_found", "not found");
+      },
+    };
+    const importForm: InstalledTakoformForm = {
+      ...FORM,
+      operations: [...FORM.operations, "import"],
+    };
+    const app = buildApp({
+      sql,
+      objects: createMemoryObjectStore(),
+      identity,
+      settlement,
+      publicOrigin: "https://api.takoserver.com",
+      forms: [importForm],
+      hostForms: [importForm],
+      takoformHostFactory: createStaticStableTestTakoformHost,
+      providers: [provider],
+      offerings: [SOLD],
+    });
+    const { organizationId, provider: auth } = await tenant(app.fetch);
+    const accepted = await call(
+      app.fetch,
+      "POST",
+      `${LANE}/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/import-bind-loss/import`,
+      {
+        apiVersion: FORM_REF.apiVersion,
+        kind: FORM_REF.kind,
+        form: { formRef: FORM_REF },
+        metadata: { name: "import-bind-loss", space: "default" },
+        nativeId: "native-bind-loss",
+        spec: {},
+      },
+      { ...auth, "idempotency-key": "import-bind-loss-0001", "if-none-match": "*" },
+    );
+    expect(accepted.status).toBe(202);
+    expect(lost).toBe(true);
+    expect(providerCalls).toBe(0);
+    expect(
+      await sql.query(
+        `SELECT import_selection_json, execution_started_at, expires_at FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?`,
+        [organizationId],
+      ),
+    ).toEqual([
+      {
+        import_selection_json: expect.stringContaining('"nativeId":"native-bind-loss"'),
+        execution_started_at: null,
+        expires_at: 253402300799999,
+      },
+    ]);
+    expect(
+      await sql.query(`SELECT phase FROM tf_resource_provider_effects WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ phase: "planned" }]);
+    expect(
+      await sql.query(`SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ?`, [
+        organizationId,
+      ]),
+    ).toEqual([{ state: "live" }]);
+    expect((await app.tick()).providerRepairs).toMatchObject({ pending: 0, settled: 1 });
+    expect(providerCalls).toBe(1);
   });
 
   test("inherits one exact provider installation for a revision Form", async () => {
@@ -937,7 +1455,7 @@ describe("Takoform apply on a real backend", () => {
       observed: { allocated: true },
       outputs: { scriptName: "script-name" },
     });
-    const result = await driver.apply({
+    const result = await applyWithSelection(driver, {
       operationId: "op_version",
       operationKey: "key_version",
       tenantId: "org_inherited",
@@ -1053,7 +1571,7 @@ describe("Takoform apply on a real backend", () => {
       outputs: { scriptName: "incapable-worker" },
     });
 
-    const capableResult = await driver.apply({
+    const capableResult = await applyWithSelection(driver, {
       operationId: "op_runtime_capable",
       operationKey: "key_runtime_capable",
       tenantId,
@@ -1080,7 +1598,7 @@ describe("Takoform apply on a real backend", () => {
     });
 
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op_runtime_incapable",
         operationKey: "key_runtime_incapable",
         tenantId,
@@ -1115,7 +1633,7 @@ describe("Takoform apply on a real backend", () => {
     });
     await ledger.fund({ organizationId: "org_reseller", fundingRef: "paid", amountMinor: 2_000 });
 
-    await driver.apply({
+    await applyWithSelection(driver, {
       operationId: "op_reseller_create",
       operationKey: "key_reseller_create",
       tenantId: "org_reseller",
@@ -1201,7 +1719,7 @@ describe("Takoform apply on a real backend", () => {
       deployments,
     });
 
-    await driver.apply({
+    await applyWithSelection(driver, {
       operationId: "op-update-target",
       operationKey: "key-update-target",
       operationMode: "initial",
@@ -1314,8 +1832,20 @@ describe("Takoform apply on a real backend", () => {
       previous,
     } as const;
 
-    await driver.import?.({ ...command, operationMode: "initial" });
-    await driver.import?.({ ...command, operationMode: "recovery" });
+    const selection = await driver.selectImport?.(command);
+    if (!selection) throw new Error("import selection unavailable");
+    await driver.import?.({
+      ...command,
+      selection,
+      atomicDeploymentCommit: true,
+      operationMode: "initial",
+    });
+    await driver.import?.({
+      ...command,
+      selection,
+      atomicDeploymentCommit: true,
+      operationMode: "recovery",
+    });
     expect(calls).toEqual([
       {
         mode: "initial",
@@ -1419,9 +1949,10 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([]);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
   });
 
@@ -1435,7 +1966,7 @@ describe("Takoform apply on a real backend", () => {
         if (
           failFinalBatch &&
           statements.some((statement) =>
-            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1"),
           )
         ) {
           failFinalBatch = false;
@@ -1468,7 +1999,7 @@ describe("Takoform apply on a real backend", () => {
     expect(first.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'lost-ack'`,
         [organizationId],
       ),
@@ -1476,9 +2007,10 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
     expect(provider.sideEffectCount).toBe(1);
     expect(
-      await sql.query("SELECT phase FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT phase FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([{ phase: "executed" }]);
     expect(
       await sql.query("SELECT id FROM tf_resource_deployments WHERE tenant_id = ?", [
@@ -1491,9 +2023,10 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([`${organizationId}/default/lost-ack`]);
     expect(provider.sideEffectCount).toBe(1);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query(
@@ -1513,7 +2046,7 @@ describe("Takoform apply on a real backend", () => {
         if (
           failFinalBatch &&
           statements.some((statement) =>
-            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas"),
+            statement.sql.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1"),
           )
         ) {
           failFinalBatch = false;
@@ -1568,7 +2101,7 @@ describe("Takoform apply on a real backend", () => {
     expect(first.body).toMatchObject({ operation: { id: operationId, done: false } });
     expect(
       await sql.query(
-        `SELECT id, phase FROM tf_deferred_operations
+        `SELECT id, phase FROM tf_deferred_operations_selection_v1
          WHERE target_name = 'delete-lost' AND operation = 'delete'`,
       ),
     ).toEqual([{ id: operationId, phase: "committing" }]);
@@ -1583,7 +2116,9 @@ describe("Takoform apply on a real backend", () => {
     expect(await sql.query("SELECT state FROM tf_resource_deployments")).toEqual([
       { state: "deleted" },
     ]);
-    expect(await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas")).toEqual([]);
+    expect(
+      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1"),
+    ).toEqual([]);
   });
 
   test("proves native absence through a read-only scoped residual receipt", async () => {
@@ -1715,7 +2250,7 @@ describe("Takoform apply on a real backend", () => {
       spec: {},
       relations: [],
     } as const;
-    await driver.apply(input);
+    await applyWithSelection(driver, input);
     await deletions.prepareResourceDeletion({
       tenantId: input.tenantId,
       resourceUid: input.resourceUid,
@@ -2212,7 +2747,7 @@ describe("Takoform apply on a real backend", () => {
     } as const;
 
     await expect(
-      driver.apply({
+      applyWithSelection(driver, {
         operationId: "op_retained_authoring",
         operationKey: "key_retained_authoring",
         tenantId,
@@ -2826,15 +3361,16 @@ describe("Takoform apply on a real backend", () => {
     expect(read.status).toBe(404);
     expect(
       await sql.query(
-        `SELECT phase FROM tf_deferred_operations
+        `SELECT phase FROM tf_deferred_operations_selection_v1
          WHERE tenant_id = ? AND target_name = 'doomed'`,
         [organizationId],
       ),
     ).toEqual([{ phase: "failed" }]);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query("SELECT claim_key FROM tf_resource_claims WHERE tenant_id = ?", [
@@ -2865,7 +3401,7 @@ describe("Takoform apply on a real backend", () => {
         async batch(statements) {
           const retirement = statements.find(
             ({ sql: statement }) =>
-              statement.includes("DELETE FROM tf_provider_mutation_sagas") &&
+              statement.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1") &&
               statement.includes("provider_handle IS NULL AND provider_outcome = 'running'") &&
               statement.includes("execution_lease_token = ? AND execution_lease_until > ?"),
           );
@@ -2876,7 +3412,7 @@ describe("Takoform apply on a real backend", () => {
             // Lose the actual lease before the batch. The original saga and
             // wallet must survive the failed transaction's stale start fence.
             const stolen = await durable.run(
-              `UPDATE tf_provider_mutation_sagas SET execution_lease_token = 'stolen-lease'
+              `UPDATE tf_provider_mutation_sagas_selection_v1 SET execution_lease_token = 'stolen-lease'
                WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?`,
               retirement.params?.slice(0, 3),
             );
@@ -2962,14 +3498,14 @@ describe("Takoform apply on a real backend", () => {
       expect(convergeCalls).toBe(0);
       expect(
         await sql.query(
-          `SELECT id, phase FROM tf_deferred_operations
+          `SELECT id, phase FROM tf_deferred_operations_selection_v1
            WHERE tenant_id = ? AND target_name = ?`,
           [organizationId, `retirement-${settlementFailure}`],
         ),
       ).toEqual([{ id: operationId, phase: "committing" }]);
       expect(
         await sql.query(
-          `SELECT operation_id, phase, provider_outcome FROM tf_provider_mutation_sagas
+          `SELECT operation_id, phase, provider_outcome FROM tf_provider_mutation_sagas_selection_v1
            WHERE tenant_id = ? AND operation_id = ?`,
           [organizationId, operationId],
         ),
@@ -3018,7 +3554,7 @@ describe("Takoform apply on a real backend", () => {
       async batch(statements) {
         const refusal = statements.some(
           ({ sql: statement }) =>
-            statement.includes("DELETE FROM tf_provider_mutation_sagas") &&
+            statement.includes("DELETE FROM tf_provider_mutation_sagas_selection_v1") &&
             statement.includes("provider_handle IS NULL AND provider_outcome = 'running'") &&
             statement.includes("execution_lease_token = ? AND execution_lease_until > ?"),
         );
@@ -3064,7 +3600,7 @@ describe("Takoform apply on a real backend", () => {
     expect(applyCalls).toBe(1);
     expect(provider.sideEffectCount).toBe(0);
     const [operation] = await sql.query(
-      `SELECT id, resource_uid, phase, terminal_json FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase, terminal_json FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'refusal-lost-ack'`,
       [organizationId],
     );
@@ -3100,7 +3636,7 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([{ ref: operationId, settled_delta: 0, held_delta: -500 }]);
     for (const [table, identityColumn] of [
-      ["tf_provider_mutation_sagas", "operation_id"],
+      ["tf_provider_mutation_sagas_selection_v1", "operation_id"],
       ["tf_resource_claims", "holder_uid"],
       ["tf_resource_provider_effects", "resource_uid"],
       ["tf_resource_deletion_attestations", "resource_uid"],
@@ -3108,7 +3644,9 @@ describe("Takoform apply on a real backend", () => {
       expect(
         await sql.query(`SELECT 1 FROM ${table} WHERE tenant_id = ? AND ${identityColumn} = ?`, [
           organizationId,
-          table === "tf_provider_mutation_sagas" ? operationId : String(operation.resource_uid),
+          table === "tf_provider_mutation_sagas_selection_v1"
+            ? operationId
+            : String(operation.resource_uid),
         ]),
       ).toEqual([]);
     }
@@ -3136,7 +3674,7 @@ describe("Takoform apply on a real backend", () => {
     expect(denied.body).toMatchObject({ error: { code: "insufficient_funds" } });
     expect(provider.listResources()).toHaveLength(4);
     const [failedOperation] = await sql.query(
-      `SELECT id, resource_uid, phase FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'five'`,
       [organizationId],
     );
@@ -3145,9 +3683,10 @@ describe("Takoform apply on a real backend", () => {
     const failedOperationId = String(failedOperation.id);
     const failedResourceUid = String(failedOperation.resource_uid);
     expect(
-      await sql.query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE tenant_id = ?", [
-        organizationId,
-      ]),
+      await sql.query(
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE tenant_id = ?",
+        [organizationId],
+      ),
     ).toEqual([]);
     expect(
       await sql.query(
@@ -3180,7 +3719,7 @@ describe("Takoform apply on a real backend", () => {
     expect(fundedRetry.status).toBe(201);
     expect(provider.listResources()).toHaveLength(5);
     const [succeededOperation] = await sql.query(
-      `SELECT id, resource_uid, phase FROM tf_deferred_operations
+      `SELECT id, resource_uid, phase FROM tf_deferred_operations_selection_v1
        WHERE tenant_id = ? AND target_name = 'five'`,
       [organizationId],
     );

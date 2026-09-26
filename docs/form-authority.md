@@ -1,5 +1,16 @@
 # Takoform Form authority
 
+For the positive-only, multi-Space implementation foundation and its remaining
+deployment integration, see [Managed Space admission](managed-space-admission.md).
+It does not replace or widen the sealed integration operator scope below.
+
+The managed-admission dependency is identified by its exact emitted released-
+Core Form bundle and target closure, not by requiring every dependent Worker to
+carry the same source commit label. When a sponsorship apply selects a different
+commit, it rebuilds the Form authority without uploading it and accepts the
+dependency only if the bundle digest is identical; the policy, named admission
+entrypoint, Version identity, and closure remain independently fenced.
+
 Takoserver’s public Worker, router, and OpenAPI surface are read-only consumers
 of durable Form admission state. They may reach `host-authority.ts` and the
 package reader, but they must not import `admission-store.ts`, `admission.ts`,
@@ -47,6 +58,66 @@ protocol, Core tag, Core commit, and artifact digest. The portable
 `--containers-rollout none`; the native image build belongs to the deploy
 surface and requires Docker on the operator machine.
 
+Integration image reuse has two distinct, narrow admission shapes. A routine
+code apply may reuse the already-running verifier image only when the present
+authority Version has the exact target binding closure; this updates code
+without making a closure transition. A closure-changing apply remains separate:
+it needs the existing explicit integration transition and an admitted exact
+declared-delta predecessor. Neither path changes the closure proof required by
+the transition itself.
+
+For either admitted shape, the live verifier identity must match both the
+current authority Worker Version and source-derived verifier digest. The deploy
+surface derives reuse internally and passes `--containers-rollout none` to the
+final bundle preparation and publication. It rechecks the same identity
+immediately before upload and still requires the successor Version's verifier
+readback. A missing or mismatched initial proof keeps the normal image-build
+path; drift after reuse was selected stops before upload. Scope transitions,
+bootstrap, rehearsal, and production do not select this path.
+
+Ordinary integration code-only applies to the probe, route-less authority, and
+operator gateway also have a bounded Form-local gate instead of repeating the
+complete repository check. It runs the repository typecheck, all four Form
+Worker typechecks and generated-type checks, import/corpus/package checks, the
+selected surface's runtime and deploy-boundary tests, and four Docker-free
+Worker bundle/closure builds with Container rollout disabled. The caller must
+first prove the existing exact closure and predecessor, selected Host/source
+identity, and absence of drift; it selects this gate once for the invocation.
+Bootstrap, profile/scope/closure/storage/service transitions, production and
+rehearsal retain their existing gates.
+
+The identity probe uses the scoped gate only for an existing full-profile
+update with its current authority present and no drift; Host-only bootstrap or
+profile-preserving updates stay on their previous paths. The operator gateway
+additionally requires its exact scope and dynamic public-identity RPC closure,
+and an exact, source-matched, no-drift authority dependency on the selected
+Host. The route-less authority fast path is narrower still: it requires an
+already-present dynamic-public-RPC authority at exact-target scope and an
+existing generated integration D1/R2 target. The existing D1 UUID/name, R2
+existence, migration-lineage and canonical-schema verification runs before
+the gate and is repeated with identical proof immediately before upload. A
+migration already applied (including 0058) or changed elsewhere is not itself
+a reason to force the complete repository check. For the released-Core
+route-less target, scoped gating also requires the already-selected reusable
+Core verifier identity; a missing or mismatched identity keeps the full gate
+and normal image build. No gate eligibility carries across deploy invocations.
+For generated-storage application-schema verification, only SQL comments and
+ASCII whitespace outside quoted SQL bytes are treated as equivalent in both
+the fresh-generation and read-only target proofs. The source migration digest
+and raw live schema digest remain exact, including at the repeated final proof
+fence.
+
+The verifier's Container name includes the Host id, while its application permits
+only one running instance. A Host-id transition can therefore hit native
+instance-capacity exhaustion while the old named instance is still active. The
+SDK stops an inactive instance after five minutes, but elapsed wall time or an
+aggregate health count alone does not prove that it stopped. If the upload was
+acknowledged and verifier readback failed, do not repeat the upload or treat a
+generic binding remedy as proof that a binding is missing. Inspect the native
+startup/stop evidence, then use the owner's `--status` readback after the state
+changes. Completion still requires the exact successor Version and verifier
+identity; this path does not raise capacity or stop instances automatically.
+
 Every advertised Form-authority environment also has one permanent minimal
 `takoserver-form-authority-identity-probe` Worker. Its target-owned
 `identityProbeWorkerName` and `identityProbeOrigin` name a workers.dev endpoint
@@ -88,6 +159,12 @@ Workers. Each Worker independently rejects every signed plan, apply, or
 readback body whose activation is not that exact `kind: space`, tenant, and
 Space before reaching the RPC or storage boundary; caller input cannot widen
 that audience.
+
+This admission path uses its dedicated Form operator key, not a customer login
+session. Its tenant/Space audience is an exact identifier scope; admission does
+not look up or create organization or Space rows. It can therefore prepare Form
+state before first login, but does not provision an organization or authorize
+subsequent customer resource requests.
 
 The separate owner surface
 `takoserver-integration-form-authority-deactivation` has the same sealed
@@ -136,6 +213,13 @@ load package bytes from R2 or invoke a new verifier dependency, and it emits an
 inactive successor only for a present active head, carrying that head's exact
 durable implementation digest and predecessor. Missing or already-inactive
 heads are no-op. Malformed, multiple, or drifted heads fail closed.
+
+Activation history is read and validated for every exact package identity,
+including identities no longer present in the implementation catalog. An active
+head for such an identity makes normal activation planning refuse before any
+mutation. Use the separate deactivation surface first; normal activation never
+silently revokes an activation. Retained inactive heads remain visible in readback and
+the current-head digest, and are valid state for an unsupported package.
 
 New support events use `takoserver.form-support@v2` and contain only the
 semantic `implementationDigest`. A Worker Version change alone does not make
@@ -294,10 +378,10 @@ inactive, plus a zero-command next plan. The v2 readback exposes each head as
 `activationHead` with `present`, `active`, `implementationDigest`, and
 `eventDigest`; it never hides a stale active head behind installed or effective
 booleans. Normal activation readiness still requires every package to be
-installed; Forms with a concrete handler additionally require support and a
+installed; Forms in the implementation catalog additionally require support and a
 present active head whose implementation digest equals the current code
-identity. A package with no handler remains installed but unsupported with no
-activation head.
+identity. A package outside that catalog remains installed but unsupported with
+an absent or retained inactive activation head.
 
 ## Exact publisher-set import
 
@@ -329,7 +413,10 @@ apply, and readback always cover all 17 packages; `apply` loads every package
 from the embedded closure and sends the whole raw set to Core in one request,
 also on retry after a refused or partial apply. Support and activation are the
 intersection of the package set with the code-owned implementation catalog.
-That catalog has concrete handlers for 15 of the 17 identities.
+The public runtime catalog currently includes 15 of the 17 identities. A Form
+must have both its own key in the code-owned capability manifest and a concrete
+handler to enter that catalog. An explicitly declared empty operation list
+remains a supported-empty identity; an absent capability key is not one.
 `StaticAssetBundle@0.1.0` is an intrinsic artifact resource: the Host resolves
 and verifies its committed manifest and blobs in the caller's tenant, without
 requiring a provider identity supply or a custom-domain zone grant. It exposes
@@ -337,16 +424,21 @@ the exact package's `create`, `read`, `delete`, `import`, and `observe`
 operations, never `update`. WorkerVersion owns the separate asset attachment
 and serving policy; admitting the bundle does not provision a Worker or domain.
 This is bundle lifecycle support, not qualification of every Worker backend's
-asset attachment. The current managed Workers-for-Platforms backend still
-refuses asset-bearing WorkerVersions until its upload and authoritative
-readback path is implemented and qualified.
-`WorkerCustomDomain` still has an empty operation intersection: its provider
-handler requires an exact tenant/hostname zone grant, and the code-owned
-capability manifest does not yet advertise that conditional capability. It
-remains supported and activatable with no executable operations. `ActorNamespace`
-and `DurableWorkflow` have no handlers, so they remain installed and
-discoverable only (`supported: false`) with an absent activation head. No
-operation is advertised unless it is declared by the package, present in the
+asset attachment. The managed Workers-for-Platforms backend implements the
+asset upload and provider-only attachment/readback path for asset-bearing
+WorkerVersions in source. Hosted/native qualification remains open: an exact
+WfP install must still prove attachment and serving before this capability is
+advertised as live-qualified.
+`WorkerCustomDomain` is in the implementation catalog with its declared
+`create`, `read`, `delete`, `import`, and `observe` operations. Its provider
+handler requires an exact tenant/hostname zone grant; integration qualification
+is allowed when that grant is realized, but this document does not establish
+production or full-lifecycle qualification. `ActorNamespace` and
+`DurableWorkflow` have no handlers, so they remain installed and discoverable only
+(`supported: false`). Neither may have an active activation head; retained inactive
+history is not discarded. Deactivate any existing active heads before deploying
+a catalog that removes their capability. No operation is advertised unless it
+is declared by the package, present in the
 Host capability manifest, and handled by the runtime.
 
 `ObjectBucket` left that list in
@@ -560,10 +652,13 @@ released-Core-verified public publisher set:
   `WorkerCustomDomain` at definition version `0.1.0`.
 
 The executable implementation catalog is a separate, derived support subset:
-it currently has 15 entries (the two actor/workflow identities have no concrete
-handlers), while the static-asset and custom-domain entries are supported with
-empty operations until a target supplies their backends. The owning
-current-catalog importer derives package, schema, and payload digests directly
+it currently has 15 entries. `WorkerCustomDomain` support is conditional on an
+exact tenant/hostname zone grant; integration qualification is allowed with
+that grant, while production and full-lifecycle qualification remain
+unestablished. The two actor/workflow identities have no concrete handlers.
+StaticAssetBundle is
+intrinsic and exposes its declared lifecycle operations, as described above.
+The owning current-catalog importer derives package, schema, and payload digests directly
 from the verified source checkout; literals in the operator do not confer
 trust. The portable gate then rechecks the embedded manifest and every payload
 against those exact current identities. The integration verifier accepts only

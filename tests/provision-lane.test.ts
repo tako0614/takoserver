@@ -210,6 +210,8 @@ describe("provision-token redemption lane", () => {
     const memory = new InMemoryTakoformResourceDriver();
     let commercialAuthority: Parameters<TakoformResourceDriver["apply"]>[0]["commercialAuthority"];
     const lane = await fundedLane({
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
       async apply(input) {
         commercialAuthority = input.commercialAuthority;
         return await memory.apply(input);
@@ -640,6 +642,8 @@ describe("Takoform run-token lane", () => {
       },
       forms: [standardForm],
       driver: {
+        selectApply: (input) => memory.selectApply(input),
+        selectImport: (input) => memory.selectImport(input),
         async apply(input) {
           mutations += 1;
           return await memory.apply(input);

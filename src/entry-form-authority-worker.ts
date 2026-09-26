@@ -21,6 +21,9 @@ import {
   createProductionFormAuthorityComposition,
   type FormAuthorityComposition,
 } from "./takoform/host-admission-endpoint.ts";
+import { loadPublisherSetClosure } from "./takoform/publisher-set-closure.ts";
+import type { SpaceAdmissionPolicyV1 } from "./takoform/space-admission-policy.ts";
+import { createTenantSpaceAdmissionAuthority } from "./takoform/tenant-space-admission.ts";
 
 export class TakoformCoreVerifierContainer extends Container<FormAuthorityWorkerEnv> {
   override defaultPort = 8080;
@@ -46,40 +49,63 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
   }
 
   plan(request: FormAuthorityPlanRequest) {
-    return this.composition().then(({ endpoint }) => endpoint.plan(request));
+    return productionComposition(this.env).then(({ endpoint }) => endpoint.plan(request));
   }
 
   apply(plan: FormAuthorityPlan) {
-    return this.composition().then(({ endpoint }) => endpoint.apply(plan));
+    return productionComposition(this.env).then(({ endpoint }) => endpoint.apply(plan));
   }
 
   readback(request: FormAuthorityPlanRequest) {
-    return this.composition().then(({ endpoint }) => endpoint.readback(request));
+    return productionComposition(this.env).then(({ endpoint }) => endpoint.readback(request));
   }
+}
 
-  private async composition(): Promise<FormAuthorityComposition> {
-    const publicHostIdentity = this.env.PUBLIC_HOST_IDENTITY as unknown as PublicHostIdentityRpc;
-    const identityEnv = {
-      TAKOSERVER_ENVIRONMENT: this.env.TAKOSERVER_ENVIRONMENT,
-      TAKOSERVER_FORM_AUTHORITY_HOST_ID: this.env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
-      TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST:
-        this.env.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST,
-      PUBLIC_HOST_IDENTITY: publicHostIdentity,
-    } satisfies FormAuthorityPublicIdentityWorkerEnv;
-    const identity = await currentPublicHostIdentity(identityEnv);
-    return await createProductionFormAuthorityComposition({
-      configuration: {
-        ...formAuthorityConfigurationFromPublicIdentity(identityEnv, identity),
-        coreVerifierArtifactDigest: this.env.TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST,
+/**
+ * Bind this entrypoint, never the full operator entrypoint, to a credential
+ * issuer. Its caller can name only an already-owned tenant; publisher evidence
+ * and the positive-only policy are composed inside this Worker.
+ */
+export class TenantSpaceAdmissionEntrypoint extends WorkerEntrypoint<FormAuthorityWorkerEnv> {
+  async ensureTenantSpaceAdmission(input: unknown) {
+    return await createTenantSpaceAdmissionAuthority({
+      policy: this.env.TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY,
+      sql: createD1Sql(this.env.STATE_DB),
+      compose: async (policy) => {
+        const composition = await productionComposition(this.env, policy);
+        const closure = await loadPublisherSetClosure();
+        return { ...composition, evidence: closure.evidence };
       },
-      bindings: {
-        sql: createD1Sql(this.env.STATE_DB),
-        objects: createR2ObjectStore(this.env.OBJECTS),
-        publicHostIdentity,
-        coreVerifier: this.env.CORE_VERIFIER,
-      },
-    });
+    }).ensureTenantSpaceAdmission(input);
   }
+}
+
+async function productionComposition(
+  env: FormAuthorityWorkerEnv,
+  activationPolicy?: SpaceAdmissionPolicyV1,
+): Promise<FormAuthorityComposition> {
+  const publicHostIdentity = env.PUBLIC_HOST_IDENTITY as unknown as PublicHostIdentityRpc;
+  const identityEnv = {
+    TAKOSERVER_ENVIRONMENT: env.TAKOSERVER_ENVIRONMENT,
+    TAKOSERVER_FORM_AUTHORITY_HOST_ID: env.TAKOSERVER_FORM_AUTHORITY_HOST_ID,
+    TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST:
+      env.TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST,
+    PUBLIC_HOST_IDENTITY: publicHostIdentity,
+  } satisfies FormAuthorityPublicIdentityWorkerEnv;
+  const identity = await currentPublicHostIdentity(identityEnv);
+  return await createProductionFormAuthorityComposition({
+    configuration: {
+      ...formAuthorityConfigurationFromPublicIdentity(identityEnv, identity),
+      coreVerifierArtifactDigest: env.TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST,
+    },
+    bindings: {
+      sql: createD1Sql(env.STATE_DB),
+      objects: createR2ObjectStore(env.OBJECTS),
+      publicHostIdentity,
+      coreVerifier: env.CORE_VERIFIER,
+    },
+    ...(activationPolicy ? { activationPolicy } : {}),
+  });
 }
 
 function exactWorkerVersionId(value: unknown): string {

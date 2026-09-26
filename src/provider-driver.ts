@@ -23,13 +23,31 @@ import {
   type ProviderTicket,
   type ProviderValue,
   providerFailureProvesNoMutation,
+  providerFailureProvesWholeOperationCompensated,
+  providerFailureProvesWholeOperationNoMutation,
 } from "./provider-port.ts";
 import {
   canMaterializeAcrossProviderPacks,
   materializeProviderRuntimeBindings,
 } from "./provider-runtime-bindings.ts";
-import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import type {
+  ResourceDeployment,
+  ResourceDeploymentMutation,
+  ResourceDeploymentStore,
+} from "./resource-deployments.ts";
+import {
+  sameTakoformApplySelection,
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+  type TakoformApplySelectionDeployment,
+  type TakoformApplySelectionRelation,
+} from "./takoform/apply-selection.ts";
 import { validateMaximumRuntimeInputBindings } from "./takoform/forms.ts";
+import {
+  sameTakoformImportSelection,
+  TAKOFORM_IMPORT_SELECTION_VERSION,
+  type TakoformImportSelection,
+} from "./takoform/import-selection.ts";
 import { receiptProjectable } from "./takoform/receipt-projection.ts";
 import { validateStandardServiceSlots } from "./takoform/standard-services.ts";
 import type { TakoformStore } from "./takoform/store.ts";
@@ -50,6 +68,17 @@ import {
   WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
+
+type TakoformImportSelectionWithRelations = Extract<
+  TakoformImportSelection,
+  { readonly kind: "provider" | "sqlite-migration" }
+>;
+type TakoformImportSelectionRelation = TakoformImportSelectionWithRelations["relations"][number];
+type TakoformImportSelectionDeployment = NonNullable<TakoformImportSelectionRelation["deployment"]>;
+type TakoformImportProviderSelection = Extract<
+  TakoformImportSelection,
+  { readonly kind: "provider" }
+>;
 
 function selectStandardServiceProjections(
   provider: Provider,
@@ -128,6 +157,62 @@ export class ProviderMutationDefinitiveRefusalError extends TakoformHostError {
   }
 
   readonly heldCharge?: LedgerHeldCharge;
+}
+
+/**
+ * A direct recovery result proved the entire durable operation idle. The
+ * action keeps import settlement separate from create convergence settlement.
+ */
+export class ProviderMutationWholeOperationRefusalError extends TakoformHostError {
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    options?: {
+      readonly action?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
+      readonly heldCharge?: LedgerHeldCharge;
+    },
+  ) {
+    super(code, status, undefined, sanitizedMessage(message));
+    this.name = "ProviderMutationWholeOperationRefusalError";
+    this.action = options?.action ?? "recoverAdopt";
+    if (options?.heldCharge) this.heldCharge = options.heldCharge;
+  }
+  readonly action: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
+  readonly heldCharge?: LedgerHeldCharge;
+}
+
+/** The dedicated conclusion seam declined before creating any provider effect. */
+export class ProviderApplyNoEffectUnsupportedError extends Error {
+  constructor() {
+    super("the provider does not support this apply no-effect conclusion");
+    this.name = "ProviderApplyNoEffectUnsupportedError";
+  }
+}
+
+/** Provider effects existed and were compensated; their history must be retained. */
+export class ProviderMutationCompensatedFailureError extends TakoformHostError {
+  readonly action = "compensateApply" as const;
+  readonly heldCharge?: LedgerHeldCharge;
+
+  constructor(
+    code: string,
+    status: number,
+    message?: string,
+    options?: { readonly heldCharge?: LedgerHeldCharge },
+  ) {
+    super(code, status, undefined, sanitizedMessage(message));
+    this.name = "ProviderMutationCompensatedFailureError";
+    if (options?.heldCharge) this.heldCharge = options.heldCharge;
+  }
+}
+
+/** Capability declined before attempting any compensation. */
+export class ProviderApplyCompensationUnsupportedError extends Error {
+  constructor() {
+    super("the provider does not support this apply compensation");
+    this.name = "ProviderApplyCompensationUnsupportedError";
+  }
 }
 
 /**
@@ -404,6 +489,320 @@ export function createProviderDriver(
     return { provider, offering, soldSelection, inheritedSelection };
   };
 
+  const selectedDeployment = async (
+    deployment: Pick<
+      ResourceDeployment,
+      | "id"
+      | "resourceUid"
+      | "offeringId"
+      | "providerPackRef"
+      | "providerInstallationRef"
+      | "nativeId"
+      | "state"
+      | "observed"
+      | "outputs"
+    >,
+  ): Promise<TakoformApplySelectionDeployment> => ({
+    id: deployment.id,
+    resourceUid: deployment.resourceUid,
+    offeringId: deployment.offeringId,
+    providerPackRef: deployment.providerPackRef,
+    providerInstallationRef: deployment.providerInstallationRef,
+    nativeId: deployment.nativeId,
+    state: deployment.state,
+    projectionDigest: await canonicalDigest({
+      observed: deployment.observed,
+      outputs: deployment.outputs,
+    }),
+  });
+
+  const selectedImportDeployment = async (
+    deployment: ResourceDeployment,
+  ): Promise<TakoformImportSelectionDeployment> => ({
+    ...(await selectedDeployment(deployment)),
+    nativeClaimed: deployment.nativeClaimed,
+  });
+
+  const selectedRelations = async (
+    relations: readonly ProviderRelation[],
+  ): Promise<readonly TakoformApplySelectionRelation[]> =>
+    await Promise.all(
+      relations.map(async (relation) => ({
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid: relation.targetUid,
+        resource: {
+          apiVersion: relation.resource.apiVersion,
+          kind: relation.resource.kind,
+          formRef: structuredClone(relation.resource.form.formRef),
+          name: relation.resource.metadata.name,
+          space: relation.resource.metadata.space,
+          uid: relation.resource.metadata.uid,
+          generation: relation.resource.metadata.generation,
+          revision: relation.resource.metadata.revision,
+        },
+        ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+        ...(relation.deployment
+          ? { deployment: await selectedDeployment(relation.deployment) }
+          : {}),
+      })),
+    );
+
+  const selectedImportRelations = async (
+    relations: readonly ProviderRelation[],
+  ): Promise<readonly TakoformImportSelectionRelation[]> =>
+    await Promise.all(
+      relations.map(async (relation) => {
+        let deployment: TakoformImportSelectionDeployment | undefined;
+        if (relation.deployment) {
+          const stored = await deployments.find(
+            relation.deployment.tenantId,
+            relation.deployment.id,
+          );
+          if (
+            !stored ||
+            canonicalJson({
+              tenantId: stored.tenantId,
+              id: stored.id,
+              resourceUid: stored.resourceUid,
+              offeringId: stored.offeringId,
+              providerPackRef: stored.providerPackRef,
+              providerInstallationRef: stored.providerInstallationRef,
+              nativeId: stored.nativeId,
+              state: stored.state,
+              observed: stored.observed,
+              outputs: stored.outputs,
+              createdAt: stored.createdAt,
+              updatedAt: stored.updatedAt,
+            }) !== canonicalJson(relation.deployment)
+          ) {
+            throw new TakoformHostError("resource_busy", 409);
+          }
+          deployment = await selectedImportDeployment(stored);
+        }
+        return {
+          pointer: relation.pointer,
+          relation: relation.relation,
+          targetUid: relation.targetUid,
+          resource: {
+            apiVersion: relation.resource.apiVersion,
+            kind: relation.resource.kind,
+            formRef: structuredClone(relation.resource.form.formRef),
+            name: relation.resource.metadata.name,
+            space: relation.resource.metadata.space,
+            uid: relation.resource.metadata.uid,
+            generation: relation.resource.metadata.generation,
+            revision: relation.resource.metadata.revision,
+          },
+          ...(relation.bindingRef ? { bindingRef: structuredClone(relation.bindingRef) } : {}),
+          ...(deployment ? { deployment } : {}),
+        };
+      }),
+    );
+
+  const resolveApplySelection = async (input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly spec: JsonObject;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly commercialAuthority?: Parameters<
+      TakoformResourceDriver["selectApply"]
+    >[0]["commercialAuthority"];
+  }) => {
+    const current = await deployments.active(input.tenantId, input.resourceUid);
+    if (intrinsicForm(input.form)) {
+      if (input.form.identity.formRef.kind !== "SQLiteMigrationApplication") {
+        return {
+          current,
+          selection: {
+            version: TAKOFORM_APPLY_SELECTION_VERSION,
+            kind: "intrinsic",
+          } satisfies TakoformApplySelection,
+        } as const;
+      }
+      const database = input.relations.find(
+        (relation) => relation.relation === "/database",
+      )?.resource;
+      if (!database) throw new TakoformHostError("resource_not_found", 404);
+      await sqliteProvider(input.tenantId, database);
+      const relationTargets = await providerRelations(input.tenantId, input.relations);
+      const relations = await selectedRelations(relationTargets);
+      if (
+        relations.filter(
+          (relation) => relation.relation === "/database" && relation.deployment !== undefined,
+        ).length !== 1
+      ) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      return {
+        current,
+        relationTargets,
+        selection: {
+          version: TAKOFORM_APPLY_SELECTION_VERSION,
+          kind: "sqlite-migration",
+          relations,
+        } satisfies TakoformApplySelection,
+      } as const;
+    }
+    const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
+      tenantId: input.tenantId,
+      form: input.form,
+      relations: input.relations,
+      ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+    });
+    assertProviderRuntimeInputs(provider, input.spec);
+    const sold = soldSelection?.sold;
+    const offeringDigest = sold ? await catalog.digest(sold) : undefined;
+    if (
+      sold &&
+      input.commercialAuthority &&
+      (input.commercialAuthority.offeringId !== sold.id ||
+        (!current && input.commercialAuthority.offeringDigest !== offeringDigest))
+    ) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const providerInstallationRef =
+      sold?.providerInstallationRef ??
+      inheritedSelection?.providerInstallationRef ??
+      (() => {
+        throw new TakoformHostError("backend_unavailable", 503);
+      })();
+    if (
+      current &&
+      (current.offeringId !== offering.id ||
+        current.providerPackRef !== provider.id ||
+        current.providerInstallationRef !== providerInstallationRef)
+    ) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const relationTargets =
+      inheritedSelection?.relations ?? (await providerRelations(input.tenantId, input.relations));
+    const selection = {
+      version: TAKOFORM_APPLY_SELECTION_VERSION,
+      kind: "provider",
+      providerPackRef: provider.id,
+      providerInstallationRef,
+      technicalOffering: structuredClone(offering),
+      ...(sold && offeringDigest
+        ? {
+            sold: {
+              offeringId: sold.id,
+              offeringDigest,
+              pricePlanRef: sold.pricePlanRef,
+              pricePlan: structuredClone(sold.pricePlan),
+            },
+          }
+        : {}),
+      ...(current ? { incumbent: await selectedDeployment(current) } : {}),
+      relations: await selectedRelations(relationTargets),
+    } satisfies TakoformApplySelection;
+    return {
+      current,
+      provider,
+      relationTargets,
+      selection,
+    } as const;
+  };
+
+  const resolveImportSelection = async (input: {
+    readonly tenantId: string;
+    readonly resourceUid: string;
+    readonly form: InstalledTakoformForm;
+    readonly name: string;
+    readonly space: string;
+    readonly spec: JsonObject;
+    readonly nativeId: string;
+    readonly relations: readonly TakoformDriverRelation[];
+    readonly previous?: TakoformStoredResource;
+  }) => {
+    const current = await deployments.active(input.tenantId, input.resourceUid);
+    if (intrinsicForm(input.form)) {
+      if (input.form.identity.formRef.kind !== "SQLiteMigrationApplication") {
+        return {
+          current,
+          selection: {
+            version: TAKOFORM_IMPORT_SELECTION_VERSION,
+            kind: "intrinsic",
+            nativeId: input.nativeId,
+          } satisfies TakoformImportSelection,
+        } as const;
+      }
+      const database = input.relations.find(
+        (relation) => relation.relation === "/database",
+      )?.resource;
+      if (!database) throw new TakoformHostError("resource_not_found", 404);
+      await sqliteProvider(input.tenantId, database);
+      const relationTargets = await providerRelations(input.tenantId, input.relations);
+      const relations = await selectedImportRelations(relationTargets);
+      const databaseRelations = relations.filter((relation) => relation.relation === "/database");
+      if (databaseRelations.length !== 1 || databaseRelations[0]?.deployment === undefined) {
+        throw new TakoformHostError("unsupported_capability", 422);
+      }
+      return {
+        current,
+        relationTargets,
+        selection: {
+          version: TAKOFORM_IMPORT_SELECTION_VERSION,
+          kind: "sqlite-migration",
+          nativeId: input.nativeId,
+          relations,
+        } satisfies TakoformImportSelection,
+      } as const;
+    }
+
+    const catalogPlacement =
+      input.form.role === "identity" ||
+      catalog.offeringsFor(input.form.identity.formRef).length > 0;
+    const soldSelection = catalogPlacement ? selectSold(input.form) : undefined;
+    const inheritedSelection = soldSelection
+      ? undefined
+      : await inherited(input.tenantId, input.form, input.relations);
+    const provider = soldSelection?.provider ?? inheritedSelection?.provider;
+    const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+    const providerInstallationRef =
+      soldSelection?.sold.providerInstallationRef ?? inheritedSelection?.providerInstallationRef;
+    if (!provider || !offering || !providerInstallationRef || !provider.adopt) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+
+    const claim = await deployments.findNativeClaim(providerInstallationRef, input.nativeId);
+    if (
+      (claim && (!current || claim.tenantId !== current.tenantId || claim.id !== current.id)) ||
+      (current &&
+        ((current.nativeClaimed && current.nativeId !== input.nativeId) ||
+          current.offeringId !== offering.id ||
+          current.providerPackRef !== provider.id ||
+          current.providerInstallationRef !== providerInstallationRef))
+    ) {
+      throw new TakoformHostError("import_conflict", 409);
+    }
+
+    const relationTargets =
+      inheritedSelection?.relations ?? (await providerRelations(input.tenantId, input.relations));
+    const selection = {
+      version: TAKOFORM_IMPORT_SELECTION_VERSION,
+      kind: "provider",
+      nativeId: input.nativeId,
+      providerPackRef: provider.id,
+      providerInstallationRef,
+      technicalOffering: structuredClone(offering),
+      placement: soldSelection
+        ? { kind: "catalog", offeringId: soldSelection.sold.id }
+        : { kind: "inherited" },
+      ...(current ? { incumbent: await selectedImportDeployment(current) } : {}),
+      relations: await selectedImportRelations(relationTargets),
+    } satisfies TakoformImportProviderSelection;
+    return {
+      current,
+      provider,
+      offering,
+      providerInstallationRef,
+      relationTargets,
+      selection,
+    } as const;
+  };
+
   const assertProviderRuntimeInputs = (provider: Provider, spec: JsonObject): void => {
     const required = spec.requiredSensitiveVars;
     const count = Array.isArray(required) ? required.length : 0;
@@ -521,6 +920,7 @@ export function createProviderDriver(
     mutation?: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
     },
   ): ProviderResult => {
     if (ticket.phase === "succeeded") {
@@ -549,6 +949,15 @@ export function createProviderDriver(
     // with `invalid_argument` and a repair line telling them to "correct the
     // desired state the message names" against a message that named nothing.
     const [code, status] = failureToWire(ticket.failure.code);
+    if (
+      mutation?.wholeOperationProof !== undefined &&
+      mutation.mode === "recovery" &&
+      providerFailureProvesWholeOperationNoMutation(ticket, mutation.operationId)
+    ) {
+      throw new ProviderMutationWholeOperationRefusalError(code, status, ticket.failure.message, {
+        action: mutation.wholeOperationProof,
+      });
+    }
     if (mutation && providerFailureProvesNoMutation(ticket, mutation.operationId)) {
       if (mutation.mode === "initial") {
         throw new ProviderMutationDefinitiveRefusalError(code, status, ticket.failure.message);
@@ -617,6 +1026,7 @@ export function createProviderDriver(
     mutation: {
       readonly operationId: string;
       readonly mode: "initial" | "recovery";
+      readonly wholeOperationProof?: "recoverAdopt" | "convergeApply" | "concludeApplyNoEffect";
     },
     work: () => Promise<ProviderTicket>,
   ): Promise<ProviderResult> => {
@@ -660,6 +1070,17 @@ export function createProviderDriver(
       return resultOf(ticket, mutation);
     } catch (error) {
       if (error instanceof ProviderMutationRecoveryError) throw error;
+      if (error instanceof ProviderMutationWholeOperationRefusalError) {
+        throw new ProviderMutationWholeOperationRefusalError(
+          error.code,
+          error.status,
+          error.publicMessage,
+          {
+            action: error.action,
+            heldCharge: { reference: mutation.operationId, amountMinor: priceMinor },
+          },
+        );
+      }
       if (error instanceof ProviderMutationDefinitiveRefusalError) {
         // Releasing here would put money back before the engine's provider-plan
         // lease fence commits. Carry the exact hold to the lifecycle owner so
@@ -910,6 +1331,67 @@ export function createProviderDriver(
     return { provider, deployment, port: provider.sqliteMigrations };
   };
 
+  const sqliteProviderFromSelection = async (
+    tenantId: string,
+    database: TakoformStoredResource,
+    selection:
+      | Extract<TakoformApplySelection, { readonly kind: "sqlite-migration" }>
+      | Extract<TakoformImportSelection, { readonly kind: "sqlite-migration" }>,
+  ): Promise<{
+    deployment: TakoformApplySelectionDeployment;
+    port: NonNullable<Provider["sqliteMigrations"]>;
+  }> => {
+    if (selection.kind !== "sqlite-migration") {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const databaseRelation = selection.relations.find(
+      (relation) => relation.relation === "/database",
+    );
+    const deployment = databaseRelation?.deployment;
+    if (
+      !databaseRelation ||
+      !deployment ||
+      databaseRelation.targetUid !== database.metadata.uid ||
+      databaseRelation.resource.uid !== database.metadata.uid ||
+      databaseRelation.resource.generation !== database.metadata.generation ||
+      databaseRelation.resource.revision !== database.metadata.revision ||
+      !sameForm(databaseRelation.resource.formRef, database.form.formRef)
+    ) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const current = await deployments.active(tenantId, database.metadata.uid);
+    const currentSelection = current
+      ? selection.version === TAKOFORM_IMPORT_SELECTION_VERSION
+        ? await selectedImportDeployment(current)
+        : await selectedDeployment(current)
+      : undefined;
+    if (!current || canonicalJson(currentSelection) !== canonicalJson(deployment)) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
+    const provider =
+      selection.version === TAKOFORM_IMPORT_SELECTION_VERSION
+        ? (() => {
+            const selectedProvider = byId.get(deployment.providerPackRef);
+            const selectedOffering = selectedProvider?.offerings.find(
+              (candidate) =>
+                candidate.id === deployment.offeringId &&
+                sameForm(candidate.form, database.form.formRef),
+            );
+            if (
+              !selectedProvider ||
+              !selectedOffering ||
+              selectedProvider.id !== deployment.providerPackRef ||
+              current.providerInstallationRef !== deployment.providerInstallationRef
+            ) {
+              throw new TakoformHostError("backend_unavailable", 503);
+            }
+            return selectedProvider;
+          })()
+        : installed(current, database.form.formRef).provider;
+    if (!provider.sqliteMigrations) throw new TakoformHostError("backend_unavailable", 503);
+    return { deployment, port: provider.sqliteMigrations };
+  };
+
   const providerValue = <T>(result: ProviderValue<T>): T => {
     if (result.ok) return result.value as T;
     throw new TakoformHostError(...failureToWire(result.failure.code));
@@ -917,6 +1399,12 @@ export function createProviderDriver(
 
   return {
     runtimeInputPolicy,
+    async selectApply(input) {
+      return structuredClone((await resolveApplySelection(input)).selection);
+    },
+    async selectImport(input) {
+      return structuredClone((await resolveImportSelection(input)).selection);
+    },
     artifactConsumerRepair: {
       async verifyNativeAbsence(input) {
         const selected = repairInstalled(input.deployment, input.formRef);
@@ -1035,7 +1523,13 @@ export function createProviderDriver(
     },
     sqliteMigrations: {
       async readLedger(input) {
-        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        const { deployment, port } = input.selection
+          ? input.selection.kind === "sqlite-migration"
+            ? await sqliteProviderFromSelection(input.tenantId, input.database, input.selection)
+            : (() => {
+                throw new TakoformHostError("backend_unavailable", 503);
+              })()
+          : await sqliteProvider(input.tenantId, input.database);
         return providerValue(
           await port.readLedger({
             nativeId: deployment.nativeId,
@@ -1049,7 +1543,14 @@ export function createProviderDriver(
         );
       },
       async applySuffix(input) {
-        const { deployment, port } = await sqliteProvider(input.tenantId, input.database);
+        if (input.selection?.kind !== "sqlite-migration") {
+          throw new TakoformHostError("backend_unavailable", 503);
+        }
+        const { deployment, port } = await sqliteProviderFromSelection(
+          input.tenantId,
+          input.database,
+          input.selection,
+        );
         providerValue(
           await port.applySuffix({
             operationId: input.operationId,
@@ -1068,26 +1569,230 @@ export function createProviderDriver(
         );
       },
     },
+    ...([...byId.values()].some((provider) => provider.concludeApplyNoEffect !== undefined)
+      ? {
+          async concludeApplyNoEffect(
+            input: Parameters<NonNullable<TakoformResourceDriver["concludeApplyNoEffect"]>>[0],
+          ): Promise<void> {
+            const selection = input.selection;
+            if (
+              selection.kind !== "provider" ||
+              selection.incumbent !== undefined ||
+              !sameForm(selection.technicalOffering.form, input.form.identity.formRef) ||
+              !selection.technicalOffering.capabilities.includes("create") ||
+              input.executionAuthority.tenantId !== input.tenantId ||
+              input.executionAuthority.resourceUid !== input.resourceUid
+            ) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            const provider = byId.get(selection.providerPackRef);
+            const concludeApplyNoEffect = provider?.concludeApplyNoEffect;
+            if (!provider) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            // The accepted selection is still exact, and this provider has not been
+            // called through the dedicated conclusion seam. Capability absence is
+            // therefore the same closed pre-attempt unsupported result as the wire
+            // sentinel: release this short execution lease and preserve the shipped
+            // convergence path. A missing selected provider remains indeterminate.
+            if (!concludeApplyNoEffect) throw new ProviderApplyNoEffectUnsupportedError();
+            const mutation = {
+              operationId: input.operationId,
+              mode: "recovery" as const,
+              wholeOperationProof: "concludeApplyNoEffect" as const,
+            };
+            const priceMinor = selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+            let heldCharge: LedgerHeldCharge | undefined;
+            if (!input.commercialAuthority && priceMinor > 0) {
+              const held = await ledger.hold({
+                organizationId: input.tenantId,
+                reference: input.operationId,
+                amountMinor: priceMinor,
+              });
+              if (!held) {
+                throw new ProviderMutationRecoveryError(
+                  "indeterminate",
+                  undefined,
+                  "insufficient_funds",
+                  402,
+                );
+              }
+              heldCharge = { reference: input.operationId, amountMinor: priceMinor };
+            }
+            let conclusion: Awaited<ReturnType<NonNullable<Provider["concludeApplyNoEffect"]>>>;
+            try {
+              conclusion = await concludeApplyNoEffect.call(provider, {
+                operationId: input.operationId,
+                providerInstallationRef: selection.providerInstallationRef,
+                executionAuthority: input.executionAuthority,
+                offering: structuredClone(selection.technicalOffering),
+                identity: {
+                  tenantRef: input.tenantId,
+                  space: input.space,
+                  name: input.name,
+                  uid: input.resourceUid,
+                },
+              });
+            } catch (error) {
+              throw indeterminateProviderMutationFailure(error);
+            }
+            if (conclusion.phase === "unsupported") {
+              throw new ProviderApplyNoEffectUnsupportedError();
+            }
+            const ticket = conclusion;
+            try {
+              // A successful or ordinary failure ticket is inconclusive on this
+              // seam. Only the identity-bound whole-operation proof throws the
+              // terminal refusal consumed by the Host lifecycle below.
+              resultOf(ticket, mutation);
+            } catch (error) {
+              if (error instanceof ProviderMutationWholeOperationRefusalError && heldCharge) {
+                throw new ProviderMutationWholeOperationRefusalError(
+                  error.code,
+                  error.status,
+                  error.publicMessage,
+                  {
+                    action: error.action,
+                    heldCharge,
+                  },
+                );
+              }
+              throw error;
+            }
+            throw new ProviderMutationRecoveryError("indeterminate");
+          },
+        }
+      : {}),
+    ...([...byId.values()].some((provider) => provider.compensateApply !== undefined)
+      ? {
+          async compensateApply(
+            input: Parameters<NonNullable<TakoformResourceDriver["compensateApply"]>>[0],
+          ): Promise<void> {
+            // Preserve the accepted identity across wallet/provider awaits. Neither
+            // the caller nor the Provider receives this proof-consumption snapshot.
+            const accepted = structuredClone(input);
+            const selection = accepted.selection;
+            if (
+              selection.kind !== "provider" ||
+              selection.incumbent !== undefined ||
+              !sameForm(selection.technicalOffering.form, accepted.form.identity.formRef) ||
+              !selection.technicalOffering.capabilities.includes("create") ||
+              accepted.executionAuthority.tenantId !== accepted.tenantId ||
+              accepted.executionAuthority.resourceUid !== accepted.resourceUid
+            ) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            const provider = byId.get(selection.providerPackRef);
+            if (!provider) throw new ProviderMutationRecoveryError("indeterminate");
+            const compensate = provider.compensateApply;
+            if (!compensate) throw new ProviderApplyCompensationUnsupportedError();
+
+            const priceMinor = selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+            let heldCharge: LedgerHeldCharge | undefined;
+            if (!accepted.commercialAuthority && priceMinor > 0) {
+              const held = await ledger.hold({
+                organizationId: accepted.tenantId,
+                reference: accepted.operationId,
+                amountMinor: priceMinor,
+              });
+              if (!held) {
+                throw new ProviderMutationRecoveryError(
+                  "indeterminate",
+                  undefined,
+                  "insufficient_funds",
+                  402,
+                );
+              }
+              heldCharge = { reference: accepted.operationId, amountMinor: priceMinor };
+            }
+            let conclusion: Awaited<ReturnType<NonNullable<Provider["compensateApply"]>>>;
+            try {
+              conclusion = await compensate.call(provider, {
+                operationId: accepted.operationId,
+                providerInstallationRef: selection.providerInstallationRef,
+                executionAuthority: { ...accepted.executionAuthority },
+                offering: structuredClone(selection.technicalOffering),
+                identity: {
+                  tenantRef: accepted.tenantId,
+                  space: accepted.space,
+                  name: accepted.name,
+                  uid: accepted.resourceUid,
+                },
+              });
+            } catch (error) {
+              // A thrown driver-shaped error is not an operation-bound proof.
+              throw error instanceof TakoformHostError
+                ? new ProviderMutationRecoveryError(
+                    "indeterminate",
+                    undefined,
+                    error.code,
+                    error.status,
+                    error.publicMessage,
+                  )
+                : new ProviderMutationRecoveryError("indeterminate");
+            }
+            if (conclusion.phase === "unsupported") {
+              if (Object.keys(conclusion).length !== 1) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              throw new ProviderApplyCompensationUnsupportedError();
+            }
+            if (conclusion.phase === "failed") {
+              const [code, status] = failureToWire(conclusion.failure.code);
+              if (
+                conclusion.handle === undefined &&
+                providerFailureProvesWholeOperationCompensated(conclusion, accepted.operationId)
+              ) {
+                // The Host owns atomic failure, effect history, claims and wallet
+                // settlement. Never release this hold independently in the driver.
+                throw new ProviderMutationCompensatedFailureError(
+                  code,
+                  status,
+                  conclusion.failure.message,
+                  heldCharge ? { heldCharge } : undefined,
+                );
+              }
+              throw new ProviderMutationRecoveryError(
+                "indeterminate",
+                undefined,
+                code,
+                status,
+                conclusion.failure.message,
+              );
+            }
+            // A compensation progress handle is not the original apply handle;
+            // neither success nor progress can produce a Resource/receipt here.
+            throw new ProviderMutationRecoveryError("indeterminate");
+          },
+        }
+      : {}),
     async apply(input): Promise<TakoformDriverReceipt> {
-      const current = await definitiveProviderPreflight(() =>
-        deployments.active(input.tenantId, input.resourceUid),
-      );
       if (intrinsicForm(input.form)) {
+        const current = await definitiveProviderPreflight(() =>
+          deployments.active(input.tenantId, input.resourceUid),
+        );
         if (current) {
           throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
         }
+        if (
+          (input.form.identity.formRef.kind === "SQLiteMigrationApplication") !==
+          (input.selection.kind === "sqlite-migration")
+        ) {
+          throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+        }
         return { observed: structuredClone(input.spec) };
       }
+      const resolved = await definitiveProviderPreflight(() => resolveApplySelection(input));
+      if (!sameTakoformApplySelection(resolved.selection, input.selection)) {
+        throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+      }
+      const current = resolved.current;
       const preflight = await definitiveProviderPreflight(async () => {
-        const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
-          tenantId: input.tenantId,
-          form: input.form,
-          relations: input.relations,
-          ...(input.commercialAuthority
-            ? { offeringId: input.commercialAuthority.offeringId }
-            : {}),
-        });
-        assertProviderRuntimeInputs(provider, input.spec);
+        if (resolved.selection.kind !== "provider" || !resolved.provider) {
+          throw new TakoformHostError("backend_unavailable", 503);
+        }
+        const provider = resolved.provider;
+        const offering = structuredClone(resolved.selection.technicalOffering);
         // Recovery adopts the retained runtime binding, not today's integration
         // registry. Initial delivery is fenced before placement or native work.
         if (input.standardServices?.length && input.operationMode === undefined) {
@@ -1097,41 +1802,15 @@ export function createProviderDriver(
           input.operationMode === "initial"
             ? selectStandardServiceProjections(provider, input)
             : [];
-        const sold = soldSelection?.sold;
-        const priceMinor = soldSelection?.priceMinor ?? 0;
-        const relationTargets =
-          inheritedSelection?.relations ??
-          (await providerRelations(input.tenantId, input.relations));
-        if (
-          sold &&
-          input.commercialAuthority &&
-          (input.commercialAuthority.offeringId !== sold.id ||
-            (!current && input.commercialAuthority.offeringDigest !== (await catalog.digest(sold))))
-        ) {
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
-        if (
-          current &&
-          (current.offeringId !== offering.id ||
-            current.providerPackRef !== provider.id ||
-            current.providerInstallationRef !==
-              (sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef))
-        ) {
-          // Moving supply is a Migration, never an ordinary Resource update.
-          throw new TakoformHostError("unsupported_capability", 422);
-        }
+        const priceMinor = resolved.selection.sold?.pricePlan.provisioning.amountMinor ?? 0;
+        const relationTargets = resolved.relationTargets;
         const previous = current
           ? {
               nativeId: current.nativeId,
               spec: input.previous?.spec ?? input.spec,
             }
           : undefined;
-        const providerInstallationRef =
-          sold?.providerInstallationRef ??
-          inheritedSelection?.providerInstallationRef ??
-          (() => {
-            throw new TakoformHostError("backend_unavailable", 503);
-          })();
+        const providerInstallationRef = resolved.selection.providerInstallationRef;
         const providerIdentity = {
           tenantRef: input.tenantId,
           space: input.space,
@@ -1359,30 +2038,47 @@ export function createProviderDriver(
       } satisfies import("./provider-port.ts").ApplyInput;
       let providerBoundaryEntered = false;
       let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
+      const mutation: {
+        readonly operationId: string;
+        readonly mode: "initial" | "recovery";
+        wholeOperationProof?: "convergeApply";
+      } = {
+        operationId: input.operationId,
+        mode: input.operationMode === "recovery" ? "recovery" : "initial",
+      };
       const work = async () => {
         providerBoundaryEntered = true;
         try {
+          const firstTicket = input.providerHandle
+            ? await pollHandle(
+                provider,
+                input.operationId,
+                input.providerHandle,
+                input.executionAuthority,
+              )
+            : input.operationMode === "recovery"
+              ? provider.convergeApply
+                ? await provider.convergeApply(providerInput)
+                : (() => {
+                    // A Host recovery lease may resume a mutation only through
+                    // an explicitly operation-keyed convergence seam. The
+                    // read-only `recoverApply` capability is never promoted
+                    // into mutation authority here.
+                    throw new ProviderMutationRecoveryError("indeterminate");
+                  })()
+              : await provider.apply(providerInput);
+          if (
+            input.operationMode === "recovery" &&
+            !input.providerHandle &&
+            !previous &&
+            firstTicket.phase === "failed"
+          ) {
+            mutation.wholeOperationProof = "convergeApply";
+          }
           const ticket = await settle(
             provider,
             input.operationId,
-            input.providerHandle
-              ? await pollHandle(
-                  provider,
-                  input.operationId,
-                  input.providerHandle,
-                  input.executionAuthority,
-                )
-              : input.operationMode === "recovery"
-                ? provider.convergeApply
-                  ? await provider.convergeApply(providerInput)
-                  : (() => {
-                      // A Host recovery lease may resume a mutation only through
-                      // an explicitly operation-keyed convergence seam. The
-                      // read-only `recoverApply` capability is never promoted
-                      // into mutation authority here.
-                      throw new ProviderMutationRecoveryError("indeterminate");
-                    })()
-                : await provider.apply(providerInput),
+            firstTicket,
             input.executionAuthority,
             Boolean(input.providerHandle),
           );
@@ -1421,10 +2117,6 @@ export function createProviderDriver(
       // Charging the organization wallet again here would double-settle the
       // same Resource. Direct organization credentials have no such authority
       // and retain the ordinary hold/capture path.
-      const mutation = {
-        operationId: input.operationId,
-        mode: input.operationMode === "recovery" ? "recovery" : "initial",
-      } as const;
       let result: ProviderResult;
       try {
         result =
@@ -1475,32 +2167,51 @@ export function createProviderDriver(
         throw runtimeBindingCallbacksEntered ? withoutDefinitiveProviderProof(error) : error;
       }
       if (input.atomicDeploymentCommit) {
+        const outputs = deploymentOutputs(result.outputs, input);
+        let deploymentMutation: ResourceDeploymentMutation;
+        if (!current) {
+          deploymentMutation = {
+            kind: "create",
+            deployment: {
+              tenantId: input.tenantId,
+              id: `dep_${input.operationId}`,
+              resourceUid: input.resourceUid,
+              offeringId: offering.id,
+              providerPackRef: provider.id,
+              providerInstallationRef,
+              nativeId: result.nativeId,
+              state: "active",
+              observed: result.observed,
+              outputs,
+            },
+          };
+        } else if (result.nativeId === current.nativeId) {
+          deploymentMutation = {
+            kind: "refresh",
+            tenantId: input.tenantId,
+            deploymentId: current.id,
+            expectedNativeId: current.nativeId,
+            observed: result.observed,
+            outputs,
+          };
+        } else {
+          // An import makes the old object a customer claim. A provider apply
+          // may replace only the Host-minted realization it already owned; the
+          // store repeats this unclaimed fence in the atomic commit batch.
+          if (current.nativeClaimed) throw new TakoformHostError("resource_busy", 409);
+          deploymentMutation = {
+            kind: "replace",
+            tenantId: input.tenantId,
+            deploymentId: current.id,
+            expectedNativeId: current.nativeId,
+            nativeId: result.nativeId,
+            observed: result.observed,
+            outputs,
+          };
+        }
         return {
           ...receiptOf(result),
-          deploymentMutation: current
-            ? {
-                kind: "refresh",
-                tenantId: input.tenantId,
-                deploymentId: current.id,
-                expectedNativeId: current.nativeId,
-                observed: result.observed,
-                outputs: deploymentOutputs(result.outputs, input),
-              }
-            : {
-                kind: "create",
-                deployment: {
-                  tenantId: input.tenantId,
-                  id: `dep_${input.operationId}`,
-                  resourceUid: input.resourceUid,
-                  offeringId: offering.id,
-                  providerPackRef: provider.id,
-                  providerInstallationRef,
-                  nativeId: result.nativeId,
-                  state: "active",
-                  observed: result.observed,
-                  outputs: deploymentOutputs(result.outputs, input),
-                },
-              },
+          deploymentMutation,
         };
       }
       if (current) {
@@ -1614,7 +2325,10 @@ export function createProviderDriver(
         );
       } else {
         if (input.operationMode === "recovery") {
-          const recoverDelete = provider.recoverDelete?.bind(provider);
+          const recoverDelete =
+            input.recoveryAction === "converge"
+              ? (provider.convergeDelete?.bind(provider) ?? provider.recoverDelete?.bind(provider))
+              : provider.recoverDelete?.bind(provider);
           if (!recoverDelete) {
             // A lost DELETE acknowledgement has no safe replay. Only a
             // provider-owned deterministic readback may settle it.
@@ -2056,53 +2770,53 @@ export function createProviderDriver(
     },
 
     async import(input): Promise<TakoformDriverReceipt> {
-      if (intrinsicForm(input.form)) return { observed: structuredClone(input.spec) };
-      const { provider, offering, providerInstallationRef, current, adopt } =
-        await definitiveProviderPreflight(async () => {
-          const soldSelection =
-            input.form.role === "identity" ||
-            catalog.offeringsFor(input.form.identity.formRef).length > 0
-              ? selectSold(input.form)
-              : undefined;
-          const inheritedSelection = soldSelection
-            ? undefined
-            : await inherited(input.tenantId, input.form, input.relations);
-          const provider = soldSelection?.provider ?? inheritedSelection?.provider;
-          const offering = soldSelection?.offering ?? inheritedSelection?.offering;
-          const sold = soldSelection?.sold;
-          const providerInstallationRef =
-            sold?.providerInstallationRef ?? inheritedSelection?.providerInstallationRef;
-          if (!provider || !offering || !providerInstallationRef) {
-            throw new TakoformHostError("unsupported_capability", 422);
-          }
-          const adopt = provider.adopt?.bind(provider);
-          if (!adopt) throw new TakoformHostError("unsupported_capability", 422);
-          const claim = await deployments.findByNative(
-            input.tenantId,
-            providerInstallationRef,
-            input.nativeId,
-          );
-          const current = await deployments.active(input.tenantId, input.resourceUid);
-          // A claim is immutable from the moment it is made, but a native id this
-          // host MINTED is not a claim: the ordinary import onto an address a
-          // configuration already manages names the object for the first time, and
-          // a host that refused it could never be imported into at all. So the
-          // refusal is a claim that already exists and names another object, never
-          // the mere presence of a minted one.
-          if (
-            (claim && claim.resourceUid !== input.resourceUid) ||
-            (current &&
-              ((current.nativeClaimed && current.nativeId !== input.nativeId) ||
-                current.offeringId !== offering.id ||
-                current.providerInstallationRef !== providerInstallationRef))
-          ) {
-            throw new TakoformHostError("import_conflict", 409);
-          }
-          return { provider, offering, providerInstallationRef, current, adopt };
-        });
-      const resolvedProviderRelations = () =>
-        definitiveProviderPreflight(() => providerRelations(input.tenantId, input.relations));
+      const resolved = await definitiveProviderPreflight(() =>
+        resolveImportSelection({
+          tenantId: input.tenantId,
+          resourceUid: input.resourceUid,
+          form: input.form,
+          name: input.name,
+          space: input.space,
+          spec: input.spec,
+          nativeId: input.nativeId,
+          relations: input.relations,
+          ...(input.previous ? { previous: input.previous } : {}),
+        }),
+      );
+      let selectionMatches = false;
+      try {
+        selectionMatches = sameTakoformImportSelection(resolved.selection, input.selection);
+      } catch {
+        throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+      }
+      if (!selectionMatches) {
+        throw new ProviderMutationDefinitiveRefusalError("resource_busy", 409);
+      }
+      if (input.selection.kind === "intrinsic") {
+        return { observed: structuredClone(input.spec) };
+      }
+      if (input.selection.kind === "sqlite-migration") {
+        return { observed: structuredClone(input.spec) };
+      }
+      if (input.selection.kind !== "provider" || !resolved.provider) {
+        throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
+      }
+      const provider = resolved.provider;
+      // The provider object is selected only after the persisted snapshot has
+      // been revalidated. The offering and installation sent to it are the
+      // retained values, never a fresh catalog projection.
+      const offering = structuredClone(input.selection.technicalOffering);
+      const providerInstallationRef = input.selection.providerInstallationRef;
+      const current = resolved.current;
+      const relationTargets = resolved.relationTargets;
+      if (!relationTargets) {
+        throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
+      }
+      const adopt = provider.adopt?.bind(provider);
+      if (!adopt) throw new ProviderMutationDefinitiveRefusalError("unsupported_capability", 422);
+      const resolvedProviderRelations = () => Promise.resolve(relationTargets);
       let firstTicket: ProviderTicket;
+      let wholeOperationProof: "recoverAdopt" | undefined;
       if (input.providerHandle) {
         firstTicket = await pollHandle(
           provider,
@@ -2144,6 +2858,12 @@ export function createProviderDriver(
               relations,
             }),
           );
+          // Only a terminal ticket returned directly by recoverAdopt may carry
+          // whole-operation proof. A running result must first cross a poll,
+          // whose answer describes that poll invocation and is never trusted
+          // for this settlement even if a future caller makes its handle
+          // durable before entering settle().
+          if (firstTicket.phase === "failed") wholeOperationProof = "recoverAdopt";
         } else {
           const relations = await resolvedProviderRelations();
           firstTicket = await enteredProviderMutation(() =>
@@ -2187,6 +2907,7 @@ export function createProviderDriver(
         {
           operationId: input.operationId,
           mode: input.operationMode === "recovery" ? "recovery" : "initial",
+          ...(wholeOperationProof ? { wholeOperationProof } : {}),
         },
       );
       if (result.nativeId !== input.nativeId) {

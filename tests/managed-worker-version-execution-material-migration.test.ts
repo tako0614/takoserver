@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 
 const MIGRATION = "0057_cloudflare_managed_worker_version_execution_material.sql";
 const PREDECESSOR = "0056_vector_index_storage.sql";
@@ -19,6 +20,144 @@ const DESCRIPTOR = sha("d");
 const PREPARATION = "preparation-test";
 const COMMITMENT = sha("c");
 const FORMAT = "takoserver.managed-worker-version-execution-material@v1";
+
+const DOMAIN_MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
+const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
+const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
+const ACCEPTED_AUTHORITY_CONTINUITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
+const PRESERVED_TABLES = [
+  "cloudflare_managed_worker_receipts",
+  "cloudflare_managed_worker_version_execution_material",
+  "cloudflare_managed_worker_version_execution_secrets",
+  "cloudflare_managed_worker_version_execution_provider_proofs",
+] as const;
+
+for (const phase of ["pending", "committed", "deleting", "deleted"] as const) {
+  test(`0058 preserves ${phase} receipt material, ciphertext, and every existing trigger`, () => {
+    const database = domainPredecessor();
+    insertReceipt(database);
+    insertMaterial(database);
+    insertSecret(database, "API_KEY");
+    insertProof(database, "object:MEDIA:runtime-proof");
+    if (phase !== "pending") commitReceipt(database);
+    if (phase === "deleting") {
+      database
+        .query(`UPDATE cloudflare_managed_worker_receipts
+        SET state = 'deleting', operation_id = 'delete-operation', generation = 2,
+            previous_json = ? WHERE resource_uid = ?`)
+        .run(committedReceiptJson(), VERSION_UID);
+    }
+    if (phase === "deleted") {
+      database.exec(`UPDATE cloudflare_managed_worker_receipts
+        SET state = 'deleted', provider_etag = NULL, observed_json = '{"deleted":true}'`);
+    }
+    const rows = preservedRows(database);
+    const triggers = database
+      .query("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+      .all();
+    database.transaction(() => database.exec(domainMigrationSql()))();
+    expect(preservedRows(database)).toEqual(rows);
+    expect(
+      database
+        .query("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' ORDER BY name")
+        .all(),
+    ).toEqual(triggers);
+    expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+    expect(
+      database.query("SELECT name FROM sqlite_schema WHERE name LIKE 'migration_0058_%'").all(),
+    ).toEqual([]);
+    expect(() => replaceSecret(database, "API_KEY")).toThrow();
+    if (phase !== "deleted") {
+      expect(() =>
+        database.exec(
+          "UPDATE cloudflare_managed_worker_version_execution_material SET tenant_ref = 'foreign'",
+        ),
+      ).toThrow("managed_worker_version_execution_material_immutable");
+    }
+    database.close();
+  });
+}
+
+test("0058 adds domain without dropping receipt state, identity, or kind constraints", () => {
+  const database = domainPredecessor();
+  const insert = (kind: string, uid: string) =>
+    database
+      .query(
+        `INSERT INTO cloudflare_managed_worker_receipts
+       (provider_id, resource_uid, native_id, kind, logical_worker_id,
+        operation_id, generation, descriptor_digest, state, observed_json)
+     VALUES (?, ?, ?, ?, 'worker', ?, 1, ?, 'pending', '{}')`,
+      )
+      .run(PROVIDER, uid, `domain:${uid}`, kind, `create-${uid}`, DESCRIPTOR);
+  expect(() => insert("domain", "new-domain")).toThrow();
+  database.transaction(() => database.exec(domainMigrationSql()))();
+  insert("domain", "new-domain");
+  expect(() => insert("unknown", "unknown-domain")).toThrow();
+  expect(() => insert("domain", "new-domain")).toThrow();
+  expect(() =>
+    database.exec("UPDATE cloudflare_managed_worker_receipts SET state = 'deleting'"),
+  ).toThrow();
+  database.close();
+});
+
+test("0058 interrupted receipt rebuild rolls back with exact ciphertext and lineage intact", () => {
+  const database = domainPredecessor();
+  insertReceipt(database);
+  insertMaterial(database);
+  insertSecret(database, "API_KEY");
+  insertProof(database, "object:MEDIA:runtime-proof");
+  const rows = preservedRows(database);
+  database.exec("CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at TEXT)");
+  for (const migration of MIGRATIONS.filter(({ name }) => name < DOMAIN_MIGRATION)) {
+    database.query("INSERT INTO applied_migrations VALUES (?, 'fixture')").run(migration.name);
+  }
+  expect(() =>
+    migrateSqlite({
+      exec(sql) {
+        if (sql.startsWith("INSERT INTO cloudflare_managed_worker_receipts SELECT")) {
+          throw new Error("injected rebuild interruption");
+        }
+        return database.exec(sql);
+      },
+      query: (sql) => database.query(sql),
+    }),
+  ).toThrow("injected rebuild interruption");
+  expect(preservedRows(database)).toEqual(rows);
+  expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+  expect(
+    database.query("SELECT name FROM applied_migrations WHERE name = ?").get(DOMAIN_MIGRATION),
+  ).toBeNull();
+  expect(migrateSqlite(database).applied).toEqual([
+    DOMAIN_MIGRATION,
+    APPLY_PROVIDER_SELECTION_MIGRATION,
+    OPERATION_GENERATION_MIGRATION,
+    ACCEPTED_AUTHORITY_CONTINUITY_MIGRATION,
+    "0062_takoform_import_provider_selection.sql",
+    "0063_cloudflare_managed_queue_retirement.sql",
+  ]);
+  expect(preservedRows(database)).toEqual(rows);
+  database.close();
+});
+
+function domainMigrationSql(): string {
+  const sql = MIGRATIONS.find(({ name }) => name === DOMAIN_MIGRATION)?.sql;
+  if (!sql) throw new Error("domain receipt migration is missing");
+  return sql;
+}
+
+function domainPredecessor(): Database {
+  const database = new Database(":memory:");
+  database.exec("PRAGMA foreign_keys = ON");
+  for (const migration of MIGRATIONS.filter(({ name }) => name < DOMAIN_MIGRATION)) {
+    database.exec(migration.sql);
+  }
+  return database;
+}
+
+function preservedRows(database: Database): readonly unknown[] {
+  return PRESERVED_TABLES.map((table) => database.query(`SELECT * FROM ${table}`).all());
+}
 
 test("0057 is additive and creates only the receipt-coupled execution-material schema", () => {
   const index = migrationIndex();

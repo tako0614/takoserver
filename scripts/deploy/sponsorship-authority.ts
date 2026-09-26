@@ -12,6 +12,11 @@ import {
   verificationError,
 } from "./errors.ts";
 import {
+  buildReleasedCoreFormAuthorityArtifactDigest,
+  inspectReleasedCoreFormAuthorityDependency,
+  type ReleasedCoreFormAuthorityDependencyInspection,
+} from "./form-authority.ts";
+import {
   type CommandResult,
   REPOSITORY,
   requireEnvironment,
@@ -27,7 +32,7 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, managedSpaceAdmissionPolicyDigest } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { workerVersionScriptContentIdentity } from "./worker-live.ts";
 import {
@@ -37,6 +42,11 @@ import {
   parseWorkerDeploymentHistory,
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
+import {
+  normalizedWorkerClosureDelta,
+  surfaceTransitionAdmits,
+  type WorkerSurfaceTransition,
+} from "./worker-surface-transition.ts";
 
 const CREDENTIAL_SIGNING_SECRET = "TAKOSERVER_SPONSORSHIP_CREDENTIAL_SIGNING_KEY";
 const RECEIPT_SIGNING_SECRET = "TAKOSERVER_SPONSORSHIP_RECEIPT_SIGNING_KEY";
@@ -48,6 +58,9 @@ const RECEIPT_KEY_ID_BINDING = "TAKOSERVER_SPONSORSHIP_RECEIPT_KEY_ID";
 const AUTHORITY_WORKER_BINDING = "TAKOSERVER_SPONSORSHIP_AUTHORITY_WORKER_NAME";
 const AUTHORITY_SOURCE_BINDING = "TAKOSERVER_SPONSORSHIP_AUTHORITY_SOURCE_COMMIT";
 const AUTHORITY_ARTIFACT_BINDING = "TAKOSERVER_SPONSORSHIP_AUTHORITY_ARTIFACT_SHA256";
+const MANAGED_SPACE_ADMISSION_POLICY_DIGEST_BINDING =
+  "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST";
+const TENANT_SPACE_ADMISSION_BINDING = "TENANT_SPACE_ADMISSION";
 const VERSION_BINDING = "WORKER_VERSION";
 
 export interface SponsorshipAuthorityDeployInvocation {
@@ -55,6 +68,7 @@ export interface SponsorshipAuthorityDeployInvocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
   readonly commit: string;
+  readonly transition?: WorkerSurfaceTransition;
 }
 
 export interface SponsorshipAuthorityDeployState {
@@ -103,6 +117,7 @@ export interface SponsorshipAuthorityInspection {
   readonly artifactDigest: `sha256:${string}`;
   readonly scriptEtag: string;
   readonly topologyAudit: CloudflareTopologyAuditEvidence;
+  readonly bindingTransitionProfile: "none" | "declared-delta-predecessor";
 }
 
 /** Prove every active ordinary key is distinct from both sponsorship authorities. */
@@ -187,6 +202,16 @@ export function writeSponsorshipAuthorityConfig(input: {
   readonly artifactDigest?: `sha256:${string}`;
 }): string {
   const selected = requireAuthorityTarget(input.target);
+  const managedFormAuthority = input.target.formAuthority;
+  const managedFormAuthorityWorkerName = managedFormAuthority?.workerName;
+  const managedSpaceAdmissionPolicy = managedFormAuthority?.managedSpaceAdmissionPolicy;
+  if (managedSpaceAdmissionPolicy !== undefined && managedFormAuthorityWorkerName === undefined) {
+    throw preflightError("managed Space admission policy requires a Form authority target");
+  }
+  const managedSpaceAdmissionPolicyDigestValue =
+    managedSpaceAdmissionPolicy === undefined
+      ? undefined
+      : managedSpaceAdmissionPolicyDigest(managedSpaceAdmissionPolicy);
   const config = {
     name: selected.workerName,
     main: input.main,
@@ -204,6 +229,12 @@ export function writeSponsorshipAuthorityConfig(input: {
       [AUTHORITY_WORKER_BINDING]: selected.workerName,
       [AUTHORITY_SOURCE_BINDING]: input.commit,
       [AUTHORITY_ARTIFACT_BINDING]: input.artifactDigest ?? `sha256:${"0".repeat(64)}`,
+      ...(managedSpaceAdmissionPolicyDigestValue === undefined
+        ? {}
+        : {
+            TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST:
+              managedSpaceAdmissionPolicyDigestValue,
+          }),
     },
     secrets: { required: [CREDENTIAL_SIGNING_SECRET, RECEIPT_SIGNING_SECRET] },
     version_metadata: { binding: VERSION_BINDING },
@@ -215,6 +246,17 @@ export function writeSponsorshipAuthorityConfig(input: {
         migrations_dir: resolve(REPOSITORY, "migrations"),
       },
     ],
+    ...(managedSpaceAdmissionPolicy === undefined
+      ? {}
+      : {
+          services: [
+            {
+              binding: "TENANT_SPACE_ADMISSION",
+              service: managedFormAuthorityWorkerName as string,
+              entrypoint: "TenantSpaceAdmissionEntrypoint",
+            },
+          ],
+        }),
     observability: { enabled: true },
   };
   writeFileSync(input.path, `${JSON.stringify(config, null, 2)}\n`, {
@@ -232,6 +274,7 @@ export function sponsorshipAuthorityBindingClosure(
   },
 ): ExpectedBindingClosure {
   const selected = requireAuthorityTarget(target);
+  const managedSpaceAdmissionPolicy = target.formAuthority?.managedSpaceAdmissionPolicy;
   return {
     STATE_DB: { type: "d1", fields: { id: target.d1.databaseId } },
     [ORGANIZATION_BINDING]: {
@@ -268,6 +311,21 @@ export function sponsorshipAuthorityBindingClosure(
       type: "plain_text",
       fields: { text: identity.artifactDigest },
     },
+    ...(managedSpaceAdmissionPolicy === undefined
+      ? {}
+      : {
+          TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST: {
+            type: "plain_text",
+            fields: { text: managedSpaceAdmissionPolicyDigest(managedSpaceAdmissionPolicy) },
+          },
+          TENANT_SPACE_ADMISSION: {
+            type: "service",
+            fields: {
+              service: target.formAuthority?.workerName as string,
+              entrypoint: "TenantSpaceAdmissionEntrypoint",
+            },
+          },
+        }),
     [VERSION_BINDING]: { type: "version_metadata", fields: {} },
   };
 }
@@ -284,6 +342,7 @@ export async function runSponsorshipAuthority(
   if (target.environment !== invocation.environment) {
     throw preflightError("sponsorship authority invocation and target differ");
   }
+  assertManagedSpaceAdmissionTransition("preflight", target, invocation.transition);
   const selected = requireAuthorityTarget(target);
   const run = options.run ?? runCommand;
   const credential =
@@ -302,7 +361,29 @@ export async function runSponsorshipAuthority(
       accountId: target.accountId,
       token: credential?.token ?? exactToken(environment),
     });
-  const before = await inspectSponsorshipAuthority("preflight", target, state);
+  const dependencyBefore = await inspectManagedSpaceAdmissionDependency("preflight", target, state);
+  const before = await inspectSponsorshipAuthority(
+    "preflight",
+    target,
+    state,
+    invocation.transition,
+  );
+  if (invocation.action === "apply" && invocation.transition !== undefined) {
+    if (before === null) {
+      throw preflightError("sponsorship authority forward transition refuses absent topology");
+    }
+    if (before.history.versionId !== invocation.transition.predecessorVersionId) {
+      throw preflightError(
+        "authoritative current sponsorship authority Version is not the pinned transition predecessor",
+        `expected=${invocation.transition.predecessorVersionId} actual=${before.history.versionId}`,
+      );
+    }
+    if (before.bindingTransitionProfile !== "declared-delta-predecessor") {
+      throw preflightError(
+        "declared sponsorship transition is already at the target closure; use the routine invocation",
+      );
+    }
+  }
 
   if (invocation.action === "status") {
     const statusRoot =
@@ -359,7 +440,11 @@ export async function runSponsorshipAuthority(
         receiptKeyId: selected.receiptKeyId,
         receiptPublicJwk: selected.receiptPublicJwk,
         receiptPublicJwkSha256: sha256(canonicalJson(selected.receiptPublicJwk)),
-        closureReady: before?.commit === invocation.commit && credentialRow !== null,
+        closureReady:
+          before?.commit === invocation.commit &&
+          before.bindingTransitionProfile === "none" &&
+          credentialRow !== null,
+        bindingTransitionProfile: before?.bindingTransitionProfile ?? null,
         functionalProofPending: true,
         rolloutReady: false,
         nextStep:
@@ -378,48 +463,37 @@ export async function runSponsorshipAuthority(
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
   );
-  await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
-
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-sponsorship-authority-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let preflightConfigRoot: string | undefined;
   try {
-    const prepared = await prepareWorkerArtifact({
-      root,
-      target,
-      commit: source.commit,
-      main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
-      writeConfig: ({ path, main, bundleDigestHex }) =>
-        writeSponsorshipAuthorityConfig({
-          path,
-          main,
-          target,
-          commit: source.commit,
-          ...(bundleDigestHex === undefined ? {} : { artifactDigest: `sha256:${bundleDigestHex}` }),
-        }),
-      run,
-      environment,
-    });
-    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
-    const database =
-      options.database ?? createRemoteSigningDatabase(prepared.configPath, environment, run);
-    const signingRow = await database.readKey(target.signing.currentKeyId, "preflight");
-    const nextSigningRow =
+    let database = options.database;
+    if (database === undefined) {
+      preflightConfigRoot = mkdtempSync(
+        join(tmpdir(), "takoserver-sponsorship-authority-preflight-"),
+      );
+      const preflightConfigPath = writeSponsorshipAuthorityConfig({
+        path: join(preflightConfigRoot, "wrangler.jsonc"),
+        main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
+        target,
+        commit: source.commit,
+      });
+      database = createRemoteSigningDatabase(preflightConfigPath, environment, run);
+    }
+    const signingRowBeforeGate = await database.readKey(target.signing.currentKeyId, "preflight");
+    const nextSigningRowBeforeGate =
       target.signing.nextKeyId === undefined
         ? null
         : await database.readKey(target.signing.nextKeyId, "preflight");
-    const credentialRowBefore = await database.readKey(selected.credentialKeyId, "preflight");
-    assertDedicatedSponsorshipKeys(target, signingRow, credentialRowBefore, nextSigningRow);
-    if (
-      credentialRowBefore !== null &&
-      before?.commit === source.commit &&
-      before.artifactDigest === artifactDigest
-    ) {
-      throw preflightError(
-        "sponsorship authority and credential key already serve the selected identity; use --status",
-      );
-    }
+    const credentialRowBeforeGate = await database.readKey(selected.credentialKeyId, "preflight");
+    assertDedicatedSponsorshipKeys(
+      target,
+      signingRowBeforeGate,
+      credentialRowBeforeGate,
+      nextSigningRowBeforeGate,
+    );
     const signingJwk = await readVerifiedPrivateSigningJwk(
       options.privateJwkPath ??
         requireEnvironment("TAKOSERVER_SPONSORSHIP_CREDENTIAL_PRIVATE_JWK_PATH"),
@@ -437,6 +511,59 @@ export async function runSponsorshipAuthority(
       },
       selected.receiptKeyId,
     );
+
+    if (dependencyBefore !== null && dependencyBefore.commit !== source.commit) {
+      const candidateArtifactDigest = await buildReleasedCoreFormAuthorityArtifactDigest({
+        target,
+        commit: source.commit,
+        run,
+        environment,
+      });
+      if (candidateArtifactDigest !== dependencyBefore.artifactDigest) {
+        throw preflightError(
+          "served released-Core Form authority dependency emitted artifact differs from the sponsorship source",
+          `served=${dependencyBefore.artifactDigest} source=${candidateArtifactDigest}`,
+        );
+      }
+    }
+
+    await checked(run, "sponsorship authority owner gate", ["bun", "run", "check"]);
+
+    const prepared = await prepareWorkerArtifact({
+      root,
+      target,
+      commit: source.commit,
+      main: resolve(REPOSITORY, "src/entry-sponsorship-authority-worker.ts"),
+      writeConfig: ({ path, main, bundleDigestHex }) =>
+        writeSponsorshipAuthorityConfig({
+          path,
+          main,
+          target,
+          commit: source.commit,
+          ...(bundleDigestHex === undefined ? {} : { artifactDigest: `sha256:${bundleDigestHex}` }),
+        }),
+      run,
+      environment,
+    });
+    const artifactDigest = `sha256:${prepared.bundleDigestHex}` as const;
+    database =
+      options.database ?? createRemoteSigningDatabase(prepared.configPath, environment, run);
+    const signingRow = await database.readKey(target.signing.currentKeyId, "preflight");
+    const nextSigningRow =
+      target.signing.nextKeyId === undefined
+        ? null
+        : await database.readKey(target.signing.nextKeyId, "preflight");
+    const credentialRowBefore = await database.readKey(selected.credentialKeyId, "preflight");
+    assertDedicatedSponsorshipKeys(target, signingRow, credentialRowBefore, nextSigningRow);
+    if (
+      credentialRowBefore !== null &&
+      before?.commit === source.commit &&
+      before.artifactDigest === artifactDigest
+    ) {
+      throw preflightError(
+        "sponsorship authority and credential key already serve the selected identity; use --status",
+      );
+    }
     const secretsPath = join(prepared.releaseDirectory, "secrets.json");
     writeFileSync(
       secretsPath,
@@ -451,8 +578,15 @@ export async function runSponsorshipAuthority(
     const sealed = prepared.seal(["secrets.json"]);
     sealed.assertUnchanged();
 
-    const last = await inspectSponsorshipAuthority("preflight", target, state);
+    const last = await inspectSponsorshipAuthority(
+      "preflight",
+      target,
+      state,
+      invocation.transition,
+    );
+    const dependencyLast = await inspectManagedSpaceAdmissionDependency("preflight", target, state);
     assertSameInspection(before, last);
+    assertSameManagedSpaceAdmissionDependency(dependencyBefore, dependencyLast);
     await registerSponsorshipCredentialPublicKey(target, database);
     const upload = await run(
       wranglerCommand([
@@ -477,6 +611,12 @@ export async function runSponsorshipAuthority(
     }
 
     const after = await inspectSponsorshipAuthority("verification", target, state);
+    const dependencyAfter = await inspectManagedSpaceAdmissionDependency(
+      "verification",
+      target,
+      state,
+    );
+    assertSameManagedSpaceAdmissionDependency(dependencyBefore, dependencyAfter, "verification");
     if (
       after === null ||
       after.history.versionId === before?.history.versionId ||
@@ -528,6 +668,8 @@ export async function runSponsorshipAuthority(
           : `wrangler versions deploy ${before.history.versionId}@100% --yes --name ${selected.workerName}`,
     };
   } finally {
+    if (preflightConfigRoot !== undefined)
+      rmSync(preflightConfigRoot, { recursive: true, force: true });
     unsealDirectory(root);
     if (temporary) rmSync(root, { recursive: true, force: true });
   }
@@ -537,7 +679,9 @@ export async function inspectSponsorshipAuthority(
   phase: DeployPhase,
   target: DeployTarget,
   state: SponsorshipAuthorityDeployState,
+  transition?: WorkerSurfaceTransition,
 ): Promise<SponsorshipAuthorityInspection | null> {
+  assertManagedSpaceAdmissionTransition(phase, target, transition);
   const selected = requireAuthorityTarget(target);
   const scripts = await state.workerScripts();
   if (scripts.length !== new Set(scripts).size) {
@@ -553,6 +697,7 @@ export async function inspectSponsorshipAuthority(
   if (domains.length !== 0 || routes.length !== 0) {
     throw phaseError(phase, "sponsorship authority unexpectedly owns a public domain or route");
   }
+  await inspectManagedSpaceAdmissionDependency(phase, target, state);
   if (!scripts.includes(selected.workerName)) return null;
   const history = parseWorkerDeploymentHistory(
     await state.workerDeployments(selected.workerName),
@@ -564,12 +709,21 @@ export async function inspectSponsorshipAuthority(
   const version = await state.workerVersion(selected.workerName, history.versionId);
   const identity = authorityIdentity(phase, history.versionId, version);
   const scriptEtag = workerVersionScriptContentIdentity(phase, history.versionId, version);
-  assertExactVersionBindingClosure(
-    phase,
-    history.versionId,
-    version,
-    sponsorshipAuthorityBindingClosure(target, identity),
-  );
+  const targetClosure = sponsorshipAuthorityBindingClosure(target, identity);
+  const bindingTransitionProfile =
+    transition !== undefined &&
+    transition.predecessorVersionId === history.versionId &&
+    surfaceTransitionAdmits(phase, history.versionId, version, {
+      delta: transition.delta,
+      environment: target.environment,
+      targetClosure,
+      targetSecrets: [CREDENTIAL_SIGNING_SECRET, RECEIPT_SIGNING_SECRET],
+    })
+      ? "declared-delta-predecessor"
+      : "none";
+  if (bindingTransitionProfile === "none") {
+    assertExactVersionBindingClosure(phase, history.versionId, version, targetClosure);
+  }
   assertExactSecretInventory(
     await state.workerSecrets(selected.workerName),
     [CREDENTIAL_SIGNING_SECRET, RECEIPT_SIGNING_SECRET],
@@ -579,7 +733,52 @@ export async function inspectSponsorshipAuthority(
   if (subdomain.enabled || subdomain.previewsEnabled) {
     throw phaseError(phase, "sponsorship authority has workers.dev or preview URLs enabled");
   }
-  return { history, ...identity, scriptEtag, topologyAudit };
+  return { history, ...identity, scriptEtag, topologyAudit, bindingTransitionProfile };
+}
+
+/**
+ * A managed sponsorship Worker may only be inspected against a served Form
+ * authority carrying the same operator policy. The Form owner's inspection
+ * proves exact released-Core code/closure identity; this seam adds the
+ * narrow named-entrypoint proof required by the service binding.
+ */
+async function inspectManagedSpaceAdmissionDependency(
+  phase: DeployPhase,
+  target: DeployTarget,
+  state: SponsorshipAuthorityDeployState,
+): Promise<ReleasedCoreFormAuthorityDependencyInspection | null> {
+  const policy = target.formAuthority?.managedSpaceAdmissionPolicy;
+  if (policy === undefined) return null;
+  const formAuthority = target.formAuthority;
+  if (!formAuthority) {
+    throw phaseError(phase, "managed Space admission requires a Form authority target");
+  }
+  const inspection = await inspectReleasedCoreFormAuthorityDependency(phase, target, state);
+  if (inspection === null) {
+    throw phaseError(phase, "managed Space admission requires a served Form authority Version");
+  }
+  const version = await state.workerVersion(formAuthority.workerName, inspection.history.versionId);
+  if (!hasTenantSpaceAdmissionEntrypoint(version)) {
+    throw phaseError(phase, "served Form authority lacks the named narrow admission entrypoint");
+  }
+  return inspection;
+}
+
+function hasTenantSpaceAdmissionEntrypoint(version: unknown): boolean {
+  if (!isRecord(version) || !isRecord(version.resources) || !isRecord(version.resources.script)) {
+    return false;
+  }
+  const namedHandlers = version.resources.script.named_handlers;
+  if (!Array.isArray(namedHandlers)) return false;
+  const matches = namedHandlers.filter(
+    (handler) =>
+      isRecord(handler) &&
+      handler.name === "TenantSpaceAdmissionEntrypoint" &&
+      Array.isArray(handler.handlers) &&
+      handler.handlers.length === 1 &&
+      handler.handlers[0] === "ensureTenantSpaceAdmission",
+  );
+  return matches.length === 1;
 }
 
 function targetCredentialRow(target: DeployTarget): SigningPublicKeyRow {
@@ -615,7 +814,8 @@ function authorityIdentity(
     !isRecord(value) ||
     !isRecord(value.annotations) ||
     !exactKeys(value.annotations, ["workers/message", "workers/triggered_by"]) ||
-    value.annotations["workers/triggered_by"] !== "version_upload"
+    (value.annotations["workers/triggered_by"] !== "version_upload" &&
+      value.annotations["workers/triggered_by"] !== "upload")
   ) {
     throw phaseError(phase, "sponsorship authority has no canonical identity");
   }
@@ -659,10 +859,59 @@ function assertSameInspection(
         before.history.previousVersionId !== after.history.previousVersionId ||
         before.commit !== after.commit ||
         before.artifactDigest !== after.artifactDigest ||
+        before.bindingTransitionProfile !== after.bindingTransitionProfile ||
         before.scriptEtag !== after.scriptEtag ||
         canonicalJson(before.topologyAudit) !== canonicalJson(after.topologyAudit)))
   ) {
     throw preflightError("sponsorship authority changed during deploy qualification");
+  }
+}
+
+function assertSameManagedSpaceAdmissionDependency(
+  before: ReleasedCoreFormAuthorityDependencyInspection | null,
+  after: ReleasedCoreFormAuthorityDependencyInspection | null,
+  phase: DeployPhase = "preflight",
+): void {
+  if (
+    (before === null) !== (after === null) ||
+    (before !== null &&
+      after !== null &&
+      (before.history.deploymentId !== after.history.deploymentId ||
+        before.history.versionId !== after.history.versionId ||
+        before.history.previousVersionId !== after.history.previousVersionId ||
+        before.commit !== after.commit ||
+        before.artifactDigest !== after.artifactDigest))
+  ) {
+    throw phaseError(phase, "Form authority managed-Space dependency changed during qualification");
+  }
+}
+
+function assertManagedSpaceAdmissionTransition(
+  phase: DeployPhase,
+  target: DeployTarget,
+  transition: WorkerSurfaceTransition | undefined,
+): void {
+  if (transition === undefined) return;
+  if (target.formAuthority?.managedSpaceAdmissionPolicy === undefined) {
+    throw phaseError(
+      phase,
+      "sponsorship authority closure transitions are limited to managed Space admission",
+    );
+  }
+  const delta = normalizedWorkerClosureDelta(transition.delta);
+  const expected = {
+    retiredVars: [],
+    addedVars: [MANAGED_SPACE_ADMISSION_POLICY_DIGEST_BINDING],
+    refreshedVars: [],
+    addedBindings: [TENANT_SPACE_ADMISSION_BINDING],
+    addedSecrets: [],
+    rotatedSecrets: [],
+  };
+  if (canonicalJson(delta) !== canonicalJson(expected)) {
+    throw phaseError(
+      phase,
+      "managed Space admission sponsorship transition must add exactly its policy digest and narrow service binding",
+    );
   }
 }
 

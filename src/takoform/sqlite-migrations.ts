@@ -10,6 +10,7 @@ import type {
   TakoformResourceDriver,
   TakoformSqliteMigration,
   TakoformSqliteMigrationIdentity,
+  TakoformSqliteMigrationSelection,
   TakoformStoredResource,
 } from "./types.ts";
 import { TakoformHostError } from "./types.ts";
@@ -57,9 +58,16 @@ export async function prepareSqliteMigrationApplication(
   const executor = input.driver.sqliteMigrations;
   if (!executor) throw new TakoformHostError("unsupported_capability", 422);
   const plan = await migrationPlan(input);
+  // Blob fetches are independent content-addressed reads; fan them out instead
+  // of serializing one store/R2 round trip per migration file.
+  const resolved = await Promise.all(
+    plan.desired.map(async (migration) => ({
+      migration,
+      sql: await input.artifacts.resolveBlob(input.tenantId, migration.digest),
+    })),
+  );
   const desired: TakoformSqliteMigration[] = [];
-  for (const migration of plan.desired) {
-    const sql = await input.artifacts.resolveBlob(input.tenantId, migration.digest);
+  for (const { migration, sql } of resolved) {
     if (!sql) throw new TakoformHostError("artifact_missing", 404);
     if ((await bytesDigest(sql)) !== migration.digest) {
       throw new TakoformHostError("artifact_invalid", 400);
@@ -80,14 +88,21 @@ export async function applySqliteMigrationApplication(input: {
   readonly executionAuthority: TakoformProviderExecutionAuthority;
   readonly prepared: PreparedSqliteMigrationApplication | null;
   readonly driver: TakoformResourceDriver;
+  /** Every mutation carries its accepted apply or import snapshot. */
+  readonly selection: TakoformSqliteMigrationSelection;
 }): Promise<void> {
   if (!input.prepared) return;
+  if (!input.selection) throw new TakoformHostError("resource_busy", 409);
+  if (input.selection.kind !== "sqlite-migration") {
+    throw new TakoformHostError("resource_busy", 409);
+  }
   const executor = input.driver.sqliteMigrations;
   if (!executor) throw new TakoformHostError("unsupported_capability", 422);
   const desired = input.prepared.desired.map(({ path, digest }) => ({ path, digest }));
   const applied = await executor.readLedger({
     tenantId: input.tenantId,
     database: input.prepared.database,
+    selection: input.selection,
   });
   requirePrefix(applied, desired);
   const migrations = input.prepared.desired.slice(applied.length);
@@ -98,6 +113,7 @@ export async function applySqliteMigrationApplication(input: {
       executionAuthority: input.executionAuthority,
       tenantId: input.tenantId,
       database: input.prepared.database,
+      selection: input.selection,
       desired: input.prepared.desired,
       expectedPrefix: applied,
       migrations,
@@ -106,6 +122,7 @@ export async function applySqliteMigrationApplication(input: {
   const settled = await executor.readLedger({
     tenantId: input.tenantId,
     database: input.prepared.database,
+    selection: input.selection,
   });
   if (!sameLedger(settled, desired)) throw new TakoformHostError("backend_unavailable", 503);
 }
@@ -139,8 +156,10 @@ export async function sqliteMigrationCondition(
 }
 
 async function migrationPlan(input: MigrationContext): Promise<MigrationPlan> {
-  const database = await relationTarget(input, DATABASE_RELATION);
-  const set = await relationTarget(input, SET_RELATION);
+  const [database, set] = await Promise.all([
+    relationTarget(input, DATABASE_RELATION),
+    relationTarget(input, SET_RELATION),
+  ]);
   const digest = set.spec.manifestDigest;
   if (typeof digest !== "string") throw new TakoformHostError("artifact_missing", 404);
   const manifest = await input.artifacts.resolveManifest(input.tenantId, digest);

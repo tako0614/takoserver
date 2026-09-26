@@ -10,8 +10,16 @@ import {
   type Offering,
 } from "../src/index.ts";
 import type { Sql, SqlParam } from "../src/ports.ts";
+import {
+  type ApplyInput,
+  failed,
+  failedWithoutProviderOperationMutation,
+} from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
+import { createResourceDependencySet } from "../src/takoform/dependency-fence.ts";
+import { createTakoformStore } from "../src/takoform/store.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const TENANT_PREFIX = "d1-definitive-failure";
@@ -91,6 +99,44 @@ const QUERY =
   `space=${SPACE}&definitionVersion=${FORM_REF.definitionVersion}` +
   `&schemaDigest=${encodeURIComponent(FORM_REF.schemaDigest)}`;
 
+test("native D1 settles whole-operation apply abort with an atomic exact hold release", async () => {
+  for (const injectReleaseConstraint of [false, true]) {
+    await withNativeD1(
+      { failOn: [], recoveryAbort: true, injectReleaseConstraint },
+      async ({ app, sql, observe }) => {
+        const tenant = await createTenant(app.fetch);
+        const initial = await applyResource(app.fetch, tenant.provider, "d1-recovery-abort");
+        expect(initial.status).toBe(202);
+        const operationId = operationIdFrom(initial.body);
+        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+          heldMinor: 500,
+        });
+        const recovered = (await app.tick()).providerRepairs;
+        expect(recovered).toMatchObject(
+          injectReleaseConstraint ? { settled: 0, pending: 1 } : { settled: 1, pending: 0 },
+        );
+        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+          settledMinor: 2_000,
+          heldMinor: injectReleaseConstraint ? 500 : 0,
+        });
+        expect(
+          await sql.query(
+            "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+            [operationId],
+          ),
+        ).toEqual(injectReleaseConstraint ? [{ provider_outcome: "indeterminate" }] : []);
+        expect(
+          await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+            operationId,
+          ]),
+        ).toEqual([{ phase: injectReleaseConstraint ? "committing" : "failed" }]);
+        expect(observe.releaseIntercepts).toBe(1);
+        expect(observe.maxBindParams).toBeLessThanOrEqual(100);
+      },
+    );
+  }
+}, 30_000);
+
 test("native D1 terminalizes a definitive refusal and releases its exact hold", async () => {
   await withNativeD1({ failOn: ["d1-success"] }, async ({ app, sql, observe }) => {
     const tenant = await createTenant(app.fetch);
@@ -132,7 +178,7 @@ test("native D1 terminalizes a definitive refusal and releases its exact hold", 
 
     expect(
       await sql.query(
-        "SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+        "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
         [operationId],
       ),
     ).toEqual([]);
@@ -141,7 +187,7 @@ test("native D1 terminalizes a definitive refusal and releases its exact hold", 
     ).toEqual([{ operation: "apply", state: "failed" }]);
     expect(
       await sql.query(
-        "SELECT phase, terminal_json, lease_token FROM tf_deferred_operations WHERE id = ?",
+        "SELECT phase, terminal_json, lease_token FROM tf_deferred_operations_selection_v1 WHERE id = ?",
         [operationId],
       ),
     ).toEqual([{ phase: "failed", terminal_json: expect.any(String), lease_token: null }]);
@@ -202,14 +248,14 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
 
       expect(
         await sql.query(
-          "SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
       ).toEqual([{ operation_id: operationId }]);
       expect(
         await sql.query(
           "SELECT phase, receipt_json, provider_outcome " +
-            "FROM tf_provider_mutation_sagas WHERE operation_id = ?",
+            "FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
           [operationId],
         ),
       ).toEqual([
@@ -222,7 +268,7 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
       expect(
         await sql.query(
           "SELECT phase, terminal_json, lease_token, lease_until " +
-            "FROM tf_deferred_operations WHERE id = ?",
+            "FROM tf_deferred_operations_selection_v1 WHERE id = ?",
           [operationId],
         ),
       ).toEqual([
@@ -255,9 +301,139 @@ test("native D1 rolls back the whole definitive-failure batch on an exact releas
   );
 }, 30_000);
 
+test("native D1 compiles every generated compensated-create settlement statement", async () => {
+  await withNativeD1({ failOn: [] }, async ({ sql }) => {
+    const statements = await capturedCompensatedCreateStatements();
+    expect(statements).toHaveLength(10);
+    for (const [index, statement] of statements.entries()) {
+      try {
+        await sql.query(`EXPLAIN ${statement.sql}`, statement.params);
+      } catch (error) {
+        throw new Error(`compensated-create statement ${index + 1} did not compile`, {
+          cause: error,
+        });
+      }
+    }
+  });
+}, 30_000);
+
 interface NativeD1Options {
+  readonly recoveryAbort?: boolean;
   readonly failOn: readonly string[];
   readonly injectReleaseConstraint?: boolean;
+}
+
+async function capturedCompensatedCreateStatements() {
+  const operationId = "op_d1_compensation_compile";
+  const tenantId = "tenant_d1_compensation_compile";
+  const resourceUid = "uid_d1_compensation_compile";
+  const targetUid = "uid_d1_compensation_target";
+  const providerLeaseToken = "provider_lease_d1_compensation_compile";
+  const hostLeaseToken = "host_lease_d1_compensation_compile";
+  const relation = {
+    pointer: "/spec/worker",
+    relation: "worker",
+    targetApiVersion: FORM_REF.apiVersion,
+    targetKind: FORM_REF.kind,
+    targetName: "dependency",
+    targetUid,
+    targetRevision: "1",
+    targetFormRef: FORM_REF,
+  } as const;
+  const dependencies = await createResourceDependencySet({
+    tenantId,
+    space: SPACE,
+    holderUid: resourceUid,
+    operationId,
+    relations: [relation],
+  });
+  const selection = {
+    version: TAKOFORM_APPLY_SELECTION_VERSION,
+    kind: "provider",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    technicalOffering: PROVIDER_OFFERING,
+    relations: [
+      {
+        pointer: relation.pointer,
+        relation: relation.relation,
+        targetUid,
+        resource: {
+          apiVersion: FORM_REF.apiVersion,
+          kind: FORM_REF.kind,
+          formRef: FORM_REF,
+          name: relation.targetName,
+          space: SPACE,
+          uid: targetUid,
+          generation: "1",
+          revision: "1",
+        },
+      },
+    ],
+  } as const;
+  const target = {
+    tenantId,
+    space: SPACE,
+    apiVersion: FORM_REF.apiVersion,
+    kind: FORM_REF.kind,
+    name: "compensated-create",
+  } as const;
+  let captured: Parameters<Sql["batch"]>[0] | undefined;
+  const captureSql: Sql = {
+    async query() {
+      return [{ committed: 0 }];
+    },
+    async run() {
+      throw new Error("compensation statement capture does not execute writes");
+    },
+    async batch(statements) {
+      captured = statements;
+      return statements.map(() => ({ rows: [], changes: 1 }));
+    },
+  };
+  const store = createTakoformStore(captureSql, () => NOW);
+  await store.commitDefinitiveProviderMutationFailure({
+    recoveryAction: "compensateApply",
+    saga: {
+      operationId,
+      operationKind: "apply",
+      replayKey: "replay_d1_compensation_compile",
+      tenantId,
+      fingerprint: "fingerprint_d1_compensation_compile",
+      resourceUid,
+      target,
+    },
+    providerLeaseToken,
+    claimOwnerId: hostLeaseToken,
+    operation: "create",
+    compensation: { selection, dependencies },
+    hostOperation: {
+      kind: "deferred",
+      leaseToken: hostLeaseToken,
+      terminalJson: JSON.stringify({ done: true }),
+      operation: {
+        id: operationId,
+        tenantId,
+        principalId: "principal_d1_compensation_compile",
+        operation: "apply",
+        phase: "committing",
+        requestPath: "/compile-only",
+        requestQuery: "",
+        requestHeaders: {},
+        requestBody: "{}",
+        fingerprint: "fingerprint_d1_compensation_compile",
+        replayKey: "replay_d1_compensation_compile",
+        target: { ...target, formRef: FORM_REF },
+        resourceUid,
+        pollsRemaining: 0,
+        leaseToken: hostLeaseToken,
+        leaseUntil: NOW.getTime() + 60_000,
+        createdAt: NOW.toISOString(),
+      },
+    },
+  });
+  if (!captured) throw new Error("compensated-create settlement produced no batch");
+  return captured;
 }
 
 interface NativeD1Observation {
@@ -304,7 +480,20 @@ async function withNativeD1(
     const base = createD1Sql(database);
     const observe: NativeD1Observation = { releaseIntercepts: 0, maxBindParams: 0 };
     const sql = observeSql(base, observe, options.injectReleaseConstraint === true);
-    const provider = new FakeProvider({
+    class AbortProvider extends FakeProvider {
+      override async apply(_input: ApplyInput) {
+        return failed("unavailable", "initial response lost before claim", true);
+      }
+      async convergeApply(input: ApplyInput) {
+        return failedWithoutProviderOperationMutation(
+          input.operationId,
+          "conflict",
+          "exact apply durably fenced",
+        );
+      }
+    }
+    const ProviderClass = options.recoveryAbort ? AbortProvider : FakeProvider;
+    const provider = new ProviderClass({
       offerings: [PROVIDER_OFFERING],
       failOn: options.failOn,
     });
@@ -470,7 +659,7 @@ async function walletAt(
 
 async function latestDeferredOperationId(sql: Sql, tenantId: string): Promise<string> {
   const rows = await sql.query(
-    "SELECT id FROM tf_deferred_operations " +
+    "SELECT id FROM tf_deferred_operations_selection_v1 " +
       "WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
     [tenantId],
   );
@@ -481,7 +670,7 @@ async function latestDeferredOperationId(sql: Sql, tenantId: string): Promise<st
 
 async function resourceUidFor(sql: Sql, operationId: string): Promise<string> {
   const rows = await sql.query(
-    "SELECT resource_uid FROM tf_deferred_operations WHERE id = ? LIMIT 1",
+    "SELECT resource_uid FROM tf_deferred_operations_selection_v1 WHERE id = ? LIMIT 1",
     [operationId],
   );
   const uid = rows[0]?.resource_uid;

@@ -8,9 +8,11 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type {
   InstalledTakoformForm,
+  TakoformDriverReceipt,
   TakoformHost,
   TakoformResourceDriver,
 } from "../src/takoform/types.ts";
@@ -133,6 +135,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         entered.resolve();
@@ -183,6 +186,7 @@ describe("durable deferred Takoform operations", () => {
     const providerOperationIds: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         providerOperationIds.push(input.operationId);
@@ -228,7 +232,9 @@ describe("durable deferred Takoform operations", () => {
     expect(new Set(providerOperationIds).size).toBe(1);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE target_name = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE target_name = ?",
+        )
         .all("renewed-authority"),
     ).toEqual([]);
     expect(
@@ -378,6 +384,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const harness = persistentHarness(undefined, {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.name === "cancel-too-late") {
           providerEntered.resolve();
@@ -480,7 +487,7 @@ describe("durable deferred Takoform operations", () => {
     });
     opened.database
       .query(
-        `UPDATE tf_deferred_operations
+        `UPDATE tf_deferred_operations_selection_v1
          SET phase = 'committing', polls_remaining = 0,
              lease_token = 'lease_dead_process', lease_until = ?
          WHERE id = ?`,
@@ -489,7 +496,7 @@ describe("durable deferred Takoform operations", () => {
     const stored = opened.database
       .query(
         `SELECT request_headers_json, request_body_json
-         FROM tf_deferred_operations WHERE id = ?`,
+         FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
       )
       .get(operationId) as {
       request_headers_json: string;
@@ -522,6 +529,7 @@ describe("durable deferred Takoform operations", () => {
     let attempts = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       async apply(input) {
         operationIds.push(input.operationId);
         operationModes.push(input.operationMode);
@@ -551,7 +559,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT phase, lease_token, lease_until, terminal_json
-           FROM tf_deferred_operations WHERE id = ?`,
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
         )
         .get(operationId),
     ).toEqual({
@@ -563,7 +571,7 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database
         .query(
-          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
            WHERE operation_id = ?`,
         )
         .get(operationId),
@@ -572,7 +580,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT provider_handle, provider_outcome
-           FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+           FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
         )
         .get(operationId),
     ).toEqual({ provider_handle: "opaque-provider-handle", provider_outcome: "running" });
@@ -581,7 +589,7 @@ describe("durable deferred Takoform operations", () => {
     // recovery must still carry the durable handle and never dispatch again.
     opened.database
       .query(
-        `UPDATE tf_provider_mutation_sagas
+        `UPDATE tf_provider_mutation_sagas_selection_v1
          SET execution_lease_until = 0 WHERE operation_id = ?`,
       )
       .run(operationId);
@@ -596,9 +604,558 @@ describe("durable deferred Takoform operations", () => {
     expect(providerHandles).toEqual([undefined, "opaque-provider-handle"]);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .all(operationId),
     ).toEqual([]);
+    opened.close();
+  });
+
+  test("retains recovery provenance when a cached receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "recovery-handle");
+        }
+        const receipt = await memory.apply(input);
+        // The Host owns this reserved field; a provider cannot choose the mode.
+        return { ...receipt, providerExecutionMode: "initial" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = desiredResource("receipt-recovery-provenance", "recovery");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-recovery-provenance`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "receipt-recovery-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const first = await apply();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(operationModes).toEqual(["initial"]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await apply();
+    expect(lostCommit?.status).toBe(202);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await apply();
+    expect(settled?.status).toBe(201);
+    expect(providerCalls).toBe(2);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("keeps initial provenance when a cached initial receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        const receipt = await memory.apply(input);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { ...receipt, providerExecutionMode: "recovery" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const desired = desiredResource("receipt-initial-provenance", "initial");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-initial-provenance`;
+    const apply = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "receipt-initial-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const lostCommit = await apply();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await apply();
+    expect(settled?.status).toBe(201);
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
+    opened.close();
+  });
+
+  test("retains recovery provenance when a cached import receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
+      apply: (input) => memory.apply(input),
+      import: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "import-recovery-handle");
+        }
+        const receipt = await memory.import(input);
+        // The provider attempts to forge initial provenance on a recovery call.
+        return { ...receipt, providerExecutionMode: "initial" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [importForm], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = importedResource("receipt-import-recovery-provenance", "recovery");
+    const path = `${lane}/resources/example.forms.invalid/DeferredImportThing/receipt-import-recovery-provenance/import`;
+    const importResource = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "POST",
+          headers: {
+            "idempotency-key": "receipt-import-recovery-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify(desired),
+        }),
+      );
+
+    const first = await importResource();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial import recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(operationModes).toEqual(["initial"]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await importResource();
+    expect(lostCommit?.status).toBe(202);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await importResource();
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(2);
+    expect(operationModes).toEqual(["initial", "recovery"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("keeps initial provenance when a cached initial import receipt follows a lost Host commit", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const operationModes: Array<"initial" | "recovery" | undefined> = [];
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
+      apply: (input) => memory.apply(input),
+      import: async (input) => {
+        providerCalls += 1;
+        operationModes.push(input.operationMode);
+        const receipt = await memory.import(input);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { ...receipt, providerExecutionMode: "recovery" };
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [importForm], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const desired = importedResource("receipt-import-initial-provenance", "initial");
+    const path = `${lane}/resources/example.forms.invalid/DeferredImportThing/receipt-import-initial-provenance/import`;
+    const importResource = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "POST",
+          headers: {
+            "idempotency-key": "receipt-import-initial-provenance-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify(desired),
+        }),
+      );
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await importResource();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial import receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await importResource();
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(1);
+    expect(operationModes).toEqual(["initial"]);
+    expect(JSON.stringify(await settled?.json())).not.toContain("providerExecutionMode");
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
+    opened.close();
+  });
+
+  test("uses durable recovery provenance for a cached provider delete receipt", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const deleteModes: Array<"initial" | "recovery" | undefined> = [];
+    const recoveryActions: Array<"observe" | "converge" | undefined> = [];
+    let deleteCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        deleteCalls += 1;
+        deleteModes.push(input.operationMode);
+        recoveryActions.push(input.recoveryAction);
+        if (input.operationMode === "initial") {
+          throw new ProviderMutationRecoveryError("indeterminate", "delete-recovery-handle");
+        }
+        // The provider attempts to forge initial provenance on a recovery call.
+        return { providerExecutionMode: "initial" };
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "receipt-delete-provenance");
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-delete-provenance?${query}`;
+    const remove = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "receipt-delete-provenance-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        }),
+      );
+
+    const first = await remove();
+    expect(first?.status).toBe(202);
+    if (!first) throw new Error("initial delete recovery attempt returned no response");
+    const operationId = ((await first.json()) as { operation: { id: string } }).operation.id;
+    expect(deleteModes).toEqual(["initial"]);
+    expect(recoveryActions).toEqual([undefined]);
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await remove();
+    expect(lostCommit?.status).toBe(202);
+    expect(deleteModes).toEqual(["initial", "recovery"]);
+    expect(recoveryActions).toEqual([undefined, "observe"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"recovery"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await remove();
+    expect(settled?.status).toBe(204);
+    expect(deleteCalls).toBe(2);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "recovery" });
+    opened.close();
+  });
+
+  test("background repair marks delete recovery as maintenance convergence", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let defer = false;
+    let now = Date.parse("2026-09-24T00:00:00.000Z");
+    const recoveryActions: Array<"observe" | "converge" | undefined> = [];
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        recoveryActions.push(input.recoveryAction);
+        if (input.operationMode !== "recovery") {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+        return await memory.delete(input);
+      },
+    };
+    const opened = persistentHarness(() => new Date(now), driver, [form], {
+      shouldDefer: () => defer,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "maintenance-delete-convergence");
+    defer = true;
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const accepted = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/maintenance-delete-convergence?${query}`,
+        "primary",
+        {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "maintenance-delete-convergence-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        },
+      ),
+    );
+    expect(accepted?.status).toBe(202);
+    expect(recoveryActions).toEqual([undefined]);
+    const leases = opened.database
+      .query(
+        `SELECT operation.lease_until AS operation_lease_until,
+                saga.execution_lease_until AS provider_lease_until
+         FROM tf_deferred_operations_selection_v1 AS operation
+         INNER JOIN tf_provider_mutation_sagas_selection_v1 AS saga
+           ON saga.operation_id = operation.id
+         WHERE operation.target_name = ?`,
+      )
+      .get("maintenance-delete-convergence") as {
+      operation_lease_until: number | null;
+      provider_lease_until: number | null;
+    } | null;
+    now = Math.max(now, leases?.operation_lease_until ?? 0, leases?.provider_lease_until ?? 0) + 1;
+    const maintenance = opened.host.maintenance;
+    if (!maintenance) throw new Error("durable Host maintenance is unavailable");
+    expect(await maintenance.drainProviderRepairs(8)).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 1,
+      pending: 0,
+    });
+    expect(recoveryActions).toEqual([undefined, "converge"]);
+    opened.close();
+  });
+
+  test("keeps initial provenance for a cached provider delete receipt", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const deleteModes: Array<"initial" | "recovery" | undefined> = [];
+    let deleteCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        deleteCalls += 1;
+        deleteModes.push(input.operationMode);
+        // The provider attempts to forge recovery provenance on an initial call.
+        return { providerExecutionMode: "recovery" };
+      },
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    }).open();
+    const current = await createNow(opened.host, "receipt-delete-initial-provenance");
+    const query = new URLSearchParams({
+      space: current.metadata.space,
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    });
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/receipt-delete-initial-provenance?${query}`;
+    const remove = () =>
+      opened.host.handle(
+        request(path, "primary", {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": "receipt-delete-initial-provenance-0001",
+            "if-match": `"${current.metadata.revision}"`,
+            "takoform-expected-generation": current.metadata.generation,
+          },
+        }),
+      );
+
+    const releaseFinalCommit = failNextProviderSagaCommit(opened.database);
+    const lostCommit = await remove();
+    expect(lostCommit?.status).toBe(202);
+    if (!lostCommit) throw new Error("initial delete receipt commit returned no response");
+    const operationId = ((await lostCommit.json()) as { operation: { id: string } }).operation.id;
+    expect(deleteCalls).toBe(1);
+    expect(deleteModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1
+           WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toMatchObject({
+      phase: "executed",
+      receipt_json: expect.stringContaining('"providerExecutionMode":"initial"'),
+    });
+
+    releaseFinalCommit();
+    const settled = await remove();
+    expect(settled?.status).toBe(204);
+    expect(deleteCalls).toBe(1);
+    expect(deleteModes).toEqual(["initial"]);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_mode FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase = 'succeeded'`,
+        )
+        .get(operationId),
+    ).toEqual({ operation_mode: "initial" });
     opened.close();
   });
 
@@ -607,6 +1164,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async () => {
         providerCalls += 1;
         throw new TakoformHostError("resource_busy", 409);
@@ -649,7 +1207,9 @@ describe("durable deferred Takoform operations", () => {
     });
     expect(providerCalls).toBe(1);
     expect(
-      opened.database.query("SELECT phase, terminal_json FROM tf_deferred_operations").all(),
+      opened.database
+        .query("SELECT phase, terminal_json FROM tf_deferred_operations_selection_v1")
+        .all(),
     ).toEqual([{ phase: "committing", terminal_json: null }]);
     opened.close();
   });
@@ -661,6 +1221,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.previous) {
           providerCalls += 1;
@@ -733,7 +1294,9 @@ describe("durable deferred Takoform operations", () => {
     });
     expect(providerCalls).toBe(1);
     expect(
-      opened.database.query("SELECT phase, receipt_json FROM tf_provider_mutation_sagas").all(),
+      opened.database
+        .query("SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1")
+        .all(),
     ).toEqual([{ phase: "executed", receipt_json: expect.any(String) }]);
     opened.close();
   });
@@ -743,6 +1306,8 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport(input),
       apply: (input) => memory.apply(input),
       import: async () => {
         providerCalls += 1;
@@ -799,6 +1364,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async () => {
@@ -854,6 +1420,7 @@ describe("durable deferred Takoform operations", () => {
     let refusing = false;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -902,6 +1469,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (!database) throw new Error("test database is unavailable");
         const terminalJson = JSON.stringify({
@@ -918,7 +1486,7 @@ describe("durable deferred Takoform operations", () => {
         });
         database
           .query(
-            `UPDATE tf_deferred_operations
+            `UPDATE tf_deferred_operations_selection_v1
              SET phase = 'failed', terminal_json = ?, lease_token = NULL, lease_until = NULL
              WHERE id = ? AND phase = 'committing'`,
           )
@@ -972,6 +1540,7 @@ describe("durable deferred Takoform operations", () => {
     const modes: Array<"initial" | "recovery" | undefined> = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       async apply(input) {
         operationIds.push(input.operationId);
         modes.push(input.operationMode);
@@ -1002,8 +1571,8 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT operation.expires_at AS operation_expiry, saga.expires_at AS saga_expiry
-           FROM tf_deferred_operations AS operation
-           INNER JOIN tf_provider_mutation_sagas AS saga ON saga.operation_id = operation.id
+           FROM tf_deferred_operations_selection_v1 AS operation
+           INNER JOIN tf_provider_mutation_sagas_selection_v1 AS saga ON saga.operation_id = operation.id
            WHERE operation.id = ?`,
         )
         .get(operationId),
@@ -1076,7 +1645,7 @@ describe("durable deferred Takoform operations", () => {
       opened.database
         .query(
           `SELECT phase, worker_endpoint_origin_reservation_id AS reservation
-           FROM tf_deferred_operations WHERE id = ?`,
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
         )
         .get(operationId),
     ).toEqual({ phase: "pending", reservation: "endpoint-reservation-01" });
@@ -1111,6 +1680,9 @@ describe("durable deferred Takoform operations", () => {
     const released = [deferred(), deferred()];
     let calls = 0;
     const driver: TakoformResourceDriver = {
+      async selectApply() {
+        return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+      },
       async apply(input) {
         const call = calls++;
         entered[call]?.resolve();
@@ -1290,6 +1862,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const harness = persistentHarness(undefined, {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         providerCalls += 1;
         return await memory.apply(input);
@@ -1340,6 +1913,7 @@ describe("durable deferred Takoform operations", () => {
     let providerCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         if (input.previous) {
           providerCalls += 1;
@@ -1407,7 +1981,9 @@ describe("durable deferred Takoform operations", () => {
     ).toEqual({ revision: "99" });
     expect(
       opened.database
-        .query("SELECT phase, expires_at FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT phase, expires_at FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .get(operationId),
     ).toEqual({ phase: "executed", expires_at: null });
 
@@ -1455,7 +2031,9 @@ describe("durable deferred Takoform operations", () => {
     expect(providerCalls).toBe(1);
     expect(
       opened.database
-        .query("SELECT operation_id FROM tf_provider_mutation_sagas WHERE operation_id = ?")
+        .query(
+          "SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
         .all(operationId),
     ).toEqual([]);
     opened.close();
@@ -1480,6 +2058,7 @@ describe("durable deferred Takoform operations", () => {
     let providerDeleteCalls = 0;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1564,6 +2143,7 @@ describe("durable deferred Takoform operations", () => {
     const memory = new InMemoryTakoformResourceDriver();
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1763,6 +2343,7 @@ describe("durable deferred Takoform operations", () => {
     let refusing = true;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: (input) => memory.apply(input),
       observe: (input) => memory.observe(input),
       delete: async (input) => {
@@ -1824,8 +2405,22 @@ describe("durable deferred Takoform operations", () => {
       pending: 0,
     });
     expect(
-      opened.database.query("SELECT operation_id FROM tf_provider_mutation_sagas").all(),
+      opened.database
+        .query("SELECT operation_id FROM tf_provider_mutation_sagas_selection_v1")
+        .all(),
     ).toEqual([]);
+    expect(
+      opened.database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(operationId),
+    ).toEqual([
+      { effect_kind: "delete", phase: "cancelled" },
+      { effect_kind: "delete", phase: "dispatched" },
+      { effect_kind: "delete", phase: "planned" },
+    ]);
 
     // And once the operator has done what the refusal asked, the same destroy
     // under the same key is a second attempt rather than the stored refusal.
@@ -1862,6 +2457,7 @@ describe("durable deferred Takoform operations", () => {
     const applies: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         applies.push(input.name);
         if (!capable) {
@@ -1988,26 +2584,49 @@ describe("durable deferred Takoform operations", () => {
   });
 
   /**
-   * A held repair that can never settle is not a repair.
+   * An invalid Form projection does not erase a real provider effect.
    *
-   * The engine holds every receipt to its Form before it materializes a
-   * Resource. When that refuses, the provider has already acted, so the command
-   * is held for repair — and for this one failure the hold is permanent: the
-   * receipt is durable, the Form is frozen, and nothing an operator does makes
-   * the stored answer publishable. The command owns the caller's plan-derived
-   * replay key while it waits, so every later apply resumed it and read back
-   * the same refusal. A real self-host left a Space unable to create its
-   * endpoint on a Host where every other Space succeeded first time.
+   * The provider's executed receipt is the only authority that can adopt or
+   * compensate the native object. A projection failure cannot discard it and
+   * start again under a new operation id or Resource uid: provider idempotency
+   * is bound to the original operation, not the caller's replay key. Until an
+   * explicit recovery consumes that receipt, the same command stays held and
+   * must never dispatch the provider again.
    */
-  test("settles a held command whose receipt its Form can never carry, and re-attempts it", async () => {
+  test("holds an unpublishable receipt without duplicating provider work", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     let published = "https://ported.invalid:28988/";
+    const appliedResourceUids: string[] = [];
+    let issuedReceipt: TakoformDriverReceipt | undefined;
     const driver: TakoformResourceDriver = {
       ...memory,
-      apply: async (input) => ({
-        ...(await memory.apply(input)),
-        outputs: { url: published },
-      }),
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        appliedResourceUids.push(input.resourceUid);
+        const base = await memory.apply(input);
+        const observed = base.observed ?? {};
+        const outputs = { url: published };
+        issuedReceipt = {
+          ...base,
+          outputs,
+          deploymentMutation: {
+            kind: "create",
+            deployment: {
+              tenantId: input.tenantId,
+              id: `deployment:${input.operationId}`,
+              resourceUid: input.resourceUid,
+              offeringId: "test.unpublishable",
+              providerPackRef: "provider.unpublishable",
+              providerInstallationRef: "provider.unpublishable.primary",
+              nativeId: `native:${input.operationId}`,
+              state: "active",
+              observed,
+              outputs,
+            },
+          },
+        };
+        return issuedReceipt;
+      },
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
     };
@@ -2036,35 +2655,82 @@ describe("durable deferred Takoform operations", () => {
         }),
       );
 
-    const refused = await apply();
-    expect(refused?.status).toBe(422);
-    expect(await refused?.json()).toMatchObject({
-      error: { code: "unsupported_capability", retryable: false },
+    const held = await apply();
+    expect(held?.status).toBe(202);
+    if (!held) throw new Error("held apply returned no response");
+    const operationId = ((await held.json()) as { operation: { id: string } }).operation.id;
+    expect(
+      opened.database
+        .query(
+          `SELECT id, resource_uid, phase
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
+        )
+        .get(operationId),
+    ).toEqual({ id: operationId, resource_uid: appliedResourceUids[0], phase: "committing" });
+    const executed = opened.database
+      .query(
+        `SELECT operation_id, resource_uid, phase, receipt_json
+         FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+      )
+      .get(operationId) as {
+      operation_id: string;
+      resource_uid: string;
+      phase: string;
+      receipt_json: string;
+    };
+    expect(executed).toMatchObject({
+      operation_id: operationId,
+      resource_uid: appliedResourceUids[0],
+      phase: "executed",
     });
-    // Settled, not held: the command has a terminal answer and its executed
-    // saga is gone, so a fresh attempt plans rather than adopting it.
+    expect(JSON.parse(executed.receipt_json)).toEqual({
+      ...issuedReceipt,
+      providerExecutionMode: "initial",
+    });
     expect(
-      opened.database.query("SELECT phase FROM tf_deferred_operations").all() as {
-        phase: string;
-      }[],
-    ).toEqual([{ phase: "failed" }]);
-    expect(
-      opened.database.query("SELECT count(*) AS rows FROM tf_provider_mutation_sagas").get(),
-    ).toEqual({ rows: 0 });
-    // The refusal is about this Host, so the operation ledger keeps the record
-    // a later repair reads.
-    expect(
-      opened.database.query("SELECT state FROM tf_operations").all() as { state: string }[],
-    ).toEqual([{ state: "failed" }]);
+      opened.database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(operationId),
+    ).toEqual([
+      { effect_kind: "apply", phase: "dispatched" },
+      { effect_kind: "apply", phase: "planned" },
+    ]);
+    expect(opened.database.query("SELECT state FROM tf_operations").all()).toEqual([]);
+    expect(opened.database.query("SELECT * FROM tf_resource_deployments").all()).toEqual([]);
 
-    // The identical apply, under the identical plan-derived key, once the Host
-    // publishes an address the Form can carry.
+    // Changing what a fresh provider call would publish cannot authorize one:
+    // the exact executed receipt remains the only repair authority.
     published = "https://repaired.invalid/";
-    const created = await apply();
-    expect(created?.status).toBe(201);
-    expect(await created?.json()).toMatchObject({
-      status: { outputs: { url: "https://repaired.invalid/" } },
-    });
+    const retried = await apply();
+    expect(retried?.status).toBe(202);
+    if (!retried) throw new Error("held apply retry returned no response");
+    expect(((await retried.json()) as { operation: { id: string } }).operation.id).toBe(
+      operationId,
+    );
+    expect(appliedResourceUids).toEqual([executed.resource_uid]);
+    expect(
+      opened.database
+        .query(
+          `SELECT operation_id, resource_uid, phase, receipt_json
+           FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+        )
+        .get(operationId),
+    ).toEqual(executed);
+    expect(
+      opened.database
+        .query(
+          `SELECT count(*) AS terminal FROM tf_resource_provider_effects
+           WHERE effect_id = ? AND phase IN ('cancelled', 'succeeded')`,
+        )
+        .get(operationId),
+    ).toEqual({ terminal: 0 });
+    expect(opened.database.query("SELECT * FROM tf_resource_deployments").all()).toEqual([]);
+    expect(
+      opened.database.query("SELECT uid FROM tf_resources WHERE name = 'unpublishable'").all(),
+    ).toEqual([]);
     opened.close();
   });
 
@@ -2086,6 +2752,7 @@ describe("durable deferred Takoform operations", () => {
     let refuse = true;
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         // The shape a self-host's endpoint mint refuses with: a statement about
         // this Host, raised after the Host marked its own dispatch and before
@@ -2135,6 +2802,7 @@ describe("durable deferred Takoform operations", () => {
     const writes: string[] = [];
     const driver: TakoformResourceDriver = {
       ...memory,
+      selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
         writes.push(input.operationId);
         await memory.apply(input);
@@ -2174,7 +2842,7 @@ describe("durable deferred Takoform operations", () => {
     expect(
       opened.database
         .query(
-          `SELECT phase, terminal_json FROM tf_deferred_operations
+          `SELECT phase, terminal_json FROM tf_deferred_operations_selection_v1
            WHERE id = ?`,
         )
         .get(operationId),
@@ -2183,7 +2851,7 @@ describe("durable deferred Takoform operations", () => {
     const saga = opened.database
       .query(
         `SELECT operation_id, resource_uid, phase, provider_outcome, receipt_json
-         FROM tf_provider_mutation_sagas WHERE operation_id = ?`,
+         FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
       )
       .get(operationId) as {
       operation_id: string;
@@ -2223,6 +2891,76 @@ describe("durable deferred Takoform operations", () => {
     ).toEqual({ rows: 0 });
     opened.close();
   });
+
+  test("answers an over-budget inline mutation with the operation contract and settles it for the next poll", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    const gate = deferred();
+    const applied = deferred();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      selectImport: (input) => memory.selectImport?.(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        await gate.promise;
+        const receipt = await memory.apply(input);
+        applied.resolve();
+        return receipt;
+      },
+      observe: (input) => memory.observe(input),
+      import: (input) => memory.import?.(input),
+      delete: (input) => memory.delete(input),
+    };
+    const opened = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+      inlineExecuteMilliseconds: 10,
+    }).open();
+    const desired = desiredResource("inline-budget", "inline");
+    const review = await prepareReview(opened.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/inline-budget`;
+    const accepted = await opened.host.handle(
+      request(path, "primary", {
+        method: "PUT",
+        headers: {
+          "idempotency-key": "inline-budget-0001",
+          "if-none-match": "*",
+          "takoform-conformance-probe": "async",
+        },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    // The blocked provider attempt outlives the request: the Host answers
+    // with the durable operation instead of an HTTP timeout.
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("apply returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+
+    // A poll inside the live lease waits instead of dispatching twice.
+    const operationPath = `${lane}/operations/${operationId}`;
+    const waiting = await opened.host.handle(request(operationPath, "primary"));
+    expect(waiting?.status).toBe(200);
+    expect(await waiting?.json()).toMatchObject({ id: operationId, done: false });
+    expect(providerCalls).toBe(1);
+
+    gate.resolve();
+    await applied.promise;
+    let settled: Response | null = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const poll = await opened.host.handle(request(operationPath, "primary"));
+      const body = (await poll?.json()) as { done?: boolean };
+      if (body.done === true) {
+        settled = poll;
+        break;
+      }
+      await Bun.sleep(5);
+    }
+    expect(settled?.status).toBe(200);
+    expect(providerCalls).toBe(1);
+    opened.close();
+  });
 });
 
 function persistentHarness(
@@ -2234,6 +2972,7 @@ function persistentHarness(
     readonly shouldDefer?: () => boolean;
     readonly pollsBeforeCommit?: number;
     readonly executeOnAccept?: boolean;
+    readonly inlineExecuteMilliseconds?: number;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), "takoserver-deferred-operation-"));
@@ -2385,6 +3124,17 @@ function desiredResource(name: string, value: string) {
   };
 }
 
+function importedResource(name: string, value: string) {
+  return {
+    apiVersion: importForm.identity.formRef.apiVersion,
+    kind: importForm.identity.formRef.kind,
+    form: { formRef: importForm.identity.formRef },
+    metadata: { name, space: "main" },
+    spec: { value },
+    nativeId: `native-${name}`,
+  };
+}
+
 async function prepareReview(
   host: TakoformHost,
   desired: ReturnType<typeof desiredResource>,
@@ -2456,4 +3206,15 @@ function request(path: string, token: string, init?: RequestInit): Request {
   headers.set("authorization", `Bearer ${token}`);
   if (init?.body !== undefined) headers.set("content-type", "application/json");
   return new Request(`https://candidate.invalid${path}`, { ...init, headers });
+}
+
+function failNextProviderSagaCommit(database: Database): () => void {
+  database.exec(`
+    CREATE TRIGGER fail_next_provider_saga_commit
+    BEFORE DELETE ON tf_provider_mutation_sagas_selection_v1
+    BEGIN
+      SELECT no_such_provider_commit_function();
+    END;
+  `);
+  return () => database.exec("DROP TRIGGER fail_next_provider_saga_commit");
 }

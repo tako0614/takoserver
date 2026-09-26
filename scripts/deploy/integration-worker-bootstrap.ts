@@ -82,6 +82,33 @@ const COMMIT = /^[0-9a-f]{40}$/u;
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
 const WORKER_NAME = /^[a-z0-9][a-z0-9-]{1,62}$/u;
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
+const INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS = [
+  "tests/deploy-integration-worker-bootstrap.test.ts",
+  "tests/deploy-integration-storage-generation.test.ts",
+  "tests/deploy-signing.test.ts",
+  "tests/deploy-realized-config-v2.test.ts",
+  "tests/deploy-worker-artifact.test.ts",
+  "tests/deploy-worker-composition.test.ts",
+  "tests/deploy-worker-state.test.ts",
+  "tests/deploy-wrangler-state.test.ts",
+  "tests/deploy-cloudflare-state.test.ts",
+  "tests/deploy-worker.test.ts",
+  "tests/entry-worker-origin.test.ts",
+  "tests/entry-worker-operator-authority.test.ts",
+  "tests/entry-worker-startup.test.ts",
+  "tests/runtime-input-seal-keyring.test.ts",
+  "tests/worker-production-composition.test.ts",
+] as const;
+const INTEGRATION_WORKER_BOOTSTRAP_GATES = [
+  {
+    label: "Host bootstrap typecheck `bun run typecheck:worker`",
+    command: ["bun", "run", "typecheck:worker"],
+  },
+  {
+    label: "Host bootstrap tests `bun test <fixed Host bootstrap test set>`",
+    command: ["bun", "test", ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS],
+  },
+] as const;
 
 export interface IntegrationWorkerBootstrapInvocation {
   readonly surface?: typeof INTEGRATION_WORKER_BOOTSTRAP_SURFACE;
@@ -266,7 +293,13 @@ export async function runIntegrationWorkerBootstrap(
     }
 
     const signingDatabase =
-      options.signingDatabase ?? createRemoteSigningDatabase(inspectionConfig, environment, run);
+      options.signingDatabase ??
+      createRemoteSigningDatabase(
+        inspectionConfig,
+        environment,
+        run,
+        wranglerCommandForPath(options.wranglerPath),
+      );
     const signingBefore = await readSigning("preflight", target, signingDatabase);
     assertDistinctJit(target, signingBefore);
     const r2Identity = resolveR2IdentityReader(options, target, credential?.token);
@@ -522,7 +555,13 @@ async function statusExisting(
     });
     const providerInspection = provider === null ? null : await provider.read("preflight");
     const signingDatabase =
-      options.signingDatabase ?? createRemoteSigningDatabase(config, environment, run);
+      options.signingDatabase ??
+      createRemoteSigningDatabase(
+        config,
+        environment,
+        run,
+        wranglerCommandForPath(options.wranglerPath),
+      );
     const signing = await readSigning("preflight", target, signingDatabase);
     assertDistinctJit(target, signing);
     const r2Identity = resolveR2IdentityReader(options, target, cloudflareToken);
@@ -764,6 +803,7 @@ async function inspectVersion(
     phase,
   );
   await assertLiveWorkerRoutingClosure(phase, target, state);
+  await assertWorkersDevSubdomainState(phase, target, state);
   const native = await readNativePresence(phase, target, state);
   assertNoTargetOwners(phase, target, native);
   assertWorkerSettings(phase, await state.workerSettings(target.workerName));
@@ -1316,8 +1356,11 @@ function assertWorkerSettings(phase: "preflight" | "verification", value: unknow
     throw phaseError(phase, "Worker settings are malformed");
   }
   const settings = value as Record<string, unknown>;
-  if (settings.workers_dev !== true || settings.preview_urls !== false) {
-    throw phaseError(phase, "Worker settings do not prove the exact workers.dev topology");
+  if (
+    (Object.hasOwn(settings, "workers_dev") && settings.workers_dev !== true) ||
+    (Object.hasOwn(settings, "preview_urls") && settings.preview_urls !== false)
+  ) {
+    throw phaseError(phase, "Worker settings contradict the exact workers.dev topology");
   }
   for (const key of ["routes", "custom_domains", "domains"] as const) {
     if (
@@ -1329,6 +1372,21 @@ function assertWorkerSettings(phase: "preflight" | "verification", value: unknow
         "Worker settings unexpectedly declare custom route or domain topology",
       );
     }
+  }
+}
+
+async function assertWorkersDevSubdomainState(
+  phase: "preflight" | "verification",
+  target: DeployTarget,
+  state: IntegrationWorkerBootstrapState,
+): Promise<void> {
+  if (!new URL(target.publicOrigin).hostname.endsWith(".workers.dev")) return;
+  const subdomain = await state.workerSubdomain?.(target.workerName);
+  if (subdomain?.enabled !== true || subdomain.previewsEnabled !== false) {
+    throw phaseError(
+      phase,
+      "Worker workers.dev subdomain must be enabled with preview URLs disabled",
+    );
   }
 }
 
@@ -1433,18 +1491,26 @@ function assertSecretSeal(phase: DeployPhase, seal: SealedArtifact): void {
 }
 
 async function checkedGate(run: WorkerProcess): Promise<void> {
-  let result: CommandResult;
-  try {
-    result = await run(["bun", "run", "check"]);
-  } catch {
-    throw preflightError("scoped owner gate `bun run check` could not be started");
+  for (const gate of INTEGRATION_WORKER_BOOTSTRAP_GATES) {
+    let result: CommandResult;
+    try {
+      result = await run(gate.command);
+    } catch {
+      throw preflightError(`scoped ${gate.label} could not be started`);
+    }
+    if (result.exitCode !== 0) {
+      throw preflightError(
+        `scoped ${gate.label} failed (exit ${result.exitCode})`,
+        `${result.stdout}${result.stderr}`.trim(),
+      );
+    }
   }
-  if (result.exitCode !== 0) {
-    throw preflightError(
-      `scoped owner gate \`bun run check\` failed (exit ${result.exitCode})`,
-      `${result.stdout}${result.stderr}`.trim(),
-    );
-  }
+}
+
+function wranglerCommandForPath(
+  wranglerPath: string | undefined,
+): ((args: readonly string[]) => readonly string[]) | undefined {
+  return wranglerPath === undefined ? undefined : (args) => [wranglerPath, ...args];
 }
 
 function exactReviewer(value: string): string {

@@ -59,6 +59,8 @@ export async function prepareWorkerArtifact(input: {
   readonly writeConfig?: WorkerArtifactConfigWriter;
   /** Use the version API for a non-mutating build when the caller will publish explicitly. */
   readonly dryRunCommand?: WorkerDryRunCommand;
+  /** Reuse the currently deployed Container image for this integration artifact. */
+  readonly containersRollout?: "none";
   /** Credential-scoped environment for Wrangler; OAuth passes only its log-suppression flag. */
   readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly run: WorkerArtifactProcess;
@@ -124,6 +126,9 @@ export async function prepareWorkerArtifact(input: {
       buildConfig,
       "--outdir",
       build,
+      ...(input.containersRollout === undefined
+        ? []
+        : ["--containers-rollout", input.containersRollout]),
     ],
     { env: input.environment ?? {} },
   );
@@ -257,6 +262,8 @@ export function canonicalizeWorkerBundleSource(
         if (candidate === repositoryRoot || candidate.startsWith(repositoryPrefix)) {
           return `// ${relative(repositoryRoot, candidate).split(sep).join("/")}`;
         }
+        const externalLabel = canonicalExternalSourceLabel(candidate);
+        if (externalLabel !== undefined) return `// ${externalLabel}`;
         const parent = dirname(base);
         if (parent === base) break;
         base = parent;
@@ -264,6 +271,23 @@ export function canonicalizeWorkerBundleSource(
       return line;
     })
     .join("\n");
+}
+
+/**
+ * A vendored package may resolve dependencies from the composition's parent
+ * `node_modules` rather than the public checkout's own directory.  Esbuild's
+ * relative source comment then contains a different number of `../` segments
+ * for each artifact depth.  Keep the package-relative identity while removing
+ * that checkout-specific prefix.
+ */
+function canonicalExternalSourceLabel(candidate: string): string | undefined {
+  const marker = `${sep}node_modules${sep}`;
+  const index = candidate.lastIndexOf(marker);
+  if (index < 0) return undefined;
+  return `node_modules/${candidate
+    .slice(index + marker.length)
+    .split(sep)
+    .join("/")}`;
 }
 
 function exactBundle(root: string): string {

@@ -10,6 +10,7 @@ import { parseStrictJson } from "../../src/strict-json.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
+import { runFormAuthorityCodeGate } from "./form-authority-gate.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -35,6 +36,7 @@ import {
   type WorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
+  assertServiceBindingRefreshIntegrationOnly,
   type BindingDifference,
   describeBindingDrift,
   surfaceTransitionAdmits,
@@ -135,6 +137,16 @@ export async function runFormAuthorityIdentityProbe(
   target: DeployTarget,
   options: FormAuthorityIdentityProbeOptions = {},
 ): Promise<Record<string, unknown>> {
+  if (invocation.transition?.delta.storageRebind !== undefined) {
+    throw preflightError("Form authority identity probe does not bind STATE_DB or OBJECTS");
+  }
+  if (invocation.transition !== undefined) {
+    assertServiceBindingRefreshIntegrationOnly(
+      "preflight",
+      invocation.environment,
+      invocation.transition.delta,
+    );
+  }
   assertPublicFormCapabilityTarget(target);
   if (target.environment !== invocation.environment) {
     throw preflightError("Form authority identity probe invocation and target differ");
@@ -354,7 +366,39 @@ export async function runFormAuthorityIdentityProbe(
   if (publicBefore.commit !== source.commit) {
     throw preflightError("served public Worker differs from identity probe source commit");
   }
-  await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
+  const ordinaryIntegrationFullProfileUpdate =
+    invocation.environment === "integration" &&
+    invocation.transition === undefined &&
+    invocation.adoptLivePath === undefined &&
+    !initialHostOnlyProfile &&
+    !hostOnlyProfilePreservingUpdate &&
+    probeProfile === null &&
+    before !== null &&
+    before.bindingTransitionProfile === "none" &&
+    before.drift.length === 0 &&
+    authorityWorkerPresent &&
+    readbackBefore.identity?.hostId === selected.hostId;
+  const integrationServiceBindingRefresh =
+    invocation.environment === "integration" &&
+    (invocation.transition?.delta.refreshedServiceBindings?.length ?? 0) > 0;
+  if (integrationServiceBindingRefresh) {
+    await checked(
+      run,
+      "integration identity probe service-binding refresh typecheck `bun run typecheck:form-authority-worker`",
+      ["bun", "run", "typecheck:form-authority-worker"],
+    );
+    await checked(run, "integration identity probe service-binding refresh tests", [
+      "bun",
+      "test",
+      "tests/deploy-form-authority-identity-probe.test.ts",
+      "tests/deploy-worker-state.test.ts",
+      "tests/deploy-contract.test.ts",
+    ]);
+  } else if (ordinaryIntegrationFullProfileUpdate) {
+    await runFormAuthorityCodeGate(run, invocation.surface);
+  } else {
+    await checked(run, "scoped identity probe owner gate `bun run check`", ["bun", "run", "check"]);
+  }
 
   const temporary = options.outputDirectory === undefined;
   const root =
@@ -634,6 +678,7 @@ async function inspectProbe(
     transition.predecessorVersionId === history.versionId &&
     surfaceTransitionAdmits(phase, history.versionId, version, {
       delta: transition.delta,
+      environment: target.environment,
       targetClosure: expected,
     })
   ) {

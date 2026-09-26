@@ -65,6 +65,10 @@ const orgApiKeyInput =
   "read: this surface acts through the Host's own published organization API, not through the provider.";
 const closureSecretDirectoryInput =
   "`TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` is required for `--apply` only, and only when the declared closure delta names an added or rotated secret; `--status` never reads it.";
+const integrationServiceBindingRefresh =
+  "The `--refresh-service-binding=NAME` delta is integration-only: the exact pinned predecessor must contain exactly one same-name service binding whose observed `service`/`entrypoint` pair differs from the selected target. The successor pair remains target-derived; D1, R2, Durable Object, plain-text and secret bindings cannot use this selector.";
+const ordinaryIntegrationFormCodeGate =
+  "An ordinary integration code-only apply to an existing exact closure, with source/Host/dependency identities matched and no bootstrap or declared transition, uses the Form-local gate once: `bun run typecheck`, `bun run typecheck:form-authority-worker`, generated Worker types, imports, corpus and integration-package checks, the surface-specific runtime/deploy tests, then `bun run build:form-authority-worker`. That build dry-runs all four Worker bundles with `--containers-rollout none`; it does not build or publish a Core image. Production, rehearsal, bootstrap and transition paths keep their existing gates.";
 const deployTargetSelectorInput =
   "`TAKOSERVER_DEPLOY_TARGET_INTEGRATION`, `TAKOSERVER_DEPLOY_TARGET_REHEARSAL`, and `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` each name the path of that environment's reviewed operator-private takoserver.deploy-target@v2 descriptor (absolute, or resolved against the checkout), defaulting to `.deploy/targets/<environment>.json`; the shared entrypoint reads only the one variable matching the selected `--environment`.";
 
@@ -237,12 +241,15 @@ export const DEPLOY_CONTRACT = {
         "src/sponsorship-credential.ts",
         "src/sponsorship-authority.ts",
         "src/sponsorship-issuance-receipt.ts",
+        "sponsorship-authority-worker-configuration.d.ts",
         "migrations/0047_sponsorship_cutover_consumption.sql",
         "wrangler.sponsorship-authority.jsonc",
         "scripts/build-sponsorship-authority-worker.ts",
+        "scripts/deploy.ts",
         "scripts/deploy/cloudflare-topology-audit.ts",
         "scripts/deploy/sponsorship-authority.ts",
         "scripts/deploy/target.ts",
+        "scripts/deploy/worker-surface-transition.ts",
       ],
       requiresScripts: ["check"],
       requiresTools: ["bun", "wrangler"],
@@ -259,11 +266,11 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} The operator-private target pins the only organization and Worker name; ` +
           "the ordinary runtime signing row is read only to prove separation, the target-pinned sponsorship credential public key is append-only registered and read back before its owned 0600 private half is published only to this route-less Worker, the distinct receipt public key is proven against its separate owned 0600 private JWK, and the exact bundle/config/two-secret file is sealed before one upload. A separate owner-private audit credential authenticates the deployment token's active all-zone Zone Read and Workers Routes Read policy; Workers Routes Write is explicitly refused before exhaustive topology readback.",
         "post-conditions":
-          "Authoritative Worker history identifies the selected commit and artifact; immutable Version readback proves exactly STATE_DB, the deploy-pinned organization and issuer, dedicated sponsorship credential key id/public JWK/secret, distinct issuance-receipt key id/secret, and Worker version metadata. The public Worker retains only its ordinary run-token key and has no tenant-run mint API or sponsorship private material. Runtime verification requires the immutable issuance-operation row's credential key id to match the JWT kid. Authenticated all-zone topology readback proves workers.dev=false, preview URLs=false, and no public route or custom domain and records only token/policy/resource digests. The entrypoint has exactly one issueTenantRunCredential method, no fetch, and a maximum 300-second credential. After additive migration 0047, one stable logical operation atomically admits the tenant/wallet decision and exact retries reconstruct byte-identical bearer/receipt bytes. This closure status is followed by Hosted's exact service-binding release and a bounded authenticated staging credential issuance/readback before any public route or retired-secret removal.",
+          "Authoritative Worker history identifies the selected commit and artifact; immutable Version readback proves exactly STATE_DB, the deploy-pinned organization and issuer, dedicated sponsorship credential key id/public JWK/secret, distinct issuance-receipt key id/secret, and Worker version metadata. A policyless target retains that exact closure; an opted-in managed-Space target additionally carries only the target-derived policy digest and TENANT_SPACE_ADMISSION service binding to the named narrow entrypoint. The full Form authority entrypoint is never bound. The public Worker retains only its ordinary run-token key and has no tenant-run mint API or sponsorship private material. Runtime verification requires the immutable issuance-operation row's credential key id to match the JWT kid. Authenticated all-zone topology readback proves workers.dev=false, preview URLs=false, and no public route or custom domain and records only token/policy/resource digests. The entrypoint has exactly one authority RPC, issueTenantRunCredential, a registration-only fetch that returns an empty 404 without reading bindings, and a maximum 300-second credential. After additive migration 0047, one stable logical operation atomically admits the tenant/wallet decision and exact retries reconstruct byte-identical bearer/receipt bytes. This closure status is followed by Hosted's exact service-binding release and a bounded authenticated staging credential issuance/readback before any public route or retired-secret removal.",
         reversal:
           "The immediately previous authority Worker Version is the provider-history rollback target; first publication has forward repair only and never deletes shared D1 state.",
         "failure-handling":
-          `${highRiskFailure} The only receipt authority is the dedicated redacted issuance-attestation signer; no funding, inventory, OAuth, billing, delete, managed-object/payment receipt, executor, Form, or public-fetch authority is present. Any extra binding, partial-scope topology token, or public topology fails closed.` +
+          `${highRiskFailure} The only receipt authority is the dedicated redacted issuance-attestation signer; no funding, inventory, OAuth, billing, delete, managed-object/payment receipt, executor, full Form, or public-fetch authority is present. Managed mode may carry only its exact narrow Form-admission service binding and policy digest. Any extra binding, partial-scope topology token, or public topology fails closed.` +
           inputContract(
             applyReviewInput,
             sponsorshipCredentialPrivateJwkInput,
@@ -294,9 +301,12 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/target.ts",
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/worker-state.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
         "scripts/deploy/qualification.ts",
       ],
-      requiresScripts: ["check"],
+      requiresScripts: ["check", "typecheck:worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: [
         "CLOUDFLARE_API_TOKEN",
@@ -306,8 +316,12 @@ export const DEPLOY_CONTRACT = {
       triggers: ["authority"],
       obligations: {
         provenance:
-          `${exactSource} The scoped owner gate runs once, then the exact link-free bundle and ` +
-          "realized configuration are sealed and requalified immediately before one upload.",
+          `${exactSource} Ordinary applies run the scoped owner gate once; only an integration ` +
+          "storage-rebind apply substitutes its component typecheck and filtered storage-rebind " +
+          "deploy tests. The exact link-free bundle and " +
+          "realized configuration are sealed and requalified immediately before one upload. " +
+          "An integration-only storage rebind derives its successor D1/R2 identities from the " +
+          "selected target; no resource identity is supplied as a successor selector.",
         "post-conditions":
           "Authoritative deployment/version state, exact binding/configuration closure and the " +
           "public product probe identify the selected authority-sensitive commit and uploaded artifact. " +
@@ -344,7 +358,8 @@ export const DEPLOY_CONTRACT = {
           "a clean/reachable exact commit and independent review; ordinary takoserver-worker deploy " +
           "cannot bypass the selector or carry the retired edge. " +
           "`--closure-predecessor-version=<uuid>` plus the repeatable `--retire-var=NAME`, " +
-          "`--add-var=NAME`, `--refresh-var=NAME`, `--add-secret=NAME` and `--rotate-secret=NAME` " +
+          "`--add-var=NAME`, `--refresh-var=NAME`, `--refresh-service-binding=NAME`, " +
+          "`--add-secret=NAME` and `--rotate-secret=NAME` " +
           "declaration is the only " +
           "path that brings a live Version forward when the operator-private target descriptor " +
           "legitimately changed shape. It is admitted only when the authoritative current Version " +
@@ -352,7 +367,9 @@ export const DEPLOY_CONTRACT = {
           "the entire difference between the predecessor closure and the target closure. " +
           "`--refresh-var` covers the difference that changes no binding name at all: the " +
           "predecessor must declare that var with a value different from the one the target derives, " +
-          "and the upload publishes the target's value. The secret inventory is the union of what " +
+          "and the upload publishes the target's value. " +
+          integrationServiceBindingRefresh +
+          " The secret inventory is the union of what " +
           "the pinned Version declares and what the script-level secret store holds, so a secret a " +
           "rollback left in the store is carried whether or not the declaration names it; naming it " +
           "under `--add-secret` only decides that its value is re-entered. One upload " +
@@ -360,7 +377,19 @@ export const DEPLOY_CONTRACT = {
           "surface produces them, every required secret, added and rotated values supplied only " +
           "through the owned 0700 secret-input directory as one ephemeral sealed Wrangler secrets " +
           "file, and every other held secret carried without being re-entered. The routine surfaces " +
-          "stay strict and never accept this predecessor." +
+          "stay strict and never accept this predecessor. The optional " +
+          "`--rebind-state-database-from=<uuid>` and `--rebind-object-bucket-from=<name>` pair is " +
+          "integration-only and accepted only on this Host surface and the two route-less Form " +
+          "authority Workers. Both exact predecessor values must differ from the selected target's " +
+          "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
+          "and all other closure names, types and fields remain exact. Before upload and again at the " +
+          "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
+          "R2 name, audited 0001-0063 lineage and canonical migrated schema. Production and rehearsal " +
+          "refuse this pair before provider effects. " +
+          integrationServiceBindingRefresh +
+          " This one integration rebind branch runs " +
+          "`bun run typecheck:worker` and the focused closure-transition, binding-state and storage-generation " +
+          "tests before Wrangler dry-run; every other Host apply keeps `bun run check`." +
           inputContract(applyReviewInput, closureSecretDirectoryInput),
         "independent-review": review,
       },
@@ -437,7 +466,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-identity-probe.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -465,7 +494,20 @@ export const DEPLOY_CONTRACT = {
           "requires complete integration formAuthority topology. Initial publication requires both " +
           "native Workers to remain absent; an existing-profile update requires the exact predecessor " +
           "to remain unchanged and Core to remain absent at the final fence. Drift is refused before upload; " +
-          "production and rehearsal retain the absence refusal." +
+          "production and rehearsal retain the absence refusal. This storage-free probe explicitly " +
+          "refuses `storageRebind`; only the public Host and the two route-less Form authority Workers " +
+          "can carry that integration-only declaration. " +
+          integrationServiceBindingRefresh +
+          " On this identity-probe surface only, an integration transition declaring " +
+          "`--refresh-service-binding` runs `bun run typecheck:form-authority-worker` followed by " +
+          "`bun test tests/deploy-form-authority-identity-probe.test.ts " +
+          "tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` before Wrangler dry-run " +
+          "or upload; either gate failure stops before dry-run and upload. " +
+          ordinaryIntegrationFormCodeGate +
+          " For the identity probe this is only a full-profile update of an existing no-drift authority " +
+          "whose public identity Host id matches the selected target; Host-only bootstrap/profile updates, " +
+          "service refreshes and other transitions do not select it. All other probe applies retain " +
+          "`bun run check`. " +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -483,14 +525,21 @@ export const DEPLOY_CONTRACT = {
         "src/form-authority-public-identity.ts",
         "src/public-host-identity.ts",
         "src/takoform/publisher-set-closure.ts",
+        "src/takoform/space-admission-policy.ts",
+        "src/takoform/tenant-space-admission.ts",
+        "form-authority-worker-configuration.d.ts",
         "src/generated/takoform-publisher-set-receipt.ts",
         "src/generated/takoform-publisher-set-authority-closure.ts",
         "services/takoform-core-verifier",
+        "scripts/build-form-authority-worker.ts",
         "wrangler.form-authority.jsonc",
         "scripts/deploy/form-authority-capability.ts",
         "scripts/deploy/form-authority.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
       ],
-      requiresScripts: ["check"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "docker", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -504,7 +553,9 @@ export const DEPLOY_CONTRACT = {
           "must contain exactly STATE_DB, OBJECTS, PUBLIC_HOST_IDENTITY, CORE_VERIFIER, WORKER_VERSION " +
           "and the four plain-text variables TAKOSERVER_ENVIRONMENT, TAKOSERVER_FORM_AUTHORITY_HOST_ID, " +
           "TAKOSERVER_FORM_AUTHORITY_CAPABILITY_MANIFEST and TAKOSERVER_TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST, " +
-          "with no public Worker identity pins, " +
+          "with no public Worker identity pins; an opted-in released-Core target adds only its canonical " +
+          "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY plain-text binding, while the integration fixture " +
+          "surface remains unchanged, " +
           "secret, route, or public-domain ownership. Status is ready only after the permanent minimal " +
           "identity probe actively calls PublicHostIdentity@v2 and matches live Version/A/P/capability/I. " +
           "Every apply against a Worker that already has a Version must additionally read the live " +
@@ -528,7 +579,26 @@ export const DEPLOY_CONTRACT = {
           "`verifierBridgePending` set. The run prints the two commands that finish the lane — the " +
           "probe's `--add-binding=FORM_AUTHORITY` transition, then this surface's `--status`, which " +
           "reports `coreVerifierRpcReady: true` only once the bridge is live. No binding to an " +
-          "absent script is ever published, and the steady-state post-condition is never relaxed." +
+          "absent script is ever published, and the steady-state post-condition is never relaxed. " +
+          "Integration storage rebind, when explicitly declared with both predecessor flags, is " +
+          "limited to this route-less Form authority Worker and the integration fixture Worker; its " +
+          "successor comes only from the selected target, and its exact generated D1/R2/schema proof " +
+          "is repeated immediately before upload. Production and rehearsal refuse it before provider effects. " +
+          "This integration storage-rebind branch runs `bun run typecheck:form-authority-worker` and " +
+          "focused Form-transition, binding-state and storage-generation tests before Wrangler dry-run; " +
+          "it retains precedence when a service-binding refresh is declared too. With no storage rebind, " +
+          "an integration service-binding refresh runs `bun run typecheck:form-authority-worker` and " +
+          "`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
+          "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
+          ordinaryIntegrationFormCodeGate +
+          " The route-less fast path additionally requires the already-present no-drift dynamic-public-RPC " +
+          "authority at exact-target scope on the parser-approved generated integration D1/R2 target. " +
+          "Its exact D1/R2/schema proof runs before the gate and is repeated identically at the immediate " +
+          "upload fence; migrations already applied or changed elsewhere do not force the full-repository " +
+          "gate. For the released-Core route-less target, an already-selected reusable Core verifier identity " +
+          "is also required; absent or mismatched image identity retains the full check and normal image build. " +
+          "Bootstrap, scope/storage/service transitions, other storage targets, and production or rehearsal " +
+          "retain their existing gates. All other Form authority applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -545,9 +615,12 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy.ts",
         "scripts/deploy/form-authority.ts",
         "scripts/deploy/form-authority-scope-transition.ts",
+        "scripts/deploy/worker-surface-transition.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy-extension.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -573,7 +646,22 @@ export const DEPLOY_CONTRACT = {
           "that public Version's position in deployment history, and removes both identity pins in one upload. " +
           "A scope transition accepts only the exact configured predecessor, uploads target scope once, " +
           "refuses absent/bootstrap, stale-public, third-scope and already-target apply, and settles a lost " +
-          "acknowledgement through status without retry." +
+          "acknowledgement through status without retry. Its optional integration storage rebind requires " +
+          "both exact predecessor flags; the selected generated target alone supplies the successor, " +
+          "and D1 UUID/name, R2 existence, audited lineage and canonical schema are reverified at the " +
+          "immediate upload fence. " +
+          integrationServiceBindingRefresh +
+          " This integration storage-rebind branch runs `bun run typecheck:form-authority-worker` and " +
+          "focused Form-transition, binding-state and storage-generation tests before Wrangler dry-run; " +
+          "it retains precedence when a service-binding refresh is also declared. With no storage " +
+          "rebind, an integration service-binding refresh runs `bun run typecheck:form-authority-worker` " +
+          "and `bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts " +
+          "tests/deploy-contract.test.ts` before dry-run or upload; either gate failure stops both. " +
+          ordinaryIntegrationFormCodeGate +
+          " The same exact-target/no-drift and generated D1/R2/schema fence applies here; migrations " +
+          "already applied or changed elsewhere do not select the full-repository gate. Bootstrap, " +
+          "transitions, other storage targets, and production or rehearsal retain their existing gate. " +
+          "All other Form authority applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -591,7 +679,7 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/form-authority-scope-transition.ts",
         "scripts/deploy/target.ts",
       ],
-      requiresScripts: ["check"],
+      requiresScripts: ["check", "typecheck:form-authority-worker"],
       requiresTools: ["bun", "wrangler"],
       requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
       triggers: ["authority"],
@@ -617,7 +705,18 @@ export const DEPLOY_CONTRACT = {
           "every RPC; the route-less authority independently rereads and verifies that same proof identity. " +
           "Foreign domain ownership and every script/domain partial topology are refused. " +
           "Transition status rejects stale-public, third-scope, absent/bootstrap and history-based roll-forward; " +
-          "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation." +
+          "already-target apply is a refused no-op and lost acknowledgement is status-only reconciliation. " +
+          "The operator gateway does not accept the public storageRebind declaration; only the route-less " +
+          "Host/Form authority Workers carry that integration-only transition. " +
+          integrationServiceBindingRefresh +
+          " An integration apply declaring this service refresh runs " +
+          "`bun run typecheck:form-authority-worker` and `bun test " +
+          "tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts` " +
+          "before Wrangler dry-run or upload; either gate failure stops both. " +
+          ordinaryIntegrationFormCodeGate +
+          " The gateway branch requires its existing exact scope and dynamic-public-RPC closure plus an " +
+          "exact, source-matched, no-drift authority dependency on the selected Host; bootstrap, scope and " +
+          "service transitions do not select it. All other operator gateway applies keep `bun run check`." +
           inputContract(applyReviewInput),
         "independent-review": review,
       },
@@ -880,6 +979,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-integration-storage-generation",
       target: "cloudflare-d1-and-r2:new-integration-generation-only",
       covers: [
+        "scripts/deploy/application-schema-shape.ts",
         "migrations",
         "scripts/deploy.ts",
         "scripts/deploy/integration-storage-generation.ts",
@@ -897,11 +997,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0057 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0063 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0057 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0063 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -917,6 +1017,98 @@ export const DEPLOY_CONTRACT = {
           "UUID/name and exact empty state are checked before migration. The R2 bucket must remain " +
           "absent until the complete schema is verified, so no older object operation can target it " +
           "during 0043. Existing database migration and rehearsal controls remain unchanged.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-storage-disposal",
+      target: "cloudflare-d1-and-r2:exact-selected-integration-target-only",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-storage-disposal.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. No resource-name selector is accepted: the exact selected ` +
+          "DeployTarget D1 id/name and R2 name must be the dedicated staging pair or one matching " +
+          "takoserver-i-<32-hex> pair. Apply requires the independent reviewer input.",
+        "post-conditions":
+          "The provider inventories the selected D1 by exact name and exact id and the R2 by exact " +
+          "name. Before deletion, current regular Worker settings and current serving Versions plus " +
+          "all current dispatch namespace scripts/bindings must be completely inventoried; namespace " +
+          "names and script counts reconcile. Any current selected-storage binding blocks disposal. " +
+          "Coverage excludes historical Versions and external API clients. The command rereads the " +
+          "identities and bindings immediately before mutation, deletes only the exact empty R2 bucket " +
+          "first, then the exact D1 id, and requires authoritative exact-identity absence readback.",
+        reversal:
+          "There is no rollback. Recreate forward through the separate storage-generation surface; " +
+          "this surface never wipes bucket objects, rebinds a target, deletes a Worker or runs migrations.",
+        "failure-handling":
+          highRiskFailure +
+          " A rejected/nonempty R2 deletion stops before D1; an unknown acknowledgement is never retried. " +
+          "After partial or indeterminate completion, use --status to read the exact selected identities." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "Before each deletion, the exact selected D1 id/name and R2 name are reread together with " +
+          "all current regular Worker settings/serving Versions and dispatch namespace scripts/bindings. " +
+          "Any selected-storage reference, incomplete inventory, identity collision or namespace count mismatch withholds mutation.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-integration-host-retirement",
+      target: "cloudflare-worker:exact-replaced-integration-public-host-only",
+      covers: [
+        "scripts/deploy.ts",
+        "scripts/deploy/integration-host-retirement.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/worker-state.ts",
+        "scripts/deploy/qualification.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Integration only. TAKOSERVER_DEPLOY_TARGET_INTEGRATION selects the ` +
+          "current Host; --retired-target selects a separate absolute operator-private historical Host descriptor. " +
+          "Both targets must name the same integration account and distinct Host identities. " +
+          "--retired-deployment and --retired-version pin the old live incarnation. No arbitrary " +
+          "Worker-name operand or old-source rebuild is accepted.",
+        "post-conditions":
+          "Readback proves the old script and deployment are absent, while the successor retains " +
+          "its exact deployment, Version and target binding closure and answers its own public " +
+          "product discovery. Storage, namespaces, routes and keys are never mutated.",
+        reversal:
+          "There is no rollback of the deleted Worker or its secret store. Recreate through the " +
+          "owning bootstrap surface under a new exact identity if needed. Existing storage is retained.",
+        "failure-handling":
+          highRiskFailure +
+          " Exactly one DELETE is sent without the force query; Cloudflare's associated-binding " +
+          "protection remains active. Explicit rejection stops. Transport failure, malformed " +
+          "acknowledgement or server error is indeterminate and requires --status; no retry, " +
+          "forced deletion, namespace cleanup or storage fallback is attempted." +
+          inputContract(applyReviewInput),
+        "pre-mutation-proof":
+          "The retired Host must not be any current target Worker identity. Its pinned deployment, " +
+          "Version, exact Host binding/secret-name/settings/cron profile, absence of routes, custom " +
+          "domains and owned Durable Object namespaces are rechecked at the deletion fence. " +
+          "The successor must retain its current exact deployment/Version and target closure and " +
+          "answer /.well-known/takoserver with its own identity. The provider, not a duplicated " +
+          "account-wide reference scanner, enforces associated-binding refusal at DELETE time. " +
+          "No Version CAS or preservation of callers using retired workers.dev or preview URLs is claimed.",
         "independent-review": review,
       },
     },
@@ -951,6 +1143,7 @@ export const DEPLOY_CONTRACT = {
       surface: "takoserver-d1-schema",
       target: "cloudflare-d1:environment-selected-takoserver-state",
       covers: [
+        "scripts/deploy/application-schema-shape.ts",
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
@@ -973,9 +1166,9 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0057; unreviewed 0058+ tails are refused before any provider command. " +
-          "Integration may retain its no-selector disposable cadence or select " +
-          "one audited wave; selected integration reports evidenceClass integration-protected-wave, " +
+          "forward-only apply. The current source inventory is exactly 0001-0063; unreviewed 0064+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
+          "Integration may select one audited wave or a separately qualified existing-data additive " +
+          "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
           "catch-up and never permits arbitrary migration-prefix adoption. The selected 0047 wave " +
           "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
@@ -999,6 +1192,7 @@ export const DEPLOY_CONTRACT = {
           "The 0055 boundary adds durable value-free Queue custody dead-letter transfer notices after 0054; terminal transfer, notice coalescing and source removal remain one guarded atomic batch, while notice acknowledgement stays an exact source-generation/target/token CAS for a private destination wake. " +
           "The 0056 boundary adds Host-owned bounded VectorIndex SQL storage after 0055: immutable cosine index configuration, per-Resource record quotas, binary32 vector records, and type-sensitive equality filter terms; it changes no published identity, binding or provider catalog. " +
           "The 0057 boundary adds receipt-coupled, provider-private execution-material tables for immutable managed Worker Versions after 0056; it stores only bounded execution descriptors and sealed values, and does not publish a Worker, activate custody, or apply any schema automatically. " +
+          "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1015,12 +1209,47 @@ export const DEPLOY_CONTRACT = {
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
           "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
           "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
-          "repository never manufactures the external drained-or-cancelled assertion.",
+          "repository never manufactures the external drained-or-cancelled assertion. The no-selector " +
+          "integration lane permits only exact audited 0058 to 0059+0060 or 0059 to 0060: canonical " +
+          "predecessor shape and zero open apply/import/delete effects without a live/pending " +
+          "Resource attestation are required before qualification and at the final mutation fence. " +
+          "Unresolved identified effects remain retained and fence new conflicting work; no drain, " +
+          "NULL-selection backfill, reset or arbitrary suffix adoption is implied. Each migration " +
+          "and its ledger insert share one D1 transaction; complete 0059 is the resumable boundary. " +
+          "Exact 0060 schema and lineage plus retained-effect integrity must read back before " +
+          "publishing the matching executor then Host. After 0060 the old binaries cannot restore " +
+          "service: repair forward. Protected selectors remain capped at 0057, and fresh generation " +
+          "initialization is not a recovery alternative for protected data. A separate exact 0060 " +
+          "to 0061 integration transition preserves historical NULL accepted-authority summaries " +
+          "without backfill and fences new pre-0061 apply admissions. It requires the audited " +
+          "0001-0061 prefix bytes, canonical predecessor/post schemas and retained-effect integrity. Never " +
+          "bundle it with the 0059/0060 transition. Have the compatible Host ready before migration; " +
+          "publish it only after schema readback, then reconcile current Form authority as needed. " +
+          "A separate exact 0061 to 0062 integration transition requires the audited 0061 predecessor " +
+          "and canonical 0061 application shape, from exact current 0001-0063 source. It requires zero planned current-generation imports " +
+          "before qualification and at the final mutation fence; the migration, ledger insert and " +
+          "old-writer fence are one atomic D1 transaction. New import writers explicitly insert immutable " +
+          "import_selection_protocol=1; old inserts are refused before preparation. The import selection " +
+          "is immutable once bound while its verified token is renewed per lease; " +
+          "historical rows are never backfilled. A provider native destination has one unique reservation " +
+          "retained through receipt publication. Read back the schema, then publish CPE and Host in that " +
+          "order as a forward-only integration repair; it grants no production authorization. " +
+          "The executor protocol generation is unchanged; unrelated components need not be republished. " +
+          "This forward-only availability boundary is not a zero-downtime or historical recovery claim. " +
+          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0063 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
-          "native claim, plus the 0043 active-root/deleting-candidate conflict count. Rehearsal writes " +
+          "native claim, plus the 0043 active-root/deleting-candidate conflict count. The additive " +
+          "integration 0058/0059 to 0060 transition also requires exact canonical schema and no " +
+          "orphan open provider effects; identified unresolved effects need not be drained. The separate " +
+          "0060 to 0061 integration transition additionally runs focused transition/preservation tests " +
+          "before the local D1 migration gate. The separate 0061 to 0062 transition additionally checks " +
+          "the exact 0061 predecessor shape, zero planned current-generation imports and the unique " +
+          "native-destination reservation through receipt publication before the local D1 migration gate. " +
+          "The separate 0062 to 0063 transition checks the exact canonical 0062 predecessor at initial preflight, after qualification and at an immediate mutation read, then requires the exact canonical 0063 post-shape. It admits no other pending suffix and leaves all protected selectors capped at 0057. " +
+          "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +
           "bytes, pre-shape and expected post-shape. Before 0037, one monotonic single-statement " +

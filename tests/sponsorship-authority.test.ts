@@ -12,6 +12,7 @@ import {
 import { createSponsorshipIssuanceReceiptIssuer } from "../src/sponsorship-issuance-receipt.ts";
 
 const now = new Date("2026-09-04T00:00:00.000Z");
+const managedPolicyDigest = `sha256:${"d".repeat(64)}` as const;
 const channel = {
   kind: "takosumi-hosted.sponsorship-authority-rpc@v1",
   hostedVersionId: "11111111-1111-4111-8111-111111111111",
@@ -293,7 +294,297 @@ describe("route-less Hosted sponsorship authority", () => {
       }),
     ).rejects.toEqual(new SponsorshipAuthorityError("invalid_input"));
   });
+
+  test("managed issuance claims before narrow admission and starts a full TTL after delayed readiness", async () => {
+    const fixture = await managedFixture({
+      onEnsure: async ({ sql, state }) => {
+        expect(
+          await sql.query(
+            "SELECT tenant_ref, org_id FROM sponsorship_tenants WHERE tenant_ref = ?",
+            ["tenant:managed"],
+          ),
+        ).toEqual([{ tenant_ref: "tenant:managed", org_id: "org_hosted" }]);
+        expect(
+          await sql.query(
+            "SELECT issuance_operation_id FROM sponsorship_credential_issuance_operations",
+          ),
+        ).toEqual([]);
+        state.current = new Date("2026-09-04T00:02:00.000Z");
+      },
+    });
+
+    const issued = await fixture.authority.issueTenantRunCredential(managedInput());
+
+    expect(issued.expiresAt).toBe("2026-09-04T00:07:00.000Z");
+    expect(fixture.issued[0]?.issuedAtEpochSeconds).toBe(
+      Math.floor(Date.parse("2026-09-04T00:02:00.000Z") / 1_000),
+    );
+    expect(fixture.events).toEqual(["ensure", "sign", "receipt"]);
+    expect(
+      await fixture.sql.query(
+        "SELECT tenant_ref, org_id, created_at FROM sponsorship_tenants WHERE tenant_ref = ?",
+        ["tenant:managed"],
+      ),
+    ).toEqual([
+      {
+        tenant_ref: "tenant:managed",
+        org_id: "org_hosted",
+        created_at: now.toISOString(),
+      },
+    ]);
+  });
+
+  test("managed admission failure leaves the guarded claim but no issuance or signer effect", async () => {
+    const fixture = await managedFixture({ ensureError: new Error("admission unavailable") });
+
+    await expect(fixture.authority.issueTenantRunCredential(managedInput())).rejects.toEqual(
+      new SponsorshipAuthorityError("authority_denied"),
+    );
+    expect(fixture.events).toEqual(["ensure"]);
+    expect(fixture.issued).toEqual([]);
+    expect(
+      await fixture.sql.query(
+        "SELECT tenant_ref, org_id FROM sponsorship_tenants WHERE tenant_ref = ?",
+        ["tenant:managed"],
+      ),
+    ).toEqual([{ tenant_ref: "tenant:managed", org_id: "org_hosted" }]);
+    expect(
+      await fixture.sql.query(
+        "SELECT issuance_operation_id FROM sponsorship_credential_issuance_operations",
+      ),
+    ).toEqual([]);
+  });
+
+  test("managed scope grammar is checked before any claim or admission", async () => {
+    const fixture = await managedFixture();
+    for (const { tenantRef, spaceRef } of [
+      { tenantRef: "tenant:managed", spaceRef: "other:space" },
+      { tenantRef: "tenant:bad/space", spaceRef: "tenant:bad/space" },
+      { tenantRef: "a".repeat(256), spaceRef: "a".repeat(256) },
+    ]) {
+      await expect(
+        fixture.authority.issueTenantRunCredential(managedInput({ tenantRef, spaceRef })),
+      ).rejects.toEqual(new SponsorshipAuthorityError("invalid_input"));
+    }
+    expect(fixture.events).toEqual([]);
+    expect(await fixture.sql.query("SELECT tenant_ref FROM sponsorship_tenants")).toEqual([]);
+  });
+
+  test("foreign ownership and an unavailable wallet never reach narrow admission", async () => {
+    const foreign = await managedFixture();
+    await foreign.sql.run(
+      "INSERT INTO sponsorship_tenants (tenant_ref, org_id, created_at) VALUES (?, ?, ?)",
+      ["tenant:managed", "org_other", now.toISOString()],
+    );
+    await expect(foreign.authority.issueTenantRunCredential(managedInput())).rejects.toEqual(
+      new SponsorshipAuthorityError("authority_denied"),
+    );
+    expect(foreign.events).toEqual([]);
+    expect(foreign.issued).toEqual([]);
+
+    const unfunded = await managedFixture({ fundAmount: 0 });
+    await expect(unfunded.authority.issueTenantRunCredential(managedInput())).rejects.toEqual(
+      new SponsorshipAuthorityError("authority_denied"),
+    );
+    expect(unfunded.events).toEqual([]);
+    expect(unfunded.issued).toEqual([]);
+    expect(await unfunded.sql.query("SELECT tenant_ref FROM sponsorship_tenants")).toEqual([]);
+  });
+
+  test("managed readiness requires the exact organization, Space, policy digest, and closed shape", async () => {
+    const invalidReady: unknown[] = [
+      managedReady("tenant:managed", { policyDigest: `sha256:${"0".repeat(64)}` }),
+      { ...managedReady("tenant:managed"), extra: true },
+      managedReady("tenant:managed", { organizationId: "org_other" }),
+      managedReady("tenant:managed", { spaceRef: "other:space" }),
+      {
+        organizationId: "org_hosted",
+        tenantRef: "tenant:managed",
+        spaceRef: "tenant:managed",
+        ready: true,
+      },
+    ];
+    for (const ready of invalidReady) {
+      const fixture = await managedFixture({ ready });
+      await expect(fixture.authority.issueTenantRunCredential(managedInput())).rejects.toEqual(
+        new SponsorshipAuthorityError("authority_denied"),
+      );
+      expect(fixture.issued).toEqual([]);
+      expect(
+        await fixture.sql.query(
+          "SELECT issuance_operation_id FROM sponsorship_credential_issuance_operations",
+        ),
+      ).toEqual([]);
+    }
+  });
+
+  test("a wallet change after readiness blocks the issuance CAS", async () => {
+    const fixture = await managedFixture({
+      onEnsure: async ({ ledger }) => {
+        expect(
+          await ledger.hold({
+            organizationId: "org_hosted",
+            reference: "hold:after-admission",
+            amountMinor: 1_000,
+          }),
+        ).toBe(true);
+      },
+    });
+
+    await expect(fixture.authority.issueTenantRunCredential(managedInput())).rejects.toEqual(
+      new SponsorshipAuthorityError("authority_denied"),
+    );
+    expect(fixture.events).toEqual(["ensure"]);
+    expect(fixture.issued).toEqual([]);
+    expect(
+      await fixture.sql.query(
+        "SELECT tenant_ref, org_id FROM sponsorship_tenants WHERE tenant_ref = ?",
+        ["tenant:managed"],
+      ),
+    ).toEqual([{ tenant_ref: "tenant:managed", org_id: "org_hosted" }]);
+    expect(
+      await fixture.sql.query(
+        "SELECT issuance_operation_id FROM sponsorship_credential_issuance_operations",
+      ),
+    ).toEqual([]);
+  });
+
+  test("exact managed replay skips re-admission and retains token and issued time after wallet change", async () => {
+    const fixture = await managedFixture();
+    const input = managedInput();
+    const first = await fixture.authority.issueTenantRunCredential(input);
+    expect(
+      await fixture.ledger.hold({
+        organizationId: "org_hosted",
+        reference: "hold:after-first-issuance",
+        amountMinor: 1_000,
+      }),
+    ).toBe(true);
+    fixture.state.current = new Date("2026-09-04T00:04:00.000Z");
+
+    const replay = await fixture.authority.issueTenantRunCredential(input);
+
+    expect(replay).toEqual(first);
+    expect(fixture.ensureCalls).toBe(1);
+    expect(fixture.issued).toHaveLength(2);
+    expect(fixture.issued[1]?.issuedAtEpochSeconds).toBe(fixture.issued[0]?.issuedAtEpochSeconds);
+    expect(fixture.events).toEqual(["ensure", "sign", "receipt", "sign", "receipt"]);
+  });
+
+  test("an input conflict is rejected before managed admission", async () => {
+    const fixture = await managedFixture();
+    const input = managedInput();
+    await fixture.authority.issueTenantRunCredential(input);
+    const events = [...fixture.events];
+
+    await expect(
+      fixture.authority.issueTenantRunCredential({ ...input, runRef: "run:changed" }),
+    ).rejects.toEqual(new SponsorshipAuthorityError("operation_conflict"));
+    expect(fixture.events).toEqual(events);
+    expect(fixture.ensureCalls).toBe(1);
+    expect(
+      await fixture.sql.query(
+        "SELECT COUNT(*) AS total FROM sponsorship_credential_issuance_operations",
+      ),
+    ).toEqual([{ total: 1 }]);
+  });
 });
+
+interface ManagedFixtureOptions {
+  readonly fundAmount?: number;
+  readonly ready?: unknown;
+  readonly ensureError?: unknown;
+  readonly onEnsure?: (context: {
+    readonly sql: ReturnType<typeof createEphemeralSql>;
+    readonly ledger: ReturnType<typeof createLedger>;
+    readonly state: { current: Date };
+  }) => Promise<void>;
+}
+
+async function managedFixture(options: ManagedFixtureOptions = {}) {
+  const sql = await authoritySql();
+  await organization(sql, "org_hosted");
+  const state = { current: now };
+  const ledger = createLedger(sql, () => state.current);
+  if ((options.fundAmount ?? 1_000) > 0) {
+    await ledger.fund({
+      organizationId: "org_hosted",
+      fundingRef: "funding:managed",
+      amountMinor: options.fundAmount ?? 1_000,
+    });
+  }
+  const events: string[] = [];
+  const issued: Parameters<SponsorshipCredentialIssuer["issue"]>[0][] = [];
+  let ensureCalls = 0;
+  const authority = createSponsorshipAuthority({
+    sql,
+    organizationId: "org_hosted",
+    clock: () => state.current,
+    ...receiptOptions,
+    credentialIssuer: fakeCredentialIssuer({
+      async issue(input) {
+        events.push("sign");
+        issued.push(input);
+        return {
+          token: `token.${input.tokenId}`,
+          expiresAt: new Date((input.issuedAtEpochSeconds + 300) * 1_000).toISOString(),
+        };
+      },
+    }),
+    receipts: {
+      async issue(input) {
+        events.push("receipt");
+        return `receipt.${input.token}`;
+      },
+    },
+    managedSpaceAdmission: {
+      policyDigest: managedPolicyDigest,
+      async ensureTenantSpaceAdmission(input) {
+        events.push("ensure");
+        ensureCalls++;
+        if (options.onEnsure) await options.onEnsure({ sql, ledger, state });
+        if (options.ensureError !== undefined) throw options.ensureError;
+        return options.ready ?? managedReady(input.tenantRef);
+      },
+    },
+  });
+  return {
+    authority,
+    sql,
+    ledger,
+    state,
+    events,
+    issued,
+    get ensureCalls() {
+      return ensureCalls;
+    },
+  };
+}
+
+function managedInput(overrides: Record<string, unknown> = {}) {
+  return {
+    tenantRef: "tenant:managed",
+    spaceRef: "tenant:managed",
+    runRef: "run:managed",
+    requiredAvailableMinor: 1_000,
+    channel,
+    ...overrides,
+  };
+}
+
+function managedReady(
+  tenantRef: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    organizationId: "org_hosted",
+    tenantRef,
+    spaceRef: tenantRef,
+    policyDigest: managedPolicyDigest,
+    ready: true,
+    ...overrides,
+  };
+}
 
 async function organization(
   sql: ReturnType<typeof createEphemeralSql>,

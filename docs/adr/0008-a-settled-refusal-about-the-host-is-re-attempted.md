@@ -10,6 +10,10 @@ refusal that describes this Host or its environment is retired when the same key
 is presented again with the same fingerprint, and the request is attempted
 afresh.
 
+This applies only after the whole attempt is known not to have produced a
+provider effect. An executed receipt that cannot be projected onto its Form
+remains held for repair; see the 2026-09-20 correction below.
+
 The closed set that is re-attempted is
 `REATTEMPTED_SETTLED_FAILURE_CODES` in `src/takoform/operations.ts`:
 `backend_unavailable`, `deadline_exceeded`, `dependency_in_use`,
@@ -86,6 +90,10 @@ a re-run of a refused apply is supposed to be.
   decision, not a refusal about anything.
 
 ## Amendment — 2026-09-02: a hold that can never settle is not a hold
+
+The receipt-retirement exception in this historical amendment is superseded by
+the 2026-09-20 correction below. The separate proven-no-effect cleanup rule
+remains in force.
 
 The rule above turns on a settled failure, and it says the store rather than the
 code list holds the safety property: an operation whose provider mutation
@@ -185,3 +193,33 @@ And a re-attempt is still never a second mutation. The safety property is the
 store's, as above: every marked refusal is a precondition failure raised before
 the driver is entered, so the provider was not invoked and there is nothing to
 attempt twice.
+
+## Correction — 2026-09-20: an unpublishable receipt is still a real effect
+
+The earlier exception confused an invalid projection with absence of a provider
+mutation. The executed saga may be the only durable full receipt, including
+the native identity and deployment mutation needed to adopt or delete the
+created supply. Dropping it and accepting the same caller key again creates a
+new Host operation ID and Resource UID. Provider idempotency follows that
+operation identity, not necessarily the caller's replay key, so a fresh attempt
+can duplicate supply and lose the first resource's recovery authority.
+
+Do not retire this receipt, label it cancelled, or append a success merely to
+release the target. Keep the executed saga, full receipt, unresolved effect
+and nonterminal deferred operation in the existing provider-repair path.
+Repeated acceptance returns the same operation and cannot enter a fresh
+provider mutation. Repairing configuration alone does not make the historical
+receipt valid; no published Form output constraint is relaxed.
+
+An explicit adopt-or-compensate disposition must consume this retained evidence
+before the operation can be released. That disposition is not supplied by this
+correction, and a held operation is not reported as recovered. The regression
+must assert retained receipt/operation identity and an unchanged provider call
+count, not merely a different HTTP status.
+
+A definitive whole-attempt-idle refusal is different. At its existing fenced
+store settlement boundary, append the exact cancelled effect and update the
+retained attestation atomically with retiring the saga. A crash must not leave
+an open effect after removing the control record that proves no mutation
+occurred. This restores the original safety property without an exception in
+the retained-effect conflict fence.

@@ -1748,7 +1748,7 @@ function validModuleMediaTypes(
   return normalized;
 }
 
-const SAFE_ASSET_PATH = /^[A-Za-z0-9_.][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_.][A-Za-z0-9._-]*)*$/u;
+const SAFE_ASSET_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 const ASSET_MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const MAX_ASSET_MEDIA_TYPE_LENGTH = 255;
 const MAX_ASSET_ENTRIES = 16_384;

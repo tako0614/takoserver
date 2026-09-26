@@ -19,6 +19,7 @@ import {
 import { createFormPackageStore, type FormPackageInput } from "./form-packages.ts";
 import {
   createHostAdmissionCoordinator,
+  type FormAuthorityActivationPolicy,
   type FormAuthorityApplyResult,
   type FormAuthorityIdentity,
   type FormAuthorityPackageIdentity,
@@ -34,6 +35,7 @@ import type {
   TakoformLifecycleCapabilityManifest,
 } from "./implementation-catalog.ts";
 import { loadPublisherSetClosure } from "./publisher-set-closure.ts";
+import { validateSpaceAdmissionPolicy } from "./space-admission-policy.ts";
 
 export { parseFormAuthorityCapabilityManifest, providerResourceOperationHandlers };
 
@@ -100,6 +102,8 @@ export class HostAdmissionEndpoint {
 export async function createProductionFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
+  /** Optional operator-pinned positive activation scope. */
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
 }): Promise<FormAuthorityComposition> {
   const closure = await loadPublisherSetClosure();
   const artifactDigest = input.configuration.coreVerifierArtifactDigest;
@@ -127,6 +131,8 @@ export async function createFormAuthorityComposition(input: {
   readonly packages: FormAuthorityPackageSource;
   readonly packageSet?: readonly FormAuthorityPackageIdentity[];
   readonly expectedEvidence?: FormAuthorityVerificationEvidence;
+  /** Optional operator-pinned positive activation scope. */
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
 }): Promise<FormAuthorityComposition> {
   return createComposition(input);
 }
@@ -161,6 +167,7 @@ async function createComposition(input: {
   readonly packages: FormAuthorityPackageSource;
   readonly packageSet?: readonly FormAuthorityPackageIdentity[];
   readonly expectedEvidence?: FormAuthorityVerificationEvidence;
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
 }): Promise<FormAuthorityComposition> {
   const catalog = await deriveRuntimeImplementationCatalog({
     implementationPayloadDigest: input.configuration.implementationPayloadDigest,
@@ -173,6 +180,21 @@ async function createComposition(input: {
     );
   }
   const identity = formAuthorityIdentity(input.configuration, catalog);
+  let activationPolicy = input.activationPolicy;
+  if (activationPolicy !== undefined) {
+    try {
+      const validated = await validateSpaceAdmissionPolicy(activationPolicy, {
+        publisherPackageSet: input.packageSet ?? catalog.entries,
+        implementationCatalog: catalog,
+      });
+      activationPolicy = validated.policy;
+    } catch (error) {
+      throw new HostAdmissionCoordinatorError(
+        "invalid_request",
+        error instanceof Error ? error.message : "space admission policy is invalid",
+      );
+    }
+  }
   const assertCurrentPublicHost = async (): Promise<void> => {
     const live = await input.bindings.publicHostIdentity.identity();
     if (
@@ -204,6 +226,7 @@ async function createComposition(input: {
         identity,
         catalog,
         ...(input.packageSet === undefined ? {} : { packageSet: input.packageSet }),
+        ...(activationPolicy === undefined ? {} : { activationPolicy }),
         ...(input.expectedEvidence === undefined
           ? {}
           : { expectedEvidence: input.expectedEvidence }),

@@ -20,16 +20,32 @@ export function copyAuditedSchemaFixture(directory: string): string {
 /** Current audited source, including the additive 0050/0051 workflow tables,
  * 0052 termination intent, 0053 Queue custody state, its 0054 bounded
  * readiness index, its 0055 durable transfer notices, the 0056 bounded
- * VectorIndex SQL store, and the reviewed 0057 execution-material tables. */
+ * VectorIndex SQL store, the 0057 execution-material tables, 0058 managed
+ * Worker domain receipts, 0059 apply provider selection, 0060 operation
+ * generation, 0061 accepted authority continuity, and 0062 import provider
+ * selection, followed by 0063 managed Queue retirement fencing. */
 export function copyCurrentSchemaFixture(directory: string): string {
   if (
-    MIGRATIONS.length !== 57 ||
-    MIGRATIONS.at(-1)?.name !== "0057_cloudflare_managed_worker_version_execution_material.sql"
+    MIGRATIONS.length !== 63 ||
+    MIGRATIONS.at(-1)?.name !== "0063_cloudflare_managed_queue_retirement.sql"
   ) {
-    throw new Error("current schema fixture requires the audited 0001-0057 lineage");
+    throw new Error("current schema fixture requires the audited 0001-0063 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {
+    copyFileSync(resolve(import.meta.dir, "../../migrations", name), join(directory, name));
+  }
+  return directory;
+}
+
+/** Frozen 0001-0060 source used only by historical operation-generation tests. */
+export function copyOperationGenerationSchemaFixture(directory: string): string {
+  const prefix = MIGRATIONS.slice(0, 60);
+  if (prefix.length !== 60 || prefix.at(-1)?.name !== "0060_takoform_operation_generation.sql") {
+    throw new Error("operation-generation fixture requires the frozen 0001-0060 lineage");
+  }
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  for (const { name } of prefix) {
     copyFileSync(resolve(import.meta.dir, "../../migrations", name), join(directory, name));
   }
   return directory;

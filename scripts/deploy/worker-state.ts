@@ -311,6 +311,8 @@ export interface WorkerClosureDelta {
    * correction would be unpublishable by any surface.
    */
   readonly refreshedVars: readonly string[];
+  /** Existing service bindings whose target-derived service/entrypoint tuple changes. */
+  readonly refreshedServiceBindings?: readonly string[];
   /**
    * Non-plain-text bindings the current target declares and the predecessor
    * lacks.
@@ -325,6 +327,15 @@ export interface WorkerClosureDelta {
   readonly addedSecrets: readonly string[];
   /** Secrets carried by both sides whose value this one upload replaces. */
   readonly rotatedSecrets: readonly string[];
+  /**
+   * Integration-only replacement of the immutable STATE_DB and OBJECTS
+   * bindings. The successor identities remain target-derived; these values
+   * name only the exact storage identities the pinned predecessor must serve.
+   */
+  readonly storageRebind?: {
+    readonly predecessorStateDatabaseId: string;
+    readonly predecessorObjectBucketName: string;
+  };
 }
 
 /** A selector without any declared change is an ordinary publication, not a transition. */
@@ -333,9 +344,11 @@ export function workerClosureDeltaIsEmpty(delta: WorkerClosureDelta): boolean {
     delta.retiredVars.length === 0 &&
     delta.addedVars.length === 0 &&
     delta.refreshedVars.length === 0 &&
+    (delta.refreshedServiceBindings?.length ?? 0) === 0 &&
     delta.addedBindings.length === 0 &&
     delta.addedSecrets.length === 0 &&
-    delta.rotatedSecrets.length === 0
+    delta.rotatedSecrets.length === 0 &&
+    delta.storageRebind === undefined
   );
 }
 

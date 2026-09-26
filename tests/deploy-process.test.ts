@@ -10,32 +10,14 @@ import {
   resolveCloudflareCredential,
   runCommand,
 } from "../scripts/deploy/process.ts";
+import { wranglerPathForTests } from "./helpers/wrangler-path.ts";
 
 const AMBIENT = "TAKOSERVER_TEST_AMBIENT_SECRET";
 const previous = process.env[AMBIENT];
-const previousCloudflareToken = process.env.CLOUDFLARE_API_TOKEN;
-const previousHome = process.env.HOME;
-const previousXdgConfig = process.env.XDG_CONFIG_HOME;
-const previousXdgCache = process.env.XDG_CACHE_HOME;
-const previousCloudflareApiEnvironment = process.env.CLOUDFLARE_API_ENVIRONMENT;
-const previousWranglerLogPath = process.env.WRANGLER_LOG_PATH;
 
 afterEach(() => {
   if (previous === undefined) delete process.env[AMBIENT];
   else process.env[AMBIENT] = previous;
-  if (previousCloudflareToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN;
-  else process.env.CLOUDFLARE_API_TOKEN = previousCloudflareToken;
-  if (previousHome === undefined) delete process.env.HOME;
-  else process.env.HOME = previousHome;
-  if (previousXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
-  else process.env.XDG_CONFIG_HOME = previousXdgConfig;
-  if (previousXdgCache === undefined) delete process.env.XDG_CACHE_HOME;
-  else process.env.XDG_CACHE_HOME = previousXdgCache;
-  if (previousCloudflareApiEnvironment === undefined) {
-    delete process.env.CLOUDFLARE_API_ENVIRONMENT;
-  } else process.env.CLOUDFLARE_API_ENVIRONMENT = previousCloudflareApiEnvironment;
-  if (previousWranglerLogPath === undefined) delete process.env.WRANGLER_LOG_PATH;
-  else process.env.WRANGLER_LOG_PATH = previousWranglerLogPath;
 });
 
 describe("sanitized deploy child environment", () => {
@@ -91,7 +73,6 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("explicit API tokens win without invoking Wrangler", async () => {
-    process.env.CLOUDFLARE_API_TOKEN = "ambient-api-token-that-must-lose";
     const explicit = "explicit-api-token";
     const sentinels = [
       "api-key-must-not-cross",
@@ -130,11 +111,11 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("integration consumes Wrangler OAuth once and never passes its bearer to children", async () => {
-    delete process.env.CLOUDFLARE_API_TOKEN;
     const secret = "oauth-token-only-in-process";
     const privateWrangler = "/private-composition/node_modules/.bin/wrangler";
     const calls: { command: readonly string[]; env: Readonly<Record<string, string>> }[] = [];
     const credential = await resolveCloudflareCredential("integration", {
+      cloudflareEnvironment: {},
       wranglerPath: privateWrangler,
       run: async (command, options) => {
         calls.push({ command, env: options?.env ?? {} });
@@ -160,7 +141,6 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("OAuth child environments allowlist Wrangler behavior and strip competing credentials", async () => {
-    delete process.env.CLOUDFLARE_API_TOKEN;
     const sentinels = {
       apiKey: "api-key-must-not-cross",
       email: "email-must-not-cross@example.test",
@@ -194,8 +174,6 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("real Wrangler OAuth extraction leaves no sentinel in debug or ambient files", async () => {
-    delete process.env.CLOUDFLARE_API_TOKEN;
-    delete process.env.CLOUDFLARE_API_ENVIRONMENT;
     const root = join(tmpdir(), `takoserver-oauth-subprocess-${Date.now()}-${Math.random()}`);
     const home = join(root, "home");
     const config = join(root, "xdg-config");
@@ -213,12 +191,21 @@ describe("integration Cloudflare credential resolver", () => {
         `oauth_token = "${secret}"\nexpiration_time = "2099-01-01T00:00:00.000Z"\n`,
         { mode: 0o600 },
       );
-      process.env.HOME = home;
-      process.env.XDG_CONFIG_HOME = config;
-      process.env.XDG_CACHE_HOME = cache;
-      process.env.WRANGLER_LOG_PATH = logs;
-
-      const credential = await resolveCloudflareCredential("integration");
+      const credential = await resolveCloudflareCredential("integration", {
+        cloudflareEnvironment: {},
+        wranglerPath: wranglerPathForTests(),
+        run: async (command, options = {}) =>
+          await runCommand(command, {
+            ...options,
+            env: {
+              ...options.env,
+              HOME: home,
+              XDG_CONFIG_HOME: config,
+              XDG_CACHE_HOME: cache,
+              WRANGLER_LOG_PATH: logs,
+            },
+          }),
+      });
       expect(credential.source).toBe("oauth");
       expect(credential.token).toBe(secret);
       expect(credential.childEnvironment).toEqual({
@@ -236,11 +223,11 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("rehearsal and production reject an absent explicit token", async () => {
-    delete process.env.CLOUDFLARE_API_TOKEN;
     for (const environment of ["rehearsal", "production"] as const) {
       let calls = 0;
       await expect(
         resolveCloudflareCredential(environment, {
+          cloudflareEnvironment: {},
           run: async () => {
             calls += 1;
             return { exitCode: 0, stdout: "{}", stderr: "" };
@@ -252,13 +239,14 @@ describe("integration Cloudflare credential resolver", () => {
   });
 
   test("does not expose OAuth command output on failure", async () => {
-    delete process.env.CLOUDFLARE_API_TOKEN;
     const secret = "oauth-secret-in-diagnostics";
     const commandFailure = await resolveCloudflareCredential("integration", {
+      cloudflareEnvironment: {},
       run: async () => ({ exitCode: 1, stdout: secret, stderr: secret }),
     }).catch((error: unknown) => error);
     expect(String(commandFailure)).not.toContain(secret);
     const shapeFailure = await resolveCloudflareCredential("integration", {
+      cloudflareEnvironment: {},
       run: async () => ({
         exitCode: 0,
         stdout: JSON.stringify({ type: "oauth", token: secret, extra: true }),

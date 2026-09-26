@@ -13,7 +13,9 @@ import {
   type IntegrationStorageGenerationProcess,
   type IntegrationStorageGenerationProvider,
   type IntegrationStorageR2Bucket,
+  type IntegrationStorageTargetReadProvider,
   runIntegrationStorageGeneration,
+  verifyIntegrationStorageGenerationTarget,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -55,7 +57,7 @@ const invocation = {
 
 const emptyState = state([], []);
 const completeState = stateWithShape(
-  MIGRATIONS.slice(0, 57).map(({ name }) => name),
+  MIGRATIONS.map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -72,6 +74,51 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
     shape,
     shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
   };
+}
+
+interface TestSchemaRow {
+  type: string;
+  name: string;
+  table: string;
+  sql: string;
+}
+
+function schemaRows(value: D1SchemaState): TestSchemaRow[] {
+  return JSON.parse(value.shape) as TestSchemaRow[];
+}
+
+function stateWithSchemaRows(base: D1SchemaState, rows: readonly TestSchemaRow[]): D1SchemaState {
+  const canonicalRows = [...rows].sort((left, right) =>
+    `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+  );
+  const shape = canonicalSchemaShape(
+    canonicalRows.map(({ type, name, table, sql }) => ({ type, name, tbl_name: table, sql })),
+  );
+  return stateWithShape(base.applied, shape);
+}
+
+function editedTriggerState(base: D1SchemaState, edit: (sql: string) => string): D1SchemaState {
+  return editedSchemaSqlState(
+    base,
+    "cloudflare_managed_worker_version_execution_material_exact_insert",
+    edit,
+  );
+}
+
+function editedSchemaSqlState(
+  base: D1SchemaState,
+  name: string,
+  edit: (sql: string) => string,
+): D1SchemaState {
+  let changed = false;
+  const rows = schemaRows(base).map((row) => {
+    if (row.name !== name) return row;
+    const sql = edit(row.sql);
+    changed = sql !== row.sql;
+    return { ...row, sql };
+  });
+  if (!changed) throw new Error(`schema test edit did not change ${name}`);
+  return stateWithSchemaRows(base, rows);
 }
 
 function applicationShape(directory: string): string {
@@ -224,6 +271,365 @@ async function rejectedError(operation: Promise<unknown>): Promise<Error> {
 }
 
 describe("integration storage generation bootstrap", () => {
+  test("storage rebind verifier proves the exact generated D1/R2 target and audited schema read-only", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const calls: string[] = [];
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        calls.push(`getD1:${databaseId}`);
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        calls.push(`getR2:${name}`);
+        return { name };
+      },
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      provider,
+      reader: {
+        async read() {
+          return completeState;
+        },
+      },
+      migrationDirectory: currentMigrations,
+    });
+    expect(proof).toMatchObject({
+      generation: GENERATION,
+      d1: { databaseId: DATABASE_ID, databaseName: GENERATED_NAME },
+      r2: { bucketName: GENERATED_NAME },
+      appliedMigrations: MIGRATIONS.map(({ name }) => name),
+    });
+    expect(proof.migrationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(proof.schemaShapeDigest).toBe(completeState.shapeDigest);
+    expect(calls).toEqual([`getD1:${DATABASE_ID}`, `getR2:${GENERATED_NAME}`]);
+  });
+
+  test("generated application schema comparison ignores only SQL trivia and keeps raw digests", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const triviaState = editedTriggerState(completeState, (sql) =>
+      `-- readback-only comment\n${sql}`
+        .replace("CREATE TRIGGER", "CREATE/* harmless block comment */TRIGGER")
+        .replace("BEFORE INSERT", "BEFORE\t \nINSERT"),
+    );
+    expect(triviaState.shapeDigest).not.toBe(completeState.shapeDigest);
+
+    const readProvider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        return { uuid: databaseId, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      provider: readProvider,
+      reader: {
+        async read() {
+          return triviaState;
+        },
+      },
+      migrationDirectory: currentMigrations,
+    });
+    expect(proof.schemaShapeDigest).toBe(triviaState.shapeDigest);
+    expect(proof.schemaShapeDigest).not.toBe(completeState.shapeDigest);
+
+    const fresh = providerFixture();
+    const process = processFixture();
+    const result = await runIntegrationStorageGeneration(
+      invocation,
+      target,
+      options(fresh.provider, [emptyState, triviaState], process),
+    );
+    expect(result.schemaShapeDigest).toBe(triviaState.shapeDigest);
+    expect(result.schemaShapeDigest).not.toBe(completeState.shapeDigest);
+    expect(fresh.calls).toContain(`createR2:${GENERATED_NAME}`);
+  });
+
+  test("generated schema proof rejects semantic, structural, malformed, and raw-digest drift", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1(databaseId) {
+        return { uuid: databaseId, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    const verify = async (readState: D1SchemaState): Promise<Error> =>
+      await rejectedError(
+        verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+          provider,
+          reader: {
+            async read() {
+              return readState;
+            },
+          },
+          migrationDirectory: currentMigrations,
+        }),
+      );
+    const expectPreflight = async (readState: D1SchemaState): Promise<void> => {
+      const error = await verify(readState);
+      expect(error).toBeInstanceOf(DeployError);
+      if (!(error instanceof DeployError)) throw error;
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("Existing generated D1 schema readback");
+    };
+
+    const semanticChanges: readonly [string, (sql: string) => string][] = [
+      ["literal", (sql) => sql.replace("'version'", "'versions'")],
+      ["identifier", (sql) => sql.replace("NEW.provider_id", "NEW.providerId")],
+      ["operator", (sql) => sql.replace(") = 2", ") != 2")],
+      ["predicate", (sql) => sql.replace("WHEN NOT EXISTS", "WHEN EXISTS")],
+      ["action", (sql) => sql.replace("RAISE(ABORT", "RAISE(FAIL")],
+      ["quoted literal bytes", (sql) => sql.replace("'version'", "'ver sion'")],
+      [
+        "comment token inside a literal",
+        (sql) =>
+          sql.replace(
+            "'managed_worker_version_execution_material_receipt_not_exact'",
+            "'managed_worker_version_execution_material_receipt/*note*/_not_exact'",
+          ),
+      ],
+    ];
+    for (const [, edit] of semanticChanges)
+      await expectPreflight(editedTriggerState(completeState, edit));
+
+    const quotedIdentifierChanges: readonly [string, (sql: string) => string][] = [
+      ["double-quoted identifier", (sql) => sql.replace('"principals"', '"principals--marker"')],
+      [
+        "backtick-quoted identifier",
+        (sql) => sql.replace('"principals"', "`principals/*marker*/`"),
+      ],
+      ["bracket-quoted identifier", (sql) => sql.replace('"principals"', "[principals--marker]")],
+    ];
+    for (const [, edit] of quotedIdentifierChanges) {
+      await expectPreflight(editedSchemaSqlState(completeState, "principals", edit));
+    }
+
+    const malformedSql: readonly [string, (sql: string) => string][] = [
+      ["single quote", (sql) => `${sql} 'unterminated`],
+      ["double quote", (sql) => `${sql} "unterminated`],
+      ["backtick", (sql) => `${sql} \`unterminated`],
+      ["bracket identifier", (sql) => `${sql} [unterminated`],
+      ["block comment", (sql) => `${sql} /* unterminated`],
+    ];
+    for (const [, edit] of malformedSql)
+      await expectPreflight(editedTriggerState(completeState, edit));
+
+    const rowCases: readonly [string, (rows: TestSchemaRow[]) => TestSchemaRow[]][] = [
+      ["inventory", (rows) => rows.slice(1)],
+      ["type", (rows) => rows.map((row, index) => (index === 0 ? { ...row, type: "view" } : row))],
+      [
+        "name",
+        (rows) =>
+          rows.map((row, index) => (index === 0 ? { ...row, name: `${row.name}-changed` } : row)),
+      ],
+      [
+        "table",
+        (rows) =>
+          rows.map((row, index) => (index === 0 ? { ...row, table: `${row.table}-changed` } : row)),
+      ],
+    ];
+    for (const [, change] of rowCases) {
+      await expectPreflight(stateWithSchemaRows(completeState, change(schemaRows(completeState))));
+    }
+
+    await expectPreflight({ ...completeState, shapeDigest: `sha256:${"0".repeat(64)}` });
+  });
+
+  test("storage rebind verifier uses the composing owner's Wrangler for OAuth and D1 readback", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const privateWrangler = "/private/runtime/node_modules/.bin/wrangler";
+    const commands: string[][] = [];
+    const requestPaths: string[] = [];
+    const applicationRows = JSON.parse(completeState.shape) as {
+      readonly type: string;
+      readonly name: string;
+      readonly table: string;
+      readonly sql: string;
+    }[];
+    const schemaRows = [
+      ...applicationRows.map(({ table, ...row }) => ({ ...row, tbl_name: table })),
+      {
+        type: "table",
+        name: "d1_migrations",
+        tbl_name: "d1_migrations",
+        sql: "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+      },
+    ].sort((left, right) =>
+      `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+    );
+    const run: IntegrationStorageGenerationProcess = async (command) => {
+      commands.push([...command]);
+      if (command[0] === privateWrangler && command[1] === "auth") {
+        return ok(JSON.stringify({ type: "oauth", token: "private-oauth-token" }));
+      }
+      if (command[0] !== privateWrangler) {
+        throw new Error(`unexpected Wrangler executable ${command[0] ?? "<missing>"}`);
+      }
+      const sql = command[command.indexOf("--command") + 1];
+      if (sql === undefined) throw new Error("D1 command omitted SQL");
+      const results = sql.startsWith("SELECT name FROM sqlite_schema")
+        ? schemaRows.filter(({ type }) => type === "table").map(({ name }) => ({ name }))
+        : sql.includes("FROM d1_migrations ORDER BY id")
+          ? MIGRATIONS.map(({ name }) => ({ name }))
+          : sql.startsWith("SELECT type, name, tbl_name, COALESCE(sql, '') AS sql")
+            ? schemaRows
+            : null;
+      if (results === null) throw new Error(`unexpected D1 query ${sql}`);
+      return ok(JSON.stringify([{ success: true, results }]));
+    };
+    const proof = await verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+      run,
+      wranglerPath: privateWrangler,
+      cloudflareEnvironment: {},
+      migrationDirectory: currentMigrations,
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        requestPaths.push(url.pathname);
+        if (url.pathname.endsWith(`/d1/database/${DATABASE_ID}`)) {
+          return jsonResponse({
+            success: true,
+            result: { uuid: DATABASE_ID, name: GENERATED_NAME },
+          });
+        }
+        if (url.pathname.endsWith(`/r2/buckets/${GENERATED_NAME}`)) {
+          return jsonResponse({ success: true, result: { name: GENERATED_NAME } });
+        }
+        throw new Error(`unexpected Cloudflare request ${url.pathname}`);
+      },
+    });
+
+    expect(proof.d1).toEqual({ databaseId: DATABASE_ID, databaseName: GENERATED_NAME });
+    expect(commands[0]).toEqual([privateWrangler, "auth", "token", "--json"]);
+    expect(commands.length).toBe(4);
+    expect(
+      commands
+        .slice(1)
+        .every(
+          (command) =>
+            command[0] === privateWrangler && command[1] === "d1" && command[2] === "execute",
+        ),
+    ).toBe(true);
+    expect(requestPaths).toEqual([
+      `/client/v4/accounts/${target.accountId}/d1/database/${DATABASE_ID}`,
+      `/client/v4/accounts/${target.accountId}/r2/buckets/${GENERATED_NAME}`,
+    ]);
+  });
+
+  test("storage rebind verifier rejects arbitrary or mismatched generated targets before provider reads", async () => {
+    let reads = 0;
+    const provider: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        reads += 1;
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        reads += 1;
+        return { name };
+      },
+    };
+    for (const invalidTarget of [
+      {
+        ...target,
+        d1: { databaseName: TARGET_DATABASE, databaseId: DATABASE_ID },
+        r2: { bucketName: TARGET_BUCKET },
+      },
+      {
+        ...target,
+        d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+        r2: { bucketName: `${GENERATED_NAME}-other` },
+      },
+      {
+        ...target,
+        d1: { databaseName: GENERATED_NAME, databaseId: "not-a-uuid" },
+        r2: { bucketName: GENERATED_NAME },
+      },
+    ] as unknown as DeployTarget[]) {
+      await expect(
+        verifyIntegrationStorageGenerationTarget(invalidTarget, "integration", { provider }),
+      ).rejects.toThrow("exact matching generated D1/R2 storage pair");
+    }
+    expect(reads).toBe(0);
+  });
+
+  test("read-only storage proof classifies a schema mismatch as preflight", async () => {
+    const generatedTarget = {
+      ...target,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    } satisfies DeployTarget;
+    const wrongD1: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        return { uuid: DATABASE_ID, name: `${GENERATED_NAME}-other` };
+      },
+      async getR2(name) {
+        return { name };
+      },
+    };
+    await expect(
+      verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+        provider: wrongD1,
+        reader: {
+          async read() {
+            return completeState;
+          },
+        },
+        migrationDirectory: currentMigrations,
+      }),
+    ).rejects.toThrow("D1 identity readback does not match");
+
+    const reads: string[] = [];
+    const exactProvider: IntegrationStorageTargetReadProvider = {
+      async getD1() {
+        reads.push("D1");
+        return { uuid: DATABASE_ID, name: GENERATED_NAME };
+      },
+      async getR2(name) {
+        reads.push("R2");
+        return { name };
+      },
+    };
+    const incomplete = state(
+      MIGRATIONS.slice(0, 56).map(({ name }) => name),
+      [],
+    );
+    const mismatch = await rejectedError(
+      verifyIntegrationStorageGenerationTarget(generatedTarget, "integration", {
+        provider: exactProvider,
+        reader: {
+          async read(phase) {
+            reads.push(`schema:${phase}`);
+            return incomplete;
+          },
+        },
+        migrationDirectory: currentMigrations,
+      }),
+    );
+    expect(mismatch).toBeInstanceOf(DeployError);
+    if (!(mismatch instanceof DeployError)) throw mismatch;
+    expect(mismatch.phase).toBe("preflight");
+    expect(mismatch.message).toContain("exact audited 0001-0063 lineage");
+    expect(mismatch.message).not.toContain("R2 creation is withheld");
+    expect(reads).toEqual(["D1", "R2", "schema:preflight"]);
+  });
+
   test("D1 filtered inventory ignores account-wide total_count and closes on a short page", async () => {
     const requests: Request[] = [];
     const provider = new CloudflareIntegrationStorageProvider(target.accountId, "bearer-secret", {
@@ -467,29 +873,37 @@ describe("integration storage generation bootstrap", () => {
     expect(failed.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrong = providerFixture();
-    await expect(
+    const wrongError = await rejectedError(
       runIntegrationStorageGeneration(
         invocation,
         target,
         options(wrong.provider, [emptyState, state(["0001_runtime_storage.sql"], [])]),
       ),
-    ).rejects.toThrow("exact audited 0001-0057 lineage");
+    );
+    expect(wrongError).toBeInstanceOf(DeployError);
+    if (!(wrongError instanceof DeployError)) throw wrongError;
+    expect(wrongError.phase).toBe("verification");
+    expect(wrongError.message).toContain("exact audited 0001-0063 lineage");
     expect(wrong.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const wrongShape = providerFixture();
-    await expect(
+    const wrongShapeError = await rejectedError(
       runIntegrationStorageGeneration(
         invocation,
         target,
         options(wrongShape.provider, [
           emptyState,
           stateWithShape(
-            MIGRATIONS.slice(0, 57).map(({ name }) => name),
+            MIGRATIONS.map(({ name }) => name),
             "[]\n",
           ),
         ]),
       ),
-    ).rejects.toThrow("differs from the exact audited application schema");
+    );
+    expect(wrongShapeError).toBeInstanceOf(DeployError);
+    if (!(wrongShapeError instanceof DeployError)) throw wrongShapeError;
+    expect(wrongShapeError.phase).toBe("verification");
+    expect(wrongShapeError.message).toContain("differs from the exact audited application schema");
     expect(wrongShape.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
 
     const raced = providerFixture({ secondR2: { name: GENERATED_NAME } });
@@ -541,7 +955,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0058_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0064_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -549,7 +963,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0057");
+      ).rejects.toThrow("exactly 0001-0063");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

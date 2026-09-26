@@ -210,6 +210,7 @@ test("the provider's exact private-PUT/public-apply/private-GET sequence complet
   const spent: { bindings?: Readonly<Record<string, string>> } = {};
   const driver: TakoformResourceDriver = {
     ...inner,
+    selectApply: (input) => inner.selectApply(input),
     apply: async (input) => {
       if (input.publicApply) {
         const lease = await runtimeInputs.leases.acquire({

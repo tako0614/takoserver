@@ -23,6 +23,7 @@ import {
   WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservations,
 } from "../src/worker-endpoint-origin-reservations.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const clock = () => new Date("2026-09-01T00:00:00.000Z");
 const tenantId = "org_endpoint_assignment";
@@ -389,7 +390,7 @@ async function fixture(input: {
  */
 test("an ordinary key gets a Host-minted reservation when the address is derived", async () => {
   const context = await fixture({});
-  await context.driver.apply(context.applyInput);
+  await applyWithSelection(context.driver, context.applyInput);
   expect(context.events).toEqual([
     "reservation.mint",
     "reservation.assign",
@@ -401,7 +402,7 @@ test("an ordinary key gets a Host-minted reservation when the address is derived
 
 test("WorkerEndpoint create is refused where no address is derived and none was supplied", async () => {
   const context = await fixture({ hostMintsReservation: false });
-  await expect(context.driver.apply(context.applyInput)).rejects.toMatchObject({
+  await expect(applyWithSelection(context.driver, context.applyInput)).rejects.toMatchObject({
     code: "unsupported_capability",
     status: 422,
   });
@@ -410,7 +411,7 @@ test("WorkerEndpoint create is refused where no address is derived and none was 
 
 test("a supplied reservation is used as it is, and nothing is minted beside it", async () => {
   const context = await fixture({});
-  await context.driver.apply({
+  await applyWithSelection(context.driver, {
     ...context.applyInput,
     workerEndpointOriginReservationId: "reservation-01",
   });
@@ -435,7 +436,7 @@ test("a supplied reservation is used as it is, and nothing is minted beside it",
 test("a supplied prepared reservation must bind before assignment and provider dispatch", async () => {
   const context = await fixture({ bindFailure: { code: "conflict", status: 409 } });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -457,7 +458,7 @@ test("a supplied prepared reservation must bind before assignment and provider d
 test("a supplied prepared reservation surfaces bind backend failure before assignment", async () => {
   const context = await fixture({ bindFailure: { code: "backend_unavailable", status: 503 } });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -470,7 +471,7 @@ test("a supplied prepared reservation surfaces bind backend failure before assig
 test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async () => {
   const context = await fixture({ priced: true });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -505,7 +506,7 @@ test("a priced pre-dispatch refusal exact-cancels the assigned endpoint", async 
 test("releases an assignment the provider never got activated, and gates the receipt", async () => {
   const context = await fixture({ activationFails: true });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -559,7 +560,7 @@ test("refuses a receipt its Form cannot publish before the assignment is activat
       }),
   });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -596,7 +597,7 @@ test("refuses a receipt its Form cannot publish before the assignment is activat
 test("gives back an assignment whose mutation failed after it was activated", async () => {
   const context = await fixture({ priced: true, captureFails: true });
   await expect(
-    context.driver.apply({
+    applyWithSelection(context.driver, {
       ...context.applyInput,
       workerEndpointOriginReservationId: "reservation-01",
     }),
@@ -621,12 +622,12 @@ test("gives back an assignment whose mutation failed after it was activated", as
 
 test("WorkerEndpoint updates re-resolve the durable assignment instead of a logical hostname", async () => {
   const context = await fixture({});
-  await context.driver.apply({
+  await applyWithSelection(context.driver, {
     ...context.applyInput,
     workerEndpointOriginReservationId: "reservation-01",
   });
   context.events.length = 0;
-  await context.driver.apply({
+  await applyWithSelection(context.driver, {
     ...context.applyInput,
     operationId: "operation-endpoint-update",
     operationKey: "key-endpoint-update",
@@ -643,13 +644,16 @@ test("recovery convergence resumes the exact assignment after process death befo
     ...context.applyInput,
     workerEndpointOriginReservationId: "reservation-01",
   } as const;
-  await expect(context.driver.apply(command)).rejects.toMatchObject({
+  await expect(applyWithSelection(context.driver, command)).rejects.toMatchObject({
     code: "backend_unavailable",
     status: 503,
   });
   expect(context.events).toEqual(["reservation.bind", "reservation.assign"]);
 
-  const recovered = await context.driver.apply({ ...command, operationMode: "recovery" });
+  const recovered = await applyWithSelection(context.driver, {
+    ...command,
+    operationMode: "recovery",
+  });
   expect(recovered.outputs).toMatchObject({ hostname: "reserved.endpoint.test" });
   expect(context.events).toEqual([
     "reservation.bind",
@@ -780,4 +784,49 @@ test("delete recovery settles the exact provider tombstone before reservation de
     incarnationId: "deployment-endpoint",
     generation: "1",
   });
+});
+
+test("maintenance delete convergence falls back to a provider's read-only recovery capability", async () => {
+  const context = await fixture({
+    recoverDelete: async (input) =>
+      succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} }),
+  });
+  await context.deployments.create({
+    tenantId,
+    id: "deployment-endpoint-maintenance-fallback",
+    resourceUid: endpointUid,
+    offeringId: "fake.endpoint",
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    nativeId: `endpoint:${endpointUid}`,
+    state: "active",
+    observed: {},
+    outputs: {},
+  });
+  const worker = (await buildEdgeForms()).forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!worker) throw new Error("released ModuleWorker Form missing");
+
+  await context.driver.delete({
+    operationId: "operation-endpoint-maintenance-fallback",
+    operationMode: "recovery",
+    recoveryAction: "converge",
+    executionAuthority: {
+      tenantId,
+      resourceUid: endpointUid,
+      leaseToken: "lease-endpoint-maintenance-fallback",
+      fingerprint: "fingerprint-endpoint-maintenance-fallback",
+    },
+    tenantId,
+    resourceUid: endpointUid,
+    resource: endpointResource(context.endpoint),
+    relations: [workerRelation(worker)],
+  });
+
+  expect(context.events).toEqual([
+    "reservation.lookup",
+    "provider.recoverDelete",
+    "reservation.deactivate",
+  ]);
 });

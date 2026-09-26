@@ -2,10 +2,20 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  TAKOFORM_APPLY_SELECTION_VERSION,
+  type TakoformApplySelection,
+} from "../src/takoform/apply-selection.ts";
+import {
+  TAKOFORM_IMPORT_SELECTION_VERSION,
+  type TakoformImportSelection,
+} from "../src/takoform/import-selection.ts";
+import { OPERATION_TTL_MILLISECONDS } from "../src/takoform/limits.ts";
 import { createTakoformStore, type ProviderMutationSaga } from "../src/takoform/store.ts";
 
 const saga: ProviderMutationSaga = {
   operationId: "op_execution_lease",
+  operationKind: "apply",
   replayKey: "replay-execution-lease",
   tenantId: "tenant-a",
   fingerprint: '{"request":"same"}',
@@ -19,7 +29,733 @@ const saga: ProviderMutationSaga = {
   },
 };
 
+const applySelection = {
+  version: TAKOFORM_APPLY_SELECTION_VERSION,
+  kind: "provider",
+  providerPackRef: "provider-a",
+  providerInstallationRef: "provider-a.primary",
+  technicalOffering: {
+    id: "provider-a.thing",
+    kind: "Thing",
+    displayName: "Thing",
+    form: {
+      apiVersion: "example.forms.invalid",
+      kind: "Thing",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"a".repeat(64)}`,
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    capabilities: ["create", "update"],
+  },
+  relations: [],
+} satisfies TakoformApplySelection;
+
+const importSelection = {
+  version: TAKOFORM_IMPORT_SELECTION_VERSION,
+  kind: "intrinsic",
+  nativeId: "native-import",
+} satisfies TakoformImportSelection;
+
+const UNFENCED_ACCEPTED_AUTHORITY =
+  '{"mode":"unfenced","protocolGeneration":1,"version":"takoserver.takoform-accepted-authority@v1"}';
+
+async function recordPlannedProviderEffect(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+): Promise<void> {
+  expect(
+    await store.reserveResourceIncarnation({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      address: mutationSaga.target,
+      formRef: applySelection.technicalOffering.form,
+    }),
+  ).toBe(true);
+  expect(
+    await store.recordResourceEffect({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      effectId: mutationSaga.operationId,
+      kind: mutationSaga.operationKind,
+      phase: "planned",
+      operationMode: "initial",
+    }),
+  ).toBe(true);
+}
+
+async function recordDispatchedProviderEffect(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+): Promise<void> {
+  expect(
+    await store.recordResourceEffect({
+      tenantId: mutationSaga.tenantId,
+      resourceUid: mutationSaga.resourceUid,
+      effectId: mutationSaga.operationId,
+      kind: mutationSaga.operationKind,
+      phase: "dispatched",
+      operationMode: "initial",
+    }),
+  ).toBe(true);
+}
+
+async function bindImportSelection(
+  store: ReturnType<typeof createTakoformStore>,
+  mutationSaga: ProviderMutationSaga,
+  leaseToken: string,
+  mode: "initial" | "recovery",
+): Promise<void> {
+  expect(
+    await store.bindProviderMutationImportSelection({
+      tenantId: mutationSaga.tenantId,
+      operationId: mutationSaga.operationId,
+      resourceUid: mutationSaga.resourceUid,
+      fingerprint: mutationSaga.fingerprint,
+      leaseToken,
+      mode,
+      selection: importSelection,
+    }),
+  ).toEqual(importSelection);
+}
+
 describe("provider mutation saga execution leases", () => {
+  test("retains an accepted selection across the ordinary plan expiry before dispatch", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      let now = 1_000;
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+      const identity = {
+        tenantId: saga.tenantId,
+        operationId: saga.operationId,
+        resourceUid: saga.resourceUid,
+      };
+      await store.acceptProviderMutationSaga(saga);
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_before_preparation",
+        leaseUntil: now + 1_000,
+      });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          ...identity,
+          fingerprint: saga.fingerprint,
+          leaseToken: "lease_before_preparation",
+          mode: "initial",
+          selection: applySelection,
+        }),
+      ).toEqual(applySelection);
+
+      // A preparation callback may have started after accepting the selection,
+      // even though dispatch has not been marked. Age alone proves no absence.
+      now += OPERATION_TTL_MILLISECONDS + 1;
+      await store.acceptProviderMutationSaga({
+        ...saga,
+        operationId: "op_sweep_unrelated",
+        replayKey: "replay-sweep-unrelated",
+        resourceUid: "uid_sweep_unrelated",
+        target: { ...saga.target, name: "sweep-unrelated" },
+      });
+      expect(
+        database
+          .query(
+            `SELECT selection_json, execution_started_at
+             FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+          )
+          .get(saga.operationId),
+      ).toMatchObject({
+        selection_json: expect.any(String),
+        execution_started_at: null,
+      });
+      expect(await store.acceptProviderMutationSaga(saga)).toEqual(saga);
+      expect(
+        await store.acquireProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_after_preparation_timeout",
+          leaseUntil: now + 1_000,
+        }),
+      ).toEqual({ kind: "acquired", mode: "initial", applySelection });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          ...identity,
+          fingerprint: saga.fingerprint,
+          leaseToken: "lease_after_preparation_timeout",
+          mode: "initial",
+          selection: { ...applySelection, providerPackRef: "provider-b" },
+        }),
+      ).toBeNull();
+    } finally {
+      database.close();
+    }
+  });
+
+  test("binds one immutable apply selection and requires each recovery lease to verify it", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const selectedSaga = {
+      ...saga,
+      operationId: "op_selected_apply",
+      replayKey: "replay-selected-apply",
+      resourceUid: "uid_selected_apply",
+      target: { ...saga.target, name: "selected-apply" },
+    };
+    const identity = {
+      tenantId: selectedSaga.tenantId,
+      operationId: selectedSaga.operationId,
+      resourceUid: selectedSaga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(selectedSaga);
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_initial",
+        leaseUntil: 2_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_initial",
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_stale",
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toBeNull();
+    expect(
+      await store.markProviderMutationDispatch({ ...identity, leaseToken: "lease_initial" }),
+    ).toBe(true);
+
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_recovery",
+        leaseUntil: 3_000,
+      }),
+    ).toEqual({
+      kind: "acquired",
+      mode: "recovery",
+      applySelection,
+    });
+    expect(
+      await store.markProviderMutationDispatch({
+        ...identity,
+        leaseToken: "lease_recovery",
+        mode: "recovery",
+      }),
+    ).toBe(false);
+    expect(
+      await store.releaseProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_recovery",
+      }),
+    ).toBe(true);
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_verified_recovery",
+        leaseUntil: 3_000,
+      }),
+    ).toMatchObject({ kind: "acquired", mode: "recovery", applySelection });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+        selection: { ...applySelection, providerPackRef: "provider-b" },
+      }),
+    ).toBeNull();
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: selectedSaga.fingerprint,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    expect(
+      database
+        .query(
+          `SELECT execution_lease_token, selection_verified_lease_token,
+                  execution_started_at, execution_lease_until
+           FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+        )
+        .get(selectedSaga.operationId),
+    ).toEqual({
+      execution_lease_token: "lease_verified_recovery",
+      selection_verified_lease_token: "lease_verified_recovery",
+      execution_started_at: 1_000,
+      execution_lease_until: 3_000,
+    });
+    expect(
+      await store.markProviderMutationDispatch({
+        ...identity,
+        leaseToken: "lease_verified_recovery",
+        mode: "recovery",
+      }),
+    ).toBe(true);
+    database.close();
+  });
+
+  test("routes apply no-effect conclusion only for a receiptless no-handle create", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+      const seedDispatched = async (
+        suffix: string,
+        accepted?: {
+          readonly acceptedUid: string;
+          readonly acceptedGeneration: string;
+          readonly acceptedRevision: string;
+        },
+      ) => {
+        const mutationSaga: ProviderMutationSaga = {
+          ...saga,
+          operationId: `op_no_effect_${suffix}`,
+          replayKey: `replay-no-effect-${suffix}`,
+          resourceUid: `uid_no_effect_${suffix}`,
+          target: { ...saga.target, name: `no-effect-${suffix}` },
+          ...accepted,
+        };
+        const identity = {
+          tenantId: mutationSaga.tenantId,
+          operationId: mutationSaga.operationId,
+          resourceUid: mutationSaga.resourceUid,
+        };
+        const leaseToken = `lease_${suffix}`;
+        await store.acceptProviderMutationSaga(mutationSaga);
+        expect(
+          await store.acquireProviderMutationExecution({
+            ...identity,
+            leaseToken,
+            leaseUntil: 2_000,
+          }),
+        ).toMatchObject({ kind: "acquired", mode: "initial" });
+        expect(
+          await store.bindProviderMutationApplySelection({
+            ...identity,
+            fingerprint: mutationSaga.fingerprint,
+            leaseToken,
+            mode: "initial",
+            selection: applySelection,
+          }),
+        ).toEqual(applySelection);
+        expect(await store.markProviderMutationDispatch({ ...identity, leaseToken })).toBe(true);
+        expect(
+          await store.recordProviderMutationOutcome({
+            ...identity,
+            leaseToken,
+            outcome: "indeterminate",
+          }),
+        ).toBe(true);
+        return { identity, leaseToken };
+      };
+
+      const noHandle = await seedDispatched("no_handle");
+      expect(await store.isProviderMutationApplyNoEffectCandidate(noHandle.identity)).toBe(true);
+      expect(
+        await store.recordProviderMutationOutcome({
+          ...noHandle.identity,
+          leaseToken: noHandle.leaseToken,
+          outcome: "running",
+          providerHandle: "provider-operation-handle",
+        }),
+      ).toBe(true);
+      expect(await store.isProviderMutationApplyNoEffectCandidate(noHandle.identity)).toBe(false);
+
+      const receipt = await seedDispatched("receipt");
+      expect(await store.isProviderMutationApplyNoEffectCandidate(receipt.identity)).toBe(true);
+      await store.recordProviderMutationReceipt({
+        ...receipt.identity,
+        leaseToken: receipt.leaseToken,
+        receipt: { observed: { durable: true } },
+      });
+      expect(await store.isProviderMutationApplyNoEffectCandidate(receipt.identity)).toBe(false);
+
+      const update = await seedDispatched("update", {
+        acceptedUid: "uid_existing_resource",
+        acceptedGeneration: "7",
+        acceptedRevision: "9",
+      });
+      expect(await store.isProviderMutationApplyNoEffectCandidate(update.identity)).toBe(false);
+
+      const unselectedSaga: ProviderMutationSaga = {
+        ...saga,
+        operationId: "op_no_effect_unselected",
+        replayKey: "replay-no-effect-unselected",
+        resourceUid: "uid_no_effect_unselected",
+        target: { ...saga.target, name: "no-effect-unselected" },
+      };
+      await store.acceptProviderMutationSaga(unselectedSaga);
+      expect(
+        await store.isProviderMutationApplyNoEffectCandidate({
+          tenantId: unselectedSaga.tenantId,
+          operationId: unselectedSaga.operationId,
+          resourceUid: unselectedSaga.resourceUid,
+        }),
+      ).toBe(false);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("does not abandon a bound apply plan, even after its execution lease is released", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+      const selectedSaga = {
+        ...saga,
+        operationId: "op_bound_apply_retention",
+        replayKey: "replay-bound-apply-retention",
+        resourceUid: "uid_bound_apply_retention",
+        target: { ...saga.target, name: "bound-apply-retention" },
+      };
+      const identity = {
+        tenantId: selectedSaga.tenantId,
+        operationId: selectedSaga.operationId,
+        resourceUid: selectedSaga.resourceUid,
+      };
+      await store.acceptProviderMutationSaga(selectedSaga);
+      expect(
+        await store.acquireProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply",
+          leaseUntil: 2_000,
+        }),
+      ).toEqual({ kind: "acquired", mode: "initial" });
+      expect(
+        await store.bindProviderMutationApplySelection({
+          ...identity,
+          fingerprint: selectedSaga.fingerprint,
+          leaseToken: "lease_bound_apply",
+          mode: "initial",
+          selection: applySelection,
+        }),
+      ).toEqual(applySelection);
+
+      // A live execution lease is never an abandon proof.
+      expect(
+        await store.abandonProviderMutationPlan({
+          ...identity,
+          replayKey: selectedSaga.replayKey,
+        }),
+      ).toBe(false);
+      expect(
+        await store.releaseProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply",
+        }),
+      ).toBe(true);
+
+      // Releasing the lease does not erase the accepted destination. The
+      // caller can retry the same initial command, while cleanup remains
+      // forbidden to discard the repair unit.
+      expect(
+        await store.abandonProviderMutationPlan({
+          ...identity,
+          replayKey: selectedSaga.replayKey,
+        }),
+      ).toBe(false);
+      expect(
+        await store.providerMutationPlanExists(
+          identity.tenantId,
+          identity.operationId,
+          identity.resourceUid,
+        ),
+      ).toBe(true);
+      expect(
+        await store.acquireProviderMutationExecution({
+          ...identity,
+          leaseToken: "lease_bound_apply_retry",
+          leaseUntil: 2_000,
+        }),
+      ).toEqual({ kind: "acquired", mode: "initial", applySelection });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("retains a selected deferred apply atomically without extending either execution lease", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const now = 1_000;
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+      await store.acceptDeferredOperation({
+        id: saga.operationId,
+        tenantId: saga.tenantId,
+        principalId: "principal-a",
+        operation: "apply",
+        phase: "pending",
+        requestPath: "/resources/Thing/leased",
+        requestQuery: "?space=main",
+        requestHeaders: {},
+        fingerprint: saga.fingerprint,
+        replayKey: saga.replayKey,
+        target: { ...saga.target, formRef: applySelection.technicalOffering.form },
+        resourceUid: saga.resourceUid,
+        pollsRemaining: 1,
+        createdAt: new Date(now).toISOString(),
+      });
+      await store.advanceDeferredOperation({
+        tenantId: saga.tenantId,
+        principalId: "principal-a",
+        id: saga.operationId,
+        leaseToken: "host_lease",
+        leaseUntil: 5_000,
+      });
+      expect(
+        (
+          await store.advanceDeferredOperation({
+            tenantId: saga.tenantId,
+            principalId: "principal-a",
+            id: saga.operationId,
+            leaseToken: "host_lease",
+            leaseUntil: 5_000,
+          })
+        ).acquired,
+      ).toBe(true);
+      await store.acceptProviderMutationSaga(saga);
+      await store.acquireProviderMutationExecution({
+        tenantId: saga.tenantId,
+        operationId: saga.operationId,
+        resourceUid: saga.resourceUid,
+        leaseToken: "provider_lease",
+        leaseUntil: 2_000,
+      });
+      const input = {
+        tenantId: saga.tenantId,
+        operationId: saga.operationId,
+        resourceUid: saga.resourceUid,
+        fingerprint: saga.fingerprint,
+        leaseToken: "provider_lease",
+        mode: "initial" as const,
+        selection: applySelection,
+      };
+      const state = () => ({
+        saga: database
+          .query(
+            `SELECT expires_at, execution_lease_until, selection_json
+             FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?`,
+          )
+          .get(saga.operationId),
+        deferred: database
+          .query(
+            "SELECT expires_at, lease_until FROM tf_deferred_operations_selection_v1 WHERE id = ?",
+          )
+          .get(saga.operationId),
+      });
+      const before = state();
+      for (const invalid of [
+        { ...input, fingerprint: "different-command" },
+        { ...input, leaseToken: "stale_lease" },
+        { ...input, mode: "recovery" as const },
+      ]) {
+        expect(await store.bindProviderMutationApplySelection(invalid)).toBeNull();
+        expect(state()).toEqual(before);
+      }
+      database.exec(`
+        CREATE TRIGGER test_reject_deferred_selection_retention
+        BEFORE UPDATE OF expires_at ON tf_deferred_operations_selection_v1
+        WHEN NEW.expires_at = 253402300799999
+        BEGIN
+          SELECT RAISE(ABORT, 'selection_retention_constraint');
+        END;
+      `);
+      await expect(store.bindProviderMutationApplySelection(input)).rejects.toThrow(
+        "selection_retention_constraint",
+      );
+      expect(state()).toEqual(before);
+      database.exec("DROP TRIGGER test_reject_deferred_selection_retention");
+
+      expect(await store.bindProviderMutationApplySelection(input)).toEqual(applySelection);
+      expect(state()).toEqual({
+        saga: {
+          expires_at: 253402300799999,
+          execution_lease_until: 2_000,
+          selection_json: expect.any(String),
+        },
+        deferred: { expires_at: 253402300799999, lease_until: 5_000 },
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("refuses to dispatch a current apply before its selection is bound", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const historicalSaga = {
+      ...saga,
+      operationId: "op_historical_unselected_apply",
+      replayKey: "replay-historical-unselected-apply",
+      resourceUid: "uid_historical_unselected_apply",
+      target: { ...saga.target, name: "historical-unselected-apply" },
+    };
+    const identity = {
+      tenantId: historicalSaga.tenantId,
+      operationId: historicalSaga.operationId,
+      resourceUid: historicalSaga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(historicalSaga);
+    await store.acquireProviderMutationExecution({
+      ...identity,
+      leaseToken: "lease_old_binary",
+      leaseUntil: 2_000,
+    });
+    expect(
+      await store.markProviderMutationDispatch({ ...identity, leaseToken: "lease_old_binary" }),
+    ).toBe(false);
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "lease_current_binary",
+        leaseUntil: 3_000,
+      }),
+    ).toEqual({ kind: "acquired", mode: "initial" });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: historicalSaga.fingerprint,
+        leaseToken: "lease_current_binary",
+        mode: "recovery",
+        selection: applySelection,
+      }),
+    ).toBeNull();
+    database.close();
+  });
+
+  test("only explicit whole-operation apply proof and the current lease retire an indeterminate create", async () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    let now = 1_000;
+    const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
+    const identity = {
+      tenantId: saga.tenantId,
+      operationId: saga.operationId,
+      resourceUid: saga.resourceUid,
+    };
+    await store.acceptProviderMutationSaga(saga);
+    await store.acquireProviderMutationExecution({
+      ...identity,
+      leaseToken: "old",
+      leaseUntil: 2_000,
+    });
+    expect(
+      await store.bindProviderMutationApplySelection({
+        ...identity,
+        fingerprint: saga.fingerprint,
+        leaseToken: "old",
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    await recordPlannedProviderEffect(store, saga);
+    expect(await store.markProviderMutationDispatch({ ...identity, leaseToken: "old" })).toBe(true);
+    await recordDispatchedProviderEffect(store, saga);
+    const unrelatedSaga: ProviderMutationSaga = {
+      ...saga,
+      operationId: "op_unrelated_open_effect",
+      replayKey: "replay-unrelated-open-effect",
+      resourceUid: "uid_unrelated_open_effect",
+      target: { ...saga.target, name: "unrelated-open-effect" },
+    };
+    await recordPlannedProviderEffect(store, unrelatedSaga);
+    await recordDispatchedProviderEffect(store, unrelatedSaga);
+    const unrelatedEffects = database
+      .query(
+        `SELECT * FROM tf_resource_provider_effects
+         WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+      )
+      .all(unrelatedSaga.tenantId, unrelatedSaga.resourceUid);
+    await store.recordProviderMutationOutcome({
+      ...identity,
+      leaseToken: "old",
+      outcome: "indeterminate",
+    });
+    now = 2_001;
+    expect(
+      await store.acquireProviderMutationExecution({
+        ...identity,
+        leaseToken: "current",
+        leaseUntil: 3_000,
+      }),
+    ).toMatchObject({ kind: "acquired", mode: "recovery" });
+    expect(
+      await store.settleProviderMutationPreconditionFailure({ ...identity, leaseToken: "current" }),
+    ).toBe(false);
+    expect(
+      await store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "old",
+        recoveryAction: "convergeApply",
+      }),
+    ).toBe(false);
+    await expect(
+      store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "current",
+        recoveryAction: "recoverAdopt" as "convergeApply",
+      }),
+    ).rejects.toThrow("invalid provider refusal recovery action");
+    expect(
+      await store.settleProviderMutationPreconditionFailure({
+        ...identity,
+        leaseToken: "current",
+        recoveryAction: "convergeApply",
+      }),
+    ).toBe(true);
+    await expect(
+      store.recordProviderMutationReceipt({
+        ...identity,
+        leaseToken: "old",
+        receipt: { observed: { late: true } },
+      }),
+    ).rejects.toMatchObject({ code: "resource_busy" });
+    expect(
+      await store.providerMutationPlanExists(saga.tenantId, saga.operationId, saga.resourceUid),
+    ).toBe(false);
+    expect(
+      database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(saga.operationId),
+    ).toEqual([
+      { effect_kind: "apply", phase: "cancelled" },
+      { effect_kind: "apply", phase: "dispatched" },
+      { effect_kind: "apply", phase: "planned" },
+    ]);
+    expect(
+      database
+        .query(
+          `SELECT * FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+        )
+        .all(unrelatedSaga.tenantId, unrelatedSaga.resourceUid),
+    ).toEqual(unrelatedEffects);
+    database.close();
+  });
   test("fences concurrent and stale executors while preserving one idempotent receipt", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
@@ -48,6 +784,17 @@ describe("provider mutation saga execution leases", () => {
     expect(firstOwner).toMatchObject({ kind: "acquired", mode: "initial" });
     const firstToken = first === firstOwner ? "lease_first" : "lease_concurrent";
     expect(
+      await store.bindProviderMutationApplySelection({
+        tenantId: saga.tenantId,
+        operationId: saga.operationId,
+        resourceUid: saga.resourceUid,
+        fingerprint: saga.fingerprint,
+        leaseToken: firstToken,
+        mode: "initial",
+        selection: applySelection,
+      }),
+    ).toEqual(applySelection);
+    expect(
       await store.markProviderMutationDispatch({
         tenantId: saga.tenantId,
         operationId: saga.operationId,
@@ -64,7 +811,7 @@ describe("provider mutation saga execution leases", () => {
       leaseToken: "lease_recovered",
       leaseUntil: 3_001,
     });
-    expect(recovered).toEqual({ kind: "acquired", mode: "recovery" });
+    expect(recovered).toEqual({ kind: "acquired", mode: "recovery", applySelection });
 
     database
       .query(
@@ -87,25 +834,28 @@ describe("provider mutation saga execution leases", () => {
       );
     database
       .query(
-        `INSERT INTO tf_deferred_operations
-           (id, tenant_id, principal_id, operation, phase, request_path, request_query,
+        `INSERT INTO tf_deferred_operations_selection_v1
+           (id, protocol_generation, tenant_id, principal_id, operation, phase, request_path, request_query,
             request_headers_json, request_body_json, fingerprint, replay_key,
             target_space, target_api_version, target_kind, target_name,
-            target_form_ref_json, accepted_uid, accepted_generation, accepted_revision,
+            target_form_ref_json, accepted_authority_json,
+            accepted_uid, accepted_generation, accepted_revision,
             resource_uid, polls_remaining, lease_token, lease_until, terminal_json,
             committed_uid, created_at, updated_at, expires_at)
-         VALUES (?, ?, 'principal-a', 'apply', 'committing', '/', '', '{}', '{}', '{}',
-                 'deferred-replay-execution-lease', ?, ?, ?, ?, '{}', NULL, NULL, NULL,
+         VALUES (?, 1, ?, 'principal-a', 'apply', 'committing', '/', '', '{}', '{}', ?,
+                 'deferred-replay-execution-lease', ?, ?, ?, ?, '{}', ?, NULL, NULL, NULL,
                  ?, 0, 'outer_recovered', 3001, NULL, NULL,
                  '2026-08-28T00:00:00.000Z', ?, 9001)`,
       )
       .run(
         saga.operationId,
         saga.tenantId,
+        saga.fingerprint,
         saga.target.space,
         saga.target.apiVersion,
         saga.target.kind,
         saga.target.name,
+        UNFENCED_ACCEPTED_AUTHORITY,
         saga.resourceUid,
         now,
       );
@@ -130,7 +880,7 @@ describe("provider mutation saga execution leases", () => {
       database
         .query(
           `SELECT lease_token, lease_until, updated_at, expires_at
-           FROM tf_deferred_operations WHERE id = ?`,
+           FROM tf_deferred_operations_selection_v1 WHERE id = ?`,
         )
         .get(saga.operationId),
     ).toEqual({
@@ -155,7 +905,7 @@ describe("provider mutation saga execution leases", () => {
       leaseToken: "lease_retry",
       leaseUntil: 3_001,
     });
-    expect(retry).toEqual({ kind: "acquired", mode: "recovery" });
+    expect(retry).toEqual({ kind: "acquired", mode: "recovery", applySelection });
     await store.recordProviderMutationReceipt({
       tenantId: saga.tenantId,
       operationId: saga.operationId,
@@ -226,12 +976,56 @@ describe("provider mutation saga execution leases", () => {
     database.close();
   });
 
+  test("abandons undispatched apply and delete plans without leaving an immortal target fence", async () => {
+    const database = new Database(":memory:");
+    try {
+      migrateSqlite(database);
+      const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+      for (const operationKind of ["apply", "delete"] as const) {
+        const candidate: ProviderMutationSaga = {
+          ...saga,
+          operationKind,
+          operationId: `op_abandon_${operationKind}`,
+          replayKey: `replay-abandon-${operationKind}`,
+          resourceUid: `uid_abandon_${operationKind}`,
+          target: { ...saga.target, name: `abandon-${operationKind}` },
+          ...(operationKind === "delete"
+            ? {
+                acceptedUid: `uid_abandon_${operationKind}`,
+                acceptedGeneration: "1",
+                acceptedRevision: "revision-one",
+              }
+            : {}),
+        };
+        await store.acceptProviderMutationSaga(candidate);
+        expect(
+          await store.abandonProviderMutationPlan({
+            tenantId: candidate.tenantId,
+            operationId: candidate.operationId,
+            replayKey: candidate.replayKey,
+            resourceUid: candidate.resourceUid,
+          }),
+        ).toBe(true);
+        expect(
+          await store.providerMutationPlanExists(
+            candidate.tenantId,
+            candidate.operationId,
+            candidate.resourceUid,
+          ),
+        ).toBe(false);
+      }
+    } finally {
+      database.close();
+    }
+  });
+
   test("a post-dispatch plan cannot be abandoned back into an initial execution", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
     const postDispatchSaga: ProviderMutationSaga = {
       ...saga,
+      operationKind: "import",
       operationId: "op_post_dispatch_preflight",
       replayKey: "replay-post-dispatch-preflight",
       resourceUid: "uid_post_dispatch_preflight",
@@ -248,6 +1042,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, postDispatchSaga, "lease_post_dispatch", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: postDispatchSaga.tenantId,
@@ -283,17 +1078,19 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_after_preflight_failure",
         leaseUntil: 2_000,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, postDispatchSaga, "lease_after_preflight_failure", "recovery");
     database.close();
   });
 
-  test("a stale import refusal cannot erase recovery after the newer lease releases", async () => {
+  test("only the current exact lease settles a closed definitive import outcome", async () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const staleImportSaga: ProviderMutationSaga = {
       ...saga,
+      operationKind: "import",
       operationId: "op_stale_import_conflict",
       replayKey: "replay-stale-import-conflict",
       resourceUid: "uid_stale_import_conflict",
@@ -309,6 +1106,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, staleImportSaga, "lease_stale_import", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: staleImportSaga.tenantId,
@@ -327,9 +1125,10 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_recovered_import",
         leaseUntil: 3_001,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, staleImportSaga, "lease_recovered_import", "recovery");
     expect(
-      await store.settleDefinitiveProviderImportConflict({
+      await store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
         operationId: staleImportSaga.operationId,
         replayKey: staleImportSaga.replayKey,
@@ -347,13 +1146,13 @@ describe("provider mutation saga execution leases", () => {
       }),
     ).toBe(true);
     expect(
-      await store.settleDefinitiveProviderImportConflict({
+      await store.settleDefinitiveProviderImportFailure({
         tenantId: staleImportSaga.tenantId,
         operationId: staleImportSaga.operationId,
         replayKey: staleImportSaga.replayKey,
         resourceUid: staleImportSaga.resourceUid,
         leaseToken: "lease_stale_import",
-        outcome: "import_conflict",
+        outcome: "adoption_aborted",
       }),
     ).toBe(false);
     expect(
@@ -364,7 +1163,35 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_after_stale_import",
         leaseUntil: 3_001,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery" });
+    ).toEqual({ kind: "acquired", mode: "recovery", importSelection });
+    await bindImportSelection(store, staleImportSaga, "lease_after_stale_import", "recovery");
+    await expect(
+      store.settleDefinitiveProviderImportFailure({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_after_stale_import",
+        outcome: "not_definitive" as "adoption_aborted",
+      }),
+    ).rejects.toThrow("provider import outcome must be definitive");
+    expect(
+      await store.settleDefinitiveProviderImportFailure({
+        tenantId: staleImportSaga.tenantId,
+        operationId: staleImportSaga.operationId,
+        replayKey: staleImportSaga.replayKey,
+        resourceUid: staleImportSaga.resourceUid,
+        leaseToken: "lease_after_stale_import",
+        outcome: "adoption_aborted",
+      }),
+    ).toBe(true);
+    expect(
+      await store.providerMutationPlanExists(
+        staleImportSaga.tenantId,
+        staleImportSaga.operationId,
+        staleImportSaga.resourceUid,
+      ),
+    ).toBe(false);
     database.close();
   });
 
@@ -375,6 +1202,7 @@ describe("provider mutation saga execution leases", () => {
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const recoverySaga: ProviderMutationSaga = {
       ...saga,
+      operationKind: "import",
       operationId: "op_persisted_provider_handle",
       replayKey: "replay-persisted-provider-handle",
       resourceUid: "uid_persisted_provider_handle",
@@ -390,6 +1218,7 @@ describe("provider mutation saga execution leases", () => {
         leaseUntil: 2_000,
       }),
     ).toEqual({ kind: "acquired", mode: "initial" });
+    await bindImportSelection(store, recoverySaga, "lease_handle_initial", "initial");
     expect(
       await store.markProviderMutationDispatch({
         tenantId: recoverySaga.tenantId,
@@ -429,9 +1258,11 @@ describe("provider mutation saga execution leases", () => {
     ).toEqual({
       kind: "acquired",
       mode: "recovery",
+      importSelection,
       providerHandle: "opaque-provider-handle",
       providerOutcome: "running",
     });
+    await bindImportSelection(store, recoverySaga, "lease_handle_recovery", "recovery");
     expect(
       await store.recordProviderMutationOutcome({
         tenantId: recoverySaga.tenantId,
@@ -459,7 +1290,13 @@ describe("provider mutation saga execution leases", () => {
         leaseToken: "lease_indeterminate_recovery",
         leaseUntil: 4_002,
       }),
-    ).toEqual({ kind: "acquired", mode: "recovery", providerOutcome: "indeterminate" });
+    ).toEqual({
+      kind: "acquired",
+      mode: "recovery",
+      importSelection,
+      providerOutcome: "indeterminate",
+    });
+    await bindImportSelection(store, recoverySaga, "lease_indeterminate_recovery", "recovery");
     database.close();
   });
 
@@ -467,14 +1304,147 @@ describe("provider mutation saga execution leases", () => {
     const database = new Database(":memory:");
     migrateSqlite(database);
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
+    for (const [suffix, terminalKind, terminalMode] of [
+      ["wrong-kind", "apply", "initial"],
+      ["wrong-mode", "import", "recovery"],
+    ] as const) {
+      const mismatchedSaga: ProviderMutationSaga = {
+        ...saga,
+        operationKind: "import",
+        operationId: `op_precondition_${suffix}`,
+        replayKey: `replay-precondition-${suffix}`,
+        resourceUid: `uid_precondition_${suffix}`,
+        target: { ...saga.target, name: `precondition-${suffix}` },
+      };
+      const leaseToken = `lease_${suffix}`;
+      await store.acceptProviderMutationSaga(mismatchedSaga);
+      await recordPlannedProviderEffect(store, mismatchedSaga);
+      await store.acquireProviderMutationExecution({
+        tenantId: mismatchedSaga.tenantId,
+        operationId: mismatchedSaga.operationId,
+        resourceUid: mismatchedSaga.resourceUid,
+        leaseToken,
+        leaseUntil: 2_000,
+      });
+      await bindImportSelection(store, mismatchedSaga, leaseToken, "initial");
+      expect(
+        await store.markProviderMutationDispatch({
+          tenantId: mismatchedSaga.tenantId,
+          operationId: mismatchedSaga.operationId,
+          resourceUid: mismatchedSaga.resourceUid,
+          leaseToken,
+        }),
+      ).toBe(true);
+      await recordDispatchedProviderEffect(store, mismatchedSaga);
+      database
+        .query(
+          `INSERT INTO tf_resource_provider_effects
+             (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+              operation_mode, provider_pack_ref, provider_installation_ref,
+              native_id, target_json, created_at)
+           VALUES (?, ?, ?, ?, ?, 'cancelled', ?, NULL, NULL, NULL, NULL, 1000)`,
+        )
+        .run(
+          mismatchedSaga.tenantId,
+          mismatchedSaga.resourceUid,
+          `${mismatchedSaga.operationId}:cancelled`,
+          mismatchedSaga.operationId,
+          terminalKind,
+          terminalMode,
+        );
+      expect(
+        await store.settleProviderMutationPreconditionFailure({
+          tenantId: mismatchedSaga.tenantId,
+          operationId: mismatchedSaga.operationId,
+          resourceUid: mismatchedSaga.resourceUid,
+          leaseToken,
+        }),
+      ).toBe(false);
+      expect(
+        await store.providerMutationPlanExists(
+          mismatchedSaga.tenantId,
+          mismatchedSaga.operationId,
+          mismatchedSaga.resourceUid,
+        ),
+      ).toBe(true);
+    }
+    const rollbackSaga: ProviderMutationSaga = {
+      ...saga,
+      operationKind: "delete",
+      operationId: "op_precondition_rollback",
+      replayKey: "replay-precondition-rollback",
+      resourceUid: "uid_precondition_rollback",
+      target: { ...saga.target, name: "precondition-rollback" },
+    };
+    const rollbackIdentity = {
+      tenantId: rollbackSaga.tenantId,
+      operationId: rollbackSaga.operationId,
+      resourceUid: rollbackSaga.resourceUid,
+      leaseToken: "lease_precondition_rollback",
+    };
+    await store.acceptProviderMutationSaga(rollbackSaga);
+    await recordPlannedProviderEffect(store, rollbackSaga);
+    await store.acquireProviderMutationExecution({ ...rollbackIdentity, leaseUntil: 2_000 });
+    expect(await store.markProviderMutationDispatch(rollbackIdentity)).toBe(true);
+    await recordDispatchedProviderEffect(store, rollbackSaga);
+    const rollbackState = () => ({
+      attestation: database
+        .query(
+          `SELECT * FROM tf_resource_deletion_attestations
+           WHERE tenant_id = ? AND resource_uid = ?`,
+        )
+        .get(rollbackSaga.tenantId, rollbackSaga.resourceUid),
+      effects: database
+        .query(
+          `SELECT * FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? ORDER BY event_id`,
+        )
+        .all(rollbackSaga.tenantId, rollbackSaga.resourceUid),
+      guards: database.query("SELECT * FROM tf_operation_commit_guards ORDER BY token").all(),
+      saga: database
+        .query(
+          `SELECT * FROM tf_provider_mutation_sagas_selection_v1
+           WHERE tenant_id = ? AND operation_id = ? AND resource_uid = ?`,
+        )
+        .get(rollbackSaga.tenantId, rollbackSaga.operationId, rollbackSaga.resourceUid),
+    });
+    const beforeRollback = rollbackState();
+    database.exec(`
+      CREATE TRIGGER test_reject_provider_precondition_saga_delete
+      BEFORE DELETE ON tf_provider_mutation_sagas_selection_v1
+      WHEN OLD.operation_id = 'op_precondition_rollback'
+      BEGIN
+        SELECT RAISE(ABORT, 'precondition_settlement_rollback');
+      END;
+    `);
+    await expect(store.settleProviderMutationPreconditionFailure(rollbackIdentity)).rejects.toThrow(
+      "precondition_settlement_rollback",
+    );
+    expect(rollbackState()).toEqual(beforeRollback);
+    database.exec("DROP TRIGGER test_reject_provider_precondition_saga_delete");
+
+    expect(await store.settleProviderMutationPreconditionFailure(rollbackIdentity)).toBe(true);
+    const afterCommit = rollbackState();
+    expect(afterCommit.saga).toBeNull();
+    expect(afterCommit.guards).toEqual([]);
+    expect(afterCommit.effects).toEqual([
+      expect.objectContaining({ effect_kind: "delete", phase: "cancelled" }),
+      expect.objectContaining({ effect_kind: "delete", phase: "dispatched" }),
+      expect.objectContaining({ effect_kind: "delete", phase: "planned" }),
+    ]);
+    expect(await store.settleProviderMutationPreconditionFailure(rollbackIdentity)).toBe(false);
+    expect(rollbackState()).toEqual(afterCommit);
+
     const failedSaga: ProviderMutationSaga = {
       ...saga,
+      operationKind: "import",
       operationId: "op_provider_precondition",
       replayKey: "replay-provider-precondition",
       resourceUid: "uid_provider_precondition",
       target: { ...saga.target, name: "provider-precondition" },
     };
     await store.acceptProviderMutationSaga(failedSaga);
+    await recordPlannedProviderEffect(store, failedSaga);
     await store.acquireProviderMutationExecution({
       tenantId: failedSaga.tenantId,
       operationId: failedSaga.operationId,
@@ -482,12 +1452,16 @@ describe("provider mutation saga execution leases", () => {
       leaseToken: "lease_precondition",
       leaseUntil: 2_000,
     });
-    await store.markProviderMutationDispatch({
-      tenantId: failedSaga.tenantId,
-      operationId: failedSaga.operationId,
-      resourceUid: failedSaga.resourceUid,
-      leaseToken: "lease_precondition",
-    });
+    await bindImportSelection(store, failedSaga, "lease_precondition", "initial");
+    expect(
+      await store.markProviderMutationDispatch({
+        tenantId: failedSaga.tenantId,
+        operationId: failedSaga.operationId,
+        resourceUid: failedSaga.resourceUid,
+        leaseToken: "lease_precondition",
+      }),
+    ).toBe(true);
+    await recordDispatchedProviderEffect(store, failedSaga);
     expect(
       await store.settleProviderMutationPreconditionFailure({
         tenantId: failedSaga.tenantId,
@@ -503,6 +1477,18 @@ describe("provider mutation saga execution leases", () => {
         failedSaga.resourceUid,
       ),
     ).toBe(false);
+    expect(
+      database
+        .query(
+          `SELECT effect_kind, phase FROM tf_resource_provider_effects
+           WHERE effect_id = ? ORDER BY event_id`,
+        )
+        .all(failedSaga.operationId),
+    ).toEqual([
+      { effect_kind: "import", phase: "cancelled" },
+      { effect_kind: "import", phase: "dispatched" },
+      { effect_kind: "import", phase: "planned" },
+    ]);
     database.close();
   });
 });

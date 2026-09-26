@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { JsonObject } from "../src/ports.ts";
+import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import type {
   InstalledTakoformForm,
   TakoformHost,
@@ -89,6 +90,9 @@ test("a WorkerEndpoint created before its own wave's WorkerDeployment succeeds",
     deploymentEntered = resolve;
   });
   const host = stableHost({
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       if (input.form.identity.formRef.kind === "WorkerDeployment") {
         deploymentEntered();
@@ -133,6 +137,9 @@ test("a WorkerEndpoint created before its own wave's WorkerDeployment succeeds",
 
 test("a WorkerEndpoint whose ModuleWorker declares no WorkerDeployment names what is missing", async () => {
   const host = stableHost({
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       return { observed: input.spec };
     },
@@ -166,6 +173,9 @@ test("a WorkerDeployment delete racing its WorkerEndpoint's delete succeeds", as
     endpointEntered = resolve;
   });
   const host = stableHost({
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       return { observed: input.spec };
     },
@@ -196,6 +206,9 @@ test("a WorkerDeployment delete racing its WorkerEndpoint's delete succeeds", as
 
 test("a WorkerDeployment delete still refuses a WorkerEndpoint nobody is deleting", async () => {
   const host = stableHost({
+    async selectApply() {
+      return { version: TAKOFORM_APPLY_SELECTION_VERSION, kind: "intrinsic" } as const;
+    },
     async apply(input) {
       return { observed: input.spec };
     },

@@ -1,11 +1,17 @@
 import { sanitizedMessage } from "../error-envelope.ts";
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
+import { acceptedAuthorityFromGrant } from "./accepted-authority.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
 import { receiptProjectable } from "./receipt-projection.ts";
-import type { DeferredOperationRecord, ResourceAddress, TakoformStore } from "./store.ts";
+import {
+  type DeferredOperationRecord,
+  LEGACY_OPERATION_GENERATION_CONFLICT,
+  type ResourceAddress,
+  type TakoformStore,
+} from "./store.ts";
 import {
   CROSS_RESOURCE_PRECONDITION,
   TakoformHostError,
@@ -47,6 +53,15 @@ export interface DeferredOperationsConfiguration {
    * repair remains durable and is resumed by maintenance after process loss.
    */
   readonly executeOnAccept?: boolean;
+  /**
+   * Bounds how long a mutation or poll request waits on inline execution
+   * before answering with the deferred contract (202 for a mutation, a pending
+   * Operation for a poll). The attempt is not cancelled: the durable record
+   * and its lease keep the saga resumable by the next poll or scheduled drain
+   * whether the detached work finishes, keeps running fenced by its lease, or
+   * dies with the isolate. Omit to keep every inline attempt unbounded.
+   */
+  readonly inlineExecuteMilliseconds?: number;
 }
 
 export interface DeferredOperations {
@@ -102,6 +117,15 @@ export function createDeferredOperations(input: {
     3_600_000,
     "leaseMilliseconds",
   );
+  const inlineExecuteMilliseconds =
+    input.configuration.inlineExecuteMilliseconds === undefined
+      ? undefined
+      : boundedInteger(
+          input.configuration.inlineExecuteMilliseconds,
+          1,
+          3_600_000,
+          "inlineExecuteMilliseconds",
+        );
 
   return {
     async accept(context, path, operation) {
@@ -147,10 +171,15 @@ export function createDeferredOperations(input: {
       if (replay) {
         if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
         if (await replayRetired(replay, input.store)) {
+          const retired = await input.store.retireDeferredOperation(replay.id, replay.replayKey);
+          if (!retired) {
+            return input.configuration.executeOnAccept
+              ? await executeAccepted(replay, accepted.lifecycleOperation)
+              : acceptedResponse(replay.id, retryAfterSeconds);
+          }
           if (replay.committedUid) {
             await input.store.releaseCommittedResourceClaims(replay.tenantId, replay.committedUid);
           }
-          await input.store.retireDeferredOperation(replay.id, replay.replayKey);
         } else {
           return input.configuration.executeOnAccept
             ? await executeAccepted(replay, accepted.lifecycleOperation)
@@ -161,39 +190,52 @@ export function createDeferredOperations(input: {
       const url = new URL(context.request.url);
       const operationId = nextIdentifier("op", input.randomId);
       const resourceUid = accepted.current?.metadata.uid ?? nextIdentifier("uid", input.randomId);
-      const record = await input.store.acceptDeferredOperation({
-        id: operationId,
-        tenantId: context.tenantId,
-        principalId: context.principalId,
-        operation,
-        phase: "pending",
-        requestPath: url.pathname,
-        requestQuery: url.search,
-        requestHeaders: retainedLifecycleHeaders(context.request),
-        ...(accepted.body === undefined ? {} : { requestBody: accepted.body }),
-        fingerprint,
-        replayKey,
-        target: {
-          space: accepted.space,
-          apiVersion: path.apiVersion,
-          kind: path.kind,
-          name: path.name,
-          formRef: structuredClone(accepted.formRef),
+      const record = await input.store.acceptDeferredOperation(
+        {
+          id: operationId,
+          tenantId: context.tenantId,
+          principalId: context.principalId,
+          operation,
+          phase: "pending",
+          requestPath: url.pathname,
+          requestQuery: url.search,
+          requestHeaders: retainedLifecycleHeaders(context.request),
+          ...(accepted.body === undefined ? {} : { requestBody: accepted.body }),
+          fingerprint,
+          replayKey,
+          target: {
+            space: accepted.space,
+            apiVersion: path.apiVersion,
+            kind: path.kind,
+            name: path.name,
+            formRef: structuredClone(accepted.formRef),
+          },
+          ...(accepted.current
+            ? {
+                acceptedUid: accepted.current.metadata.uid,
+                acceptedGeneration: accepted.current.metadata.generation,
+                acceptedRevision: accepted.current.metadata.revision,
+              }
+            : {}),
+          ...(operation === "apply" && accepted.authority
+            ? {
+                acceptedAuthority: acceptedAuthorityFromGrant({
+                  lifecycleOperation:
+                    accepted.lifecycleOperation === "create" ? "create" : "update",
+                  formRef: accepted.formRef,
+                  ...(accepted.authority?.fence ? { fence: accepted.authority.fence } : {}),
+                }),
+              }
+            : {}),
+          resourceUid,
+          ...(context.workerEndpointOriginReservationId
+            ? { workerEndpointOriginReservationId: context.workerEndpointOriginReservationId }
+            : {}),
+          pollsRemaining: pollsBeforeCommit,
+          createdAt: input.clock().toISOString(),
         },
-        ...(accepted.current
-          ? {
-              acceptedUid: accepted.current.metadata.uid,
-              acceptedGeneration: accepted.current.metadata.generation,
-              acceptedRevision: accepted.current.metadata.revision,
-            }
-          : {}),
-        resourceUid,
-        ...(context.workerEndpointOriginReservationId
-          ? { workerEndpointOriginReservationId: context.workerEndpointOriginReservationId }
-          : {}),
-        pollsRemaining: pollsBeforeCommit,
-        createdAt: input.clock().toISOString(),
-      });
+        operation === "apply" && accepted.authority?.fence ? accepted.authority.fence : undefined,
+      );
       if (record.fingerprint !== fingerprint) throw new TakoformHostError();
       return input.configuration.executeOnAccept
         ? await executeAccepted(record, accepted.lifecycleOperation)
@@ -258,7 +300,9 @@ export function createDeferredOperations(input: {
       if (isTerminal(operation)) return terminalResponse(operation);
       if (!advanced.acquired) return pendingResponse(operation.id, retryAfterSeconds);
 
-      await execute(operation, leaseToken);
+      if (!(await executeInline(operation, leaseToken, "observe"))) {
+        return pendingResponse(operation.id, retryAfterSeconds);
+      }
       const settled = await input.store.readDeferredOperation(
         operation.tenantId,
         operation.principalId,
@@ -287,7 +331,7 @@ export function createDeferredOperations(input: {
         });
         if (!advanced.acquired || !advanced.operation) continue;
         acquired += 1;
-        await execute(advanced.operation, leaseToken);
+        await execute(advanced.operation, leaseToken, "converge");
         const current = await input.store.readDeferredOperation(
           candidate.tenantId,
           candidate.principalId,
@@ -346,7 +390,9 @@ export function createDeferredOperations(input: {
     // executor reports a repair-needed error. The durable record is the public
     // authority in that case: reread it before answering so a pending repair
     // is tracked by its Operation handle rather than leaking the stale error.
-    await execute(advanced.operation, leaseToken);
+    if (!(await executeInline(advanced.operation, leaseToken, "observe"))) {
+      return acceptedResponse(record.id, retryAfterSeconds);
+    }
     const settled = await input.store.readDeferredOperation(
       record.tenantId,
       record.principalId,
@@ -361,6 +407,7 @@ export function createDeferredOperations(input: {
   async function execute(
     operation: DeferredOperationRecord,
     leaseToken: string,
+    deleteRecoveryAction: "observe" | "converge",
   ): Promise<
     { readonly kind: "settled" } | { readonly kind: "repair"; readonly error: TakoformHostError }
   > {
@@ -388,7 +435,12 @@ export function createDeferredOperations(input: {
       durableOperation: {
         id: operation.id,
         resourceUid: operation.resourceUid,
+        ...(operation.acceptedRevision !== undefined
+          ? { acceptedRevision: operation.acceptedRevision }
+          : {}),
         claimOwnerId: leaseToken,
+        deleteRecoveryAction,
+        ...(operation.acceptedAuthority ? { acceptedAuthority: operation.acceptedAuthority } : {}),
         commit: async (mutation) => {
           await input.store.commitDeferredMutation({
             operation,
@@ -405,7 +457,9 @@ export function createDeferredOperations(input: {
             providerLeaseToken: failure.providerLeaseToken,
             claimOwnerId: leaseToken,
             operation: failure.operation,
-            charge: failure.charge,
+            ...(failure.charge ? { charge: failure.charge } : {}),
+            ...(failure.recoveryAction ? { recoveryAction: failure.recoveryAction } : {}),
+            ...(failure.compensation ? { compensation: failure.compensation } : {}),
             hostOperation: {
               kind: "deferred",
               operation,
@@ -446,13 +500,12 @@ export function createDeferredOperations(input: {
             operation.resourceUid,
           );
       if (providerReceipt && !carriableReceipt(operation, providerReceipt, input.forms)) {
-        // A hold that can never settle is not a hold. The receipt is durable
-        // and the Form is frozen, so no repair makes this answer publishable;
-        // holding it pinned one Host misconfiguration to a resource name for
-        // the life of the deployment. It is a refusal about this Host, and
-        // ADR 0008 re-attempts those, so the operator who reconfigures the Host
-        // and re-runs the identical apply gets a fresh attempt. The saga goes
-        // with it: adopting it again would re-project the same answer.
+        // The provider acted, so this exact receipt remains the only recovery
+        // authority even when the current Form cannot publish it. Retiring the
+        // saga and minting a new operation/resource identity would not be a
+        // retry: provider execution is keyed by the operation identity and may
+        // create a second native object. Hold the command until an explicit
+        // adopt-or-compensate recovery can consume this receipt.
         console.error(
           canonicalJson({
             event: "takoform.deferred_operation.unpublishable_receipt",
@@ -465,19 +518,10 @@ export function createDeferredOperations(input: {
           "unsupported_capability",
           422,
           undefined,
-          `the provider's answer for this ${operation.target.kind} is not one ${operation.target.kind}@${operation.target.formRef.definitionVersion} can publish, so this Host cannot record it; repair the Host's configuration and apply again`,
+          `the provider's answer for this ${operation.target.kind} is not one ${operation.target.kind}@${operation.target.formRef.definitionVersion} can publish, so this Host cannot record it; the exact provider receipt is retained for explicit adopt-or-compensate repair, and changing configuration or repeating this request will not dispatch the provider again`,
         );
-        await input.store.retireUnpublishableProviderMutation({
-          operation,
-          leaseToken,
-          terminalJson: failureTerminal(
-            operation.id,
-            refusal.code,
-            refusal.publicMessage ?? diagnosticMessage(refusal.code),
-            refusal.hostCode,
-          ),
-        });
-        return { kind: "settled" };
+        await input.store.holdDeferredProviderRepair({ operation, leaseToken });
+        return { kind: "repair", error: refusal };
       }
       if (providerReceipt || providerPlan) {
         console.error(
@@ -500,6 +544,10 @@ export function createDeferredOperations(input: {
       }
       const hostError =
         error instanceof TakoformHostError ? error : new TakoformHostError("internal_error", 500);
+      if (hostError.hostCode === LEGACY_OPERATION_GENERATION_CONFLICT) {
+        await input.store.holdDeferredProviderRepair({ operation, leaseToken });
+        return { kind: "repair", error: hostError };
+      }
       if (!(error instanceof TakoformHostError)) {
         console.error(
           canonicalJson({
@@ -528,6 +576,61 @@ export function createDeferredOperations(input: {
       });
     }
     return { kind: "settled" };
+  }
+
+  /**
+   * Inline execution bounded by the configured millisecond budget. Returns
+   * false when the budget expired first: the attempt is left running under
+   * its lease, so a later poll either finds its commits or re-acquires the
+   * record after lease expiry and resumes the saga from the durable markers.
+   */
+  async function executeInline(
+    operation: DeferredOperationRecord,
+    leaseToken: string,
+    deleteRecoveryAction: "observe" | "converge",
+  ): Promise<boolean> {
+    if (inlineExecuteMilliseconds === undefined) {
+      await execute(operation, leaseToken, deleteRecoveryAction);
+      return true;
+    }
+    // The tracked promise resolves for both outcomes so an abandoned attempt
+    // can never surface as an unhandled rejection after the request answered.
+    const tracked = execute(operation, leaseToken, deleteRecoveryAction).then(
+      () => "settled" as const,
+      (error: unknown) => error,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), inlineExecuteMilliseconds);
+    });
+    const outcome = await Promise.race([tracked, expired]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (outcome === "timeout") {
+      void tracked.then((result) => {
+        if (result !== "settled") {
+          console.error(
+            canonicalJson({
+              event: "takoform.deferred_operation.inline_attempt_failed",
+              operationId: operation.id,
+              operation: operation.operation,
+              errorClass: result instanceof Error ? result.name : "unknown",
+            }),
+          );
+        }
+      });
+      console.error(
+        canonicalJson({
+          event: "takoform.deferred_operation.inline_budget_exceeded",
+          operationId: operation.id,
+          operation: operation.operation,
+          kind: operation.target.kind,
+          budgetMilliseconds: inlineExecuteMilliseconds,
+        }),
+      );
+      return false;
+    }
+    if (outcome !== "settled") throw outcome;
+    return true;
   }
 }
 
@@ -613,6 +716,7 @@ async function acceptedMutation(
   readonly space: string;
   readonly current: Awaited<ReturnType<TakoformStore["readResource"]>>;
   readonly body?: string;
+  readonly authority?: Awaited<ReturnType<TakoformHostAuthority["authorizeMutation"]>>;
 }> {
   if (operation === "apply" || operation === "import") {
     const body = await context.request.clone().text();
@@ -635,8 +739,9 @@ async function acceptedMutation(
     if (current && !sameFormRef(current.form.formRef, parsed.form.formRef)) {
       throw new TakoformHostError("resource_not_found", 404);
     }
+    let authorityGrant: Awaited<ReturnType<TakoformHostAuthority["authorizeMutation"]>> | undefined;
     if (authority) {
-      await authority.authorizeMutation({
+      authorityGrant = await authority.authorizeMutation({
         operation: operation === "import" ? "import" : current ? "update" : "create",
         context: {
           tenantId: context.tenantId,
@@ -652,6 +757,7 @@ async function acceptedMutation(
       space: parsed.metadata.space,
       current,
       body,
+      ...(authorityGrant ? { authority: authorityGrant } : {}),
     };
   }
 

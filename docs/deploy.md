@@ -104,9 +104,33 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0057 lineage and verifies its canonical schema, then creates the
+audited 0001–0063 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
+
+Disposal is a separate, one-way operation for an exact target-selected pair:
+
+```sh
+bun run deploy -- takoserver-integration-storage-disposal --status --environment=integration --commit=<40-hex-sha>
+bun run deploy -- takoserver-integration-storage-disposal --apply --environment=integration --commit=<40-hex-sha>
+```
+
+The only accepted target pairs are `takoserver-runtime-staging` with
+`takoserver-objects-staging`, or a matching D1/R2 name
+`takoserver-i-<32-lowercase-hex>`. Status and apply inventory the D1 by both its
+exact id and name and the R2 by its exact name. Disposal refuses while any
+current regular Worker settings/current serving Version or any current
+Workers for Platforms dispatch-script binding references either selected
+resource. Namespace names and script counts must reconcile, and incomplete or
+failed reads stop before mutation. This coverage does not include historical
+Worker Versions or external API clients. Apply requires
+`TAKOSERVER_INDEPENDENT_REVIEW`, re-reads identities and bindings immediately
+before mutation, deletes only the exact R2 bucket first, then the exact D1 id,
+and succeeds only after authoritative absence readback. Cloudflare must accept
+the R2 delete (so a nonempty bucket halts before D1); the command never wipes
+objects, retries an unknown acknowledgement, rebinds a target, deletes Workers,
+or runs migrations. Use the separate generation surface to recreate storage;
+there is no rollback or adoption of same-name D1 resources.
 
 The fresh empty database uses one sealed `wrangler d1 execute --file` import,
 not the remote `migrations apply` query path. The import retains every audited
@@ -134,6 +158,55 @@ deleted: inspect that generation with status and keep the current target.
 Successful output is only a candidate storage projection. It does not publish
 a Host or WfP Worker, register signing keys, change a route or switch the
 current target. Those steps retain their separate owning deploy surfaces.
+
+### Retire a replaced integration Host
+
+After a disposable rebuild, the public Host has its own retirement operation.
+It does not retire the private executor, delete storage, or move a route.
+Select the **successor** with `TAKOSERVER_DEPLOY_TARGET_INTEGRATION`, and pass
+the old Host's separate operator-private descriptor and observed identities:
+
+```sh
+bun run deploy -- takoserver-integration-host-retirement --status --environment=integration --commit=<tool-head-sha> --retired-target=/absolute/retired-target.json --retired-deployment=<deployment-uuid> --retired-version=<version-uuid>
+bun run deploy -- takoserver-integration-host-retirement --apply --environment=integration --commit=<tool-head-sha> --retired-target=/absolute/retired-target.json --retired-deployment=<deployment-uuid> --retired-version=<version-uuid>
+```
+
+Status is read-only; apply requires `TAKOSERVER_INDEPENDENT_REVIEW`. Both
+descriptors must belong to the same integration account. The old Host cannot
+be the successor or any other Worker named by the successor target. Do not
+construct the retired descriptor from a name alone: its old D1/R2, origin and
+account settings must match the pinned live Host. The two Hosts may share
+storage; neither database nor bucket is changed by this operation.
+
+The retired descriptor is read only as historical evidence, not as a
+deployable current target. The retirement-only profile recognizes the old
+Host's exact binding types and legacy secret names. Selector-derived values
+must match; the full observed binding/settings projection must remain unchanged
+at the deletion fence. Unrelated historical authoring fields are not used to
+configure or authorize anything. This does not relax the binding or secret
+requirements for normal publication, adoption, or updates.
+
+The operation checks the old Host's exact deployment/Version, Host binding
+and secret-name closure, settings, cron, and absence of routes, custom domains
+and owned Durable Object namespaces. The successor must retain its observed
+deployment/Version and exact target bindings and answer
+`/.well-known/takoserver` with its own product and origin. These checks repeat
+at the deletion fence. They are not a provider-side Version compare-and-swap;
+do not concurrently deploy to either selected Host during retirement.
+
+One DELETE is sent for the old Worker, with no `force` query or override.
+[Cloudflare's associated-binding protection](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/methods/delete/)
+remains active; a referenced Worker is refused instead of forcibly removing
+its references or durable resources. This does not preserve external clients
+calling the retired workers.dev or preview URLs. Use this only for the explicitly
+disposable, replaced integration Host.
+
+Success requires old script/deployment absence plus the unchanged successor
+and its HTTP identity. A rejected or uncertain DELETE is never retried:
+inspect the same exact selection with `--status` before deciding the next
+action. Deletion also removes the old Worker's secret store, with no rollback
+to its retained Versions. Any recreation uses the separate owning bootstrap
+surface under a new identity. This operation never generates or rotates keys.
 
 ### First integration Host publication
 
@@ -269,6 +342,8 @@ it:
 - `takoserver-integration-form-authority-worker`
 - `takoserver-integration-form-authority-operator-worker`
 - `takoserver-form-authority-identity-probe`
+- `takoserver-sponsorship-authority-worker` (only the managed Space admission
+  addition described below)
 
 No other public surface needs it: `takoserver-worker` shares the public
 Worker's closure and its declaration is `takoserver-worker-authority-cutover`;
@@ -278,13 +353,37 @@ does not enter this public transition mechanism.
 
 Each accepts `--closure-predecessor-version=<uuid>` together with an explicit
 declaration built from the repeatable `--retire-var=NAME`, `--add-var=NAME`,
-`--refresh-var=NAME`, `--add-binding=NAME`, `--add-secret=NAME` and
-`--rotate-secret=NAME` flags. `--add-binding` names a binding that is not plain
-text — a service, D1, R2 or Durable Object binding the current code derives and
-the predecessor lacks. Code-derived values stay code-derived: the declaration
-names the binding, and the value still comes from the selected commit and
-target. Where nothing is declared, every surface stays exactly as strict as it
-is today.
+`--refresh-var=NAME`, `--refresh-service-binding=NAME`, `--add-binding=NAME`,
+`--add-secret=NAME` and `--rotate-secret=NAME` flags. `--add-binding` names a
+binding that is not plain text — a service, D1, R2 or Durable Object binding
+the current code derives and the predecessor lacks. Code-derived values stay
+code-derived: the declaration names the binding, and the value still comes
+from the selected commit and target. Where nothing is declared, every surface
+stays exactly as strict as it is today.
+
+The sponsorship surface accepts only the initial managed-admission addition:
+`--add-var=TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY_DIGEST` and
+`--add-binding=TENANT_SPACE_ADMISSION`, together with its exact predecessor
+Version. Both are required and any additional delta is rejected. An absent
+sponsorship Worker uses ordinary first creation, not a predecessor transition.
+The released-Core Form authority must already serve the exact target policy
+and narrow named entrypoint. Qualification proves that dependency by rebuilding
+the exact released-Core Form artifact and requiring its emitted bundle digest to
+match the served Version; the source commit labels need not be equal when those
+bytes match. The Form closure and dependency identity are re-read before
+registration and upload, and any artifact or closure drift refuses the apply.
+See [managed Space admission](managed-space-admission.md) for the publication
+order and remaining live acceptance.
+
+`--refresh-service-binding=NAME` is integration-only and names an existing
+service binding whose exact service/entrypoint tuple changes. The pinned
+predecessor must contain that same-name service binding, and its tuple must
+differ from the target-derived successor tuple; a no-op declaration is
+refused. The public Takoserver deploy owner still derives the successor from
+the selected commit and target — this flag supplies only the binding name.
+It cannot refresh D1, R2, Durable Object, plain-text or secret bindings. Every
+unlisted binding and the routing closure remain exact. D1/R2 changes continue
+to use only the separate paired integration storage rebind below.
 
 The declaration is
 machine-checked: the profile admits the predecessor only when the authoritative
@@ -296,6 +395,56 @@ declaration is what says the current target either no longer derives them or
 derives them differently; every other binding name, type and plain-text value
 and the routing closure stay as strict as the routine path.
 The routine surfaces stay strict too and never accept such a predecessor.
+
+The public storage rebind is a separate, narrow delta available only in
+`integration` on `takoserver-worker-authority-cutover`,
+`takoserver-form-authority-worker` (the staging Form authority Worker), and
+`takoserver-integration-form-authority-worker`. It requires the pinned closure
+predecessor plus both flags:
+
+```sh
+--rebind-state-database-from=<predecessor-d1-uuid>
+--rebind-object-bucket-from=<predecessor-r2-name>
+```
+
+These flags name only the predecessor's old `STATE_DB` UUID and `OBJECTS`
+bucket name. Both must be strict lowercase identities and differ from the
+successor. The successor is never a CLI operand: it comes only from the selected
+target, whose D1 and R2 names must be the same exact
+`takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0063 migration lineage,
+and canonical migrated schema before preparation and immediately before upload.
+Every other binding name, type, and field must still match the target exactly;
+this does not alter migrations, runtime code, or the ordinary strict path.
+Production and rehearsal reject the rebind before provider effects. The
+operator gateway and storage-free identity probe do not accept it.
+This integration storage-rebind apply uses the bounded publication gate:
+the Host runs `bun run typecheck:worker`, then Bun tests matching
+`storage rebind` in the Host closure-transition, Worker binding-state and
+integration storage-generation test files; Form authority runs
+`bun run typecheck:form-authority-worker`, then the equivalent filtered Form
+transition, binding-state and storage-generation tests. Both gates finish
+before Wrangler dry-run. Status is read-only, and every other apply on these
+Host/Form storage-rebind Worker surfaces retains its existing `bun run check`
+gate.
+
+On Form authority surfaces, an integration transition declaring
+`--refresh-service-binding=NAME` without storage rebind runs
+`bun run typecheck:form-authority-worker`, then
+`bun test tests/deploy-form-authority.test.ts tests/deploy-worker-state.test.ts
+tests/deploy-contract.test.ts` before Wrangler dry-run or upload; either gate
+failure stops both. This includes the authenticated integration operator
+gateway. If the same transition also declares storage rebind on a route-less
+Form Worker, the storage-rebind gate above retains precedence and its filtered
+storage tests remain selected. The operator gateway does not accept storage
+rebind. Other Form authority applies retain `bun run check`.
+
+For the identity probe only, an integration transition declaring
+`--refresh-service-binding` runs `bun run typecheck:form-authority-worker`, then
+`bun test tests/deploy-form-authority-identity-probe.test.ts
+tests/deploy-worker-state.test.ts tests/deploy-contract.test.ts`, before any
+Wrangler dry-run or upload. Either gate failing prevents both; every other
+identity-probe apply retains `bun run check`.
 
 Applying a transition still requires everything the surface required before it:
 the same independent reviewer, the same source qualification, the same single
@@ -625,9 +774,9 @@ The conservative `requiresEnv` union remains unchanged.
 | Surface | Supported action(s) | Environment | Required input condition |
 | --- | --- | --- | --- |
 | `takoserver-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved operator deploy credential for both actions: explicit `CLOUDFLARE_API_TOKEN` or integration-only Wrangler OAuth fallback; rehearsal and production require the explicit token. This credential authorizes the deploy process and is never a public Worker binding. Managed-runtime supplies are private and are not accepted by this public surface. |
-| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. |
-| `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
-| `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
+| `takoserver-worker-authority-cutover` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY` for `--apply` only, and only when the declared closure delta names an added or rotated secret. Storage rebind flags are integration-only. |
+| `takoserver-form-authority-identity-probe` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. `storageRebind` is refused because this Worker binds neither D1 nor R2. |
+| `takoserver-form-authority-worker` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Storage rebind flags are integration-only. |
 | `takoserver-integration-form-authority-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority-operator-worker` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or the integration OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
 | `takoserver-integration-form-authority` | `--status`, `--apply` | integration only | Resolved Cloudflare credential and `TAKOSERVER_FORM_AUTHORITY_OPERATOR_PRIVATE_JWK_PATH` for both (OAuth fallback is integration-only); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. |
@@ -636,6 +785,8 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-integration-e2e-credentials` | `--issue`, `--status`, `--revoke` | integration only | Resolved Cloudflare credential, `TAKOSERVER_INTEGRATION_E2E_API_KEY_PRIVATE_JWK_PATH`, and `TAKOSERVER_INTEGRATION_E2E_OUTPUT_DIRECTORY` for all three; `TAKOSERVER_INDEPENDENT_REVIEW` for `--issue` and `--revoke` only. |
 | `takoserver-site` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
+| `takoserver-integration-storage-disposal` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Exact target-selected storage names only; complete current regular + dispatch Worker binding inventory required. |
+| `takoserver-integration-host-retirement` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The current target selects the successor; exact `--retired-target`, `--retired-deployment`, and `--retired-version` select the replaced Host. No force or storage deletion. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
@@ -808,6 +959,12 @@ managed customer runtime.
   released Form package verification exists. Released Core supplies verification
   facts only; Takoserver Host retains admission policy and private handle
   issuance. Deploying the shell does not grant Form mutation authority.
+  An optional operator-owned `formAuthority.managedSpaceAdmissionPolicy`
+  enables the separate `TenantSpaceAdmissionEntrypoint`; only that narrow
+  entrypoint may be bound to the sponsorship issuer. Its exact policy is
+  configuration, not a live value adopted implicitly by `--adopt-live`.
+  This released-Core surface also supports the integration environment; it is
+  distinct from the singleton fixture surface below.
 - `takoserver-integration-form-authority-worker`: integration only. It packages
   the exact generated 17-Form unsigned fixture corpus, hard-refuses any other
   environment before binding reads, and remains permanently non-production.
@@ -1018,20 +1175,182 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0057 names and SHA-256 inventory, so a checkout with unreviewed 0058+
+  0001–0063 names and SHA-256 inventory, so a checkout with unreviewed 0064+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
   `integration-protected-wave` result is never accepted by rehearsal or
-  production; the no-selector integration lane remains the disposable suffix
-  path described above.
+  production. The no-selector integration lane additionally permits only the
+  exact existing-data 0058/0059 to 0060, separate 0060 to 0061, separate
+  0061 to 0062, and separate 0062 to 0063 transitions
+  described below. Earlier
+  predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
   protocol below. Keep its maintenance projection while the selected 0044–0057
   trail is pending; a Cloudflare provider executor (CPE) service is optional
   and may be introduced only after 0045 and its dependencies are settled. The
   normal Host closure retires the quiescence mode only after the selected schema
   lineage is settled, with no rehearsal receipt chain created for integration.
+
+### 0058 domain receipt schema: protected wave unavailable
+
+The current source includes audited 0058–0063 for fresh, explicitly
+disposable integration storage. Protected wave selectors still stop at 0057:
+neither rehearsal nor production accepts `--through-migration=0058`,
+`--through-migration=0059`, `--through-migration=0060`,
+`--through-migration=0061`, `--through-migration=0062`, or
+`--through-migration=0063`.
+
+0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
+so the migration preserves the receipt-coupled version material and sealed
+BLOB tables, restores their exact existing definitions and triggers, and keeps
+foreign keys enabled. Local preservation/rollback tests do not qualify a
+nonempty D1 upgrade. Before adding that wave, rehearse representative pending,
+committed, deleting and deleted receipts on D1; prove whole-file plus lineage
+transactionality, quiesce every writer including the private executor, measure
+copy size/runtime against platform limits, and compare rows, BLOBs, triggers and
+foreign keys after migration. Large targets require a separate bounded
+maintenance/shadow transition. Do not use an integration reset as production
+recovery or bypass the protected selector.
+
+### 0059/0060: additive existing-data integration cutover
+
+The no-selector `takoserver-d1-schema` integration lane accepts only an exact
+audited 0058 predecessor with `[0059, 0060]` pending, or an exact 0059
+predecessor with `[0060]` pending. Production and rehearsal selectors still
+stop at 0057. This does not qualify the table replacement in 0058.
+
+0059 adds selection columns and guards. 0060 creates separate, paired saga
+and deferred-operation tables, freezes new legacy insertions, and prevents
+cleanup from deleting unresolved legacy control rows. Neither migration copies
+or backfills historical operations. Current acceptance also checks retained
+open apply/import/delete effects: an older runtime could already have swept a
+planned saga while its preparation callback was running. The append-only effect
+and its Resource attestation preserve that conflict even without the saga.
+Terminal `succeeded`/`cancelled` evidence closes only the same tenant, Resource
+UID and effect identity.
+
+Status and apply require the exact audited source inventory and hashes,
+canonical predecessor schema, and zero open effects missing their retained
+`live`/`pending` Resource attestation. A nonzero count of correctly identified
+unresolved operations is allowed; this is not a drain assertion. Integrity is
+read again during qualification and immediately before mutation. A schema
+mismatch or orphan effect refuses apply before qualification or mutation.
+An earlier integration predecessor remains unavailable. Neither a reviewer
+string, lease expiry, nor a wait can override these checks.
+
+The scoped migration gate and independent review precede mutation. Pinned
+Wrangler submits each complete migration together with its ledger insert as
+one D1 transaction. A failure is followed by authoritative readback, never a
+blind retry. A complete 0059 with 0060 pending is the supported partial boundary;
+resume through the same owning surface. Success requires exact 0060 lineage,
+canonical schema and retained-effect integrity readback, not only a successful
+provider response.
+
+Once 0060 commits, old binaries cannot accept new work: this is a forward-only
+availability boundary. Have the matching provider executor and Host candidates
+ready before applying. After successful schema readback, publish the current
+executor, then the current Host. A mixed runtime pair refuses execution
+retryably; restoring an old binary does not restore service. Repair forward
+through the owning surfaces if publication fails.
+
+Historical `NULL` selections stay quarantined, not recovered or reinterpreted.
+An isolated fresh database is not a recovery alternative for protected existing
+data. A successful cutover must still be followed by apply/recovery checks on
+the exact deployed Host/executor pair; local tests alone do not claim that live
+cutover or application operation has completed.
+
+### 0061: accepted-apply authority continuity integration cutover
+
+The same no-selector `takoserver-d1-schema` surface accepts one additional,
+separate integration transition: exact audited 0060 to 0061. It requires the
+audited 0001–0061 prefix names and hashes, the canonical 0060 application
+schema, and zero orphan open provider effects at every pre-mutation fence.
+It refuses an earlier predecessor or a bundled 0059/0060/0061 suffix. Protected
+rehearsal and production selectors still stop at 0057.
+
+0061 adds an immutable, nullable admission summary to the current deferred
+operation table. Existing rows remain unchanged with `NULL` summaries; their
+recovery still requires the historical exact authority head. No migration or
+runtime path guesses or backfills missing provenance. New apply insertions
+from pre-0061 binaries are rejected by a database trigger, while historical
+recovery and import/delete admission keep their existing behavior.
+
+Prepare the matching Host before applying: the new runtime cannot accept work
+on a pre-0061 database, and the old runtime cannot accept new applies after
+0061. This is a forward-only availability boundary, not a zero-downtime claim.
+The lane runs its focused transition/preservation tests and the existing local
+D1 migration gate, then applies the one sealed migration and ledger insert.
+Success requires authoritative exact 0061 lineage, canonical schema including
+both guards, and retained-effect integrity. A lost acknowledgement is resolved
+by readback, not another apply. An already complete wave is status-only;
+publication failure after migration is repaired forward without a down
+migration, reset, or old-binary rollback.
+
+After schema readback, publish the compatible Host through its owning surface
+and reconcile its current Form authority if the semantic implementation changed.
+Private provider composition still verifies its own dependency closure; 0061
+does not change the executor protocol generation. Do not republish unrelated
+components merely to align source labels. The new continuation behavior applies
+only to new accepts: exact Form/package and provider selection remain fixed,
+fresh permission is checked before execution, and the final commit checks the
+current authority again. A real apply/recovery check on the deployed target is
+still needed; local migration success is not live lifecycle completion.
+
+### 0062: import-selection continuity integration cutover
+
+The same no-selector `takoserver-d1-schema` surface accepts one separate
+existing-data transition from the exact audited 0061 prefix. It requires the
+canonical 0061 application shape and zero planned protocol-generation-1
+imports before qualification and again at the final mutation fence. The
+0062 migration and its ledger insert, including the old-writer fence, are one
+atomic D1 transaction; a partial acknowledgement is resolved by authoritative
+readback and never by a blind retry.
+
+0062 adds a nullable immutable `import_selection_protocol` marker. New import
+writers explicitly insert `1`; older writers omit it and are rejected before
+preparation can issue service material. The migration itself atomically refuses
+any planned import, closing the race after the last preflight read. Existing
+executed receipts remain publishable without provider reexecution.
+
+The import-selection snapshot is immutable once bound; its verified-lease token
+must be renewed for each execution lease. Historical `NULL` rows remain unchanged
+and no selection or authority evidence is backfilled. A provider native
+destination has one unique reservation retained
+through receipt publication, so an executed-but-uncommitted import cannot
+release the pair for a competing import. After exact schema readback, publish
+the matching CPE and then Host in order. This is forward-only integration
+repair, does not authorize rehearsal or production, and a fresh generation
+remains a disposable initialization path rather than a recovery alternative
+for protected data.
+
+### 0063: managed Queue retirement integration cutover
+
+The no-selector `takoserver-d1-schema` integration lane accepts one further
+standalone transition: the exact audited 0062 prefix with only
+`0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
+must be exactly 0001–0063 with the audited 0063 SHA-256, and the selected D1
+must have the canonical 0062 application shape. Protected rehearsal and
+production selectors remain capped at 0057; an unreviewed 0064 tail is refused.
+
+0063 creates only the durable managed Queue retirement marker, helper-phase
+rows, route tripwire and their immutable/no-regression guards. It rewrites and
+backfills no existing row, so this transition adds no generic writer
+quiescence or data-drain claim. Historical Queues without a marker are not
+adopted, repaired, or replayed by the migration.
+
+The owner checks the exact predecessor at initial preflight, after source and
+test qualification, and with a fresh authoritative state read immediately
+before the one migration request. The sealed migration and its ledger insert
+remain one D1 transaction. Success requires exact all-0063 lineage and the
+canonical 0063 post-shape. A lost acknowledgement is reconciled from that
+authoritative lineage and shape and must not trigger a second apply.
+
+Release order is schema, matching CPE, Host authority cutover, then Form. CPE
+readiness must itself prove the exact 0063 retirement objects before
+publication. Host scheduling and an actual managed Queue convergence E2E are
+separate post-publication evidence; local schema success does not claim either.
 
 ### 0043 artifact blob-I/O compatibility protocol
 
@@ -1174,8 +1493,10 @@ time-based deletion policy; do not prune them merely to reduce the count.
   run-token secret, exposes no tenant-run mint API, and accepts a tenant-run JWT
   only when migration `0047` contains the matching immutable admission row and
   credential key id. The authority has `workers_dev=false`,
-  `preview_urls=false`, no routes or custom domains, no public `fetch`, and
-  exposes only `issueTenantRunCredential`. Status and post-apply readback prove
+  `preview_urls=false`, and no routes or custom domains. Its registration-only
+  `fetch` handler always returns an empty 404 without reading bindings or issuing
+  credentials; `issueTenantRunCredential` remains the only authority RPC.
+  Status and post-apply readback prove
   the active Version, script identity, exact binding/secret closure, and empty
   public topology. Before topology enumeration, an owner-private audit
   credential reads the exact deployment token's active policy and mechanically

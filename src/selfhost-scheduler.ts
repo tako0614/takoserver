@@ -1,10 +1,10 @@
+import { parseWorkerCron, type WorkerCronSchedule } from "./cron.ts";
 import type { Sql } from "./ports.ts";
 import type {
   SelfhostEventSelection,
   SelfhostEventTarget,
   SelfhostEventTargets,
 } from "./providers/selfhost.ts";
-import { parseSelfhostCron, type SelfhostCronSchedule } from "./providers/selfhost-cron.ts";
 import {
   SELFHOST_WORKER_EVENT_CONTENT_TYPE,
   SELFHOST_WORKER_EVENT_HEADER,
@@ -94,7 +94,7 @@ export function createSelfhostWorkerScheduler(
    */
   const due = async (
     script: string,
-    schedule: SelfhostCronSchedule,
+    schedule: WorkerCronSchedule,
     millis: number,
   ): Promise<{ readonly nextFireAtMillis: number; readonly running: boolean } | null> => {
     const rows = await sql.query(
@@ -156,7 +156,7 @@ export function createSelfhostWorkerScheduler(
       let fired = 0;
       for (const target of targets) {
         for (const cron of target.crons) {
-          const schedule = parseSelfhostCron(cron);
+          const schedule = parseWorkerCron(cron);
           // A recorded expression this Host cannot read fires nothing. The
           // apply refuses one, so reaching here means the record predates that
           // refusal or was edited outside this process.

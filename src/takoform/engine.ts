@@ -3,15 +3,25 @@ import type { LedgerHeldCharge } from "../ledger.ts";
 import type { Clock, JsonObject } from "../ports.ts";
 import { SqlError } from "../ports.ts";
 import {
+  ProviderApplyCompensationUnsupportedError,
+  ProviderApplyNoEffectUnsupportedError,
+  ProviderMutationCompensatedFailureError,
   ProviderMutationDefinitiveRefusalError,
   ProviderMutationRecoveryError,
+  ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
+import {
+  type AcceptedAuthoritySummary,
+  assertAcceptedAuthorityGrant,
+} from "./accepted-authority.ts";
+import type { TakoformApplySelection } from "./apply-selection.ts";
 import type { TakoformArtifactManifest } from "./artifacts.ts";
 import { type BindingRegistry, installedBindings } from "./bindings.ts";
 import { createResourceDependencySet, type ResourceDependencySet } from "./dependency-fence.ts";
 import { canonicalizeEdgeSpec } from "./edge-semantics.ts";
 import { exactInstalledForm, type FormRegistry, installedForms, sameFormRef } from "./forms.ts";
 import type { TakoformAuthorityFence, TakoformHostAuthority } from "./host-authority.ts";
+import { sameTakoformImportSelection, type TakoformImportSelection } from "./import-selection.ts";
 import {
   PREPARE_TTL_MILLISECONDS,
   PROVIDER_MUTATION_EXECUTION_LEASE_MILLISECONDS,
@@ -29,6 +39,7 @@ import {
 import { materializeDefaults, validateDesired } from "./schema.ts";
 import {
   applySqliteMigrationApplication,
+  isSqliteMigrationApplication,
   type PreparedSqliteMigrationApplication,
   prepareSqliteMigrationApplication,
   sqliteMigrationCondition,
@@ -98,12 +109,51 @@ export interface ArtifactResolver {
   resolveBlob(tenantId: string, digest: string): Promise<Uint8Array | null>;
 }
 
+/**
+ * Artifact identities are content-addressed digests, so a resolved manifest or
+ * blob is immutable for the lifetime of one engine operation. Migration
+ * preparation, application, and derived readiness each resolve the same
+ * manifest and every migration blob; memoizing per call turns the repeated
+ * store/R2 round trips into one fetch per digest. The memo never crosses
+ * engine calls, so a later request still observes freshly stored state.
+ */
+export function memoizeArtifacts(resolver: ArtifactResolver): ArtifactResolver {
+  const manifests = new Map<string, Promise<TakoformArtifactManifest | null>>();
+  const blobs = new Map<string, Promise<Uint8Array | null>>();
+  return {
+    resolveManifest(tenantId, digest) {
+      const key = `${tenantId}\u0000${digest}`;
+      let cached = manifests.get(key);
+      if (!cached) {
+        cached = resolver.resolveManifest(tenantId, digest);
+        manifests.set(key, cached);
+      }
+      return cached;
+    },
+    resolveBlob(tenantId, digest) {
+      const key = `${tenantId}\u0000${digest}`;
+      let cached = blobs.get(key);
+      if (!cached) {
+        cached = resolver.resolveBlob(tenantId, digest);
+        blobs.set(key, cached);
+      }
+      return cached;
+    },
+  };
+}
+
 export interface EngineContext {
   readonly request: Request;
   readonly url: URL;
   readonly tenantId: string;
   readonly principalId: string;
-  /** Runs after every portable fence/review check and immediately before create side effects. */
+  /**
+   * Runs after every portable fence/review check and immediately before create
+   * side effects. The callback is invoked before the durable dispatch marker,
+   * so its owner must make the same exact request/token retry-safe: a lost
+   * acknowledgement may invoke it again before the provider boundary is
+   * crossed.
+   */
   readonly beforeCreate?: () => Promise<void>;
   /** A paid create credential must never inherit authority over an existing incarnation. */
   readonly provisionOnly?: boolean;
@@ -115,8 +165,14 @@ export interface EngineContext {
   readonly durableOperation?: {
     readonly id: string;
     readonly resourceUid: string;
+    /** Immutable admission identity, not the latest status-rendering revision. */
+    readonly acceptedRevision?: string;
+    /** Authority accepted before this deferred apply crossed the Host boundary. */
+    readonly acceptedAuthority?: AcceptedAuthoritySummary;
     /** Lease-scoped claim owner; stale workers must not release a successor's reservation. */
     readonly claimOwnerId: string;
+    /** Only the route-less maintenance lane may request provider convergence. */
+    readonly deleteRecoveryAction: "observe" | "converge";
     readonly commit: (mutation: EngineMutationCommit) => Promise<void>;
     readonly commitDefinitiveProviderFailure: (
       failure: EngineDefinitiveProviderFailureCommit,
@@ -125,10 +181,15 @@ export interface EngineContext {
 }
 
 export interface EngineDefinitiveProviderFailureCommit {
+  readonly recoveryAction?: "convergeApply" | "concludeApplyNoEffect" | "compensateApply";
   readonly saga: ProviderMutationSaga;
   readonly providerLeaseToken: string;
   readonly operation: "create" | "update";
-  readonly charge: LedgerHeldCharge;
+  readonly charge?: LedgerHeldCharge;
+  readonly compensation?: {
+    readonly selection: TakoformApplySelection;
+    readonly dependencies: ResourceDependencySet;
+  };
   readonly error: {
     readonly code: string;
     readonly publicMessage?: string;
@@ -311,12 +372,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     /** Signals that an earlier attempt already crossed the provider boundary. */
     readonly onPreviouslyDispatched?: () => void;
     readonly onContention?: () => void;
-    readonly onDispatch?: () => void | Promise<void>;
+    readonly onDispatch?: (mode: "initial" | "recovery") => void | Promise<void>;
     readonly onReceiptReady?: () => void;
     /** The wallet hold and Host lifecycle settle through one store-owned batch. */
     readonly commitDefinitiveFailure?: (
       leaseToken: string,
-      error: ProviderMutationDefinitiveRefusalError,
+      error:
+        | ProviderMutationCompensatedFailureError
+        | ProviderMutationDefinitiveRefusalError
+        | ProviderMutationWholeOperationRefusalError,
     ) => Promise<boolean>;
     /** Provider-only refusal proof cannot erase an earlier mutation step. */
     readonly providerRefusalProvesWholeAttemptIdle?: () => boolean;
@@ -334,8 +398,14 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     readonly prepare?: (
       dependencies: ResourceDependencySet | undefined,
       mode: "initial" | "recovery",
+      leaseToken: string,
+      acceptedSelection?: TakoformApplySelection,
+      acceptedImportSelection?: TakoformImportSelection,
     ) => Promise<void>;
-    readonly settleDefinitiveImportConflict?: (leaseToken: string) => Promise<boolean>;
+    readonly settleDefinitiveImportFailure?: (
+      leaseToken: string,
+      outcome: "import_conflict" | "adoption_aborted",
+    ) => Promise<boolean>;
     readonly execute: (
       mode: "initial" | "recovery",
       execution: Extract<ProviderMutationExecution, { readonly kind: "acquired" }>,
@@ -425,7 +495,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         }
         input.onDependenciesAccepted?.(dependencySet);
       }
-      await input.prepare?.(dependencySet, execution.mode);
+      await input.prepare?.(
+        dependencySet,
+        execution.mode,
+        leaseToken,
+        execution.applySelection,
+        execution.importSelection,
+      );
       const marked = await store.markProviderMutationDispatch({
         tenantId: input.tenantId,
         operationId: input.operationId,
@@ -446,9 +522,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         throw new TakoformHostError("resource_busy", 409);
       }
       providerDispatchMarked = true;
-      await input.onDispatch?.();
+      await input.onDispatch?.(execution.mode);
       executeEntered = true;
-      const receipt = await input.execute(execution.mode, execution, leaseToken);
+      const receipt = {
+        ...(await input.execute(execution.mode, execution, leaseToken)),
+        providerExecutionMode: execution.mode,
+      };
       input.onReceiptReady?.();
       await store.recordProviderMutationReceipt({
         tenantId: input.tenantId,
@@ -461,19 +540,45 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       return receipt;
     } catch (error) {
+      if (error instanceof ProviderApplyNoEffectUnsupportedError) {
+        // The dedicated provider seam explicitly declined before attempting
+        // its abort fence. Release this lease unchanged so the caller may
+        // resume the pre-existing recovery path for that offering.
+        const released = await store.releaseProviderMutationExecution({
+          tenantId: input.tenantId,
+          operationId: input.operationId,
+          resourceUid: input.resourceUid,
+          leaseToken,
+        });
+        if (!released) input.onContention?.();
+        throw error;
+      }
       const providerRefusalProvesWholeAttemptIdle =
         input.providerRefusalProvesWholeAttemptIdle?.() ?? true;
+      const initialImportConflict =
+        execution.mode === "initial" &&
+        error instanceof TakoformHostError &&
+        error.code === "import_conflict";
+      const recoveryAdoptionAborted =
+        execution.mode === "recovery" &&
+        error instanceof ProviderMutationWholeOperationRefusalError &&
+        error.action === "recoverAdopt";
+      let definitiveImportFailureOutcome: "import_conflict" | "adoption_aborted" | undefined;
       if (
         executeEntered &&
-        execution.mode === "initial" &&
         providerRefusalProvesWholeAttemptIdle &&
-        input.settleDefinitiveImportConflict &&
-        error instanceof TakoformHostError &&
-        error.code === "import_conflict"
+        input.settleDefinitiveImportFailure
       ) {
+        if (initialImportConflict) definitiveImportFailureOutcome = "import_conflict";
+        else if (recoveryAdoptionAborted) definitiveImportFailureOutcome = "adoption_aborted";
+      }
+      if (definitiveImportFailureOutcome && input.settleDefinitiveImportFailure) {
         let settled: boolean;
         try {
-          settled = await input.settleDefinitiveImportConflict(leaseToken);
+          settled = await input.settleDefinitiveImportFailure(
+            leaseToken,
+            definitiveImportFailureOutcome,
+          );
         } catch (settlementError) {
           input.onContention?.();
           throw settlementError;
@@ -495,10 +600,25 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         execution.mode === "initial" &&
         providerRefusalProvesWholeAttemptIdle &&
         error instanceof ProviderMutationDefinitiveRefusalError;
+      const definitiveApplyAbort =
+        execution.mode === "recovery" &&
+        // Only apply installs this lifecycle settlement owner; imports and
+        // deletes must never consume an apply-convergence disposition.
+        input.commitDefinitiveFailure !== undefined &&
+        providerRefusalProvesWholeAttemptIdle &&
+        error instanceof ProviderMutationWholeOperationRefusalError &&
+        (error.action === "convergeApply" || error.action === "concludeApplyNoEffect");
+      const definitiveCompensation =
+        execution.mode === "recovery" &&
+        input.commitDefinitiveFailure !== undefined &&
+        error instanceof ProviderMutationCompensatedFailureError &&
+        error.action === "compensateApply";
+      const definitiveRefusal =
+        definitiveInitialRefusal || definitiveApplyAbort || definitiveCompensation;
       const recoveryError =
         error instanceof ProviderMutationRecoveryError
           ? error
-          : executeEntered && !definitiveInitialRefusal
+          : executeEntered && !definitiveRefusal
             ? new ProviderMutationRecoveryError("indeterminate")
             : undefined;
       if (recoveryError) {
@@ -511,34 +631,31 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           ...(recoveryError.providerHandle ? { providerHandle: recoveryError.providerHandle } : {}),
         });
         if (!recorded) input.onContention?.();
-      } else if (definitiveInitialRefusal && error.heldCharge) {
-        if (input.commitDefinitiveFailure) {
-          try {
-            settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
-          } catch (settlementError) {
-            input.onContention?.();
-            throw settlementError;
-          }
-          if (settledPrecondition) {
-            settledDefinitiveFailureAtomically = true;
-            input.onDefinitiveFailureSettled?.();
-          } else {
-            input.onContention?.();
-          }
+      } else if (definitiveRefusal && input.commitDefinitiveFailure) {
+        try {
+          settledPrecondition = await input.commitDefinitiveFailure(leaseToken, error);
+        } catch (settlementError) {
+          input.onContention?.();
+          throw settlementError;
+        }
+        if (settledPrecondition) {
+          settledDefinitiveFailureAtomically = true;
+          input.onDefinitiveFailureSettled?.();
         } else {
-          // A held refusal cannot fall back to saga-only retirement: doing so
-          // would strand the money without the plan that owns its recovery.
           input.onContention?.();
         }
       } else if (
         (execution.mode === "initial" && providerDispatchMarked && !executeEntered) ||
-        (executeEntered && definitiveInitialRefusal)
+        (executeEntered && definitiveRefusal)
       ) {
         settledPrecondition = await store.settleProviderMutationPreconditionFailure({
           tenantId: input.tenantId,
           operationId: input.operationId,
           resourceUid: input.resourceUid,
           leaseToken,
+          ...(definitiveApplyAbort && error instanceof ProviderMutationWholeOperationRefusalError
+            ? { recoveryAction: error.action as "convergeApply" | "concludeApplyNoEffect" }
+            : {}),
         });
         if (settledPrecondition) input.onProvablyIdle?.();
         else input.onContention?.();
@@ -678,12 +795,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
     form: InstalledTakoformForm,
     spec: JsonObject,
     tenantId: string,
+    resolver: ArtifactResolver,
   ): Promise<void> => {
     const requirement = form.artifactRequirement;
     if (requirement === undefined) return;
     const manifestDigest = spec[requirement.specField];
     if (typeof manifestDigest !== "string") throw new TakoformHostError("artifact_missing", 404);
-    const manifest = await artifacts.resolveManifest(tenantId, manifestDigest);
+    const manifest = await resolver.resolveManifest(tenantId, manifestDigest);
     if (!manifest) throw new TakoformHostError("artifact_missing", 404);
     if (manifest.kind !== requirement.kind) throw new TakoformHostError("artifact_invalid", 400);
   };
@@ -1008,6 +1126,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async read(context, path): Promise<EngineResult> {
       exactQuery(context.url, resourceQueryKeys);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const space = requiredQuery(context.url, "space");
       const address = addressFromParts(context.tenantId, space, path);
       let resource = await store.readResource(address);
@@ -1048,7 +1167,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             form,
             relations,
             store,
-            artifacts,
+            artifacts: scopedArtifacts,
             driver,
           });
       const workerCondition =
@@ -1074,6 +1193,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async apply(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       // Read before the original stream is consumed. This is the value-free
       // identity a sensitive runtime-input claim is fenced against: the
       // preparation committed to one exact apply, and only the request actually
@@ -1111,8 +1231,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       if (current && !sameFormRef(current.form.formRef, form.identity.formRef)) {
         throw new TakoformHostError("resource_not_found", 404);
       }
-      await requireArtifact(form, body.spec, context.tenantId);
-      validateStandardServiceSlots({ form, spec: body.spec });
+      await requireArtifact(form, body.spec, context.tenantId, scopedArtifacts);
+      const hasApplyServiceSlots =
+        validateStandardServiceSlots({ form, spec: body.spec }).length > 0;
 
       const replayKey = replayKeyFor(context, body.metadata.space, "apply");
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
@@ -1126,12 +1247,24 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
 
       const create = current === null;
-      const authority = await authorizeMutation(
+      let authority = await authorizeMutation(
         context,
         create ? "create" : "update",
         body.metadata.space,
         form.identity.formRef,
       );
+      if (context.durableOperation?.acceptedAuthority) {
+        try {
+          assertAcceptedAuthorityGrant({
+            summary: context.durableOperation.acceptedAuthority,
+            lifecycleOperation: create ? "create" : "update",
+            formRef: form.identity.formRef,
+            grant: authority,
+          });
+        } catch {
+          throw new TakoformHostError("form_unavailable", 503);
+        }
+      }
       form = authority.form;
       const createIntent = context.request.headers.get("if-none-match") === "*";
       const generationHeader = context.request.headers.get("takoform-expected-generation");
@@ -1180,13 +1313,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const proposedOperationId = context.durableOperation?.id ?? operationId();
       const proposedResourceUid =
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
+      const acceptedSagaAuthorityHeadDigest = sagaAuthorityHeadDigest(
+        context.durableOperation?.acceptedAuthority,
+        authority.fence,
+      );
       const proposedSaga = {
         operationId: proposedOperationId,
+        operationKind: "apply" as const,
         replayKey,
         tenantId: context.tenantId,
         fingerprint,
         resourceUid: proposedResourceUid,
-        ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
+        ...(acceptedSagaAuthorityHeadDigest
+          ? {
+              authorityHeadDigest: acceptedSagaAuthorityHeadDigest,
+            }
+          : {}),
         target: address,
         ...(current
           ? {
@@ -1203,14 +1345,265 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const establishedSaga =
         context.durableOperation !== undefined &&
         (await store.establishedProviderMutationSaga(proposedSaga));
+
+      // An accepted create whose original provider acknowledgement was lost
+      // may no longer satisfy today's mutable relation/readiness projection.
+      // Route only the exact persisted no-handle/indeterminate state around
+      // those checks. The authoritative selection is restored below under the
+      // current saga lease; this read-only predicate conveys no placement or
+      // provider authority of its own.
+      const applyNoEffectCandidate =
+        establishedSaga &&
+        create &&
+        context.durableOperation !== undefined &&
+        (driver.concludeApplyNoEffect !== undefined || driver.compensateApply !== undefined) &&
+        !hasApplyServiceSlots &&
+        !isSqliteMigrationApplication(form) &&
+        (await store.isProviderMutationApplyNoEffectCandidate({
+          tenantId: context.tenantId,
+          operationId: proposedOperationId,
+          resourceUid: proposedResourceUid,
+        }));
+      if (applyNoEffectCandidate) {
+        const durableOperation = context.durableOperation;
+        const concludeApplyNoEffect = driver.concludeApplyNoEffect;
+        if (!durableOperation) {
+          throw new ProviderMutationRecoveryError("indeterminate");
+        }
+
+        const recoveryOperationId =
+          proposedOperationId.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 128) || "unknown";
+        const logRecoveryStage = (
+          stage:
+            | "unsupported-accepted"
+            | "dependency-status"
+            | "dependency-status-threw"
+            | "dependencies-read",
+          details?: {
+            readonly dependencyStatus?: "current" | "changed" | null;
+            readonly dependenciesRead?: boolean;
+          },
+        ): void => {
+          try {
+            console.error(
+              canonicalJson({
+                event: "takoform.accepted_apply_recovery",
+                operationId: recoveryOperationId,
+                stage,
+                ...(details ?? {}),
+              }),
+            );
+          } catch {
+            // Recovery diagnostics must not change Host behavior.
+          }
+        };
+
+        const compensateApply = driver.compensateApply;
+        let applySelection: TakoformApplySelection | undefined;
+        let compensationDependencies: ResourceDependencySet | undefined;
+        let providerProvablyIdle = false;
+        try {
+          // A concurrently recorded receipt is returned here and then consumed
+          // by the ordinary path below. Only a current leased, receipt-less
+          // recovery can enter the conclusion capability.
+          await executeProviderMutation({
+            tenantId: context.tenantId,
+            operationId: proposedOperationId,
+            resourceUid: proposedResourceUid,
+            fingerprint,
+            claimOwnerId: durableOperation.claimOwnerId,
+            providerRefusalProvesWholeAttemptIdle: () => true,
+            onProvablyIdle: () => {
+              providerProvablyIdle = true;
+            },
+            ...(acceptedSagaAuthorityHeadDigest
+              ? { authorityHeadDigest: acceptedSagaAuthorityHeadDigest }
+              : {}),
+            prepare: async (_dependencies, mode, leaseToken, acceptedSelection) => {
+              if (mode !== "recovery" || !acceptedSelection) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              const boundSelection = await store.bindProviderMutationApplySelection({
+                tenantId: context.tenantId,
+                operationId: proposedOperationId,
+                resourceUid: proposedResourceUid,
+                fingerprint,
+                leaseToken,
+                mode,
+                selection: acceptedSelection,
+              });
+              if (!boundSelection) throw new ProviderMutationRecoveryError("indeterminate");
+              applySelection = boundSelection;
+            },
+            commitDefinitiveFailure: async (providerLeaseToken, error) => {
+              if (error instanceof ProviderMutationCompensatedFailureError) {
+                if (!applySelection || !compensationDependencies) {
+                  throw new ProviderMutationRecoveryError("indeterminate");
+                }
+                return await durableOperation.commitDefinitiveProviderFailure({
+                  saga: proposedSaga,
+                  providerLeaseToken,
+                  operation: "create",
+                  recoveryAction: "compensateApply",
+                  compensation: {
+                    selection: applySelection,
+                    dependencies: compensationDependencies,
+                  },
+                  ...(error.heldCharge ? { charge: error.heldCharge } : {}),
+                  error: {
+                    code: error.code,
+                    ...(error.publicMessage ? { publicMessage: error.publicMessage } : {}),
+                    ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+                  },
+                });
+              }
+              return await durableOperation.commitDefinitiveProviderFailure({
+                saga: proposedSaga,
+                providerLeaseToken,
+                operation: "create",
+                recoveryAction: "concludeApplyNoEffect",
+                ...(error.heldCharge ? { charge: error.heldCharge } : {}),
+                error: {
+                  code: error.code,
+                  ...(error.publicMessage ? { publicMessage: error.publicMessage } : {}),
+                  ...(error.hostCode ? { hostCode: error.hostCode } : {}),
+                },
+              });
+            },
+            execute: async (mode, execution, leaseToken) => {
+              if (mode !== "recovery" || !applySelection) {
+                throw new ProviderMutationRecoveryError(
+                  execution.providerOutcome === "running" ? "running" : "indeterminate",
+                  execution.providerHandle,
+                );
+              }
+              // The cheap candidate read may race a newly recorded handle.
+              // Nothing on the conclusion seam has run yet, so hand this
+              // exact leased state back to the existing poll/convergence path.
+              if (
+                execution.providerHandle !== undefined ||
+                execution.providerOutcome === "running"
+              ) {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              if (execution.providerOutcome !== "indeterminate") {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              // Provider-only proof cannot cover Host or extension work that
+              // may have happened before the original provider invocation.
+              // Treat these accepted selections as pre-attempt unsupported so
+              // the shipped apply/convergence path performs its own callback
+              // and reservation handling. This check is under the current
+              // saga lease and precedes any conclusion/provider/ledger call.
+              if (
+                context.workerEndpointOriginReservationId !== undefined ||
+                form.identity.formRef.kind === "WorkerEndpoint" ||
+                (applySelection.kind === "provider" &&
+                  applySelection.relations.some((relation) => relation.bindingRef !== undefined))
+              ) {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              const recoveryInput = {
+                operationId: proposedOperationId,
+                executionAuthority: {
+                  tenantId: context.tenantId,
+                  resourceUid: proposedResourceUid,
+                  leaseToken,
+                  fingerprint,
+                },
+                tenantId: context.tenantId,
+                resourceUid: proposedResourceUid,
+                form,
+                name: body.metadata.name,
+                space: body.metadata.space,
+                selection: applySelection,
+                ...(context.commercialAuthority
+                  ? { commercialAuthority: context.commercialAuthority }
+                  : {}),
+              } as const;
+              if (concludeApplyNoEffect) {
+                try {
+                  await concludeApplyNoEffect(recoveryInput);
+                } catch (error) {
+                  if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) throw error;
+                  logRecoveryStage("unsupported-accepted");
+                }
+              }
+              if (!compensateApply) throw new ProviderApplyNoEffectUnsupportedError();
+              let dependencyStatus: "current" | "changed" | null;
+              try {
+                dependencyStatus = await store.providerMutationDependencyStatus({
+                  tenantId: context.tenantId,
+                  operationId: proposedOperationId,
+                  resourceUid: proposedResourceUid,
+                  leaseToken,
+                });
+              } catch (error) {
+                logRecoveryStage("dependency-status-threw");
+                throw error;
+              }
+              logRecoveryStage("dependency-status", { dependencyStatus });
+              if (dependencyStatus === "current") {
+                throw new ProviderApplyNoEffectUnsupportedError();
+              }
+              if (dependencyStatus === null) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              const acceptedDependencies = await store.readProviderMutationDependencies({
+                tenantId: context.tenantId,
+                resourceUid: proposedResourceUid,
+                operationId: proposedOperationId,
+              });
+              compensationDependencies = acceptedDependencies ?? undefined;
+              logRecoveryStage("dependencies-read", {
+                dependenciesRead:
+                  acceptedDependencies !== null && acceptedDependencies !== undefined,
+              });
+              if (!compensationDependencies) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              try {
+                await compensateApply(recoveryInput);
+              } catch (error) {
+                if (error instanceof ProviderApplyCompensationUnsupportedError) {
+                  throw new ProviderApplyNoEffectUnsupportedError();
+                }
+                throw error;
+              }
+              // The capability never returns success. A return is
+              // inconclusive and therefore keeps the accepted operation held.
+              throw new ProviderMutationRecoveryError("indeterminate");
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) {
+            if (providerProvablyIdle) {
+              await store.releaseResourceClaims(durableOperation.claimOwnerId);
+              await settleIdleAttempt(
+                context.tenantId,
+                proposedResourceUid,
+                proposedOperationId,
+                "apply",
+              );
+            }
+            throw error;
+          }
+        }
+        // An explicit pre-attempt unsupported result continues into the
+        // original validation and convergence path below.
+      }
       if (!establishedSaga) {
         const review = await store.readPrepare(context.tenantId, body.review.prepareDigest);
+        const reviewAuthorityHeadDigest =
+          context.durableOperation?.acceptedAuthority?.mode === "mutation"
+            ? context.durableOperation.acceptedAuthority.headDigest
+            : authority.fence?.headDigest;
         if (
           !review ||
           review.fingerprint !== canonicalJson(stripApplyReview(body)) ||
           review.expectedGeneration !== (current?.metadata.generation ?? undefined) ||
           review.currentUid !== (current?.metadata.uid ?? undefined) ||
-          review.authorityHeadDigest !== authority.fence?.headDigest
+          review.authorityHeadDigest !== reviewAuthorityHeadDigest
         ) {
           throw new TakoformHostError();
         }
@@ -1238,7 +1631,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               form,
               relations: currentRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             })
           : null;
@@ -1409,27 +1802,17 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         throw new TakoformHostError("resource_busy", 409);
       }
-      if (
-        !(await store.recordResourceEffect({
-          tenantId: context.tenantId,
-          resourceUid: uid,
-          effectId: opId,
-          kind: "apply",
-          phase: "planned",
-          operationMode: "initial",
-        }))
-      ) {
-        throw new TakoformHostError("resource_busy", 409);
-      }
       let persisted = false;
       let providerSettled = false;
       let providerDispatched = false;
       let providerProvablyIdle = false;
+      let providerPlanRecorded = false;
       let releaseClaimsOnFailure = true;
       try {
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
         let acceptedRelations = relations;
         let preparedMigration: PreparedSqliteMigrationApplication | null = null;
+        let applySelection: TakoformApplySelection | undefined;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: opId,
@@ -1443,6 +1826,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onPreviouslyDispatched: () => {
             providerDispatched = true;
+            releaseClaimsOnFailure = false;
           },
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -1455,9 +1839,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onProvablyIdle: () => {
             providerProvablyIdle = true;
+            releaseClaimsOnFailure = true;
           },
-          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
-          onDispatch: async () => {
+          providerRefusalProvesWholeAttemptIdle: () =>
+            preparedMigration === null && !hasApplyServiceSlots,
+          onDispatch: async (operationMode) => {
             if (
               !(await store.recordResourceEffect({
                 tenantId: context.tenantId,
@@ -1465,52 +1851,84 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 effectId: opId,
                 kind: "apply",
                 phase: "dispatched",
-                operationMode: "initial",
+                operationMode,
               }))
             ) {
               throw new TakoformHostError("resource_busy", 409);
             }
             providerDispatched = true;
           },
-          ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies, executionMode) => {
+          ...(acceptedSagaAuthorityHeadDigest
+            ? {
+                authorityHeadDigest: acceptedSagaAuthorityHeadDigest,
+              }
+            : {}),
+          prepare: async (acceptedDependencies, executionMode, leaseToken, acceptedSelection) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
               body.metadata.space,
               acceptedRelations,
             );
+            const resolvedSelection = await driver.selectApply({
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              relations: preparedDriverRelations,
+              ...(context.commercialAuthority
+                ? { commercialAuthority: context.commercialAuthority }
+                : {}),
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+            const currentSelection =
+              executionMode === "recovery"
+                ? acceptedSelection &&
+                  canonicalJson(resolvedSelection) === canonicalJson(acceptedSelection)
+                  ? acceptedSelection
+                  : undefined
+                : resolvedSelection;
+            if (!currentSelection) throw new TakoformHostError("resource_busy", 409);
+            const boundSelection = await store.bindProviderMutationApplySelection({
+              tenantId: context.tenantId,
+              operationId: opId,
+              resourceUid: uid,
+              fingerprint,
+              leaseToken,
+              mode: executionMode,
+              selection: currentSelection,
+            });
+            if (!boundSelection) throw new TakoformHostError("resource_busy", 409);
+            applySelection = boundSelection;
+            if (
+              !(await store.recordResourceEffect({
+                tenantId: context.tenantId,
+                resourceUid: uid,
+                effectId: opId,
+                kind: "apply",
+                phase: "planned",
+                operationMode: executionMode,
+              }))
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
+            providerPlanRecorded = true;
             preparedMigration = await prepareSqliteMigrationApplication({
               tenantId: context.tenantId,
               space: body.metadata.space,
               form,
               relations: acceptedRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             });
-            // Supply resolution is deliberately part of the initial
-            // pre-dispatch prepare. Completed receipts and recovered commands
-            // must not depend on a resolver being available or project new
-            // runtime material.
+            // Satisfiability is pure pre-dispatch preparation. Completed
+            // receipts and recovered commands must not depend on a resolver or
+            // project fresh runtime material.
             if (executionMode === "initial") {
-              if (create && context.beforeCreate) {
-                // A provision token is single-use authority. Check required
-                // service satisfiability before claiming it, then resolve the
-                // execution projection only after that authority succeeds.
-                await resolveStandardServiceSlots({
-                  tenantId: context.tenantId,
-                  space: body.metadata.space,
-                  form,
-                  spec: body.spec,
-                  ...(options.standardServiceResolver
-                    ? { resolver: options.standardServiceResolver }
-                    : {}),
-                  project: false,
-                });
-                await context.beforeCreate();
-              }
-              standardServices = await resolveStandardServiceSlots({
+              await resolveStandardServiceSlots({
                 tenantId: context.tenantId,
                 space: body.metadata.space,
                 form,
@@ -1518,10 +1936,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 ...(options.standardServiceResolver
                   ? { resolver: options.standardServiceResolver }
                   : {}),
-                project: true,
+                project: false,
               });
+              if (create && context.beforeCreate) {
+                await context.beforeCreate();
+              }
             }
-            await refreshMutation(
+            authority = await refreshMutation(
               context,
               create ? "create" : "update",
               body.metadata.space,
@@ -1530,13 +1951,15 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             );
           },
           commitDefinitiveFailure: async (providerLeaseToken, error) => {
-            const charge = error.heldCharge;
-            if (!charge) return false;
             const failure = {
               saga,
               providerLeaseToken,
               operation: create ? ("create" as const) : ("update" as const),
-              charge,
+              ...(error.heldCharge ? { charge: error.heldCharge } : {}),
+              ...(error instanceof ProviderMutationWholeOperationRefusalError &&
+              (error.action === "convergeApply" || error.action === "concludeApplyNoEffect")
+                ? { recoveryAction: error.action }
+                : {}),
             };
             if (context.durableOperation) {
               return await context.durableOperation.commitDefinitiveProviderFailure({
@@ -1555,6 +1978,22 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             });
           },
           execute: async (operationMode, execution, leaseToken) => {
+            if (!applySelection) throw new TakoformHostError("backend_unavailable", 503);
+            // Material projection is deliberately after the durable dispatch
+            // marker. If acknowledgement is lost, the saga remains a repair
+            // unit and recovery never issues a second projection.
+            if (operationMode === "initial") {
+              standardServices = await resolveStandardServiceSlots({
+                tenantId: context.tenantId,
+                space: body.metadata.space,
+                form,
+                spec: body.spec,
+                ...(options.standardServiceResolver
+                  ? { resolver: options.standardServiceResolver }
+                  : {}),
+                project: true,
+              });
+            }
             const executionAuthority = {
               tenantId: context.tenantId,
               resourceUid: uid,
@@ -1568,6 +2007,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               executionAuthority,
               prepared: preparedMigration,
               driver,
+              selection: applySelection,
             });
             return await driver.apply({
               operationId: opId,
@@ -1593,6 +2033,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               spec: structuredClone(body.spec),
               desiredGeneration: incomingDesiredGeneration(body, current),
               relations: preparedDriverRelations,
+              selection: applySelection,
               atomicDeploymentCommit: true,
               ...(context.commercialAuthority
                 ? { commercialAuthority: context.commercialAuthority }
@@ -1615,7 +2056,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           form,
           relations: acceptedRelations,
           store,
-          artifacts,
+          artifacts: scopedArtifacts,
           driver,
         });
         const initialWorkerCondition = initialMigrationCondition
@@ -1650,7 +2091,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replayKey,
             replay: replayRecord,
             providerReceipt: receipt,
-            providerEffect: { effectId: opId, kind: "apply", operationMode: "initial" },
+            providerEffect: {
+              effectId: opId,
+              kind: "apply",
+              operationMode: receipt.providerExecutionMode ?? "initial",
+            },
             claimKeys,
             dependencySet,
             ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -1672,7 +2117,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               replayKey,
               replay: replayRecord,
               providerReceipt: receipt,
-              providerEffect: { effectId: opId, kind: "apply", operationMode: "initial" },
+              providerEffect: {
+                effectId: opId,
+                kind: "apply",
+                operationMode: receipt.providerExecutionMode ?? "initial",
+              },
               ...(claimKeys.length > 0 ? { claimKeys } : {}),
               dependencySet,
               ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -1683,17 +2132,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         return { kind: "resource", resource: next, status };
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
-          await store.releaseResourceClaims(claimOwnerId);
-          if (!providerDispatched) {
-            await store.abandonProviderMutationPlan({
+          let idle = providerProvablyIdle;
+          if (!providerDispatched && !idle) {
+            idle = await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: opId,
               replayKey,
               resourceUid: uid,
             });
           }
-          if (!providerDispatched || providerProvablyIdle) {
-            await settleIdleAttempt(context.tenantId, uid, opId, "apply");
+          if (idle) {
+            await store.releaseResourceClaims(claimOwnerId);
+            if (providerPlanRecorded) {
+              await settleIdleAttempt(context.tenantId, uid, opId, "apply");
+            } else {
+              await store.releaseUncommittedResourceIncarnation({
+                tenantId: context.tenantId,
+                resourceUid: uid,
+                effectId: opId,
+              });
+            }
           }
         }
         throw error;
@@ -1702,6 +2160,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async observe(context, path): Promise<EngineResult> {
       exactQuery(context.url, resourceQueryKeys);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const address = addressFromParts(context.tenantId, requiredQuery(context.url, "space"), path);
       const current = await store.readResource(address);
       const queriedFormRef = formRefFromResourceQuery(context.url, path);
@@ -1753,7 +2212,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             form,
             relations,
             store,
-            artifacts,
+            artifacts: scopedArtifacts,
             driver,
           });
       const workerCondition =
@@ -1776,6 +2235,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
     async importResource(context, path): Promise<EngineResult> {
       const rawBodyDigest = await requestBodyDigest(context.request);
+      const scopedArtifacts = memoizeArtifacts(artifacts);
       const parsedBody = importRequest(await jsonBody(context.request));
       const runtime = await runtimeRegistry(context, parsedBody.metadata.space);
       let form = exactInstalledForm(parsedBody.form.formRef, runtime.forms);
@@ -1788,9 +2248,12 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: canonicalizeEdgeSpec(form, materializeDefaults(form.desiredSchema, parsedBody.spec)),
       };
       const importProviderResource = driver.import?.bind(driver);
-      if (!form.operations.includes("import") || !importProviderResource) {
+      const selectImport = driver.selectImport?.bind(driver);
+      if (!form.operations.includes("import") || !importProviderResource || !selectImport) {
         throw new TakoformHostError("unsupported_capability", 422);
       }
+      const hasImportServiceSlots =
+        validateStandardServiceSlots({ form, spec: body.spec }).length > 0;
       const diagnostics = validateDesired(form, body.spec);
       if (diagnostics.some((entry) => entry.severity === "error")) {
         throw new TakoformHostError("invalid_argument", 400, { diagnostics });
@@ -1813,7 +2276,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         form.identity.formRef,
       );
       form = authority.form;
-      await requireArtifact(form, body.spec, context.tenantId);
+      await requireArtifact(form, body.spec, context.tenantId, scopedArtifacts);
       validateStandardServiceSlots({ form, spec: body.spec });
 
       const replayKey = replayKeyFor(context, body.metadata.space, "import");
@@ -1885,6 +2348,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
       const saga = await store.acceptProviderMutationSaga({
         operationId: proposedImportId,
+        operationKind: "import",
         replayKey,
         tenantId: context.tenantId,
         fingerprint,
@@ -1940,13 +2404,13 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           formRef: form.identity.formRef,
         }))
       ) {
-        await store.releaseResourceClaims(claimOwnerId);
-        await store.abandonProviderMutationPlan({
+        const abandoned = await store.abandonProviderMutationPlan({
           tenantId: context.tenantId,
           operationId: importId,
           replayKey,
           resourceUid: uid,
         });
+        if (abandoned) await store.releaseResourceClaims(claimOwnerId);
         throw new TakoformHostError("resource_busy", 409);
       }
       if (
@@ -1970,6 +2434,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         let preparedDriverRelations: readonly TakoformDriverRelation[] = [];
         let acceptedRelations = relations;
         let preparedMigration: PreparedSqliteMigrationApplication | null = null;
+        let importSelection: TakoformImportSelection | undefined;
         const receipt = await executeProviderMutation({
           tenantId: context.tenantId,
           operationId: importId,
@@ -1983,6 +2448,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onPreviouslyDispatched: () => {
             providerDispatched = true;
+            releaseClaimsOnFailure = false;
           },
           onContention: () => {
             releaseClaimsOnFailure = false;
@@ -1992,9 +2458,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           },
           onProvablyIdle: () => {
             providerProvablyIdle = true;
+            releaseClaimsOnFailure = true;
           },
-          providerRefusalProvesWholeAttemptIdle: () => preparedMigration === null,
-          onDispatch: async () => {
+          providerRefusalProvesWholeAttemptIdle: () =>
+            preparedMigration === null && !hasImportServiceSlots,
+          onDispatch: async (operationMode) => {
             if (
               !(await store.recordResourceEffect({
                 tenantId: context.tenantId,
@@ -2002,7 +2470,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 effectId: importId,
                 kind: "import",
                 phase: "dispatched",
-                operationMode: "initial",
+                operationMode,
               }))
             ) {
               throw new TakoformHostError("resource_busy", 409);
@@ -2010,27 +2478,84 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             providerDispatched = true;
           },
           ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
-          prepare: async (acceptedDependencies, executionMode) => {
+          prepare: async (
+            acceptedDependencies,
+            executionMode,
+            leaseToken,
+            _acceptedApplySelection,
+            acceptedImportSelection,
+          ) => {
             if (!acceptedDependencies) throw new TakoformHostError("backend_unavailable", 503);
             preparedDriverRelations = await driverRelations(
               context.tenantId,
               body.metadata.space,
               acceptedRelations,
             );
+            const resolvedSelection = await selectImport({
+              tenantId: context.tenantId,
+              resourceUid: uid,
+              form,
+              name: body.metadata.name,
+              space: body.metadata.space,
+              spec: structuredClone(body.spec),
+              nativeId: body.nativeId,
+              relations: preparedDriverRelations,
+              ...(current ? { previous: structuredClone(current) } : {}),
+            });
+            // Even an undispatched retry can already have accepted placement.
+            // Never overwrite it; historical dispatched NULL cannot be filled.
+            if (
+              resolvedSelection.nativeId !== body.nativeId ||
+              (executionMode === "recovery" && !acceptedImportSelection) ||
+              (acceptedImportSelection &&
+                !sameTakoformImportSelection(resolvedSelection, acceptedImportSelection))
+            ) {
+              throw new TakoformHostError("resource_busy", 409);
+            }
             preparedMigration = await prepareSqliteMigrationApplication({
               tenantId: context.tenantId,
               space: body.metadata.space,
               form,
               relations: acceptedRelations,
               store,
-              artifacts,
+              artifacts: scopedArtifacts,
               driver,
             });
-            // Supply resolution is deliberately part of the initial
-            // pre-dispatch prepare. Completed receipts and recovered commands
-            // must not depend on a resolver being available or project new
-            // runtime material.
-            if (executionMode === "initial") {
+            await refreshMutation(
+              context,
+              "import",
+              body.metadata.space,
+              form.identity.formRef,
+              authority,
+            );
+            const boundSelection = await store.bindProviderMutationImportSelection({
+              tenantId: context.tenantId,
+              operationId: importId,
+              resourceUid: uid,
+              fingerprint,
+              leaseToken,
+              mode: executionMode,
+              selection: acceptedImportSelection ?? resolvedSelection,
+            });
+            if (!boundSelection) throw new TakoformHostError("resource_busy", 409);
+            importSelection = boundSelection;
+          },
+          settleDefinitiveImportFailure: async (leaseToken, outcome) => {
+            return await store.settleDefinitiveProviderImportFailure({
+              tenantId: context.tenantId,
+              operationId: importId,
+              replayKey,
+              resourceUid: uid,
+              leaseToken,
+              outcome,
+            });
+          },
+          execute: async (operationMode, execution, leaseToken) => {
+            if (!importSelection) throw new TakoformHostError("resource_busy", 409);
+            // A resolver can issue material. Cross the durable dispatch fence
+            // first so an uncertain projection is never erased as idle prep.
+            // Recovery does not issue fresh material or infer prior absence.
+            if (operationMode === "initial") {
               standardServices = await resolveStandardServiceSlots({
                 tenantId: context.tenantId,
                 space: body.metadata.space,
@@ -2042,25 +2567,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 project: true,
               });
             }
-            await refreshMutation(
-              context,
-              "import",
-              body.metadata.space,
-              form.identity.formRef,
-              authority,
-            );
-          },
-          settleDefinitiveImportConflict: async (leaseToken) => {
-            return await store.settleDefinitiveProviderImportConflict({
-              tenantId: context.tenantId,
-              operationId: importId,
-              replayKey,
-              resourceUid: uid,
-              leaseToken,
-              outcome: "import_conflict",
-            });
-          },
-          execute: async (operationMode, execution, leaseToken) => {
             const executionAuthority = {
               tenantId: context.tenantId,
               resourceUid: uid,
@@ -2074,8 +2580,10 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               executionAuthority,
               prepared: preparedMigration,
               driver,
+              selection: importSelection,
             });
             return await importProviderResource({
+              selection: importSelection,
               operationId: importId,
               operationMode,
               ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
@@ -2102,7 +2610,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           form,
           relations: acceptedRelations,
           store,
-          artifacts,
+          artifacts: scopedArtifacts,
           driver,
         });
         const initialWorkerCondition = initialMigrationCondition
@@ -2137,7 +2645,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replayKey,
             replay: replayRecord,
             providerReceipt: receipt,
-            providerEffect: { effectId: importId, kind: "import", operationMode: "initial" },
+            providerEffect: {
+              effectId: importId,
+              kind: "import",
+              operationMode: receipt.providerExecutionMode ?? "initial",
+            },
             claimKeys,
             dependencySet,
             ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -2159,7 +2671,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               replayKey,
               replay: replayRecord,
               providerReceipt: receipt,
-              providerEffect: { effectId: importId, kind: "import", operationMode: "initial" },
+              providerEffect: {
+                effectId: importId,
+                kind: "import",
+                operationMode: receipt.providerExecutionMode ?? "initial",
+              },
               ...(claimKeys.length > 0 ? { claimKeys } : {}),
               dependencySet,
               ...(authority.fence ? { authorityFence: authority.fence } : {}),
@@ -2170,16 +2686,19 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         return { kind: "resource", resource: next, status };
       } catch (error) {
         if (!persisted && !providerSettled && releaseClaimsOnFailure) {
-          await store.releaseResourceClaims(claimOwnerId);
-          if (!providerDispatched) {
-            await store.abandonProviderMutationPlan({
+          let idle = providerProvablyIdle;
+          if (!providerDispatched && !idle) {
+            idle = await store.abandonProviderMutationPlan({
               tenantId: context.tenantId,
               operationId: importId,
               replayKey,
               resourceUid: uid,
             });
           }
-          if (!providerDispatched || providerProvablyIdle) {
+          // The guarded delete is also the ACK-loss readback: a bound import
+          // remains a repair unit, even when this invocation saw no bind result.
+          if (idle) {
+            await store.releaseResourceClaims(claimOwnerId);
             await settleIdleAttempt(context.tenantId, uid, importId, "import");
           }
         }
@@ -2265,6 +2784,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
 
       const saga = await store.acceptProviderMutationSaga({
         operationId: context.durableOperation?.id ?? operationId(),
+        operationKind: "delete",
         replayKey,
         tenantId: context.tenantId,
         fingerprint,
@@ -2272,7 +2792,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         target: address,
         acceptedUid: current.metadata.uid,
         acceptedGeneration: current.metadata.generation,
-        acceptedRevision: current.metadata.revision,
+        acceptedRevision: context.durableOperation?.acceptedRevision ?? current.metadata.revision,
         ...(authority.fence ? { authorityHeadDigest: authority.fence.headDigest } : {}),
       });
       const deleteId = saga.operationId;
@@ -2336,6 +2856,9 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
               (await driver.delete({
                 operationId: deleteId,
                 operationMode,
+                ...(operationMode === "recovery"
+                  ? { recoveryAction: context.durableOperation?.deleteRecoveryAction ?? "observe" }
+                  : {}),
                 ...(execution.providerHandle ? { providerHandle: execution.providerHandle } : {}),
                 executionAuthority: {
                   tenantId: context.tenantId,
@@ -2382,6 +2905,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
           replayKey,
           replay: replayRecord,
           providerReceipt: receipt,
+          providerEffect: {
+            effectId: deleteId,
+            kind: "delete",
+            operationMode: receipt.providerExecutionMode ?? "initial",
+          },
           deletionTombstone: { operationId: deleteId },
           ...(authority.fence ? { authorityFence: authority.fence } : {}),
         });
@@ -2399,6 +2927,11 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
             replayKey,
             replay: replayRecord,
             providerReceipt: receipt,
+            providerEffect: {
+              effectId: deleteId,
+              kind: "delete",
+              operationMode: receipt.providerExecutionMode ?? "initial",
+            },
             deletionTombstone: { operationId: deleteId },
             ...(authority.fence ? { authorityFence: authority.fence } : {}),
           },
@@ -2524,6 +3057,16 @@ function nextResourceUid(randomId: () => string): string {
     return `uid_${encoded}`;
   }
   return `uid_${raw.replace(/[^A-Za-z0-9._-]/gu, "")}`;
+}
+
+function sagaAuthorityHeadDigest(
+  accepted: AcceptedAuthoritySummary | undefined,
+  current: TakoformAuthorityFence | undefined,
+): `sha256:${string}` | undefined {
+  if (accepted !== undefined) {
+    return accepted.mode === "mutation" ? accepted.headDigest : undefined;
+  }
+  return current?.headDigest;
 }
 
 /** An observation that changed nothing must not mint a new revision. */

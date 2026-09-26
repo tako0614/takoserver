@@ -42,6 +42,7 @@ function recordingHost(): {
   const seen: { value?: ProviderRuntimeInputPublicApply } = {};
   const driver: TakoformResourceDriver = {
     ...inner,
+    selectApply: (input) => inner.selectApply(input),
     apply: async (input) => {
       if (input.publicApply) seen.value = input.publicApply;
       return await inner.apply(input);

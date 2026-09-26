@@ -13,6 +13,7 @@ import {
   loadProviderEraTestCatalog,
   type StableLocalWorkerComposition,
 } from "../src/worker-stable-local-composition.ts";
+import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
 const TAKOFORM_ROOT = resolve(import.meta.dir, "fixtures/takoform-v1");
 
@@ -143,7 +144,7 @@ describe("the test-only stable worker runtime", () => {
     const bundle = resource(local.form("WorkerBundle"), "bundle", {
       manifestDigest: "sha256:manifest",
     });
-    await local.driver.apply(applyInput(worker, []));
+    await applyWithSelection(local.driver, applyInput(worker, []));
 
     const version = resource(local.form("WorkerVersion"), "version", {
       bundle: ref(bundle),
@@ -160,7 +161,8 @@ describe("the test-only stable worker runtime", () => {
       ],
     });
     await expect(
-      local.driver.apply(
+      applyWithSelection(
+        local.driver,
         applyInput(version, [relation("/worker", worker), relation("/bundle", bundle)]),
       ),
     ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
@@ -236,18 +238,21 @@ async function applyWorkerChain(local: StableLocalWorkerComposition) {
     worker: ref(worker),
   });
 
-  await local.driver.apply(applyInput(worker, []));
-  await local.driver.apply(applyInput(bundle, []));
-  await local.driver.apply(
+  await applyWithSelection(local.driver, applyInput(worker, []));
+  await applyWithSelection(local.driver, applyInput(bundle, []));
+  await applyWithSelection(
+    local.driver,
     applyInput(version, [relation("/worker", worker), relation("/bundle", bundle)]),
   );
-  await local.driver.apply(
+  await applyWithSelection(
+    local.driver,
     applyInput(deployment, [
       relation("/worker", worker),
       relation("/versions/0/workerVersion", version),
     ]),
   );
-  const endpointReceipt = await local.driver.apply(
+  const endpointReceipt = await applyWithSelection(
+    local.driver,
     applyInput(endpoint, [relation("/worker", worker)]),
   );
   if (endpointReceipt.outputs) endpoint.status.outputs = endpointReceipt.outputs;
@@ -258,7 +263,7 @@ function applyInput(
   value: TakoformStoredResource,
   relations: readonly TakoformDriverRelation[],
   extras: Partial<Parameters<StableLocalWorkerComposition["driver"]["apply"]>[0]> = {},
-): Parameters<StableLocalWorkerComposition["driver"]["apply"]>[0] {
+): Omit<Parameters<StableLocalWorkerComposition["driver"]["apply"]>[0], "selection"> {
   return {
     operationId: `op-${value.metadata.name}`,
     operationKey: extras.operationKey ?? `stable-local-${value.metadata.name}`,

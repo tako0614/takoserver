@@ -12,6 +12,7 @@ import type { SponsorshipCredentialIssuer } from "../src/sponsorship-credential.
 import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
 
 const NOW = new Date("2026-09-04T00:00:00.000Z");
+const MANAGED_POLICY_DIGEST = `sha256:${"d".repeat(64)}` as const;
 const CHANNEL = {
   kind: "takosumi-hosted.sponsorship-authority-rpc@v1",
   hostedVersionId: "11111111-1111-4111-8111-111111111111",
@@ -127,15 +128,84 @@ test("D1 executes the guarded bind and preserves duplicate, conflict, and floor 
       }),
     ).rejects.toEqual(new SponsorshipAuthorityError("authority_denied"));
 
+    const managedSigned: Parameters<SponsorshipCredentialIssuer["issue"]>[0][] = [];
+    const managedEnsures: string[] = [];
+    const managedAuthority = createSponsorshipAuthority({
+      sql,
+      organizationId: "org_hosted",
+      clock: () => NOW,
+      credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "c".repeat(43) },
+      receipts: {
+        async issue() {
+          return "receipt.managed.payload";
+        },
+      },
+      issuanceAuthority: {
+        workerName: "takoserver-sponsorship-authority-test",
+        versionId: "22222222-2222-4222-8222-222222222222",
+        sourceCommit: "e".repeat(40),
+        artifactSha256: `sha256:${"f".repeat(64)}`,
+        credentialKeyId: "credential-key-test",
+        receiptKeyId: "receipt-key-test",
+      },
+      credentialIssuer: {
+        async issue(input) {
+          managedSigned.push(input);
+          return {
+            token: "header.managed.signature",
+            expiresAt: "2026-09-04T00:05:00.000Z",
+          };
+        },
+      },
+      managedSpaceAdmission: {
+        policyDigest: MANAGED_POLICY_DIGEST,
+        async ensureTenantSpaceAdmission(input) {
+          managedEnsures.push(input.tenantRef);
+          expect(
+            await sql.query(
+              "SELECT tenant_ref, org_id FROM sponsorship_tenants WHERE tenant_ref = ?",
+              [input.tenantRef],
+            ),
+          ).toEqual([{ tenant_ref: input.tenantRef, org_id: "org_hosted" }]);
+          expect(
+            await sql.query(
+              "SELECT COUNT(*) AS total FROM sponsorship_credential_issuance_operations",
+            ),
+          ).toEqual([{ total: 1 }]);
+          return {
+            organizationId: "org_hosted",
+            tenantRef: input.tenantRef,
+            spaceRef: input.tenantRef,
+            policyDigest: MANAGED_POLICY_DIGEST,
+            ready: true,
+          };
+        },
+      },
+    });
+    const managedInput = {
+      tenantRef: "tenant:managed-d1",
+      spaceRef: "tenant:managed-d1",
+      runRef: "run:managed-d1",
+      requiredAvailableMinor: 1_000,
+      channel: await channelFor("e"),
+    } as const;
+    await expect(managedAuthority.issueTenantRunCredential(managedInput)).resolves.toMatchObject({
+      token: "header.managed.signature",
+      expiresAt: "2026-09-04T00:05:00.000Z",
+    });
+    expect(managedEnsures).toEqual(["tenant:managed-d1"]);
+    expect(managedSigned).toHaveLength(1);
+
     expect(new Set(signed.map((input) => JSON.stringify(input))).size).toBe(1);
     expect(
       await sql.query("SELECT COUNT(*) AS total FROM sponsorship_credential_issuance_operations"),
-    ).toEqual([{ total: 1 }]);
+    ).toEqual([{ total: 2 }]);
     expect(
       await sql.query("SELECT tenant_ref, org_id FROM sponsorship_tenants ORDER BY tenant_ref"),
     ).toEqual([
       { tenant_ref: "tenant:conflict", org_id: "org_other" },
       { tenant_ref: "tenant:d1", org_id: "org_hosted" },
+      { tenant_ref: "tenant:managed-d1", org_id: "org_hosted" },
     ]);
   } finally {
     await runtime.dispose();

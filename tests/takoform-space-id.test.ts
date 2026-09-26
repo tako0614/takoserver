@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isSpaceId as extensionIsSpaceId } from "../src/provider-extension.ts";
 import {
   isSpaceId,
   SPACE_ID_MAX_CODE_POINTS,
@@ -6,6 +7,10 @@ import {
 } from "../src/takoform/space-id.ts";
 
 describe("stable Takoform Space grammar", () => {
+  test("provider extensions use the exact Host Space codec", () => {
+    expect(extensionIsSpaceId).toBe(isSpaceId);
+  });
+
   test("accepts tenant, interior whitespace, maximum, and astral identifiers", () => {
     const maximum = `tenant:${"界".repeat(248)}`;
     const astralMaximum = "😀".repeat(SPACE_ID_MAX_CODE_POINTS);
