@@ -28,8 +28,9 @@ import { createStaticStableTestTakoformHost } from "./helpers/historical-takofor
  * the other deployment, without one byte of this resource's plan moving.
  *
  * So those refusals carry `hostCode: cross_resource_precondition` and are
- * re-attempted; a malformed document still replays. The wire answer is
- * unchanged in both cases: `invalid_argument` 400, `retryable: false`, so
+ * re-attempted; a malformed document still replays. The attachment gate uses
+ * the frozen `unsupported_capability` 422 answer; other neighbour refusals can
+ * still be `invalid_argument` 400. Both stay `retryable: false`, so
  * provider 4.0.0 surfaces the refusal to the operator now rather than retrying
  * it, and only the *next* identical apply gets a fresh attempt.
  */
@@ -123,7 +124,7 @@ test("an endpoint refused for a missing WorkerDeployment is created by the ident
   expect(refused.terminal).toMatchObject({
     done: true,
     error: {
-      code: "invalid_argument",
+      code: "unsupported_capability",
       retryable: false,
       hostCode: "cross_resource_precondition",
       message: expect.stringContaining("has no WorkerDeployment"),
@@ -240,7 +241,7 @@ test("a cross-resource refusal adds hostCode and nothing else to the envelope", 
   const refused = await apply(host, WORKER_ENDPOINT, "endpoint", {
     worker: named("ModuleWorker", "worker"),
   });
-  expect(refused.status).toBe(400);
+  expect(refused.status).toBe(422);
   const error = (refused.body as { error: Record<string, unknown> }).error;
   expect(Object.keys(error).sort()).toEqual([
     "code",
@@ -250,11 +251,11 @@ test("a cross-resource refusal adds hostCode and nothing else to the envelope", 
     "retryable",
   ]);
   expect(error).toMatchObject({
-    code: "invalid_argument",
+    code: "unsupported_capability",
     retryable: false,
     hostCode: "cross_resource_precondition",
   });
-  expect(STABLE_ERROR_HTTP_STATUS[String(error.code)]).toBe(400);
+  expect(STABLE_ERROR_HTTP_STATUS[String(error.code)]).toBe(422);
 });
 
 async function servingWorker(host: TakoformHost): Promise<void> {

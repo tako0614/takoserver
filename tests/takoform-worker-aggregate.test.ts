@@ -198,8 +198,8 @@ test("an inward activation with no WorkerDeployment at all names the missing dep
       },
     }),
   ).rejects.toMatchObject({
-    code: "invalid_argument",
-    status: 400,
+    code: "unsupported_capability",
+    status: 422,
     publicMessage: expect.stringContaining("has no WorkerDeployment"),
   });
 });
@@ -249,8 +249,8 @@ test("an inbound service binding is rejected until its target worker serves fetc
       },
     }),
   ).rejects.toMatchObject({
-    code: "invalid_argument",
-    status: 400,
+    code: "unsupported_capability",
+    status: 422,
     publicMessage: expect.stringContaining("has no WorkerDeployment"),
   });
 });
@@ -697,6 +697,57 @@ test("an inward activation whose deployment has not become Ready is refused retr
     code: "resource_busy",
     status: 409,
     publicMessage: expect.stringContaining("no serving deployment yet"),
+  });
+});
+
+test("an inward activation refuses a deployed version that lacks its handler", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  await expect(
+    validateWorkerAggregate({
+      tenantId: "tenant-a",
+      space: "conformance",
+      resourceName: "trigger",
+      form: {
+        identity: { formRef: { ...formRef, kind: "WorkerCronTrigger" } },
+        role: "attachment",
+        desiredSchema: {},
+        operations: ["create", "read", "delete"],
+      },
+      spec: { cron: "*/5 * * * *" },
+      relations: [workerRelation],
+      wave: testWave(),
+      store: {
+        async hostnameClaims() {
+          return [];
+        },
+        async queuePathReaches() {
+          return false;
+        },
+        async resourcesByRelation(input) {
+          return input.sourceKind === "WorkerDeployment"
+            ? [{ resource: deployment, relations: [versionRelation] }]
+            : [];
+        },
+        async readResource() {
+          return { ...version, spec: { handlers: ["fetch"] } };
+        },
+        async readRelations() {
+          return [];
+        },
+        ...noClaims,
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "unsupported_capability",
+    status: 422,
+    publicMessage: expect.stringContaining("scheduled"),
   });
 });
 

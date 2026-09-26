@@ -264,22 +264,15 @@ export async function validateWorkerAggregate(input: {
 /**
  * Refuses an inward activation whose target Worker is not serving the handler.
  *
- * The refusal is about *what is missing*, which is two different facts and was
- * one wrong answer. A Worker for which nothing declares a `WorkerDeployment` is
- * a precondition the operator has to fix in the configuration; a Worker whose
- * deployment has simply not landed yet is ordering inside one apply wave, cured
- * by the wave itself and, failing that, by asking again. Neither is a Host
- * capability that does not exist, which is what this used to say — sending an
- * operator to "apply against a host whose Host Support Profile declares it"
- * while the only thing missing was a deployment their own graph creates.
+ * The frozen attachment gate distinguishes a settled absence from a transient
+ * one. No deployment, or a deployed version that definitively lacks the
+ * handler, is `unsupported_capability` (422). A deployment whose selected
+ * version has not become readable is still `resource_busy` (409). An in-flight
+ * deployment in the same wave is awaited before either refusal.
  *
- * The definitive half is still definitive — `invalid_argument` 400, not
- * retryable, surfaced to the operator now — but it is a
- * `crossResourcePrecondition`, because what makes it true is a *neighbour*.
- * Adding the missing `WorkerDeployment` changes nothing in this endpoint's
- * plan, so the cured `tofu apply` arrives under the identical plan-derived
- * idempotency key, and a Host that replayed the stored refusal would hand back
- * an answer that stopped being true the moment the deployment landed.
+ * The definitive answer retains `crossResourcePrecondition`: adding or changing
+ * the neighbour does not change this attachment's plan-derived idempotency
+ * key, so the next identical apply must not replay a stale settled refusal.
  */
 async function requireServingWorker(
   input: {
@@ -315,8 +308,50 @@ async function requireServingWorker(
   });
   if (deployments.length === 0) {
     throw crossResourcePrecondition({
+      code: "unsupported_capability",
+      status: 422,
       message: `the ModuleWorker ${worker.targetName} has no WorkerDeployment, so nothing serves its ${handler} handler; declare a WorkerDeployment that selects a WorkerVersion serving ${handler}, then apply again`,
     });
+  }
+  const deployment = deployments.length === 1 ? deployments[0] : undefined;
+  if (deployment) {
+    const versions = deployment.relations.filter(
+      (relation) => relation.relation === DEPLOYMENT_VERSION_RELATION,
+    );
+    if (versions.length > 0) {
+      const selected = await Promise.all(
+        versions.map(async (relation) => ({
+          relation,
+          version: await input.store.readResource({
+            tenantId: input.tenantId,
+            space: input.space,
+            apiVersion: relation.targetApiVersion,
+            kind: relation.targetKind,
+            name: relation.targetName,
+          }),
+        })),
+      );
+      if (
+        selected.every(
+          ({ relation, version }) =>
+            version?.metadata.uid === relation.targetUid && Array.isArray(version.spec.handlers),
+        )
+      ) {
+        if (
+          selected.every(
+            ({ version }) =>
+              Array.isArray(version?.spec.handlers) && version.spec.handlers.includes(handler),
+          )
+        ) {
+          return;
+        }
+        throw crossResourcePrecondition({
+          code: "unsupported_capability",
+          status: 422,
+          message: `the ModuleWorker ${worker.targetName} has an active WorkerDeployment whose selected WorkerVersion does not serve ${handler}; select only versions that serve ${handler}, then apply again`,
+        });
+      }
+    }
   }
   throw new TakoformHostError(
     "resource_busy",
