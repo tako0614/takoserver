@@ -92,6 +92,7 @@ func Run(options Options) error {
 	}
 
 	controller := newController(options.WorkerdBinary)
+	controller.experimentalWorkerdCandidate = options.ExperimentalWorkerdCandidate
 	writer := newReplyWriter(options.Out, controller.signalWriterFailure)
 	controller.setJournalWriter(writer)
 	writer.start()
@@ -856,7 +857,8 @@ func parseJournalMarker(line []byte, token string) (int64, bool, error) {
 type controller struct {
 	mu sync.Mutex
 
-	binary string
+	binary                       string
+	experimentalWorkerdCandidate bool
 
 	registered    bool
 	terminal      bool
@@ -1275,7 +1277,11 @@ func (controller *controller) spawnChild(
 		return
 	}
 
-	command := exec.Command(controller.binary, "serve", configPath)
+	args := []string{"serve", configPath}
+	if controller.experimentalWorkerdCandidate {
+		args = append(args, "--experimental")
+	}
+	command := exec.Command(controller.binary, args...)
 	command.Env = []string{}
 	command.ExtraFiles = nil
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}

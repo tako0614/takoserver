@@ -72,6 +72,7 @@ const utf8Encoder = new TextEncoder();
 
 interface WorkflowLoaderStaticGraph {
   readonly outerEntrypoint: string;
+  readonly outerHelper: string;
   readonly outerModules: ReadonlyMap<string, Uint8Array>;
   readonly outerModuleMediaTypes: Readonly<Record<string, WorkerdModuleMediaType>>;
   readonly staticHostModules: ReadonlyMap<string, Uint8Array>;
@@ -377,6 +378,8 @@ export async function prepareWorkerdWorkflowExecution(
     hostEntries: tenantEntries,
     childBindingNames,
   };
+  // Only generated Host code executes in this static isolate. All selected
+  // tenant bytes remain inert text/data until the closed child is loaded on RUN.
   const outerModules = new Map<string, Uint8Array>([
     [outerEntrypoint, encoder.encode(outerEntrySource(outerHelper, outerOptions))],
     [outerHelper, encoder.encode(WORKFLOW_LOADER_OUTER_SOURCE)],
@@ -396,6 +399,7 @@ export async function prepareWorkerdWorkflowExecution(
   }
   const staticGraph: WorkflowLoaderStaticGraph = {
     outerEntrypoint,
+    outerHelper,
     outerModules,
     outerModuleMediaTypes,
     staticHostModules,

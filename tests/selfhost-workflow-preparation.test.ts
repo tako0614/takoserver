@@ -257,12 +257,24 @@ test("materializes the selected graph privately without evaluating or exposing p
     expect(resolvedIdentities).toEqual([identity]);
     expect(config).toContain('(name = "__workflow_outer.js", esModule = embed');
     expect(config).toContain('(name = "__workflow_outer_helper.js", esModule = embed');
+    expect(applicationSection).not.toContain("modulePolicy");
+    expect(applicationSection).not.toContain("role =");
+    const carriers = [
+      ...config.matchAll(/\(name = "__workflow_payload_\d+", ([a-zA-Z]+) = embed/g),
+    ];
+    expect(carriers).toHaveLength(8);
+    expect(carriers.every(([, kind]) => kind === "text" || kind === "data")).toBe(true);
     expect(config).toContain('(name = "__workflow_payload_00000", text = embed');
     expect(config).toContain('(name = "__workflow_payload_00002", data = embed');
     expect(config).not.toContain('(name = "index.js",');
     expect(config).not.toContain('(name = "module.txt",');
     expect(config).not.toContain('(name = "module.bin",');
     expect(applicationSection).toContain('(name = "APP_VALUE", text = "app-a")');
+    expect(applicationSection).toContain('compatibilityDate = "2026-01-01"');
+    // ctx.exports is already enabled at this date. Native workerd rejects
+    // redundant defaulted flags instead of merely warning during startup.
+    expect(applicationSection).not.toContain('"enable_ctx_exports"');
+    expect(applicationSection).toContain('"disallow_importable_env"');
     expect(applicationSection).not.toContain("DATA_TOKEN");
     expect(dataSection).toContain('(name = "DATA_TOKEN", text = "facade-only-token")');
     expect(config).toContain(`address = "${currentDataPlaneAddress}"`);

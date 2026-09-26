@@ -22,9 +22,18 @@ import (
 const testIdentity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 // TestMain is the explicit, internal child injection seam. The guard still
-// invokes this exact test binary as [binary, "serve", configPath]; no general
-// command is exposed by the test or production CLI.
+// invokes this exact test binary as [binary, "serve", configPath], optionally
+// with the fixed candidate switch; no general command or argv is exposed.
 func TestMain(main *testing.M) {
+	if len(os.Args) == 4 && os.Args[1] == "serve" && os.Args[3] == "--experimental" {
+		if err := os.WriteFile(os.Args[2]+".experimental", []byte("enabled"), 0o600); err != nil {
+			os.Exit(3)
+		}
+		if err := runTestChild(os.Args[2]); err != nil {
+			os.Exit(3)
+		}
+		return
+	}
 	if len(os.Args) == 3 && os.Args[1] == "serve" {
 		if err := runTestChild(os.Args[2]); err != nil {
 			os.Exit(3)
@@ -53,17 +62,52 @@ type testSession struct {
 }
 
 func newTestSession(t *testing.T) *testSession {
+	return newTestSessionWithOptions(t, Options{})
+}
+
+func newTestSessionWithOptions(t *testing.T, options Options) *testSession {
 	t.Helper()
 	inReader, input := io.Pipe()
 	outReader, outWriter := io.Pipe()
 	done := make(chan error, 1)
 	executable := testExecutable(t)
+	options.WorkerdBinary, options.In, options.Out = executable, inReader, outWriter
 	go func() {
-		err := Run(Options{WorkerdBinary: executable, In: inReader, Out: outWriter})
+		err := Run(options)
 		_ = outWriter.Close()
 		done <- err
 	}()
 	return &testSession{input: input, output: bufio.NewReader(outReader), done: done}
+}
+
+func TestGuardExperimentalCandidateIsExplicitAndStillReaped(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "child.pid")
+			session := newTestSessionWithOptions(t, Options{ExperimentalWorkerdCandidate: enabled})
+			session.send(t, registrationFields(t, 5*time.Second, 10*time.Second))
+			_ = session.reply(t)
+			session.send(t, startFields(2, marker))
+			if got := session.reply(t); got != (reply{ID: 2, Kind: "started"}) {
+				t.Fatalf("start reply = %#v", got)
+			}
+			pid := waitForPID(t, marker)
+			_, err := os.Stat(marker + ".experimental")
+			if (enabled && err != nil) || (!enabled && !os.IsNotExist(err)) {
+				t.Fatalf("experimental=%v marker error: %v", enabled, err)
+			}
+			session.send(t, map[string]any{"id": 3, "op": "stop", "identity": testIdentity})
+			if got := session.reply(t); got != (reply{ID: 3, Kind: "stopped"}) {
+				t.Fatalf("stop reply = %#v", got)
+			}
+			if err := session.wait(t); err != nil {
+				t.Fatal(err)
+			}
+			if !waitForGone(pid) {
+				t.Fatalf("child pid %d remains", pid)
+			}
+		})
+	}
 }
 
 func testExecutable(t *testing.T) string {

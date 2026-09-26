@@ -3,6 +3,7 @@ import { executeWorkflowClass } from "./workflow-class-execution.ts";
 import { encodeDocument, parseDocument, plainInputRecord } from "./workflow-data.ts";
 import {
   adoptTrustedWorkflowPromise,
+  createWorkflowPromise,
   isWorkflowCallInputError,
   WorkflowCallInputError,
   type WorkflowDriver,
@@ -228,7 +229,22 @@ export function createWorkflowLoaderTenantWorker(options: WorkflowLoaderTenantWo
       }
       const exchangeMethod = get(host, "exchange");
       if (typeof exchangeMethod !== "function") throw unavailable();
-      hostExchange = (payload) => apply(exchangeMethod, host, [payload]) as Promise<string>;
+      hostExchange = (payload) =>
+        createWorkflowPromise<string>((resolve, reject) => {
+          // The retained Host stub returns workerd's RpcPromise, not a genuine
+          // JS Promise. Observe its native then without exposing it to tenant
+          // code or passing it to the genuine-Promise-only adoption helper.
+          const pending = apply(exchangeMethod, host, [payload]) as object;
+          const then = get(pending, "then");
+          if (typeof then !== "function") throw unavailable();
+          apply(then, pending, [
+            (value: unknown) => {
+              if (typeof value === "string") resolve(value);
+              else reject(unavailable());
+            },
+            reject,
+          ]);
+        });
 
       // The wrapper is loaded before the tenant namespace. Both imports happen
       // in this child only after the outer worker's one-shot RUN latch.

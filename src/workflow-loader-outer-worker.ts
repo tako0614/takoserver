@@ -48,7 +48,7 @@ export interface WorkflowLoaderWorkerCode {
 }
 
 export interface WorkflowLoaderEntrypoint {
-  run(): Promise<unknown> | unknown;
+  run(request: null): Promise<unknown> | unknown;
 }
 
 export interface WorkflowLoaderWorker {
@@ -163,20 +163,26 @@ export function createWorkflowLoaderOuterWorker(
     const workflowHostFactory = get(context?.exports, "WorkflowHost");
     if (typeof workflowHostFactory !== "function") throw unavailable();
     const workflowHost = await resolveMaybe(
-      apply(workflowHostFactory, context.exports, []) as object | Promise<object>,
+      apply(workflowHostFactory, context.exports, [create(null)]) as object | Promise<object>,
     );
     if (!workflowHost || (typeof workflowHost !== "object" && typeof workflowHost !== "function")) {
       throw unavailable();
     }
     if (typeof get(workflowHost, "exchange") !== "function") throw unavailable();
 
-    const childEnv = create(null) as Record<string, unknown>;
+    const childEnv: Record<string, unknown> = {};
     for (const name of childBindingNames) {
-      if (hasOwn(rawEnv, name)) childEnv[name] = get(rawEnv, name);
+      if (hasOwn(rawEnv, name))
+        define(childEnv, name, {
+          value: get(rawEnv, name),
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
     }
     // The RPC stub is the sole Host authority visible to the child. Loader,
     // companion, journal and every other outer binding stay out of this map.
-    childEnv[WORKFLOW_HOST_BINDING] = workflowHost;
+    define(childEnv, WORKFLOW_HOST_BINDING, { value: workflowHost, enumerable: true });
 
     const code: WorkflowLoaderWorkerCode = {
       compatibilityDate: "2026-01-01",
@@ -207,7 +213,9 @@ export function createWorkflowLoaderOuterWorker(
     }
     const runMethod = get(entrypoint, "run");
     if (typeof runMethod !== "function") throw unavailable();
-    const result = await resolveMaybe(apply(runMethod, entrypoint, []) as string | Promise<string>);
+    const result = await resolveMaybe(
+      apply(runMethod, entrypoint, [null]) as string | Promise<string>,
+    );
     if (typeof result !== "string" || utf8Size(result) > MAX_FRAME_BYTES) throw unavailable();
     return result;
   }
@@ -291,13 +299,10 @@ function utf8Size(value: string): number {
 }
 
 async function resolveMaybe<T>(value: T | Promise<T>): Promise<T> {
-  if (value && (typeof value === "object" || typeof value === "function")) {
-    const then = get(value, "then");
-    if (typeof then === "function") {
-      return (await trusted(value as Promise<T>)).value;
-    }
-  }
-  return value as T;
+  // Native RPC returns RpcPromise, not a genuine JS Promise. This trusted
+  // outer isolate never evaluates tenant code, so use normal thenable adoption
+  // rather than applying Promise.prototype.then to an incompatible receiver.
+  return await value;
 }
 
 function captureNativeGetter(prototype: object, name: string): (() => unknown) | undefined {

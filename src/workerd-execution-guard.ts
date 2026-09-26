@@ -63,6 +63,8 @@ type Ack = "registered" | "configured" | "started" | "extended" | "stopped";
 export function spawnWorkerdExecutionGuard(options: {
   readonly guardBinary: string;
   readonly workerdBinary: string;
+  /** Explicit unqualified native candidate tests only; accepted execution defaults off. */
+  readonly experimentalWorkerdCandidate?: boolean;
   readonly registration: WorkerdExecutionRegistration;
   readonly onJournalMarker?: (sequence: number) => void;
 }): WorkerdExecutionGuard {
@@ -75,12 +77,22 @@ export function spawnWorkerdExecutionGuard(options: {
     registration: options.registration,
     ...(options.onJournalMarker === undefined ? {} : { onJournalMarker: options.onJournalMarker }),
     spawn: () => {
-      const child = Bun.spawn([options.guardBinary, "--workerd-binary", options.workerdBinary], {
-        stdin: "pipe",
-        stdout: "pipe",
-        stderr: "ignore",
-        env: {},
-      });
+      const child = Bun.spawn(
+        [
+          options.guardBinary,
+          "--workerd-binary",
+          options.workerdBinary,
+          ...(options.experimentalWorkerdCandidate === true
+            ? ["--experimental-workerd-candidate"]
+            : []),
+        ],
+        {
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "ignore",
+          env: {},
+        },
+      );
       return {
         stdout: child.stdout,
         exited: child.exited,

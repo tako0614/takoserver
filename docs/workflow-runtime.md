@@ -244,6 +244,12 @@ and no new binary search or implicit runtime fallback is enabled. WfP needs
 its own qualified implementation of the same private host protocol; a local
 Linux process guard is not a managed Cloudflare implementation.
 
+Unqualified WorkerLoader native tests explicitly select the guard's private
+`--experimental-workerd-candidate` option. It adds only workerd's fixed
+`--experimental` switch, never arbitrary child arguments. The accepted path
+and ordinary host factory leave this off; this opt-in does not qualify or
+promote a candidate binary.
+
 The opt-in `tests/workerd-native-execution-guard.test.ts` targets only the
 exact pinned workerd and an explicitly supplied guard binary. It exercises
 paused registration, synchronous CPU execution, stop/reap, lease expiry,
@@ -342,6 +348,24 @@ handlers. Neither controller nor preparation evaluates tenant code. The
 two-dictionary closed-graph module policy and `disallow_importable_env` remain
 required; loader, companion binding and journal nonce are not application env.
 
+The static outer supervisor does not install `modulePolicy`: that policy
+forbids builtin imports even to Host-private modules, while the generated
+outer needs `WorkerEntrypoint`. Only its generated entry/helper and the
+Host-owned data facade are executable; selected tenant JS/Wasm is checked as
+inert text/data carriers. The dynamic
+tenant child still installs the exact closed policy. Its bootstrap uses
+workerd's functional RPC entry, called with one `null` argument and a
+runtime-injected environment, so it requires no builtin import. Non-loader
+private executions retain their policy. Both outer and child deny global
+outbound traffic.
+
+The native boundary requires an explicit Options dictionary for the outer
+`ctx.exports` factory and a plain serializable child env record (own properties
+preserve names such as `__proto__`). Native `RpcPromise` is a thenable, not a
+genuine JavaScript Promise. The trusted outer adopts it normally; the tenant
+bridge observes the retained Host stub's reply and resolves a private genuine
+Promise with a string only, without modifying tenant globals.
+
 `workflow-http-controller` implements one concrete request/response turn
 protocol. A call first lets the durable driver request its name, then requests
 pending arguments only when the driver needs them, and invokes an effect only
@@ -378,26 +402,20 @@ initializes its native console formatter on first use; capturing the entry
 function alone did not initialize that dependency. Subsequent private markers
 must still pair with their payloads and pass the stop/seal barrier.
 
-The selected runtime still has unresolved startup and in-run compatibility
-gaps when an application replaces Promise methods. Separate raw dynamic-import
-and raw private service-fetch probes reproduce the failures without any
-Workflow helper imports. The native corpus retains both as expected
-infrastructure refusals, with zero durable steps and physical stop, journal
-seal, owner release and artifact disposal; these are **not** successful loader
-qualification. A separate positive case replaces non-Promise intrinsics
-inside `run`. Captured helper intrinsics do not make the native module
-evaluator or native service-fetch machinery immune to application mutation.
-The implementation does not restore tenant globals, exclude these cases from
-the forward contract or claim full runtime qualification.
+Startup Promise poisoning still exposes a native module-evaluation gap. The
+candidate HTTP corpus retains it as an infrastructure refusal with zero
+durable steps, physical stop, journal seal, owner release and artifact
+disposal. It is not positive loader qualification, and the implementation
+does not restore tenant globals or exclude this case from the forward contract.
 
-A callable `Object.prototype.then` exposes a related native Response-fulfillment
-gap. A helper-free private fetch reproduces thenable assimilation before the
-helper can box the native response. The memo-replay refusal case retains
-exactly its first completed durable step, creates no further step, and requires
-the same nonterminal result, owner release and stop/seal/disposal boundary.
-Ordinary completed-name replay and the helper's own final Response protection
-remain separate positive cases. These native gaps require a different qualified
-transport/runtime boundary, not an observable rewrite of tenant prototypes.
+The former same-isolate HTTP transport also refused in-run Promise poisoning
+and callable `Object.prototype.then` during memo replay. With the separate
+outer and functional-RPC child, those two candidate cases now require exact
+successful outputs, their completed durable steps before disposal, terminal
+step cleanup and owner release. Non-Promise poisoning, builtin/private import
+denials and genuine/forged errors remain separate assertions. These scoped
+candidate results do not establish complete runtime qualification or change
+the accepted binary pin.
 
 ### Capturing the active Worker Version
 

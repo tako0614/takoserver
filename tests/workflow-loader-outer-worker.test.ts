@@ -30,7 +30,10 @@ afterEach(() => {
 function contextFor(worker: ReturnType<typeof createWorkflowLoaderOuterWorker>) {
   const context = {
     exports: {
-      WorkflowHost() {
+      WorkflowHost(options: Record<string, unknown>) {
+        // Native LoopbackServiceStub requires an Options dictionary even when
+        // no props are supplied; a zero-argument fake hides that startup failure.
+        if (!options || Object.keys(options).length !== 0) throw new TypeError("Options required");
         const host = {
           exchange(payload: string) {
             return worker.exchange(payload);
@@ -127,15 +130,33 @@ test("loader receives separate role dictionaries and only projected child bindin
       "__tenant.js": { js: "export default {};" },
       "same.js": { js: "export const host = true;" },
     },
-    childBindingNames: ["APP_VALUE"],
+    childBindingNames: ["APP_VALUE", "__proto__"],
   });
   const env = {
     APP_VALUE: "visible",
+    ["__proto__"]: "literal-binding",
     SECRET: "hidden",
     [WORKFLOW_LOADER_BINDING]: {
       load(code: WorkflowLoaderWorkerCode) {
+        // Native WorkerLoader serializes env as a plain record, unlike its
+        // module dictionaries. Null-prototype env records are not serializable.
+        if (Object.getPrototypeOf(code.env) !== Object.prototype)
+          throw new Error("unserializable env");
         received = code;
-        return { getEntrypoint: () => ({ run: () => "ok" }) };
+        return {
+          getEntrypoint: () => ({
+            run: (...args: unknown[]) => {
+              expect(args).toEqual([null]);
+              // RpcPromise is a thenable, not a native Promise instance.
+              return {
+                // biome-ignore lint/suspicious/noThenProperty: models native RpcPromise thenable adoption
+                then(resolve: (value: string) => void) {
+                  resolve("ok");
+                },
+              };
+            },
+          }),
+        };
       },
     },
     [WORKFLOW_COMPANION_BINDING]: { fetch() {} },
@@ -145,13 +166,19 @@ test("loader receives separate role dictionaries and only projected child bindin
   if (!received) throw new Error("loader input was not captured");
   expect(Object.getPrototypeOf(received.modules)).toBeNull();
   expect(Object.getPrototypeOf(received.hostPrivateModules)).toBeNull();
-  expect(Object.getPrototypeOf(received.env)).toBeNull();
+  expect(Object.getPrototypeOf(received.env)).toBe(Object.prototype);
+  expect(Object.hasOwn(received.env, "__proto__")).toBe(true);
+  expect(Object.getOwnPropertyDescriptor(received.env, "__proto__")?.value).toBe("literal-binding");
   expect(Object.keys(received.modules)).toEqual(["same.js"]);
   expect(Object.keys(received.hostPrivateModules)).toEqual(["__tenant.js", "same.js"]);
   expect(received.mainModuleRole).toBe("hostPrivate");
   expect(received.modulePolicy.applicationMain).toBe("same.js");
   expect(received.globalOutbound).toBeNull();
-  expect(Object.keys(received.env)).toEqual(["APP_VALUE", "__TAKOSERVER_WORKFLOW_HOST"]);
+  expect(Object.keys(received.env)).toEqual([
+    "APP_VALUE",
+    "__proto__",
+    "__TAKOSERVER_WORKFLOW_HOST",
+  ]);
   expect(received.env.SECRET).toBeUndefined();
 });
 

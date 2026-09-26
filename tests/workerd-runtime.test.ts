@@ -299,6 +299,38 @@ test("legacy private writer preserves its Host entrypoint without the loader", a
   expect(config).toContain(
     '(name = "index.js", esModule = embed "./application/module-00000", role = application)',
   );
+  expect(config).toContain('modulePolicy = (applicationMain = "index.js")');
+});
+
+test("trusted Workflow outer rejects executable source carriers", async () => {
+  for (const mediaType of ["application/javascript+module", "application/wasm"] as const) {
+    await expect(
+      writeWorkerdPrivateExecution({
+        root,
+        site: { directory: "site", mainModule: "index.js", hostnames: [] },
+        modules: MODULES,
+        hostModules: new Map(),
+        companionAddress: "127.0.0.1:4666",
+        runSocketPath: join(root, "workflow.sock"),
+        workflowLoader: {
+          outerEntrypoint: "outer.js",
+          outerHelper: "helper.js",
+          outerModules: new Map([
+            ["outer.js", new TextEncoder().encode("export default {}")],
+            ["helper.js", new TextEncoder().encode("export {}")],
+            ["payload", new TextEncoder().encode("throw Error('must stay inert')")],
+          ]),
+          outerModuleMediaTypes: {
+            "outer.js": "application/javascript+module",
+            "helper.js": "application/javascript+module",
+            payload: mediaType,
+          },
+          staticHostModules: new Map(),
+        },
+      }),
+    ).rejects.toThrow("workflow source carriers must be inert text or data");
+  }
+  expect(await readdir(root)).toEqual([]);
 });
 
 test("renders retained scalar readiness as one private Host capability route", async () => {

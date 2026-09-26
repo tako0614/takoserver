@@ -2155,6 +2155,7 @@ export async function writeWorkerdPrivateExecution(options: {
    */
   readonly workflowLoader?: {
     readonly outerEntrypoint: string;
+    readonly outerHelper: string;
     readonly outerModules: ReadonlyMap<string, Uint8Array>;
     readonly outerModuleMediaTypes: Readonly<Record<string, WorkerdModuleMediaType>>;
     readonly staticHostModules: ReadonlyMap<string, Uint8Array>;
@@ -2209,6 +2210,19 @@ export async function writeWorkerdPrivateExecution(options: {
   // remain in the exact closed graph without installing their routing services.
   const { assets: _assets, events: _events, ...classSite } = site;
   const { hostEntrypoint: _workflowHostEntrypoint, ...workflowClassSite } = classSite;
+  if (options.workflowLoader) {
+    const graph = options.workflowLoader;
+    for (const [name, mediaType] of Object.entries(graph.outerModuleMediaTypes)) {
+      const executable = name === graph.outerEntrypoint || name === graph.outerHelper;
+      if (
+        executable
+          ? mediaType !== "application/javascript+module"
+          : mediaType !== "text/plain" && mediaType !== "application/octet-stream"
+      ) {
+        throw new Error("workflow source carriers must be inert text or data");
+      }
+    }
+  }
   const prepared = options.workflowLoader
     ? await prepareWorkerdSite(
         {
@@ -2280,20 +2294,22 @@ export async function writeWorkerdPrivateExecution(options: {
   )),
   (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
   }
+  // The static outer is a trusted supervisor, not a tenant execution graph.
+  // Closed modulePolicy forbids builtins even to Host-private code, whereas
+  // its generated WorkerEntrypoint needs cloudflare:workers. Tenant bytes here
+  // are checked inert carriers; WorkerLoader installs the closed policy in the
+  // separate tenant child on RUN. Ordinary private executions keep their policy.
+  const modulePolicy = options.workflowLoader
+    ? ""
+    : `\n    modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),`;
   const config = `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
  services = [
   (name = "application", worker = (
-    modules = [${renderWorkerdModules(prepared.manifest, ".")}],
-    bindings = [${bindings.join(", ")}],
-    modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
+    modules = [${renderWorkerdModules(prepared.manifest, ".", options.workflowLoader !== undefined)}],
+    bindings = [${bindings.join(", ")}],${modulePolicy}
     compatibilityDate = "2026-01-01",
-    compatibilityFlags = [${[
-      ...APPLICATION_COMPATIBILITY_FLAGS,
-      ...(options.workflowLoader ? ["enable_ctx_exports"] : []),
-    ]
-      .map(capnpText)
-      .join(", ")}],
+    compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
   (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}${serviceExternals}
@@ -3367,7 +3383,11 @@ function publishedGraphIdentity(
  * picks by `Host`; anything unclaimed gets a 404 that says so, which is the
  * only honest answer when nobody has asked for that name.
  */
-function renderWorkerdModules(manifest: Manifest, storagePrefix: string): string {
+function renderWorkerdModules(
+  manifest: Manifest,
+  storagePrefix: string,
+  trustedWorkflowOuter = false,
+): string {
   const mainModule = validModules([manifest.mainModule])[0] as string;
   const declaredModules = validModules(manifest.modules ?? [], manifest.mainModule);
   const moduleMediaTypes = validModuleMediaTypes(
@@ -3398,7 +3418,7 @@ function renderWorkerdModules(manifest: Manifest, storagePrefix: string): string
           : "application/javascript+module";
       const directory =
         role === "application" ? APPLICATION_MODULE_DIRECTORY : HOST_PRIVATE_MODULE_DIRECTORY;
-      return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${storagePrefix}/${directory}/${module.key}`)}, role = ${role})`;
+      return `(name = ${capnpText(module.name)}, ${workerdModuleKind(mediaType)} = embed ${capnpText(`${storagePrefix}/${directory}/${module.key}`)}${trustedWorkflowOuter ? "" : `, role = ${role}`})`;
     })
     .join(", ");
 }

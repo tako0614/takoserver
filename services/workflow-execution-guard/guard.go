@@ -25,8 +25,11 @@ const (
 // controller pipe; the child never receives either descriptor.
 type Options struct {
 	WorkerdBinary string
-	In            io.Reader
-	Out           io.Writer
+	// ExperimentalWorkerdCandidate enables only workerd's fixed --experimental
+	// switch for explicit unqualified candidate tests. Accepted execution defaults off.
+	ExperimentalWorkerdCandidate bool
+	In                           io.Reader
+	Out                          io.Writer
 }
 
 // Code is a bounded internal failure classification emitted on the private

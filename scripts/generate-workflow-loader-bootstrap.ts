@@ -60,13 +60,13 @@ async function bundle(entrypoint: string, label: "outer" | "tenant"): Promise<st
   let source = await output.text();
   if (!source.endsWith("\n")) source += "\n";
 
-  // The only external import in either trusted bundle is the workerd-provided
-  // WorkerEntrypoint intrinsic. Tenant application imports remain dynamic and
-  // are supplied only by the per-execution WorkerLoader graph.
+  // Only the trusted outer may import workerd's WorkerEntrypoint intrinsic.
+  // The closed tenant bootstrap uses functional RPC and cannot import builtins.
+  // Tenant application imports remain dynamic in the WorkerLoader graph.
   const staticImports = [
     ...source.matchAll(/(?:^|\n)\s*import\s+(?:[^\n;]+\s+from\s+)?["']([^"']+)["']/gu),
   ].map((match) => match[1]);
-  if (staticImports.some((specifier) => specifier !== "cloudflare:workers")) {
+  if (staticImports.some((specifier) => label !== "outer" || specifier !== "cloudflare:workers")) {
     throw new Error(`workflow loader ${label} bootstrap has an unexpected static import`);
   }
   if (label === "outer") {

@@ -14,6 +14,7 @@ import {
 import { createWorkerdWorkflowExecutionHost } from "../src/selfhost-workflow-execution-host.ts";
 import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-preparation.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { spawnWorkerdExecutionGuard } from "../src/workerd-execution-guard.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 import {
@@ -47,7 +48,8 @@ globalThis.TextEncoder = broken;
 console.error = broken;
 `;
 
-// These native-profile gaps are refusal tests, not positive conformance.
+// Startup poisoning still tests a native module-evaluation refusal. In-run
+// poisoning must not escape the tenant isolate into the outer transport.
 const poisonIntrinsicsSource = `${poisonNonPromiseIntrinsicsSource}
 const originalPromise = Promise;
 globalThis.Promise = broken;
@@ -100,7 +102,7 @@ ${poisonNonPromiseIntrinsicsSource}
     output: { value: { value: "selected", input: 7 } },
   },
   {
-    name: "in-run-promise-poison-refusal",
+    name: "in-run-promise-poison",
     source: `
 export class Application {
   constructor(env) { this.env = env; }
@@ -110,7 +112,15 @@ ${poisonIntrinsicsSource}
       .then(value => ({ value }));
   }
 }`,
-    infrastructure: "host_unavailable",
+    output: { value: { value: "selected", input: 7 } },
+    completedSteps: [
+      {
+        name: "protected",
+        kind: "do",
+        state: "complete",
+        result_json: '{"input":7,"value":"selected"}',
+      },
+    ],
   },
   {
     name: "startup-poison-refusal",
@@ -135,7 +145,7 @@ export class Application {
     output: { checked: true, value: { ok: true } },
   },
   {
-    name: "inherited-then-memo-refusal",
+    name: "inherited-then-memo",
     source: `export class Application { async run(event, step) {
       const first = await step.do("memo", () => ({ value: 7 }));
       Object.defineProperty(Object.prototype, "then", { configurable: true, value() { throw Error("inherited then observed private data"); } });
@@ -144,8 +154,8 @@ export class Application {
       finally { delete Object.prototype.then; }
       return { first, second };
     } }`,
-    infrastructure: "host_unavailable",
-    retainedSteps: [{ name: "memo", kind: "do", state: "complete", result_json: '{"value":7}' }],
+    output: { first: { value: 7 }, second: { value: 7 } },
+    completedSteps: [{ name: "memo", kind: "do", state: "complete", result_json: '{"value":7}' }],
   },
   {
     name: "inherited-then-final-response",
@@ -187,6 +197,7 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
   `${workerd.mode === "candidate" ? "candidate-only" : "pinned"} guarded HTTP class bridge uses canonical env and durable step coordinator`,
   async () => {
     const root = await mkdtemp(join(tmpdir(), "takoserver-native-workflow-http-"));
+    let fixture = "candidate selection";
     try {
       const binary = await selectWorkerdNativeTestBinary({
         input: workerd,
@@ -196,6 +207,7 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
         throw new Error("TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY is required for native tests");
       }
       for (const application of applications) {
+        fixture = application.name;
         const directory = await mkdtemp(join(root, `${application.name}-`));
         const db = new Database(":memory:");
         for (const name of [
@@ -269,10 +281,19 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
         let configured = 0;
         let readyChecks = 0;
         let disposed = 0;
+        let stepsBeforeDispose: unknown[] = [];
         const host = createWorkerdWorkflowExecutionHost({
           guardBinary,
           workerdBinary: binary,
           maximumRegistrations: 4,
+          spawnGuard: (registration, onJournalMarker) =>
+            spawnWorkerdExecutionGuard({
+              guardBinary,
+              workerdBinary: binary,
+              experimentalWorkerdCandidate: workerd.mode === "candidate",
+              registration,
+              onJournalMarker,
+            }),
           async prepare(identity, input, signal, channel) {
             configured += 1;
             const prepared = await prepare(identity, input, signal, channel);
@@ -302,6 +323,11 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
                 return prepared.run(driver);
               },
               async dispose() {
+                stepsBeforeDispose = db
+                  .query(
+                    "SELECT name, kind, state, result_json FROM tf_workflow_steps ORDER BY name",
+                  )
+                  .all();
                 await prepared.dispose();
                 disposed += 1;
               },
@@ -359,7 +385,7 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
               db
                 .query("SELECT name, kind, state, result_json FROM tf_workflow_steps ORDER BY name")
                 .all(),
-            ).toEqual("retainedSteps" in application ? [...application.retainedSteps] : []);
+            ).toEqual([]);
           } else {
             const result = await runtime.runOne(scope, "instance");
             const status = await runtime.instances.status(scope, "instance");
@@ -370,6 +396,18 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
                   : { kind: "complete", output: application.output },
               );
               expect(status.output).toEqual(application.output);
+              expect(status.status).toBe("complete");
+              expect(
+                db
+                  .query(
+                    "SELECT run_owner, run_lease_until FROM tf_workflow_instances WHERE instance_id = 'instance'",
+                  )
+                  .get(),
+              ).toEqual({ run_owner: null, run_lease_until: null });
+              if ("completedSteps" in application) {
+                expect(stepsBeforeDispose).toEqual([...application.completedSteps]);
+                expect(db.query("SELECT name FROM tf_workflow_steps").all()).toEqual([]);
+              }
             } else {
               expect(result).toEqual({ kind: "terminal", status: "errored" });
               expect(status.error?.reason).toBe(application.reason);
@@ -383,6 +421,8 @@ test.skipIf(!workerdNativeTestIsEnabled(workerd, guardBinary))(
           db.close();
         }
       }
+    } catch (cause) {
+      throw new Error(`native Workflow HTTP fixture failed: ${fixture}`, { cause });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -8,19 +8,30 @@ import (
 )
 
 func main() {
-	workerdBinary, err := parseWorkerdBinary(os.Args[1:])
+	options, err := parseWorkerdOptions(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if err := guard.Run(guard.Options{
-		WorkerdBinary: workerdBinary,
-		In:            os.Stdin,
-		Out:           os.Stdout,
-	}); err != nil {
+	options.In, options.Out = os.Stdin, os.Stdout
+	if err := guard.Run(options); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func parseWorkerdOptions(args []string) (guard.Options, error) {
+	options := guard.Options{}
+	if len(args) > 0 && args[len(args)-1] == "--experimental-workerd-candidate" {
+		options.ExperimentalWorkerdCandidate = true
+		args = args[:len(args)-1]
+	}
+	binary, err := parseWorkerdBinary(args)
+	if err != nil {
+		return guard.Options{}, err
+	}
+	options.WorkerdBinary = binary
+	return options, nil
 }
 
 func parseWorkerdBinary(args []string) (string, error) {
@@ -33,5 +44,5 @@ func parseWorkerdBinary(args []string) (string, error) {
 			return args[0][len(prefix):], nil
 		}
 	}
-	return "", fmt.Errorf("usage: workflow-execution-guard --workerd-binary /absolute/path")
+	return "", fmt.Errorf("usage: workflow-execution-guard --workerd-binary /absolute/path [--experimental-workerd-candidate]")
 }
