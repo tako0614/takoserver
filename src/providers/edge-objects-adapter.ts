@@ -1086,12 +1086,7 @@ async function boundedText(response: Response): Promise<string> {
   let size = 0;
   try {
     while (true) {
-      let result: ReadableStreamReadResult<Uint8Array>;
-      try {
-        result = await reader.read();
-      } catch {
-        edgeError("backend_unavailable");
-      }
+      const result = await reader.read().catch(() => edgeError("backend_unavailable"));
       if (result.done) break;
       if (!(result.value instanceof Uint8Array) || result.value.byteLength > maximum - size) {
         void reader.cancel("private S3 response exceeded its byte bound").catch(() => undefined);
