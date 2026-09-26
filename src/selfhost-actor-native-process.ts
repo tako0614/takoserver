@@ -4,25 +4,34 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
 import { SELFHOST_WORKER_PROJECT_ENV_EXPORT } from "./providers/selfhost-worker-wrapper.ts";
-import { type WorkerdSite, writeWorkerdPrivateExecution } from "./workerd-runtime.ts";
+import { type WorkerdActiveActorGraph, writeWorkerdPrivateExecution } from "./workerd-runtime.ts";
 
 /** Internal, selected bytes only. Never accepted as provider desired state. */
 export interface WorkerdActorNamespaceOptions {
   readonly namespaceKey: string;
   readonly storagePath: string;
   readonly className: string;
-  readonly site: WorkerdSite;
-  readonly modules: ReadonlyMap<string, Uint8Array>;
-  readonly hostModules: ReadonlyMap<string, Uint8Array>;
+  readonly graph: WorkerdActiveActorGraph;
   readonly signal: AbortSignal;
-  /** Host authority reader; never exposed to application modules. */
-  readonly admitAlarm: (signal: AbortSignal) => Promise<boolean>;
+  /** Host authority callbacks; neither is exposed to application modules. */
+  readonly admitAlarm: (
+    id: string,
+    attemptNonce: string,
+    signal: AbortSignal,
+  ) => Promise<{
+    readonly variantKey: string;
+    readonly generationKey: string;
+    readonly epoch: string;
+    readonly leaseId: string;
+  } | null>;
+  readonly completeAlarm: (leaseId: string) => void;
 }
 
 export interface WorkerdActorNamespace {
-  fetch(id: string, request: Request): Promise<Response>;
+  fetch(id: string, request: Request, variantKey: string): Promise<Response>;
   /** Settles when the native child exits, including an intentional close. */
   readonly exited: Promise<void>;
+  readonly epoch: string;
   enableAlarmAdmission(): void;
   disableAlarmAdmission(): void;
   /** Ordinary retirement drains responses; a dead child can be reaped immediately. */
@@ -48,49 +57,51 @@ export async function openWorkerdActorNamespace(
     options.className.includes("\u0000")
   )
     throw new Error("unusable Actor namespace selection");
-  const site = structuredClone(options.site);
-  const modules = new Map(
-    [...options.modules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
-  );
-  const hostModules = new Map(
-    [...options.hostModules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
-  );
-  if ((site.serviceBindings?.length ?? 0) > 0 || site.dataPlane) {
-    throw new Error("Actor retained service/data binding composition unavailable");
-  }
-  const wrapper = site.hostEntrypoint;
-  if (!wrapper || wrapper === site.mainModule || !hostModules.has(wrapper)) {
-    throw new Error("Actor selected Version has no private environment projector");
-  }
-  const occupied = new Set([...modules.keys(), ...hostModules.keys(), site.mainModule]);
-  const allocate = (stem: string): string => {
-    let name = `${stem}.js`;
-    for (let index = 1; occupied.has(name); index += 1) name = `${stem}-${index}.js`;
-    occupied.add(name);
-    return name;
-  };
-  const entry = allocate("__actor_entry");
-  const owner = allocate("__actor_owner");
-  const helper = allocate("__actor_bootstrap");
+  const graph = structuredClone(options.graph);
+  if (
+    !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
+    !graph.generation ||
+    graph.versions.length === 0 ||
+    graph.versions.length > 100 ||
+    graph.workerResourceUid !== graph.versions[0]?.site.workerResourceUid
+  )
+    throw new Error("unusable Actor active graph");
+  const epoch = randomBytes(32).toString("hex");
+  const variantKeys = graph.versions.map((version) => version.variantKey);
   const token = randomBytes(32).toString("hex");
   const alarmToken = randomBytes(32).toString("hex");
   const deliveryToken = randomBytes(32).toString("hex");
   const admissionToken = randomBytes(32).toString("hex");
   const literal = JSON.stringify;
   const encoder = new TextEncoder();
-  hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
-  hostModules.set(
-    owner,
-    encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${helper}`)};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)});
-export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});`),
-  );
-  // Application loading happens only in the native child. The raw native env
-  // and storage never enter the constructor: the existing Host wrapper
-  // projects declared bindings, then the adapter builds a closed context.
-  hostModules.set(
-    entry,
-    encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort } from ${literal(`./${helper}`)};
+  const nativeVariants = graph.versions.map((version, index) => {
+    const site = structuredClone(version.site);
+    const modules = new Map(
+      [...version.modules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
+    );
+    const hostModules = new Map(
+      [...version.hostModules].map(([name, bytes]) => [name, new Uint8Array(bytes)]),
+    );
+    if ((site.serviceBindings?.length ?? 0) > 0 || site.dataPlane) {
+      throw new Error("Actor retained service/data binding composition unavailable");
+    }
+    const wrapper = site.hostEntrypoint;
+    if (!wrapper || wrapper === site.mainModule || !hostModules.has(wrapper)) {
+      throw new Error("Actor Version has no private environment projector");
+    }
+    const occupied = new Set([...modules.keys(), ...hostModules.keys(), site.mainModule]);
+    const allocate = (stem: string): string => {
+      let name = `${stem}.js`;
+      for (let suffix = 1; occupied.has(name); suffix += 1) name = `${stem}-${suffix}.js`;
+      occupied.add(name);
+      return name;
+    };
+    const helper = allocate("__actor_bootstrap");
+    const entry = allocate("__actor_entry");
+    hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
+    hostModules.set(
+      entry,
+      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
@@ -113,10 +124,47 @@ export class ActorChild {
     }
     const headers = new SafeHeaders(incoming);
     SafeApply(SafeHeadersDelete, headers, ["x-takoserver-private-actor-delivery"]);
+    SafeApply(SafeHeadersDelete, headers, ["x-takoserver-private-actor-variant"]);
     return (await this.execution).fetch(new SafeRequest(request, { headers }));
   }
 }
 export default { fetch() { return new Response(null, { status: 404 }); } };`),
+    );
+    return {
+      site: {
+        ...site,
+        hostEntrypoint: entry,
+        hostModules: [...hostModules.keys()].filter((name) => name !== entry),
+      },
+      modules,
+      hostModules,
+      className: "ActorChild",
+      variantKey: version.variantKey,
+      index,
+      helper,
+      entry,
+    };
+  });
+  const first = nativeVariants[0];
+  if (!first) throw new Error("unusable Actor active graph");
+  const occupied = new Set([
+    ...first.modules.keys(),
+    ...first.hostModules.keys(),
+    first.site.mainModule,
+  ]);
+  const allocateOwner = (): string => {
+    let name = "__actor_owner.js";
+    for (let suffix = 1; occupied.has(name); suffix += 1) name = `__actor_owner-${suffix}.js`;
+    occupied.add(name);
+    return name;
+  };
+  const owner = allocateOwner();
+  const ownerModules = new Map(first.hostModules);
+  ownerModules.set(
+    owner,
+    encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${first.helper}`)};
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })});
+export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});`),
   );
   const root = await mkdtemp(join(tmpdir(), "tactor-"));
   await chmod(root, 0o700);
@@ -129,14 +177,59 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
     async fetch(request) {
       if (
         closing ||
-        !verified ||
         request.method !== "POST" ||
         request.headers.get("x-takoserver-private-alarm-admission") !== admissionToken
       )
         return new Response(null, { status: 503 });
       try {
-        const allowed = await options.admitAlarm(AbortSignal.timeout(5_000));
-        return new Response(null, { status: allowed && verified && !closing ? 204 : 503 });
+        const body = await request.text();
+        if (body.length > 4_096) return new Response(null, { status: 503 });
+        const value: unknown = JSON.parse(body);
+        if (typeof value !== "object" || value === null || Array.isArray(value)) {
+          return new Response(null, { status: 503 });
+        }
+        const record = value as Record<string, unknown>;
+        if (record.action === "complete" && typeof record.leaseId === "string") {
+          options.completeAlarm(record.leaseId);
+          return new Response(null, { status: closing ? 503 : 204 });
+        }
+        if (!verified) return new Response(null, { status: 503 });
+        if (
+          record.action !== undefined ||
+          typeof record.id !== "string" ||
+          typeof record.attemptNonce !== "string" ||
+          !record.id ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+            record.attemptNonce,
+          )
+        ) {
+          return new Response(null, { status: 503 });
+        }
+        const admissionResult = await options.admitAlarm(
+          record.id,
+          record.attemptNonce,
+          AbortSignal.timeout(5_000),
+        );
+        if (!admissionResult) return new Response(null, { status: 503 });
+        if (
+          !verified ||
+          closing ||
+          admissionResult.generationKey !== graph.generationKey ||
+          admissionResult.epoch !== epoch ||
+          !variantKeys.includes(admissionResult.variantKey) ||
+          !admissionResult.leaseId
+        ) {
+          options.completeAlarm(admissionResult.leaseId);
+          return new Response(null, { status: 503 });
+        }
+        return Response.json(
+          {
+            id: record.id,
+            attemptNonce: record.attemptNonce,
+            ...admissionResult,
+          },
+          { status: 200 },
+        );
       } catch {
         return new Response(null, { status: 503 });
       }
@@ -161,12 +254,11 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
     const config = await writeWorkerdPrivateExecution({
       root,
       site: {
-        ...site,
-        hostEntrypoint: entry,
-        hostModules: [...hostModules.keys()].filter((name) => name !== entry),
+        ...first.site,
+        hostModules: [...ownerModules.keys()].filter((name) => name !== first.site.hostEntrypoint),
       },
-      modules,
-      hostModules,
+      modules: first.modules,
+      hostModules: ownerModules,
       runSocketPath: socket,
       actor: {
         namespaceKey: options.namespaceKey,
@@ -174,6 +266,24 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
         ownerModule: owner,
         className: "ActorChild",
         alarmAdmissionAddress: `127.0.0.1:${admission.port}`,
+        variants: nativeVariants.map(
+          ({
+            site: variantSite,
+            modules: variantModules,
+            hostModules: variantHostModules,
+            className,
+          }) => ({
+            site: {
+              ...variantSite,
+              hostModules: [...variantHostModules.keys()].filter(
+                (name) => name !== variantSite.hostEntrypoint,
+              ),
+            },
+            modules: variantModules,
+            hostModules: variantHostModules,
+            className,
+          }),
+        ),
       },
     });
     options.signal.throwIfAborted();
@@ -215,11 +325,14 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
       disableAlarmAdmission() {
         verified = false;
       },
-      async fetch(id, request) {
+      async fetch(id, request, variantKey) {
         if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (!variantKeys.includes(variantKey))
+          throw new Error("Actor Version selection unavailable");
         const headers = new Headers(request.headers);
         headers.set("x-takoserver-private-actor-token", token);
         headers.set("x-takoserver-private-actor-id", encodeURIComponent(id));
+        headers.set("x-takoserver-private-actor-variant", variantKey);
         // This private hop returns application redirects as response heads.
         // Following one here could escape the Unix socket with hop credentials.
         return fetch(new Request(request, { headers, redirect: "manual" }), {
@@ -227,6 +340,7 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
           redirect: "manual",
         });
       },
+      epoch,
       close,
     };
   } catch (error) {

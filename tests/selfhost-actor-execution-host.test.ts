@@ -262,8 +262,16 @@ export class Counter extends Base {
    return super.fetch(request);
  }
  async alarm() {
+   if (this.context.id === 'held-alarm-b') {
+     await this.context.storage.execute("CREATE TABLE IF NOT EXISTS alarm_hold (phase TEXT)");
+     await this.context.storage.execute("INSERT INTO alarm_hold VALUES ('start')");
+     await new Promise(resolve => setTimeout(resolve, 2000));
+     await this.context.storage.execute("INSERT INTO alarm_hold VALUES ('finish')");
+   }
    await this.context.storage.execute("CREATE TABLE IF NOT EXISTS alarm_runs (n INTEGER)");
    await this.context.storage.execute("INSERT INTO alarm_runs VALUES (1)");
+   await this.context.storage.execute("CREATE TABLE IF NOT EXISTS alarm_versions (version TEXT)");
+   await this.context.storage.execute("INSERT INTO alarm_versions VALUES (?)", [this.env.VERSION]);
    const runs = await this.context.storage.query("SELECT count(*) AS n FROM alarm_runs");
    if (runs.rows[0].n === 1) {
      if (this.context.id.endsWith('b')) await this.context.alarm.clear();
@@ -295,7 +303,11 @@ export class Counter extends Base {
           fetchHandler: true,
           modules: ["counter.mjs"],
           vars: [
-            { name: "VERSION", value: version, kind: "text" },
+            {
+              name: "VERSION",
+              value: generation === "generation-2" && version === "b" ? "b2" : version,
+              kind: "text",
+            },
             { name: "PRIVATE", value: "not-declared", kind: "text" },
           ],
         },
@@ -504,12 +516,20 @@ export class Counter extends Base {
       } finally {
         await competing.close();
       }
+      const startsBeforeWeightChange = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
       basisPoint = 9999;
       expect(await (await owner.fetch(identity, request())).json()).toEqual({
         id: identity.id,
         value: 2,
         version: "b",
       });
+      // A fresh weighted event may select B without replacing a native owner
+      // that already has both classes and the same durable SQL path.
+      expect((await readFile(childPidFile, "utf8")).trim().split("\n")).toHaveLength(
+        startsBeforeWeightChange,
+      );
       await owner.close();
       owner = makeOwner();
       expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
@@ -566,7 +586,7 @@ export class Counter extends Base {
         "native child exited during startup",
       );
       await expect(owner.fetch(selectorBadIdentity, request())).rejects.toThrow(
-        "unusable worker active version snapshot",
+        "unusable worker active Actor graph",
       );
       f.database
         .query(
@@ -621,6 +641,9 @@ export class Counter extends Base {
       const held = await owner.fetch(identity, request("/stream"));
       const heldReader = held.body?.getReader();
       expect(new TextDecoder().decode((await heldReader?.read())?.value)).toBe("head");
+      // A weight-only change does not retire this graph. Publish a distinct
+      // generation to exercise deletion while a legitimate rotation drains.
+      await runtime.publish?.("worker", publication("generation-1-rotation"));
       basisPoint = 0;
       let remainingGraphReads = 2;
       const selected = new Promise<void>((resolve) => {
@@ -634,8 +657,8 @@ export class Counter extends Base {
       });
       const stale = owner.fetch(identity, request("/increment"));
       await selected;
-      // The second request selected Version A but must wait for Version B's
-      // held body. Deletion in that gap must fence the selected bytes.
+      // The second request selected the new graph but must wait for the old
+      // graph's held body. Deletion in that gap must fence the selected bytes.
       await Bun.sleep(10);
       f.database
         .query(
@@ -773,6 +796,115 @@ export class Counter extends Base {
       await Bun.sleep(1_300);
       expect(await durableAlarmRuns(3)).toBe(9);
       expect(await durableAlarmObligations()).toBeGreaterThan(0);
+
+      // A retained alarm, with no subsequent HTTP call, must cause the
+      // namespace owner to rotate to the newly active graph. Each retry then
+      // samples the current weights afresh rather than inheriting startup A.
+      const updateUid = "namespace-autonomous-version-update";
+      insert(f.database, resource(actorForm, "counter-autonomous-version-update", updateUid), [
+        f.relation,
+      ]);
+      const updateIdentity = { ...identity, id: "updated-b", namespaceResourceUid: updateUid };
+      basisPoint = 0;
+      await (await owner.fetch(updateIdentity, request("/alarm-set?delay=2000"))).json();
+      const startsBeforeAutonomousUpdate = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
+      await runtime.publish?.("worker", publication("generation-2"));
+      basisPoint = 9999;
+      const updateKey = createHash("sha256")
+        .update(JSON.stringify([scope.tenantId, updateUid]))
+        .digest("hex");
+      const readUpdateVersions = async (): Promise<string[]> => {
+        const versions: string[] = [];
+        for await (const relative of new Bun.Glob("**/*.sqlite").scan(
+          join(storageRoot, "namespaces", updateKey),
+        )) {
+          const database = new Database(join(storageRoot, "namespaces", updateKey, relative), {
+            readonly: true,
+          });
+          try {
+            const rows = database
+              .query("SELECT version FROM alarm_versions ORDER BY rowid")
+              .all() as {
+              version: string;
+            }[];
+            versions.push(...rows.map((row) => row.version));
+          } catch (error) {
+            if (!String(error).includes("no such table: alarm_versions")) throw error;
+          } finally {
+            database.close();
+          }
+        }
+        return versions;
+      };
+      let updatedVersions: string[] = [];
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        updatedVersions = await readUpdateVersions();
+        if (updatedVersions.includes("b2")) break;
+        await Bun.sleep(25);
+      }
+      expect(updatedVersions).toEqual(["b2"]);
+      basisPoint = 0;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        updatedVersions = await readUpdateVersions();
+        if (updatedVersions.length >= 2) break;
+        await Bun.sleep(25);
+      }
+      expect(updatedVersions).toEqual(["b2", "a"]);
+      expect((await readFile(childPidFile, "utf8")).trim().split("\n").length).toBeGreaterThan(
+        startsBeforeAutonomousUpdate,
+      );
+
+      // Rotation is namespace-wide, so an alarm admitted for another ID is
+      // part of the drain even if no HTTP response is active in that ID.
+      const readHeldPhases = async (): Promise<string[]> => {
+        const phases: string[] = [];
+        for await (const relative of new Bun.Glob("**/*.sqlite").scan(
+          join(storageRoot, "namespaces", updateKey),
+        )) {
+          const database = new Database(join(storageRoot, "namespaces", updateKey, relative), {
+            readonly: true,
+          });
+          try {
+            const rows = database.query("SELECT phase FROM alarm_hold ORDER BY rowid").all() as {
+              phase: string;
+            }[];
+            phases.push(...rows.map((row) => row.phase));
+          } catch (error) {
+            if (!String(error).includes("no such table: alarm_hold")) throw error;
+          } finally {
+            database.close();
+          }
+        }
+        return phases;
+      };
+      await (
+        await owner.fetch({ ...updateIdentity, id: "held-alarm-b" }, request("/alarm-set?delay=50"))
+      ).json();
+      let heldPhases: string[] = [];
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        heldPhases = await readHeldPhases();
+        if (heldPhases.includes("start")) break;
+        await Bun.sleep(10);
+      }
+      expect(heldPhases).toEqual(["start"]);
+      const heldProcessPid = Number(
+        (await readFile(childPidFile, "utf8")).trim().split("\n").at(-1),
+      );
+      await runtime.publish?.("worker", publication("generation-3"));
+      let rotationDone = false;
+      const rotation = owner
+        .fetch({ ...updateIdentity, id: "rotation-c" }, request())
+        .then(async (response) => {
+          rotationDone = true;
+          return response.json();
+        });
+      await Bun.sleep(100);
+      expect(rotationDone).toBe(false);
+      expect(() => process.kill(heldProcessPid, 0)).not.toThrow();
+      await rotation;
+      expect(await readHeldPhases()).toContain("finish");
     } finally {
       await owner.close();
       f.database.close();

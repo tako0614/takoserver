@@ -1,4 +1,4 @@
-import { createHash, randomInt } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { link, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { ActorResourceGraph, ActorResourceGraphReader } from "./actor-resource-graph.ts";
@@ -7,11 +7,19 @@ import {
   openWorkerdActorNamespace,
   type WorkerdActorNamespace,
 } from "./selfhost-actor-native-process.ts";
-import { readWorkerdSelectedActiveVersion } from "./workerd-runtime.ts";
+import {
+  readWorkerdActiveActorGraph,
+  readWorkerdSelectedActiveVersion,
+  type WorkerdActiveActorGraph,
+  type WorkerdSelectedActiveVersion,
+} from "./workerd-runtime.ts";
 
 interface Session {
   readonly selection: string;
+  readonly graph: WorkerdActiveActorGraph;
+  readonly epoch: string;
   readonly process: WorkerdActorNamespace;
+  readonly alarmLeases: Set<string>;
   active: number;
   readonly idle: Set<() => void>;
   dead: boolean;
@@ -22,6 +30,7 @@ interface Owner {
   tail: Promise<void>;
   session?: Session;
   locked: boolean;
+  refreshing?: Promise<void>;
 }
 
 interface ActorScope {
@@ -124,30 +133,55 @@ export function createSelfhostActorExecutionHost(options: {
   };
   const sameGraph = (a: ActorResourceGraph, b: ActorResourceGraph | null): boolean =>
     b !== null && JSON.stringify(a) === JSON.stringify(b);
-  const selectedVersion = async (
-    owner: Owner,
-    script: string,
-    workerResourceUid: string,
-    basisPoint: number,
-  ) => {
+  const selectedVersion = async (script: string, workerResourceUid: string, basisPoint: number) => {
     try {
       return await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
         expectedWorkerResourceUid: workerResourceUid,
         basisPoint,
       });
     } catch (error) {
-      // A selector error invalidates an already-running session too. Do not
-      // leave native alarms executing under bytes we can no longer prove.
-      await retire(owner);
+      // A bad current snapshot refuses this event. Retain the old native
+      // carrier as a wake source: its alarm bridge rechecks authority on
+      // every attempt and can resume autonomously after operator repair.
       throw new ActorSelectionReadUnavailable(error);
     }
+  };
+
+  const activeGraph = async (
+    script: string,
+    workerResourceUid: string,
+  ): Promise<WorkerdActiveActorGraph | null> => {
+    try {
+      return await readWorkerdActiveActorGraph(options.runtimeRoot, script, workerResourceUid);
+    } catch (error) {
+      // Keep the previous carrier for alarm watchdog retries, but do not
+      // admit new application work from an unproven graph.
+      throw new ActorSelectionReadUnavailable(error);
+    }
+  };
+
+  const scheduleRefresh = (owner: Owner, identity: ActorScope): void => {
+    if (stopped || owner.refreshing) return;
+    // The admission bridge must answer the native callback before replacing
+    // its process. Coalesce every stale alarm wake into one out-of-band refresh.
+    owner.refreshing = Promise.resolve()
+      .then(async () => {
+        const warmed = await activate(identity, AbortSignal.timeout(30_000), false);
+        release(warmed.session);
+      })
+      .catch(() => {
+        // Native alarm obligation remains durable and its watchdog retries.
+      })
+      .finally(() => {
+        delete owner.refreshing;
+      });
   };
 
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
     register: boolean,
-  ): Promise<Session> => {
+  ): Promise<{ readonly session: Session; readonly variantKey: string }> => {
     if (stopped || !identity.tenantId || !identity.namespaceResourceUid)
       throw new Error("Actor namespace unavailable");
     const key = keyOf(identity.tenantId, identity.namespaceResourceUid);
@@ -186,11 +220,9 @@ export function createSelfhostActorExecutionHost(options: {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
-      const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
-      const selected = await selectedVersion(current, script, graph.worker.uid, basisPoint);
-      if (!selected) {
-        await retire(current);
-        throw new ActorAuthorityUnavailable("Actor Worker Version unavailable");
+      const residentGraph = await activeGraph(script, graph.worker.uid);
+      if (!residentGraph) {
+        throw new ActorAuthorityUnavailable("Actor Worker graph unavailable");
       }
       // A publication read cannot confer authority after Resource deletion
       // or deployment replacement during that read.
@@ -206,9 +238,13 @@ export function createSelfhostActorExecutionHost(options: {
       const selection = JSON.stringify([
         graph.namespace.className,
         graph.worker.uid,
-        selected.versionId,
-        selected.workerVersionUid,
-        selected.generationKey,
+        residentGraph.generationKey,
+        residentGraph.versions.map((version) => [
+          version.variantKey,
+          version.versionId,
+          version.workerVersionUid,
+          version.weight,
+        ]),
       ]);
       if (current.session?.selection !== selection || current.session.dead) {
         await retire(current);
@@ -223,40 +259,62 @@ export function createSelfhostActorExecutionHost(options: {
         }
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
-        const admittedAlarm = async (gateSignal: AbortSignal): Promise<boolean> => {
+        const admittedAlarm = async (
+          id: string,
+          attemptNonce: string,
+          gateSignal: AbortSignal,
+        ): Promise<{
+          readonly variantKey: string;
+          readonly generationKey: string;
+          readonly epoch: string;
+          readonly leaseId: string;
+        } | null> => {
           // This runs on the private bridge, never on `exclusive`: a native
           // startup alarm can arrive while activate awaits child readiness.
           const session = admittedSession;
           if (
             stopped ||
+            !id ||
+            !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+              attemptNonce,
+            ) ||
             !session ||
             current.session !== session ||
             session.dead ||
             session.retiring
           )
-            return false;
+            return null;
           const graphNow = await options.graph(identity, gateSignal);
-          if (!sameGraph(graph, graphNow)) return false;
+          if (!sameGraph(graph, graphNow)) return null;
           const deploymentNow = await options.deployments.active(
             identity.tenantId,
             graph.worker.uid,
           );
-          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) return false;
-          const versionNow = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
-            expectedWorkerResourceUid: graph.worker.uid,
-            basisPoint,
-          });
-          if (
-            !versionNow ||
-            JSON.stringify([
-              graph.namespace.className,
-              graph.worker.uid,
-              versionNow.versionId,
-              versionNow.workerVersionUid,
-              versionNow.generationKey,
-            ]) !== selection
-          )
-            return false;
+          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) return null;
+          // Entropy is drawn once, at this eligible alarm attempt. A retry
+          // draws afresh; neither a stale resident graph nor an exception may
+          // silently fall back to another weighted Version.
+          const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
+          let versionNow: WorkerdSelectedActiveVersion | null;
+          try {
+            versionNow = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
+              expectedWorkerResourceUid: graph.worker.uid,
+              basisPoint,
+            });
+          } catch {
+            return null;
+          }
+          if (!versionNow) return null;
+          if (versionNow.generationKey !== session.graph.generationKey) {
+            scheduleRefresh(current, identity);
+            return null;
+          }
+          const variant = session.graph.versions.find(
+            (entry) =>
+              entry.versionId === versionNow.versionId &&
+              entry.workerVersionUid === versionNow.workerVersionUid,
+          );
+          if (!variant) return null;
           // Fence graph/deployment again after the asynchronous Version read.
           // Pending deletion before this final graph read denies the callback.
           const finalDeployment = await options.deployments.active(
@@ -265,32 +323,47 @@ export function createSelfhostActorExecutionHost(options: {
           );
           const finalGraph = await options.graph(identity, gateSignal);
           gateSignal.throwIfAborted();
-          return (
+          const stillAuthorized =
             !stopped &&
             current.session === session &&
             !session.dead &&
             !session.retiring &&
             sameGraph(graph, finalGraph) &&
-            JSON.stringify(finalDeployment) === JSON.stringify(deployment)
-          );
+            JSON.stringify(finalDeployment) === JSON.stringify(deployment);
+          if (!stillAuthorized) return null;
+          const leaseId = randomBytes(16).toString("hex");
+          session.alarmLeases.add(leaseId);
+          session.active += 1;
+          return {
+            variantKey: variant.variantKey,
+            generationKey: session.graph.generationKey,
+            epoch: session.epoch,
+            leaseId,
+          };
         };
         try {
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
             storagePath: join(options.storageRoot, "namespaces", key),
             className: graph.namespace.className,
-            site: selected.site,
-            modules: selected.modules,
-            hostModules: selected.hostModules,
+            graph: residentGraph,
             signal,
             admitAlarm: admittedAlarm,
+            completeAlarm(leaseId) {
+              const session = admittedSession;
+              if (!session?.alarmLeases.delete(leaseId)) return;
+              release(session);
+            },
           });
         } catch (error) {
           throw new ActorNativeStartUnavailable(error);
         }
         const session: Session = {
           selection,
+          graph: residentGraph,
+          epoch: process.epoch,
           process,
+          alarmLeases: new Set(),
           active: 0,
           idle: new Set(),
           dead: false,
@@ -321,7 +394,7 @@ export function createSelfhostActorExecutionHost(options: {
               for (let attempt = 0; attempt < 3 && !stopped; attempt += 1) {
                 try {
                   const warmed = await activate(identity, AbortSignal.timeout(30_000), false);
-                  release(warmed);
+                  release(warmed.session);
                   return;
                 } catch (error) {
                   // A broken candidate must not fork forever. The durable
@@ -363,31 +436,34 @@ export function createSelfhostActorExecutionHost(options: {
       // Retirement can wait on an old response stream, and native startup
       // can also yield. A Resource or publication selected before either
       // wait must not be dispatched afterward without another readback.
-      const finalVersion = await selectedVersion(current, script, graph.worker.uid, basisPoint);
+      const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
+      const finalVersion = await selectedVersion(script, graph.worker.uid, basisPoint);
       const finalDeployment = await options.deployments.active(identity.tenantId, graph.worker.uid);
       const finalGraph = await options.graph(identity, signal);
       if (
         stopped ||
         !sameGraph(graph, finalGraph) ||
-        JSON.stringify(finalDeployment) !== JSON.stringify(deployment) ||
-        !finalVersion ||
-        JSON.stringify([
-          graph.namespace.className,
-          graph.worker.uid,
-          finalVersion.versionId,
-          finalVersion.workerVersionUid,
-          finalVersion.generationKey,
-        ]) !== selection
+        JSON.stringify(finalDeployment) !== JSON.stringify(deployment)
       ) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Resource changed during selection");
+      }
+      if (!finalVersion || finalVersion.generationKey !== residentGraph.generationKey)
+        throw new ActorAuthorityUnavailable("Actor Version changed during selection");
+      const variant = residentGraph.versions.find(
+        (entry) =>
+          entry.versionId === finalVersion.versionId &&
+          entry.workerVersionUid === finalVersion.workerVersionUid,
+      );
+      if (!variant) {
+        throw new ActorAuthorityUnavailable("Actor Version is not in resident graph");
       }
       signal.throwIfAborted();
       const session = current.session;
       if (!session || session.dead) throw new Error("Actor namespace unavailable");
       session.process.enableAlarmAdmission();
       session.active += 1;
-      return session;
+      return { session, variantKey: variant.variantKey };
     });
     coldStartFailures.delete(key);
     return session;
@@ -437,8 +513,8 @@ export function createSelfhostActorExecutionHost(options: {
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
-          const session = await activate(scope, AbortSignal.timeout(30_000), false);
-          release(session);
+          const acquired = await activate(scope, AbortSignal.timeout(30_000), false);
+          release(acquired.session);
           break;
         } catch (error) {
           // Absence of current authority must never resurrect an old UID.
@@ -492,10 +568,14 @@ export function createSelfhostActorExecutionHost(options: {
       const releaseOnce = (): void => {
         if (released) return;
         released = true;
-        release(acquired);
+        release(acquired.session);
       };
       try {
-        const response = await acquired.process.fetch(identity.id, request);
+        const response = await acquired.session.process.fetch(
+          identity.id,
+          request,
+          acquired.variantKey,
+        );
         if (!response.body) {
           releaseOnce();
           return response;

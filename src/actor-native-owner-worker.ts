@@ -23,6 +23,7 @@ const TOKEN_HEADER = "x-takoserver-private-actor-token";
 const ALARM_ACTION_HEADER = "x-takoserver-private-alarm-action";
 const ALARM_AT_HEADER = "x-takoserver-private-alarm-at";
 const DELIVERY_HEADER = "x-takoserver-private-actor-delivery";
+const VARIANT_HEADER = "x-takoserver-private-actor-variant";
 const ALARM_RETRY_MS = 1_000;
 const ALARM_WATCHDOG_MS = 35_000;
 const ALARM_HANDLER_MS = 30_000;
@@ -43,6 +44,9 @@ const SafeIsSafeInteger = Number.isSafeInteger;
 const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
 const SafeSubtleSign = crypto.subtle.sign;
+const SafeCrypto = crypto;
+const SafeCryptoRandomUUID = crypto.randomUUID;
+const SafeJsonStringify = JSON.stringify;
 const SafeEncoder = new TextEncoder();
 const SafeEncode = TextEncoder.prototype.encode;
 const SafeUint8Array = Uint8Array;
@@ -143,22 +147,44 @@ function withHeaders(request: Request, headers: Headers): Request {
  * This does not qualify crash recovery or native request lifetime limits;
  * the self-host Actor admission refusal remains in force.
  */
-export function createActorNativeOwner(deliveryToken: string, admissionToken: string) {
+export function createActorNativeOwner(
+  deliveryToken: string,
+  admissionToken: string,
+  graph: {
+    readonly generationKey: string;
+    readonly epoch: string;
+    readonly variantKeys: readonly string[];
+  },
+) {
   if (!/^[a-f0-9]{64}$/u.test(deliveryToken) || !/^[a-f0-9]{64}$/u.test(admissionToken))
     throw new Error("Actor delivery capability unavailable");
+  if (
+    !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
+    typeof graph.epoch !== "string" ||
+    !graph.epoch ||
+    !Array.isArray(graph.variantKeys) ||
+    graph.variantKeys.length === 0 ||
+    graph.variantKeys.some((key) => typeof key !== "string" || !key) ||
+    new Set(graph.variantKeys).size !== graph.variantKeys.length
+  )
+    throw new Error("Actor alarm graph bindings unavailable");
+  const variantKeys = Object.freeze([...graph.variantKeys]);
   return class ActorOwner {
     readonly state: NativeState;
     readonly env: {
       readonly CLASS: unknown;
+      readonly [name: string]: unknown;
       readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
     };
     private tail: Promise<void> = Promise.resolve();
     private alarmTail: Promise<void> = Promise.resolve();
+    private poisoned = false;
     private readonly ready: Promise<void>;
     constructor(
       state: NativeState,
       env: {
         readonly CLASS: unknown;
+        readonly [name: string]: unknown;
         readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
       },
     ) {
@@ -264,6 +290,7 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
       void queuedWake.catch(() => {});
       const turn = this.tail.then(async () => {
         await queuedWake;
+        if (this.poisoned) throw new Error("Actor facet retirement failed");
         const claimed = await this.control(async () => {
           const state = this.readAlarm();
           const now = Date.now();
@@ -289,12 +316,14 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
         });
         if (claimed === null) return;
         let succeeded = false;
+        let leaseId: string | undefined;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const deadline = new AbortController();
         try {
           const admission = this.env.ADMISSION;
           if (!admission || !SafeResponseStatus)
             throw new Error("Actor alarm admission unavailable");
+          const attemptNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []);
           const admit = await Promise.race([
             SafeReflectApply(admission.fetch, admission, [
               new SafeRequest("http://actor.invalid/", {
@@ -302,6 +331,12 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
                 headers: new SafeHeaders({
                   "x-takoserver-private-alarm-admission": admissionToken,
                 }),
+                body: SafeReflectApply(SafeJsonStringify, JSON, [
+                  {
+                    id: claimed,
+                    attemptNonce,
+                  },
+                ]),
                 signal: deadline.signal,
               }),
             ]) as Promise<Response>,
@@ -312,13 +347,51 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
               }, 5_000);
             }),
           ]);
-          if (SafeReflectApply(SafeResponseStatus, admit, []) !== 204)
+          if (SafeReflectApply(SafeResponseStatus, admit, []) !== 200)
             throw new Error("Actor alarm admission denied");
-          await admit.body?.cancel();
+          const selection: unknown = await SafeReflectApply(SafeResponseJson, admit, []);
+          if (typeof selection !== "object" || selection === null)
+            throw new Error("Actor alarm admission denied");
+          const selected = selection as {
+            variantKey?: unknown;
+            generationKey?: unknown;
+            epoch?: unknown;
+            leaseId?: unknown;
+            id?: unknown;
+            attemptNonce?: unknown;
+          };
+          if (
+            typeof selected.variantKey !== "string" ||
+            typeof selected.generationKey !== "string" ||
+            typeof selected.epoch !== "string" ||
+            typeof selected.leaseId !== "string" ||
+            !selected.leaseId ||
+            typeof selected.id !== "string" ||
+            typeof selected.attemptNonce !== "string" ||
+            !SafeHasOwn(selection, "variantKey") ||
+            !SafeHasOwn(selection, "generationKey") ||
+            !SafeHasOwn(selection, "epoch") ||
+            !SafeHasOwn(selection, "leaseId")
+          )
+            throw new Error("Actor alarm admission denied");
+          leaseId = selected.leaseId;
+          if (
+            selected.generationKey !== graph.generationKey ||
+            selected.epoch !== graph.epoch ||
+            selected.id !== claimed ||
+            selected.attemptNonce !== attemptNonce
+          )
+            throw new Error("Actor alarm admission denied");
+          const variantIndex = variantKeys.indexOf(selected.variantKey);
+          if (variantIndex < 0) throw new Error("Actor alarm admission denied");
           if (timer) clearTimeout(timer);
           timer = undefined;
+          const bindingName = `CLASS_${variantIndex}`;
+          if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
+            throw new Error("Actor alarm variant unavailable");
+          const selectedClass = this.env[bindingName];
           const child = this.state.facets.get("actor", () => ({
-            class: this.env.CLASS,
+            class: selectedClass,
             id: claimed,
           }));
           const request = new Request("http://actor.invalid/", {
@@ -342,11 +415,21 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
         } finally {
           if (timer) clearTimeout(timer);
         }
-        if (!this.state.facets.abort) throw new Error("Actor facet retirement unavailable");
-        this.state.facets.abort("actor", "actor-alarm-retirement");
+        let retirementFailed = false;
+        const abortFacet = this.state.facets.abort;
+        if (!abortFacet) {
+          retirementFailed = true;
+        } else {
+          try {
+            SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-alarm-retirement"]);
+          } catch {
+            retirementFailed = true;
+          }
+        }
+        if (retirementFailed) this.poisoned = true;
         await this.control(async () => {
           const state = this.readAlarm();
-          if (succeeded) {
+          if (succeeded && !retirementFailed) {
             // Arm a successor before retiring its predecessor. If the owner
             // dies after settlement, the successor still has a native wake.
             if (state.pending !== null) await this.requireStorage().setAlarm(state.pending);
@@ -365,6 +448,23 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
           }
           await this.reconcile();
         });
+        if (leaseId !== undefined) {
+          const admission = this.env.ADMISSION;
+          if (!admission || !SafeResponseStatus)
+            throw new Error("Actor alarm completion unavailable");
+          const completion = await SafeReflectApply(admission.fetch, admission, [
+            new SafeRequest("http://actor.invalid/", {
+              method: "POST",
+              headers: new SafeHeaders({
+                "x-takoserver-private-alarm-admission": admissionToken,
+              }),
+              body: SafeReflectApply(SafeJsonStringify, JSON, [{ action: "complete", leaseId }]),
+            }),
+          ]);
+          if (SafeReflectApply(SafeResponseStatus, completion, []) !== 204)
+            throw new Error("Actor alarm completion unavailable");
+          await completion.body?.cancel();
+        }
       });
       this.tail = turn.catch(() => {});
       this.state.waitUntil(this.tail);
@@ -383,9 +483,13 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
       // instance instead reserves the turn until the actual body terminates.
       const turn = this.tail.then(async () => {
         await this.ready;
+        if (this.poisoned) throw new Error("Actor facet retirement failed");
         const encodedId = request.headers.get("x-takoserver-private-actor-id");
         if (!encodedId) throw new Error("Actor identity unavailable");
         const id = decodeURIComponent(encodedId);
+        const variantKey = request.headers.get(VARIANT_HEADER);
+        const variantIndex = variantKey === null ? -1 : variantKeys.indexOf(variantKey);
+        if (variantIndex < 0) throw new Error("Actor variant unavailable");
         if (this.state.storage) {
           await this.control(async () => {
             const existing = this.readAlarm().actorId;
@@ -399,25 +503,57 @@ export function createActorNativeOwner(deliveryToken: string, admissionToken: st
         }
         const headers = new Headers(request.headers);
         headers.delete("x-takoserver-private-actor-id");
-        const child = this.state.facets.get("actor", () => ({ class: this.env.CLASS, id }));
-        const response = await child.fetch(withHeaders(request, headers));
-        if (response.body === null) {
-          resolve(response);
-          return;
-        }
-        const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-        resolve(
-          new Response(readable, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-          }),
-        );
+        headers.delete(VARIANT_HEADER);
+        let childRequest: Request | undefined;
+        let retirementError: unknown;
         try {
-          await response.body.pipeTo(writable);
-        } catch {
-          /* cancellation/error terminates this body, then releases the gate */
+          const bindingName = `CLASS_${variantIndex}`;
+          if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
+            throw new Error("Actor variant unavailable");
+          const child = this.state.facets.get("actor", () => ({
+            class: this.env[bindingName],
+            id,
+          }));
+          childRequest = withHeaders(request, headers);
+          const response = await child.fetch(childRequest);
+          if (response.body === null) {
+            resolve(response);
+          } else {
+            const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+            resolve(
+              new Response(readable, {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+              }),
+            );
+            try {
+              await response.body.pipeTo(writable);
+            } catch {
+              /* cancellation/error terminates this body, then releases the gate */
+            }
+          }
+        } finally {
+          try {
+            if (childRequest?.body && !childRequest.body.locked)
+              await childRequest.body.cancel("actor event retired");
+          } catch {
+            /* an application-owned stream may already be locked or errored */
+          }
+          const abortFacet = this.state.facets.abort;
+          if (!abortFacet) {
+            retirementError = new Error("Actor facet retirement unavailable");
+            this.poisoned = true;
+          } else {
+            try {
+              SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-event-retirement"]);
+            } catch (error) {
+              retirementError = error;
+              this.poisoned = true;
+            }
+          }
         }
+        if (retirementError !== undefined) throw retirementError;
       });
       this.tail = turn.catch(reject);
       this.state.waitUntil(this.tail);
@@ -455,6 +591,8 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
         headers.delete(ALARM_ACTION_HEADER);
         headers.delete(ALARM_AT_HEADER);
         headers.delete(DELIVERY_HEADER);
+      } else {
+        headers.delete(VARIANT_HEADER);
       }
       return env.NAMESPACE.get(env.NAMESPACE.idFromName(id)).fetch(withHeaders(request, headers));
     },

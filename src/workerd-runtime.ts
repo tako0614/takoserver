@@ -236,6 +236,19 @@ export interface WorkerdSelectedActiveVersion {
   readonly assets?: ReadonlyMap<string, Uint8Array>;
 }
 
+/** The complete, atomically verified graph used by one native Actor owner. */
+export interface WorkerdActiveActorGraph {
+  readonly generation: string;
+  readonly generationKey: string;
+  readonly workerResourceUid: string;
+  readonly versions: readonly (SelfhostWeightedVersion & {
+    readonly variantKey: string;
+    readonly site: WorkerdSite;
+    readonly modules: ReadonlyMap<string, Uint8Array>;
+    readonly hostModules: ReadonlyMap<string, Uint8Array>;
+  })[];
+}
+
 /** The gate service one script receives its events through. */
 export interface WorkerdEventGate {
   /** Module inside the script's directory that implements the gate. */
@@ -2151,6 +2164,12 @@ export async function writeWorkerdPrivateExecution(options: {
     readonly ownerModule: string;
     readonly className: string;
     readonly alarmAdmissionAddress: string;
+    readonly variants: readonly {
+      readonly site: WorkerdSite;
+      readonly modules: ReadonlyMap<string, Uint8Array>;
+      readonly hostModules: ReadonlyMap<string, Uint8Array>;
+      readonly className: string;
+    }[];
   };
   readonly runSocketPath: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
@@ -2205,6 +2224,12 @@ export async function writeWorkerdPrivateExecution(options: {
       !/^127\.0\.0\.1:[1-9][0-9]{0,4}$/u.test(actor.alarmAdmissionAddress))
   ) {
     throw new Error("unusable private Actor execution declaration");
+  }
+  if (
+    actor &&
+    (!Array.isArray(actor.variants) || actor.variants.length === 0 || actor.variants.length > 100)
+  ) {
+    throw new Error("unusable private Actor version graph");
   }
   const companion = actor ? undefined : validDataPlaneAddress(options.companionAddress ?? "");
   const planeAddress = site.dataPlane
@@ -2263,6 +2288,8 @@ export async function writeWorkerdPrivateExecution(options: {
   (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
   }
   let actorServices = "";
+  let actorVersionServices = "";
+  const actorPrepared: Awaited<ReturnType<typeof prepareWorkerdSite>>[] = [];
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
     if (
@@ -2275,10 +2302,46 @@ export async function writeWorkerdPrivateExecution(options: {
       throw new Error("private Actor alarm binding collision");
     const actorBindings = [
       '(name = "NAMESPACE", durableObjectNamespace = "ActorOwner")',
-      `(name = "CLASS", durableObjectClass = (name = "application", entrypoint = ${capnpText(actor.className)}))`,
       '(name = "ADMISSION", service = "actor-alarm-admission")',
-      ...bindings,
     ];
+    for (let index = 0; index < actor.variants.length; index += 1) {
+      const variant = actor.variants[index];
+      if (!variant || !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(variant.className)) {
+        throw new Error("unusable private Actor class binding");
+      }
+      const serviceName = `actor-version-${index}`;
+      actorBindings.push(
+        `(name = ${capnpText(`CLASS_${index}`)}, durableObjectClass = (name = ${capnpText(serviceName)}, entrypoint = ${capnpText(variant.className)}))`,
+      );
+      // Actor classes have no public asset/event ingress. Those declarations
+      // were verified from durable state, but are intentionally not composed
+      // into the private class service.
+      const { assets: _assets, events: _events, ...versionSite } = variant.site;
+      const version = await prepareWorkerdSite(
+        { ...versionSite, hostnames: [] },
+        variant.modules,
+        undefined,
+        variant.hostModules,
+      );
+      actorPrepared.push(version);
+      const versionBindings = validBindings(version.manifest.vars ?? []).map(
+        (binding) =>
+          `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+      );
+      if (
+        version.manifest.vars?.some((binding) => binding.name === "__TAKOSERVER_ACTOR_ALARM_OWNER")
+      ) {
+        throw new Error("private Actor internal binding collision");
+      }
+      versionBindings.push('(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")');
+      actorVersionServices += `
+  (name = ${capnpText(serviceName)}, worker = (
+    modules = [${renderWorkerdModules(version.manifest, ".")}],
+    modulePolicy = (applicationMain = ${capnpText(version.manifest.mainModule)}),
+    compatibilityDate = "2026-01-01", compatibilityFlags = [${[...APPLICATION_COMPATIBILITY_FLAGS, "experimental"].map(capnpText).join(", ")}], globalOutbound = "deny",
+    bindings = [${versionBindings.join(", ")}]
+  )),`;
+    }
     actorServices = `
   (name = "actor-owner", worker = (
     modules = [${renderWorkerdModules({ ...prepared.manifest, hostEntrypoint: actor.ownerModule }, ".")}],
@@ -2302,12 +2365,13 @@ const config :Workerd.Config = (
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorServices}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorVersionServices}${actorServices}
   (name = "deny", network = (allow = []))
  ],
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})]
 );`;
   await writePreparedWorkerdSite(root, prepared);
+  for (const version of actorPrepared) await writePreparedWorkerdSite(root, version);
   const configPath = join(root, "workerd.capnp");
   await writeFile(configPath, config, { mode: 0o600, flag: "wx" });
   return configPath;
@@ -3137,6 +3201,185 @@ export async function readWorkerdSelectedActiveVersion(
     modules,
     hostModules,
     ...(assets === undefined ? {} : { assets }),
+  };
+}
+
+/**
+ * Reads every Version in the active private publication without sampling the
+ * weighted selector. All module bytes are verified before the active marker
+ * and stable pointer are reread, so callers receive one closed graph or null.
+ */
+export async function readWorkerdActiveActorGraph(
+  root: string,
+  script: string,
+  expectedWorkerResourceUid: string,
+): Promise<WorkerdActiveActorGraph | null> {
+  if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
+  expectedWorkerResourceUid = validWorkerResourceUid(expectedWorkerResourceUid);
+  const scriptsRoot = join(root, "workers");
+  const activationPath = join(scriptsRoot, ".takoserver-active.json");
+  let before: Record<string, string | null>;
+  try {
+    before = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  const activeGeneration = before[script];
+  if (typeof activeGeneration !== "string") return null;
+  const pointerPath = join(scriptsRoot, script, MANIFEST);
+  const pointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active Actor graph");
+  });
+  if (pointerRaw === null) return null;
+  let pointerValue: unknown;
+  try {
+    pointerValue = JSON.parse(pointerRaw);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  let deployment: WeightedDeploymentSnapshot;
+  try {
+    deployment = await readWeightedDeploymentSnapshot(scriptsRoot, script, pointerValue);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  if (
+    deployment.deployment.generation !== activeGeneration ||
+    deployment.deployment.workerResourceUid !== expectedWorkerResourceUid
+  )
+    return null;
+
+  const versions: WorkerdActiveActorGraph["versions"][number][] = [];
+  for (let index = 0; index < deployment.deployment.versions.length; index += 1) {
+    const stored = deployment.deployment.versions[index];
+    const weighted = deployment.canonical[index];
+    if (!stored || !weighted) throw new Error("unusable worker active Actor graph");
+    const identity = stored.manifest;
+    if (
+      typeof identity !== "object" ||
+      identity === null ||
+      Array.isArray(identity) ||
+      identity.generation !== deployment.deployment.generation ||
+      identity.workerResourceUid !== deployment.deployment.workerResourceUid ||
+      !Array.isArray(identity.hostnames) ||
+      identity.hostnames.length !== 0
+    )
+      throw new Error("unusable worker active Actor graph");
+
+    const capture: Required<ReadbackCapture> = {
+      application: new Map(),
+      hostPrivate: new Map(),
+      assets: new Map(),
+    };
+    let manifest: Manifest;
+    try {
+      const moduleRoot = join(deployment.generationRoot, stored.storageKey);
+      manifest = await readValidatedManifest(
+        moduleRoot,
+        join(moduleRoot, ASSETS_ROOT_DIRECTORY),
+        identity,
+        capture,
+      );
+    } catch {
+      throw new Error("unusable worker active Actor graph");
+    }
+    if (
+      manifest.generation !== deployment.deployment.generation ||
+      manifest.workerResourceUid !== deployment.deployment.workerResourceUid ||
+      manifest.hostnames.length !== 0
+    )
+      throw new Error("unusable worker active Actor graph");
+
+    let site: WorkerdSite;
+    try {
+      site = {
+        directory: script,
+        mainModule: manifest.mainModule,
+        ...(manifest.hostEntrypoint === undefined
+          ? {}
+          : { hostEntrypoint: manifest.hostEntrypoint }),
+        ...(manifest.hostModules === undefined ? {} : { hostModules: [...manifest.hostModules] }),
+        hostnames: [...manifest.hostnames],
+        ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
+        ...(manifest.workerResourceUid === undefined
+          ? {}
+          : { workerResourceUid: manifest.workerResourceUid }),
+        ...(manifest.fetchHandler === undefined ? {} : { fetchHandler: manifest.fetchHandler }),
+        ...(manifest.serviceBindings === undefined
+          ? {}
+          : { serviceBindings: manifest.serviceBindings.map((binding) => ({ ...binding })) }),
+        ...(manifest.vars === undefined
+          ? {}
+          : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
+        ...(manifest.modules === undefined ? {} : { modules: [...manifest.modules] }),
+        ...(manifest.moduleMediaTypes === undefined
+          ? {}
+          : { moduleMediaTypes: { ...manifest.moduleMediaTypes } }),
+        ...(manifest.dataPlane === undefined
+          ? {}
+          : {
+              dataPlane: {
+                ...manifest.dataPlane,
+                vars: manifest.dataPlane.vars.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.events === undefined
+          ? {}
+          : {
+              events: {
+                ...manifest.events,
+                vars: manifest.events.vars.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.assets === undefined
+          ? {}
+          : {
+              assets: {
+                notFoundHandling: manifest.assets.notFoundHandling,
+                runWorkerFirst: manifest.assets.runWorkerFirst,
+                mediaTypes: Object.fromEntries(
+                  Object.entries(manifest.assets.files).map(([path, entry]) => [
+                    path,
+                    entry.mediaType,
+                  ]),
+                ),
+              },
+            }),
+      };
+    } catch {
+      throw new Error("unusable worker active Actor graph");
+    }
+    versions.push({
+      ...weighted,
+      variantKey: weighted.workerVersionUid,
+      site,
+      modules: capture.application,
+      hostModules: capture.hostPrivate,
+    });
+  }
+
+  let after: Record<string, string | null>;
+  const finalPointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active Actor graph");
+  });
+  try {
+    after = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  if (
+    finalPointerRaw === null ||
+    after[script] !== activeGeneration ||
+    finalPointerRaw !== pointerRaw
+  )
+    return null;
+  return {
+    generation: deployment.deployment.generation,
+    generationKey: deployment.pointer.generationKey,
+    workerResourceUid: deployment.deployment.workerResourceUid,
+    versions,
   };
 }
 
