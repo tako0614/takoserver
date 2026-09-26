@@ -19,7 +19,9 @@ export interface WorkerdActorNamespaceOptions {
 
 export interface WorkerdActorNamespace {
   fetch(id: string, request: Request): Promise<Response>;
-  /** The caller must drain every response before closing. Resolves after reap. */
+  /** Settles when the native child exits, including an intentional close. */
+  readonly exited: Promise<void>;
+  /** Ordinary retirement drains responses; a dead child can be reaped immediately. */
   close(): Promise<void>;
 }
 
@@ -154,7 +156,9 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
     }
     if (!ready) throw new Error("Actor native child readiness unavailable");
     options.signal.throwIfAborted();
+    const runningChild = child;
     return {
+      exited: runningChild.exited.then(() => {}),
       async fetch(id, request) {
         if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
         const headers = new Headers(request.headers);

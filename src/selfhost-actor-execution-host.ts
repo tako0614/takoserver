@@ -14,6 +14,8 @@ interface Session {
   readonly process: WorkerdActorNamespace;
   active: number;
   readonly idle: Set<() => void>;
+  dead: boolean;
+  reap?: Promise<void>;
 }
 interface Owner {
   tail: Promise<void>;
@@ -26,7 +28,7 @@ interface Owner {
  * Worker realization -> immutable published Version -> native Actor namespace.
  * This is deliberately not an admission capability or a public binding API.
  * Existing unsupported Actor gates remain in force while alarm/socket/quota
- * and crash-recovery qualifications are outstanding.
+ * and broader crash-recovery qualifications are outstanding.
  */
 export function createSelfhostActorExecutionHost(options: {
   readonly runtimeRoot: string;
@@ -59,9 +61,10 @@ export function createSelfhostActorExecutionHost(options: {
   const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
     if (!session) return;
-    if (session.active > 0) await new Promise<void>((resolve) => session.idle.add(resolve));
-    await session.process.close();
-    delete owner.session;
+    if (session.active > 0 && !session.dead)
+      await new Promise<void>((resolve) => session.idle.add(resolve));
+    await (session.reap ?? session.process.close());
+    if (owner.session === session) delete owner.session;
   };
   const sameGraph = (a: ActorResourceGraph, b: ActorResourceGraph | null): boolean =>
     b !== null && JSON.stringify(a) === JSON.stringify(b);
@@ -148,7 +151,7 @@ export function createSelfhostActorExecutionHost(options: {
           selected.workerVersionUid,
           selected.generationKey,
         ]);
-        if (current.session?.selection !== selection) {
+        if (current.session?.selection !== selection || current.session.dead) {
           await retire(current);
           if (!current.locked) {
             await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
@@ -167,7 +170,28 @@ export function createSelfhostActorExecutionHost(options: {
             hostModules: selected.hostModules,
             signal: request.signal,
           });
-          current.session = { selection, process, active: 0, idle: new Set() };
+          const session: Session = {
+            selection,
+            process,
+            active: 0,
+            idle: new Set(),
+            dead: false,
+          };
+          current.session = session;
+          void process.exited.then(() => {
+            session.dead = true;
+            // A dead child cannot complete a held response. Wake retirement
+            // without replaying an in-flight request or waiting for its body.
+            for (const notify of session.idle) notify();
+            session.idle.clear();
+            session.reap = process.close();
+            // The normal close path also awaits this promise. Attach a handler
+            // now so a cleanup error cannot become an unhandled rejection.
+            void session.reap.catch(() => {});
+            void exclusive(current, async () => {
+              if (current.session === session) await retire(current);
+            }).catch(() => {});
+          });
         }
         // Retirement can wait on an old response stream, and native startup
         // can also yield. A Resource or publication selected before either
@@ -199,6 +223,7 @@ export function createSelfhostActorExecutionHost(options: {
         }
         request.signal.throwIfAborted();
         const session = current.session;
+        if (!session || session.dead) throw new Error("Actor namespace unavailable");
         session.active += 1;
         return session;
       });

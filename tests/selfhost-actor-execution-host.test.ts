@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
@@ -66,7 +66,7 @@ test("Actor owner rejects persisted relation/deployment gaps before native alloc
 });
 
 test.skipIf(binary === undefined)(
-  "real self-host Actor owner selects persisted deployment, gates streams and retains UID-private SQL",
+  "real self-host Actor owner recovers child exits without losing UID-private SQL or lease fences",
   async () => {
     if (!binary || !digest || !/^[a-f0-9]{64}$/u.test(digest))
       throw new Error("candidate SHA required");
@@ -79,6 +79,14 @@ test.skipIf(binary === undefined)(
       "c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52",
     );
     const root = await mkdtemp(join(tmpdir(), "actor-owner-native-"));
+    const childPidFile = join(root, "actor-child.pid");
+    const childConfigFile = join(root, "actor-child.config");
+    const childWrapper = join(root, "actor-child");
+    await writeFile(
+      childWrapper,
+      `#!/bin/sh\nprintf '%s\\n' "$$" >> '${childPidFile}'\nprintf '%s\\n' "$2" >> '${childConfigFile}'\nexec '${binary}' "$@"\n`,
+      { mode: 0o700 },
+    );
     const f = await deployedFixture();
     const runtimeRoot = join(root, "runtime");
     const storageRoot = join(root, "state");
@@ -149,7 +157,7 @@ export class Counter extends Base {
       createSelfhostActorExecutionHost({
         runtimeRoot,
         storageRoot,
-        binary,
+        binary: childWrapper,
         graph: async (scope, signal) => {
           const graph = await f.read(scope, signal);
           afterGraphRead?.();
@@ -160,6 +168,25 @@ export class Counter extends Base {
         providerInstallationRef: "local.primary",
         basisPoint: () => basisPoint,
       });
+    const crashChild = async (): Promise<string> => {
+      const childPid = Number((await readFile(childPidFile, "utf8")).trim().split("\n").at(-1));
+      const deadConfig = (await readFile(childConfigFile, "utf8")).trim().split("\n").at(-1);
+      expect(Number.isSafeInteger(childPid) && childPid > 0).toBe(true);
+      expect(deadConfig).toBeDefined();
+      process.kill(childPid, "SIGKILL");
+      let childGone = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        try {
+          process.kill(childPid, 0);
+        } catch {
+          childGone = true;
+          break;
+        }
+        await Bun.sleep(10);
+      }
+      expect(childGone).toBe(true);
+      return deadConfig ?? "";
+    };
     let owner = makeOwner();
     const identity = { ...scope, id: "カウンター/a" };
     try {
@@ -221,6 +248,22 @@ export class Counter extends Base {
       await owner.close();
       owner = makeOwner();
       expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
+      const idleConfig = await crashChild();
+      expect((await (await owner.fetch(identity, request("/increment"))).json()).value).toBe(3);
+      expect(await stat(dirname(idleConfig)).catch(() => null)).toBeNull();
+      const crashedStream = await owner.fetch(identity, request("/stream"));
+      const crashedReader = crashedStream.body?.getReader();
+      expect(new TextDecoder().decode((await crashedReader?.read())?.value)).toBe("head");
+      const activeConfig = await crashChild();
+      // The old response is not replayed or drained on the caller's behalf.
+      // A new request must reopen against the same UID-private SQL authority.
+      const recovered = await Promise.all([
+        owner.fetch(identity, request("/increment")).then((response) => response.json()),
+        owner.fetch(identity, request("/increment")).then((response) => response.json()),
+      ]);
+      expect(recovered.map((result) => result.value).sort()).toEqual([4, 5]);
+      expect(await stat(dirname(activeConfig)).catch(() => null)).toBeNull();
+      await crashedReader?.cancel().catch(() => {});
       const held = await owner.fetch(identity, request("/stream"));
       const heldReader = held.body?.getReader();
       expect(new TextDecoder().decode((await heldReader?.read())?.value)).toBe("head");
@@ -272,6 +315,16 @@ export class Counter extends Base {
           ).json()
         ).value,
       ).toBe(0);
+      const closingStream = await owner.fetch(
+        { ...identity, namespaceResourceUid: replacement.metadata.uid },
+        request("/stream"),
+      );
+      const closingReader = closingStream.body?.getReader();
+      expect(new TextDecoder().decode((await closingReader?.read())?.value)).toBe("head");
+      const closingConfig = await crashChild();
+      await owner.close();
+      expect(await stat(dirname(closingConfig)).catch(() => null)).toBeNull();
+      await closingReader?.cancel().catch(() => {});
     } finally {
       await owner.close();
       f.database.close();
