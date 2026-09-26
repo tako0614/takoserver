@@ -23,10 +23,11 @@ supply. Provider bucket names, regions, endpoints, credentials, and supply
 documents remain inside the selected Provider Pack and Deployment; none is
 Resource desired, observed, output, discovery, or Worker binding state.
 
-Both Cloudflare Worker backends carry that Binding. The OSS ordinary-workers
-backend uploads the tenant's exact bundle bytes with no wrapper, so the
-declared name carries Cloudflare's native R2 binding. The separately supplied
-managed backend exposes the same nine-method `edge.objects` facade while
+Both Cloudflare Worker backends carry that Binding. When explicitly enabled for
+development, the OSS ordinary-workers backend uploads the tenant's exact bundle
+bytes with no wrapper, so the declared name carries Cloudflare's native R2
+binding. The separately supplied managed backend exposes the same nine-method
+`edge.objects` facade while
 keeping provider-native capabilities out of the tenant environment. Its
 operator owns multipart recovery, retention, and destruction reconciliation;
 uncertain provider effects are not reported as success or retried blindly.
@@ -532,6 +533,16 @@ installation configuration stay in the operator's factory closure. A missing,
 asynchronous, incomplete or wrong-kind backend is a startup error, never an
 ordinary-Workers fallback; the deprecated ordinary endpoint suffix cannot be
 combined with that factory.
+
+Ordinary Cloudflare Worker writes are disabled by default. A development harness
+must explicitly select `workerBackend: { kind: "ordinary-workers",
+allowDevelopmentWorkerWrites: true }` to create or update Workers through this
+adapter; a `workerEndpointSuffix` alone does not enable writes. Existing
+WorkerVersion operations may still recover by readback without that opt-in, and
+legacy Workers remain observable and deletable. Managed customer `ModuleWorker`
+supply on Cloudflare requires the separately supplied Workers for Platforms
+backend, not ordinary account Worker scripts or `workers.dev`. This boundary does
+not itself qualify that managed backend or admit its Forms.
 
 Mutation failure codes do not prove that nothing changed. A Provider may return
 `failedWithoutProviderMutation(operationId, code, message)` from this extension
