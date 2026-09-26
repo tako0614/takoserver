@@ -66,6 +66,11 @@ child kill: after each, no HTTP request is sent until a direct read of the
 actor-private SQLite store proves the pending alarm handler ran. A persisted
 namespace registration contains only tenant ID and namespace UID; startup
 rechecks the live Resource, deployment and selected Version before launching.
+One registered namespace's native launch or selected-Version snapshot failure
+is reported by `ready` and `coldStartFailures()` after at most three attempts
+(1s, then 2s backoff), without disabling another namespace. A failed namespace
+is not reported as having delivered its alarm; corrupt registration metadata
+still fails startup.
 The current isolated owner starts every previously served namespace serially,
 even if it has no pending alarm, so cold startup scales with registration count.
 An unclean parent-process crash leaves the exclusive lease in place and fails

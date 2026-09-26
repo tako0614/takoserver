@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -12,7 +12,14 @@ import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/workerd-runtime.ts";
-import { actorForm, fixture, insert, resource, scope } from "./helpers/actor-resource-fixture.ts";
+import {
+  actorForm,
+  fixture,
+  insert,
+  resource,
+  scope,
+  workerForm,
+} from "./helpers/actor-resource-fixture.ts";
 
 const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
 const digest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
@@ -66,6 +73,42 @@ test("Actor owner rejects persisted relation/deployment gaps before native alloc
   }
 });
 
+test("Actor cold restore fails closed on corrupt registration metadata", async () => {
+  const f = await deployedFixture();
+  const root = await mkdtemp(join(tmpdir(), "actor-owner-corrupt-registration-"));
+  const storageRoot = join(root, "state");
+  const registrations = join(storageRoot, "registrations");
+  const key = createHash("sha256")
+    .update(JSON.stringify([scope.tenantId, scope.namespaceResourceUid]))
+    .digest("hex");
+  await mkdir(registrations, { recursive: true });
+  await writeFile(
+    join(registrations, `${key}.json`),
+    JSON.stringify({ tenantId: scope.tenantId, namespaceResourceUid: scope.namespaceResourceUid }),
+  );
+  await writeFile(join(registrations, `${"f".repeat(64)}.json`), "{}");
+  const owner = createSelfhostActorExecutionHost({
+    runtimeRoot: root,
+    storageRoot,
+    binary: "/never-execute",
+    graph: f.read,
+    deployments: f.deployments,
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await expect(owner.ready).rejects.toThrow("registration invalid");
+    await expect(owner.fetch({ ...scope, id: "a" }, request())).rejects.toThrow(
+      "registration invalid",
+    );
+    expect(await stat(join(storageRoot, "namespaces")).catch(() => null)).toBeNull();
+  } finally {
+    await owner.close();
+    f.database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test.skipIf(binary === undefined)(
   "real self-host Actor owner recovers child exits without losing UID-private SQL or lease fences",
   async () => {
@@ -83,12 +126,59 @@ test.skipIf(binary === undefined)(
     const childPidFile = join(root, "actor-child.pid");
     const childConfigFile = join(root, "actor-child.config");
     const childWrapper = join(root, "actor-child");
+    const badNamespaceUid = "namespace-bad";
+    const badKey = createHash("sha256")
+      .update(JSON.stringify([scope.tenantId, badNamespaceUid]))
+      .digest("hex");
     await writeFile(
       childWrapper,
-      `#!/bin/sh\nprintf '%s\\n' "$$" >> '${childPidFile}'\nprintf '%s\\n' "$2" >> '${childConfigFile}'\nexec '${binary}' "$@"\n`,
+      `#!/bin/sh\nif /usr/bin/grep -q '${badKey}' "$2"; then exit 65; fi\nprintf '%s\\n' "$$" >> '${childPidFile}'\nprintf '%s\\n' "$2" >> '${childConfigFile}'\nexec '${binary}' "$@"\n`,
       { mode: 0o700 },
     );
     const f = await deployedFixture();
+    insert(f.database, resource(actorForm, "counter-bad", badNamespaceUid), [f.relation]);
+    const selectorNamespaceUid = "namespace-selector-bad";
+    const selectorWorker = resource(workerForm, "worker-selector-bad", "worker-selector-bad-uid");
+    insert(f.database, selectorWorker, []);
+    insert(
+      f.database,
+      {
+        ...resource(actorForm, "counter-selector-bad", selectorNamespaceUid),
+        spec: {
+          className: "Counter",
+          worker: {
+            apiVersion: selectorWorker.apiVersion,
+            kind: "ModuleWorker",
+            name: selectorWorker.metadata.name,
+          },
+        },
+      },
+      [
+        {
+          ...f.relation,
+          targetName: selectorWorker.metadata.name,
+          targetUid: selectorWorker.metadata.uid,
+        },
+      ],
+    );
+    await f.deployments.create({
+      tenantId: scope.tenantId,
+      id: "deployment-selector-bad",
+      resourceUid: selectorWorker.metadata.uid,
+      offeringId: "worker-local",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      nativeId: "selfhost-worker:selector-worker:operation-1",
+      state: "active",
+      observed: {},
+      outputs: { scriptName: "selector-worker" },
+    });
+    expect(
+      await f.read(
+        { tenantId: scope.tenantId, namespaceResourceUid: selectorNamespaceUid },
+        new AbortController().signal,
+      ),
+    ).not.toBeNull();
     const runtimeRoot = join(root, "runtime");
     const storageRoot = join(root, "state");
     const runtime = createWorkerdRuntime({ root: runtimeRoot, isReady: () => true });
@@ -182,22 +272,26 @@ export class Counter extends Base {
    }
  }
 }`;
-    const publication = (generation: string): WorkerdDeploymentPublication => ({
+    const publication = (
+      generation: string,
+      workerResourceUid = f.target.metadata.uid,
+      script = "worker",
+    ): WorkerdDeploymentPublication => ({
       generation,
-      workerResourceUid: f.target.metadata.uid,
+      workerResourceUid,
       hostnames: [],
       versions: ["a", "b"].map((version) => ({
         versionId: `version-${version}`,
         workerVersionUid: `version-uid-${version}`,
         weight: version === "a" ? 1 : 9999,
         site: {
-          directory: "worker",
+          directory: script,
           mainModule: "main.mjs",
           hostEntrypoint: "__host.mjs",
           hostModules: [SELFHOST_WORKER_PRELUDE_MODULE],
           hostnames: [],
           generation,
-          workerResourceUid: f.target.metadata.uid,
+          workerResourceUid,
           fetchHandler: true,
           modules: ["counter.mjs"],
           vars: [
@@ -286,6 +380,10 @@ export class Counter extends Base {
     const identity = { ...scope, id: "カウンター/a" };
     try {
       await runtime.publish?.("worker", publication("generation-1"));
+      await runtime.publish?.(
+        "selector-worker",
+        publication("generation-selector", selectorWorker.metadata.uid, "selector-worker"),
+      );
       const initial = await (await owner.fetch(identity, request("/increment"))).json();
       expect(initial).toEqual({ id: identity.id, value: 1, version: "a" });
       expect(await (await owner.fetch(identity, request("/env"))).json()).toEqual({
@@ -394,6 +492,13 @@ export class Counter extends Base {
       await owner.close();
       owner = makeOwner();
       expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
+      const badIdentity = { ...identity, namespaceResourceUid: badNamespaceUid };
+      await expect(owner.fetch(badIdentity, request())).rejects.toThrow(
+        "native child exited during startup",
+      );
+      const selectorBadIdentity = { ...identity, namespaceResourceUid: selectorNamespaceUid };
+      expect((await (await owner.fetch(selectorBadIdentity, request())).json()).value).toBe(0);
+      await writeFile(join(runtimeRoot, "workers", "selector-worker", "takoserver-site.json"), "{");
       const pendingBeforeRestart = (await (
         await owner.fetch(identity, request("/alarm-set?delay=3000"))
       ).json()) as { pending: number };
@@ -405,7 +510,23 @@ export class Counter extends Base {
       owner = makeOwner();
       // No HTTP call may be needed to reconstruct the native owner and wake
       // this persisted alarm. Only direct SQLite reads observe the wake.
-      await owner.ready;
+      const failedColdStarts = [
+        {
+          tenantId: scope.tenantId,
+          namespaceResourceUid: badNamespaceUid,
+          reason: "native_start_unavailable",
+          attempts: 3,
+        },
+        {
+          tenantId: scope.tenantId,
+          namespaceResourceUid: selectorNamespaceUid,
+          reason: "version_snapshot_unavailable",
+          attempts: 3,
+        },
+      ] as const;
+      expect(await owner.ready).toEqual(expect.arrayContaining(failedColdStarts));
+      expect(owner.coldStartFailures()).toEqual(expect.arrayContaining(failedColdStarts));
+      expect(owner.coldStartFailures()).toHaveLength(2);
       let coldStarts = startsBeforeColdRestart;
       for (let attempt = 0; attempt < 100; attempt += 1) {
         coldStarts = (await readFile(childPidFile, "utf8")).trim().split("\n").length;
@@ -419,6 +540,23 @@ export class Counter extends Base {
         restoredRuns = await durableAlarmRuns();
       }
       expect(restoredRuns).toBe(5);
+      expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
+      await expect(owner.fetch(badIdentity, request())).rejects.toThrow(
+        "native child exited during startup",
+      );
+      await expect(owner.fetch(selectorBadIdentity, request())).rejects.toThrow(
+        "unusable worker active version snapshot",
+      );
+      f.database
+        .query(
+          "UPDATE tf_resource_deletion_attestations SET state = 'pending' WHERE resource_uid = ?",
+        )
+        .run(badNamespaceUid);
+      f.database
+        .query(
+          "UPDATE tf_resource_deletion_attestations SET state = 'pending' WHERE resource_uid = ?",
+        )
+        .run(selectorNamespaceUid);
       expect(
         (await (await owner.fetch(identity, request("/alarm-status"))).json()).pending,
       ).toBeNull();

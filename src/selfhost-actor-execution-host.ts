@@ -30,6 +30,25 @@ interface ActorScope {
 }
 
 class ActorAuthorityUnavailable extends Error {}
+class ActorNativeStartUnavailable extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Actor native startup unavailable", { cause });
+  }
+}
+class ActorSelectionReadUnavailable extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Actor Version snapshot unavailable", { cause });
+  }
+}
+
+export interface ActorColdStartFailure extends ActorScope {
+  readonly reason:
+    | "authority_unavailable"
+    | "native_start_unavailable"
+    | "version_snapshot_unavailable"
+    | "recovery_unavailable";
+  readonly attempts: number;
+}
 
 /**
  * Internal self-host composition: persisted Resource incarnation -> active
@@ -52,6 +71,7 @@ export function createSelfhostActorExecutionHost(options: {
   if (!isAbsolute(options.runtimeRoot) || !isAbsolute(options.storageRoot))
     throw new Error("Actor owner roots must be absolute");
   const owners = new Map<string, Owner>();
+  const coldStartFailures = new Map<string, ActorColdStartFailure>();
   let stopped = false;
   let stopping: Promise<void> | undefined;
   const registrations = join(options.storageRoot, "registrations");
@@ -103,6 +123,24 @@ export function createSelfhostActorExecutionHost(options: {
   };
   const sameGraph = (a: ActorResourceGraph, b: ActorResourceGraph | null): boolean =>
     b !== null && JSON.stringify(a) === JSON.stringify(b);
+  const selectedVersion = async (
+    owner: Owner,
+    script: string,
+    workerResourceUid: string,
+    basisPoint: number,
+  ) => {
+    try {
+      return await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
+        expectedWorkerResourceUid: workerResourceUid,
+        basisPoint,
+      });
+    } catch (error) {
+      // A selector error invalidates an already-running session too. Do not
+      // leave native alarms executing under bytes we can no longer prove.
+      await retire(owner);
+      throw new ActorSelectionReadUnavailable(error);
+    }
+  };
 
   const activate = async (
     identity: ActorScope,
@@ -120,7 +158,7 @@ export function createSelfhostActorExecutionHost(options: {
     const current = owner;
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
-    return exclusive(current, async () => {
+    const session = await exclusive(current, async () => {
       if (stopped) throw new Error("Actor owner stopped");
       const graph = await options.graph(identity, signal);
       if (
@@ -148,10 +186,7 @@ export function createSelfhostActorExecutionHost(options: {
         throw new ActorAuthorityUnavailable("Actor Worker realization unavailable");
       }
       const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
-      const selected = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
-        expectedWorkerResourceUid: graph.worker.uid,
-        basisPoint,
-      });
+      const selected = await selectedVersion(current, script, graph.worker.uid, basisPoint);
       if (!selected) {
         await retire(current);
         throw new ActorAuthorityUnavailable("Actor Worker Version unavailable");
@@ -185,15 +220,20 @@ export function createSelfhostActorExecutionHost(options: {
           await mkdir(join(options.storageRoot, "leases", key), { mode: 0o700 });
           current.locked = true;
         }
-        const process = await openWorkerdActorNamespace(options.binary, {
-          namespaceKey: key,
-          storagePath: join(options.storageRoot, "namespaces", key),
-          className: graph.namespace.className,
-          site: selected.site,
-          modules: selected.modules,
-          hostModules: selected.hostModules,
-          signal,
-        });
+        let process: WorkerdActorNamespace;
+        try {
+          process = await openWorkerdActorNamespace(options.binary, {
+            namespaceKey: key,
+            storagePath: join(options.storageRoot, "namespaces", key),
+            className: graph.namespace.className,
+            site: selected.site,
+            modules: selected.modules,
+            hostModules: selected.hostModules,
+            signal,
+          });
+        } catch (error) {
+          throw new ActorNativeStartUnavailable(error);
+        }
         const session: Session = {
           selection,
           process,
@@ -231,7 +271,32 @@ export function createSelfhostActorExecutionHost(options: {
                   // A broken candidate must not fork forever. The durable
                   // alarm stays retained; a later explicit owner restart
                   // can re-attempt after operator repair.
-                  if (error instanceof ActorAuthorityUnavailable) return;
+                  if (error instanceof ActorAuthorityUnavailable) {
+                    coldStartFailures.set(key, {
+                      tenantId: identity.tenantId,
+                      namespaceResourceUid: identity.namespaceResourceUid,
+                      reason: "authority_unavailable",
+                      attempts: attempt + 1,
+                    });
+                    return;
+                  }
+                  const recoverable =
+                    error instanceof ActorNativeStartUnavailable ||
+                    error instanceof ActorSelectionReadUnavailable;
+                  if (!recoverable || attempt === 2) {
+                    coldStartFailures.set(key, {
+                      tenantId: identity.tenantId,
+                      namespaceResourceUid: identity.namespaceResourceUid,
+                      reason:
+                        error instanceof ActorNativeStartUnavailable
+                          ? "native_start_unavailable"
+                          : error instanceof ActorSelectionReadUnavailable
+                            ? "version_snapshot_unavailable"
+                            : "recovery_unavailable",
+                      attempts: attempt + 1,
+                    });
+                    if (!recoverable) return;
+                  }
                   if (!stopped && attempt < 2) await Bun.sleep(1_000 * 2 ** attempt);
                 }
               }
@@ -242,10 +307,7 @@ export function createSelfhostActorExecutionHost(options: {
       // Retirement can wait on an old response stream, and native startup
       // can also yield. A Resource or publication selected before either
       // wait must not be dispatched afterward without another readback.
-      const finalVersion = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
-        expectedWorkerResourceUid: graph.worker.uid,
-        basisPoint,
-      });
+      const finalVersion = await selectedVersion(current, script, graph.worker.uid, basisPoint);
       const finalDeployment = await options.deployments.active(identity.tenantId, graph.worker.uid);
       const finalGraph = await options.graph(identity, signal);
       if (
@@ -270,6 +332,8 @@ export function createSelfhostActorExecutionHost(options: {
       session.active += 1;
       return session;
     });
+    coldStartFailures.delete(key);
+    return session;
   };
   const release = (session: Session): void => {
     session.active -= 1;
@@ -278,7 +342,7 @@ export function createSelfhostActorExecutionHost(options: {
       session.idle.clear();
     }
   };
-  const restore = async (): Promise<void> => {
+  const restore = async (): Promise<readonly ActorColdStartFailure[]> => {
     // Without a separate durable index of pending alarms, boot every
     // previously served namespace. Work is serial and scales with the
     // registration count, not merely the due-alarm count.
@@ -288,7 +352,8 @@ export function createSelfhostActorExecutionHost(options: {
         throw error;
       },
     );
-    for (const entry of entries) {
+    const scopes: ActorScope[] = [];
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
       if (!entry.isFile() || !/^[a-f0-9]{64}\.json$/u.test(entry.name))
         throw new Error("Actor namespace registration invalid");
       const raw: unknown = JSON.parse(await readFile(join(registrations, entry.name), "utf8"));
@@ -304,24 +369,62 @@ export function createSelfhostActorExecutionHost(options: {
           entry.name
       )
         throw new Error("Actor namespace registration invalid");
+      scopes.push(raw as ActorScope);
+    }
+    // Validate every registration before launching any process. A corrupt
+    // later entry cannot leave an earlier namespace running while ready
+    // reports that startup failed closed.
+    for (const scope of scopes) {
       // A registration identifies work to inspect, not execution authority:
       // activate rechecks the live Resource, deployment and selected Version.
-      try {
-        const session = await activate(raw as ActorScope, AbortSignal.timeout(30_000), false);
-        release(session);
-      } catch (error) {
-        // A deleted/replaced Resource is not authority to resurrect its
-        // namespace. Keep its retained record for explicit lifecycle cleanup
-        // without blocking other registered namespaces from waking.
-        if (!(error instanceof ActorAuthorityUnavailable)) throw error;
+      const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          const session = await activate(scope, AbortSignal.timeout(30_000), false);
+          release(session);
+          break;
+        } catch (error) {
+          // Absence of current authority must never resurrect an old UID.
+          // Native startup or one selected Version read failure is isolated
+          // to this registration. Corrupt registration metadata, graph store
+          // errors and other global failures still reject ready.
+          if (error instanceof ActorAuthorityUnavailable) {
+            coldStartFailures.set(key, {
+              ...scope,
+              reason: "authority_unavailable",
+              attempts: attempt,
+            });
+            break;
+          }
+          if (
+            !(error instanceof ActorNativeStartUnavailable) &&
+            !(error instanceof ActorSelectionReadUnavailable)
+          )
+            throw error;
+          if (attempt === 3) {
+            coldStartFailures.set(key, {
+              ...scope,
+              reason:
+                error instanceof ActorNativeStartUnavailable
+                  ? "native_start_unavailable"
+                  : "version_snapshot_unavailable",
+              attempts: attempt,
+            });
+          } else {
+            await Bun.sleep(1_000 * 2 ** (attempt - 1));
+          }
+        }
       }
     }
+    return [...coldStartFailures.values()].map((failure) => ({ ...failure }));
   };
   const ready = restore();
   void ready.catch(() => {});
 
   return {
     ready,
+    coldStartFailures: (): readonly ActorColdStartFailure[] =>
+      [...coldStartFailures.values()].map((failure) => ({ ...failure })),
     async fetch(scope: ActorScope & { readonly id: string }, request: Request): Promise<Response> {
       if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
       await ready;
