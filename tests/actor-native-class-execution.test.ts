@@ -1,0 +1,241 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import {
+  type ActorSqlValue,
+  createNativeActorExecution,
+  type NativeActorSqlFacade,
+  type NativeActorStorage,
+} from "../src/actor-native-class-execution.ts";
+
+function storage(database: Database): NativeActorStorage {
+  return {
+    sql: {
+      exec(sql, ...params) {
+        const before = database.query("SELECT total_changes() AS n").get() as { n: number };
+        const rows = database.query(sql).all(...params) as Record<string, unknown>[];
+        const after = database.query("SELECT total_changes() AS n").get() as { n: number };
+        return {
+          rowsWritten: after.n - before.n,
+          [Symbol.iterator]: () => rows[Symbol.iterator](),
+        };
+      },
+    },
+    transactionSync: (callback) => database.transaction(callback)(),
+  };
+}
+
+test("native class adapter initializes once and exposes only SQL and unavailable facades", async () => {
+  const db = new Database(":memory:");
+  const events: string[] = [];
+  let context!: {
+    storage: NativeActorSqlFacade;
+    alarm: { set(at: number): Promise<void> };
+    sockets: { list(): Promise<unknown> };
+  };
+  class Counter {
+    constructor(ctx: typeof context) {
+      events.push("constructor");
+      context = ctx;
+    }
+    async start() {
+      events.push("start");
+      await context.storage.execute("CREATE TABLE counter (value INTEGER)");
+      await Promise.resolve();
+      events.push("ready");
+    }
+    async fetch() {
+      events.push("fetch");
+      await context.storage.execute("INSERT INTO counter VALUES (?)", [1]);
+      return Response.json(await context.storage.query("SELECT count(*) AS n FROM counter"));
+    }
+    alarm() {}
+    socketMessage() {}
+    socketClose() {}
+    socketError() {}
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { Counter },
+      exportName: "Counter",
+      id: "one",
+      env: {},
+      storage: storage(db),
+    });
+    expect(events).toEqual([]);
+    expect((await (await actor.fetch(new Request("https://actor.test"))).json()).rows).toEqual([
+      { n: 1 },
+    ]);
+    expect((await (await actor.fetch(new Request("https://actor.test"))).json()).rows).toEqual([
+      { n: 2 },
+    ]);
+    expect(events).toEqual(["constructor", "start", "ready", "fetch", "fetch"]);
+    expect(Object.keys(context).sort()).toEqual(["alarm", "id", "sockets", "storage"]);
+    expect(Object.keys(context.storage).sort()).toEqual(["execute", "query", "transaction"]);
+    expect(Object.isFrozen(context.storage)).toBe(true);
+    await expect(context.alarm.set(1)).rejects.toMatchObject({ code: "backend_unavailable" });
+    await expect(context.sockets.list()).rejects.toMatchObject({ code: "backend_unavailable" });
+    await context.storage.query("INSERT INTO counter VALUES (999)");
+    expect((await context.storage.query("SELECT count(*) AS n FROM counter")).rows).toEqual([
+      { n: 2 },
+    ]);
+    await context.storage.execute("CREATE TABLE trigger_identifiers (begin INTEGER, end INTEGER)");
+    await context.storage.execute(
+      "CREATE TRIGGER tricky AFTER INSERT ON counter BEGIN INSERT INTO trigger_identifiers VALUES (1, 2); SELECT begin, end, CASE WHEN begin = 1 THEN end ELSE 0 END FROM trigger_identifiers; END; -- done",
+    );
+    await context.storage.execute("INSERT INTO counter VALUES (3)");
+    expect((await context.storage.query("SELECT * FROM trigger_identifiers")).rows).toEqual([
+      { begin: 1, end: 2 },
+    ]);
+    await expect(
+      context.storage.execute(
+        "CREATE TRIGGER forbidden AFTER INSERT ON counter BEGIN SELECT begin FROM trigger_identifiers; END; DELETE FROM counter;",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    await context.storage.execute("DROP TRIGGER tricky");
+    await context.storage.execute("DELETE FROM counter WHERE value = 3");
+    await expect(
+      context.storage.transaction([{ sql: "INSERT INTO counter VALUES (7)" }, { sql: "INVALID" }]),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    expect((await context.storage.query("SELECT count(*) AS n FROM counter")).rows).toEqual([
+      { n: 2 },
+    ]);
+    await context.storage.execute("CREATE TABLE blobs (value BLOB)");
+    await context.storage.execute("INSERT INTO blobs VALUES (?)", [
+      { encoding: "base64", data: "AAH/" },
+    ]);
+    expect((await context.storage.query("SELECT value FROM blobs")).rows).toEqual([
+      { value: { encoding: "base64", data: "AAH/" } },
+    ]);
+    await expect(
+      context.storage.execute("SELECT ?", [true as unknown as ActorSqlValue]),
+    ).rejects.toMatchObject({
+      code: "invalid_sql",
+    });
+    const invalid = await context.storage
+      .execute("SELECT ?", [true as unknown as ActorSqlValue])
+      .catch((error: Error) => error);
+    expect(Reflect.set(invalid, "name", "forged")).toBe(false);
+    expect(Reflect.set(invalid, "code", "forged")).toBe(false);
+    for (const value of [1e20, -1e20, Number.NaN, Number.POSITIVE_INFINITY]) {
+      await expect(
+        context.storage.execute("INSERT INTO counter VALUES (?)", [value]),
+      ).rejects.toMatchObject({ code: "numeric_out_of_range" });
+    }
+    await expect(
+      context.storage.execute("INSERT INTO counter VALUES (5) RETURNING 1e20 AS value"),
+    ).rejects.toMatchObject({ code: "numeric_out_of_range" });
+    expect((await context.storage.query("SELECT count(*) AS n FROM counter")).rows).toEqual([
+      { n: 2 },
+    ]);
+    await expect(
+      context.storage.transaction(Array.from({ length: 101 }, () => ({ sql: "SELECT 1" }))),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    await expect(
+      context.storage.query(
+        "WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<10001) SELECT v FROM n",
+      ),
+    ).rejects.toMatchObject({ code: "result_too_large" });
+    await expect(
+      context.storage.execute("INSERT INTO counter VALUES (3); INSERT INTO counter VALUES (4)"),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    await expect(
+      context.storage.execute("SELECT ?", [
+        { encoding: "base64", data: "AAH/", extra: 1 } as ActorSqlValue,
+      ]),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    expect(
+      (
+        await context.storage.execute(
+          "SELECT ?100 AS value",
+          Array.from({ length: 100 }, () => 1.5),
+        )
+      ).rows,
+    ).toEqual([{ value: 1.5 }]);
+    await expect(
+      context.storage.execute(
+        "SELECT ?",
+        Array.from({ length: 101 }, () => 0),
+      ),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    expect(
+      (await context.storage.transaction(Array.from({ length: 100 }, () => ({ sql: "SELECT 1" }))))
+        .results,
+    ).toHaveLength(100);
+    expect(
+      (
+        await context.storage.query(
+          "WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<10000) SELECT v FROM n",
+        )
+      ).rows,
+    ).toHaveLength(10000);
+    for (const sql of [
+      `SELECT 1 AS "${"é".repeat(65)}"`,
+      `SELECT ${Array.from({ length: 101 }, (_, index) => `1 AS c${index}`).join(",")}`,
+      "SELECT printf('%.*c', 1000001, 'x') AS value",
+    ])
+      await expect(context.storage.query(sql)).rejects.toMatchObject({ code: "result_too_large" });
+    await expect(context.storage.execute("SELECT ?", ["é".repeat(500001)])).rejects.toMatchObject({
+      code: "invalid_sql",
+    });
+    await expect(
+      context.storage.execute("SELECT ?", [{ encoding: "base64", data: "AB==" }]),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    await expect(
+      context.storage.execute(`SELECT 1 /*${"x".repeat(100000)}*/`),
+    ).rejects.toMatchObject({ code: "invalid_sql" });
+    const large =
+      "WITH RECURSIVE n(v) AS (VALUES(1) UNION ALL SELECT v+1 FROM n WHERE v<5) SELECT printf('%.*c', 1000000, 'x') AS value FROM n";
+    await expect(
+      context.storage.transaction([
+        { sql: "INSERT INTO counter VALUES (7)" },
+        { sql: large },
+        { sql: large },
+      ]),
+    ).rejects.toMatchObject({ code: "result_too_large" });
+    expect((await context.storage.query("SELECT count(*) AS n FROM counter")).rows).toEqual([
+      { n: 2 },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("adapter returns the original streaming Response without reading or buffering", async () => {
+  const db = new Database(":memory:");
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const response = new Response(
+    new ReadableStream<Uint8Array>({
+      start(value) {
+        controller = value;
+      },
+    }),
+  );
+  class Streaming {
+    fetch() {
+      return response;
+    }
+    alarm() {}
+    socketMessage() {}
+    socketClose() {}
+    socketError() {}
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { Streaming },
+      exportName: "Streaming",
+      id: "stream",
+      env: {},
+      storage: storage(db),
+    });
+    const returned = await actor.fetch(new Request("https://actor.test"));
+    expect(returned).toBe(response);
+    expect(returned.bodyUsed).toBe(false);
+    const reader = returned.body?.getReader();
+    controller.enqueue(new TextEncoder().encode("head"));
+    expect(new TextDecoder().decode((await reader?.read())?.value)).toBe("head");
+    controller.close();
+    expect((await reader?.read())?.done).toBe(true);
+  } finally {
+    db.close();
+  }
+});
