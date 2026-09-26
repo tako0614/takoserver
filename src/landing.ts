@@ -108,6 +108,15 @@ export function landingHtml(options: LandingOptions): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Takoserver</title>
 <meta name="description" content="${copy.description}">
+<meta property="og:title" content="Takoserver">
+<meta property="og:description" content="${copy.description}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Takoserver">
+<meta property="og:locale" content="${locale === "ja" ? "ja_JP" : "en_US"}">
+<meta property="og:url" content="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Takoserver">
+<meta name="twitter:description" content="${copy.description}">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 34 34'%3E%3Crect width='34' height='34' fill='%23b0301f'/%3E%3C/svg%3E">
 <style>
