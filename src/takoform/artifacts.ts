@@ -388,7 +388,7 @@ export function createTakoformArtifacts(
         if (replay) return replayArtifactResponse(replay);
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
-        if (upload.lifecycleState !== "open") return failure("artifact_invalid", 409);
+        if (upload.lifecycleState === "abandoned") return failure("artifact_invalid", 409);
         // The manifest is not parsed again here. The row exists only because a
         // strict parse already succeeded, and preserving its portable `path`
         // field is what keeps the content address equal to the caller's
@@ -432,6 +432,19 @@ export function createTakoformArtifacts(
               upload.manifestDigest,
             ])
           ).length === 1;
+        if (upload.lifecycleState === "committed") {
+          // A new idempotency key is still a valid re-commit of this upload.
+          // Keep it read-only: writing a new replay would extend the artifact's
+          // retention after the upload owner has intentionally released it.
+          if (
+            upload.rootState !== "active" ||
+            !(await holds(principal.tenantId, upload.manifestDigest, "manifest")) ||
+            !existed
+          ) {
+            return failure("artifact_missing", 404);
+          }
+          return Response.json({ manifestDigest: upload.manifestDigest }, { status: 200 });
+        }
         const result = {
           status: existed ? 200 : 201,
           body: { manifestDigest: upload.manifestDigest },

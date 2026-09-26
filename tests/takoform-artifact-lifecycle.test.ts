@@ -412,6 +412,48 @@ describe("Takoform artifact lifecycle", () => {
     expect((await target.call(`blobs/${digest}`, { method: "HEAD" })).status).toBe(200);
   });
 
+  test("a committed upload returns its digest on a second commit key", async () => {
+    const target = fixture();
+    const bytes = new TextEncoder().encode(
+      "export default { fetch() { return new Response('ok') } }",
+    );
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+
+    const { uploadId } = await startUpload(target, manifest, "recommit-start");
+    expect(
+      (
+        await target.call(`uploads/${uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    const commit = (key: string) =>
+      target.call(`uploads/${uploadId}/commit`, {
+        method: "POST",
+        headers: { "idempotency-key": key },
+      });
+    const first = await commit("recommit-first");
+    expect(first.status).toBe(201);
+    const firstBody = await first.json();
+
+    const second = await commit("recommit-second");
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(firstBody);
+    const replayed = await commit("recommit-second");
+    expect(replayed.status).toBe(200);
+    expect(await replayed.json()).toEqual(firstBody);
+    const foreign = await target.call(
+      `uploads/${uploadId}/commit`,
+      { method: "POST", headers: { "idempotency-key": "recommit-foreign" } },
+      SECOND_PRINCIPAL,
+    );
+    expect(foreign.status).toBe(404);
+    expect(await foreign.json()).toEqual({ error: { code: "artifact_missing" } });
+  });
+
   test("an upload abandoned while its body is arriving cannot publish bytes or a hold", async () => {
     const durable = createEphemeralSql();
     let uploadRead!: () => void;
