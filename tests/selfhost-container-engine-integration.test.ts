@@ -8,6 +8,28 @@ import type { JsonObject } from "../src/json.ts";
 import { createDockerHttpRevisionRuntime } from "../src/providers/docker-http-revision.ts";
 import { createSelfhostContainerRuntime } from "../src/providers/selfhost-container-runtime.ts";
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((accept) => {
+    resolve = accept;
+  });
+  return { promise, resolve };
+}
+
+async function within<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("operation exceeded test deadline")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 // Only the external daemon is a fixture. Both Takoserver runtime layers,
 // private durable storage, Unix-socket transport and application HTTP execute.
 // This is deliberately not evidence that a real Docker daemon started an image.
@@ -16,6 +38,9 @@ test("container service composes Docker transport, durable recovery and applicat
   const containers = new Map<string, JsonObject>();
   let created = 0;
   let candidateHealthy = false;
+  let holdNextCreate = false;
+  const candidateCreateEntered = deferred();
+  const releaseCandidateCreate = deferred();
   const encoded = gzipSync("compressed application response");
   const appA = Bun.serve({
     hostname: "127.0.0.1",
@@ -68,6 +93,11 @@ test("container service composes Docker transport, durable recovery and applicat
         const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as JsonObject;
         const name = url.searchParams.get("name");
         if (!name) throw new Error("missing native name");
+        if (holdNextCreate) {
+          holdNextCreate = false;
+          candidateCreateEntered.resolve();
+          await releaseCandidateCreate.promise;
+        }
         if (containers.has(name)) {
           reply(409);
           return;
@@ -178,7 +208,23 @@ test("container service composes Docker transport, durable recovery and applicat
       image: `registry.example/app@sha256:${"b".repeat(64)}`,
       port: appB.port as number,
     };
-    await runtime.reconcile(second);
+    holdNextCreate = true;
+    const updating = runtime.reconcile(second);
+    await candidateCreateEntered.promise;
+    // The candidate's native creation is still pending. Admission must remain
+    // bound to the old immutable revision while that external call is in flight.
+    let oldRoute: Response | undefined;
+    try {
+      oldRoute = await within(
+        runtime.fetch(identity, new Request("https://logical.example/")),
+        2_000,
+      );
+    } finally {
+      releaseCandidateCreate.resolve();
+    }
+    if (!oldRoute) throw new Error("old route did not return a response");
+    expect(await oldRoute.json()).toEqual({ version: "a", path: "/", body: "" });
+    await updating;
     expect(
       await (await runtime.fetch(identity, new Request("https://logical.example/"))).json(),
     ).toEqual({ version: "a", path: "/", body: "" });
