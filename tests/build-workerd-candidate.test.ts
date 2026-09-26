@@ -9,6 +9,7 @@ import {
   publishWorkflowLoaderCandidate,
   type WorkerdOverlay,
   workflowLoaderCandidateOverlays,
+  workflowLoaderCandidateResourceArguments,
 } from "../scripts/build-workerd.ts";
 
 const temporaryRoots: string[] = [];
@@ -20,6 +21,14 @@ afterEach(async () => {
 });
 
 describe("workerd WorkerLoader candidate build inputs", () => {
+  test("emits separate Bazel local-resource assignments", () => {
+    expect(workflowLoaderCandidateResourceArguments({ jobs: 2, memoryMiB: 8192 })).toEqual([
+      "--jobs=2",
+      "--local_resources=cpu=2",
+      "--local_resources=memory=8192",
+    ]);
+  });
+
   test("selects both patches in closed-graph then WorkerLoader candidate order", async () => {
     const overlays = workflowLoaderCandidateOverlays();
     const calls: string[] = [];
@@ -76,6 +85,12 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     await expect(
       createWorkflowLoaderCandidateProvenance({
         takoserverCommit: "1bf2118",
+        buildScriptSha256: "a".repeat(64),
+      }),
+    ).rejects.toThrow("full Takoserver commit hash");
+    await expect(
+      createWorkflowLoaderCandidateProvenance({
+        takoserverCommit: "1".repeat(41),
         buildScriptSha256: "a".repeat(64),
       }),
     ).rejects.toThrow("full Takoserver commit hash");

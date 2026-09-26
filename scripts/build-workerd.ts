@@ -216,10 +216,10 @@ async function main(): Promise<void> {
       "build",
       ...(candidateProvenance === null
         ? []
-        : [
-            `--jobs=${input.jobs ?? 2}`,
-            `--local_resources=cpu=${input.jobs ?? 2},memory=${input.memoryMiB ?? 8192}`,
-          ]),
+        : workflowLoaderCandidateResourceArguments({
+            jobs: input.jobs ?? 2,
+            memoryMiB: input.memoryMiB ?? 8192,
+          })),
       WORKERD_TARGET,
       `--repository_cache=${join(stateRoot, "repository-cache")}`,
       `--action_env=LD_LIBRARY_PATH=${libraryPath}`,
@@ -288,12 +288,23 @@ export function workflowLoaderCandidateOverlays(): readonly WorkerdOverlay[] {
   ];
 }
 
+export function workflowLoaderCandidateResourceArguments(input: {
+  readonly jobs: number;
+  readonly memoryMiB: number;
+}): readonly string[] {
+  return [
+    `--jobs=${input.jobs}`,
+    `--local_resources=cpu=${input.jobs}`,
+    `--local_resources=memory=${input.memoryMiB}`,
+  ];
+}
+
 export async function createWorkflowLoaderCandidateProvenance(input: {
   readonly takoserverCommit: string;
   readonly buildScriptSha256: string;
 }): Promise<WorkflowLoaderCandidateProvenance> {
   const takoserverCommit = input.takoserverCommit.trim();
-  if (!/^[a-f0-9]{40,64}$/u.test(takoserverCommit)) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(takoserverCommit)) {
     throw new Error("candidate provenance requires a full Takoserver commit hash");
   }
   if (!/^[a-f0-9]{64}$/u.test(input.buildScriptSha256)) {
