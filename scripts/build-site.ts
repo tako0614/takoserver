@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { landingHtml } from "../src/landing.ts";
 
@@ -35,6 +35,9 @@ const commonOptions = {
 };
 const html = landingHtml({ ...commonOptions, locale: "en" });
 await Bun.write(join(outDir, "index.html"), html);
+// The social card: rendered from the committed site/og.svg and carried as a
+// plain file because Pages serves the whole output directory.
+copyFileSync("site/og.png", join(outDir, "og.png"));
 for (const locale of ["ja", "en"] as const) {
   const localeDirectory = join(outDir, locale);
   mkdirSync(localeDirectory, { recursive: true });
