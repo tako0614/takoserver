@@ -128,6 +128,28 @@ export interface Operation {
   readonly createdAt: string;
 }
 
+/** The Host receipt has no inventory-only update timestamp. */
+export type ResourceReceipt = Omit<ResourceSummary, "metadata"> & {
+  readonly metadata: Omit<ResourceSummary["metadata"], "updatedAt">;
+};
+
+/** A stable Host operation handle, distinct from the control-plane history. */
+export type ResourceOperation = {
+  readonly apiVersion: string;
+  readonly kind: "Operation";
+  readonly id: string;
+} & (
+  | { readonly done: false }
+  | {
+      readonly done: true;
+      readonly result: { readonly resource: ResourceReceipt } | { readonly deleted: true };
+    }
+);
+
+export type ResourceMutationResult<Result> =
+  | { readonly state: "completed"; readonly result: Result }
+  | { readonly state: "accepted"; readonly operation: ResourceOperation };
+
 /**
  * The exact-pin lane this console speaks.
  *
@@ -175,12 +197,12 @@ export interface ApiOptions {
 }
 
 export function createApi(options: ApiOptions) {
-  const call = async <Result>(
+  const request = async <Result>(
     method: string,
     path: string,
     body?: unknown,
     extra: Record<string, string> = {},
-  ): Promise<Result> => {
+  ): Promise<{ readonly status: number; readonly payload: Result }> => {
     const token = options.token();
     let response: Response;
     try {
@@ -211,7 +233,21 @@ export function createApi(options: ApiOptions) {
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;
     }
-    return payload as Result;
+    return { status: response.status, payload: payload as Result };
+  };
+
+  const call = async <Result>(
+    method: string,
+    path: string,
+    body?: unknown,
+    extra: Record<string, string> = {},
+  ): Promise<Result> => (await request<Result>(method, path, body, extra)).payload;
+
+  const accepted = (payload: unknown, path: string): ResourceMutationResult<never> => {
+    if (!isRecord(payload) || !isOperation(payload.operation) || payload.operation.done !== false) {
+      throw new ApiError("invalid_response", 202, path);
+    }
+    return { state: "accepted", operation: payload.operation as ResourceOperation };
   };
 
   return {
@@ -310,7 +346,10 @@ export function createApi(options: ApiOptions) {
      * skipped the review would be one that could apply something other than
      * what it showed.
      */
-    async createResource(organizationId: string, declaration: ResourceDeclaration) {
+    async createResource(
+      organizationId: string,
+      declaration: ResourceDeclaration,
+    ): Promise<ResourceMutationResult<ResourceReceipt>> {
       const body = {
         apiVersion: declaration.form.apiVersion,
         kind: declaration.form.kind,
@@ -325,9 +364,10 @@ export function createApi(options: ApiOptions) {
         body,
         naming,
       );
-      return await call<ResourceSummary>(
+      const path = `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`;
+      const response = await request<unknown>(
         "PUT",
-        `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`,
+        path,
         { ...body, review: { prepareDigest: prepared.review.prepareDigest } },
         {
           ...naming,
@@ -335,29 +375,59 @@ export function createApi(options: ApiOptions) {
           "if-none-match": "*",
         },
       );
+      if (response.status === 202) return accepted(response.payload, path);
+      if ((response.status !== 200 && response.status !== 201) || !isResource(response.payload)) {
+        throw new ApiError("invalid_response", response.status, path);
+      }
+      return { state: "completed", result: response.payload };
     },
 
     /** Deletes a resource, fenced on the generation the console last read. */
-    deleteResource(
+    async deleteResource(
       organizationId: string,
       declaration: Omit<ResourceDeclaration, "spec">,
       generation: string,
-    ) {
+    ): Promise<ResourceMutationResult<void>> {
       const query = new URLSearchParams({
         space: declaration.space,
         definitionVersion: declaration.form.definitionVersion,
         schemaDigest: declaration.form.schemaDigest,
       });
-      return call<void>(
-        "DELETE",
-        `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`,
-        undefined,
-        {
-          "takoform-organization": organizationId,
-          "idempotency-key": `console-delete-${declaration.name}-${Date.now()}`,
-          "takoform-expected-generation": generation,
-        },
-      );
+      const path = `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`;
+      const response = await request<unknown>("DELETE", path, undefined, {
+        "takoform-organization": organizationId,
+        "idempotency-key": `console-delete-${declaration.name}-${Date.now()}`,
+        "takoform-expected-generation": generation,
+      });
+      if (response.status === 202) return accepted(response.payload, path);
+      if (response.status !== 204) throw new ApiError("invalid_response", response.status, path);
+      return { state: "completed", result: undefined };
+    },
+
+    /** Reads one accepted operation; never reissues the original mutation. */
+    async resourceOperation(organizationId: string, id: string): Promise<ResourceOperation> {
+      const path = `${LANE}/operations/${encodeURIComponent(id)}`;
+      const { payload, status } = await request<unknown>("GET", path, undefined, {
+        "takoform-organization": organizationId,
+      });
+      if (status !== 200 || !isOperation(payload) || payload.id !== id) {
+        throw new ApiError("invalid_response", status, path);
+      }
+      if (payload.done === false) return payload as ResourceOperation;
+      if (payload.done === true) {
+        if (isRecord(payload.error) && typeof payload.error.code === "string" && !payload.result) {
+          throw new ApiError(payload.error.code, status, path);
+        }
+        if (
+          !payload.error &&
+          isRecord(payload.result) &&
+          ((isResource(payload.result.resource) && payload.result.deleted === undefined) ||
+            (payload.result.deleted === true && payload.result.resource === undefined))
+        ) {
+          return payload as ResourceOperation;
+        }
+      }
+      throw new ApiError("invalid_response", status, path);
     },
 
     operations: (organizationId: string) =>
@@ -366,6 +436,32 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOperation(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    typeof value.apiVersion === "string" &&
+    value.kind === "Operation" &&
+    typeof value.id === "string" &&
+    value.id.length > 0
+  );
+}
+
+function isResource(value: unknown): value is ResourceReceipt {
+  if (!isRecord(value) || !isRecord(value.metadata)) return false;
+  const metadata = value.metadata;
+  return (
+    typeof value.apiVersion === "string" &&
+    typeof value.kind === "string" &&
+    ["space", "name", "uid", "generation", "revision"].every(
+      (key) => typeof metadata[key] === "string",
+    )
+  );
 }
 
 export type Api = ReturnType<typeof createApi>;

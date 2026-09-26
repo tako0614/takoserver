@@ -130,12 +130,18 @@ export function createResource(organizationId: string, offerings: readonly Offer
         return;
       }
       try {
-        const created = await api.createResource(organizationId, {
+        const outcome = await api.createResource(organizationId, {
           form: chosen().form,
           space: declaredSpace,
           name: declaredName,
           spec: parsed,
         });
+        if (outcome.state === "accepted") {
+          close();
+          navigate(`/resources?operation=${encodeURIComponent(outcome.operation.id)}`);
+          return;
+        }
+        const created = outcome.result;
         toast(
           tr(
             `${created.kind} ${created.metadata.name} を作成しました`,
@@ -186,11 +192,16 @@ export function deleteResource(
     ),
     onConfirm: async () => {
       try {
-        await api.deleteResource(
+        const outcome = await api.deleteResource(
           organizationId,
           { form: declaration.form, space: declaration.space, name: declaration.name },
           declaration.generation,
         );
+        if (outcome.state === "accepted") {
+          close();
+          navigate(`/resources?operation=${encodeURIComponent(outcome.operation.id)}`);
+          return;
+        }
         toast(tr(`${declaration.name}を削除しました`, `${declaration.name} deleted`), "ok");
         close();
         done();
