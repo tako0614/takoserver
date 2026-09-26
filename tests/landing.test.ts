@@ -42,6 +42,19 @@ describe("Takoserver public site", () => {
     expect(html).toContain("日本語");
   });
 
+  test("renders complete endpoint URLs in every locale", () => {
+    const apiOrigin = "https://api.takoserver.example";
+    const endpoints = ["/openapi.json", "/.well-known/takoserver", "/.well-known/takoform/v1"];
+
+    for (const locale of ["en", "ja"] as const) {
+      const html = landingHtml({ consoleOrigin: null, apiOrigin, locale });
+
+      for (const endpoint of endpoints) {
+        expect(html).toContain(`<code>${apiOrigin}${endpoint}</code>`);
+      }
+    }
+  });
+
   test("does not invent locale paths on the API-origin landing page", () => {
     const html = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(html).toContain("const localizedPaths=false");
