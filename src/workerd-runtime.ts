@@ -2143,7 +2143,14 @@ export async function writeWorkerdPrivateExecution(options: {
   readonly site: WorkerdSite;
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
-  readonly companionAddress: string;
+  readonly companionAddress?: string;
+  /** Internal Actor composition only; never a provider/admission option. */
+  readonly actor?: {
+    readonly namespaceKey: string;
+    readonly storagePath: string;
+    readonly ownerModule: string;
+    readonly className: string;
+  };
   readonly runSocketPath: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
   readonly dataPlaneAddress?: string;
@@ -2187,7 +2194,17 @@ export async function writeWorkerdPrivateExecution(options: {
     }
     servicePaths.add(mapping.socketPath);
   }
-  const companion = validDataPlaneAddress(options.companionAddress);
+  const actor = options.actor;
+  if (
+    actor &&
+    (!/^[a-f0-9]{64}$/u.test(actor.namespaceKey) ||
+      !isAbsolute(actor.storagePath) ||
+      actor.storagePath.includes("\u0000") ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(actor.className))
+  ) {
+    throw new Error("unusable private Actor execution declaration");
+  }
+  const companion = actor ? undefined : validDataPlaneAddress(options.companionAddress ?? "");
   const planeAddress = site.dataPlane
     ? validDataPlaneAddress(options.dataPlaneAddress ?? "")
     : undefined;
@@ -2216,7 +2233,7 @@ export async function writeWorkerdPrivateExecution(options: {
   ) {
     throw new Error("private execution internal binding collision");
   }
-  bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
+  if (companion) bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
   const serviceExternals = serviceMappings
     .map((mapping, index) => {
       const name = `service-${index}`;
@@ -2243,6 +2260,20 @@ export async function writeWorkerdPrivateExecution(options: {
   )),
   (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
   }
+  let actorServices = "";
+  if (actor) {
+    requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
+    actorServices = `
+  (name = "actor-owner", worker = (
+    modules = [${renderWorkerdModules({ ...prepared.manifest, hostEntrypoint: actor.ownerModule }, ".")}],
+    modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
+    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"], globalOutbound = "deny",
+    bindings = [(name = "NAMESPACE", durableObjectNamespace = "ActorOwner"), (name = "CLASS", durableObjectClass = (name = "application", entrypoint = ${capnpText(actor.className)}))],
+    durableObjectNamespaces = [(className = "ActorOwner", uniqueKey = ${capnpText(actor.namespaceKey)}, enableSql = true)],
+    durableObjectStorage = (localDisk = "actor-storage")
+  )),
+  (name = "actor-storage", disk = (path = ${capnpText(actor.storagePath)}, writable = true)),`;
+  }
   const config = `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
  services = [
@@ -2251,13 +2282,13 @@ const config :Workerd.Config = (
     bindings = [${bindings.join(", ")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01",
-    compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
+    compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}${serviceExternals}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorServices}
   (name = "deny", network = (allow = []))
  ],
- sockets = [(name = "workflow", address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = "application")]
+ sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})]
 );`;
   await writePreparedWorkerdSite(root, prepared);
   const configPath = join(root, "workerd.capnp");
