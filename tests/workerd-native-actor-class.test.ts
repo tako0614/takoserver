@@ -60,7 +60,7 @@ test.skipIf(binary === undefined)(
         `import * as namespace from "./witness.mjs";
 import { createNativeActorExecution } from "./adapter.mjs";
 export class ActorChild {
- constructor(state, env) { this.actor = createNativeActorExecution({ namespace, exportName: "Witness", id: state.id.toString(), env: { VERSION: env.VERSION, CONTROL: env.CONTROL }, storage: state.storage }); }
+ constructor(state, env) { this.actor = createNativeActorExecution({ namespace, exportName: "Witness", id: state.id.toString(), env: { VERSION: env.VERSION, CONTROL: env.CONTROL }, storage: state.storage, alarm: { async set() { throw new Error("no owner"); }, async get() { throw new Error("no owner"); }, async clear() { throw new Error("no owner"); } } }); }
  fetch(request) { return this.actor.fetch(request); }
 }
 export default { fetch() { return new Response("not a public entrypoint", {status:404}); } };`,

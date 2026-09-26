@@ -93,8 +93,72 @@ test.skipIf(binary === undefined)(
     const runtime = createWorkerdRuntime({ root: runtimeRoot, isReady: () => true });
     const source = await readFile(join(import.meta.dir, "fixtures/actor-host/counter.mjs"), "utf8");
     const main = `import { Counter as Base } from './counter.mjs';
+// Hostile application top-level runs before every handler. If the Host uses
+// mutable request/header globals for its private alarm port, redirect A to B
+// and observe the capability bearer. The real Host must capture first.
+const NativeHeaders = globalThis.Headers;
+const NativeRequest = globalThis.Request;
+const nativeGet = NativeHeaders.prototype.get;
+const nativeSet = NativeHeaders.prototype.set;
+NativeHeaders.prototype.get = function(name) {
+  const value = nativeGet.call(this, name);
+  if (name === 'x-takoserver-private-actor-token' && /^[a-f0-9]{64}$/.test(value ?? '')) globalThis.__alarmTokenObserved = true;
+  return value;
+};
+NativeHeaders.prototype.set = function(name, value) {
+  return nativeSet.call(this, name, name === 'x-takoserver-private-actor-id' ? encodeURIComponent('b') : value);
+};
+globalThis.Headers = class extends NativeHeaders {
+  constructor(init) {
+    super(init);
+    const token = nativeGet.call(this, 'x-takoserver-private-actor-token');
+    if (token && /^[a-f0-9]{64}$/.test(token)) {
+      globalThis.__alarmTokenObserved = true;
+      nativeSet.call(this, 'x-takoserver-private-actor-id', encodeURIComponent('b'));
+    }
+  }
+};
+globalThis.Request = class extends NativeRequest {
+  constructor(input, init) {
+    const token = init?.headers && nativeGet.call(init.headers, 'x-takoserver-private-actor-token');
+    if (token && /^[a-f0-9]{64}$/.test(token)) {
+      globalThis.__alarmTokenObserved = true;
+      nativeSet.call(init.headers, 'x-takoserver-private-actor-id', encodeURIComponent('b'));
+    }
+    super(input, init);
+  }
+};
 export class Counter extends Base {
  async fetch(request) {
+   const url = new URL(request.url);
+   if (url.pathname === '/alarm-set') {
+     await this.context.alarm.set(Date.now() + Number(url.searchParams.get('delay') ?? '50'));
+     return Response.json({ pending: await this.context.alarm.get() });
+   }
+   if (url.pathname === '/alarm-invalid') {
+     const failures = [];
+     for (const at of [NaN, 1e20, -1, 1.5]) {
+       try { await this.context.alarm.set(at); failures.push('accepted'); }
+       catch (error) { failures.push(error.name); }
+     }
+     return Response.json({ failures, pending:await this.context.alarm.get() });
+   }
+   if (url.pathname === '/alarm-private') {
+     const schema = await this.context.storage.query("SELECT name FROM sqlite_schema WHERE name = 'actor_alarm_state'");
+     let builtin = 'blocked';
+     try { await import('cloudflare:workers'); builtin = 'allowed'; } catch {}
+     let hostModule = 'blocked';
+     try { await import('./__actor_entry.js'); hostModule = 'allowed'; } catch {}
+     return Response.json({ visible:schema.rows.length, builtin, hostModule, tokenObserved:globalThis.__alarmTokenObserved === true });
+   }
+   if (url.pathname === '/alarm-status') {
+     const runs = await this.context.storage.query("SELECT count(*) AS n FROM alarm_runs").catch(() => ({ rows:[{ n:0 }] }));
+     return Response.json({ runs:runs.rows[0].n, pending:await this.context.alarm.get() });
+   }
+   if (url.pathname === '/alarm-clear') {
+     await this.context.alarm.clear();
+     return Response.json({ pending:await this.context.alarm.get() });
+   }
    if (new URL(request.url).pathname === '/stream') {
      return new Response(new ReadableStream({ start(controller) {
        controller.enqueue(new TextEncoder().encode('head'));
@@ -105,6 +169,16 @@ export class Counter extends Base {
    if (new URL(request.url).pathname === '/echo') return Response.json({ body:await request.text(), privateHeaders:[...request.headers.keys()].filter(key=>key.startsWith('x-takoserver-private-actor-')) });
    if (new URL(request.url).pathname === '/redirect') return new Response(null, { status:302, headers:{ Location:'/value' } });
    return super.fetch(request);
+ }
+ async alarm() {
+   await this.context.storage.execute("CREATE TABLE IF NOT EXISTS alarm_runs (n INTEGER)");
+   await this.context.storage.execute("INSERT INTO alarm_runs VALUES (1)");
+   const runs = await this.context.storage.query("SELECT count(*) AS n FROM alarm_runs");
+   if (runs.rows[0].n === 1) {
+     if (this.context.id.endsWith('b')) await this.context.alarm.clear();
+     else await this.context.alarm.set(Date.now() + 10000);
+     throw new Error('retry first alarm without consuming successor');
+   }
  }
 }`;
     const publication = (generation: string): WorkerdDeploymentPublication => ({
@@ -214,6 +288,57 @@ export class Counter extends Base {
       expect(redirect.headers.get("location")).toBe("/value");
       await redirect.body?.cancel();
       expect((await (await owner.fetch({ ...identity, id: "b" }, request())).json()).value).toBe(0);
+      expect(await (await owner.fetch(identity, request("/alarm-invalid"))).json()).toEqual({
+        failures: ["TypeError", "TypeError", "TypeError", "TypeError"],
+        pending: null,
+      });
+      expect(await (await owner.fetch(identity, request("/alarm-private"))).json()).toEqual({
+        visible: 0,
+        builtin: "blocked",
+        hostModule: "blocked",
+        tokenObserved: false,
+      });
+      const alarmSet = (await (await owner.fetch(identity, request("/alarm-set"))).json()) as {
+        pending: number;
+      };
+      expect(Number.isSafeInteger(alarmSet.pending)).toBe(true);
+      expect(
+        (await (await owner.fetch({ ...identity, id: "b" }, request("/alarm-status"))).json())
+          .pending,
+      ).toBeNull();
+      expect(
+        (await (await owner.fetch(identity, request("/alarm-private"))).json()).tokenObserved,
+      ).toBe(false);
+      let alarmStatus: { runs: number; pending: number | null } = { runs: 0, pending: null };
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        alarmStatus = (await (
+          await owner.fetch(identity, request("/alarm-status"))
+        ).json()) as typeof alarmStatus;
+        if (alarmStatus.runs >= 2) break;
+        await Bun.sleep(50);
+      }
+      expect(alarmStatus.runs).toBe(2);
+      expect(alarmStatus.pending).toBeGreaterThan(Date.now());
+      expect(await (await owner.fetch(identity, request("/alarm-clear"))).json()).toEqual({
+        pending: null,
+      });
+      expect(
+        (await (await owner.fetch({ ...identity, id: "b" }, request("/alarm-status"))).json()).runs,
+      ).toBe(0);
+      await (await owner.fetch({ ...identity, id: "b" }, request("/alarm-set"))).json();
+      let clearedRuns = 0;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        const status = (await (
+          await owner.fetch({ ...identity, id: "b" }, request("/alarm-status"))
+        ).json()) as { runs: number; pending: number | null };
+        clearedRuns = status.runs;
+        if (clearedRuns >= 2) {
+          expect(status.pending).toBeNull();
+          break;
+        }
+        await Bun.sleep(50);
+      }
+      expect(clearedRuns).toBe(2);
       const stream = await owner.fetch(identity, request("/stream"));
       const reader = stream.body?.getReader();
       expect(reader).toBeDefined();
@@ -248,6 +373,23 @@ export class Counter extends Base {
       await owner.close();
       owner = makeOwner();
       expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
+      const pendingBeforeRestart = (await (
+        await owner.fetch(identity, request("/alarm-set?delay=3000"))
+      ).json()) as { pending: number };
+      await owner.close();
+      owner = makeOwner();
+      expect((await (await owner.fetch(identity, request("/alarm-status"))).json()).pending).toBe(
+        pendingBeforeRestart.pending,
+      );
+      let restoredRuns = 0;
+      for (let attempt = 0; attempt < 160; attempt += 1) {
+        restoredRuns = (
+          (await (await owner.fetch(identity, request("/alarm-status"))).json()) as { runs: number }
+        ).runs;
+        if (restoredRuns >= 3) break;
+        await Bun.sleep(50);
+      }
+      expect(restoredRuns).toBe(3);
       const idleConfig = await crashChild();
       expect((await (await owner.fetch(identity, request("/increment"))).json()).value).toBe(3);
       expect(await stat(dirname(idleConfig)).catch(() => null)).toBeNull();

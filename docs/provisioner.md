@@ -545,6 +545,22 @@ code-update socket continuity, storage-format upgrades or machine power-loss
 recovery. Actor/Workflow support remains unavailable until the relevant exact
 contracts and provider execution are implemented and verified.
 
+The unadmitted self-host Actor execution path also has a development-only
+alarm slice. Its native per-ID owner stores a pending time separately from an
+unsettled delivery, uses a native Durable Object alarm as a wake/watchdog, and
+dispatches the class alarm handler under the same owner queue as HTTP bodies.
+The child receives only `set/get/clear`; owner alarm metadata is outside its
+private application SQL. A failed handler retains its obligation and any
+successor time, with an explicit retry wake rather than dependence on the
+native six-retry limit. The opt-in candidate-binary test checks set/clear,
+failed-delivery successor settlement, ID isolation, and pending-time recovery
+after an owner process is reopened. It does **not** prove autonomous cold
+delivery while the self-host runtime is stopped: the execution process is
+opened on demand, so a pending alarm cannot wake an absent process. Weighted
+Version reselection for alarms, namespace deletion/retention, producer-tail
+retirement, sockets and managed WfP execution also remain unqualified. This
+slice does not enable Actor admission or change a published contract.
+
 Two additional opt-in fixtures investigate code handoff, separately from that
 capability check:
 

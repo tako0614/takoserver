@@ -24,12 +24,16 @@ function storage(database: Database): NativeActorStorage {
   };
 }
 
-test("native class adapter initializes once and exposes only SQL and unavailable facades", async () => {
+test("native class adapter initializes once and exposes SQL and a host-owned alarm facade", async () => {
   const db = new Database(":memory:");
   const events: string[] = [];
   let context!: {
     storage: NativeActorSqlFacade;
-    alarm: { set(at: number): Promise<void> };
+    alarm: {
+      set(at: number): Promise<void>;
+      get(): Promise<number | null>;
+      clear(): Promise<void>;
+    };
     sockets: { list(): Promise<unknown> };
   };
   class Counter {
@@ -48,7 +52,10 @@ test("native class adapter initializes once and exposes only SQL and unavailable
       await context.storage.execute("INSERT INTO counter VALUES (?)", [1]);
       return Response.json(await context.storage.query("SELECT count(*) AS n FROM counter"));
     }
-    alarm() {}
+    async alarm() {
+      events.push("alarm");
+      await context.alarm.set(200);
+    }
     socketMessage() {}
     socketClose() {}
     socketError() {}
@@ -60,6 +67,17 @@ test("native class adapter initializes once and exposes only SQL and unavailable
       id: "one",
       env: {},
       storage: storage(db),
+      alarm: {
+        async set(at) {
+          events.push(`set:${at}`);
+        },
+        async get() {
+          return 200;
+        },
+        async clear() {
+          events.push("clear");
+        },
+      },
     });
     expect(events).toEqual([]);
     expect((await (await actor.fetch(new Request("https://actor.test"))).json()).rows).toEqual([
@@ -72,7 +90,11 @@ test("native class adapter initializes once and exposes only SQL and unavailable
     expect(Object.keys(context).sort()).toEqual(["alarm", "id", "sockets", "storage"]);
     expect(Object.keys(context.storage).sort()).toEqual(["execute", "query", "transaction"]);
     expect(Object.isFrozen(context.storage)).toBe(true);
-    await expect(context.alarm.set(1)).rejects.toMatchObject({ code: "backend_unavailable" });
+    await context.alarm.set(100);
+    expect(await context.alarm.get()).toBe(200);
+    await actor.alarm(new AbortController().signal);
+    await context.alarm.clear();
+    expect(events.slice(-4)).toEqual(["set:100", "alarm", "set:200", "clear"]);
     await expect(context.sockets.list()).rejects.toMatchObject({ code: "backend_unavailable" });
     await context.storage.query("INSERT INTO counter VALUES (999)");
     expect((await context.storage.query("SELECT count(*) AS n FROM counter")).rows).toEqual([
@@ -226,6 +248,13 @@ test("adapter returns the original streaming Response without reading or bufferi
       id: "stream",
       env: {},
       storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
     });
     const returned = await actor.fetch(new Request("https://actor.test"));
     expect(returned).toBe(response);

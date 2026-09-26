@@ -47,6 +47,13 @@ export interface NativeActorSqlFacade {
   ): Promise<{ readonly results: readonly ActorSqlResult[] }>;
 }
 
+/** Host-private owner port. The application sees only the closed facade below. */
+export interface NativeActorAlarmPort {
+  set(atMillis: number): Promise<void>;
+  get(): Promise<number | null>;
+  clear(): Promise<void>;
+}
+
 type SqlCode =
   | "invalid_sql"
   | "constraint_violation"
@@ -334,10 +341,36 @@ export function createNativeActorExecution(options: {
   readonly id: string;
   readonly env: Readonly<Record<string, unknown>>;
   readonly storage: NativeActorStorage;
-}): { fetch(request: Request): Promise<Response> } {
+  readonly alarm: NativeActorAlarmPort;
+}): { fetch(request: Request): Promise<Response>; alarm(signal: AbortSignal): Promise<void> } {
   const unavailable = async (): Promise<never> => {
     throw new ActorRuntimeError("backend_unavailable");
   };
+  const alarm = Object.freeze({
+    async set(atMillis: number): Promise<void> {
+      if (!Number.isSafeInteger(atMillis) || atMillis < 0)
+        throw new TypeError("Actor alarm time must be a nonnegative safe integer");
+      try {
+        await options.alarm.set(atMillis);
+      } catch {
+        throw new ActorRuntimeError("backend_unavailable");
+      }
+    },
+    async get(): Promise<number | null> {
+      try {
+        return await options.alarm.get();
+      } catch {
+        throw new ActorRuntimeError("backend_unavailable");
+      }
+    },
+    async clear(): Promise<void> {
+      try {
+        await options.alarm.clear();
+      } catch {
+        throw new ActorRuntimeError("backend_unavailable");
+      }
+    },
+  });
   const execution = createActorClassExecution({
     namespace: options.namespace,
     exportName: options.exportName,
@@ -345,7 +378,7 @@ export function createNativeActorExecution(options: {
     context: createActorContext({
       id: options.id,
       storage: createSqlFacade(options.storage) as unknown as Readonly<Record<string, unknown>>,
-      alarm: Object.freeze({ set: unavailable, get: unavailable, clear: unavailable }),
+      alarm,
       sockets: Object.freeze({ accept: unavailable, get: unavailable, list: unavailable }),
     }),
   });
@@ -359,6 +392,9 @@ export function createNativeActorExecution(options: {
       // Preserve the real Response and its streaming body. The owner, not this
       // adapter, retains the admission reservation through the chosen lifetime.
       return response;
+    },
+    async alarm(signal: AbortSignal): Promise<void> {
+      await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));
     },
   });
 }

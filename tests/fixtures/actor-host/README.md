@@ -47,8 +47,10 @@ single-context ownership, in-flight process-death recovery, streaming admission
 lifetime, asynchronous constructor confinement, deployment/weighted-Version
 selection, or safe production handoff. The adapter itself deliberately owns none
 of those mechanisms and must not be admitted before its execution owner supplies
-them. Alarm and socket methods reject as unavailable; no alarm/socket delivery or
-WfP support is claimed. No tenant source executes in the controller process.
+them. This direct fixture does not wire an alarm owner, so it is not
+alarm-delivery evidence. The actual self-host owner alarm path is exercised in
+`tests/selfhost-actor-execution-host.test.ts`; socket and WfP support remain
+unavailable. No tenant source executes in the controller process.
 
 Regression sensitivity was checked by temporarily moving the query rollback
 outside the native transaction: the native test exposed the surviving

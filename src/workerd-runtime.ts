@@ -2263,12 +2263,21 @@ export async function writeWorkerdPrivateExecution(options: {
   let actorServices = "";
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
+    if (
+      prepared.manifest.vars?.some((binding) => binding.name === "__TAKOSERVER_ACTOR_ALARM_OWNER")
+    )
+      throw new Error("private Actor alarm binding collision");
+    const actorBindings = [
+      '(name = "NAMESPACE", durableObjectNamespace = "ActorOwner")',
+      `(name = "CLASS", durableObjectClass = (name = "application", entrypoint = ${capnpText(actor.className)}))`,
+      ...bindings,
+    ];
     actorServices = `
   (name = "actor-owner", worker = (
     modules = [${renderWorkerdModules({ ...prepared.manifest, hostEntrypoint: actor.ownerModule }, ".")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"], globalOutbound = "deny",
-    bindings = [(name = "NAMESPACE", durableObjectNamespace = "ActorOwner"), (name = "CLASS", durableObjectClass = (name = "application", entrypoint = ${capnpText(actor.className)}))],
+    bindings = [${actorBindings.join(", ")}],
     durableObjectNamespaces = [(className = "ActorOwner", uniqueKey = ${capnpText(actor.namespaceKey)}, enableSql = true)],
     durableObjectStorage = (localDisk = "actor-storage")
   )),
@@ -2279,7 +2288,7 @@ const config :Workerd.Config = (
  services = [
   (name = "application", worker = (
     modules = [${renderWorkerdModules(prepared.manifest, ".")}],
-    bindings = [${bindings.join(", ")}],
+    bindings = [${[...bindings, ...(actor ? ['(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")'] : [])].join(", ")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01",
     compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],

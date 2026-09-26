@@ -69,27 +69,47 @@ export async function openWorkerdActorNamespace(
   const owner = allocate("__actor_owner");
   const helper = allocate("__actor_bootstrap");
   const token = randomBytes(32).toString("hex");
+  const alarmToken = randomBytes(32).toString("hex");
+  const deliveryToken = randomBytes(32).toString("hex");
   const literal = JSON.stringify;
   const encoder = new TextEncoder();
   hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
   hostModules.set(
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${helper}`)};
-export const ActorOwner = createActorNativeOwner();
-export default createActorNativeIngress(${literal(token)});`),
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)});
+export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});`),
   );
   // Application loading happens only in the native child. The raw native env
   // and storage never enter the constructor: the existing Host wrapper
   // projects declared bindings, then the adapter builds a closed context.
   hostModules.set(
     entry,
-    encoder.encode(`import { createNativeActorExecution } from ${literal(`./${helper}`)};
-import { ${SELFHOST_WORKER_PROJECT_ENV_EXPORT} as projectEnv } from ${literal(`./${wrapper}`)};
+    encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort } from ${literal(`./${helper}`)};
+const SafeHeaders = Headers;
+const SafeRequest = Request;
+const SafeResponse = Response;
+const SafeApply = Reflect.apply;
+const SafeHeadersGet = Headers.prototype.get;
+const SafeHeadersDelete = Headers.prototype.delete;
+const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers").get;
+const SafeRequestSignal = Object.getOwnPropertyDescriptor(Request.prototype, "signal").get;
 export class ActorChild {
   constructor(state, env) {
-    this.execution = import(${literal(`./${site.mainModule}`)}).then(namespace => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id: state.id.toString(), env: projectEnv(env), storage: state.storage }));
+    const id = state.id.toString();
+    const alarm = createActorNativeAlarmPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id);
+    this.execution = Promise.all([import(${literal(`./${wrapper}`)}), import(${literal(`./${site.mainModule}`)})]).then(([wrapper, namespace]) => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id, env: wrapper.${SELFHOST_WORKER_PROJECT_ENV_EXPORT}(env), storage: state.storage, alarm }));
   }
-  async fetch(request) { return (await this.execution).fetch(request); }
+  async fetch(request) {
+    const incoming = SafeApply(SafeRequestHeaders, request, []);
+    if (SafeApply(SafeHeadersGet, incoming, ["x-takoserver-private-actor-delivery"]) === ${literal(deliveryToken)}) {
+      await (await this.execution).alarm(SafeApply(SafeRequestSignal, request, []));
+      return new SafeResponse(null, { status: 204 });
+    }
+    const headers = new SafeHeaders(incoming);
+    SafeApply(SafeHeadersDelete, headers, ["x-takoserver-private-actor-delivery"]);
+    return (await this.execution).fetch(new SafeRequest(request, { headers }));
+  }
 }
 export default { fetch() { return new Response(null, { status: 404 }); } };`),
   );
