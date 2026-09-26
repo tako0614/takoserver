@@ -1079,10 +1079,37 @@ function xmlEscape(value: string): string {
 }
 
 async function boundedText(response: Response): Promise<string> {
-  const value = await response.text();
-  if (new TextEncoder().encode(value).byteLength > 2 * 1024 * 1024)
-    edgeError("backend_unavailable");
-  return value;
+  if (!response.body) return "";
+  const maximum = 2 * 1024 * 1024;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch {
+        edgeError("backend_unavailable");
+      }
+      if (result.done) break;
+      if (!(result.value instanceof Uint8Array) || result.value.byteLength > maximum - size) {
+        void reader.cancel("private S3 response exceeded its byte bound").catch(() => undefined);
+        edgeError("backend_unavailable");
+      }
+      chunks.push(result.value);
+      size += result.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function requireStatus(response: Response, expected: readonly number[]): void {

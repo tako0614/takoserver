@@ -831,7 +831,7 @@ describe("current ObjectBucket Form on the ordinary-workers backend", () => {
     });
     expect(ticket).toMatchObject({
       phase: "failed",
-      failure: { code: "conflict", retryable: false },
+      failure: { code: "occupied", retryable: false },
     });
     if (ticket.phase !== "failed") throw new Error("expected failure");
     expect(ticket.failure.message).toContain("empty it and destroy again");

@@ -1241,7 +1241,7 @@ export class CloudflareProvider implements Provider {
         (await this.#r2BucketPresent(native.name)) === true
       ) {
         return failed(
-          "conflict",
+          "occupied",
           "the bucket was refused and is still present; R2 does not destroy a bucket that " +
             "still holds objects or unfinished multipart uploads, so empty it and destroy again",
         );

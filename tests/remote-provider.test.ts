@@ -253,6 +253,7 @@ describe("failures as the caller sees them", () => {
     const { failureToWire } = await import("../src/provider-driver.ts");
     expect(failureToWire("invalid_spec")).toEqual(["invalid_argument", 400]);
     expect(failureToWire("conflict")).toEqual(["resource_busy", 409]);
+    expect(failureToWire("occupied")).toEqual(["dependency_in_use", 409]);
     expect(failureToWire("not_found")).toEqual(["resource_not_found", 404]);
   });
 });
