@@ -23,6 +23,7 @@ import {
   type SelfhostWeightedVersion,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import { TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES } from "./takoform/limits.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 
 /**
@@ -1752,7 +1753,7 @@ const SAFE_ASSET_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9
 const ASSET_MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const MAX_ASSET_MEDIA_TYPE_LENGTH = 255;
 const MAX_ASSET_ENTRIES = 16_384;
-const MAX_ASSET_BYTES = 10_485_760;
+const MAX_ASSET_BYTES = TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
 function validAssetPath(value: string): boolean {

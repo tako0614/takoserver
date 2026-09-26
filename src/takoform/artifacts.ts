@@ -6,6 +6,7 @@ import { admitArtifactBlobWrite, commitArtifactBlobWrite } from "./artifact-blob
 import {
   MAXIMUM_REQUEST_BODY_BYTES,
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
 } from "./limits.ts";
@@ -691,7 +692,12 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
   }
   exactKeys(input, ["apiVersion", "kind", "files"]);
   const files = fileDeclarations(input.files, TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES);
-  requireMaximumBundleBytes(files);
+  requireMaximumBundleBytes(
+    files,
+    kind === "StaticAssetBundle"
+      ? TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES
+      : TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+  );
   return {
     apiVersion: input.apiVersion,
     kind,
@@ -699,11 +705,14 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
   };
 }
 
-function requireMaximumBundleBytes(declarations: readonly { readonly size: number }[]): void {
+function requireMaximumBundleBytes(
+  declarations: readonly { readonly size: number }[],
+  maximumBytes: number,
+): void {
   let total = 0;
   for (const declaration of declarations) {
     total += declaration.size;
-    if (!Number.isSafeInteger(total) || total > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) {
+    if (!Number.isSafeInteger(total) || total > maximumBytes) {
       throw new ArtifactInputError();
     }
   }

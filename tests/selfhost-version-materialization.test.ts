@@ -77,6 +77,7 @@ async function materializerFixture(source?: string) {
 async function assetMaterializerFixture(
   paths: readonly string[],
   mediaTypes: Readonly<Record<string, string>> = {},
+  assetBytes?: Uint8Array,
 ) {
   const workerBytes = new TextEncoder().encode("export default { fetch() {} }");
   const workerDigest = await bytesDigest(workerBytes);
@@ -97,7 +98,7 @@ async function assetMaterializerFixture(
   const blobs = new Map<string, Uint8Array>([[workerDigest, workerBytes]]);
   const files = await Promise.all(
     paths.map(async (path) => {
-      const bytes = new TextEncoder().encode(`asset:${path}`);
+      const bytes = assetBytes ?? new TextEncoder().encode(`asset:${path}`);
       const digest = await bytesDigest(bytes);
       blobs.set(digest, bytes);
       return {
@@ -138,6 +139,51 @@ async function assetMaterializerFixture(
 }
 
 describe("self-host Worker Version materialization", () => {
+  test("materializes and reads back an asset above 10 MiB, but refuses one above 20 MiB", async () => {
+    const accepted = await assetMaterializerFixture(["index.html"], {}, new Uint8Array(10_485_761));
+    const acceptedInput = {
+      ...accepted.input,
+      assets: {
+        manifestDigest: accepted.assetManifestDigest,
+        notFoundHandling: "none" as const,
+        runWorkerFirst: false,
+      },
+    };
+    await accepted.materializer.materialize(acceptedInput);
+    const restarted = createSelfhostVersionMaterializer({
+      root,
+      artifacts: {
+        async manifest() {
+          throw new Error("readback must not consult artifact storage");
+        },
+        async blob() {
+          throw new Error("readback must not consult artifact storage");
+        },
+      },
+    });
+    const snapshot = await restarted.readSnapshot(accepted.input);
+    expect(snapshot.state).toBe("present");
+    if (snapshot.state !== "present") throw new Error("asset snapshot was not retained");
+    expect(snapshot.prepared.assets?.get("index.html")?.byteLength).toBe(10_485_761);
+
+    const oversized = await assetMaterializerFixture(
+      ["index.html"],
+      {},
+      new Uint8Array(20_971_521),
+    );
+    await expect(
+      oversized.materializer.prepare({
+        ...oversized.input,
+        versionId: "oversized",
+        assets: {
+          manifestDigest: oversized.assetManifestDigest,
+          notFoundHandling: "none",
+          runWorkerFirst: false,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec" });
+  });
+
   test.each(["mainModule", "module declaration"] as const)(
     "rejects dot-prefixed WorkerBundle %s paths before materialization",
     async (invalidPath) => {

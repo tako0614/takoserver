@@ -635,6 +635,43 @@ test("persists private asset routing order through reload and restart", async ()
   expect(await restarted.has("site", "gen-assets")).toBe(true);
 });
 
+test("keeps assets above 10 MiB across restart and rejects assets above 20 MiB", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  const site = {
+    directory: "large-assets",
+    mainModule: "index.js",
+    hostnames: ["large-assets.localhost"],
+    generation: "large-assets-v1",
+    assets: {
+      notFoundHandling: "none" as const,
+      runWorkerFirst: false,
+      mediaTypes: { "index.html": "text/html" },
+    },
+  };
+  await runtime.write(
+    "large-assets",
+    site,
+    MODULES,
+    new Map([["index.html", new Uint8Array(10_485_761)]]),
+  );
+  const restarted = createWorkerdRuntime({ root, isReady: () => true });
+  expect(await restarted.restore()).toEqual(["large-assets"]);
+  expect(await restarted.has("large-assets", "large-assets-v1")).toBe(true);
+  expect((await readFile(join(root, "assets", "large-assets", "asset-00000"))).byteLength).toBe(
+    10_485_761,
+  );
+
+  await expect(
+    restarted.write(
+      "large-assets",
+      { ...site, generation: "large-assets-v2" },
+      MODULES,
+      new Map([["index.html", new Uint8Array(20_971_521)]]),
+    ),
+  ).rejects.toThrow("unusable worker asset declaration");
+  expect(await restarted.has("large-assets", "large-assets-v1")).toBe(true);
+});
+
 test("materializes underscore-prefixed and internal-dot asset paths in flat storage", async () => {
   const runtime = createWorkerdRuntime({ root, isReady: () => true });
   const paths = ["_env", "dir/_x", "_well-known/nodeinfo.v1.json", "a/_hidden/main.js"] as const;

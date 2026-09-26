@@ -429,6 +429,13 @@ asset upload and provider-only attachment/readback path for asset-bearing
 WorkerVersions in source. Hosted/native qualification remains open: an exact
 WfP install must still prove attachment and serving before this capability is
 advertised as live-qualified.
+This Host advertises a 20 MiB aggregate `maximumBundleBytes` for
+`StaticAssetBundle`; its `WorkerBundle` and migration bundle ceilings remain
+10 MiB. The asset limit is Host implementation policy, not a change to the
+published Form or artifact transport. It also bounds self-host materialization
+and workerd readback. The public Cloudflare adapter sends the same committed
+files to Workers Static Assets; the Host's 20 MiB aggregate bound keeps each
+file below Cloudflare's [25 MiB per-file limit](https://developers.cloudflare.com/workers/platform/limits/).
 `WorkerCustomDomain` is in the implementation catalog with its declared
 `create`, `read`, `delete`, `import`, and `observe` operations. Its provider
 handler requires an exact tenant/hostname zone grant; integration qualification

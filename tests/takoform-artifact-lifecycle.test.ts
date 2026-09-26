@@ -13,6 +13,8 @@ import {
   type TakoformArtifactManifest,
   type TakoformArtifactPrincipal,
 } from "../src/takoform/artifacts.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { formSupportProfile } from "../src/takoform/forms.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 
 const PREFIX = "/apis/forms.takoform.com/v1/artifacts";
@@ -206,6 +208,66 @@ async function prepareDueBlobCandidate(input: {
 }
 
 describe("Takoform artifact lifecycle", () => {
+  test("advertises a larger StaticAssetBundle ceiling without widening Worker or migration bundles", () => {
+    const forms = currentTakoformCandidates().forms;
+    const ceiling = (kind: string) => {
+      const form = forms.find((candidate) => candidate.identity.formRef.kind === kind);
+      if (!form) throw new Error(`missing ${kind} Form`);
+      const profile = formSupportProfile(form, "support.takoform.com/v1") as {
+        limits: Record<string, number>;
+      };
+      return profile.limits["/maximumBundleBytes"];
+    };
+    expect(ceiling("StaticAssetBundle")).toBe(20_971_520);
+    expect(ceiling("WorkerBundle")).toBe(10_485_760);
+    expect(ceiling("SQLiteMigrationSet")).toBe(10_485_760);
+  });
+
+  test("commits an asset bundle above 10 MiB but refuses assets above 20 MiB", async () => {
+    const target = fixture();
+    const bytes = new Uint8Array(10_485_761);
+    const digest = (await bytesDigest(bytes)) as `sha256:${string}`;
+    const file = (size: number) => ({
+      path: "index.html",
+      mediaType: "text/html",
+      size,
+      digest,
+    });
+    const manifest = (kind: "StaticAssetBundle" | "MigrationBundle", size: number) => ({
+      apiVersion: "artifacts.takoform.com/v1alpha1" as const,
+      kind,
+      files: [file(size)],
+    });
+    const started = await startUpload(
+      target,
+      manifest("StaticAssetBundle", bytes.byteLength),
+      "assets-11m",
+    );
+    expect(started.response.status).toBe(201);
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}/commit`, {
+          method: "POST",
+          headers: { "idempotency-key": "assets-11m-commit" },
+        })
+      ).status,
+    ).toBe(201);
+    await expect(
+      startUpload(target, manifest("StaticAssetBundle", 20_971_521), "assets-21m"),
+    ).rejects.toMatchObject({ name: "ArtifactInputError" });
+    await expect(
+      startUpload(target, manifest("MigrationBundle", 10_485_761), "migration-11m"),
+    ).rejects.toMatchObject({ name: "ArtifactInputError" });
+  });
+
   test("an object transport without exact write identity is rejected at composition", async () => {
     const sql = createEphemeralSql();
     let objectRequests = 0;
