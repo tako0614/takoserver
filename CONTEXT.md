@@ -1,4 +1,4 @@
-# Takoserver Cloud
+# Takoserver
 
 Takoserver turns provider capacity into independently managed cloud resources. Takoform
 describes resource meaning and relationships; Takoserver owns placement, commercial
