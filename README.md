@@ -483,6 +483,7 @@ The reservation and RuntimeInputAuthority boundary is recorded in
 [docs/adr/0004-runtime-input-authority.md](docs/adr/0004-runtime-input-authority.md),
 and the runtime-input wire contract this Host now speaks in
 [docs/adr/0006-runtime-input-wire-contract-v2.md](docs/adr/0006-runtime-input-wire-contract-v2.md).
+All recorded decisions are indexed in [docs/adr/](docs/adr/README.md).
 
 ## Resource and supply model
 
