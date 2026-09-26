@@ -112,6 +112,16 @@ export const CLOUDFLARE_TAKOFORM_HANDLER_KINDS = [
 
 const cloudflareTakoformHandlerKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);
 
+const cloudflareWorkerKinds = new Set([
+  "ModuleWorker",
+  "WorkerVersion",
+  "WorkerDeployment",
+  "WorkerEndpoint",
+  "WorkerCustomDomain",
+  "WorkerCronTrigger",
+  "QueueConsumer",
+]);
+
 /** The name a script reaches its own static assets by. */
 const ASSETS_BINDING = "ASSETS";
 
@@ -208,7 +218,7 @@ export interface CloudflareProviderOptions {
   /** Returns an `Authorization` header value. Credentials never live here. */
   readonly authorize: () => Promise<string> | string;
   readonly apiOrigin?: string;
-  /** Closed placement contract for every Worker-shaped resource. */
+  /** Closed placement contract; ordinary Worker writes require explicit development opt-in. */
   readonly workerBackend?: CloudflareWorkerBackendOptions;
   /** Exact suffix assigned to this account, for example `team.workers.dev`. */
   /** @deprecated Prefer `workerBackend: { kind: "ordinary-workers", ... }`. */
@@ -249,6 +259,7 @@ export class CloudflareProvider implements Provider {
   readonly #fetch: (request: Request) => Promise<Response>;
   readonly #workerEndpointSuffix: string | undefined;
   readonly #workerBackend: CloudflareWorkerBackend | undefined;
+  readonly #allowDevelopmentWorkerWrites: boolean;
   readonly #workerCompatibilityDate: string;
   readonly #runtimeInputs: ProviderRuntimeInputLeasePort | undefined;
 
@@ -282,6 +293,9 @@ export class CloudflareProvider implements Provider {
     }
     this.#workerEndpointSuffix =
       workerBackend.kind === "ordinary-workers" ? workerBackend.workerEndpointSuffix : undefined;
+    this.#allowDevelopmentWorkerWrites =
+      workerBackend.kind === "ordinary-workers" &&
+      workerBackend.allowDevelopmentWorkerWrites === true;
     this.#workerBackend =
       workerBackend.kind === "workers-for-platforms"
         ? createManagedWorkerBackend(workerBackend.create, {
@@ -553,6 +567,13 @@ export class CloudflareProvider implements Provider {
       input.offering.kind.startsWith("takoform.") &&
       isEdgeFormsApiVersion(input.offering.form.apiVersion) &&
       input.offering.form.kind === "WorkerVersion";
+    if (!canRecoverWorkerVersion || input.operationMode === "initial") {
+      const refusal = this.#ordinaryWorkerWriteRefusal(
+        input.offering,
+        input.operationMode === "initial" ? input.operationId : undefined,
+      );
+      if (refusal) return refusal;
+    }
     const canRecoverQueue =
       cloudflareQueueOffering(input.offering) && queuePreviousNativeName(input.previous) !== null;
     if (input.operationMode === "recovery" && !canRecoverWorkerVersion && !canRecoverQueue) {
@@ -645,6 +666,30 @@ export class CloudflareProvider implements Provider {
       );
     }
     return await this.#applyWorkerVersion({ ...input, operationMode: "recovery" });
+  }
+
+  #ordinaryWorkerWriteRefusal(
+    offering: ProviderOffering,
+    initialOperationId?: string,
+  ): ProviderTicket | null {
+    if (
+      this.#allowDevelopmentWorkerWrites ||
+      (offering.kind !== "worker_script" &&
+        !(
+          offering.kind.startsWith("takoform.") &&
+          isEdgeFormsApiVersion(offering.form.apiVersion) &&
+          cloudflareWorkerKinds.has(offering.form.kind)
+        ))
+    ) {
+      return null;
+    }
+    // Keep pre-WfP native IDs usable for observe/delete and passive Version
+    // recovery. Only explicit development composition may send new Worker writes.
+    const message =
+      "ordinary Cloudflare Worker writes are disabled; managed customer Workers require Workers for Platforms";
+    return initialOperationId === undefined
+      ? failed("denied", message)
+      : failedWithoutProviderMutation(initialOperationId, "denied", message);
   }
 
   /**
@@ -1879,7 +1924,7 @@ export class CloudflareProvider implements Provider {
     if (input.previous) return failed("invalid_spec", "Worker Versions are immutable");
     const unsupportedBindingFailure = unsupportedWorkerVersionBindingFailure(
       input.spec,
-      input.operationId,
+      input.operationMode === "initial" ? input.operationId : undefined,
     );
     if (unsupportedBindingFailure) return unsupportedBindingFailure;
     const operationMarker = await workerVersionOperationMarker(input.operationId);

@@ -26,6 +26,8 @@ import type { CloudflareZone } from "./cloudflare.ts";
 
 export interface CloudflareOrdinaryWorkerBackendOptions {
   readonly kind: "ordinary-workers";
+  /** Test/development harness only. Managed customer Workers must use Workers for Platforms. */
+  readonly allowDevelopmentWorkerWrites?: boolean;
   /** Exact account suffix, for example `team.workers.dev`. */
   readonly workerEndpointSuffix?: string;
 }
