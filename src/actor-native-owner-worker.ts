@@ -27,6 +27,8 @@ const VARIANT_HEADER = "x-takoserver-private-actor-variant";
 const ALARM_RETRY_MS = 1_000;
 const ALARM_WATCHDOG_MS = 35_000;
 const ALARM_HANDLER_MS = 30_000;
+const HTTP_HANDLER_MS = 30_000;
+const HTTP_PRODUCER_MS = 300_000;
 // The child imports this Host-private bundle before importing application
 // modules. Capture every primitive used to construct the capability-bearing
 // request now: application top-level code may replace globals and prototypes.
@@ -131,12 +133,12 @@ export function createActorNativeAlarmPort(
 // Bun currently retains the original headers when cloning a Request with an
 // empty replacement Headers. Rebuild from the URL so the private hop headers
 // cannot reach the application even when they were the only headers present.
-function withHeaders(request: Request, headers: Headers): Request {
+function withHeaders(request: Request, headers: Headers, signal = request.signal): Request {
   return new Request(request.url, {
     method: request.method,
     headers,
     body: request.body,
-    signal: request.signal,
+    signal,
     redirect: "manual",
   });
 }
@@ -155,6 +157,12 @@ export function createActorNativeOwner(
     readonly epoch: string;
     readonly variantKeys: readonly string[];
   },
+  // Host-private timing seam for focused qualification; public admission does
+  // not accept or forward deadline values.
+  deadlines: { readonly handlerMs: number; readonly producerMs: number } = {
+    handlerMs: HTTP_HANDLER_MS,
+    producerMs: HTTP_PRODUCER_MS,
+  },
 ) {
   if (!/^[a-f0-9]{64}$/u.test(deliveryToken) || !/^[a-f0-9]{64}$/u.test(admissionToken))
     throw new Error("Actor delivery capability unavailable");
@@ -168,6 +176,13 @@ export function createActorNativeOwner(
     new Set(graph.variantKeys).size !== graph.variantKeys.length
   )
     throw new Error("Actor alarm graph bindings unavailable");
+  if (
+    !SafeIsSafeInteger(deadlines.handlerMs) ||
+    deadlines.handlerMs <= 0 ||
+    !SafeIsSafeInteger(deadlines.producerMs) ||
+    deadlines.producerMs <= 0
+  )
+    throw new Error("Actor HTTP deadlines unavailable");
   const variantKeys = Object.freeze([...graph.variantKeys]);
   return class ActorOwner {
     readonly state: NativeState;
@@ -535,6 +550,9 @@ export function createActorNativeOwner(
         headers.delete(VARIANT_HEADER);
         let childRequest: Request | undefined;
         let retirementError: unknown;
+        const turnAbort = new AbortController();
+        const headExpired = Symbol("actor-head-expired");
+        let headTimer: ReturnType<typeof setTimeout> | undefined;
         try {
           const bindingName = `CLASS_${variantIndex}`;
           if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
@@ -543,29 +561,85 @@ export function createActorNativeOwner(
             class: this.env[bindingName],
             id,
           }));
-          childRequest = withHeaders(request, headers);
-          const response = await child.fetch(childRequest);
+          childRequest = withHeaders(
+            request,
+            headers,
+            AbortSignal.any([request.signal, turnAbort.signal]),
+          );
+          // Start the admitted-event clock before invoking the child, including
+          // its start hook. A non-cooperative fetch cannot retain the ID gate.
+          const response = await Promise.race([
+            Promise.resolve().then(() => child.fetch(childRequest as Request)),
+            new Promise<never>((_accept, refuse) => {
+              headTimer = setTimeout(() => refuse(headExpired), deadlines.handlerMs);
+            }),
+          ]);
+          if (headTimer) clearTimeout(headTimer);
+          headTimer = undefined;
           if (response.body === null) {
             resolve(response);
           } else {
-            const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+            const source = response.body.getReader();
+            let complete = false;
+            let finishProducer!: () => void;
+            const producerDone = new Promise<void>((accept) => {
+              finishProducer = accept;
+            });
+            let producerTimer: ReturnType<typeof setTimeout> | undefined;
+            const finish = () => {
+              if (complete) return false;
+              complete = true;
+              if (producerTimer) clearTimeout(producerTimer);
+              finishProducer();
+              return true;
+            };
+            let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+            const body = new ReadableStream<Uint8Array>({
+              start(controller) {
+                bodyController = controller;
+              },
+              async pull(controller) {
+                try {
+                  const chunk = await source.read();
+                  if (complete) return;
+                  if (chunk.done) {
+                    if (finish()) controller.close();
+                  } else {
+                    controller.enqueue(chunk.value);
+                  }
+                } catch (error) {
+                  if (finish()) controller.error(error);
+                }
+              },
+              cancel(reason) {
+                if (finish()) void source.cancel(reason).catch(() => {});
+              },
+            });
+            // This independent lease begins only once the response head exists.
+            // Error the receiving stream before retiring the producer facet.
+            producerTimer = setTimeout(() => {
+              if (!finish()) return;
+              bodyController.error(new Error("response_aborted"));
+              void source.cancel("response_aborted").catch(() => {});
+            }, deadlines.producerMs);
             resolve(
-              new Response(readable, {
+              new Response(body, {
                 status: response.status,
                 statusText: response.statusText,
                 headers: response.headers,
               }),
             );
-            try {
-              await response.body.pipeTo(writable);
-            } catch {
-              /* cancellation/error terminates this body, then releases the gate */
-            }
+            await producerDone;
           }
+        } catch (error) {
+          if (error === headExpired) resolve(new Response(null, { status: 504 }));
+          else throw error;
         } finally {
+          if (headTimer) clearTimeout(headTimer);
+          turnAbort.abort(new Error("request_aborted"));
           try {
             if (childRequest?.body && !childRequest.body.locked)
-              await childRequest.body.cancel("actor event retired");
+              void childRequest.body.cancel("request_aborted").catch(() => {});
           } catch {
             /* an application-owned stream may already be locked or errored */
           }

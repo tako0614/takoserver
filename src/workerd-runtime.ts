@@ -2289,16 +2289,20 @@ export async function writeWorkerdPrivateExecution(options: {
   }
   let actorServices = "";
   let actorVersionServices = "";
-  const actorPrepared: Awaited<ReturnType<typeof prepareWorkerdSite>>[] = [];
+  const actorPrepared: {
+    readonly root: string;
+    readonly version: Awaited<ReturnType<typeof prepareWorkerdSite>>;
+  }[] = [];
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
-    if (
-      prepared.manifest.vars?.some((binding) =>
-        ["__TAKOSERVER_ACTOR_ALARM_OWNER", "NAMESPACE", "CLASS", "ADMISSION"].includes(
-          binding.name,
-        ),
-      )
-    )
+    const actorInternalBindings = new Set([
+      "__TAKOSERVER_ACTOR_ALARM_OWNER",
+      "NAMESPACE",
+      "CLASS",
+      "ADMISSION",
+      ...actor.variants.map((_, index) => `INSPECT_${index}`),
+    ]);
+    if (prepared.manifest.vars?.some((binding) => actorInternalBindings.has(binding.name)))
       throw new Error("private Actor alarm binding collision");
     const actorBindings = [
       '(name = "NAMESPACE", durableObjectNamespace = "ActorOwner")',
@@ -2313,6 +2317,9 @@ export async function writeWorkerdPrivateExecution(options: {
       actorBindings.push(
         `(name = ${capnpText(`CLASS_${index}`)}, durableObjectClass = (name = ${capnpText(serviceName)}, entrypoint = ${capnpText(variant.className)}))`,
       );
+      actorBindings.push(
+        `(name = ${capnpText(`INSPECT_${index}`)}, service = ${capnpText(serviceName)})`,
+      );
       // Actor classes have no public asset/event ingress. Those declarations
       // were verified from durable state, but are intentionally not composed
       // into the private class service.
@@ -2323,7 +2330,9 @@ export async function writeWorkerdPrivateExecution(options: {
         undefined,
         variant.hostModules,
       );
-      actorPrepared.push(version);
+      const versionRoot = join(root, "actor-versions", String(index));
+      const versionPrefix = `./actor-versions/${index}`;
+      actorPrepared.push({ root: versionRoot, version });
       const versionBindings = validBindings(version.manifest.vars ?? []).map(
         (binding) =>
           `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -2336,7 +2345,7 @@ export async function writeWorkerdPrivateExecution(options: {
       versionBindings.push('(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")');
       actorVersionServices += `
   (name = ${capnpText(serviceName)}, worker = (
-    modules = [${renderWorkerdModules(version.manifest, ".")}],
+    modules = [${renderWorkerdModules(version.manifest, versionPrefix)}],
     modulePolicy = (applicationMain = ${capnpText(version.manifest.mainModule)}),
     compatibilityDate = "2026-01-01", compatibilityFlags = [${[...APPLICATION_COMPATIBILITY_FLAGS, "experimental"].map(capnpText).join(", ")}], globalOutbound = "deny",
     bindings = [${versionBindings.join(", ")}]
@@ -2371,7 +2380,9 @@ const config :Workerd.Config = (
  sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})]
 );`;
   await writePreparedWorkerdSite(root, prepared);
-  for (const version of actorPrepared) await writePreparedWorkerdSite(root, version);
+  for (const { root: versionRoot, version } of actorPrepared) {
+    await writePreparedWorkerdSite(versionRoot, version);
+  }
   const configPath = join(root, "workerd.capnp");
   await writeFile(configPath, config, { mode: 0o600, flag: "wx" });
   return configPath;

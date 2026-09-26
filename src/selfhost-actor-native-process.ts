@@ -186,10 +186,11 @@ export async function openWorkerdActorNamespace(
     };
     const helper = allocate("__actor_bootstrap");
     const entry = allocate("__actor_entry");
+    const inspectionToken = randomBytes(32).toString("hex");
     hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
     hostModules.set(
       entry,
-      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort } from ${literal(`./${helper}`)};
+      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, inspectActorClass } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
@@ -198,6 +199,28 @@ const SafeHeadersGet = Headers.prototype.get;
 const SafeHeadersDelete = Headers.prototype.delete;
 const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers").get;
 const SafeRequestSignal = Object.getOwnPropertyDescriptor(Request.prototype, "signal").get;
+const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method").get;
+const INSPECTION_HEADER = "x-takoserver-private-actor-class-inspection";
+const INSPECTION_TOKEN = ${literal(inspectionToken)};
+let inspection;
+async function inspectVersion(request) {
+  const headers = SafeApply(SafeRequestHeaders, request, []);
+  const method = SafeApply(SafeRequestMethod, request, []);
+  const url = request.url;
+  const authorized = SafeApply(SafeHeadersGet, headers, [INSPECTION_HEADER]) === INSPECTION_TOKEN;
+  if (method !== "POST" || url !== "http://actor.invalid/__actor_class_inspection__" || !authorized)
+    return new SafeResponse(null, { status: 404 });
+  inspection ??= (async () => {
+    try {
+      const namespace = await import(${literal(`./${site.mainModule}`)});
+      inspectActorClass(namespace, ${literal(options.className)});
+      return 204;
+    } catch {
+      return 422;
+    }
+  })();
+  return new SafeResponse(null, { status: await inspection });
+}
 export class ActorChild {
   constructor(state, env) {
     const id = state.id.toString();
@@ -216,7 +239,7 @@ export class ActorChild {
     return (await this.execution).fetch(new SafeRequest(request, { headers }));
   }
 }
-export default { fetch() { return new Response(null, { status: 404 }); } };`),
+export default { fetch(request) { return inspectVersion(request); } };`),
     );
     return {
       site: {
@@ -231,6 +254,7 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
       index,
       helper,
       entry,
+      inspectionToken,
     };
   });
   const first = nativeVariants[0];
@@ -248,11 +272,42 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
   };
   const owner = allocateOwner();
   const ownerModules = new Map(first.hostModules);
+  const inspectionTokens = nativeVariants.map((variant) => variant.inspectionToken);
   ownerModules.set(
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${first.helper}`)};
 export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })});
-export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});`),
+const ingress = createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});
+const inspectionTokens = ${JSON.stringify(inspectionTokens)};
+let inspections;
+function inspectVersions(env) {
+  inspections ??= Promise.all(inspectionTokens.map(async (inspectionToken, index) => {
+    try {
+      const binding = env[${literal("INSPECT_")} + index];
+      const response = await binding.fetch(new Request("http://actor.invalid/__actor_class_inspection__", {
+        method: "POST",
+        headers: { "x-takoserver-private-actor-class-inspection": inspectionToken }
+      }));
+      return response.status;
+    } catch {
+      return 503;
+    }
+  })).then((statuses) => {
+    return statuses.includes(422) ? 422 : statuses.every((status) => status === 204) ? 204 : 503;
+  }).then((status) => {
+    if (status === 503) inspections = undefined;
+    return status;
+  });
+  return inspections;
+}
+export default {
+  async fetch(request, env) {
+    if (request.method === "GET" && request.url === "http://actor.invalid/" && request.headers.get("x-takoserver-private-actor-token") === ${literal(token)} && !request.headers.has("x-takoserver-private-actor-id")) {
+      return new Response(null, { status: await inspectVersions(env) });
+    }
+    return ingress.fetch(request, env);
+  }
+};`),
   );
   const root = await mkdtemp(join(tmpdir(), "tactor-"));
   await chmod(root, 0o700);
@@ -391,26 +446,36 @@ export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)
       stderr: "ignore",
     });
     let ready = false;
-    for (let attempt = 0; attempt < 200; attempt += 1) {
+    let lastReadinessStatus: number | undefined;
+    const startupDeadlineAt = Date.now() + 20_000;
+    for (let attempt = 0; attempt < 200 && Date.now() < startupDeadlineAt; attempt += 1) {
       options.signal.throwIfAborted();
       if (child.exitCode !== null) throw new Error("Actor native child exited during startup");
+      let response: Response;
       try {
-        const response = await fetch("http://actor.invalid/", {
+        response = await fetch("http://actor.invalid/", {
           unix: socket,
           headers: { "x-takoserver-private-actor-token": token },
-          signal: AbortSignal.timeout(100),
+          signal: AbortSignal.timeout(Math.max(1, Math.min(5_000, startupDeadlineAt - Date.now()))),
         });
-        if (response.status === 204) {
-          ready = true;
-          break;
-        }
-        await response.body?.cancel();
+        lastReadinessStatus = response.status;
       } catch {
         /* startup socket is not ready yet */
+        await Bun.sleep(10);
+        continue;
       }
+      if (response.status === 204) {
+        ready = true;
+        break;
+      }
+      await response.body?.cancel();
+      if (response.status === 422) throw new Error("Actor Version class inspection failed");
       await Bun.sleep(10);
     }
-    if (!ready) throw new Error("Actor native child readiness unavailable");
+    if (!ready)
+      throw new Error(
+        `Actor native child readiness unavailable${lastReadinessStatus === undefined ? "" : ` (${lastReadinessStatus})`}`,
+      );
     options.signal.throwIfAborted();
     const runningChild = child;
     return {
