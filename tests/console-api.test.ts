@@ -149,115 +149,130 @@ describe("console stable Host API contract", () => {
     },
   );
 
-  test("prepares, applies, reads and generation-fenced deletes against the real stable routes", async () => {
-    const host = createStaticStableInMemoryTakoformHost({
-      authenticate: async (authorization) =>
-        authorization === "Bearer console-session"
-          ? { tenantId: ORGANIZATION, principalId: "console-user" }
-          : null,
-      forms: [
-        {
-          identity: { formRef: FORM_REF },
-          desiredSchema: {
-            type: "object",
-            properties: { message: { type: "string" }, enabled: { type: "boolean" } },
-            required: ["message", "enabled"],
-            additionalProperties: false,
+  test.each([
+    { label: "ordinary", space: DECLARATION.space },
+    { label: "Unicode", space: "tenant:日本 +&?%" },
+    { label: "maximum-length", space: "s".repeat(255) },
+  ])(
+    "prepares, applies, reads and fenced deletes in a $label Space on the real stable routes",
+    async ({ space }) => {
+      const declaration = { ...DECLARATION, space };
+      const host = createStaticStableInMemoryTakoformHost({
+        authenticate: async (authorization) =>
+          authorization === "Bearer console-session"
+            ? { tenantId: ORGANIZATION, principalId: "console-user" }
+            : null,
+        forms: [
+          {
+            identity: { formRef: FORM_REF },
+            desiredSchema: {
+              type: "object",
+              properties: { message: { type: "string" }, enabled: { type: "boolean" } },
+              required: ["message", "enabled"],
+              additionalProperties: false,
+            },
+            operations: ["create", "read", "update", "delete"],
           },
-          operations: ["create", "read", "update", "delete"],
-        },
-      ],
-    });
-    const responses: Response[] = [];
-    const requests = transport(async (request) => {
-      const response = await host.handle(request);
-      if (!response) return new Response(null, { status: 404 });
-      responses.push(response.clone());
-      return response;
-    });
-    const { api, sessionLosses } = client();
+        ],
+      });
+      const responses: Response[] = [];
+      const requests = transport(async (request) => {
+        const response = await host.handle(request);
+        if (!response) return new Response(null, { status: 404 });
+        responses.push(response.clone());
+        return response;
+      });
+      const { api, sessionLosses } = client();
 
-    const outcome = await api.createResource(ORGANIZATION, DECLARATION);
-    expect(outcome.state).toBe("completed");
-    if (outcome.state !== "completed") throw new Error("create did not complete");
-    const created = outcome.result;
-    expect(created).toMatchObject({
-      apiVersion: "example.forms.test",
-      kind: "Widget",
-      form: { formRef: FORM_REF },
-      metadata: { name: "console-widget", space: "tenant:console", generation: "1" },
-      spec: { message: "from the console", enabled: false },
-    });
-    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
-      ["POST", "/apis/forms.takoform.com/v1/resources/prepare"],
-      ["PUT", RESOURCE_PATH],
-    ]);
-    const preparedBody = await requests[0]?.json();
-    expect(preparedBody).toEqual({
-      apiVersion: "example.forms.test",
-      kind: "Widget",
-      form: { formRef: FORM_REF },
-      metadata: { name: "console-widget", space: "tenant:console" },
-      spec: { message: "from the console", enabled: false },
-    });
-    const prepared = (await responses[0]?.json()) as { review: { prepareDigest: string } };
-    expect(await requests[1]?.json()).toEqual({
-      ...preparedBody,
-      review: { prepareDigest: prepared.review.prepareDigest },
-    });
-    expect(requests[0]?.headers.get("idempotency-key")).toBeNull();
-    expect(requests[1]?.headers.get("if-none-match")).toBe("*");
-    expect(requests[1]?.headers.get("idempotency-key")).toMatch(
-      /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u,
-    );
-    for (const request of requests) {
-      expect(request.headers.get("authorization")).toBe("Bearer console-session");
-      expect(request.headers.get("takoform-organization")).toBe(ORGANIZATION);
-      expect(request.headers.get("content-type")).toBe("application/json");
-      expect(request.credentials).toBe("include");
-    }
+      const outcome = await api.createResource(ORGANIZATION, declaration);
+      expect(outcome.state).toBe("completed");
+      if (outcome.state !== "completed") throw new Error("create did not complete");
+      const created = outcome.result;
+      expect(created).toMatchObject({
+        apiVersion: "example.forms.test",
+        kind: "Widget",
+        form: { formRef: FORM_REF },
+        metadata: { name: "console-widget", space, generation: "1" },
+        spec: { message: "from the console", enabled: false },
+      });
+      expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+        ["POST", "/apis/forms.takoform.com/v1/resources/prepare"],
+        ["PUT", RESOURCE_PATH],
+      ]);
+      const preparedBody = await requests[0]?.json();
+      expect(preparedBody).toEqual({
+        apiVersion: "example.forms.test",
+        kind: "Widget",
+        form: { formRef: FORM_REF },
+        metadata: { name: "console-widget", space },
+        spec: { message: "from the console", enabled: false },
+      });
+      const prepared = (await responses[0]?.json()) as { review: { prepareDigest: string } };
+      expect(await requests[1]?.json()).toEqual({
+        ...preparedBody,
+        review: { prepareDigest: prepared.review.prepareDigest },
+      });
+      expect(requests[0]?.headers.get("idempotency-key")).toBeNull();
+      expect(requests[1]?.headers.get("if-none-match")).toBe("*");
+      expect(requests[1]?.headers.get("idempotency-key")).toMatch(
+        /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u,
+      );
+      expect(requests[1]?.headers.get("idempotency-key")?.startsWith("console-create-")).toBe(true);
+      for (const request of requests) {
+        expect(request.headers.get("authorization")).toBe("Bearer console-session");
+        expect(request.headers.get("takoform-organization")).toBe(ORGANIZATION);
+        expect(request.headers.get("content-type")).toBe("application/json");
+        expect(request.credentials).toBe("include");
+      }
 
-    // There is no single-resource GET wrapper: verify the Host can read the
-    // identity produced by the console before using it as the deletion fence.
-    const readUrl = new URL(`${ORIGIN}${RESOURCE_PATH}`);
-    readUrl.search = new URLSearchParams({
-      space: DECLARATION.space,
-      definitionVersion: FORM_REF.definitionVersion,
-      schemaDigest: FORM_REF.schemaDigest,
-    }).toString();
-    const read = () =>
-      host.handle(new Request(readUrl, { headers: { authorization: "Bearer console-session" } }));
-    const retrieved = await read();
-    expect(retrieved?.status).toBe(200);
-    expect(await retrieved?.json()).toMatchObject({
-      metadata: created.metadata,
-      spec: created.spec,
-    });
+      // There is no single-resource GET wrapper: verify the Host can read the
+      // identity produced by the console before using it as the deletion fence.
+      const readUrl = new URL(`${ORIGIN}${RESOURCE_PATH}`);
+      readUrl.search = new URLSearchParams({
+        space,
+        definitionVersion: FORM_REF.definitionVersion,
+        schemaDigest: FORM_REF.schemaDigest,
+      }).toString();
+      const read = () =>
+        host.handle(new Request(readUrl, { headers: { authorization: "Bearer console-session" } }));
+      const retrieved = await read();
+      expect(retrieved?.status).toBe(200);
+      expect(await retrieved?.json()).toMatchObject({
+        metadata: created.metadata,
+        spec: created.spec,
+      });
 
-    expect(
-      await api.deleteResource(ORGANIZATION, DECLARATION, created.metadata.generation),
-    ).toEqual({
-      state: "completed",
-      result: undefined,
-    });
-    const deleted = requests[2];
-    expect(deleted?.method).toBe("DELETE");
-    expect(new URL(deleted?.url ?? "").pathname).toBe(RESOURCE_PATH);
-    expect([...new URL(deleted?.url ?? "").searchParams]).toEqual([
-      ["space", "tenant:console"],
-      ["definitionVersion", "1.0.0"],
-      ["schemaDigest", FORM_REF.schemaDigest],
-    ]);
-    expect(deleted?.headers.get("takoform-organization")).toBe(ORGANIZATION);
-    expect(deleted?.headers.get("takoform-expected-generation")).toBe("1");
-    expect(deleted?.headers.get("idempotency-key")).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u);
-    expect(deleted?.headers.has("content-type")).toBe(false);
-    expect(await deleted?.text()).toBe("");
-    const missing = await read();
-    expect(missing?.status).toBe(404);
-    expect(await missing?.json()).toMatchObject({ error: { code: "resource_not_found" } });
-    expect(sessionLosses()).toBe(0);
-  });
+      expect(
+        await api.deleteResource(ORGANIZATION, declaration, created.metadata.generation),
+      ).toEqual({
+        state: "completed",
+        result: undefined,
+      });
+      const deleted = requests[2];
+      expect(deleted?.method).toBe("DELETE");
+      expect(new URL(deleted?.url ?? "").pathname).toBe(RESOURCE_PATH);
+      expect([...new URL(deleted?.url ?? "").searchParams]).toEqual([
+        ["space", space],
+        ["definitionVersion", "1.0.0"],
+        ["schemaDigest", FORM_REF.schemaDigest],
+      ]);
+      expect(deleted?.headers.get("takoform-organization")).toBe(ORGANIZATION);
+      expect(deleted?.headers.get("takoform-expected-generation")).toBe("1");
+      expect(deleted?.headers.get("idempotency-key")).toMatch(
+        /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u,
+      );
+      expect(deleted?.headers.get("idempotency-key")?.startsWith("console-delete-")).toBe(true);
+      expect(deleted?.headers.get("idempotency-key")).not.toBe(
+        requests[1]?.headers.get("idempotency-key"),
+      );
+      expect(deleted?.headers.has("content-type")).toBe(false);
+      expect(await deleted?.text()).toBe("");
+      const missing = await read();
+      expect(missing?.status).toBe(404);
+      expect(await missing?.json()).toMatchObject({ error: { code: "resource_not_found" } });
+      expect(sessionLosses()).toBe(0);
+    },
+  );
 
   test("keeps resource names in one path segment and exact pins in deletion query values", async () => {
     // Wire-level escaping is independent of admission: this deliberately
@@ -277,9 +292,7 @@ describe("console stable Host API contract", () => {
           : new Response(null, { status: 204 }),
     );
     const { api } = client();
-    // Use an ASCII space for create because the existing idempotency key
-    // includes it; deletion transports the full Space value in its query.
-    await api.createResource(ORGANIZATION, { ...declaration, space: "tenant:console" });
+    await api.createResource(ORGANIZATION, declaration);
     await api.deleteResource(ORGANIZATION, declaration, "42");
 
     const encodedPath =

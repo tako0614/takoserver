@@ -371,7 +371,7 @@ export function createApi(options: ApiOptions) {
         { ...body, review: { prepareDigest: prepared.review.prepareDigest } },
         {
           ...naming,
-          "idempotency-key": `console-${declaration.space}-${declaration.name}-${Date.now()}`,
+          "idempotency-key": `console-create-${crypto.randomUUID()}`,
           "if-none-match": "*",
         },
       );
@@ -396,7 +396,7 @@ export function createApi(options: ApiOptions) {
       const path = `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`;
       const response = await request<unknown>("DELETE", path, undefined, {
         "takoform-organization": organizationId,
-        "idempotency-key": `console-delete-${declaration.name}-${Date.now()}`,
+        "idempotency-key": `console-delete-${crypto.randomUUID()}`,
         "takoform-expected-generation": generation,
       });
       if (response.status === 202) return accepted(response.payload, path);
