@@ -114,6 +114,7 @@ async function fileSha256(path: string | URL): Promise<string> {
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
 }
+
 import { createHash } from "node:crypto";
 import { createReadStream, constants as fsConstants } from "node:fs";
 import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
