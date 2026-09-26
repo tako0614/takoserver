@@ -215,10 +215,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(routineWorker?.obligations["failure-handling"]).toContain("credential resolver");
     expect(identityProbe?.obligations.provenance).toContain("integration-host-only");
     expect(identityProbe?.obligations.provenance).toContain("no FORM_AUTHORITY");
-    expect(identityProbe?.requiresScripts).toEqual([
-      "check",
-      "typecheck:form-authority-worker",
-    ]);
+    expect(identityProbe?.requiresScripts).toEqual(["check", "typecheck:form-authority-worker"]);
     expect(storageDisposal?.requiresScripts).toEqual([]);
     expect(hostRetirement?.requiresScripts).toEqual([]);
     expect(identityProbe?.obligations["post-conditions"]).toContain("publicIdentityRpcReady: true");
@@ -269,10 +266,7 @@ describe("Takoserver split deploy entrypoint", () => {
     expect(integrationAuthority?.obligations["failure-handling"]).toContain(
       "it retains precedence when a service-binding refresh is also declared",
     );
-    expect(gateway?.requiresScripts).toEqual([
-      "check",
-      "typecheck:form-authority-worker",
-    ]);
+    expect(gateway?.requiresScripts).toEqual(["check", "typecheck:form-authority-worker"]);
     expect(gateway?.obligations["failure-handling"]).toContain(
       "exact, source-matched, no-drift authority dependency on the selected Host",
     );
