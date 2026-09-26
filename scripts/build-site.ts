@@ -38,10 +38,7 @@ await Bun.write(join(outDir, "index.html"), html);
 for (const locale of ["ja", "en"] as const) {
   const localeDirectory = join(outDir, locale);
   mkdirSync(localeDirectory, { recursive: true });
-  await Bun.write(
-    join(localeDirectory, "index.html"),
-    landingHtml({ ...commonOptions, locale }),
-  );
+  await Bun.write(join(localeDirectory, "index.html"), landingHtml({ ...commonOptions, locale }));
 }
 
 process.stdout.write(`site built into ${outDir}\n`);

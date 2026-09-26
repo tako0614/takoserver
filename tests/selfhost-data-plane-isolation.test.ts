@@ -122,7 +122,7 @@ test("a leaked service binding reaches nothing but those two routes", async () =
     "/provision/v1",
     "/",
     `${SELFHOST_DATA_PLANE_SQL_PATH}/`,
-    `${SELFHOST_DATA_PLANE_SQL_PATH}?x=1#y`.split("?")[0] + "x",
+    `${`${SELFHOST_DATA_PLANE_SQL_PATH}?x=1#y`.split("?")[0]}x`,
     "/.well-known/takoserver/selfhost-data/v1/../../../v1/organizations",
   ]) {
     const response = await served_(call(path), env);

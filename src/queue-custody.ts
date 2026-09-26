@@ -825,8 +825,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       );
       const current = await readGeneration(selected);
       if (
-        !current ||
-        current.state !== "active" ||
+        current?.state !== "active" ||
         current.consumerId !== selected.consumerId ||
         current.generation !== selected.generation
       ) {
@@ -1131,8 +1130,7 @@ export function createQueueCustody(options: QueueCustodyOptions): QueueCustody {
       const selected = generationIdentity(input);
       const current = await readGeneration(selected);
       if (
-        !current ||
-        current.state !== "retiring" ||
+        current?.state !== "retiring" ||
         current.consumerId !== selected.consumerId ||
         current.generation !== selected.generation
       ) {

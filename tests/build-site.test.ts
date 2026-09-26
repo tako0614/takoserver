@@ -28,7 +28,9 @@ describe("Takoserver public site build", () => {
       expect(readFileSync(join(root, "en", "index.html"), "utf8")).toBe(rootHtml);
       expect(japaneseHtml).not.toBe(rootHtml);
       expect(japaneseHtml).toContain('<html lang="ja">');
-      expect(japaneseHtml).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
+      expect(japaneseHtml).toContain(
+        "インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。",
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -578,7 +578,7 @@ async function authorize(
   lookup: SelfhostDataPlaneOptions["grant"],
 ): Promise<SelfhostDataPlaneGrant | null> {
   const header = request.headers.get("authorization");
-  if (!header || !header.startsWith("Bearer ") || header.length > 512) return null;
+  if (!header?.startsWith("Bearer ") || header.length > 512) return null;
   const parts = header.slice("Bearer ".length).split(".");
   const [script, versionId, secret] = parts;
   if (

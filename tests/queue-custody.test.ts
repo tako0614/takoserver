@@ -311,7 +311,7 @@ test("a stale terminal lease cannot create or replace a transfer notice", async 
 
 test("a stale transfer acknowledgement cannot remove a coalesced newer notice", async () => {
   const sql = createEphemeralSql();
-  let millis = 455_000;
+  const millis = 455_000;
   const ids = [
     "coalesce-lease-one",
     "coalesce-dead-letter-one",
