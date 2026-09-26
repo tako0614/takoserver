@@ -30,6 +30,37 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("uses Pages-compatible page size and reads the complete deployment history", async () => {
+    const deployments = Array.from({ length: 22 }, (_, index) => ({ id: `deployment-${index}` }));
+    const requests: URL[] = [];
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        requests.push(url);
+        if (url.searchParams.get("per_page") !== "20") {
+          return Response.json(
+            {
+              success: false,
+              errors: [{ code: 8000024, message: "Invalid list options provided." }],
+            },
+            { status: 400 },
+          );
+        }
+        const page = Number(url.searchParams.get("page"));
+        return envelope(deployments.slice((page - 1) * 20, page * 20), page, 2, 22, 20);
+      },
+    });
+
+    expect(await state.pagesDeployments("takoserver-website")).toEqual(deployments);
+    expect(requests.map((url) => url.searchParams.get("page"))).toEqual(["1", "2"]);
+    expect(requests.every((url) => url.searchParams.get("per_page") === "20")).toBe(true);
+    expect(requests[0]?.pathname).toBe(
+      `/client/v4/accounts/${ACCOUNT}/pages/projects/takoserver-website/deployments`,
+    );
+  });
+
   test("reads Worker-local cron triggers without inventing pagination or Version metadata", async () => {
     const requests: Request[] = [];
     const state = new CloudflareState({
