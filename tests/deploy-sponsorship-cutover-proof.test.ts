@@ -50,7 +50,7 @@ const PUBLIC_WORKER = "takoserver-api-integration";
 const CREDENTIAL_PUBLIC_JWK = {
   kty: "OKP",
   crv: "Ed25519",
-  x: "B".repeat(42) + "A",
+  x: `${"B".repeat(42)}A`,
 } as const;
 const AUDIT = {
   deploymentTokenIdSha256: `sha256:${"6".repeat(64)}` as const,

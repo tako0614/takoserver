@@ -33,7 +33,7 @@ const target = {
     workerName: "takoserver-sponsorship-authority-integration",
     organizationId: "org_hosted",
     credentialKeyId: "sponsorship-credential-key",
-    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: "B".repeat(42) + "A" },
+    credentialPublicJwk: { kty: "OKP", crv: "Ed25519", x: `${"B".repeat(42)}A` },
     receiptKeyId: "receipt-key",
     receiptPublicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
   },
@@ -63,7 +63,7 @@ describe("route-less sponsorship authority deploy", () => {
         keyId: target.sponsorshipAuthority.credentialKeyId,
         publicJwk: JSON.stringify({
           ...target.sponsorshipAuthority.credentialPublicJwk,
-          x: "D".repeat(42) + "A",
+          x: `${"D".repeat(42)}A`,
         }),
         createdAtEpochSeconds: 1,
         revokedAtEpochSeconds: null,
