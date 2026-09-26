@@ -25,6 +25,7 @@ import {
 import {
   type ArtifactBytes,
   CloudflareProvider,
+  type CloudflareProviderOptions,
   type CloudflareZone,
 } from "../src/providers/cloudflare.ts";
 import type { CloudflareWorkerBackend } from "../src/providers/cloudflare-worker-backend.ts";
@@ -135,6 +136,7 @@ function recorder(
   const provider = new CloudflareProvider({
     accountId: "acct_1",
     offerings: [BUCKET, DATABASE, WORKER],
+    workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
     artifacts,
     zones: [
       ...extraZones,
@@ -185,6 +187,7 @@ describe("Cloudflare provider", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [stable],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -1232,6 +1235,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings,
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -1603,6 +1607,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering, deploymentOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -1718,6 +1723,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -1888,7 +1894,7 @@ describe("released edge Form placement", () => {
         message: "the Worker Version workflow bindings are not supported by this provider",
       },
     });
-    expect(providerFailureProvesNoMutation(recovered, "op-version-recover-workflow")).toBe(true);
+    expect(providerFailureProvesNoMutation(recovered, "op-version-recover-workflow")).toBe(false);
     expect(calls).toHaveLength(beforeObserve);
   });
 
@@ -1900,6 +1906,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -1968,6 +1975,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2043,6 +2051,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2120,6 +2129,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -2174,12 +2184,12 @@ describe("released edge Form placement", () => {
     expect(requests).toBe(0);
   });
 
-  test("recovers an already uploaded Version without uploading it again", async () => {
+  test("recovers an already uploaded Version without development write opt-in or another upload", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     const requests: Request[] = [];
     let storedVersion: { id: string; marker: string } | undefined;
-    const provider = new CloudflareProvider({
+    const options: CloudflareProviderOptions = {
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
       artifacts,
@@ -2242,39 +2252,51 @@ describe("released edge Form placement", () => {
         }
         throw new Error(`unexpected Cloudflare request: ${request.method} ${url.pathname}`);
       },
+    };
+    const development = new CloudflareProvider({
+      ...options,
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
     });
-    const apply = (operationMode: "initial" | "recovery") =>
-      provider.apply({
-        operationId: "op-version-commit-retry",
-        operationMode,
-        offering: versionOffering,
-        identity: { ...IDENTITY, name: "version" },
-        spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
-        relations: [
-          related("/worker", stored("ModuleWorker", "worker-uid", {}), {
-            nativeId: "worker:script-name",
-            offeringId: workerOffering.id,
-            providerPackRef: "cloudflare",
-            outputs: { scriptName: "script-name" },
+    const provider = new CloudflareProvider(options);
+    const input = {
+      operationId: "op-version-commit-retry",
+      offering: versionOffering,
+      identity: { ...IDENTITY, name: "version" },
+      spec: { handlers: ["fetch"], requiredSensitiveVars: [] },
+      relations: [
+        related("/worker", stored("ModuleWorker", "worker-uid", {}), {
+          nativeId: "worker:script-name",
+          offeringId: workerOffering.id,
+          providerPackRef: "cloudflare",
+          outputs: { scriptName: "script-name" },
+        }),
+        related(
+          "/bundle",
+          stored("WorkerBundle", "bundle-uid", {
+            manifestDigest: `sha256:${"d".repeat(64)}`,
           }),
-          related(
-            "/bundle",
-            stored("WorkerBundle", "bundle-uid", {
-              manifestDigest: `sha256:${"d".repeat(64)}`,
-            }),
-          ),
-        ],
-      });
+        ),
+      ],
+    };
 
-    expect(await apply("initial")).toMatchObject({
+    expect(await development.apply({ ...input, operationMode: "initial" })).toMatchObject({
       phase: "succeeded",
       result: { nativeId: "version:script-name:version-commit-retry" },
     });
-    expect(await apply("recovery")).toMatchObject({
-      phase: "succeeded",
-      result: { nativeId: "version:script-name:version-commit-retry" },
-    });
+    const initialRequests = requests.length;
+    for (const ticket of [
+      await provider.apply(input),
+      await provider.apply({ ...input, operationMode: "recovery" }),
+      await provider.recoverApply(input),
+      await provider.convergeApply(input),
+    ]) {
+      expect(ticket).toMatchObject({
+        phase: "succeeded",
+        result: { nativeId: "version:script-name:version-commit-retry" },
+      });
+    }
     expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    expect(requests.slice(initialRequests).every((request) => request.method === "GET")).toBe(true);
   });
 
   test("recovers the one tagged Version after its upload response is lost", async () => {
@@ -2286,6 +2308,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2388,6 +2411,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2437,6 +2461,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2540,6 +2565,7 @@ describe("released edge Form placement", () => {
       const provider = new CloudflareProvider({
         accountId: "acct_1",
         offerings: [workerOffering, versionOffering],
+        workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
         artifacts,
         authorize: () => "Bearer secret-account-token",
         apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2610,6 +2636,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2678,6 +2705,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2771,6 +2799,7 @@ describe("released edge Form placement", () => {
       const provider = new CloudflareProvider({
         accountId: "acct_1",
         offerings: [workerOffering, versionOffering],
+        workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
         artifacts,
         authorize: () => "Bearer secret-account-token",
         apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -2994,6 +3023,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -3044,6 +3074,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
@@ -3134,6 +3165,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -3210,7 +3242,7 @@ describe("released edge Form placement", () => {
     expect(JSON.stringify(ticket)).not.toContain("secret-oidc-value");
   });
 
-  test("settles a dispatched sensitive lease by readback without uploading twice", async () => {
+  test("settles a dispatched sensitive lease without development write opt-in or another upload", async () => {
     const workerOffering = technical("ModuleWorker");
     const versionOffering = technical("WorkerVersion");
     let marker = "";
@@ -3264,7 +3296,7 @@ describe("released edge Form placement", () => {
         };
       },
     };
-    const provider = new CloudflareProvider({
+    const options: CloudflareProviderOptions = {
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
       artifacts,
@@ -3325,7 +3357,12 @@ describe("released edge Form placement", () => {
         }
         throw new Error(`unexpected request: ${request.method} ${url.pathname}`);
       },
+    };
+    const development = new CloudflareProvider({
+      ...options,
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
     });
+    const provider = new CloudflareProvider(options);
     const input = {
       operationId: "op-version-sensitive-recovery",
       operationKey: SENSITIVE_OPERATION_KEY,
@@ -3349,7 +3386,7 @@ describe("released edge Form placement", () => {
       ],
     } as const;
 
-    expect(await provider.apply({ ...input, operationMode: "initial" })).toMatchObject({
+    expect(await development.apply({ ...input, operationMode: "initial" })).toMatchObject({
       phase: "failed",
       failure: { code: "unavailable", retryable: true },
     });
@@ -3446,6 +3483,7 @@ describe("released edge Form placement", () => {
       const provider = new CloudflareProvider({
         accountId: "acct_1",
         offerings: [workerOffering, versionOffering],
+        workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
         artifacts,
         runtimeInputs,
         authorize: () => "Bearer secret-account-token",
@@ -3557,6 +3595,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -3633,6 +3672,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -3716,6 +3756,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -3786,6 +3827,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -3885,6 +3927,7 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [workerOffering, versionOffering],
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       artifacts,
       runtimeInputs,
       authorize: () => "Bearer secret-account-token",
@@ -4738,10 +4781,14 @@ describe("released edge Form placement", () => {
     const provider = new CloudflareProvider({
       accountId: "acct_1",
       offerings: [endpointOffering],
+      workerBackend: {
+        kind: "ordinary-workers",
+        allowDevelopmentWorkerWrites: true,
+        workerEndpointSuffix: "tenant.workers.dev",
+      },
       artifacts,
       authorize: () => "Bearer secret-account-token",
       apiOrigin: "https://api.cloudflare.test/client/v4",
-      workerEndpointSuffix: "tenant.workers.dev",
       async fetch(request) {
         calls.push({
           method: request.method,

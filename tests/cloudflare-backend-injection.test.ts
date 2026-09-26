@@ -258,6 +258,75 @@ test("CloudflareProvider forwards managed delete and readback authority objects 
   expect(verifyNativeAbsenceInput?.target).toBe(target);
 });
 
+test("CloudflareProvider delegates every managed Worker write before refusing ordinary fallback", async () => {
+  for (const owns of [true, false]) {
+    const calls: { method: string; input: ApplyInput }[] = [];
+    const provider = new CloudflareProvider({
+      ...baseOptions(),
+      workerBackend: {
+        kind: "workers-for-platforms",
+        create: () => ({
+          ...backend,
+          owns: () => owns,
+          apply: async (input) => {
+            calls.push({ method: "apply", input });
+            return backend.apply(input);
+          },
+          recoverApply: async (input) => {
+            calls.push({ method: "recoverApply", input });
+            return backend.recoverApply(input);
+          },
+          convergeApply: async (input) => {
+            calls.push({ method: "convergeApply", input });
+            return backend.convergeApply(input);
+          },
+        }),
+      },
+    });
+    for (const kind of [
+      "ModuleWorker",
+      "WorkerVersion",
+      "WorkerDeployment",
+      "WorkerEndpoint",
+      "WorkerCustomDomain",
+      "WorkerCronTrigger",
+      "QueueConsumer",
+      "worker_script",
+    ]) {
+      const input: ApplyInput = {
+        operationId: `injected-${kind}`,
+        operationMode: "initial",
+        offering: {
+          ...offering,
+          kind: kind === "worker_script" ? kind : `takoform.${kind}`,
+          form: { ...offering.form, kind: kind === "worker_script" ? "WorkerVersion" : kind },
+        },
+        identity: { tenantRef: "tenant-injected", space: "default", name: "worker" },
+        spec: {},
+      };
+      for (const method of ["apply", "recoverApply", "convergeApply"] as const) {
+        const ticket = await provider[method](input);
+        if (owns) {
+          expect(ticket).toMatchObject({
+            phase: "succeeded",
+            result: { nativeId: "injected-native" },
+          });
+          expect(calls.at(-1)?.method).toBe(method);
+          expect(calls.at(-1)?.input).toEqual(
+            method === "convergeApply" ? { ...input, operationMode: "recovery" } : input,
+          );
+        } else {
+          expect(ticket).toMatchObject({
+            phase: "failed",
+            ...(method === "apply" ? { failure: { code: "denied" } } : {}),
+          });
+          expect(calls).toEqual([]);
+        }
+      }
+    }
+  }
+});
+
 test("CloudflareProvider rejects invalid managed factories without ordinary fallback", () => {
   const partial = { ...backend } as Partial<CloudflareWorkerBackend>;
   delete partial.recoverApply;
