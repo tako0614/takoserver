@@ -215,7 +215,7 @@ footer a { color: inherit; }
   h1 { font-size: 28px; }
   section { margin-top: 52px; }
   li a { flex-direction: column; align-items: flex-start; gap: 2px; }
-  li a code { white-space: nowrap; }
+  
 }
 </style>
 </head>
