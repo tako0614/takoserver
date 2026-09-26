@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -261,6 +262,26 @@ export class Counter extends Base {
       expect(childGone).toBe(true);
       return deadConfig ?? "";
     };
+    const durableAlarmRuns = async (): Promise<number> => {
+      const namespaceRoot = join(storageRoot, "namespaces");
+      const counts: number[] = [];
+      for await (const relative of new Bun.Glob("**/*.sqlite").scan(namespaceRoot)) {
+        const database = new Database(join(namespaceRoot, relative), { readonly: true });
+        try {
+          const row = database.query("SELECT count(*) AS n FROM alarm_runs").get() as {
+            n: number;
+          } | null;
+          if (row) counts.push(row.n);
+        } catch (error) {
+          // Other Actor IDs and Host-private owner stores have no fixture table.
+          if (!String(error).includes("no such table: alarm_runs")) throw error;
+        } finally {
+          database.close();
+        }
+      }
+      expect(counts).toHaveLength(2);
+      return counts.reduce((total, count) => total + count, 0);
+    };
     let owner = makeOwner();
     const identity = { ...scope, id: "カウンター/a" };
     try {
@@ -376,20 +397,52 @@ export class Counter extends Base {
       const pendingBeforeRestart = (await (
         await owner.fetch(identity, request("/alarm-set?delay=3000"))
       ).json()) as { pending: number };
+      expect(pendingBeforeRestart.pending).toBeGreaterThan(Date.now());
       await owner.close();
+      const startsBeforeColdRestart = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
       owner = makeOwner();
-      expect((await (await owner.fetch(identity, request("/alarm-status"))).json()).pending).toBe(
-        pendingBeforeRestart.pending,
-      );
-      let restoredRuns = 0;
-      for (let attempt = 0; attempt < 160; attempt += 1) {
-        restoredRuns = (
-          (await (await owner.fetch(identity, request("/alarm-status"))).json()) as { runs: number }
-        ).runs;
-        if (restoredRuns >= 3) break;
-        await Bun.sleep(50);
+      // No HTTP call may be needed to reconstruct the native owner and wake
+      // this persisted alarm. Only direct SQLite reads observe the wake.
+      await owner.ready;
+      let coldStarts = startsBeforeColdRestart;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        coldStarts = (await readFile(childPidFile, "utf8")).trim().split("\n").length;
+        if (coldStarts > startsBeforeColdRestart) break;
+        await Bun.sleep(20);
       }
-      expect(restoredRuns).toBe(3);
+      expect(coldStarts).toBe(startsBeforeColdRestart + 1);
+      let restoredRuns = await durableAlarmRuns();
+      for (let attempt = 0; attempt < 160 && restoredRuns < 5; attempt += 1) {
+        await Bun.sleep(50);
+        restoredRuns = await durableAlarmRuns();
+      }
+      expect(restoredRuns).toBe(5);
+      expect(
+        (await (await owner.fetch(identity, request("/alarm-status"))).json()).pending,
+      ).toBeNull();
+      const coldCrashAlarm = (await (
+        await owner.fetch(identity, request("/alarm-set?delay=3000"))
+      ).json()) as { pending: number };
+      const startsBeforeColdCrash = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
+      await crashChild();
+      let startsAfterColdCrash = startsBeforeColdCrash;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        startsAfterColdCrash = (await readFile(childPidFile, "utf8")).trim().split("\n").length;
+        if (startsAfterColdCrash > startsBeforeColdCrash) break;
+        await Bun.sleep(20);
+      }
+      expect(startsAfterColdCrash).toBe(startsBeforeColdCrash + 1);
+      expect(coldCrashAlarm.pending).toBeGreaterThan(Date.now());
+      let recoveredColdRuns = await durableAlarmRuns();
+      for (let attempt = 0; attempt < 160 && recoveredColdRuns < 6; attempt += 1) {
+        await Bun.sleep(50);
+        recoveredColdRuns = await durableAlarmRuns();
+      }
+      expect(recoveredColdRuns).toBe(6);
       const idleConfig = await crashChild();
       expect((await (await owner.fetch(identity, request("/increment"))).json()).value).toBe(3);
       expect(await stat(dirname(idleConfig)).catch(() => null)).toBeNull();
@@ -467,6 +520,19 @@ export class Counter extends Base {
       await owner.close();
       expect(await stat(dirname(closingConfig)).catch(() => null)).toBeNull();
       await closingReader?.cancel().catch(() => {});
+      owner = makeOwner();
+      await owner.ready;
+      await expect(owner.fetch(identity, request())).rejects.toThrow("Resource unavailable");
+      expect(
+        (
+          await (
+            await owner.fetch(
+              { ...identity, namespaceResourceUid: replacement.metadata.uid },
+              request(),
+            )
+          ).json()
+        ).value,
+      ).toBe(0);
     } finally {
       await owner.close();
       f.database.close();

@@ -52,6 +52,26 @@ alarm-delivery evidence. The actual self-host owner alarm path is exercised in
 `tests/selfhost-actor-execution-host.test.ts`; socket and WfP support remain
 unavailable. No tenant source executes in the controller process.
 
+The self-host cold-alarm qualifier is opt-in and fails (rather than skipping)
+without both exact candidate variables:
+
+```sh
+TAKOSERVER_ACTOR_QUALIFICATION_BINARY=/absolute/path/to/workerd \
+TAKOSERVER_ACTOR_QUALIFICATION_SHA256=<exact-sha256> \
+  bun run qualify:actor-cold-alarm
+```
+
+It verifies a clean execution-owner close/recreation and an unexpected native
+child kill: after each, no HTTP request is sent until a direct read of the
+actor-private SQLite store proves the pending alarm handler ran. A persisted
+namespace registration contains only tenant ID and namespace UID; startup
+rechecks the live Resource, deployment and selected Version before launching.
+The current isolated owner starts every previously served namespace serially,
+even if it has no pending alarm, so cold startup scales with registration count.
+An unclean parent-process crash leaves the exclusive lease in place and fails
+closed; this test does not qualify automatic stale-lease takeover, native
+provider retry ceilings, socket delivery or production Actor admission.
+
 Regression sensitivity was checked by temporarily moving the query rollback
 outside the native transaction: the native test exposed the surviving
 `query_must_rollback` table and the unit test exposed an extra row. Restoring the
