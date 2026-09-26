@@ -38,6 +38,94 @@ export interface WorkerdActorNamespace {
   close(): Promise<void>;
 }
 
+type AlarmGrant = NonNullable<Awaited<ReturnType<WorkerdActorNamespaceOptions["admitAlarm"]>>>;
+
+/** Process-local bridge bookkeeping, never a second durable alarm authority. */
+export function createActorAlarmAttemptRegistry(completeAlarm: (leaseId: string) => void) {
+  type Attempt = {
+    phase: "pending" | "granted" | "closed";
+    leaseId?: string;
+    controller: AbortController;
+    timer: ReturnType<typeof setTimeout>;
+    expire?: () => void;
+  };
+  const attempts = new Map<string, Attempt>();
+  const validDeadline = (deadlineAt: number): boolean =>
+    Number.isSafeInteger(deadlineAt) && deadlineAt > Date.now() && deadlineAt <= Date.now() + 5_000;
+  const tombstone = (nonce: string, deadlineAt: number): void => {
+    if (!validDeadline(deadlineAt)) return;
+    const controller = new AbortController();
+    const state: Attempt = {
+      phase: "closed",
+      controller,
+      timer: setTimeout(
+        () => {
+          if (attempts.get(nonce) === state) attempts.delete(nonce);
+        },
+        Math.max(1, deadlineAt - Date.now()),
+      ),
+    };
+    attempts.set(nonce, state);
+  };
+  return {
+    async begin(
+      _id: string,
+      nonce: string,
+      deadlineAt: number,
+      admit: (signal: AbortSignal) => Promise<AlarmGrant | null>,
+    ): Promise<AlarmGrant | null> {
+      if (!validDeadline(deadlineAt) || attempts.has(nonce)) return null;
+      const controller = new AbortController();
+      let expire!: (value: null) => void;
+      const expired = new Promise<null>((resolve) => {
+        expire = resolve;
+      });
+      const state: Attempt = {
+        phase: "pending",
+        controller,
+        expire: () => expire(null),
+        timer: setTimeout(
+          () => {
+            if (state.phase !== "pending") return;
+            state.phase = "closed";
+            state.controller.abort();
+            if (attempts.get(nonce) === state) attempts.delete(nonce);
+            state.expire?.();
+          },
+          Math.max(1, deadlineAt - Date.now()),
+        ),
+      };
+      attempts.set(nonce, state);
+      const result = Promise.resolve()
+        .then(() => admit(controller.signal))
+        .then((grant) => {
+          if (!grant) return null;
+          if (state.phase !== "pending" || Date.now() >= deadlineAt) {
+            completeAlarm(grant.leaseId);
+            return null;
+          }
+          state.phase = "granted";
+          state.leaseId = grant.leaseId;
+          return grant;
+        });
+      return Promise.race([result, expired]);
+    },
+    complete(nonce: string, deadlineAt: number): void {
+      const state = attempts.get(nonce);
+      if (state) {
+        if (state.phase === "closed") return;
+        state.phase = "closed";
+        state.controller.abort();
+        clearTimeout(state.timer);
+        state.expire?.();
+        if (state.leaseId !== undefined) completeAlarm(state.leaseId);
+        attempts.delete(nonce);
+      }
+      tombstone(nonce, deadlineAt);
+    },
+  };
+}
+
 /**
  * Private native namespace lifetime. Called only by HostedWorkerdRuntime using
  * the same operator-selected executable as its other children. No route,
@@ -171,6 +259,10 @@ export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)
   let child: ReturnType<typeof Bun.spawn> | undefined;
   let closing: Promise<void> | undefined;
   let verified = false;
+  const attempts = createActorAlarmAttemptRegistry(options.completeAlarm);
+  const validAttemptNonce = (value: unknown): value is string =>
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
   const admission = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -189,26 +281,32 @@ export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)
           return new Response(null, { status: 503 });
         }
         const record = value as Record<string, unknown>;
-        if (record.action === "complete" && typeof record.leaseId === "string") {
-          options.completeAlarm(record.leaseId);
-          return new Response(null, { status: closing ? 503 : 204 });
+        if (
+          record.action === "complete" &&
+          validAttemptNonce(record.attemptNonce) &&
+          typeof record.deadlineAt === "number" &&
+          Number.isSafeInteger(record.deadlineAt)
+        ) {
+          attempts.complete(record.attemptNonce, record.deadlineAt);
+          return new Response(null, { status: 204 });
         }
         if (!verified) return new Response(null, { status: 503 });
         if (
           record.action !== undefined ||
           typeof record.id !== "string" ||
-          typeof record.attemptNonce !== "string" ||
           !record.id ||
-          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-            record.attemptNonce,
-          )
+          !validAttemptNonce(record.attemptNonce) ||
+          typeof record.deadlineAt !== "number" ||
+          !Number.isSafeInteger(record.deadlineAt)
         ) {
           return new Response(null, { status: 503 });
         }
-        const admissionResult = await options.admitAlarm(
+        const admissionResult = await attempts.begin(
           record.id,
           record.attemptNonce,
-          AbortSignal.timeout(5_000),
+          record.deadlineAt,
+          (signal) =>
+            options.admitAlarm(record.id as string, record.attemptNonce as string, signal),
         );
         if (!admissionResult) return new Response(null, { status: 503 });
         if (
@@ -219,7 +317,7 @@ export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)
           !variantKeys.includes(admissionResult.variantKey) ||
           !admissionResult.leaseId
         ) {
-          options.completeAlarm(admissionResult.leaseId);
+          attempts.complete(record.attemptNonce, record.deadlineAt);
           return new Response(null, { status: 503 });
         }
         return Response.json(

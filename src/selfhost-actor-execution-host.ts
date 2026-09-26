@@ -160,6 +160,31 @@ export function createSelfhostActorExecutionHost(options: {
     }
   };
 
+  const hasCurrentRealization = async (
+    candidate: ActorResourceGraph | null,
+    identity: ActorScope,
+  ): Promise<boolean> => {
+    if (
+      !candidate ||
+      candidate.tenantId !== identity.tenantId ||
+      candidate.namespace.uid !== identity.namespaceResourceUid
+    )
+      return false;
+    const realized = await options.deployments.active(candidate.tenantId, candidate.worker.uid);
+    const script = realized?.outputs.scriptName;
+    return (
+      realized?.state === "active" &&
+      realized.tenantId === candidate.tenantId &&
+      realized.resourceUid === candidate.worker.uid &&
+      realized.providerPackRef === options.providerPackRef &&
+      realized.providerInstallationRef === options.providerInstallationRef &&
+      typeof script === "string" &&
+      /^[a-z0-9][a-z0-9_-]{0,127}$/u.test(script) &&
+      realized.nativeId.startsWith(`selfhost-worker:${script}:`) &&
+      realized.nativeId !== `selfhost-worker:${script}:`
+    );
+  };
+
   const scheduleRefresh = (owner: Owner, identity: ActorScope): void => {
     if (stopped || owner.refreshing) return;
     // The admission bridge must answer the native callback before replacing
@@ -236,8 +261,8 @@ export function createSelfhostActorExecutionHost(options: {
       }
       signal.throwIfAborted();
       const selection = JSON.stringify([
-        graph.namespace.className,
-        graph.worker.uid,
+        graph,
+        deployment,
         residentGraph.generationKey,
         residentGraph.versions.map((version) => [
           version.variantKey,
@@ -285,12 +310,18 @@ export function createSelfhostActorExecutionHost(options: {
           )
             return null;
           const graphNow = await options.graph(identity, gateSignal);
-          if (!sameGraph(graph, graphNow)) return null;
+          if (!sameGraph(graph, graphNow)) {
+            if (await hasCurrentRealization(graphNow, identity)) scheduleRefresh(current, identity);
+            return null;
+          }
           const deploymentNow = await options.deployments.active(
             identity.tenantId,
             graph.worker.uid,
           );
-          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) return null;
+          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) {
+            if (await hasCurrentRealization(graphNow, identity)) scheduleRefresh(current, identity);
+            return null;
+          }
           // Entropy is drawn once, at this eligible alarm attempt. A retry
           // draws afresh; neither a stale resident graph nor an exception may
           // silently fall back to another weighted Version.
@@ -330,7 +361,11 @@ export function createSelfhostActorExecutionHost(options: {
             !session.retiring &&
             sameGraph(graph, finalGraph) &&
             JSON.stringify(finalDeployment) === JSON.stringify(deployment);
-          if (!stillAuthorized) return null;
+          if (!stillAuthorized) {
+            if (await hasCurrentRealization(finalGraph, identity))
+              scheduleRefresh(current, identity);
+            return null;
+          }
           const leaseId = randomBytes(16).toString("hex");
           session.alarmLeases.add(leaseId);
           session.active += 1;

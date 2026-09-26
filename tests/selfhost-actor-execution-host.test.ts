@@ -801,9 +801,8 @@ export class Counter extends Base {
       // namespace owner to rotate to the newly active graph. Each retry then
       // samples the current weights afresh rather than inheriting startup A.
       const updateUid = "namespace-autonomous-version-update";
-      insert(f.database, resource(actorForm, "counter-autonomous-version-update", updateUid), [
-        f.relation,
-      ]);
+      const updateResource = resource(actorForm, "counter-autonomous-version-update", updateUid);
+      insert(f.database, updateResource, [f.relation]);
       const updateIdentity = { ...identity, id: "updated-b", namespaceResourceUid: updateUid };
       basisPoint = 0;
       await (await owner.fetch(updateIdentity, request("/alarm-set?delay=2000"))).json();
@@ -854,6 +853,60 @@ export class Counter extends Base {
       expect(updatedVersions).toEqual(["b2", "a"]);
       expect((await readFile(childPidFile, "utf8")).trim().split("\n").length).toBeGreaterThan(
         startsBeforeAutonomousUpdate,
+      );
+
+      // A valid Resource revision replacement also rotates from its retained
+      // alarm wake without a new HTTP request. Pending deletion above remains
+      // a denial, not a replacement.
+      const versionsBeforeResourceChange = updatedVersions.length;
+      const startsBeforeResourceChange = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
+      basisPoint = 9999;
+      await (
+        await owner.fetch(
+          { ...updateIdentity, id: "resource-refresh-b" },
+          request("/alarm-set?delay=700"),
+        )
+      ).json();
+      const revisedResource = {
+        ...updateResource,
+        metadata: { ...updateResource.metadata, revision: "8" },
+      };
+      f.database
+        .query("UPDATE tf_resources SET revision = ?, resource_json = ? WHERE uid = ?")
+        .run("8", JSON.stringify(revisedResource), updateUid);
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        updatedVersions = await readUpdateVersions();
+        if (updatedVersions.length > versionsBeforeResourceChange) break;
+        await Bun.sleep(25);
+      }
+      expect(updatedVersions.length).toBeGreaterThan(versionsBeforeResourceChange);
+      expect((await readFile(childPidFile, "utf8")).trim().split("\n").length).toBeGreaterThan(
+        startsBeforeResourceChange,
+      );
+
+      const versionsBeforeDeploymentChange = updatedVersions.length;
+      const startsBeforeDeploymentChange = (await readFile(childPidFile, "utf8"))
+        .trim()
+        .split("\n").length;
+      await (
+        await owner.fetch(
+          { ...updateIdentity, id: "deployment-refresh-b" },
+          request("/alarm-set?delay=700"),
+        )
+      ).json();
+      f.database
+        .query("UPDATE tf_resource_deployments SET native_id = ? WHERE id = ?")
+        .run("selfhost-worker:worker:operation-2", "deployment-worker");
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        updatedVersions = await readUpdateVersions();
+        if (updatedVersions.length > versionsBeforeDeploymentChange) break;
+        await Bun.sleep(25);
+      }
+      expect(updatedVersions.length).toBeGreaterThan(versionsBeforeDeploymentChange);
+      expect((await readFile(childPidFile, "utf8")).trim().split("\n").length).toBeGreaterThan(
+        startsBeforeDeploymentChange,
       );
 
       // Rotation is namespace-wide, so an alarm admitted for another ID is

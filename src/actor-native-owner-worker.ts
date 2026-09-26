@@ -316,30 +316,32 @@ export function createActorNativeOwner(
         });
         if (claimed === null) return;
         let succeeded = false;
-        let leaseId: string | undefined;
+        const attemptNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []);
+        const grantDeadlineAt = Date.now() + 5_000;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const deadline = new AbortController();
         try {
           const admission = this.env.ADMISSION;
           if (!admission || !SafeResponseStatus)
             throw new Error("Actor alarm admission unavailable");
-          const attemptNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []);
-          const admit = await Promise.race([
-            SafeReflectApply(admission.fetch, admission, [
-              new SafeRequest("http://actor.invalid/", {
-                method: "POST",
-                headers: new SafeHeaders({
-                  "x-takoserver-private-alarm-admission": admissionToken,
+          const selection: unknown = await Promise.race([
+            (async () => {
+              const admit = await (SafeReflectApply(admission.fetch, admission, [
+                new SafeRequest("http://actor.invalid/", {
+                  method: "POST",
+                  headers: new SafeHeaders({
+                    "x-takoserver-private-alarm-admission": admissionToken,
+                  }),
+                  body: SafeReflectApply(SafeJsonStringify, JSON, [
+                    { id: claimed, attemptNonce, deadlineAt: grantDeadlineAt },
+                  ]),
+                  signal: deadline.signal,
                 }),
-                body: SafeReflectApply(SafeJsonStringify, JSON, [
-                  {
-                    id: claimed,
-                    attemptNonce,
-                  },
-                ]),
-                signal: deadline.signal,
-              }),
-            ]) as Promise<Response>,
+              ]) as Promise<Response>);
+              if (SafeReflectApply(SafeResponseStatus, admit, []) !== 200)
+                throw new Error("Actor alarm admission denied");
+              return SafeReflectApply(SafeResponseJson, admit, []) as Promise<unknown>;
+            })(),
             new Promise<never>((_resolve, reject) => {
               timer = setTimeout(() => {
                 deadline.abort();
@@ -347,9 +349,6 @@ export function createActorNativeOwner(
               }, 5_000);
             }),
           ]);
-          if (SafeReflectApply(SafeResponseStatus, admit, []) !== 200)
-            throw new Error("Actor alarm admission denied");
-          const selection: unknown = await SafeReflectApply(SafeResponseJson, admit, []);
           if (typeof selection !== "object" || selection === null)
             throw new Error("Actor alarm admission denied");
           const selected = selection as {
@@ -374,7 +373,6 @@ export function createActorNativeOwner(
             !SafeHasOwn(selection, "leaseId")
           )
             throw new Error("Actor alarm admission denied");
-          leaseId = selected.leaseId;
           if (
             selected.generationKey !== graph.generationKey ||
             selected.epoch !== graph.epoch ||
@@ -382,6 +380,7 @@ export function createActorNativeOwner(
             selected.attemptNonce !== attemptNonce
           )
             throw new Error("Actor alarm admission denied");
+          if (Date.now() >= grantDeadlineAt) throw new Error("Actor alarm admission deadline");
           const variantIndex = variantKeys.indexOf(selected.variantKey);
           if (variantIndex < 0) throw new Error("Actor alarm admission denied");
           if (timer) clearTimeout(timer);
@@ -427,44 +426,74 @@ export function createActorNativeOwner(
           }
         }
         if (retirementFailed) this.poisoned = true;
-        await this.control(async () => {
-          const state = this.readAlarm();
-          if (succeeded && !retirementFailed) {
-            // Arm a successor before retiring its predecessor. If the owner
-            // dies after settlement, the successor still has a native wake.
-            if (state.pending !== null) await this.requireStorage().setAlarm(state.pending);
-            this.requireStorage().sql.exec(
-              "UPDATE actor_alarm_state SET obligation = 0, retry_at = NULL WHERE id = 1",
-            );
-          } else {
-            const retryAt = Date.now() + ALARM_RETRY_MS;
-            // An early wake before this write sees the old watchdog and
-            // reconciles; a crash after it retains the short retry timer.
-            await this.requireStorage().setAlarm(retryAt);
-            this.requireStorage().sql.exec(
-              "UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1",
-              retryAt,
-            );
-          }
-          await this.reconcile();
-        });
-        if (leaseId !== undefined) {
-          const admission = this.env.ADMISSION;
-          if (!admission || !SafeResponseStatus)
-            throw new Error("Actor alarm completion unavailable");
-          const completion = await SafeReflectApply(admission.fetch, admission, [
-            new SafeRequest("http://actor.invalid/", {
-              method: "POST",
-              headers: new SafeHeaders({
-                "x-takoserver-private-alarm-admission": admissionToken,
-              }),
-              body: SafeReflectApply(SafeJsonStringify, JSON, [{ action: "complete", leaseId }]),
-            }),
-          ]);
-          if (SafeReflectApply(SafeResponseStatus, completion, []) !== 204)
-            throw new Error("Actor alarm completion unavailable");
-          await completion.body?.cancel();
+        let settlementFailure: unknown;
+        try {
+          await this.control(async () => {
+            const state = this.readAlarm();
+            if (succeeded && !retirementFailed) {
+              // Arm a successor before retiring its predecessor. If the owner
+              // dies after settlement, the successor still has a native wake.
+              if (state.pending !== null) await this.requireStorage().setAlarm(state.pending);
+              this.requireStorage().sql.exec(
+                "UPDATE actor_alarm_state SET obligation = 0, retry_at = NULL WHERE id = 1",
+              );
+            } else {
+              const retryAt = Date.now() + ALARM_RETRY_MS;
+              // An early wake before this write sees the old watchdog and
+              // reconciles; a crash after it retains the short retry timer.
+              await this.requireStorage().setAlarm(retryAt);
+              this.requireStorage().sql.exec(
+                "UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1",
+                retryAt,
+              );
+            }
+            await this.reconcile();
+          });
+        } catch (error) {
+          settlementFailure = error;
         }
+        const admission = this.env.ADMISSION;
+        if (!admission || !SafeResponseStatus)
+          throw new Error("Actor alarm completion unavailable");
+        let completed = false;
+        for (let attempt = 0; attempt < 3 && !completed; attempt += 1) {
+          const completionDeadline = new AbortController();
+          let completionTimer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            const completion = await Promise.race([
+              SafeReflectApply(admission.fetch, admission, [
+                new SafeRequest("http://actor.invalid/", {
+                  method: "POST",
+                  headers: new SafeHeaders({
+                    "x-takoserver-private-alarm-admission": admissionToken,
+                  }),
+                  body: SafeReflectApply(SafeJsonStringify, JSON, [
+                    { action: "complete", attemptNonce, deadlineAt: grantDeadlineAt },
+                  ]),
+                  signal: completionDeadline.signal,
+                }),
+              ]) as Promise<Response>,
+              new Promise<never>((_resolve, reject) => {
+                completionTimer = setTimeout(() => {
+                  completionDeadline.abort();
+                  reject(new Error("Actor alarm completion deadline"));
+                }, 1_000);
+              }),
+            ]);
+            if (SafeReflectApply(SafeResponseStatus, completion, []) === 204) {
+              completed = true;
+            }
+          } catch {
+            // The attempt UUID makes a retry an idempotent release, not a replay.
+          } finally {
+            if (completionTimer) clearTimeout(completionTimer);
+          }
+        }
+        if (!completed) {
+          this.poisoned = true;
+          throw new Error("Actor alarm completion unavailable");
+        }
+        if (settlementFailure !== undefined) throw settlementFailure;
       });
       this.tail = turn.catch(() => {});
       this.state.waitUntil(this.tail);

@@ -378,7 +378,7 @@ test("native alarm selects the admitted variant independently for each attempt o
         async fetch(request) {
           const body = (await request.json()) as Record<string, unknown>;
           if (body.action === "complete") {
-            completions.push(body.leaseId as string);
+            completions.push(body.attemptNonce as string);
             return new Response(null, { status: 204 });
           }
           admissionRequests.push({
@@ -410,7 +410,73 @@ test("native alarm selects the admitted variant independently for each attempt o
     expect(admissionRequests).toHaveLength(2);
     expect(admissionRequests.map(({ id }) => id)).toEqual(["same-id", "same-id"]);
     expect(admissionRequests[0]?.attemptNonce).not.toBe(admissionRequests[1]?.attemptNonce);
-    expect(completions).toEqual(["lease-0", "lease-1"]);
+    expect(completions).toEqual(admissionRequests.map(({ attemptNonce }) => attemptNonce));
+  } finally {
+    database.close();
+  }
+});
+
+test("lost grant response still completes the known attempt without constructing a facet", async () => {
+  const database = new Database(":memory:");
+  const attempts: string[] = [];
+  const completions: string[] = [];
+  let facetGets = 0;
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  const owner = new Owner(
+    {
+      facets: {
+        get() {
+          facetGets += 1;
+          throw new Error("facet must not be constructed");
+        },
+        abort() {},
+      },
+      storage: {
+        sql: {
+          exec(sql: string, ...params: (string | number | null)[]) {
+            const statement = database.query(sql);
+            if (sql.startsWith("SELECT"))
+              return statement.all(...params) as Record<string, unknown>[];
+            statement.run(...params);
+            return [];
+          },
+        },
+        setAlarm() {},
+        deleteAlarm() {},
+      },
+      waitUntil() {},
+    },
+    {
+      CLASS: {},
+      CLASS_0: {},
+      ADMISSION: {
+        async fetch(request) {
+          const body = (await request.json()) as Record<string, unknown>;
+          if (body.action === "complete") {
+            completions.push(body.attemptNonce as string);
+            return new Response(null, { status: 204 });
+          }
+          attempts.push(body.attemptNonce as string);
+          throw new Error("grant response lost after Host lease allocation");
+        },
+      },
+    },
+  );
+  try {
+    database
+      .query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1")
+      .run("same-id", Date.now() - 1);
+    await owner.alarm();
+    expect(facetGets).toBe(0);
+    expect(attempts).toHaveLength(1);
+    expect(completions).toEqual(attempts);
+    expect(database.query("SELECT obligation FROM actor_alarm_state WHERE id = 1").get()).toEqual({
+      obligation: 1,
+    });
   } finally {
     database.close();
   }
