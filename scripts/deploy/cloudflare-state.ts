@@ -6,6 +6,8 @@ import { preflightError } from "./errors.ts";
 
 const API = "https://api.cloudflare.com/client/v4";
 const PAGE_SIZE = 100;
+// Pages rejects the shared inventory size; retain strict pagination at 20 entries.
+const PAGES_PAGE_SIZE = 20;
 const MAX_PAGES = 10_000;
 const MAX_PROVIDER_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAX_TOPOLOGY_AUDIT_RESPONSE_BYTES = 1024 * 1024;
@@ -404,9 +406,10 @@ export class CloudflareState {
   }
 
   pagesDeployments(project: string): Promise<readonly unknown[]> {
-    return this.list(
-      `/pages/projects/${encodeURIComponent(project)}/deployments`,
+    return this.#list(
+      this.#url(`/pages/projects/${encodeURIComponent(project)}/deployments`),
       `${project} Pages deployment history`,
+      PAGES_PAGE_SIZE,
     );
   }
 
