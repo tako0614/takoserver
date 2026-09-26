@@ -114,6 +114,7 @@ export function landingHtml(options: LandingOptions): string {
 <meta property="og:site_name" content="Takoserver">
 <meta property="og:locale" content="${locale === "ja" ? "ja_JP" : "en_US"}">
 <meta property="og:url" content="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+<link rel="canonical" href="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Takoserver">
 <meta name="twitter:description" content="${copy.description}">
