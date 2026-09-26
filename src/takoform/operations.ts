@@ -1080,8 +1080,8 @@ const REATTEMPTED_SETTLED_FAILURE_CODES: ReadonlySet<string> = new Set([
  * because the code taxonomy is closed and released and one of its codes carries
  * both shapes. `invalid_argument` is "your weights do not sum to 10000" — a
  * fact about the request that no repair elsewhere changes — and it is equally
- * "the ModuleWorker you name has no WorkerDeployment", "another resource holds
- * this hostname", "a second deployment already holds this Worker": facts about
+ * "another resource holds this hostname", "a second deployment already holds
+ * this Worker": facts about
  * a neighbour, each cured without one byte of this resource's plan moving. So
  * the site that knows says so, by marking its refusal
  * `CROSS_RESOURCE_PRECONDITION`, and a marked refusal is re-attempted whatever

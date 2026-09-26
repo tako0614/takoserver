@@ -588,11 +588,10 @@ export class TakoformHostError extends Error {
  * "this document is wrong" — malformed weights, a duplicated binding name, a
  * relation the document does not declare — and that is a fact about the
  * request, so the stored answer stays the answer for as long as the request is
- * byte-identical. It also says "the ModuleWorker this endpoint names has no
- * WorkerDeployment", "another resource already claims this hostname", "a second
+ * byte-identical. It also says "another resource already claims this hostname", "a second
  * deployment already holds this Worker" — and none of those is a fact about the
  * request at all. Each is a fact about a *neighbour*, which the operator cures
- * by adding the deployment, releasing the hostname, or deleting the other
+ * by releasing the hostname or deleting the other
  * deployment, without touching one byte of this resource's plan.
  *
  * The released provider derives its idempotency key from that plan, so the

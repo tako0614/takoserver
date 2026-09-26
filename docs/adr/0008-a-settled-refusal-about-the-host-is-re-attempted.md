@@ -228,7 +228,8 @@ the retained-effect conflict fence.
 
 The examples above described a missing `WorkerDeployment` as
 `invalid_argument` (400). That was an implementation observation, not the
-published attachment-gate rule: the frozen Host API v1 contract requires
+published attachment-gate rule: the frozen stable-v1 Edge family conformance
+checks `attachment-requires-active-deployment` and `handler-gated-attachments` require
 `unsupported_capability` (422) when an attachment's worker has no active
 deployment. Inbound service bindings to an unserved worker use the same rule.
 The Host now answers with that portable code and status while retaining
