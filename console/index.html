@@ -10,8 +10,46 @@
     />
     <meta name="color-scheme" content="light dark" />
     <meta name="referrer" content="same-origin" />
+    <meta name="robots" content="noindex" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/app.css" />
+    <style>
+      html {
+        background: #ffffff;
+        color: #0e0e10;
+      }
+      @media (prefers-color-scheme: dark) {
+        html:not([data-theme="light"]) {
+          background: #0b0b0c;
+          color: #f2f2f3;
+        }
+      }
+      html[data-theme="dark"] {
+        background: #0b0b0c;
+        color: #f2f2f3;
+      }
+      html[data-theme="light"] {
+        background: #ffffff;
+        color: #0e0e10;
+      }
+    </style>
+    <script>
+      (() => {
+        const theme = localStorage.getItem("takoserver.theme");
+        if (theme === "light" || theme === "dark") {
+          document.documentElement.dataset.theme = theme;
+        }
+        const saved = localStorage.getItem("takoserver.console.locale");
+        const languages =
+          navigator.languages ?? (navigator.language ? [navigator.language] : []);
+        document.documentElement.lang =
+          saved === "ja" || saved === "en"
+            ? saved
+            : languages.some((language) => language.toLowerCase().startsWith("ja"))
+              ? "ja"
+              : "en";
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

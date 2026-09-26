@@ -56,11 +56,17 @@ cpSync("console/favicon.svg", join(outDir, "favicon.svg"));
 let html = await Bun.file("console/index.html").text();
 if (apiOrigin !== undefined) {
   // Stamped on the root element, where `state.ts` reads it before the first
-  // request is made.
-  html = html.replace(
-    '<html lang="en">',
-    `<html lang="en" data-api-origin="${escapeHtml(apiOrigin)}">`,
-  );
+  // request is made. The tag already carries `lang`, so stamp by inserting
+  // the attribute rather than matching a fixed string; a miss must fail
+  // loudly instead of shipping a console that guesses its API origin.
+  const tag = /<html[^>]*>/u.exec(html);
+  if (tag === null) {
+    throw new Error("console/index.html has no <html> tag to stamp");
+  }
+  const stamped = tag[0].includes("data-api-origin=")
+    ? tag[0].replace(/data-api-origin="[^"]*"/u, `data-api-origin="${escapeHtml(apiOrigin)}"`)
+    : `${tag[0].slice(0, -1)} data-api-origin="${escapeHtml(apiOrigin)}">`;
+  html = html.replace(tag[0], stamped);
 }
 await Bun.write(join(outDir, "index.html"), html);
 

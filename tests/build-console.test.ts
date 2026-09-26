@@ -34,7 +34,7 @@ describe("Takoserver Console build", () => {
     const html = readFileSync(join(output, "index.html"), "utf8");
     const script = readFileSync(join(output, "console.js"), "utf8");
 
-    expect(html).toContain('<html lang="ja">');
+    expect(html).toContain('<html lang="ja" data-api-origin="https://api.takoserver.com">');
     expect(script).toContain("使用量と請求");
     expect(script).toContain("リソース");
     expect(script).not.toContain('"/forms"');
