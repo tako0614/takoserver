@@ -115,7 +115,11 @@ export async function startStableLocalCloudflareHost(input: {
     },
     authorize: () => "Bearer local-cloudflare-authority",
     apiOrigin: "https://api.cloudflare.test/client/v4",
-    workerEndpointSuffix: WORKER_SUFFIX,
+    workerBackend: {
+      kind: "ordinary-workers",
+      allowDevelopmentWorkerWrites: true,
+      workerEndpointSuffix: WORKER_SUFFIX,
+    },
     workerCompatibilityDate: "2026-08-18",
     fetch: (request) => cloudflare.fetch(request),
   });

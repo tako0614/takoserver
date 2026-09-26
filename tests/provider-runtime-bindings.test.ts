@@ -939,6 +939,7 @@ describe("provider-private runtime Binding materialization", () => {
     const moduleDigest = `sha256:${"e".repeat(64)}`;
     const uploads: string[] = [];
     const cloudflare = new CloudflareProvider({
+      workerBackend: { kind: "ordinary-workers", allowDevelopmentWorkerWrites: true },
       accountId: "acct_1",
       offerings: [edgeProviderOffering(version, { id: "cloudflare.edge.stable-v1.workerversion" })],
       authorize: () => "Bearer secret-account-token",

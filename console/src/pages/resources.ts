@@ -3,9 +3,9 @@ import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
-import { linkProps, navigate, resourcePath } from "../router.ts";
+import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api } from "../state.ts";
-import { ago, badge, card, empty, ICON, icon, shortDigest, whenReady } from "../ui.ts";
+import { ago, badge, card, copyable, empty, ICON, icon, shortDigest, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /**
@@ -20,6 +20,22 @@ export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
   const spaceFilter = signal("");
   const page = resource(() => api.resources(organizationId));
+  const operationId = route().query.get("operation");
+  // Keep the accepted handle in the URL across refreshes. Checking status is
+  // explicit: it never resubmits create/delete or claims acceptance is done.
+  const operation = operationId
+    ? resource(async () => {
+        try {
+          return await api.resourceOperation(organizationId, operationId);
+        } finally {
+          page.reload();
+        }
+      })
+    : null;
+  const reload = (): void => {
+    if (operation) operation.reload();
+    else page.reload();
+  };
   // Loaded alongside, because the button that creates a resource must offer
   // exactly what this organization may provision — not a list written here.
   const catalog = resource(() => api.catalog(organizationId));
@@ -48,7 +64,7 @@ export function resourcesPage(organizationId: string): Child {
         { class: "toolbar" },
         h(
           "button",
-          { class: "btn", type: "button", onClick: page.reload },
+          { class: "btn", type: "button", onClick: reload },
           icon(ICON.refresh, 14),
           text(tr("再読み込み", "Reload")),
         ),
@@ -72,6 +88,50 @@ export function resourcesPage(organizationId: string): Child {
         }),
       ),
     ),
+    operation && operationId
+      ? card(
+          tr("受け付けた操作", "Accepted operation"),
+          h(
+            "div",
+            { class: "card__body", style: { display: "grid", gap: "12px" } },
+            copyable(operationId),
+            live(() =>
+              whenReady(
+                operation.get(),
+                (current) => {
+                  if (!current.done) {
+                    return h(
+                      "div",
+                      { class: "notice" },
+                      tr(
+                        "操作を受け付けました。まだ完了していません。「再読み込み」で状態を確認できます。",
+                        "Accepted, not yet complete. Use Reload to check its status.",
+                      ),
+                    );
+                  }
+                  if ("deleted" in current.result) {
+                    return badge(tr("削除が完了しました", "Deletion complete"), "ok");
+                  }
+                  const created = current.result.resource;
+                  return h(
+                    "a",
+                    {
+                      ...linkProps(
+                        resourcePath(created.metadata.space, created.kind, created.metadata.name),
+                      ),
+                    },
+                    tr(
+                      `${created.kind} ${created.metadata.name} の作成が完了しました`,
+                      `${created.kind} ${created.metadata.name} created`,
+                    ),
+                  );
+                },
+                { retry: reload },
+              ),
+            ),
+          ),
+        )
+      : null,
     live(() =>
       whenReady(
         page.get(),
@@ -82,8 +142,8 @@ export function resourcesPage(organizationId: string): Child {
               empty(
                 tr("リソースがありません", "Nothing declared yet"),
                 tr(
-                  "ここで作成するか、Takoform providerまたはCLIから適用してください。ホストが受け付けるとすぐに表示されます。",
-                  "Declare one here, or apply it with the Takoform provider or the CLI — either way it appears the moment the Host accepts it.",
+                  "ここで作成するか、Takoform providerまたはCLIから適用してください。ホストで作成が完了すると表示されます。",
+                  "Declare one here, or apply it with the Takoform provider or the CLI. It appears once the Host completes creation.",
                 ),
               ),
             );
