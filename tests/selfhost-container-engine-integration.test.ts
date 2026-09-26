@@ -210,21 +210,27 @@ test("container service composes Docker transport, durable recovery and applicat
     };
     holdNextCreate = true;
     const updating = runtime.reconcile(second);
-    await candidateCreateEntered.promise;
-    // The candidate's native creation is still pending. Admission must remain
-    // bound to the old immutable revision while that external call is in flight.
+    const settledUpdating = updating.then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    );
     let oldRoute: Response | undefined;
     try {
+      await within(candidateCreateEntered.promise, 2_000);
+      // The candidate's native creation is still pending. Admission must remain
+      // bound to the old immutable revision while that external call is in flight.
       oldRoute = await within(
         runtime.fetch(identity, new Request("https://logical.example/")),
         2_000,
       );
+      if (!oldRoute) throw new Error("old route did not return a response");
+      expect(await oldRoute.json()).toEqual({ version: "a", path: "/", body: "" });
     } finally {
       releaseCandidateCreate.resolve();
+      await within(settledUpdating, 2_000).catch(() => undefined);
     }
-    if (!oldRoute) throw new Error("old route did not return a response");
-    expect(await oldRoute.json()).toEqual({ version: "a", path: "/", body: "" });
-    await updating;
+    const updateResult = await within(settledUpdating, 2_000);
+    if (updateResult.status === "rejected") throw updateResult.error;
     expect(
       await (await runtime.fetch(identity, new Request("https://logical.example/"))).json(),
     ).toEqual({ version: "a", path: "/", body: "" });
