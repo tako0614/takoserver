@@ -76,7 +76,8 @@ is not performed by this build script.
 ## Unqualified WorkerLoader closed-graph candidate
 
 `patches/worker-loader-closed-graph.candidate.patch` is a separate development
-overlay, applied **after** the active `closed-module-graph.patch`. It keeps the
+overlay selected explicitly with `--candidate workflow-loader`. Candidate mode
+applies the active `closed-module-graph.patch` first and this patch second. It keeps the
 existing WorkerLoader `modules` dictionary application-only, adds a separate
 optional `hostPrivateModules` dictionary, and adds `mainModuleRole` plus an
 explicit application-main policy using the same native module boundary as
@@ -85,12 +86,42 @@ once in each provenance namespace without adding a second role authority to a
 module entry. Its SHA-256 is
 `5a65dc6c02b1b444513e670b3b44eaf6cf4ea419a1590c73a39a72cbdc15b7d7`.
 
-Static patch application (`git apply --check` and GNU `patch --dry-run --fuzz=0`)
-and JS syntax checks, plus independent source review, have passed. Native
-compilation and WorkerLoader/closed-graph tests have not.
-The normal build script does not apply this candidate, and the active patch,
-source and binary pins remain unchanged. Do not claim Workflow execution
-support or configure a candidate binary from these static checks.
+Candidate preparation/build requires a fresh private state root. `--prepare-only`
+downloads or verifies the pinned upstream archive and applies both overlays in
+order without invoking Bazel. Its JSON output includes a deterministic candidate
+identity bound to the Takoserver commit, build-script digest, upstream archive
+identity, Bazelisk/Bazel digests, clang version/platform, and both patch digests.
+A full candidate build requires a clean Takoserver worktree and writes the
+binary plus `provenance.json` only beneath
+`artifacts/candidates/<identity>/`; the output SHA-256 names the exact candidate
+binary. Candidate mode uses Bazel `--jobs` and `--local_resources` scheduling
+budgets (default 2 jobs / 8192 MiB). These are Bazel scheduling limits, not an
+OS-enforced memory ceiling. The candidate publisher refuses an existing
+identity directory rather than replacing its bytes or record.
+
+```sh
+BAZELISK=/absolute/path/to/bazelisk \
+WORKERD_LLVM_ROOT=/absolute/compiler-root \
+bun run build:workerd -- \
+  --candidate workflow-loader \
+  --state-root /absolute/private/workerd-loader-candidate \
+  --jobs 2 \
+  --memory-mib 8192
+```
+
+The state root owns a private source tree, Bazel output root, and repository
+cache; it does not silently reuse the operator's global Bazel cache. Provision
+enough private disk for the pinned source archive, dependency downloads, and
+native outputs before a full candidate build. `--prepare-only` is the
+non-compile way to verify archive retrieval and combined-patch application.
+
+The accepted build remains the default when `--candidate workflow-loader` is
+absent. The candidate output is explicitly marked
+`unqualified-native-tests-not-run`; native compilation, exact-binary probing,
+WorkerLoader/closed-graph qualification, runtime wiring, and acceptance into
+the artifact pin remain separate work. The active patch, source and accepted
+binary pins are unchanged. Do not claim Workflow execution support or configure
+a candidate binary as `TAKOSERVER_WORKERD_BINARY`.
 
 Promotion requires a separately qualified combined overlay and new artifact
 identity, then outer/tenant-isolate runtime wiring and native RPC, lifecycle and
