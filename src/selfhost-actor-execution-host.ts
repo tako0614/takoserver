@@ -115,6 +115,7 @@ export function createSelfhostActorExecutionHost(options: {
   const retire = async (owner: Owner): Promise<void> => {
     const session = owner.session;
     if (!session) return;
+    session.process.disableAlarmAdmission();
     if (session.active > 0 && !session.dead)
       await new Promise<void>((resolve) => session.idle.add(resolve));
     session.retiring = true;
@@ -221,6 +222,58 @@ export function createSelfhostActorExecutionHost(options: {
           current.locked = true;
         }
         let process: WorkerdActorNamespace;
+        let admittedSession: Session | undefined;
+        const admittedAlarm = async (gateSignal: AbortSignal): Promise<boolean> => {
+          // This runs on the private bridge, never on `exclusive`: a native
+          // startup alarm can arrive while activate awaits child readiness.
+          const session = admittedSession;
+          if (
+            stopped ||
+            !session ||
+            current.session !== session ||
+            session.dead ||
+            session.retiring
+          )
+            return false;
+          const graphNow = await options.graph(identity, gateSignal);
+          if (!sameGraph(graph, graphNow)) return false;
+          const deploymentNow = await options.deployments.active(
+            identity.tenantId,
+            graph.worker.uid,
+          );
+          if (JSON.stringify(deploymentNow) !== JSON.stringify(deployment)) return false;
+          const versionNow = await readWorkerdSelectedActiveVersion(options.runtimeRoot, script, {
+            expectedWorkerResourceUid: graph.worker.uid,
+            basisPoint,
+          });
+          if (
+            !versionNow ||
+            JSON.stringify([
+              graph.namespace.className,
+              graph.worker.uid,
+              versionNow.versionId,
+              versionNow.workerVersionUid,
+              versionNow.generationKey,
+            ]) !== selection
+          )
+            return false;
+          // Fence graph/deployment again after the asynchronous Version read.
+          // Pending deletion before this final graph read denies the callback.
+          const finalDeployment = await options.deployments.active(
+            identity.tenantId,
+            graph.worker.uid,
+          );
+          const finalGraph = await options.graph(identity, gateSignal);
+          gateSignal.throwIfAborted();
+          return (
+            !stopped &&
+            current.session === session &&
+            !session.dead &&
+            !session.retiring &&
+            sameGraph(graph, finalGraph) &&
+            JSON.stringify(finalDeployment) === JSON.stringify(deployment)
+          );
+        };
         try {
           process = await openWorkerdActorNamespace(options.binary, {
             namespaceKey: key,
@@ -230,6 +283,7 @@ export function createSelfhostActorExecutionHost(options: {
             modules: selected.modules,
             hostModules: selected.hostModules,
             signal,
+            admitAlarm: admittedAlarm,
           });
         } catch (error) {
           throw new ActorNativeStartUnavailable(error);
@@ -242,8 +296,10 @@ export function createSelfhostActorExecutionHost(options: {
           dead: false,
           retiring: false,
         };
+        admittedSession = session;
         current.session = session;
         void process.exited.then(() => {
+          process.disableAlarmAdmission();
           const unexpected = !session.retiring;
           session.dead = true;
           // A dead child cannot complete a held response. Wake retirement
@@ -329,6 +385,7 @@ export function createSelfhostActorExecutionHost(options: {
       signal.throwIfAborted();
       const session = current.session;
       if (!session || session.dead) throw new Error("Actor namespace unavailable");
+      session.process.enableAlarmAdmission();
       session.active += 1;
       return session;
     });

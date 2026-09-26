@@ -321,7 +321,7 @@ export class Counter extends Base {
       })),
     });
     let basisPoint = 0;
-    let afterGraphRead: (() => void) | undefined;
+    let afterGraphRead: ((readScope: typeof scope) => void | Promise<void>) | undefined;
     const makeOwner = () =>
       createSelfhostActorExecutionHost({
         runtimeRoot,
@@ -329,7 +329,7 @@ export class Counter extends Base {
         binary: childWrapper,
         graph: async (scope, signal) => {
           const graph = await f.read(scope, signal);
-          afterGraphRead?.();
+          await afterGraphRead?.(scope);
           return graph;
         },
         deployments: f.deployments,
@@ -356,7 +356,7 @@ export class Counter extends Base {
       expect(childGone).toBe(true);
       return deadConfig ?? "";
     };
-    const durableAlarmRuns = async (): Promise<number> => {
+    const durableAlarmRuns = async (expectedIds: number | null = 2): Promise<number> => {
       const namespaceRoot = join(storageRoot, "namespaces");
       const counts: number[] = [];
       for await (const relative of new Bun.Glob("**/*.sqlite").scan(namespaceRoot)) {
@@ -373,8 +373,29 @@ export class Counter extends Base {
           database.close();
         }
       }
-      expect(counts).toHaveLength(2);
+      if (expectedIds !== null) expect(counts).toHaveLength(expectedIds);
       return counts.reduce((total, count) => total + count, 0);
+    };
+    const durableAlarmObligations = async (): Promise<number> => {
+      let obligations = 0;
+      for await (const relative of new Bun.Glob("**/*.sqlite").scan(
+        join(storageRoot, "namespaces"),
+      )) {
+        const database = new Database(join(storageRoot, "namespaces", relative), {
+          readonly: true,
+        });
+        try {
+          const row = database.query("SELECT obligation FROM actor_alarm_state").get() as {
+            obligation: number;
+          } | null;
+          obligations += row?.obligation ?? 0;
+        } catch (error) {
+          if (!String(error).includes("no such table: actor_alarm_state")) throw error;
+        } finally {
+          database.close();
+        }
+      }
+      return obligations;
     };
     let owner = makeOwner();
     const identity = { ...scope, id: "カウンター/a" };
@@ -671,11 +692,92 @@ export class Counter extends Base {
           ).json()
         ).value,
       ).toBe(0);
+      const replacementIdentity = {
+        ...identity,
+        id: "b",
+        namespaceResourceUid: replacement.metadata.uid,
+      };
+      await (await owner.fetch(replacementIdentity, request("/alarm-set?delay=1000"))).json();
+      await owner.close();
+      let replacementReads = 0;
+      let releaseFinalGraph!: () => void;
+      const heldFinalGraph = new Promise<void>((resolve) => {
+        releaseFinalGraph = resolve;
+      });
+      let reachedFinalGraph!: () => void;
+      const finalGraphReached = new Promise<void>((resolve) => {
+        reachedFinalGraph = resolve;
+      });
+      afterGraphRead = async (readScope) => {
+        if (readScope.namespaceResourceUid !== replacement.metadata.uid) return;
+        replacementReads += 1;
+        if (replacementReads === 3) {
+          afterGraphRead = undefined;
+          reachedFinalGraph();
+          await heldFinalGraph;
+        }
+      };
+      owner = makeOwner();
+      try {
+        await finalGraphReached;
+        // Native startup has loaded the retained due alarm, but final Host
+        // verification is still held: no tenant callback may begin yet.
+        await Bun.sleep(1_200);
+        expect(await durableAlarmRuns(2)).toBe(6);
+        expect(await durableAlarmObligations()).toBeGreaterThan(0);
+      } finally {
+        releaseFinalGraph();
+      }
+      await owner.ready;
+      let startupRuns = 6;
+      for (let attempt = 0; attempt < 100 && startupRuns < 8; attempt += 1) {
+        await Bun.sleep(50);
+        startupRuns = await durableAlarmRuns(null);
+      }
+      expect(startupRuns).toBe(8);
+      const selectedPointer = join(runtimeRoot, "workers", "worker", "takoserver-site.json");
+      const selectedBytes = await readFile(selectedPointer);
+      await (await owner.fetch(replacementIdentity, request("/alarm-set?delay=700"))).json();
+      await writeFile(selectedPointer, "{");
+      await Bun.sleep(1_300);
+      expect(await durableAlarmRuns(3)).toBe(8);
+      expect(await durableAlarmObligations()).toBeGreaterThan(0);
+      await writeFile(selectedPointer, selectedBytes);
+      let repairedRuns = 8;
+      for (let attempt = 0; attempt < 100 && repairedRuns < 9; attempt += 1) {
+        await Bun.sleep(50);
+        repairedRuns = await durableAlarmRuns(null);
+      }
+      expect(repairedRuns).toBe(9);
+      await (await owner.fetch(replacementIdentity, request("/alarm-set?delay=700"))).json();
+      f.database
+        .query(
+          "UPDATE tf_resource_deletion_attestations SET state = 'pending' WHERE resource_uid = ?",
+        )
+        .run(replacement.metadata.uid);
+      await Bun.sleep(1_300);
+      expect(await durableAlarmRuns(3)).toBe(9);
+      expect(await durableAlarmObligations()).toBeGreaterThan(0);
+      await owner.close();
+      owner = makeOwner();
+      expect(await owner.ready).toEqual(
+        expect.arrayContaining([
+          {
+            tenantId: scope.tenantId,
+            namespaceResourceUid: replacement.metadata.uid,
+            reason: "authority_unavailable",
+            attempts: 1,
+          },
+        ]),
+      );
+      await Bun.sleep(1_300);
+      expect(await durableAlarmRuns(3)).toBe(9);
+      expect(await durableAlarmObligations()).toBeGreaterThan(0);
     } finally {
       await owner.close();
       f.database.close();
       await rm(root, { recursive: true, force: true });
     }
   },
-  30_000,
+  45_000,
 );

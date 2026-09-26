@@ -71,6 +71,16 @@ is reported by `ready` and `coldStartFailures()` after at most three attempts
 (1s, then 2s backoff), without disabling another namespace. A failed namespace
 is not reported as having delivered its alarm; corrupt registration metadata
 still fails startup.
+Before each native alarm callback, an owner-only private bridge defaults to
+deny, including during child startup. An explicit allow rechecks the live
+namespace graph, active deployment and pinned selected Version; denial retains
+the durable obligation and retry wake without constructing the application
+facet. The native qualifier checks malformed selected-Version bytes and a
+pending deletion attestation deny callbacks, including after a cold owner
+restart. This is an admission fence, not complete deletion purge or child
+termination. A graph revision, deployment or Version change leaves an old
+process retrying without autonomous rotation until a request or owner restart;
+fresh weighted Version choice per alarm is not qualified.
 The current isolated owner starts every previously served namespace serially,
 even if it has no pending alarm, so cold startup scales with registration count.
 An unclean parent-process crash leaves the exclusive lease in place and fails

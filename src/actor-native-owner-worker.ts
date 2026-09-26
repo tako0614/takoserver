@@ -35,6 +35,7 @@ const SafeReflectApply = Reflect.apply;
 const SafeHeadersSet = Headers.prototype.set;
 const SafeResponseJson = Response.prototype.json;
 const SafeResponseOk = Object.getOwnPropertyDescriptor(Response.prototype, "ok")?.get;
+const SafeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
 const SafeEncodeURIComponent = encodeURIComponent;
 const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
@@ -142,16 +143,25 @@ function withHeaders(request: Request, headers: Headers): Request {
  * This does not qualify crash recovery or native request lifetime limits;
  * the self-host Actor admission refusal remains in force.
  */
-export function createActorNativeOwner(deliveryToken: string) {
-  if (!/^[a-f0-9]{64}$/u.test(deliveryToken))
+export function createActorNativeOwner(deliveryToken: string, admissionToken: string) {
+  if (!/^[a-f0-9]{64}$/u.test(deliveryToken) || !/^[a-f0-9]{64}$/u.test(admissionToken))
     throw new Error("Actor delivery capability unavailable");
   return class ActorOwner {
     readonly state: NativeState;
-    readonly env: { readonly CLASS: unknown };
+    readonly env: {
+      readonly CLASS: unknown;
+      readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+    };
     private tail: Promise<void> = Promise.resolve();
     private alarmTail: Promise<void> = Promise.resolve();
     private readonly ready: Promise<void>;
-    constructor(state: NativeState, env: { readonly CLASS: unknown }) {
+    constructor(
+      state: NativeState,
+      env: {
+        readonly CLASS: unknown;
+        readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+      },
+    ) {
       this.state = state;
       this.env = env;
       const initialize = async (): Promise<void> => {
@@ -279,13 +289,38 @@ export function createActorNativeOwner(deliveryToken: string) {
         });
         if (claimed === null) return;
         let succeeded = false;
-        const child = this.state.facets.get("actor", () => ({
-          class: this.env.CLASS,
-          id: claimed,
-        }));
         let timer: ReturnType<typeof setTimeout> | undefined;
         const deadline = new AbortController();
         try {
+          const admission = this.env.ADMISSION;
+          if (!admission || !SafeResponseStatus)
+            throw new Error("Actor alarm admission unavailable");
+          const admit = await Promise.race([
+            SafeReflectApply(admission.fetch, admission, [
+              new SafeRequest("http://actor.invalid/", {
+                method: "POST",
+                headers: new SafeHeaders({
+                  "x-takoserver-private-alarm-admission": admissionToken,
+                }),
+                signal: deadline.signal,
+              }),
+            ]) as Promise<Response>,
+            new Promise<never>((_resolve, reject) => {
+              timer = setTimeout(() => {
+                deadline.abort();
+                reject(new Error("Actor alarm admission deadline"));
+              }, 5_000);
+            }),
+          ]);
+          if (SafeReflectApply(SafeResponseStatus, admit, []) !== 204)
+            throw new Error("Actor alarm admission denied");
+          await admit.body?.cancel();
+          if (timer) clearTimeout(timer);
+          timer = undefined;
+          const child = this.state.facets.get("actor", () => ({
+            class: this.env.CLASS,
+            id: claimed,
+          }));
           const request = new Request("http://actor.invalid/", {
             headers: { [DELIVERY_HEADER]: deliveryToken },
             signal: deadline.signal,

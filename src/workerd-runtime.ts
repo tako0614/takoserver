@@ -2150,6 +2150,7 @@ export async function writeWorkerdPrivateExecution(options: {
     readonly storagePath: string;
     readonly ownerModule: string;
     readonly className: string;
+    readonly alarmAdmissionAddress: string;
   };
   readonly runSocketPath: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
@@ -2200,7 +2201,8 @@ export async function writeWorkerdPrivateExecution(options: {
     (!/^[a-f0-9]{64}$/u.test(actor.namespaceKey) ||
       !isAbsolute(actor.storagePath) ||
       actor.storagePath.includes("\u0000") ||
-      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(actor.className))
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(actor.className) ||
+      !/^127\.0\.0\.1:[1-9][0-9]{0,4}$/u.test(actor.alarmAdmissionAddress))
   ) {
     throw new Error("unusable private Actor execution declaration");
   }
@@ -2264,12 +2266,17 @@ export async function writeWorkerdPrivateExecution(options: {
   if (actor) {
     requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
     if (
-      prepared.manifest.vars?.some((binding) => binding.name === "__TAKOSERVER_ACTOR_ALARM_OWNER")
+      prepared.manifest.vars?.some((binding) =>
+        ["__TAKOSERVER_ACTOR_ALARM_OWNER", "NAMESPACE", "CLASS", "ADMISSION"].includes(
+          binding.name,
+        ),
+      )
     )
       throw new Error("private Actor alarm binding collision");
     const actorBindings = [
       '(name = "NAMESPACE", durableObjectNamespace = "ActorOwner")',
       `(name = "CLASS", durableObjectClass = (name = "application", entrypoint = ${capnpText(actor.className)}))`,
+      '(name = "ADMISSION", service = "actor-alarm-admission")',
       ...bindings,
     ];
     actorServices = `
@@ -2281,7 +2288,8 @@ export async function writeWorkerdPrivateExecution(options: {
     durableObjectNamespaces = [(className = "ActorOwner", uniqueKey = ${capnpText(actor.namespaceKey)}, enableSql = true)],
     durableObjectStorage = (localDisk = "actor-storage")
   )),
-  (name = "actor-storage", disk = (path = ${capnpText(actor.storagePath)}, writable = true)),`;
+  (name = "actor-storage", disk = (path = ${capnpText(actor.storagePath)}, writable = true)),
+  (name = "actor-alarm-admission", external = (address = ${capnpText(actor.alarmAdmissionAddress)}, http = ())),`;
   }
   const config = `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (

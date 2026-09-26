@@ -15,12 +15,16 @@ export interface WorkerdActorNamespaceOptions {
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
   readonly signal: AbortSignal;
+  /** Host authority reader; never exposed to application modules. */
+  readonly admitAlarm: (signal: AbortSignal) => Promise<boolean>;
 }
 
 export interface WorkerdActorNamespace {
   fetch(id: string, request: Request): Promise<Response>;
   /** Settles when the native child exits, including an intentional close. */
   readonly exited: Promise<void>;
+  enableAlarmAdmission(): void;
+  disableAlarmAdmission(): void;
   /** Ordinary retirement drains responses; a dead child can be reaped immediately. */
   close(): Promise<void>;
 }
@@ -71,13 +75,14 @@ export async function openWorkerdActorNamespace(
   const token = randomBytes(32).toString("hex");
   const alarmToken = randomBytes(32).toString("hex");
   const deliveryToken = randomBytes(32).toString("hex");
+  const admissionToken = randomBytes(32).toString("hex");
   const literal = JSON.stringify;
   const encoder = new TextEncoder();
   hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
   hostModules.set(
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${helper}`)};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)});
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)});
 export default createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});`),
   );
   // Application loading happens only in the native child. The raw native env
@@ -117,8 +122,30 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
   await chmod(root, 0o700);
   let child: ReturnType<typeof Bun.spawn> | undefined;
   let closing: Promise<void> | undefined;
+  let verified = false;
+  const admission = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      if (
+        closing ||
+        !verified ||
+        request.method !== "POST" ||
+        request.headers.get("x-takoserver-private-alarm-admission") !== admissionToken
+      )
+        return new Response(null, { status: 503 });
+      try {
+        const allowed = await options.admitAlarm(AbortSignal.timeout(5_000));
+        return new Response(null, { status: allowed && verified && !closing ? 204 : 503 });
+      } catch {
+        return new Response(null, { status: 503 });
+      }
+    },
+  });
   const close = (): Promise<void> => {
     closing ??= (async () => {
+      verified = false;
+      admission.stop(true);
       if (child) {
         child.kill("SIGKILL");
         await child.exited;
@@ -146,6 +173,7 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
         storagePath: options.storagePath,
         ownerModule: owner,
         className: "ActorChild",
+        alarmAdmissionAddress: `127.0.0.1:${admission.port}`,
       },
     });
     options.signal.throwIfAborted();
@@ -178,7 +206,15 @@ export default { fetch() { return new Response(null, { status: 404 }); } };`),
     options.signal.throwIfAborted();
     const runningChild = child;
     return {
-      exited: runningChild.exited.then(() => {}),
+      exited: runningChild.exited.then(() => {
+        verified = false;
+      }),
+      enableAlarmAdmission() {
+        if (!closing && runningChild.exitCode === null) verified = true;
+      },
+      disableAlarmAdmission() {
+        verified = false;
+      },
       async fetch(id, request) {
         if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
         const headers = new Headers(request.headers);

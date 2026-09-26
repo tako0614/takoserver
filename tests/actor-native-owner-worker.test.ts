@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
   createActorNativeAlarmPort,
@@ -7,7 +8,7 @@ import {
 
 function fixture(fetch: (request: Request) => Promise<Response>) {
   const retained: Promise<unknown>[] = [];
-  const Owner = createActorNativeOwner("a".repeat(64));
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64));
   const owner = new Owner(
     {
       facets: {
@@ -177,4 +178,60 @@ test("a valid alarm bearer cannot be retargeted to another actor ID", async () =
   });
   expect(response.status).toBe(404);
   expect(routed).toBe(false);
+});
+
+test("native alarm defaults to deny before facet construction and retains its durable obligation", async () => {
+  const database = new Database(":memory:");
+  let nativeWake: number | null = null;
+  let facetGets = 0;
+  let facetAborts = 0;
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64));
+  const state = {
+    facets: {
+      get() {
+        facetGets += 1;
+        return { fetch: async () => new Response(null, { status: 204 }) };
+      },
+      abort() {
+        facetAborts += 1;
+      },
+    },
+    storage: {
+      sql: {
+        exec(sql: string, ...params: (string | number | null)[]) {
+          const statement = database.query(sql);
+          if (sql.startsWith("SELECT"))
+            return statement.all(...params) as Record<string, unknown>[];
+          statement.run(...params);
+          return [];
+        },
+      },
+      setAlarm(at: number) {
+        nativeWake = at;
+      },
+      deleteAlarm() {
+        nativeWake = null;
+      },
+    },
+    waitUntil() {},
+  };
+  try {
+    const owner = new Owner(state, { CLASS: {} });
+    database
+      .query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1")
+      .run("id", Date.now() - 1);
+    await owner.alarm();
+    expect(facetGets).toBe(0);
+    expect(facetAborts).toBe(1);
+    expect(
+      database
+        .query(
+          "SELECT obligation, pending_at AS pending, retry_at AS retryAt FROM actor_alarm_state",
+        )
+        .get(),
+    ).toEqual({ obligation: 1, pending: null, retryAt: expect.any(Number) });
+    expect(nativeWake).toBeGreaterThan(Date.now());
+  } finally {
+    database.close();
+  }
 });
