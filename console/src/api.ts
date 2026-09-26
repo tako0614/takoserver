@@ -128,8 +128,14 @@ export interface Operation {
   readonly createdAt: string;
 }
 
-/** The exact-pin lane this console speaks. */
-const LANE = "/apis/forms.takoform.com/v1alpha3";
+/**
+ * The exact-pin lane this console speaks.
+ *
+ * The stable lane addresses a Form family by its complete versionless
+ * apiVersion as one path segment -- the retired alpha lanes carried a separate
+ * version segment that no longer exists.
+ */
+const LANE = "/apis/forms.takoform.com/v1";
 
 export class ApiError extends Error {
   constructor(
@@ -319,10 +325,9 @@ export function createApi(options: ApiOptions) {
         body,
         naming,
       );
-      const [group, version] = declaration.form.apiVersion.split("/");
       return await call<ResourceSummary>(
         "PUT",
-        `${LANE}/resources/${group}/${version}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`,
+        `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}`,
         { ...body, review: { prepareDigest: prepared.review.prepareDigest } },
         {
           ...naming,
@@ -338,17 +343,14 @@ export function createApi(options: ApiOptions) {
       declaration: Omit<ResourceDeclaration, "spec">,
       generation: string,
     ) {
-      const [group, version] = declaration.form.apiVersion.split("/");
       const query = new URLSearchParams({
         space: declaration.space,
-        group: declaration.form.apiVersion,
-        kind: declaration.form.kind,
         definitionVersion: declaration.form.definitionVersion,
         schemaDigest: declaration.form.schemaDigest,
       });
       return call<void>(
         "DELETE",
-        `${LANE}/resources/${group}/${version}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`,
+        `${LANE}/resources/${declaration.form.apiVersion}/${declaration.form.kind}/${encodeURIComponent(declaration.name)}?${query}`,
         undefined,
         {
           "takoform-organization": organizationId,
