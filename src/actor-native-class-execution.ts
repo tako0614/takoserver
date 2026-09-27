@@ -30,6 +30,7 @@ const SafeWeakMapDelete = WeakMap.prototype.delete;
 const SafeHeaders = Headers;
 const SafeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
 const SafeHeadersForEach = Headers.prototype.forEach;
+const SafeHeadersAppend = Headers.prototype.append;
 const SafeReflectApply = Reflect.apply;
 const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
 const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
@@ -59,6 +60,19 @@ interface UpgradeRecord {
   readonly socketId: string;
   readonly protocol?: string;
   readonly headers: [string, string][];
+}
+
+/** Host-only: never re-enter tenant iterable hooks after header validation. */
+export function createActorNativeUpgradeHeaders(
+  snapshot: readonly (readonly [string, string])[],
+): Headers {
+  const headers = new SafeHeaders();
+  for (let index = 0; index < snapshot.length; index += 1) {
+    const pair = snapshot[index];
+    if (!pair) throw new ActorRuntimeError("invalid_upgrade");
+    SafeReflectApply(SafeHeadersAppend, headers, [pair[0], pair[1]]);
+  }
+  return headers;
 }
 
 export type ActorSqlValue =

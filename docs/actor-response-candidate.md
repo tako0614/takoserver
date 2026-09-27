@@ -56,6 +56,11 @@ same constructor before application evaluation in both child and Worker realms,
 consume `accept().response`, and carry `takeUpgrade(...).headers` through its
 private signed decision and native transport response. A protocol-only header
 copy or an uninstalled Worker constructor would still break this contract.
+Build the private decision Headers with captured append and indexed snapshot
+pairs (`createActorNativeUpgradeHeaders`), never `new Headers(upgrade.headers)`:
+the latter re-enters application-modifiable iterable hooks after validation.
+An accepted-upgrade regression poisons the Array iterator to inject a reserved
+protocol, and verifies that the decision retains only the validated snapshot.
 
 Focused checks: `bun test tests/actor-upgrade-handoff.test.ts
 tests/actor-native-class-execution.test.ts tests/actor-class-execution.test.ts

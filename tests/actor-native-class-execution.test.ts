@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import {
   type ActorSqlValue,
+  createActorNativeUpgradeHeaders,
   createNativeActorExecution,
   type NativeActorSqlFacade,
   type NativeActorStorage,
@@ -105,6 +106,83 @@ test("accept returns Response and transfers a reconstructed alias once with publ
     expect(actor.takeUpgrade(accepted, "nonce")).toBeNull();
     expect(actor.takeUpgrade(result.clone(), "nonce")).toBeNull();
   } finally {
+    db.close();
+    globalThis.Response = NativeResponse;
+  }
+});
+
+test("accepted Actor upgrade cannot inject headers through a poisoned snapshot iterator", async () => {
+  const NativeResponse = Response;
+  const iterator = Array.prototype[Symbol.iterator];
+  installActorResponseRuntime();
+  const db = new Database(":memory:");
+  class Actor {
+    constructor(
+      readonly context: { sockets: { accept(request: Request): Promise<{ response: Response }> } },
+    ) {}
+    async fetch(request: Request): Promise<Response> {
+      const { response } = await this.context.sockets.accept(request);
+      response.headers.append("set-cookie", "a=1");
+      response.headers.append("set-cookie", "b=2");
+      Array.prototype[Symbol.iterator] = function* () {
+        const pair = ["sec-websocket-protocol", "forged"];
+        Object.defineProperty(pair, Symbol.iterator, { value: iterator });
+        yield pair;
+        return undefined;
+      };
+      return response;
+    }
+    alarm() {}
+    socketMessage() {}
+    socketClose() {}
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      id: "actor-id",
+      env: {},
+      storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
+      socketPort: () => ({
+        async accept() {
+          return "socket-id";
+        },
+        async get() {
+          return false;
+        },
+        async list() {
+          return [];
+        },
+        async send() {},
+        async close() {},
+        async getAttachment() {
+          return null;
+        },
+        async setAttachment() {},
+      }),
+    });
+    const response = await actor.fetch(
+      new Request("http://actor.invalid", { headers: { upgrade: "websocket" } }),
+      "nonce",
+    );
+    const upgrade = actor.takeUpgrade(response, "nonce");
+    if (!upgrade) throw new Error("accepted upgrade missing");
+    const head = createActorNativeUpgradeHeaders(upgrade.headers);
+    const decision = new NativeResponse(null, { status: 204, headers: head });
+    Array.prototype[Symbol.iterator] = iterator;
+    expect(head.get("sec-websocket-protocol")).toBeNull();
+    expect(head.getSetCookie()).toEqual(["a=1", "b=2"]);
+    expect(decision.headers.get("sec-websocket-protocol")).toBeNull();
+    expect(decision.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+  } finally {
+    Array.prototype[Symbol.iterator] = iterator;
     db.close();
     globalThis.Response = NativeResponse;
   }

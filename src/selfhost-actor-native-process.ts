@@ -215,7 +215,7 @@ export async function openWorkerdActorNamespace(
     hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
     hostModules.set(
       entry,
-      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass, installActorResponseRuntime } from ${literal(`./${helper}`)};
+      encoder.encode(`import { createNativeActorExecution, createActorNativeUpgradeHeaders, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass, installActorResponseRuntime } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
@@ -312,7 +312,7 @@ export class ActorChild {
     const upgrade = nonce ? execution.takeUpgrade(result, nonce) : null;
     if (!upgrade) return result;
     const decision = await signActorNativeUpgradeDecision(DELIVERY_TOKEN, nonce, SafeEncodeURIComponent(this.id), upgrade.socketId, upgrade.protocol ?? "");
-    const responseHeaders = new SafeHeaders(upgrade.headers);
+    const responseHeaders = createActorNativeUpgradeHeaders(upgrade.headers);
     SafeApply(SafeHeadersSet, responseHeaders, [UPGRADE_DECISION, decision]);
     SafeApply(SafeHeadersSet, responseHeaders, [UPGRADE_SOCKET_ID, upgrade.socketId]);
     if (upgrade.protocol) SafeApply(SafeHeadersSet, responseHeaders, ["sec-websocket-protocol", upgrade.protocol]);
