@@ -5,6 +5,7 @@ import { runFormAuthorityCodeGate } from "../scripts/deploy/form-authority-gate.
 
 describe("ordinary integration Form code gate", () => {
   test.each([
+    ["takoserver-existing-space-operator-worker", "tests/existing-space-operator.test.ts"],
     ["takoserver-form-authority-identity-probe", "tests/form-authority-identity-probe.test.ts"],
     ["takoserver-form-authority-worker", "tests/takoform-core-verifier-adapter.test.ts"],
     [

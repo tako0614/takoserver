@@ -88,6 +88,61 @@ export const DEPLOY_CONTRACT = {
   kind: "takos.deploy-contract@v2",
   surfaces: [
     {
+      surface: "takoserver-existing-space-operator-worker",
+      target: "cloudflare-worker:explicit-existing-space-operator-ingress",
+      covers: [
+        "src/existing-space-operator.ts",
+        "src/existing-space-operator-proof.ts",
+        "src/entry-existing-space-operator-worker.ts",
+        "wrangler.existing-space-operator.jsonc",
+        "scripts/deploy/form-authority.ts",
+        "scripts/deploy/target.ts",
+      ],
+      requiresScripts: ["check", "build:form-authority-worker"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance: `${exactSource} Build exact bridge bytes and prove current public Host and released-Core authority source/identity/policy closure before one upload. Explicit formAuthority.existingSpaceOperator selects a dedicated HTTPS ingress and dedicated public key, never defaults. ${cloudflareTokenInput}`,
+        "post-conditions":
+          "Read exact Version/source, two service bindings, five vars, custom domain and disabled workers.dev/preview topology; confirm live Host and released-Core authority identities. The bridge exposes only signed existing-space reconciliation/readback and has no storage/provider/customer authority.",
+        reversal:
+          "Rollback code only to a known compatible provider Version after inspecting authority/policy closure. Ingress/key/policy changes require separate reviewed authority transition; never reactivate or deactivate Forms as rollback.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-existing-space-reconciliation",
+      target: "takoserver:explicit-existing-space-positive-head-reconciliation",
+      covers: [
+        "scripts/deploy/existing-space-operator.ts",
+        "src/existing-space-operator.ts",
+        "src/existing-space-operator-proof.ts",
+        "src/takoform/existing-space-admission.ts",
+      ],
+      requiresScripts: ["check"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_EXISTING_SPACE_REQUEST_PATH",
+        "TAKOSERVER_EXISTING_SPACE_OPERATOR_PRIVATE_JWK_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance: `${exactSource} TAKOSERVER_EXISTING_SPACE_REQUEST_PATH selects an explicit owned 0600 request containing policyDigest and 1..100 unique Spaces, with no discovery/default scope. TAKOSERVER_EXISTING_SPACE_OPERATOR_PRIVATE_JWK_PATH selects the dedicated owned 0600 operator signing key. Both actions require exact deployed bridge/authority/Host/policy proof and dedicated operator key. Apply requires independent review and sends one closed signed reconciliation request. ${cloudflareTokenInput}`,
+        "post-conditions":
+          "Status invokes only signed POST readback, never reconcile/plan/apply. Apply performs one reconcile then exact existing v2 per-Space readback; only reported existing positive heads are proven, not new grants or application readiness.",
+        reversal:
+          "Positive reconciliation retains prior writes on partial/unknown outcome. Inspect status and explicitly forward repair; no automated retry, rollback, grant, or deactivation.",
+        "failure-handling":
+          highRiskFailure +
+          " All mutation HTTP/transport errors remain indeterminate; no implicit retry. Readback uses bounded signed POST bodies rather than unsupported GET bodies.",
+        "independent-review": applyReviewInput,
+      },
+    },
+    {
       surface: "takoserver-worker",
       target: "cloudflare-worker:environment-selected-takoserver-worker",
       covers: [

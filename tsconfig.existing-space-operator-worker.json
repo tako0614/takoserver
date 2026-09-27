@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["ES2022"], "types": ["@cloudflare/workers-types"] },
+  "include": [
+    "existing-space-operator-worker-configuration.d.ts",
+    "src/entry-existing-space-operator-worker.ts"
+  ],
+  "exclude": []
+}
