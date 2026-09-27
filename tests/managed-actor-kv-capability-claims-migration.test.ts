@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -34,15 +34,20 @@ const CLAIM = [
   "a".repeat(64),
 ] as const;
 
-function claim(database: Database, values = CLAIM) {
+function claim(database: Database, values: readonly SQLQueryBindings[] = CLAIM) {
   return database.query(INSERT).run(...values);
 }
 
-function replace(database: Database, values: typeof CLAIM, state: string, etag: string | null) {
+function replace(
+  database: Database,
+  values: readonly SQLQueryBindings[],
+  state: string,
+  etag: string | null,
+) {
   return database.query(REPLACE).run(...values, state, etag);
 }
 
-function claimWithAuthority(database: Database, values: readonly (string | number)[]) {
+function claimWithAuthority(database: Database, values: readonly SQLQueryBindings[]) {
   return database.query(CLAIM_WITH_AUTHORITY).run(...values);
 }
 
