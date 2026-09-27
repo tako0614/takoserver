@@ -78,10 +78,18 @@ function readHead(socket: Socket): Promise<{ head: string; tail: Buffer }> {
   });
 }
 
-function parseHead(head: string): { first: string; headers: Map<string, string> } {
+function parseHead(
+  head: string,
+  response = false,
+): {
+  first: string;
+  headers: Map<string, string>;
+  setCookies: string[];
+} {
   const [first, ...lines] = head.split("\r\n");
   if (!first || lines.length > 100) throw new Error("Actor broker head invalid");
   const headers = new Map<string, string>();
+  const setCookies: string[] = [];
   for (const line of lines) {
     if (/^[ \t]/u.test(line)) throw new Error("Actor broker folded header refused");
     const colon = line.indexOf(":");
@@ -95,10 +103,16 @@ function parseHead(head: string): { first: string; headers: Map<string, string> 
     }
     if (!/^[a-z0-9!#$%&'*+.^_`|~-]+$/u.test(name) || controls)
       throw new Error("Actor broker header invalid");
+    // Set-Cookie is not a comma-joinable header. Keep its response field values
+    // separately, in order; no request/private/handshake singleton is relaxed.
+    if (response && name === "set-cookie") {
+      setCookies.push(value);
+      continue;
+    }
     if (headers.has(name)) throw new Error("Actor broker duplicate header refused");
     headers.set(name, value);
   }
-  return { first, headers };
+  return { first, headers, setCookies };
 }
 
 function validToken(got: string | undefined, expected: string): boolean {
@@ -108,9 +122,14 @@ function validToken(got: string | undefined, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-function writeHead(first: string, headers: Map<string, string>): Buffer {
+function writeHead(
+  first: string,
+  headers: Map<string, string>,
+  setCookies: readonly string[] = [],
+): Buffer {
   const lines = [first];
   for (const [name, value] of headers) lines.push(`${name}: ${value}`);
+  for (const value of setCookies) lines.push(`set-cookie: ${value}`);
   return Buffer.from(`${lines.join("\r\n")}\r\n\r\n`, "latin1");
 }
 
@@ -263,7 +282,7 @@ export async function openSelfhostActorUpgradeBroker(
         });
         upstream.write(writeHead(parsed.first, parsed.headers));
         const response = await readHead(upstream);
-        const upstreamHead = parseHead(response.head);
+        const upstreamHead = parseHead(response.head, true);
         if (
           !/^HTTP\/1\.[01] 101(?: |$)/u.test(upstreamHead.first) ||
           upstreamHead.headers.has(RESERVATION_HEADER)
@@ -297,7 +316,7 @@ export async function openSelfhostActorUpgradeBroker(
         pending.set(id, entry);
         client.once("close", () => abandon(id as string));
         upstream.once("close", () => abandon(id as string));
-        client.write(writeHead(upstreamHead.first, upstreamHead.headers));
+        client.write(writeHead(upstreamHead.first, upstreamHead.headers, upstreamHead.setCookies));
       } catch {
         if (id) abandon(id);
         else {

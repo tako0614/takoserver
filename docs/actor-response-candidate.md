@@ -36,6 +36,13 @@ changes and deletions survive into the client response. Broker commitment and
 expiry remain Host-owned, and native head emission is not proven by a portable
 unit test.
 
+The Unix upgrade broker preserves each response `Set-Cookie` field value in
+order rather than comma-joining or rejecting repeated cookies. Other duplicate
+fields, including private credentials and reserved handshake headers, remain
+refused. `tests/selfhost-actor-upgrade-broker.test.ts` drives the actual broker
+over Unix sockets, including its commit control request; this is carrier-parser
+evidence, not a native workerd WebSocket qualification.
+
 The pinned Hono 4.12.31 test exercises its actual CORS/context reconstruction and
 post-handler header mutation, without a Hono-specific branch. On baseline
 `639112e`, the empty opaque object reconstructs into a status-200 Response and
