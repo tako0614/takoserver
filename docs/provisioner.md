@@ -336,6 +336,16 @@ but recovery must not skip an unconfirmed claim by treating it as provider
 dispatch. Provision redemption remains synchronous and is not enrolled in the
 deferred-operation repair scheduler.
 
+For a provider-backed Host request, the 15-second inline budget limits only
+how long HTTP waits for a Resource response. When it answers with a pending
+Operation, the Cloudflare invocation retains the unfinished provider RPC with
+`waitUntil`; that extension is bounded, not a promise of completion. The
+durable saga, leases, and scheduled repair remain responsible if the runtime
+ends first. A GET of the pending Operation can acquire a lease and resume the
+same command, so it is not a read-only status probe. Repeated GET polling can
+also occupy the lease at a scheduled repair boundary; operator diagnosis uses
+exact state and invocation-log reads without triggering another execution.
+
 Standard-service material is resolved only on the initial execution after the
 dispatch marker and before SQLite or provider effects. Recovery does not issue
 that material again. Once placement is bound, a preparation failure cannot

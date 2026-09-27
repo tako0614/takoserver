@@ -2,6 +2,7 @@ import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
+import type { RequestLifetime } from "../request-lifetime.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "../standard-service-port.ts";
 import type { TakoformApplySelection } from "./apply-selection.ts";
@@ -528,7 +529,7 @@ export interface TakoformStoredResource {
 }
 
 export interface TakoformHost {
-  handle(request: Request): Promise<Response | null>;
+  handle(request: Request, lifetime?: RequestLifetime): Promise<Response | null>;
   /** Route-less Host maintenance; never exposed through the public API. */
   readonly maintenance?: {
     drainProviderRepairs(limit?: number): Promise<{

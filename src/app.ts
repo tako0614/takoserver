@@ -656,10 +656,10 @@ export function buildApp(ports: AppPorts): App {
   return {
     fetch:
       integrationOrganizationBootstrapRoute || integrationE2eCredentialRoute
-        ? async (request) =>
+        ? async (request, lifetime) =>
             (await integrationOrganizationBootstrapRoute?.(request)) ??
             (await integrationE2eCredentialRoute?.(request)) ??
-            (await router(request))
+            (await router(request, lifetime))
         : router,
     maintenance: { artifacts: artifactReconciler },
     async tick(): Promise<TickReport> {

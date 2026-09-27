@@ -2921,6 +2921,7 @@ describe("durable deferred Takoform operations", () => {
     const desired = desiredResource("inline-budget", "inline");
     const review = await prepareReview(opened.host, desired);
     const path = `${lane}/resources/example.forms.invalid/DeferredThing/inline-budget`;
+    let retained: Promise<void> | undefined;
     const accepted = await opened.host.handle(
       request(path, "primary", {
         method: "PUT",
@@ -2931,10 +2932,16 @@ describe("durable deferred Takoform operations", () => {
         },
         body: JSON.stringify({ ...desired, review }),
       }),
+      {
+        waitUntil: (work) => {
+          retained = work;
+        },
+      },
     );
     // The blocked provider attempt outlives the request: the Host answers
     // with the durable operation instead of an HTTP timeout.
     expect(accepted?.status).toBe(202);
+    expect(retained).toBeDefined();
     if (!accepted) throw new Error("apply returned no response");
     const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
 
@@ -2946,6 +2953,7 @@ describe("durable deferred Takoform operations", () => {
     expect(providerCalls).toBe(1);
 
     gate.resolve();
+    await retained;
     await applied.promise;
     let settled: Response | null = null;
     for (let attempt = 0; attempt < 100; attempt += 1) {

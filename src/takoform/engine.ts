@@ -10,6 +10,7 @@ import {
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
+import type { RequestLifetime } from "../request-lifetime.ts";
 import {
   type AcceptedAuthoritySummary,
   assertAcceptedAuthorityGrant,
@@ -144,6 +145,8 @@ export function memoizeArtifacts(resolver: ArtifactResolver): ArtifactResolver {
 
 export interface EngineContext {
   readonly request: Request;
+  /** The live invocation owns post-response work; never retained in durable state. */
+  readonly lifetime?: RequestLifetime;
   readonly url: URL;
   readonly tenantId: string;
   readonly principalId: string;
