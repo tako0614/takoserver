@@ -14,6 +14,7 @@
     "./actor-namespace-facade-source": "./src/actor-namespace-facade-source.ts",
     "./actor-addressing-source": "./src/actor-addressing-source.ts",
     "./actor-native-bootstrap-source": "./src/actor-native-bootstrap-source.ts",
+    "./actor-resource-graph": "./src/actor-resource-graph.ts",
     "./deploy-extension": "./scripts/deploy-extension.ts",
     "./testing": "./tests/helpers/hosted-supply-fixtures.ts",
     "./testing/cloudflare-workers": "./src/cloudflare-workers-rpc.d.ts"
