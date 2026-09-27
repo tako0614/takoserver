@@ -9,6 +9,7 @@ import {
   selfhostWorkerPreludeSource,
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
+import { openSelfhostActorHttpBroker } from "../src/selfhost-actor-http-broker.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import { openSelfhostActorUpgradeBroker } from "../src/selfhost-actor-upgrade-broker.ts";
 import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
@@ -34,6 +35,8 @@ export class Actor {
   async fetch(request) {
     if (new URL(request.url).pathname === "/probe")
       return NativeResponse.json({live:(await this.ctx.sockets.list()).length});
+    if (new URL(request.url).pathname === "/echo")
+      return new NativeResponse(request.body, {headers:{"content-type":"text/plain"}});
     const {upgrade, socket} = await this.ctx.sockets.accept(request, {protocol:"chat", attachment:new Uint8Array([7])});
     await socket.send("provisional");
     const abandoned = new URL(request.url).pathname === "/poison" ?
@@ -89,7 +92,7 @@ export class Actor {
   };
 }
 
-function publicConfig(actorSocketPath: string, port: number): string {
+function publicConfig(actorSocketPath: string, actorHttpPath: string, port: number): string {
   return `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
  services = [
@@ -99,9 +102,10 @@ const config :Workerd.Config = (
     (name = "application.mjs", esModule = embed "application.mjs", role = application)],
    modulePolicy = (applicationMain = "application.mjs"),
    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"],
-   globalOutbound = "deny", bindings = [(name = "ACTOR", service = "actor")]
+   globalOutbound = "deny", bindings = [(name = "ACTOR", service = "actor"), (name = "ACTOR_HTTP", service = "actor-http")]
   )),
   (name = "actor", external = (address = ${JSON.stringify(`unix:${actorSocketPath}`)}, http = (style = proxy))),
+  (name = "actor-http", external = (address = ${JSON.stringify(`unix:${actorHttpPath}`)}, http = ())),
   (name = "deny", network = (allow = []))
  ], sockets = [(name = "http", address = "127.0.0.1:${port}", http = (), service = "public")]
 );`;
@@ -121,6 +125,7 @@ test.skipIf(binary === undefined)(
     const publicRoot = join(root, "public");
     let namespace: Awaited<ReturnType<typeof openWorkerdActorNamespace>> | undefined;
     let broker: Awaited<ReturnType<typeof openSelfhostActorUpgradeBroker>> | undefined;
+    let httpBroker: Awaited<ReturnType<typeof openSelfhostActorHttpBroker>> | undefined;
     let publicProcess: ReturnType<typeof Bun.spawn> | undefined;
     try {
       await mkdir(publicRoot, { mode: 0o700 });
@@ -168,6 +173,22 @@ test.skipIf(binary === undefined)(
           };
         },
       });
+      httpBroker = await openSelfhostActorHttpBroker({
+        socketPath: join(root, "broker-http.sock"),
+        token: brokerToken,
+        fetch: (actorId, request) => activeNamespace.fetch(actorId, request, "variant-two"),
+      });
+      expect(
+        (
+          await fetch("http://actor.invalid/probe", {
+            unix: httpBroker.socketPath,
+            headers: {
+              "x-takoserver-private-broker-token": brokerToken,
+              "x-takoserver-private-broker-actor-id": "actor-id",
+            },
+          })
+        ).status,
+      ).toBe(200);
       expect(
         (
           await fetch("http://actor.invalid/socket", {
@@ -184,6 +205,10 @@ test.skipIf(binary === undefined)(
   if (new URL(request.url).pathname === "/health") return new Response("ok");
   if (new URL(request.url).searchParams.get("ticket") !== "authorized")
     return new Response("denied", {status:403});
+  if (new URL(request.url).pathname === "/actor-http")
+    return env.ACTOR_HTTP.fetch(new Request("http://actor.invalid/probe"));
+  if (new URL(request.url).pathname === "/actor-http-echo")
+    return env.ACTOR_HTTP.fetch(new Request("http://actor.invalid/echo", {method:"POST", body:request.body}));
   return env.ACTOR.fetch(request);
 }};`,
       );
@@ -194,6 +219,12 @@ import application from "./application.mjs";
 const NativeResponse = Response;
 const brokerToken = ${JSON.stringify(brokerToken)};
 export default {async fetch(request, env) {
+  const actorHttp = Object.freeze({fetch(actorRequest) {
+    const headers = new Headers(actorRequest.headers);
+    headers.set("x-takoserver-private-broker-token", brokerToken);
+    headers.set("x-takoserver-private-broker-actor-id", "actor-id");
+    return env.ACTOR_HTTP.fetch(new Request(actorRequest, {headers}));
+  }});
   const handoff = createActorUpgradeHandoff(request, {
     async open(actorRequest, ingress) {
       if (ingress.method !== "GET" || ingress.version !== "13" || !ingress.key)
@@ -219,7 +250,7 @@ export default {async fetch(request, env) {
       }};
     }
   });
-  try { return await handoff.finish(await application.fetch(request, Object.freeze({ACTOR:handoff.actor}))); }
+  try { return await handoff.finish(await application.fetch(request, Object.freeze({ACTOR:handoff.actor, ACTOR_HTTP:actorHttp}))); }
   catch { await handoff.abandon(); return new NativeResponse(null, {status:500}); }
 }};`,
       );
@@ -227,7 +258,10 @@ export default {async fetch(request, env) {
       const port = reserved.port;
       reserved.stop(true);
       if (!port) throw new Error("ephemeral port unavailable");
-      await writeFile(join(publicRoot, "config.capnp"), publicConfig(broker.socketPath, port));
+      await writeFile(
+        join(publicRoot, "config.capnp"),
+        publicConfig(broker.socketPath, httpBroker.socketPath, port),
+      );
       publicProcess = Bun.spawn(
         [binary, "serve", "--experimental", join(publicRoot, "config.capnp")],
         {
@@ -309,11 +343,21 @@ export default {async fetch(request, env) {
       }
       expect(live).toBe(0);
       expect(admittedFetches).toBe(2);
+      const ordinary = await fetch(`${origin}/actor-http?ticket=authorized`);
+      expect(ordinary.status).toBe(200);
+      expect(await ordinary.json()).toEqual({ live: 0 });
+      const echoed = await fetch(`${origin}/actor-http-echo?ticket=authorized`, {
+        method: "POST",
+        body: "ordinary streaming actor body",
+      });
+      expect(echoed.status).toBe(200);
+      expect(await echoed.text()).toBe("ordinary streaming actor body");
     } finally {
       publicProcess?.kill(9);
       await publicProcess?.exited;
       await namespace?.close();
       await broker?.close();
+      await httpBroker?.close();
       await rm(root, { recursive: true, force: true });
     }
   },
