@@ -8,6 +8,286 @@ import {
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
 
+function inboundFixture(callback?: (request: Request) => Promise<Response>) {
+  type Socket = Parameters<
+    InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
+  >[0];
+  const sockets: Socket[] = [];
+  const closes: [string, number | undefined][] = [];
+  const delivered: string[] = [];
+  const retained: Promise<unknown>[] = [];
+  let producer!: ReadableStreamDefaultController<Uint8Array>;
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  const owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            if (!request.headers.has("x-takoserver-private-actor-socket-action"))
+              return new Response(
+                new ReadableStream<Uint8Array>({
+                  start(controller) {
+                    producer = controller;
+                  },
+                }),
+              );
+            delivered.push(
+              request.headers.get("x-takoserver-private-actor-socket-id") ?? "missing",
+            );
+            return callback ? callback(request) : new Response(null, { status: 204 });
+          },
+        }),
+        abort() {},
+      },
+      getWebSockets: () => sockets,
+      waitUntil: (promise) => {
+        retained.push(promise);
+      },
+    },
+    {
+      CLASS: {},
+      CLASS_0: {},
+      ADMISSION: {
+        async fetch(request) {
+          const body = (await request.json()) as Record<string, unknown>;
+          return body.action === "socket-complete"
+            ? new Response(null, { status: 204 })
+            : Response.json({
+                id: "inbound-owner",
+                attemptNonce: body.attemptNonce,
+                generationKey: "d".repeat(64),
+                epoch: "epoch-1",
+                variantKey: "default",
+                leaseId: "lease",
+              });
+        },
+      },
+    },
+  );
+  return {
+    owner,
+    closes,
+    delivered,
+    retained,
+    accounting() {
+      const state = owner as unknown as {
+        inboundCount: number;
+        inboundBytes: number;
+        socketBatch?: Set<unknown>;
+        inbound: Map<unknown, unknown>;
+      };
+      return {
+        count: state.inboundCount,
+        bytes: state.inboundBytes,
+        queued: state.socketBatch?.size ?? 0,
+        connections: state.inbound.size,
+      };
+    },
+    socket(id: string) {
+      const socket = {
+        deserializeAttachment: () => ({ socketId: id, actorId: "inbound-owner", attachment: null }),
+        serializeAttachment(_value: unknown) {},
+        send(_value: string | ArrayBuffer) {},
+        close(code?: number) {
+          closes.push([id, code]);
+        },
+      } as Socket;
+      sockets.push(socket);
+      return socket;
+    },
+    async holdProducer() {
+      const response = await owner.fetch(
+        new Request("http://actor.invalid/", {
+          headers: {
+            "x-takoserver-private-actor-id": "inbound-owner",
+            "x-takoserver-private-actor-variant": "default",
+          },
+        }),
+      );
+      return async () => {
+        producer.close();
+        await response.text();
+      };
+    },
+  };
+}
+
+test("native inbound count overflow discards zero-length backlog while HTTP producer holds the ID", async () => {
+  const f = inboundFixture();
+  const offender = f.socket("offender");
+  const survivor = f.socket("survivor");
+  const drain = await f.holdProducer();
+  const pending = Array.from({ length: 65 }, () => f.owner.webSocketMessage(offender, ""));
+  const next = f.owner.webSocketMessage(survivor, "next");
+  const observedClose = [...f.closes];
+  expect(f.delivered).toEqual([]);
+  await drain();
+  await Promise.all([...pending, next, ...f.retained]);
+  expect(observedClose).toEqual([["offender", 1013]]);
+  expect(f.delivered).toEqual(["survivor"]);
+});
+
+test("native inbound byte overflow counts UTF-8 and releases discarded bytes before drain", async () => {
+  const f = inboundFixture();
+  const offender = f.socket("offender");
+  const survivor = f.socket("survivor");
+  const drain = await f.holdProducer();
+  const pending = [
+    f.owner.webSocketMessage(offender, "あ".repeat(2 * 1024 * 1024)),
+    f.owner.webSocketMessage(offender, new ArrayBuffer(3 * 1024 * 1024)),
+  ];
+  const next = f.owner.webSocketMessage(survivor, new ArrayBuffer(8 * 1024 * 1024));
+  const observedClose = [...f.closes];
+  await drain();
+  await Promise.all([...pending, next, ...f.retained]);
+  expect(observedClose).toEqual([["offender", 1013]]);
+  expect(f.delivered).toEqual(["survivor"]);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound actor count ceiling spans connections and repeated overflow retains no tombstones", async () => {
+  const f = inboundFixture();
+  const drain = await f.holdProducer();
+  const pending: Promise<void>[] = [];
+  for (let connection = 0; connection < 4; connection++) {
+    const socket = f.socket(`survivor-${connection}`);
+    for (let message = 0; message < 64; message++)
+      pending.push(f.owner.webSocketMessage(socket, ""));
+  }
+  for (let connection = 0; connection < 100; connection++) {
+    const socket = f.socket(`offender-${connection}`);
+    pending.push(f.owner.webSocketMessage(socket, ""));
+  }
+  expect(f.accounting()).toEqual({ count: 256, bytes: 0, queued: 256, connections: 4 });
+  expect(f.closes).toHaveLength(100);
+  expect(f.closes.every(([, code]) => code === 1013)).toBe(true);
+  expect(f.retained).toHaveLength(2); // Held HTTP turn and one removable socket batch.
+  await drain();
+  await Promise.all(pending);
+  expect(f.delivered).toHaveLength(256);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound actor bytes ceiling spans connections without failing already queued peers", async () => {
+  const f = inboundFixture();
+  const drain = await f.holdProducer();
+  const pending = ["first", "second"].map((id) =>
+    f.owner.webSocketMessage(f.socket(id), new ArrayBuffer(8 * 1024 * 1024)),
+  );
+  const offender = f.socket("offender");
+  pending.push(f.owner.webSocketMessage(offender, "x"));
+  expect(f.closes).toEqual([["offender", 1013]]);
+  expect(f.accounting().bytes).toBe(16 * 1024 * 1024);
+  await drain();
+  await Promise.all(pending);
+  expect(f.delivered).toEqual(["first", "second"]);
+  expect(f.accounting().bytes).toBe(0);
+});
+
+test("native inbound active callback remains charged and failure drops its queued messages", async () => {
+  let release!: () => void;
+  let started!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = inboundFixture(async (request) => {
+    if (request.headers.get("x-takoserver-private-actor-socket-id") === "offender") {
+      started();
+      await held;
+      throw new Error("callback failed");
+    }
+    return new Response(null, { status: 204 });
+  });
+  const offender = f.socket("offender");
+  const active = f.owner.webSocketMessage(offender, new ArrayBuffer(8 * 1024 * 1024));
+  await entered;
+  await f.owner.webSocketMessage(offender, "overflow");
+  expect(f.closes).toEqual([["offender", 1013]]);
+  expect(f.accounting()).toEqual({ count: 1, bytes: 8 * 1024 * 1024, queued: 0, connections: 1 });
+  const survivor = f.owner.webSocketMessage(f.socket("survivor"), "next");
+  release();
+  await Promise.all([active, survivor]);
+  expect(f.delivered).toEqual(["offender", "survivor"]);
+  expect(f.closes).toEqual([["offender", 1013]]);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound callback failure discards undelivered payloads and admits a healthy connection", async () => {
+  const f = inboundFixture(async (request) => {
+    if (request.headers.get("x-takoserver-private-actor-socket-id") === "offender")
+      throw new Error("failed");
+    return new Response(null, { status: 204 });
+  });
+  const offender = f.socket("offender");
+  const pending = [
+    f.owner.webSocketMessage(offender, "first"),
+    f.owner.webSocketMessage(offender, "discarded"),
+    f.owner.webSocketMessage(f.socket("survivor"), "next"),
+  ];
+  await Promise.all(pending);
+  expect(f.delivered).toEqual(["offender", "survivor"]);
+  expect(f.closes).toEqual([["offender", 1011]]);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound close preserves preceding messages, deduplicates callbacks and releases counters", async () => {
+  const f = inboundFixture();
+  const socket = f.socket("socket");
+  const drain = await f.holdProducer();
+  const pending = [
+    f.owner.webSocketMessage(socket, "before"),
+    f.owner.webSocketClose(socket, 1000, "done", true),
+    f.owner.webSocketClose(socket, 1000, "duplicate", true),
+    f.owner.webSocketMessage(socket, "after"),
+  ];
+  await drain();
+  await Promise.all(pending);
+  expect(f.delivered).toEqual(["socket", "socket"]);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound oversize remains 1009 and unknown native close still receives one callback", async () => {
+  const f = inboundFixture();
+  const socket = f.socket("oversize");
+  await f.owner.webSocketMessage(socket, new ArrayBuffer(8 * 1024 * 1024 + 1));
+  await f.owner.webSocketMessage(socket, "ignored");
+  expect(f.closes).toEqual([["oversize", 1009]]);
+  expect(f.delivered).toEqual([]);
+  const unknown = {
+    deserializeAttachment: () => ({
+      socketId: "unknown",
+      actorId: "inbound-owner",
+      attachment: null,
+    }),
+    close() {},
+  } as Parameters<typeof f.owner.webSocketClose>[0];
+  await f.owner.webSocketClose(unknown, 1000, "native closed", true);
+  await f.owner.webSocketClose(unknown, 1000, "duplicate", true);
+  expect(f.delivered).toEqual(["unknown"]);
+});
+
+test("native inbound batches do not overtake an intervening whole HTTP producer turn", async () => {
+  const f = inboundFixture();
+  const drain = await f.holdProducer();
+  const first = f.owner.webSocketMessage(f.socket("first"), "one");
+  const secondProducer = f.holdProducer();
+  const second = f.owner.webSocketMessage(f.socket("second"), "two");
+  await drain();
+  const drainSecond = await secondProducer;
+  await first;
+  expect(f.delivered).toEqual(["first"]);
+  await drainSecond();
+  await second;
+  expect(f.delivered).toEqual(["first", "second"]);
+});
+
 function fixture(fetch: (request: Request) => Promise<Response>) {
   const retained: Promise<unknown>[] = [];
   const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {

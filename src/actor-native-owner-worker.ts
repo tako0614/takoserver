@@ -49,6 +49,12 @@ const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
 const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
 const RESERVATION_MS = 30_000;
 const SOCKET_MESSAGE_LIMIT = 8 * 1024 * 1024;
+// Host-owned inbound policy, not portable capacity or a native transport bound.
+// Count empty messages too, and retain charges through callback settlement.
+const SOCKET_INBOUND_COUNT = 64;
+const SOCKET_INBOUND_BYTES = 8 * 1024 * 1024;
+const ACTOR_INBOUND_COUNT = 256;
+const ACTOR_INBOUND_BYTES = 16 * 1024 * 1024;
 const SOCKET_ATTACHMENT_LIMIT = 8_192;
 const SOCKET_ID_LIMIT = 10_000;
 const ALARM_RETRY_MS = 1_000;
@@ -221,6 +227,24 @@ function validActorOwnerGraph(value: ActorOwnerGraph | undefined): value is Acto
       if (value.variantKeys[previous] === key) return false;
   }
   return true;
+}
+
+type SocketEvent =
+  | { readonly kind: "message"; readonly data: string | ArrayBuffer }
+  | {
+      readonly kind: "close";
+      readonly code: number;
+      readonly reason: string;
+      readonly wasClean: boolean;
+    };
+
+interface InboundSocketEvent {
+  readonly socket: NativeActorWebSocket;
+  event: SocketEvent | undefined;
+  readonly bytes: number;
+  readonly batch: Set<InboundSocketEvent>;
+  readonly resolve: () => void;
+  readonly reject: (error: unknown) => void;
 }
 
 interface SocketRecord {
@@ -556,6 +580,15 @@ export function createActorNativeOwner(
       | undefined;
     private readonly sockets = new Map<string, SocketRecord>();
     private readonly suppressedCloses = new WeakSet<NativeActorWebSocket>();
+    private readonly stoppedInbound = new WeakSet<NativeActorWebSocket>();
+    private readonly closingInbound = new WeakSet<NativeActorWebSocket>();
+    private readonly inbound = new Map<
+      NativeActorWebSocket,
+      { bytes: number; events: Set<InboundSocketEvent> }
+    >();
+    private inboundCount = 0;
+    private inboundBytes = 0;
+    private socketBatch: Set<InboundSocketEvent> | undefined;
     constructor(
       state: NativeState,
       env: {
@@ -735,6 +768,7 @@ export function createActorNativeOwner(
       if ((cached?.status === "live" || cached?.status === "transport-pending") && cached.socket)
         return cached;
       for (const socket of this.state.getWebSockets?.() ?? []) {
+        if (this.suppressedCloses.has(socket)) continue;
         const metadata = socketMetadata(socket);
         if (!metadata || metadata.socketId !== socketId) continue;
         const record: SocketRecord = {
@@ -837,6 +871,7 @@ export function createActorNativeOwner(
       } catch {
         return Promise.resolve(new Response(null, { status: 404 }));
       }
+      this.socketBatch = undefined;
       const turn = this.tail.then(async () => {
         await this.ready;
         if (this.poisoned) return new Response(null, { status: 503 });
@@ -1121,6 +1156,7 @@ export function createActorNativeOwner(
         else await this.reconcile();
       });
       void queuedWake.catch(() => {});
+      this.socketBatch = undefined;
       const turn = this.tail.then(async () => {
         await queuedWake;
         if (this.poisoned) throw new Error("Actor facet retirement failed");
@@ -1416,190 +1452,260 @@ export function createActorNativeOwner(
       this.poisoned = true;
       throw new Error("Actor socket completion unavailable");
     }
+    private releaseInbound(entry: InboundSocketEvent): void {
+      const connection = this.inbound.get(entry.socket);
+      if (!connection?.events.delete(entry)) return;
+      entry.event = undefined;
+      entry.batch.delete(entry);
+      connection.bytes -= entry.bytes;
+      this.inboundBytes -= entry.bytes;
+      this.inboundCount -= 1;
+      if (connection.events.size === 0) this.inbound.delete(entry.socket);
+    }
+    private discardInbound(socket: NativeActorWebSocket): void {
+      this.stoppedInbound.add(socket);
+      for (const entry of this.inbound.get(socket)?.events ?? []) {
+        // A delivered callback keeps its charge until it actually settles.
+        if (!entry.batch.has(entry)) continue;
+        this.releaseInbound(entry);
+        entry.resolve();
+      }
+    }
     private socketEvent(
       socket: NativeActorWebSocket,
-      event:
-        | { readonly kind: "message"; readonly data: string | ArrayBuffer }
-        | {
-            readonly kind: "close";
-            readonly code: number;
-            readonly reason: string;
-            readonly wasClean: boolean;
-          },
+      event: SocketEvent,
+      bytes = 0,
     ): Promise<void> {
-      const turn = this.tail.then(async () => {
-        await this.ready;
-        if (this.poisoned) throw new Error("Actor facet retirement failed");
-        const metadata = socketMetadata(socket);
-        if (!metadata) throw new Error("Actor socket metadata unavailable");
-        const socketId = metadata.socketId;
-        const actorId = metadata.actorId;
-        if (event.kind === "close" && this.suppressedCloses.has(socket)) return;
-        if (metadata.reservationBearer !== undefined) {
-          const pending = this.liveSocket(socketId);
-          if (pending?.status === "transport-pending") this.discardPending(pending);
-          await this.reconcile();
-          return;
-        }
-        let record = this.liveSocket(socketId);
-        if (!record && event.kind === "close") {
-          record = {
-            socketId,
-            actorId,
-            nonce: "",
-            protocol: "",
-            attachment: decodeAttachment(metadata.attachment),
-            queued: [],
-            queuedBytes: 0,
-            status: "live",
-            socket,
-          };
-          this.sockets.set(socketId, record);
-        }
-        if (!record || record.socket !== socket) throw new Error("Actor socket unavailable");
-        let admission: Awaited<ReturnType<typeof this.socketAdmission>> | undefined;
-        let failed = false;
-        let retired = false;
-        let completionError: unknown;
+      if (
+        this.suppressedCloses.has(socket) ||
+        this.closingInbound.has(socket) ||
+        (event.kind === "message" && this.stoppedInbound.has(socket))
+      )
+        return Promise.resolve();
+      const connection = this.inbound.get(socket) ?? {
+        bytes: 0,
+        events: new Set<InboundSocketEvent>(),
+      };
+      if (
+        connection.events.size >= SOCKET_INBOUND_COUNT ||
+        connection.bytes + bytes > SOCKET_INBOUND_BYTES ||
+        this.inboundCount >= ACTOR_INBOUND_COUNT ||
+        this.inboundBytes + bytes > ACTOR_INBOUND_BYTES
+      ) {
+        this.discardInbound(socket);
+        if (event.kind === "close") this.suppressedCloses.add(socket);
         try {
-          admission = await this.socketAdmission(actorId);
-          const graphNow = await this.currentGraph();
-          const key = graphNow.variantKeys[admission.variantIndex];
-          if (
-            key !== admission.variantKey ||
-            graphNow.generationKey !== admission.generationKey ||
-            graphNow.epoch !== admission.epoch
-          )
-            throw new Error("Actor socket variant unavailable");
-          const child = await this.selectedChild(actorId, key, admission.variantIndex, graphNow);
-          const graphBeforeDelivery = await this.currentGraph();
-          if (
-            graphBeforeDelivery.generationKey !== admission.generationKey ||
-            graphBeforeDelivery.epoch !== admission.epoch ||
-            graphBeforeDelivery.variantKeys[admission.variantIndex] !== admission.variantKey
-          )
-            throw new Error("Actor socket graph changed before delivery");
-          const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
-          const controller = new AbortController();
-          const body =
-            event.kind === "message"
-              ? event.data
-              : SafeJsonStringify({
-                  code: event.code,
-                  reason: event.reason,
-                  wasClean: event.wasClean,
-                });
-          const headers = new SafeHeaders({
-            [DELIVERY_HEADER]: deliveryForEvent(),
-            [SOCKET_ACTION_HEADER]:
-              event.kind === "message" ? "callback-message" : "callback-close",
-            [SOCKET_NONCE_HEADER]: nonce,
-            [SOCKET_ID_HEADER]: socketId,
-          });
-          if (event.kind === "message")
-            headers.set(SOCKET_KIND_HEADER, typeof event.data === "string" ? "text" : "binary");
-          this.activeSocketInvocation = { actorId, nonce, kind: "callback", accepting: false };
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          let retirementError: unknown;
-          try {
-            const response = await Promise.race([
-              child.fetch(
-                new SafeRequest("http://actor.invalid/", {
-                  method: "POST",
-                  headers,
-                  body,
-                  signal: controller.signal,
-                }),
-              ),
-              new Promise<never>((_accept, reject) => {
-                timer = setTimeout(() => {
-                  controller.abort();
-                  reject(new Error("Actor socket callback deadline"));
-                }, deadlines.handlerMs);
-              }),
-            ]);
-            if (response.status !== 204) throw new Error("Actor socket callback unavailable");
-            await response.body?.cancel();
-          } finally {
-            if (timer) clearTimeout(timer);
-            controller.abort();
-            this.activeSocketInvocation = undefined;
-            const abortFacet = this.state.facets.abort;
-            if (!abortFacet) {
-              this.poisoned = true;
-              retirementError = new Error("Actor facet retirement unavailable");
-            } else {
-              try {
-                SafeReflectApply(abortFacet, this.state.facets, [
-                  "actor",
-                  "actor-socket-retirement",
-                ]);
-                retired = true;
-              } catch (error) {
-                this.poisoned = true;
-                retirementError = error;
-              }
-            }
-          }
-          if (retirementError !== undefined) throw retirementError;
+          socket.close(1013, "inbound queue overloaded");
         } catch {
-          failed = true;
-        } finally {
-          if (admission && !retired) {
-            const abortFacet = this.state.facets.abort;
-            if (!abortFacet) this.poisoned = true;
-            else {
-              try {
-                SafeReflectApply(abortFacet, this.state.facets, [
-                  "actor",
-                  "actor-socket-retirement",
-                ]);
-                retired = true;
-              } catch {
-                this.poisoned = true;
-              }
-            }
-          }
-          if (admission) {
+          /* peer already gone */
+        }
+        return Promise.resolve();
+      }
+      if (event.kind === "close") this.closingInbound.add(socket);
+      if (!this.socketBatch) {
+        const batch = new Set<InboundSocketEvent>();
+        this.socketBatch = batch;
+        const turn = this.tail.then(async () => {
+          // One tail closure per consecutive socket batch, never per payload.
+          // HTTP/alarm/reservation insertion seals this batch to preserve FIFO.
+          for (const entry of batch) {
+            batch.delete(entry);
             try {
-              await this.completeSocketAdmission(admission.attemptNonce, admission.deadlineAt);
+              if (entry.event) await this.deliverSocketEvent(entry.socket, entry.event);
+              entry.resolve();
             } catch (error) {
-              failed = true;
-              completionError = error;
+              this.discardInbound(entry.socket);
+              entry.reject(error);
+            } finally {
+              this.releaseInbound(entry);
             }
           }
-        }
-        if (failed || event.kind === "close") {
-          record.status = "closed";
-          this.sockets.delete(socketId);
-          this.suppressedCloses.add(socket);
-          if (failed && event.kind !== "close") {
-            try {
-              socket.close(1011, "actor callback failed");
-            } catch {
-              /* peer already gone */
-            }
-          }
-        }
-        if (completionError !== undefined) throw completionError;
+          if (this.socketBatch === batch) this.socketBatch = undefined;
+        });
+        this.tail = turn.catch(() => {});
+        this.state.waitUntil(this.tail);
+      }
+      const batch = this.socketBatch;
+      const promise = new Promise<void>((resolve, reject) => {
+        const entry: InboundSocketEvent = { socket, event, bytes, batch, resolve, reject };
+        connection.events.add(entry);
+        batch.add(entry);
       });
-      this.tail = turn.catch(() => {});
-      this.state.waitUntil(this.tail);
-      return turn;
+      this.inbound.set(socket, connection);
+      connection.bytes += bytes;
+      this.inboundBytes += bytes;
+      this.inboundCount += 1;
+      return promise;
+    }
+    private async deliverSocketEvent(
+      socket: NativeActorWebSocket,
+      event: SocketEvent,
+    ): Promise<void> {
+      await this.ready;
+      if (this.poisoned) throw new Error("Actor facet retirement failed");
+      const metadata = socketMetadata(socket);
+      if (!metadata) throw new Error("Actor socket metadata unavailable");
+      const socketId = metadata.socketId;
+      const actorId = metadata.actorId;
+      if (event.kind === "close" && this.suppressedCloses.has(socket)) return;
+      if (metadata.reservationBearer !== undefined) {
+        const pending = this.liveSocket(socketId);
+        if (pending?.status === "transport-pending") this.discardPending(pending);
+        await this.reconcile();
+        return;
+      }
+      let record = this.liveSocket(socketId);
+      if (!record && event.kind === "close") {
+        record = {
+          socketId,
+          actorId,
+          nonce: "",
+          protocol: "",
+          attachment: decodeAttachment(metadata.attachment),
+          queued: [],
+          queuedBytes: 0,
+          status: "live",
+          socket,
+        };
+        this.sockets.set(socketId, record);
+      }
+      if (!record || record.socket !== socket) throw new Error("Actor socket unavailable");
+      let admission: Awaited<ReturnType<typeof this.socketAdmission>> | undefined;
+      let failed = false;
+      let retired = false;
+      let completionError: unknown;
+      try {
+        admission = await this.socketAdmission(actorId);
+        const graphNow = await this.currentGraph();
+        const key = graphNow.variantKeys[admission.variantIndex];
+        if (
+          key !== admission.variantKey ||
+          graphNow.generationKey !== admission.generationKey ||
+          graphNow.epoch !== admission.epoch
+        )
+          throw new Error("Actor socket variant unavailable");
+        const child = await this.selectedChild(actorId, key, admission.variantIndex, graphNow);
+        const graphBeforeDelivery = await this.currentGraph();
+        if (
+          graphBeforeDelivery.generationKey !== admission.generationKey ||
+          graphBeforeDelivery.epoch !== admission.epoch ||
+          graphBeforeDelivery.variantKeys[admission.variantIndex] !== admission.variantKey
+        )
+          throw new Error("Actor socket graph changed before delivery");
+        const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
+        const controller = new AbortController();
+        const body =
+          event.kind === "message"
+            ? event.data
+            : SafeJsonStringify({
+                code: event.code,
+                reason: event.reason,
+                wasClean: event.wasClean,
+              });
+        const headers = new SafeHeaders({
+          [DELIVERY_HEADER]: deliveryForEvent(),
+          [SOCKET_ACTION_HEADER]: event.kind === "message" ? "callback-message" : "callback-close",
+          [SOCKET_NONCE_HEADER]: nonce,
+          [SOCKET_ID_HEADER]: socketId,
+        });
+        if (event.kind === "message")
+          headers.set(SOCKET_KIND_HEADER, typeof event.data === "string" ? "text" : "binary");
+        this.activeSocketInvocation = { actorId, nonce, kind: "callback", accepting: false };
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let retirementError: unknown;
+        try {
+          const response = await Promise.race([
+            child.fetch(
+              new SafeRequest("http://actor.invalid/", {
+                method: "POST",
+                headers,
+                body,
+                signal: controller.signal,
+              }),
+            ),
+            new Promise<never>((_accept, reject) => {
+              timer = setTimeout(() => {
+                controller.abort();
+                reject(new Error("Actor socket callback deadline"));
+              }, deadlines.handlerMs);
+            }),
+          ]);
+          if (response.status !== 204) throw new Error("Actor socket callback unavailable");
+          await response.body?.cancel();
+        } finally {
+          if (timer) clearTimeout(timer);
+          controller.abort();
+          this.activeSocketInvocation = undefined;
+          const abortFacet = this.state.facets.abort;
+          if (!abortFacet) {
+            this.poisoned = true;
+            retirementError = new Error("Actor facet retirement unavailable");
+          } else {
+            try {
+              SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-socket-retirement"]);
+              retired = true;
+            } catch (error) {
+              this.poisoned = true;
+              retirementError = error;
+            }
+          }
+        }
+        if (retirementError !== undefined) throw retirementError;
+      } catch {
+        failed = true;
+      } finally {
+        if (admission && !retired) {
+          const abortFacet = this.state.facets.abort;
+          if (!abortFacet) this.poisoned = true;
+          else {
+            try {
+              SafeReflectApply(abortFacet, this.state.facets, ["actor", "actor-socket-retirement"]);
+              retired = true;
+            } catch {
+              this.poisoned = true;
+            }
+          }
+        }
+        if (admission) {
+          try {
+            await this.completeSocketAdmission(admission.attemptNonce, admission.deadlineAt);
+          } catch (error) {
+            failed = true;
+            completionError = error;
+          }
+        }
+      }
+      if (failed || event.kind === "close") {
+        const alreadyStopped = this.stoppedInbound.has(socket);
+        this.discardInbound(socket);
+        record.status = "closed";
+        this.sockets.delete(socketId);
+        this.suppressedCloses.add(socket);
+        if (failed && event.kind !== "close" && !alreadyStopped) {
+          try {
+            socket.close(1011, "actor callback failed");
+          } catch {
+            /* peer already gone */
+          }
+        }
+      }
+      if (completionError !== undefined) throw completionError;
     }
     webSocketMessage(socket: NativeActorWebSocket, data: string | ArrayBuffer): Promise<void> {
-      if (typeof data !== "string" && data.byteLength > SOCKET_MESSAGE_LIMIT) {
-        socket.close(1009, "message too large");
-        return Promise.resolve();
-      }
       if (
-        typeof data === "string" &&
-        new TextEncoder().encode(data).byteLength > SOCKET_MESSAGE_LIMIT
-      ) {
+        this.stoppedInbound.has(socket) ||
+        this.suppressedCloses.has(socket) ||
+        this.closingInbound.has(socket)
+      )
+        return Promise.resolve();
+      const bytes =
+        typeof data === "string" ? new TextEncoder().encode(data).byteLength : data.byteLength;
+      if (bytes > SOCKET_MESSAGE_LIMIT) {
+        this.discardInbound(socket);
         socket.close(1009, "message too large");
         return Promise.resolve();
       }
-      return this.socketEvent(socket, { kind: "message", data });
+      return this.socketEvent(socket, { kind: "message", data }, bytes);
     }
     webSocketClose(
       socket: NativeActorWebSocket,
@@ -1607,15 +1713,14 @@ export function createActorNativeOwner(
       reason: string,
       wasClean: boolean,
     ): Promise<void> {
-      return this.socketEvent(socket, { kind: "close", code, reason, wasClean });
+      return this.socketEvent(
+        socket,
+        { kind: "close", code, reason, wasClean },
+        new TextEncoder().encode(reason).byteLength,
+      );
     }
     webSocketError(socket: NativeActorWebSocket): Promise<void> {
-      return this.socketEvent(socket, {
-        kind: "close",
-        code: 1006,
-        reason: "transport_error",
-        wasClean: false,
-      });
+      return this.webSocketClose(socket, 1006, "transport_error", false);
     }
     fetch(request: Request): Promise<Response> {
       if (request.headers.has(ALARM_ACTION_HEADER)) return this.alarmControl(request);
@@ -1630,6 +1735,7 @@ export function createActorNativeOwner(
       // The native input gate cannot stay closed while delivering a streaming
       // response: it defers the head and deadlocks the body pump. The owning
       // instance instead reserves the turn until the actual body terminates.
+      this.socketBatch = undefined;
       const turn = this.tail.then(async () => {
         await this.ready;
         if (this.poisoned) throw new Error("Actor facet retirement failed");
