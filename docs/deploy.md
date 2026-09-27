@@ -1183,7 +1183,7 @@ managed customer runtime.
   `integration-protected-wave` result is never accepted by rehearsal or
   production. The no-selector integration lane additionally permits only the
   exact existing-data 0058/0059 to 0060, separate 0060 to 0061, separate
-  0061 to 0062, and separate 0062 to 0063 transitions
+  0061 to 0062, separate 0062 to 0063, and separate 0063 to 0064 transitions
   described below. Earlier
   predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
@@ -1199,8 +1199,8 @@ The current source includes audited 0058–0064 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
 `--through-migration=0059`, `--through-migration=0060`,
-`--through-migration=0061`, `--through-migration=0062`, or
-`--through-migration=0063`.
+`--through-migration=0061`, `--through-migration=0062`,
+`--through-migration=0063`, or `--through-migration=0064`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1333,8 +1333,8 @@ standalone transition: the exact audited 0062 prefix with only
 must be exactly 0001–0064 with the audited 0063 SHA-256, and the selected D1
 must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
-table has no in-place existing-D1 schema wave in this change. A fresh
-integration storage generation can use the full audited lineage; an unreviewed
+table has a separate in-place integration wave only after exact 0063; a fresh
+integration storage generation can use the full audited lineage. An unreviewed
 0065 tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
@@ -1354,6 +1354,32 @@ Release order is schema, matching CPE, Host authority cutover, then Form. CPE
 readiness must itself prove the exact 0063 retirement objects before
 publication. Host scheduling and an actual managed Queue convergence E2E are
 separate post-publication evidence; local schema success does not claim either.
+
+### 0064: durable Actor owner claim integration cutover
+
+The no-selector integration lane accepts one further standalone additive wave
+from exact all-0063 lineage and canonical 0063 application shape to only
+`0064_cloudflare_managed_actor_owner_claims.sql`. It requires the exact audited
+0001–0064 source inventory and bytes; it does not extend the protected
+rehearsal/production selectors beyond 0057. The existing D1 is protected and
+non-disposable: this is a forward-only migration, never a reset or a raw SQL
+workaround. The 0064 table is separate from the existing Worker receipt table;
+the latter's schema and rows remain unchanged. This wave neither admits Actor
+workloads nor publishes the private Actor runtime.
+
+The owner compares the exact 0063 shape at initial preflight, after source and
+focused test qualification, and in a fresh authoritative read immediately
+before the single migration request. The audited file and migration-ledger
+insert execute in one D1 transaction. Success requires exact all-0064 lineage
+and canonical 0064 post-shape. A lost provider acknowledgement is settled only
+from that authoritative readback, never by replay; a shape or lineage mismatch
+requires forward repair. A local nonempty production-shaped rehearsal verifies
+preservation, but does not qualify a live D1 or authorize a schema release.
+
+For an actual release, independently review the exact source and D1 state,
+then use the owner deploy lane and its authoritative readback before publishing
+matching private CPE and Host code. Actor admission and end-to-end runtime
+readiness remain separate evidence.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

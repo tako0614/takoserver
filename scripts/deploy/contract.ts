@@ -1166,7 +1166,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0064; unreviewed 0065+ tails are refused before any provider command. Migration 0064 has no in-place existing-D1 schema wave in this change; a fresh integration storage generation uses the full audited lineage. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0064; unreviewed 0065+ tails are refused before any provider command. A separate integration-only in-place 0063 to 0064 wave follows the exact 0063 predecessor; a fresh integration storage generation also uses the full audited lineage. Protected wave selectors still end at 0057. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1193,6 +1193,7 @@ export const DEPLOY_CONTRACT = {
           "The 0056 boundary adds Host-owned bounded VectorIndex SQL storage after 0055: immutable cosine index configuration, per-Resource record quotas, binary32 vector records, and type-sensitive equality filter terms; it changes no published identity, binding or provider catalog. " +
           "The 0057 boundary adds receipt-coupled, provider-private execution-material tables for immutable managed Worker Versions after 0056; it stores only bounded execution descriptors and sealed values, and does not publish a Worker, activate custody, or apply any schema automatically. " +
           "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
+          "The separate integration-only 0063 to 0064 transition adds an Actor owner claim table without rewriting the Worker receipt table or admitting Actors; it performs no backfill and changes no protected selector. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1236,7 +1237,8 @@ export const DEPLOY_CONTRACT = {
           "order as a forward-only integration repair; it grants no production authorization. " +
           "The executor protocol generation is unchanged; unrelated components need not be republished. " +
           "This forward-only availability boundary is not a zero-downtime or historical recovery claim. " +
-          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0064 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition.",
+          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0064 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition. " +
+          "The following exact 0063 to 0064 integration transition requires canonical all-0063 shape and only the audited 0064 suffix. It preserves existing Worker receipts, adds no Actor admission, and has no data backfill or generic quiescence claim. Its migration and ledger insert are atomic, exact all-0064 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. It remains a protected non-disposable D1 migration, not a reset or a raw SQL workaround; independent source and live-state review precedes any real release.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
@@ -1249,6 +1251,7 @@ export const DEPLOY_CONTRACT = {
           "the exact 0061 predecessor shape, zero planned current-generation imports and the unique " +
           "native-destination reservation through receipt publication before the local D1 migration gate. " +
           "The separate 0062 to 0063 transition checks the exact canonical 0062 predecessor at initial preflight, after qualification and at an immediate mutation read, then requires the exact canonical 0063 post-shape. It admits no other pending suffix and leaves all protected selectors capped at 0057. " +
+          "The separate 0063 to 0064 transition likewise checks exact canonical 0063 shape at initial preflight, after qualification and immediately before mutation; it accepts only the audited 0064 suffix and requires exact canonical 0064 post-shape. " +
           "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +

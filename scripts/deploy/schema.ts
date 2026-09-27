@@ -431,6 +431,7 @@ const OPERATION_GENERATION_MIGRATION = "0060_takoform_operation_generation.sql";
 const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuity.sql";
 const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
 const MANAGED_QUEUE_RETIREMENT_MIGRATION = "0063_cloudflare_managed_queue_retirement.sql";
+const MANAGED_ACTOR_OWNER_CLAIM_MIGRATION = "0064_cloudflare_managed_actor_owner_claims.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -836,9 +837,16 @@ export async function runD1Schema(
       state: initial,
       artifact: sourceMigrations,
     });
+    const managedActorOwnerCutover = inspectManagedActorOwnerCutover({
+      invocation,
+      wave,
+      state: initial,
+      artifact: sourceMigrations,
+    });
     if (invocation.action === "apply") {
       assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
       assertManagedQueueRetirementCutoverReady(managedQueueRetirementCutover);
+      assertManagedActorOwnerCutoverReady(managedActorOwnerCutover);
     }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -905,6 +913,7 @@ export async function runD1Schema(
         artifactBlobIoCompatibility,
         applyProviderSelectionCutover,
         managedQueueRetirementCutover,
+        managedActorOwnerCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -918,7 +927,9 @@ export async function runD1Schema(
           (applyProviderSelectionCutover.status === "not_pending" ||
             applyProviderSelectionCutover.status === "ready") &&
           (managedQueueRetirementCutover.status === "not_pending" ||
-            managedQueueRetirementCutover.status === "ready"),
+            managedQueueRetirementCutover.status === "ready") &&
+          (managedActorOwnerCutover.status === "not_pending" ||
+            managedActorOwnerCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -977,6 +988,13 @@ export async function runD1Schema(
         "tests/deploy-schema-managed-queue-retirement.test.ts",
       ]);
     }
+    if (wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)) {
+      await checked(run, "preflight", "managed Actor owner claim transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-managed-actor-owner.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -1001,7 +1019,8 @@ export async function runD1Schema(
     }
     const additiveCutoverPostShape =
       applyProviderSelectionCutover.status === "ready" ||
-      managedQueueRetirementCutover.status === "ready"
+      managedQueueRetirementCutover.status === "ready" ||
+      managedActorOwnerCutover.status === "ready"
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
@@ -1037,6 +1056,14 @@ export async function runD1Schema(
     );
     assertManagedQueueRetirementCutoverReady(
       inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: requalifiedWave,
+        state: requalified,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertManagedActorOwnerCutoverReady(
+      inspectManagedActorOwnerCutover({
         invocation,
         wave: requalifiedWave,
         state: requalified,
@@ -1116,6 +1143,14 @@ export async function runD1Schema(
     );
     assertManagedQueueRetirementCutoverReady(
       inspectManagedQueueRetirementCutover({
+        invocation,
+        wave: fencedWave,
+        state: fenced,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertManagedActorOwnerCutoverReady(
+      inspectManagedActorOwnerCutover({
         invocation,
         wave: fencedWave,
         state: fenced,
@@ -1342,6 +1377,28 @@ export async function runD1Schema(
           }),
         );
       }
+      if (fencedWave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)) {
+        const immediateManagedActorOwnerState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(
+          fenced,
+          immediateManagedActorOwnerState,
+          "at the immediate 0064 Actor owner claim migration fence",
+        );
+        assertManagedActorOwnerCutoverReady(
+          inspectManagedActorOwnerCutover({
+            invocation,
+            wave: fencedWave,
+            state: immediateManagedActorOwnerState,
+            artifact: sourceMigrations,
+          }),
+        );
+      }
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1457,13 +1514,15 @@ export async function runD1Schema(
       );
     }
     if (additiveCutoverPostShape !== null) {
-      const cutoverName = wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
-        ? "managed Queue retirement"
-        : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
-          ? "import-selection"
-          : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-            ? "accepted-authority"
-            : "operation-generation";
+      const cutoverName = wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
+        ? "Actor owner claim"
+        : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+          ? "managed Queue retirement"
+          : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+            ? "import-selection"
+            : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+              ? "accepted-authority"
+              : "operation-generation";
       const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
@@ -1595,6 +1654,7 @@ export async function runD1Schema(
       artifactBlobIoCompatibility: fencedArtifactBlobIoCompatibility,
       applyProviderSelectionCutover,
       managedQueueRetirementCutover,
+      managedActorOwnerCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1663,6 +1723,7 @@ function selectSchemaWave(
         ACCEPTED_AUTHORITY_MIGRATION,
         IMPORT_PROVIDER_SELECTION_MIGRATION,
         MANAGED_QUEUE_RETIREMENT_MIGRATION,
+        MANAGED_ACTOR_OWNER_CLAIM_MIGRATION,
       ].includes(name),
     );
     if (hasAvailabilityCutover) {
@@ -1680,7 +1741,9 @@ function selectSchemaWave(
           ? 61
           : applied.length === 61
             ? 62
-            : 63
+            : applied.length === 62
+              ? 63
+              : 64
       : artifact.names.length;
     const throughPrefixNames = artifact.names.slice(0, throughCount);
     const throughPrefixFiles = artifact.files.slice(0, throughCount);
@@ -2081,6 +2144,14 @@ interface ManagedQueueRetirementCutover {
     | "managed_queue_retirement_cutover_unqualified";
 }
 
+interface ManagedActorOwnerCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "managed_actor_owner_cutover_unqualified";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -2197,6 +2268,46 @@ function assertManagedQueueRetirementCutoverReady(cutover: ManagedQueueRetiremen
   if (cutover.status !== "not_pending" && cutover.status !== "ready") {
     throw preflightError(
       `managed Queue retirement cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
+function inspectManagedActorOwnerCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+}): ManagedActorOwnerCutover {
+  if (!input.wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)) {
+    return { status: "not_pending" };
+  }
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    input.state.applied.length !== 63 ||
+    JSON.stringify(input.wave.pending) !== JSON.stringify([MANAGED_ACTOR_OWNER_CLAIM_MIGRATION])
+  ) {
+    return { status: "managed_actor_owner_cutover_unqualified" };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "Actor owner claim cutover requires the exact audited source inventory 0001-0064",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  return applicationSchemaMatches(
+    input.state,
+    deriveExpectedApplicationShape(input.artifact.files.slice(0, 63)),
+  )
+    ? { status: "ready" }
+    : { status: "predecessor_schema_mismatch" };
+}
+
+function assertManagedActorOwnerCutoverReady(cutover: ManagedActorOwnerCutover): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `Actor owner claim cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
     );
   }

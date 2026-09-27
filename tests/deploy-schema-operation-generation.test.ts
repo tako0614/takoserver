@@ -511,7 +511,7 @@ describe("0060 operation-generation cutover", () => {
   });
 
   test("keeps the no-op refusal and rehearsal/production fixed-wave selectors unchanged", async () => {
-    const complete = createDatabaseThrough(63);
+    const complete = createDatabaseThrough(64);
     const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "takoserver-opgen-noop-"));
     try {
       const fixture = databaseProcess(complete);

@@ -1161,7 +1161,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  for (const refusedBoundary of ["0058", "0059", "0060", "0061", "0062", "0063"] as const) {
+  for (const refusedBoundary of ["0058", "0059", "0060", "0061", "0062", "0063", "0064"] as const) {
     test(`${refusedBoundary} remains unavailable as a rehearsal or production fixed-wave boundary`, async () => {
       for (const environment of ["rehearsal", "production"] as const) {
         const root = mkdtempSync(
