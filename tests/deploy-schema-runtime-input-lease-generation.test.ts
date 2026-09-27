@@ -299,7 +299,12 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
-      await expect(f.invoke("apply")).rejects.toThrow("already complete");
+      expect(await f.invoke("status")).toMatchObject({
+        fromMigration: LEASE_GENERATION,
+        throughMigration: "0066_cloudflare_managed_actor_kv_capability_claims.sql",
+        pendingMigrations: ["0066_cloudflare_managed_actor_kv_capability_claims.sql"],
+        actorKvCapabilityCutover: { status: "ready" },
+      });
       expect(f.applies()).toBe(1);
     } finally {
       f.db.close();

@@ -1221,7 +1221,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0066; unreviewed 0067+ tails are refused before any provider command. Separate integration-only in-place 0063 to 0064 and 0064 to 0065 waves follow their exact predecessors. The new 0065 to 0066 Actor KV capability claim transition has no live migration gate in this source-only change and is not authorized for application. A fresh integration storage generation uses the full audited lineage. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0066; unreviewed 0067+ tails are refused before qualification or provider mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the full audited lineage. Protected wave selectors still end at 0057. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1250,6 +1250,7 @@ export const DEPLOY_CONTRACT = {
           "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
           "The separate integration-only 0063 to 0064 transition adds an Actor owner claim table without rewriting the Worker receipt table or admitting Actors; it performs no backfill and changes no protected selector. " +
           "The separate integration-only 0064 to 0065 transition adds a value-free runtime-input lease generation and backfills prepared/claimed rows from their live seal nonce; historical dispatched and terminal rows with no nonce remain NULL and fail closed on ambiguous acknowledgement. It changes no protected selector. " +
+          "The separate integration-only 0065 to 0066 transition adds only an Actor KV capability claim WITHOUT ROWID table and three triggers. It performs no backfill, preserves existing data, and changes no public API, Actor admission or protected selector. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1309,6 +1310,7 @@ export const DEPLOY_CONTRACT = {
           "The separate 0062 to 0063 transition checks the exact canonical 0062 predecessor at initial preflight, after qualification and at an immediate mutation read, then requires the exact canonical 0063 post-shape. It admits no other pending suffix and leaves all protected selectors capped at 0057. " +
           "The separate 0063 to 0064 transition likewise checks exact canonical 0063 shape at initial preflight, after qualification and immediately before mutation; it accepts only the audited 0064 suffix and requires exact canonical 0064 post-shape. " +
           "The separate 0064 to 0065 transition checks exact canonical 0064 shape at the same three fences; it accepts only the audited 0065 suffix and requires exact canonical 0065 post-shape. " +
+          "The separate 0065 to 0066 transition checks exact canonical 0065 shape at initial preflight, after source and focused-test qualification, at final preflight and immediately before mutation. It accepts only the audited 0066 suffix, applies its SQL and d1_migrations insert in one transaction, and requires exact all-0066 lineage and canonical post-shape. Unknown acknowledgement requires authoritative readback, never blind replay. Status may show complete; apply refuses already-complete no-op mutation evidence. Local preservation and rollback tests do not grant live mutation authority; independent source and live-state review remain required. " +
           "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +

@@ -439,6 +439,7 @@ const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selec
 const MANAGED_QUEUE_RETIREMENT_MIGRATION = "0063_cloudflare_managed_queue_retirement.sql";
 const MANAGED_ACTOR_OWNER_CLAIM_MIGRATION = "0064_cloudflare_managed_actor_owner_claims.sql";
 const RUNTIME_INPUT_LEASE_GENERATION_MIGRATION = "0065_worker_runtime_input_lease_generation.sql";
+const ACTOR_KV_CAPABILITY_MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -856,11 +857,18 @@ export async function runD1Schema(
       state: initial,
       artifact: sourceMigrations,
     });
+    const actorKvCapabilityCutover = inspectActorKvCapabilityCutover({
+      invocation,
+      wave,
+      state: initial,
+      artifact: sourceMigrations,
+    });
     if (invocation.action === "apply") {
       assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
       assertManagedQueueRetirementCutoverReady(managedQueueRetirementCutover);
       assertManagedActorOwnerCutoverReady(managedActorOwnerCutover);
       assertRuntimeInputLeaseGenerationCutoverReady(runtimeInputLeaseGenerationCutover);
+      assertActorKvCapabilityCutoverReady(actorKvCapabilityCutover);
     }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -929,6 +937,7 @@ export async function runD1Schema(
         managedQueueRetirementCutover,
         managedActorOwnerCutover,
         runtimeInputLeaseGenerationCutover,
+        actorKvCapabilityCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -946,7 +955,9 @@ export async function runD1Schema(
           (managedActorOwnerCutover.status === "not_pending" ||
             managedActorOwnerCutover.status === "ready") &&
           (runtimeInputLeaseGenerationCutover.status === "not_pending" ||
-            runtimeInputLeaseGenerationCutover.status === "ready"),
+            runtimeInputLeaseGenerationCutover.status === "ready") &&
+          (actorKvCapabilityCutover.status === "not_pending" ||
+            actorKvCapabilityCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -1020,6 +1031,13 @@ export async function runD1Schema(
         "tests/runtime-input-preparations.test.ts",
       ]);
     }
+    if (wave.pending.includes(ACTOR_KV_CAPABILITY_MIGRATION)) {
+      await checked(run, "preflight", "Actor KV capability claim transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-actor-kv-capability-cutover.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -1046,7 +1064,8 @@ export async function runD1Schema(
       applyProviderSelectionCutover.status === "ready" ||
       managedQueueRetirementCutover.status === "ready" ||
       managedActorOwnerCutover.status === "ready" ||
-      runtimeInputLeaseGenerationCutover.status === "ready"
+      runtimeInputLeaseGenerationCutover.status === "ready" ||
+      actorKvCapabilityCutover.status === "ready"
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
@@ -1098,6 +1117,14 @@ export async function runD1Schema(
     );
     assertRuntimeInputLeaseGenerationCutoverReady(
       inspectRuntimeInputLeaseGenerationCutover({
+        invocation,
+        wave: requalifiedWave,
+        state: requalified,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertActorKvCapabilityCutoverReady(
+      inspectActorKvCapabilityCutover({
         invocation,
         wave: requalifiedWave,
         state: requalified,
@@ -1193,6 +1220,14 @@ export async function runD1Schema(
     );
     assertRuntimeInputLeaseGenerationCutoverReady(
       inspectRuntimeInputLeaseGenerationCutover({
+        invocation,
+        wave: fencedWave,
+        state: fenced,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertActorKvCapabilityCutoverReady(
+      inspectActorKvCapabilityCutover({
         invocation,
         wave: fencedWave,
         state: fenced,
@@ -1463,6 +1498,28 @@ export async function runD1Schema(
           }),
         );
       }
+      if (fencedWave.pending.includes(ACTOR_KV_CAPABILITY_MIGRATION)) {
+        const immediateState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(
+          fenced,
+          immediateState,
+          "at the immediate 0066 Actor KV capability claim migration fence",
+        );
+        assertActorKvCapabilityCutoverReady(
+          inspectActorKvCapabilityCutover({
+            invocation,
+            wave: fencedWave,
+            state: immediateState,
+            artifact: sourceMigrations,
+          }),
+        );
+      }
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1578,17 +1635,19 @@ export async function runD1Schema(
       );
     }
     if (additiveCutoverPostShape !== null) {
-      const cutoverName = wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)
-        ? "runtime-input lease generation"
-        : wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
-          ? "Actor owner claim"
-          : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
-            ? "managed Queue retirement"
-            : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
-              ? "import-selection"
-              : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-                ? "accepted-authority"
-                : "operation-generation";
+      const cutoverName = wave.pending.includes(ACTOR_KV_CAPABILITY_MIGRATION)
+        ? "Actor KV capability claim"
+        : wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)
+          ? "runtime-input lease generation"
+          : wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
+            ? "Actor owner claim"
+            : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+              ? "managed Queue retirement"
+              : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+                ? "import-selection"
+                : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+                  ? "accepted-authority"
+                  : "operation-generation";
       const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
@@ -1722,6 +1781,7 @@ export async function runD1Schema(
       managedQueueRetirementCutover,
       managedActorOwnerCutover,
       runtimeInputLeaseGenerationCutover,
+      actorKvCapabilityCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1792,6 +1852,7 @@ function selectSchemaWave(
         MANAGED_QUEUE_RETIREMENT_MIGRATION,
         MANAGED_ACTOR_OWNER_CLAIM_MIGRATION,
         RUNTIME_INPUT_LEASE_GENERATION_MIGRATION,
+        ACTOR_KV_CAPABILITY_MIGRATION,
       ].includes(name),
     );
     if (hasAvailabilityCutover) {
@@ -1813,7 +1874,9 @@ function selectSchemaWave(
               ? 63
               : applied.length === 63
                 ? 64
-                : 65
+                : applied.length === 64
+                  ? 65
+                  : 66
       : artifact.names.length;
     const throughPrefixNames = artifact.names.slice(0, throughCount);
     const throughPrefixFiles = artifact.files.slice(0, throughCount);
@@ -2230,6 +2293,14 @@ interface RuntimeInputLeaseGenerationCutover {
     | "runtime_input_lease_generation_cutover_unqualified";
 }
 
+interface ActorKvCapabilityCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "actor_kv_capability_cutover_unqualified";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -2429,6 +2500,46 @@ function assertRuntimeInputLeaseGenerationCutoverReady(
   if (cutover.status !== "not_pending" && cutover.status !== "ready") {
     throw preflightError(
       `runtime-input lease generation cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
+function inspectActorKvCapabilityCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+}): ActorKvCapabilityCutover {
+  if (!input.wave.pending.includes(ACTOR_KV_CAPABILITY_MIGRATION)) {
+    return { status: "not_pending" };
+  }
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    input.state.applied.length !== 65 ||
+    JSON.stringify(input.wave.pending) !== JSON.stringify([ACTOR_KV_CAPABILITY_MIGRATION])
+  ) {
+    return { status: "actor_kv_capability_cutover_unqualified" };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0066",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  return applicationSchemaMatches(
+    input.state,
+    deriveExpectedApplicationShape(input.artifact.files.slice(0, 65)),
+  )
+    ? { status: "ready" }
+    : { status: "predecessor_schema_mismatch" };
+}
+
+function assertActorKvCapabilityCutoverReady(cutover: ActorKvCapabilityCutover): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `Actor KV capability claim cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
     );
   }

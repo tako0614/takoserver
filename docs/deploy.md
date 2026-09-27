@@ -1176,7 +1176,7 @@ managed customer runtime.
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
   0001–0066 names and SHA-256 inventory, so a checkout with unreviewed 0067+
-  migrations is refused before any provider command. The selected integration
+  migrations is refused before qualification or provider mutation. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
@@ -1184,9 +1184,7 @@ managed customer runtime.
   production. The no-selector integration lane additionally permits only the
   exact existing-data 0058/0059 to 0060, separate 0060 to 0061, separate
   0061 to 0062, separate 0062 to 0063, separate 0063 to 0064, and separate
-  0064 to 0065 transitions
-  described below. There is no 0065 to 0066 in-place migration gate yet; the
-  source-only 0066 migration is not authorized for application. Earlier
+  0064 to 0065, and separate 0065 to 0066 transitions described below. Earlier
   predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
   protocol below. Keep its maintenance projection while the selected 0044–0057
@@ -1197,13 +1195,13 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes audited 0058–0065 for fresh, explicitly
+The current source includes audited 0058–0066 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
 `--through-migration=0059`, `--through-migration=0060`,
 `--through-migration=0061`, `--through-migration=0062`,
-`--through-migration=0063`, `--through-migration=0064`, or
-`--through-migration=0065`.
+`--through-migration=0063`, `--through-migration=0064`,
+`--through-migration=0065`, or `--through-migration=0066`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1414,7 +1412,14 @@ nor authorizes release. Independently review the exact source and live D1
 state before any owner-lane mutation; publish compatible runtime code only
 after schema readback, then obtain separate end-to-end readiness evidence.
 
-### 0066: Actor KV capability claim source only
+### 0066: Actor KV capability claim integration cutover
+
+The no-selector integration lane accepts only the next standalone wave from
+exact all-0065 lineage and canonical 0065 application shape to
+`0066_cloudflare_managed_actor_kv_capability_claims.sql`. The source inventory
+and bytes must be exactly the audited 0001–0066 set. Protected rehearsal and
+production selectors remain capped at 0057. This is a protected, forward-only
+existing-data transition, not a disposable reset or raw SQL repair.
 
 Migration `0066_cloudflare_managed_actor_kv_capability_claims.sql` adds a
 separate immutable claim for one exact target deployment incarnation and its
@@ -1428,10 +1433,26 @@ claim; the private adapter still requires exact readback to recognize a retry.
 This does not add a public Host state API or alter the existing Actor
 owner-claim table.
 
-This source-only addition has no 0065→0066 live migration gate or apply
-authorization. A future protected application needs a separately reviewed
-owner lane with exact predecessor and post-shape contracts. Protected rehearsal
-and production selectors remain capped at 0057.
+The migration adds only one `WITHOUT ROWID` table and three triggers; it has
+no backfill, Worker publication, public API or Actor admission change. Existing
+Worker receipts, Actor owner claims and runtime-input preparations remain
+untouched. There is no generic quiescence requirement for this additive wave.
+
+The owner checks the exact predecessor at initial preflight, after source and
+focused-test qualification, at the final preflight fence, and by a fresh read
+immediately before the single migration request. Wrangler applies the frozen
+SQL and its migration-ledger insert in one transaction. Success requires exact
+all-0066 lineage and canonical 0066 post-shape, including all three triggers.
+An unknown acknowledgement is reconciled only from authoritative lineage and
+shape readback; neither blind replay nor automatic down migration is allowed.
+Status may report no pending migrations after completion, but apply refuses
+to turn that no-op into successful mutation evidence. Failure repairs forward.
+
+Local nonempty SQLite rehearsal proves preservation and transaction rollback;
+it is not live D1 evidence or release authority. Independently review the exact
+source and live D1 state before any owner-lane mutation, then obtain canonical
+schema readback before publishing compatible runtime code. End-to-end Actor KV
+readiness remains a separate qualification.
 
 ### 0043 artifact blob-I/O compatibility protocol
 
