@@ -125,6 +125,7 @@ async function runtimeInputFixture(
   return {
     sql,
     authority,
+    key,
     setNow(value: string) {
       now = new Date(value);
     },
@@ -272,6 +273,142 @@ test("claims the exact operation key with a commitment-bound preparation identit
   await expect(
     authority.leases.acquire(leaseInput({ operationId: "op_other" })),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+test("fences plaintext claim and dispatch to the composition's durable phase", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await sql.run(
+    "CREATE TABLE private_preclaim (operation_id TEXT PRIMARY KEY, state TEXT NOT NULL)",
+  );
+  await sql.run("INSERT INTO private_preclaim (operation_id, state) VALUES (?, 'preclaim')", [
+    HOST_OPERATION_ID,
+  ]);
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  if (!pinPrepared) throw new Error("runtime-input pinning is unavailable");
+  const pinned = await pinPrepared(leaseInput());
+  const fence = {
+    claim: {
+      sql: "EXISTS (SELECT 1 FROM private_preclaim WHERE operation_id = ? AND state = 'preclaim')",
+      params: [HOST_OPERATION_ID],
+    },
+  };
+  const dispatchFence = {
+    sql: "EXISTS (SELECT 1 FROM private_preclaim WHERE operation_id = ? AND state = 'pending')",
+    params: [HOST_OPERATION_ID],
+  };
+  const input = { ...leaseInput(), expectedGeneration: pinned.generation, leaseFence: fence };
+  const lease = await authority.leases.acquire(input);
+  await expect(lease.dispatch()).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await expect(lease.dispatch(dispatchFence)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "claimed",
+  );
+  await sql.run("UPDATE private_preclaim SET state = 'pending' WHERE operation_id = ?", [
+    HOST_OPERATION_ID,
+  ]);
+  await expect(authority.leases.acquire(input)).rejects.toMatchObject({ code: "conflict" });
+  await lease.dispatch(dispatchFence);
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
+test("no-effect batch closes the exact generation and never revokes a replacement", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await sql.run(
+    "CREATE TABLE private_preclaim (operation_id TEXT PRIMARY KEY, state TEXT NOT NULL)",
+  );
+  await sql.run("INSERT INTO private_preclaim (operation_id, state) VALUES (?, 'preclaim')", [
+    HOST_OPERATION_ID,
+  ]);
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  const noEffectRevocation = authority.leases.noEffectRevocation;
+  if (!pinPrepared || !noEffectRevocation) {
+    throw new Error("runtime-input no-effect fence is unavailable");
+  }
+  const old = await pinPrepared(leaseInput());
+  const revoke = await noEffectRevocation({
+    ...leaseInput(),
+    generation: old.generation,
+  });
+  const outcome = await sql.batch([
+    {
+      sql: `UPDATE private_preclaim SET state = 'closed'
+            WHERE operation_id = ? AND state = 'preclaim'
+              AND EXISTS (SELECT 1 FROM worker_runtime_input_preparations
+                          WHERE organization_id = ? AND operation_key = ? AND seal_nonce = ?
+                            AND state IN ('prepared', 'claimed'))`,
+      params: [HOST_OPERATION_ID, "org_01", OPERATION_KEY, old.generation],
+    },
+    revoke,
+  ]);
+  expect(outcome.map((result) => result.changes)).toEqual([1, 1]);
+  expect(
+    (await sql.query("SELECT state, sealed_payload FROM worker_runtime_input_preparations"))[0],
+  ).toEqual({
+    state: "revoked",
+    sealed_payload: null,
+  });
+
+  await authority.preparations.prepare(preparationInput());
+  const next = await pinPrepared(leaseInput());
+  expect(next.generation).not.toBe(old.generation);
+  await expect(
+    noEffectRevocation({ ...leaseInput(), generation: old.generation }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await expect(
+    authority.leases.acquire({ ...leaseInput(), expectedGeneration: old.generation }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "prepared",
+  );
+});
+
+test("an old in-flight claim cannot claim a replacement after no-effect closure", async () => {
+  const { sql, authority, key } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  const noEffectRevocation = authority.leases.noEffectRevocation;
+  if (!pinPrepared || !noEffectRevocation) {
+    throw new Error("runtime-input no-effect fence is unavailable");
+  }
+  const old = await pinPrepared(leaseInput());
+  const signals = { entered: () => {}, release: () => {} };
+  const atClaim = new Promise<void>((resolve) => (signals.entered = resolve));
+  const resume = new Promise<void>((resolve) => (signals.release = resolve));
+  const raced = createRuntimeInputAuthority({
+    sql: {
+      ...sql,
+      async run(statement, params) {
+        if (statement.includes("SET state = 'claimed'")) {
+          signals.entered();
+          await resume;
+        }
+        return sql.run(statement, params);
+      },
+    },
+    sealKeys: { current: { keyId: "runtime-input-test-key", key } },
+    canonicalPublicOrigin: HOST_ORIGIN,
+    clock: () => new Date(PREPARATION_TIME),
+  });
+  const acquisition = raced.leases.acquire({ ...leaseInput(), expectedGeneration: old.generation });
+  await atClaim;
+  const revoke = await noEffectRevocation({
+    ...leaseInput(),
+    generation: old.generation,
+  });
+  expect((await sql.batch([revoke]))[0]?.changes).toBe(1);
+  await authority.preparations.prepare(preparationInput());
+  signals.release();
+  await expect(acquisition).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "prepared",
+  );
 });
 
 test("claims a Worker in every stable Host Space the durable handoff can name", async () => {

@@ -1,9 +1,10 @@
-import type { Clock, Row, Sql, SqlWrite } from "./ports.ts";
+import type { Clock, Row, Sql, SqlStatement, SqlWrite } from "./ports.ts";
 import {
   MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
   type ProviderRuntimeInputLeasePort,
   type ProviderRuntimeInputPreparationIdentity,
   type ProviderRuntimeInputPublicApply,
+  type ProviderRuntimeInputSqlPredicate,
 } from "./provider-runtime-input-port.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 
@@ -178,6 +179,8 @@ export interface RuntimeInputClaimInput extends RuntimeInputRecoveryInput {
    * it named.
    */
   readonly publicApply: ProviderRuntimeInputPublicApply;
+  readonly claimFence?: ProviderRuntimeInputSqlPredicate;
+  readonly expectedGeneration?: string;
 }
 
 export interface RuntimeInputClaim {
@@ -242,8 +245,15 @@ export interface RuntimeInputPreparations {
     scope?: RuntimeInputPreparationScope,
   ): Promise<RuntimeInputPreparationProjection | null>;
   claim(input: RuntimeInputClaimInput): Promise<RuntimeInputClaim>;
+  pinPrepared(input: RuntimeInputClaimInput): Promise<string>;
+  noEffectRevocation(
+    input: RuntimeInputRecoveryInput & { readonly generation: string },
+  ): Promise<SqlStatement>;
   abort(input: RuntimeInputClaimIdentity): Promise<void>;
-  dispatch(input: RuntimeInputClaimIdentity): Promise<{ readonly fence: number }>;
+  dispatch(
+    input: RuntimeInputClaimIdentity,
+    dispatchFence?: ProviderRuntimeInputSqlPredicate,
+  ): Promise<{ readonly fence: number }>;
   consume(input: RuntimeInputConsumption): Promise<void>;
   /** Reads only the value-free identity of one exact dispatched handoff. */
   recover(input: RuntimeInputRecoveryInput): Promise<RuntimeInputRecoveryIdentity>;
@@ -346,10 +356,25 @@ export function createRuntimeInputAuthority(
       revoke: (organizationId, operationKey) => internals.revoke(organizationId, operationKey),
     },
     leases: {
+      async pinPrepared(input) {
+        return {
+          generation: await internals.pinPrepared({
+            ...recoveryInputFor(input),
+            publicApply: input.publicApply,
+          }),
+        };
+      },
+      noEffectRevocation: (input) =>
+        internals.noEffectRevocation({ ...recoveryInputFor(input), generation: input.generation }),
       async acquire(input) {
+        if (input.leaseFence && !input.expectedGeneration) {
+          throw new RuntimeInputPreparationError("conflict", 409);
+        }
         const claim = await internals.claim({
           ...recoveryInputFor(input),
           publicApply: input.publicApply,
+          ...(input.leaseFence ? { claimFence: input.leaseFence.claim } : {}),
+          ...(input.expectedGeneration ? { expectedGeneration: input.expectedGeneration } : {}),
         });
         const preparation = preparationIdentity(claim);
         const identity: RuntimeInputClaimIdentity = {
@@ -363,8 +388,12 @@ export function createRuntimeInputAuthority(
           bindings: claim.bindings,
           preparation,
           abort: async () => await internals.abort(identity),
-          async dispatch() {
-            const dispatched = await internals.dispatch(identity);
+          async dispatch(dispatchFence) {
+            const selectedFence = dispatchFence ?? input.leaseFence?.dispatch;
+            if (input.leaseFence && !selectedFence) {
+              throw new RuntimeInputPreparationError("conflict", 409);
+            }
+            const dispatched = await internals.dispatch(identity, selectedFence);
             return {
               settle: async (providerReceiptDigest) =>
                 await internals.consume({
@@ -594,7 +623,70 @@ export function createRuntimeInputPreparations(
       return projection(row);
     },
 
+    async pinPrepared(input) {
+      const normalized = normalizeClaimInput(input);
+      const executing = await executingApplyCommitment(input.publicApply);
+      const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
+      assertNames(row, normalized);
+      assertExecutingApply(row, executing);
+      assertPreparedSpace(row, normalized.target.space);
+      if (row.state !== "prepared" || rowExpired(row, options.clock().getTime())) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      return validatedGeneration(row.seal_nonce);
+    },
+
+    async noEffectRevocation(input) {
+      const normalized = normalizeClaimInput(input);
+      const generation = validatedGeneration(input.generation);
+      const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
+      assertNames(row, normalized);
+      assertPreparedSpace(row, normalized.target.space);
+      if (row.seal_nonce !== generation || (row.state !== "prepared" && row.state !== "claimed")) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      if (row.state === "claimed") assertClaimedTarget(row, normalized);
+      // The private operation owner executes this statement in the SAME Sql.batch
+      // as its exact preclaim tombstone. The nonce is a generation fence: the
+      // deterministic preparation ID and resettable integer fence are not.
+      const now = options.clock().getTime();
+      return {
+        sql: `UPDATE worker_runtime_input_preparations
+              SET state = 'revoked', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
+                  fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
+                  updated_at = ?, revoked_at = ?
+              WHERE organization_id = ? AND operation_key = ? AND preparation_id = ?
+                AND seal_nonce = ?
+                AND binding_names_json = ? AND (space IS NULL OR space = ?)
+                AND (
+                  state = 'prepared'
+                  OR (state = 'claimed' AND claim_owner = ? AND claimed_resource_uid = ?
+                      AND worker_name = ? AND worker_resource_uid = ? AND bundle_name = ?)
+                )`,
+        params: [
+          now,
+          now,
+          normalized.organizationId,
+          normalized.operationKey,
+          row.preparation_id,
+          generation,
+          JSON.stringify(normalized.bindingNames),
+          normalized.target.space,
+          normalized.claimOwner,
+          normalized.resourceUid,
+          normalized.target.workerName,
+          normalized.target.workerResourceUid,
+          normalized.target.bundleName,
+        ],
+      };
+    },
+
     async claim(input) {
+      if (input.claimFence && !input.expectedGeneration) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
       const normalized = normalizeClaimInput(input);
       // The executing apply's own commitment, derived here rather than taken
       // from the caller. A request this contract cannot authorize at all is not
@@ -612,6 +704,12 @@ export function createRuntimeInputPreparations(
       assertExecutingApply(candidate, executing);
       assertPreparedSpace(candidate, normalized.target.space);
       if (
+        input.expectedGeneration !== undefined &&
+        candidate.seal_nonce !== validatedGeneration(input.expectedGeneration)
+      ) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
+      if (
         candidate.preparation_id !==
         (await derivePreparationId(normalized.organizationId, normalized.operationKey))
       ) {
@@ -623,16 +721,20 @@ export function createRuntimeInputPreparations(
       }
       if (candidate.state === "claimed") {
         assertClaimedTarget(candidate, normalized);
+        await assertLeaseFence(options.sql, input.claimFence);
         // The same wrapper the fresh-claim path uses. Unreadable sealed
         // material is a durable fact about the row, not about which branch
         // noticed it: erasing it here too keeps a re-claim from leaving
         // ciphertext nobody can open sitting until the claim TTL runs out.
-        return await openClaim(candidate, now);
+        const claim = await openClaim(candidate, now);
+        await assertLeaseFence(options.sql, input.claimFence);
+        return claim;
       }
       if (candidate.state !== "prepared") {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
       const claimExpiresAt = Math.min(candidate.expires_at, now + CLAIM_TTL_MILLISECONDS);
+      const claimFence = validatedLeaseFence(input.claimFence);
       try {
         await options.sql.run(
           `UPDATE worker_runtime_input_preparations
@@ -641,8 +743,9 @@ export function createRuntimeInputPreparations(
                claimed_resource_uid = ?, space = ?, worker_name = ?,
                worker_resource_uid = ?, bundle_name = ?, updated_at = ?
            WHERE organization_id = ? AND operation_key = ? AND state = 'prepared'
-             AND fence = ? AND expires_at > ? AND apply_commitment = ?
+             AND fence = ? AND seal_nonce = ? AND expires_at > ? AND apply_commitment = ?
              AND (space IS NULL OR space = ?)
+             AND (${claimFence.sql})
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ? AND resource_uid = ? AND state = 'live'
@@ -660,9 +763,11 @@ export function createRuntimeInputPreparations(
             normalized.organizationId,
             normalized.operationKey,
             candidate.fence,
+            candidate.seal_nonce,
             now,
             executing,
             normalized.target.space,
+            ...claimFence.params,
             normalized.organizationId,
             normalized.target.workerResourceUid,
           ],
@@ -674,13 +779,22 @@ export function createRuntimeInputPreparations(
       if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(candidate, normalized);
       assertExecutingApply(candidate, executing);
+      if (
+        input.expectedGeneration !== undefined &&
+        candidate.seal_nonce !== input.expectedGeneration
+      ) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
       if (candidate.state !== "claimed") throw new RuntimeInputPreparationError("conflict", 409);
       assertClaimedTarget(candidate, normalized);
+      await assertLeaseFence(options.sql, input.claimFence);
       if (rowExpired(candidate, now)) {
         await expireExact(options.sql, candidate, now);
         throw new RuntimeInputPreparationError("conflict", 409);
       }
-      return await openClaim(candidate, now);
+      const claim = await openClaim(candidate, now);
+      await assertLeaseFence(options.sql, input.claimFence);
+      return claim;
     },
 
     async abort(input) {
@@ -724,9 +838,10 @@ export function createRuntimeInputPreparations(
       throw new RuntimeInputPreparationError("conflict", 409);
     },
 
-    async dispatch(input) {
+    async dispatch(input, dispatchFence) {
       validateClaimIdentity(input);
       const now = options.clock().getTime();
+      const fence = validatedLeaseFence(dispatchFence);
       try {
         const result = await options.sql.run(
           `UPDATE worker_runtime_input_preparations
@@ -735,6 +850,7 @@ export function createRuntimeInputPreparations(
            WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed'
              AND fence = ? AND claim_owner = ? AND claimed_resource_uid = ?
              AND claim_expires_at > ?
+             AND (${fence.sql})
              AND EXISTS (
                SELECT 1 FROM tf_resource_deletion_attestations
                WHERE tenant_id = ?
@@ -763,6 +879,7 @@ export function createRuntimeInputPreparations(
             input.claimOwner,
             input.resourceUid,
             now,
+            ...fence.params,
             input.organizationId,
             input.organizationId,
             input.organizationId,
@@ -1085,6 +1202,48 @@ function normalizeClaimInput(input: RuntimeInputRecoveryInput): NormalizedClaimI
   validateBoundedText(input.target.bundleName, 128);
   validateOpaqueId(input.target.workerResourceUid);
   return { ...input, bindingNames: validatedBindingNames(input.bindingNames) };
+}
+
+function validatedLeaseFence(
+  fence: ProviderRuntimeInputSqlPredicate | undefined,
+): ProviderRuntimeInputSqlPredicate {
+  if (!fence) return { sql: "1", params: [] };
+  // Only trusted composition code constructs this predicate. Restrict it to
+  // one bounded EXISTS expression so an accidental SQL statement cannot become
+  // a second authority or smuggle secret material into durable SQL text.
+  if (
+    !/^EXISTS\s*\(/iu.test(fence.sql) ||
+    fence.sql.length > 4_096 ||
+    fence.sql.includes(";") ||
+    fence.params.length > 80
+  ) {
+    throw new RuntimeInputPreparationError("invalid_argument", 400);
+  }
+  return fence;
+}
+
+function validatedGeneration(value: string | null): string {
+  // The sealing nonce is random, row-scoped, public-safe, and retained for the
+  // entire pre-dispatch lifetime. It is erased with ciphertext on closure.
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{16}$/u.test(value)) {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  return value;
+}
+
+async function assertLeaseFence(
+  sql: Sql,
+  fence: ProviderRuntimeInputSqlPredicate | undefined,
+): Promise<void> {
+  if (!fence) return;
+  const predicate = validatedLeaseFence(fence);
+  let rows: readonly Row[];
+  try {
+    rows = await sql.query(`SELECT 1 AS authorized WHERE ${predicate.sql}`, predicate.params);
+  } catch {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  if (rows.length !== 1) throw new RuntimeInputPreparationError("conflict", 409);
 }
 
 function validatedBindingNames(names: readonly string[]): readonly string[] {

@@ -1,4 +1,24 @@
+import type { SqlParam, SqlStatement } from "./ports.ts";
+
 export const MAX_PROVIDER_RUNTIME_INPUT_BINDINGS = 64;
+
+/**
+ * Trusted, internal SQL boolean expression for a composition-owned durable
+ * operation fence. This is never parsed from a request or persisted with a
+ * preparation. It must be a bound, value-free EXISTS predicate over the same
+ * database as the runtime-input authority.
+ */
+export interface ProviderRuntimeInputSqlPredicate {
+  readonly sql: string;
+  readonly params: readonly SqlParam[];
+}
+
+export interface ProviderRuntimeInputLeaseFence {
+  /** Authorizes the exact pending operation before plaintext is released. */
+  readonly claim: ProviderRuntimeInputSqlPredicate;
+  /** Optional default; an exact predicate may be supplied at dispatch time. */
+  readonly dispatch?: ProviderRuntimeInputSqlPredicate;
+}
 
 /** Static truth a provider exposes only when its configured adapter can consume leases. */
 export interface ProviderRuntimeInputCapabilities {
@@ -43,6 +63,19 @@ export interface ProviderRuntimeInputAcquireInput {
   readonly bindingNames: readonly string[];
   /** The exact apply being executed, recomputed and fenced against the stored commitment. */
   readonly publicApply: ProviderRuntimeInputPublicApply;
+  /** Optional internal composition fence; never supplied by a public caller. */
+  readonly leaseFence?: ProviderRuntimeInputLeaseFence;
+  /** Exact prepared generation pinned before an external preclaim is recorded. */
+  readonly expectedGeneration?: string;
+}
+
+export interface ProviderRuntimeInputPinnedGeneration {
+  /** Opaque, value-free generation token. It is not a bearer credential. */
+  readonly generation: string;
+}
+
+export interface ProviderRuntimeInputNoEffectInput extends ProviderRuntimeInputRecoveryInput {
+  readonly generation: string;
 }
 
 /**
@@ -83,7 +116,10 @@ export interface ProviderRuntimeInputLease {
   readonly preparation: ProviderRuntimeInputPreparationIdentity;
   /** Definitively closes an acquired lease before provider dispatch and erases its ciphertext. */
   abort(): Promise<void>;
-  dispatch(): Promise<ProviderRuntimeInputDispatchedLease>;
+  /** Supply the derived exact pending receipt fence immediately before delivery. */
+  dispatch(
+    dispatchFence?: ProviderRuntimeInputSqlPredicate,
+  ): Promise<ProviderRuntimeInputDispatchedLease>;
 }
 
 /** The only operation available after this handoff's durable ciphertext is erased. */
@@ -110,6 +146,16 @@ export interface ProviderRuntimeInputRecoveryLease {
  * receives no values and cannot redispatch.
  */
 export interface ProviderRuntimeInputLeasePort {
+  /** Pin the exact still-prepared handoff before composing a durable preclaim. */
+  pinPrepared?(
+    input: ProviderRuntimeInputAcquireInput,
+  ): Promise<ProviderRuntimeInputPinnedGeneration>;
+  /**
+   * Build an exact-generation pre-dispatch revocation for the caller's atomic
+   * batch with its own operation tombstone. A closed-marker replay must never
+   * execute this statement against a newer preparation.
+   */
+  noEffectRevocation?(input: ProviderRuntimeInputNoEffectInput): Promise<SqlStatement>;
   acquire(input: ProviderRuntimeInputAcquireInput): Promise<ProviderRuntimeInputLease>;
   recover(input: ProviderRuntimeInputRecoveryInput): Promise<ProviderRuntimeInputRecoveryLease>;
   /**
