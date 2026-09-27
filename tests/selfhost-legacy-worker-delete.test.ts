@@ -77,7 +77,9 @@ interface LegacyWorkerFixture {
  * legacy runtime.write branch before the parent Worker is deleted.
  */
 async function legacyWorkerFixture(): Promise<LegacyWorkerFixture> {
-  const baseRuntime = createWorkerdRuntime({ root, isReady: () => true });
+  // This fixture publishes to disk but does not boot workerd. Avoid mistaking
+  // an unrelated process on the shared default port for its runtime.
+  const baseRuntime = createWorkerdRuntime({ root, isReady: () => true, port: 0 });
   let writes = 0;
   let publishes = 0;
   const runtime: WorkerdRuntime = {

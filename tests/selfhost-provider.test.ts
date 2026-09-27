@@ -553,7 +553,10 @@ function provider(options: ProviderCase = {}) {
   return createSelfhostProvider({
     offerings: [],
     dataRoot: root,
-    runtime: options.runtime ?? materializingRuntime({ root, isReady: () => true }),
+    // Provider tests stage configs but do not boot workerd. Keep their readiness
+    // probe off the shared default port, where an unrelated local server could
+    // otherwise look like this fixture's runtime and block publication.
+    runtime: options.runtime ?? materializingRuntime({ root, isReady: () => true, port: 0 }),
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined
