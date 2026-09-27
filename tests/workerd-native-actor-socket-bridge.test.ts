@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { renderActorUpgradeHandoffModuleSource } from "../src/actor-upgrade-handoff-source.ts";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
@@ -151,14 +152,7 @@ test.skipIf(binary === undefined)(
       epoch = namespace.epoch;
       namespace.enableAlarmAdmission();
       const target = namespace.duplexTarget("actor-id", "variant-one");
-      const helper = await Bun.build({
-        entrypoints: [join(import.meta.dir, "../src/actor-upgrade-handoff.ts")],
-        target: "browser",
-        format: "esm",
-        minify: false,
-      });
-      if (!helper.success || !helper.outputs[0]) throw new Error("Actor handoff build failed");
-      await writeFile(join(publicRoot, "handoff.mjs"), await helper.outputs[0].text());
+      await writeFile(join(publicRoot, "handoff.mjs"), renderActorUpgradeHandoffModuleSource());
       await writeFile(
         join(publicRoot, "application.mjs"),
         `export default {async fetch(request, env) {
