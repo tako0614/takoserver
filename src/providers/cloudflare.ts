@@ -235,6 +235,8 @@ export interface CloudflareProviderOptions {
   readonly workerCompatibilityDate?: string;
   /** Host-owned one-shot runtime input authority; absent disables sensitive bindings. */
   readonly runtimeInputs?: ProviderRuntimeInputLeasePort;
+  /** Optional exact Worker class inspection capability for this provider instance. */
+  readonly workerClassRuntime?: Provider["workerClassRuntime"];
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -253,6 +255,7 @@ interface ManagedObjectDestroyHandle {
 export class CloudflareProvider implements Provider {
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
+  readonly workerClassRuntime?: NonNullable<Provider["workerClassRuntime"]>;
   readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly workerEndpointOriginReservations: NonNullable<
     Provider["workerEndpointOriginReservations"]
@@ -279,6 +282,9 @@ export class CloudflareProvider implements Provider {
     this.offerings = structuredClone(options.offerings);
     if (options.recoveryOfferings) {
       this.recoveryOfferings = structuredClone(options.recoveryOfferings);
+    }
+    if (options.workerClassRuntime !== undefined) {
+      this.workerClassRuntime = options.workerClassRuntime;
     }
     this.#artifacts = options.artifacts;
     this.#zones = [...(options.zones ?? [])];

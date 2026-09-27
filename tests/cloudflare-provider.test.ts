@@ -7,6 +7,7 @@ import {
 import { bytesDigest } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 import {
+  type Provider,
   type ProviderOffering,
   type ProviderRelation,
   type ProviderRuntimeBinding,
@@ -118,6 +119,72 @@ const artifacts: ArtifactBytes = {
     return digest === `sha256:${"e".repeat(64)}` ? MODULE_BYTES : null;
   },
 };
+
+describe("Cloudflare provider Worker class runtime option", () => {
+  const options = {
+    accountId: "acct_1",
+    offerings: [],
+    artifacts,
+    authorize: () => "Bearer test-token",
+  } satisfies CloudflareProviderOptions;
+
+  test("does not expose the optional capability when omitted", () => {
+    const provider = new CloudflareProvider(options);
+
+    expect(provider.workerClassRuntime).toBeUndefined();
+  });
+
+  test("exposes and delegates the exact configured inspection port", async () => {
+    const contract = {
+      formRef: FORM_REF,
+      packageDigest: `sha256:${"a".repeat(64)}` as const,
+      runtimeClassRef: {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.actor",
+        version: "2.0.0",
+        schemaDigest: `sha256:${"d".repeat(64)}` as const,
+      },
+    } as const;
+    const resourceIdentity = {
+      uid: "uid-1",
+      generation: "1",
+      revision: "1",
+      formRef: FORM_REF,
+    };
+    const input: Parameters<NonNullable<Provider["workerClassRuntime"]>["inspect"]>[0] = {
+      contract,
+      tenantId: "tenant-1",
+      space: "main",
+      className: "Counter",
+      holder: resourceIdentity,
+      worker: resourceIdentity,
+      deployment: resourceIdentity,
+      version: resourceIdentity,
+      weight: 10_000,
+      bundle: { ...resourceIdentity, manifestDigest: `sha256:${"b".repeat(64)}` },
+      providerInstallationRef: "installation-1",
+      holderNativeId: "holder-native-1",
+      versionNativeId: "version-native-1",
+    };
+    let receiver: unknown;
+    let inspectedInput: typeof input | undefined;
+    const runtime: NonNullable<CloudflareProviderOptions["workerClassRuntime"]> = {
+      contracts: [contract],
+      async inspect(value) {
+        receiver = this;
+        inspectedInput = value;
+        return "valid";
+      },
+    };
+    const provider = new CloudflareProvider({ ...options, workerClassRuntime: runtime });
+
+    expect(provider.workerClassRuntime).toBe(runtime);
+    expect(provider.workerClassRuntime?.contracts[0]).toBe(contract);
+    expect(await provider.workerClassRuntime?.inspect(input)).toBe("valid");
+    expect(receiver).toBe(runtime);
+    expect(inspectedInput).toBe(input);
+  });
+});
 
 const RELEASED_EDGE = await buildEdgeForms();
 
