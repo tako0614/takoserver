@@ -3,7 +3,6 @@ import { array, boundedJson, ProviderMeterError, record } from "./provider-meter
 
 const GRAPHQL_ENDPOINT = "https://api.cloudflare.com/client/v4/graphql";
 const MAX_WINDOW_DAYS = 31;
-const MAX_GROUPS = 10_000;
 const MAX_SAFE_COUNT = Number.MAX_SAFE_INTEGER;
 
 interface ActorAnalyticsRequest {
@@ -23,6 +22,7 @@ interface ActorAnalyticsRequest {
 export interface CloudflareActorNamespaceObservation {
   readonly namespaceId: string;
   readonly window: { readonly from: string; readonly until: string };
+  readonly finality: "unfinalized";
   readonly requests: { readonly value: number; readonly unit: "requests" };
   readonly duration: { readonly value: number; readonly unit: "GB*s" };
   readonly rowsRead: { readonly value: number; readonly unit: "rows" };
@@ -83,28 +83,27 @@ export function createCloudflareActorNamespaceMetricsReader(options: {
       const accounts = array(record(record(root.data).viewer).accounts, 1);
       if (accounts.length !== 1) throw new ProviderMeterError("upstream_invalid");
       const account = record(accounts[0]);
+      const requests = namespaceGroup(account.durableObjectsInvocationsAdaptiveGroups, namespaceId);
+      const periodic = namespaceGroup(account.durableObjectsPeriodicGroups, namespaceId);
 
       return {
         namespaceId,
         window: { from: input.from, until: input.until },
+        finality: "unfinalized",
         requests: {
-          value: sumGroups(
-            account.durableObjectsInvocationsAdaptiveGroups,
-            namespaceId,
-            "requests",
-          ),
+          value: requests === null ? 0 : safeCount(record(requests.sum).requests),
           unit: "requests",
         },
         duration: {
-          value: sumGroups(account.durableObjectsPeriodicGroups, namespaceId, "duration"),
+          value: periodic === null ? 0 : nonnegativeFinite(record(periodic.sum).duration),
           unit: "GB*s",
         },
         rowsRead: {
-          value: sumGroups(account.durableObjectsPeriodicGroups, namespaceId, "rowsRead"),
+          value: periodic === null ? 0 : safeCount(record(periodic.sum).rowsRead),
           unit: "rows",
         },
         rowsWritten: {
-          value: sumGroups(account.durableObjectsPeriodicGroups, namespaceId, "rowsWritten"),
+          value: periodic === null ? 0 : safeCount(record(periodic.sum).rowsWritten),
           unit: "rows",
         },
       };
@@ -135,23 +134,16 @@ function boundedWindow(from: string, until: string): void {
   }
 }
 
-function sumGroups(value: unknown, namespaceId: string, field: string): number {
-  const groups = array(value, MAX_GROUPS);
-  // Reaching the API limit could mean the returned sum is incomplete.
-  if (groups.length === MAX_GROUPS) throw new ProviderMeterError("upstream_invalid");
-  return groups.reduce<number>((total, candidate) => {
-    const group = record(candidate);
-    if (record(group.dimensions).namespaceId !== namespaceId) {
-      throw new ProviderMeterError("upstream_invalid");
-    }
-    const sum = record(group.sum);
-    const quantity = field === "duration" ? nonnegativeFinite(sum[field]) : safeCount(sum[field]);
-    const next = total + quantity;
-    if (!Number.isFinite(next) || (field !== "duration" && !Number.isSafeInteger(next))) {
-      throw new ProviderMeterError("upstream_invalid");
-    }
-    return next;
-  }, 0);
+function namespaceGroup(value: unknown, namespaceId: string): Record<string, unknown> | null {
+  // `Groups` results group by selected dimensions. Filtering and grouping on
+  // one namespace must produce at most one row; duplicates are an ambiguity.
+  const groups = array(value, 1);
+  if (groups.length === 0) return null;
+  const group = record(groups[0]);
+  if (record(group.dimensions).namespaceId !== namespaceId) {
+    throw new ProviderMeterError("upstream_invalid");
+  }
+  return group;
 }
 
 function safeCount(value: unknown): number {
@@ -191,11 +183,11 @@ function bounded(value: unknown, minimum: number, maximum: number): string {
 
 const QUERY = `query TakoserverActorNamespaceMetrics($accountTag: string!, $namespaceId: string!, $start: Time!, $end: Time!) {
   viewer { accounts(filter: { accountTag: $accountTag }) {
-    durableObjectsInvocationsAdaptiveGroups(limit: 10000, filter: { namespaceId: $namespaceId, datetime_geq: $start, datetime_lt: $end }) {
+    durableObjectsInvocationsAdaptiveGroups(limit: 2, filter: { namespaceId: $namespaceId, datetime_geq: $start, datetime_lt: $end }) {
       dimensions { namespaceId }
       sum { requests }
     }
-    durableObjectsPeriodicGroups(limit: 10000, filter: { namespaceId: $namespaceId, datetime_geq: $start, datetime_lt: $end }) {
+    durableObjectsPeriodicGroups(limit: 2, filter: { namespaceId: $namespaceId, datetime_geq: $start, datetime_lt: $end }) {
       dimensions { namespaceId }
       sum { duration rowsRead rowsWritten }
     }

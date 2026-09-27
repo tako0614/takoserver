@@ -23,17 +23,12 @@ function payload(overrides: Record<string, unknown> = {}) {
         accounts: [
           {
             durableObjectsInvocationsAdaptiveGroups: [
-              { dimensions: { namespaceId }, sum: { requests: 10 } },
-              { dimensions: { namespaceId }, sum: { requests: "12" } },
+              { dimensions: { namespaceId }, sum: { requests: 22 } },
             ],
             durableObjectsPeriodicGroups: [
               {
                 dimensions: { namespaceId },
-                sum: { duration: 1.25, rowsRead: 20, rowsWritten: "3" },
-              },
-              {
-                dimensions: { namespaceId },
-                sum: { duration: 0.75, rowsRead: "4", rowsWritten: 5 },
+                sum: { duration: 2, rowsRead: 24, rowsWritten: 8 },
               },
             ],
             ...overrides,
@@ -59,6 +54,7 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
     await expect(reader.read({ deployment, from, until })).resolves.toEqual({
       namespaceId,
       window: { from, until },
+      finality: "unfinalized",
       requests: { value: 22, unit: "requests" },
       duration: { value: 2, unit: "GB*s" },
       rowsRead: { value: 24, unit: "rows" },
@@ -77,7 +73,38 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
       "namespaceId: $namespaceId, datetime_geq: $start, datetime_lt: $end",
     );
     expect(body.query).toContain("sum { duration rowsRead rowsWritten }");
+    expect(body.query).toContain("AdaptiveGroups(limit: 2");
     expect(body.query).not.toContain("durableObjectsStorageGroups");
+  });
+
+  test("returns explicitly unfinalized zero observations for empty windows", async () => {
+    const reader = createCloudflareActorNamespaceMetricsReader({
+      accountId: "account-id",
+      apiToken: "provider-token",
+      fetch: async () =>
+        Response.json({
+          data: {
+            viewer: {
+              accounts: [
+                {
+                  durableObjectsInvocationsAdaptiveGroups: [],
+                  durableObjectsPeriodicGroups: [],
+                },
+              ],
+            },
+          },
+        }),
+    });
+
+    await expect(reader.read({ deployment, from, until })).resolves.toEqual({
+      namespaceId,
+      window: { from, until },
+      finality: "unfinalized",
+      requests: { value: 0, unit: "requests" },
+      duration: { value: 0, unit: "GB*s" },
+      rowsRead: { value: 0, unit: "rows" },
+      rowsWritten: { value: 0, unit: "rows" },
+    });
   });
 
   test("rejects wrong provider/native identity and unbounded or noncanonical windows", async () => {
@@ -108,7 +135,7 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
     ).rejects.toThrow("window_invalid");
   });
 
-  test("rejects partial, malformed, truncated, and identity-mixed upstream data", async () => {
+  test("rejects partial, duplicate, malformed, and identity-mixed upstream data", async () => {
     const replies = [
       { ...payload(), errors: [{ message: "private upstream text must not escape" }] },
       payload({ durableObjectsPeriodicGroups: undefined }),
@@ -122,7 +149,21 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
       }),
       payload({
         durableObjectsInvocationsAdaptiveGroups: [
-          { dimensions: { namespaceId }, sum: { requests: Number.MAX_SAFE_INTEGER + 1 } },
+          { dimensions: { namespaceId }, sum: { requests: 1 } },
+          { dimensions: { namespaceId }, sum: { requests: 2 } },
+        ],
+      }),
+      payload({
+        durableObjectsInvocationsAdaptiveGroups: [
+          { dimensions: { namespaceId }, sum: { requests: "9007199254740992" } },
+        ],
+      }),
+      payload({
+        durableObjectsPeriodicGroups: [
+          {
+            dimensions: { namespaceId },
+            sum: { duration: 1, rowsRead: Number.MAX_SAFE_INTEGER + 1, rowsWritten: 0 },
+          },
         ],
       }),
     ];
@@ -154,5 +195,39 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
       fetch: async () => new Response("not-json"),
     });
     await expect(reader.read({ deployment, from, until })).rejects.toThrow();
+  });
+
+  test("bounds oversized responses and sanitizes HTTP and network failures", async () => {
+    const makeReader = (fetch: (request: Request) => Promise<Response>) =>
+      createCloudflareActorNamespaceMetricsReader({
+        accountId: "account-id",
+        apiToken: "provider-token",
+        fetch,
+      });
+
+    const oversized = makeReader(async () => new Response("x".repeat(262_145)));
+    await expect(oversized.read({ deployment, from, until })).rejects.toMatchObject({
+      code: "upstream_invalid",
+      message: "upstream_invalid",
+    });
+
+    const httpFailure = makeReader(async () =>
+      Response.json({ error: "sensitive provider response" }, { status: 503 }),
+    );
+    await expect(httpFailure.read({ deployment, from, until })).rejects.toMatchObject({
+      code: "upstream_unavailable",
+      message: "upstream_unavailable",
+    });
+
+    const networkFailure = makeReader(async () => {
+      throw new Error("sensitive transport diagnostic");
+    });
+    await expect(networkFailure.read({ deployment, from, until })).rejects.toMatchObject({
+      code: "upstream_unavailable",
+      message: "upstream_unavailable",
+    });
+    await expect(networkFailure.read({ deployment, from, until })).rejects.not.toThrow(
+      "sensitive transport diagnostic",
+    );
   });
 });
