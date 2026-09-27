@@ -71,6 +71,7 @@ const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
 const SafeArrayIsArray = Array.isArray;
 const SafeArrayIndexOf = Array.prototype.indexOf;
+const SafeObjectFreeze = Object.freeze;
 const SafeIsSafeInteger = Number.isSafeInteger;
 const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
@@ -490,7 +491,15 @@ export function createActorNativeOwner(
     handlerMs: HTTP_HANDLER_MS,
     producerMs: HTTP_PRODUCER_MS,
   },
-  loadVariantClass?: (env: Record<string, unknown>, variantKey: string) => Promise<unknown>,
+  loadVariantClass?: (
+    env: Record<string, unknown>,
+    variantKey: string,
+    selection: {
+      readonly actorId: string;
+      readonly generationKey: string;
+      readonly epoch: string;
+    },
+  ) => Promise<unknown>,
   readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
 ) {
   if (
@@ -617,10 +626,23 @@ export function createActorNativeOwner(
         variantKeys[index] = selected.variantKeys[index] as string;
       return { generationKey: selected.generationKey, epoch: selected.epoch, variantKeys };
     }
-    private async selectedChild(actorId: string, key: string, variantIndex: number) {
+    private async selectedChild(
+      actorId: string,
+      key: string,
+      variantIndex: number,
+      graph: ActorOwnerGraph,
+    ) {
       const bindingName = `CLASS_${variantIndex}`;
       const selectedClass = loadVariantClass
-        ? await loadVariantClass(this.env, key)
+        ? await loadVariantClass(
+            this.env,
+            key,
+            SafeObjectFreeze({
+              actorId,
+              generationKey: graph.generationKey,
+              epoch: graph.epoch,
+            }),
+          )
         : SafeHasOwn(this.env, bindingName)
           ? this.env[bindingName]
           : undefined;
@@ -1196,7 +1218,12 @@ export function createActorNativeOwner(
           if (variantIndex < 0) throw new Error("Actor alarm admission denied");
           if (timer) clearTimeout(timer);
           timer = undefined;
-          const child = await this.selectedChild(claimed, selected.variantKey, variantIndex);
+          const child = await this.selectedChild(
+            claimed,
+            selected.variantKey,
+            variantIndex,
+            currentGraph,
+          );
           const graphBeforeDelivery = await this.currentGraph();
           if (
             graphBeforeDelivery.generationKey !== currentGraph.generationKey ||
@@ -1444,7 +1471,7 @@ export function createActorNativeOwner(
             graphNow.epoch !== admission.epoch
           )
             throw new Error("Actor socket variant unavailable");
-          const child = await this.selectedChild(actorId, key, admission.variantIndex);
+          const child = await this.selectedChild(actorId, key, admission.variantIndex, graphNow);
           const graphBeforeDelivery = await this.currentGraph();
           if (
             graphBeforeDelivery.generationKey !== admission.generationKey ||
@@ -1650,7 +1677,12 @@ export function createActorNativeOwner(
         const eventDeliveryToken = deliveryForEvent();
         let upgrade: SocketRecord | undefined;
         try {
-          const child = await this.selectedChild(id, variantKey as string, variantIndex);
+          const child = await this.selectedChild(
+            id,
+            variantKey as string,
+            variantIndex,
+            currentGraph,
+          );
           const graphBeforeDelivery = await this.currentGraph();
           if (
             graphBeforeDelivery.generationKey !== currentGraph.generationKey ||

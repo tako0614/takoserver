@@ -191,7 +191,10 @@ test.skipIf(binary === undefined)(
       expect(admittedFetches).toBe(0);
       const application = `export default {async fetch(request, env) {
   if (new URL(request.url).pathname === "/health") return new Response("ok");
-  if (new URL(request.url).pathname === "/env") return Response.json({
+  if (new URL(request.url).pathname === "/env") {
+  let importedEnv = "blocked";
+  try { importedEnv = (await import("cloudflare:workers")).env ?? "no-env"; } catch {}
+  return Response.json({
     own:Reflect.ownKeys(env).sort(),
     nullPrototype:Object.getPrototypeOf(env) === null,
     appValue:env.APP_VALUE,
@@ -200,7 +203,9 @@ test.skipIf(binary === undefined)(
     upgradeIn:"__TAKOSERVER_ACTOR_UPGRADE_00000" in env,
     readinessIn:"__TAKOSERVER_SELFHOST_RUNTIME_READINESS" in env,
     inherited:Object.getPrototypeOf(env)?.__TAKOSERVER_ACTOR_HTTP_00000 ?? null,
+    importedEnv,
   });
+  }
   if (new URL(request.url).searchParams.get("ticket") !== "authorized")
     return new Response("denied", {status:403});
   const room = env.ROOM.get(env.ROOM.idFromName("room"));
@@ -290,6 +295,7 @@ test.skipIf(binary === undefined)(
         upgradeIn: false,
         readinessIn: false,
         inherited: null,
+        importedEnv: "blocked",
       });
       expect((await fetch(`${origin}/socket`)).status).toBe(403);
       const messages: string[] = [];

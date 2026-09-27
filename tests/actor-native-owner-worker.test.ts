@@ -130,12 +130,14 @@ test("dynamic owner graph rejects a rollout between selection and child dispatch
   let epoch = "epoch-1";
   let rollOnLoad = true;
   let childCalls = 0;
+  const selections: unknown[] = [];
   const Owner = createActorNativeOwner(
     undefined,
     "c".repeat(64),
     undefined,
     undefined,
-    async () => {
+    async (_env, key, selection) => {
+      selections.push({ key, selection });
       if (rollOnLoad) {
         epoch = "epoch-2";
         rollOnLoad = false;
@@ -174,6 +176,25 @@ test("dynamic owner graph rejects a rollout between selection and child dispatch
   expect(childCalls).toBe(0);
   expect(await (await owner.fetch(request())).text()).toBe("selected");
   expect(childCalls).toBe(1);
+  expect(selections).toEqual([
+    {
+      key: "selected",
+      selection: {
+        actorId: "loaded-id",
+        generationKey: "d".repeat(64),
+        epoch: "epoch-1",
+      },
+    },
+    {
+      key: "selected",
+      selection: {
+        actorId: "loaded-id",
+        generationKey: "d".repeat(64),
+        epoch: "epoch-2",
+      },
+    },
+  ]);
+  expect(Object.isFrozen((selections[0] as { selection: object }).selection)).toBe(true);
 });
 
 for (const [cause, epoch, variantKeys] of [
@@ -295,7 +316,15 @@ test("structural WfP owner omits admission and control bearers only in dynamic m
     undefined,
     undefined,
     undefined,
-    async () => selectedClass,
+    async (_env, key, selection) => {
+      expect(key).toBe("selected");
+      expect(selection).toEqual({
+        actorId,
+        generationKey: graph.generationKey,
+        epoch: graph.epoch,
+      });
+      return selectedClass;
+    },
     async () => graph,
   );
   const owner = new Owner(
