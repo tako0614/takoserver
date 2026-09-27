@@ -195,6 +195,9 @@ export function createSponsorshipAuthority(options: {
       tenantRef: input.tenantRef,
       spaceRef: input.spaceRef,
       runRef: input.runRef,
+      ...(input.logicalPrincipalRef === undefined
+        ? {}
+        : { logicalPrincipalRef: input.logicalPrincipalRef }),
       ...(input.workerEndpointOriginReservationId === undefined
         ? {}
         : {
@@ -237,6 +240,7 @@ interface CredentialInput {
   readonly tenantRef: string;
   readonly spaceRef: string;
   readonly runRef: string;
+  readonly logicalPrincipalRef?: string;
   readonly requiredAvailableMinor: number;
   readonly workerEndpointOriginReservationId?: string;
   readonly channel: SponsorshipReceiptChannel;
@@ -524,10 +528,11 @@ function credentialInput(value: unknown): CredentialInput {
   if (!record(value)) invalidInput();
   const keys = Object.keys(value).sort();
   const expected = ["channel", "requiredAvailableMinor", "runRef", "spaceRef", "tenantRef"];
-  const withReservation = [...expected, "workerEndpointOriginReservationId"].sort();
+  const optional = ["logicalPrincipalRef", "workerEndpointOriginReservationId"];
   if (
-    JSON.stringify(keys) !== JSON.stringify(expected) &&
-    JSON.stringify(keys) !== JSON.stringify(withReservation)
+    !expected.every((key) => keys.includes(key)) ||
+    keys.some((key) => !expected.includes(key) && !optional.includes(key)) ||
+    keys.length !== new Set(keys).size
   ) {
     invalidInput();
   }
@@ -544,6 +549,9 @@ function credentialInput(value: unknown): CredentialInput {
       tenantRef: reference(value.tenantRef),
       spaceRef: reference(value.spaceRef),
       runRef: reference(value.runRef),
+      ...(value.logicalPrincipalRef === undefined
+        ? {}
+        : { logicalPrincipalRef: reference(value.logicalPrincipalRef) }),
       requiredAvailableMinor: requiredAvailableMinor as number,
       channel: receiptChannel(value.channel),
       ...(value.workerEndpointOriginReservationId === undefined

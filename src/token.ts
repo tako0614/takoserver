@@ -57,6 +57,7 @@ export interface TakoformTenantRunTokenClaims {
   /** Opaque Capsule-scoped Takoform namespace selected by the reseller. */
   readonly spaceRef: string;
   readonly runRef: string;
+  readonly logicalPrincipalRef?: string;
   readonly workerEndpointOriginReservationId?: string;
   readonly mode: "tenant-run";
   readonly issuedAtEpochSeconds: number;
@@ -684,6 +685,7 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     "nbf",
     "organizationId",
     "runRef",
+    ...(payload.logicalPrincipalRef === undefined ? [] : ["logicalPrincipalRef"]),
     "spaceRef",
     "tenantRef",
     ...(payload.workerEndpointOriginReservationId === undefined
@@ -696,6 +698,9 @@ function takoformTenantRunClaims(payload: Record<string, unknown>): TakoformTena
     tenantRef: claimReference(payload.tenantRef),
     spaceRef: claimReference(payload.spaceRef),
     runRef: claimReference(payload.runRef),
+    ...(payload.logicalPrincipalRef === undefined
+      ? {}
+      : { logicalPrincipalRef: claimReference(payload.logicalPrincipalRef) }),
     ...(payload.workerEndpointOriginReservationId === undefined
       ? {}
       : {

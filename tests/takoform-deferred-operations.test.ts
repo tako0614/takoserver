@@ -263,11 +263,14 @@ describe("durable deferred Takoform operations", () => {
           objects: createMemoryObjectStore(),
           authenticate: async (request) => {
             const token = request.headers.get("authorization");
-            if (token === "Bearer primary") {
+            if (token === "Bearer primary" || token === "Bearer same-capsule-next-run") {
               return { tenantId: "tenant-a", principalId: "principal-a" };
             }
             if (token === "Bearer alternate") {
               return { tenantId: "tenant-a", principalId: "principal-b" };
+            }
+            if (token === "Bearer other-tenant") {
+              return { tenantId: "tenant-b", principalId: "principal-a" };
             }
             return null;
           },
@@ -335,6 +338,23 @@ describe("durable deferred Takoform operations", () => {
     const replayed = await opened.host.handle(apply.clone());
     expect(await replayed?.json()).toEqual(acceptedBody);
     expect(replayed?.status).toBe(202);
+    const replayedByNextRun = await opened.host.handle(
+      request(
+        `${lane}/resources/example.forms.invalid/DeferredThing/durable`,
+        "same-capsule-next-run",
+        {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "create-durable-0001",
+            "if-none-match": "*",
+            "takoform-conformance-probe": "async",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        },
+      ),
+    );
+    expect(replayedByNextRun?.status).toBe(202);
+    expect(await replayedByNextRun?.json()).toEqual(acceptedBody);
 
     const operationPath = `${lane}/operations/${acceptedBody.operation.id}`;
     const hidden = await opened.host.handle(request(operationPath, "alternate"));
@@ -343,16 +363,26 @@ describe("durable deferred Takoform operations", () => {
       error: { code: "operation_not_found" },
     });
 
-    const pending = await opened.host.handle(request(operationPath, "primary"));
+    const foreignTenant = await opened.host.handle(request(operationPath, "other-tenant"));
+    expect(foreignTenant?.status).toBe(404);
+    const foreignCancel = await opened.host.handle(
+      request(`${operationPath}/cancel`, "alternate", {
+        method: "POST",
+        headers: { "idempotency-key": "foreign-cancel-0001" },
+      }),
+    );
+    expect(foreignCancel?.status).toBe(404);
+
+    const pending = await opened.host.handle(request(operationPath, "same-capsule-next-run"));
     expect(pending?.status).toBe(200);
     expect(pending?.headers.get("retry-after")).toBe("0");
     expect(await pending?.json()).toEqual(acceptedBody.operation);
 
-    const committing = await opened.host.handle(request(operationPath, "primary"));
+    const committing = await opened.host.handle(request(operationPath, "same-capsule-next-run"));
     expect(committing?.headers.get("retry-after")).toBe("0");
     expect(await committing?.json()).toEqual(acceptedBody.operation);
 
-    const settled = await opened.host.handle(request(operationPath, "primary"));
+    const settled = await opened.host.handle(request(operationPath, "same-capsule-next-run"));
     expect(settled?.status).toBe(200);
     const settledText = await settled?.text();
     const settledBody = JSON.parse(settledText ?? "null") as {

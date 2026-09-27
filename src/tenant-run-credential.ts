@@ -1,4 +1,4 @@
-import { base64UrlEncode } from "./json.ts";
+import { base64UrlEncode, canonicalDigest } from "./json.ts";
 import type { Clock } from "./ports.ts";
 import type { SigningKey } from "./token.ts";
 
@@ -7,6 +7,27 @@ const TAKOFORM_RUN_AUDIENCE = "takoform.run";
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$/u;
 export const MAX_TENANT_RUN_CREDENTIAL_LIFETIME_SECONDS = 300;
+
+/** Host operation ownership is logical when an admitted issuer supplies one. */
+export async function tenantRunPrincipalId(claims: {
+  readonly organizationId: string;
+  readonly tenantRef: string;
+  readonly spaceRef: string;
+  readonly tokenId: string;
+  readonly logicalPrincipalRef?: string;
+}): Promise<string> {
+  if (claims.logicalPrincipalRef === undefined) return `run:${claims.tokenId}`;
+  const digest = await canonicalDigest({
+    kind: "takoserver.tenant-run-operation-principal@v1",
+    organizationId: claims.organizationId,
+    tenantRef: claims.tenantRef,
+    spaceRef: claims.spaceRef,
+    logicalPrincipalRef: claims.logicalPrincipalRef,
+  });
+  // Retain the established run: principal class used by artifact closure
+  // policy and durable CHECK constraints; only the owner identity changes.
+  return `run:owner_${digest.slice(7)}`;
+}
 
 /**
  * Private signer grammar shared by the independent sponsorship and self-host
@@ -19,6 +40,7 @@ export interface TenantRunCredentialSigner {
     readonly tenantRef: string;
     readonly spaceRef: string;
     readonly runRef: string;
+    readonly logicalPrincipalRef?: string;
     readonly workerEndpointOriginReservationId?: string;
     readonly issuedAtEpochSeconds: number;
     readonly tokenId: string;
@@ -67,6 +89,9 @@ export function createTenantRunCredentialSigner(options: {
         nbf: input.issuedAtEpochSeconds,
         organizationId: reference(input.organizationId, errorLabel),
         runRef: reference(input.runRef, errorLabel),
+        ...(input.logicalPrincipalRef === undefined
+          ? {}
+          : { logicalPrincipalRef: reference(input.logicalPrincipalRef, errorLabel) }),
         spaceRef: reference(input.spaceRef, errorLabel),
         tenantRef: reference(input.tenantRef, errorLabel),
         ...(input.workerEndpointOriginReservationId === undefined

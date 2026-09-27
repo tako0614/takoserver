@@ -84,6 +84,7 @@ describe("route-less Hosted sponsorship authority", () => {
       tenantRef: "tenant:opaque",
       spaceRef: "space:opaque",
       runRef: "run:exact",
+      logicalPrincipalRef: "opaque:logical-owner",
       requiredAvailableMinor: 1_500,
       channel,
       workerEndpointOriginReservationId: "reservation:opaque",
@@ -96,9 +97,13 @@ describe("route-less Hosted sponsorship authority", () => {
     });
     await expect(authority.issueTenantRunCredential(input)).resolves.toEqual(first);
     expect(new Set(issued.map((item) => JSON.stringify(item))).size).toBe(1);
+    expect(issued[0]?.logicalPrincipalRef).toBe("opaque:logical-owner");
 
     await expect(
       authority.issueTenantRunCredential({ ...input, runRef: "run:mismatch" }),
+    ).rejects.toEqual(new SponsorshipAuthorityError("operation_conflict"));
+    await expect(
+      authority.issueTenantRunCredential({ ...input, logicalPrincipalRef: "opaque:other-owner" }),
     ).rejects.toEqual(new SponsorshipAuthorityError("operation_conflict"));
     expect(
       await sql.query(
