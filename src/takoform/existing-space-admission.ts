@@ -19,6 +19,12 @@ export interface ExistingSpaceAdmissionRequest {
   readonly spaces: readonly string[];
 }
 
+/** Internal signed operator transport precondition; never caller policy. */
+export interface ExistingSpaceAdmissionExpectation {
+  readonly identity: FormAuthorityIdentity;
+  readonly authorityWorkerVersionId: string;
+}
+
 export interface ExistingSpaceAdmissionResult {
   readonly policyDigest: `sha256:${string}`;
   readonly identity: FormAuthorityIdentity;
@@ -55,7 +61,15 @@ export function createExistingSpaceAdmissionAuthority(options: {
   const policy = parseSpaceAdmissionPolicy(options.policy);
 
   return {
-    async reconcileExistingSpaces(input: unknown): Promise<ExistingSpaceAdmissionResult> {
+    async reconcileExistingSpaces(
+      input: unknown,
+      expectedIdentity: FormAuthorityIdentity,
+    ): Promise<ExistingSpaceAdmissionResult> {
+      if (!expectedIdentity) notReady();
+      const expectedIdentityJson = canonicalJson(expectedIdentity);
+      const assertExpectedIdentity = (identity: FormAuthorityIdentity): void => {
+        if (canonicalJson(identity) !== expectedIdentityJson) notReady();
+      };
       const selection = parseSelection(input);
       const policyDigest = await spaceAdmissionPolicyDigest(policy);
       if (selection.policyDigest !== policyDigest) {
@@ -63,6 +77,7 @@ export function createExistingSpaceAdmissionAuthority(options: {
       }
       const composition = await options.compose(policy);
       const { identity, evidence } = composition;
+      assertExpectedIdentity(identity);
       const snapshots = [];
       // Capture the whole explicit selection before the first mutation.
       for (const space of selection.spaces) {
@@ -79,6 +94,7 @@ export function createExistingSpaceAdmissionAuthority(options: {
           actor: "operator-existing-space-admission",
           reason: `Refresh retained positive admission (${policyDigest})`,
         };
+        assertExpectedIdentity(composition.identity);
         const before = await composition.endpoint.readback(request);
         assertIdentity(before, request);
         const forms = policy.forms.filter((selected) => {
@@ -93,7 +109,7 @@ export function createExistingSpaceAdmissionAuthority(options: {
         if (forms.length === 0) continue;
         const selectedPolicy = { ...policy, forms };
         const scoped = await options.compose(selectedPolicy);
-        if (canonicalJson(scoped.identity) !== canonicalJson(identity)) notReady();
+        assertExpectedIdentity(scoped.identity);
         const plan = await scoped.endpoint.plan(request);
         if (
           canonicalJson(plan.request) !== canonicalJson(request) ||
@@ -104,6 +120,7 @@ export function createExistingSpaceAdmissionAuthority(options: {
         // Comparing captured activation heads prevents a deactivation between
         // capture and planning from being resurrected. Coordinator apply then
         // fences every command against the exact planned durable predecessor.
+        assertExpectedIdentity(scoped.identity);
         const result = await scoped.endpoint.apply(plan);
         if (
           result.status !== "converged" ||
@@ -124,6 +141,7 @@ export function createExistingSpaceAdmissionAuthority(options: {
       // A later Space's failure or identity/head drift must not be hidden by
       // an earlier successful apply. Freshly check the complete selection.
       for (const { request, before, forms, expected } of snapshots) {
+        assertExpectedIdentity(composition.identity);
         const after = await composition.endpoint.readback(request);
         assertIdentity(after, request);
         for (const previous of before.forms) {

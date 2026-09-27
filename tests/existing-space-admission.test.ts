@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { canonicalJson } from "../src/json.ts";
@@ -21,6 +21,11 @@ import {
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 const digest = (letter: string) => `sha256:${letter.repeat(64)}` as const;
+
+mock.module("cloudflare:workers", () => ({
+  DurableObject: class DurableObject {},
+  WorkerEntrypoint: class WorkerEntrypoint {},
+}));
 
 async function fixture() {
   const closure = await loadPublisherSetClosure();
@@ -110,6 +115,7 @@ async function fixture() {
     beforeApply: async (_space: string) => {},
     afterApply: async (_space: string) => {},
     applyCount: 0,
+    readbackCount: 0,
     composePolicy: (value: SpaceAdmissionPolicyV1) => value,
   };
   const authority = createExistingSpaceAdmissionAuthority({
@@ -131,7 +137,10 @@ async function fixture() {
             await controls.afterApply(plan.request.activation.space);
             return result;
           },
-          readback: (input) => endpoint.readback(input),
+          readback: (input) => {
+            controls.readbackCount++;
+            return endpoint.readback(input);
+          },
         },
       };
     },
@@ -157,15 +166,64 @@ async function fixture() {
       identity.implementationDigest = digest("d");
     },
     run: async (spaces: string[]) =>
-      authority.reconcileExistingSpaces({
-        policyDigest: await spaceAdmissionPolicyDigest(policy),
-        spaces,
-      }),
-    raw: (input: unknown) => authority.reconcileExistingSpaces(input),
+      authority.reconcileExistingSpaces(
+        {
+          policyDigest: await spaceAdmissionPolicyDigest(policy),
+          spaces,
+        },
+        identity,
+      ),
+    raw: (input: unknown) => authority.reconcileExistingSpaces(input, identity),
+    signed: async (signedIdentity: FormAuthorityIdentity) =>
+      authority.reconcileExistingSpaces(
+        {
+          policyDigest: await spaceAdmissionPolicyDigest(policy),
+          spaces: ["space-a"],
+        },
+        signedIdentity,
+      ),
   };
 }
 
 describe("operator existing-Space software update convergence", () => {
+  test("a signed old implementation identity cannot authorize a freshly composed identity", async () => {
+    const f = await fixture();
+    await f.apply("space-a");
+    const before = await f.history();
+    const signed = { ...f.identity };
+    f.rotate();
+    await expect(f.signed(signed)).rejects.toMatchObject({ code: "admission_not_ready" });
+    expect(f.controls.readbackCount).toBe(0);
+    expect(f.controls.applyCount).toBe(0);
+    expect(await f.history()).toEqual(before);
+  });
+
+  test("the full Worker RPC refuses missing or stale authority Version before reading policy or storage", async () => {
+    const specifier = "../src/entry-form-authority-worker.ts";
+    const { FormAuthorityEntrypoint } = await import(specifier);
+    let reads = 0;
+    const env = {
+      WORKER_VERSION: { id: "00000000-0000-4000-8000-000000000001" },
+      get TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY() {
+        reads++;
+        throw new Error("policy must not be read");
+      },
+      get STATE_DB() {
+        reads++;
+        throw new Error("storage must not be read");
+      },
+    };
+    for (const expected of [
+      undefined,
+      { authorityWorkerVersionId: "00000000-0000-4000-8000-000000000002", identity: {} },
+    ]) {
+      await expect(
+        FormAuthorityEntrypoint.prototype.reconcileExistingSpaces.call({ env }, {}, expected),
+      ).rejects.toMatchObject({ code: "admission_not_ready" });
+    }
+    expect(reads).toBe(0);
+  });
+
   test("two retained Spaces converge across I rotation while all other heads remain intact; repeat is a noop", async () => {
     const f = await fixture();
     for (const space of ["space-a", "space-b", "inactive", "unselected"]) await f.apply(space);

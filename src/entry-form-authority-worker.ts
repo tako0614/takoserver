@@ -12,7 +12,11 @@ import {
 import { createR2ObjectStore } from "./objects-r2.ts";
 import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { createD1Sql } from "./sql-d1.ts";
-import { createExistingSpaceAdmissionAuthority } from "./takoform/existing-space-admission.ts";
+import {
+  createExistingSpaceAdmissionAuthority,
+  ExistingSpaceAdmissionError,
+  type ExistingSpaceAdmissionExpectation,
+} from "./takoform/existing-space-admission.ts";
 import { readReleasedCoreVerifierIdentity } from "./takoform/form-authority-verification.ts";
 import type {
   FormAuthorityPlan,
@@ -62,7 +66,13 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
   }
 
   /** Full operator capability only; never exposed to the credential issuer. */
-  async reconcileExistingSpaces(input: unknown) {
+  async reconcileExistingSpaces(input: unknown, expected: ExistingSpaceAdmissionExpectation) {
+    if (
+      !expected?.identity ||
+      expected.authorityWorkerVersionId !== exactWorkerVersionId(this.env.WORKER_VERSION?.id)
+    ) {
+      throw new ExistingSpaceAdmissionError("admission_not_ready");
+    }
     return await createExistingSpaceAdmissionAuthority({
       policy: this.env.TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY,
       compose: async (policy) => {
@@ -70,7 +80,7 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
         const closure = await loadPublisherSetClosure();
         return { ...composition, evidence: closure.evidence };
       },
-    }).reconcileExistingSpaces(input);
+    }).reconcileExistingSpaces(input, expected.identity);
   }
 }
 

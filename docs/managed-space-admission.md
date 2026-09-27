@@ -144,6 +144,17 @@ provides bounded positive convergence for an explicit selection:
 { policyDigest: "sha256:...", spaces: ["space-a", "space-b"] }
 ```
 
+The internal RPC additionally requires a second argument
+`{ identity, authorityWorkerVersionId }` supplied from the signed operator
+request, never reconstructed from a newer identity after signature verification.
+The entrypoint refuses a different served authority Version before policy or
+storage access. The helper requires the exact composed public Host identity
+before readback, planning and apply; the existing endpoint and per-command
+mutation fences also recheck the live public Host. Missing expectations have no
+fallback. This precondition does not grant policy authority or change the
+caller body above. See [Existing-Space operator deployment](existing-space-operator.md)
+for the owning transport and read-only observation path.
+
 The digest must match the configured `TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY`.
 There must be 1–100 distinct valid Space references. The policy alone selects
 the organization and exact Form/package identities. This operator operation
