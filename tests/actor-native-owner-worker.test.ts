@@ -52,6 +52,80 @@ test("native per-ID owner releases failed head and strips private identity befor
   await Promise.all(f.retained);
 });
 
+test("native owner loads an exact selected class through a Host-only async loader", async () => {
+  const seen: string[] = [];
+  const selected = Object.freeze({ marker: "selected-class" });
+  const Owner = createActorNativeOwner(
+    "a".repeat(64),
+    "c".repeat(64),
+    { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["selected"] },
+    undefined,
+    async (_env, variantKey) => {
+      seen.push(variantKey);
+      return selected;
+    },
+  );
+  const owner = new Owner(
+    {
+      facets: {
+        get: (_name, create) => {
+          expect(create().class).toBe(selected);
+          return { fetch: async () => new Response("loaded") };
+        },
+        abort() {},
+      },
+      waitUntil() {},
+    },
+    { CLASS: {} },
+  );
+  const response = await owner.fetch(
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": "loaded-id",
+        "x-takoserver-private-actor-variant": "selected",
+      },
+    }),
+  );
+  expect(await response.text()).toBe("loaded");
+  expect(seen).toEqual(["selected"]);
+});
+
+test("structural facet lane overwrites a forged event secret before child dispatch", async () => {
+  let captured = "";
+  const Owner = createActorNativeOwner(undefined, "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["selected"],
+  });
+  const owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            captured = request.headers.get("x-takoserver-private-actor-event-secret") ?? "";
+            return new Response("ordinary");
+          },
+        }),
+        abort() {},
+      },
+      waitUntil() {},
+    },
+    { CLASS: {}, CLASS_0: {} },
+  );
+  const response = await owner.fetch(
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": "loaded-id",
+        "x-takoserver-private-actor-variant": "selected",
+        "x-takoserver-private-actor-event-secret": "attacker-chosen",
+      },
+    }),
+  );
+  expect(await response.text()).toBe("ordinary");
+  expect(captured).toMatch(/^[a-f0-9]{64}$/u);
+  expect(captured).not.toBe("attacker-chosen");
+});
+
 test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {
   let calls = 0;
   const f = fixture(async () => {

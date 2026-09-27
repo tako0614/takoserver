@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -44,6 +44,8 @@ export interface WorkerdActorNamespace {
     readonly socketPath: string;
     readonly headers: Readonly<Record<string, string>>;
   };
+  /** Host-only owner lifecycle control, over the ordinary authenticated Unix hop. */
+  settleDuplex(id: string, bearer: string, action: "commit" | "abandon"): Promise<void>;
   /** Settles when the native child exits, including an intentional close. */
   readonly exited: Promise<void>;
   readonly epoch: string;
@@ -239,6 +241,7 @@ const DELIVERY_TOKEN = ${literal(deliveryToken)};
 const UPGRADE_NONCE = "x-takoserver-private-actor-upgrade-nonce";
 const UPGRADE_DECISION = "x-takoserver-private-actor-upgrade-decision";
 const UPGRADE_SOCKET_ID = "x-takoserver-private-actor-upgrade-socket-id";
+const EVENT_SECRET = "x-takoserver-private-actor-event-secret";
 const SOCKET_ACTION = "x-takoserver-private-actor-socket-action";
 const SOCKET_NONCE = "x-takoserver-private-actor-socket-nonce";
 const SOCKET_ID = "x-takoserver-private-actor-socket-id";
@@ -299,7 +302,7 @@ export class ActorChild {
     }
     const headers = new SafeHeaders(incoming);
     const nonce = SafeApply(SafeHeadersGet, headers, [UPGRADE_NONCE]);
-    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
+    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, EVENT_SECRET, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
     for (let index = 0; index < privateNames.length; index += 1)
       SafeApply(SafeHeadersDelete, headers, [privateNames[index]]);
     const appRequest = new SafeRequest(SafeRequestUrl ? SafeApply(SafeRequestUrl, request, []) : request.url, { method: SafeApply(SafeRequestMethod, request, []), headers, body: SafeRequestBody ? SafeApply(SafeRequestBody, request, []) : request.body, signal: SafeApply(SafeRequestSignal, request, []), redirect: "manual" });
@@ -596,6 +599,32 @@ export default {
             "x-takoserver-private-actor-variant": variantKey,
           }),
         });
+      },
+      async settleDuplex(id, bearer, action) {
+        if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (
+          !id ||
+          id.includes("\u0000") ||
+          !/^[a-f0-9]{64}$/u.test(bearer) ||
+          (action !== "commit" && action !== "abandon")
+        )
+          throw new Error("Actor socket reservation unavailable");
+        const encodedId = encodeURIComponent(id);
+        const controlToken = createHmac("sha256", alarmToken).update(encodedId).digest("hex");
+        const response = await fetch("http://actor.invalid/__actor_socket_reservation__", {
+          unix: socket,
+          method: "POST",
+          headers: {
+            "x-takoserver-private-actor-token": controlToken,
+            "x-takoserver-private-actor-id": encodedId,
+            "x-takoserver-private-actor-reservation": bearer,
+            "x-takoserver-private-actor-reservation-action": action,
+          },
+          redirect: "manual",
+          signal: AbortSignal.timeout(5_000),
+        });
+        await response.body?.cancel();
+        if (response.status !== 204) throw new Error("Actor socket reservation unavailable");
       },
       epoch,
       actorProxySocketPath,

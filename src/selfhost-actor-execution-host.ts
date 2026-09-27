@@ -674,6 +674,8 @@ export function createSelfhostActorExecutionHost(options: {
     ): Promise<{
       readonly target: ReturnType<WorkerdActorNamespace["duplexTarget"]>;
       commit(): Promise<void>;
+      commitTransport(bearer: string): Promise<void>;
+      abandonTransport(bearer: string): Promise<void>;
       abandon(): void;
     }> {
       if (
@@ -710,32 +712,47 @@ export function createSelfhostActorExecutionHost(options: {
       }
       try {
         const target = acquired.session.process.duplexTarget(identity.id, acquired.variantKey);
+        const verifyAuthority = async (): Promise<void> => {
+          if (settled) throw new Error("Actor socket reservation expired");
+          const session = acquired.session;
+          const graphNow = await options.graph(identity, request.signal);
+          const deploymentNow = await options.deployments.active(
+            identity.tenantId,
+            session.resourceGraph.worker.uid,
+          );
+          const residentNow = await activeGraph(session.script, session.resourceGraph.worker.uid);
+          request.signal.throwIfAborted();
+          if (
+            stopped ||
+            session.dead ||
+            session.retiring ||
+            !sameGraph(session.resourceGraph, graphNow) ||
+            JSON.stringify(deploymentNow) !== session.deploymentJson ||
+            residentNow?.generationKey !== session.graph.generationKey ||
+            settled
+          )
+            throw new ActorAuthorityUnavailable("Actor authority changed before upgrade");
+        };
         return Object.freeze({
           target,
           async commit(): Promise<void> {
-            if (settled) throw new Error("Actor socket reservation expired");
-            const session = acquired.session;
             try {
-              const graphNow = await options.graph(identity, request.signal);
-              const deploymentNow = await options.deployments.active(
-                identity.tenantId,
-                session.resourceGraph.worker.uid,
-              );
-              const residentNow = await activeGraph(
-                session.script,
-                session.resourceGraph.worker.uid,
-              );
-              request.signal.throwIfAborted();
-              if (
-                stopped ||
-                session.dead ||
-                session.retiring ||
-                !sameGraph(session.resourceGraph, graphNow) ||
-                JSON.stringify(deploymentNow) !== session.deploymentJson ||
-                residentNow?.generationKey !== session.graph.generationKey ||
-                settled
-              )
-                throw new ActorAuthorityUnavailable("Actor authority changed before upgrade");
+              await verifyAuthority();
+            } finally {
+              finish();
+            }
+          },
+          async commitTransport(bearer: string): Promise<void> {
+            try {
+              await verifyAuthority();
+              await acquired.session.process.settleDuplex(identity.id, bearer, "commit");
+            } finally {
+              finish();
+            }
+          },
+          async abandonTransport(bearer: string): Promise<void> {
+            try {
+              await acquired.session.process.settleDuplex(identity.id, bearer, "abandon");
             } finally {
               finish();
             }

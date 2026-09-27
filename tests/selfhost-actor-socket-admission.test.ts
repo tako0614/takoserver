@@ -27,6 +27,7 @@ mock.module("../src/selfhost-actor-native-process.ts", () => ({
         socketPath: "/tmp/unused-actor-upgrade.sock",
         headers: { "x-test-id": id, "x-test-variant": variantKey },
       }),
+      async settleDuplex() {},
       exited,
       fetch: async (_id, _request, variantKey) => Response.json({ variantKey }),
       enableAlarmAdmission() {},

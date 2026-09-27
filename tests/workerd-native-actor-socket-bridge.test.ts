@@ -168,7 +168,8 @@ test.skipIf(binary === undefined)(
           admittedFetches += 1;
           return {
             target: activeNamespace.duplexTarget(actorId, "variant-one"),
-            async commit() {},
+            commitTransport: (bearer) => activeNamespace.settleDuplex(actorId, bearer, "commit"),
+            abandonTransport: (bearer) => activeNamespace.settleDuplex(actorId, bearer, "abandon"),
             abandon() {},
           };
         },
@@ -310,6 +311,9 @@ export default {async fetch(request, env) {
         await Bun.sleep(10);
       expect(completed).toEqual(["socket-event-1", "socket-event-2"]);
       ws.close();
+      for (let attempt = 0; completed.length < 3 && attempt < 100; attempt += 1)
+        await Bun.sleep(10);
+      expect(completed).toEqual(["socket-event-1", "socket-event-2", "socket-event-3"]);
 
       const poisoned = new WebSocket(
         `${origin.replace(/^http:/u, "ws:")}/poison?ticket=authorized`,
@@ -342,6 +346,8 @@ export default {async fetch(request, env) {
         await Bun.sleep(10);
       }
       expect(live).toBe(0);
+      await Bun.sleep(100);
+      expect(completed).toEqual(["socket-event-1", "socket-event-2", "socket-event-3"]);
       expect(admittedFetches).toBe(2);
       const ordinary = await fetch(`${origin}/actor-http?ticket=authorized`);
       expect(ordinary.status).toBe(200);

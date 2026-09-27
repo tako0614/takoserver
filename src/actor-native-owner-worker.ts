@@ -44,6 +44,10 @@ const SOCKET_KIND_HEADER = "x-takoserver-private-actor-socket-kind";
 const UPGRADE_NONCE_HEADER = "x-takoserver-private-actor-upgrade-nonce";
 const UPGRADE_DECISION_HEADER = "x-takoserver-private-actor-upgrade-decision";
 const UPGRADE_SOCKET_ID_HEADER = "x-takoserver-private-actor-upgrade-socket-id";
+const EVENT_SECRET_HEADER = "x-takoserver-private-actor-event-secret";
+const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
+const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
+const RESERVATION_MS = 30_000;
 const SOCKET_MESSAGE_LIMIT = 8 * 1024 * 1024;
 const SOCKET_ATTACHMENT_LIMIT = 8_192;
 const SOCKET_ID_LIMIT = 10_000;
@@ -72,11 +76,22 @@ const SafeSubtleSign = crypto.subtle.sign;
 const SafeSubtleVerify = crypto.subtle.verify;
 const SafeCrypto = crypto;
 const SafeCryptoRandomUUID = crypto.randomUUID;
+const SafeCryptoGetRandomValues = crypto.getRandomValues;
+const SafeNow = Date.now;
+const SafeMathMin = Math.min;
 const SafeJsonStringify = JSON.stringify;
 const SafeEncoder = new TextEncoder();
 const SafeEncode = TextEncoder.prototype.encode;
 const SafeUint8Array = Uint8Array;
 const HEX = "0123456789abcdef";
+
+function randomBearer(): string {
+  const bytes = new SafeUint8Array(32);
+  SafeReflectApply(SafeCryptoGetRandomValues, SafeCrypto, [bytes]);
+  let bearer = "";
+  for (const byte of bytes) bearer += (HEX[byte >> 4] as string) + (HEX[byte & 15] as string);
+  return bearer;
+}
 
 function hexBytes(value: string): Uint8Array | null {
   if (!/^[a-f0-9]{64}$/u.test(value)) return null;
@@ -188,7 +203,9 @@ interface SocketRecord {
   attachment: Uint8Array | null;
   readonly queued: (string | Uint8Array)[];
   queuedBytes: number;
-  status: "provisional" | "live" | "closed";
+  status: "provisional" | "transport-pending" | "live" | "closed";
+  reservationBearer?: string | undefined;
+  reservationExpiresAt?: number | undefined;
   socket?: NativeActorWebSocket;
 }
 
@@ -196,6 +213,8 @@ interface SocketAttachment {
   readonly socketId: string;
   readonly actorId: string;
   readonly attachment: string | null;
+  readonly reservationBearer?: string | undefined;
+  readonly reservationExpiresAt?: number | undefined;
 }
 
 function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
@@ -205,7 +224,12 @@ function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
   if (
     typeof record.socketId !== "string" ||
     typeof record.actorId !== "string" ||
-    (record.attachment !== null && typeof record.attachment !== "string")
+    (record.attachment !== null && typeof record.attachment !== "string") ||
+    (record.reservationBearer !== undefined &&
+      (typeof record.reservationBearer !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(record.reservationBearer))) ||
+    (record.reservationExpiresAt !== undefined && !alarmTime(record.reservationExpiresAt)) ||
+    (record.reservationBearer === undefined) !== (record.reservationExpiresAt === undefined)
   )
     return null;
   return record as SocketAttachment;
@@ -410,7 +434,7 @@ function withHeaders(request: Request, headers: Headers, signal = request.signal
  * the self-host Actor admission refusal remains in force.
  */
 export function createActorNativeOwner(
-  deliveryToken: string,
+  deliveryToken: string | undefined,
   admissionToken: string,
   graph: {
     readonly generationKey: string;
@@ -423,9 +447,16 @@ export function createActorNativeOwner(
     handlerMs: HTTP_HANDLER_MS,
     producerMs: HTTP_PRODUCER_MS,
   },
+  loadVariantClass?: (env: Record<string, unknown>, variantKey: string) => Promise<unknown>,
 ) {
-  if (!/^[a-f0-9]{64}$/u.test(deliveryToken) || !/^[a-f0-9]{64}$/u.test(admissionToken))
+  if (
+    (deliveryToken !== undefined && !/^[a-f0-9]{64}$/u.test(deliveryToken)) ||
+    !/^[a-f0-9]{64}$/u.test(admissionToken)
+  )
     throw new Error("Actor delivery capability unavailable");
+  // Undefined is only for a route-less, structurally Host-owned facet loader:
+  // no static secret may be embedded in immutable/recoverable WfP WorkerCode.
+  const deliveryForEvent = (): string => deliveryToken ?? randomBearer();
   if (
     !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
     typeof graph.epoch !== "string" ||
@@ -484,6 +515,36 @@ export function createActorNativeOwner(
         storage.sql.exec(
           "INSERT OR IGNORE INTO actor_alarm_state (id, actor_id, pending_at, obligation, retry_at) VALUES (1, NULL, NULL, 0, NULL)",
         );
+        storage.sql.exec(
+          "CREATE TABLE IF NOT EXISTS actor_socket_reservations (socket_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, bearer TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+        );
+        const recoveredSockets = state.getWebSockets?.() ?? [];
+        for (let index = 0; index < recoveredSockets.length; index += 1) {
+          const socket = recoveredSockets[index] as NativeActorWebSocket;
+          const metadata = socketMetadata(socket);
+          if (metadata?.reservationBearer === undefined) continue;
+          const row = storage.sql
+            .exec(
+              "SELECT bearer, expires_at AS expiresAt FROM actor_socket_reservations WHERE socket_id = ? AND actor_id = ?",
+              metadata.socketId,
+              metadata.actorId,
+            )
+            [Symbol.iterator]()
+            .next().value;
+          if (
+            row?.bearer === metadata.reservationBearer &&
+            row.expiresAt === metadata.reservationExpiresAt &&
+            alarmTime(row.expiresAt) &&
+            row.expiresAt > (SafeReflectApply(SafeNow, Date, []) as number)
+          )
+            continue;
+          this.suppressedCloses.add(socket);
+          socket.close(1008, "upgrade not committed");
+          storage.sql.exec(
+            "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
+            metadata.socketId,
+          );
+        }
         await this.reconcile();
       };
       // Native storage, not a timer in this process, reconstructs the wake.
@@ -494,6 +555,19 @@ export function createActorNativeOwner(
     private requireStorage(): NonNullable<NativeState["storage"]> {
       if (!this.state.storage) throw new Error("Actor alarm storage unavailable");
       return this.state.storage;
+    }
+    private async selectedChild(actorId: string, variantIndex: number) {
+      const key = variantKeys[variantIndex];
+      if (key === undefined) throw new Error("Actor variant unavailable");
+      const bindingName = `CLASS_${variantIndex}`;
+      const selectedClass = loadVariantClass
+        ? await loadVariantClass(this.env, key)
+        : SafeHasOwn(this.env, bindingName)
+          ? this.env[bindingName]
+          : undefined;
+      if (selectedClass === undefined || selectedClass === null)
+        throw new Error("Actor variant unavailable");
+      return this.state.facets.get("actor", () => ({ class: selectedClass, id: actorId }));
     }
     private readAlarm(): AlarmState {
       const rows = this.requireStorage().sql.exec(
@@ -520,7 +594,20 @@ export function createActorNativeOwner(
     }
     private async reconcile(): Promise<void> {
       const alarm = this.readAlarm();
-      const wake = alarm.obligation ? alarm.retryAt : alarm.pending;
+      const actorWake = alarm.obligation ? alarm.retryAt : alarm.pending;
+      const pending = this.requireStorage()
+        .sql.exec("SELECT MIN(expires_at) AS expiresAt FROM actor_socket_reservations")
+        [Symbol.iterator]()
+        .next().value;
+      const pendingWake = pending?.expiresAt;
+      if (pendingWake !== null && pendingWake !== undefined && !alarmTime(pendingWake))
+        throw new Error("Actor socket reservation state corrupt");
+      const wake =
+        actorWake === null
+          ? (pendingWake ?? null)
+          : pendingWake === null || pendingWake === undefined
+            ? actorWake
+            : (SafeReflectApply(SafeMathMin, Math, [actorWake, pendingWake]) as number);
       if (wake === null) await this.requireStorage().deleteAlarm();
       else await this.requireStorage().setAlarm(wake);
     }
@@ -564,7 +651,8 @@ export function createActorNativeOwner(
     }
     private liveSocket(socketId: string): SocketRecord | undefined {
       const cached = this.sockets.get(socketId);
-      if (cached?.status === "live" && cached.socket) return cached;
+      if ((cached?.status === "live" || cached?.status === "transport-pending") && cached.socket)
+        return cached;
       for (const socket of this.state.getWebSockets?.() ?? []) {
         const metadata = socketMetadata(socket);
         if (!metadata || metadata.socketId !== socketId) continue;
@@ -576,7 +664,9 @@ export function createActorNativeOwner(
           attachment: decodeAttachment(metadata.attachment),
           queued: [],
           queuedBytes: 0,
-          status: "live",
+          status: metadata.reservationBearer === undefined ? "live" : "transport-pending",
+          reservationBearer: metadata.reservationBearer,
+          reservationExpiresAt: metadata.reservationExpiresAt,
           socket,
         };
         this.sockets.set(socketId, record);
@@ -589,6 +679,12 @@ export function createActorNativeOwner(
         socketId: record.socketId,
         actorId: record.actorId,
         attachment: encodeAttachment(record.attachment),
+        ...(record.status === "transport-pending"
+          ? {
+              reservationBearer: record.reservationBearer,
+              reservationExpiresAt: record.reservationExpiresAt,
+            }
+          : {}),
       } satisfies SocketAttachment);
     }
     private discardProvisional(nonce: string, except?: string): void {
@@ -596,6 +692,121 @@ export function createActorNativeOwner(
         if (record.status === "provisional" && record.nonce === nonce && socketId !== except)
           this.sockets.delete(socketId);
       }
+    }
+    private discardPending(record: SocketRecord): void {
+      record.status = "closed";
+      this.sockets.delete(record.socketId);
+      this.requireStorage().sql.exec(
+        "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
+        record.socketId,
+      );
+      if (record.socket) {
+        this.suppressedCloses.add(record.socket);
+        try {
+          record.socket.close(1008, "upgrade not committed");
+        } catch {
+          /* The peer may already be gone. */
+        }
+      }
+    }
+    private async expirePending(): Promise<void> {
+      const rows = this.requireStorage().sql.exec(
+        "SELECT socket_id AS socketId FROM actor_socket_reservations WHERE expires_at <= ?",
+        SafeReflectApply(SafeNow, Date, []) as number,
+      );
+      const socketIds: string[] = [];
+      for (const row of rows) {
+        const socketId = row.socketId;
+        if (typeof socketId !== "string") throw new Error("Actor socket reservation state corrupt");
+        socketIds[socketIds.length] = socketId;
+      }
+      for (let index = 0; index < socketIds.length; index += 1) {
+        const socketId = socketIds[index] as string;
+        const record = this.liveSocket(socketId);
+        if (record?.status === "transport-pending") this.discardPending(record);
+        else
+          this.requireStorage().sql.exec(
+            "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
+            socketId,
+          );
+      }
+      await this.reconcile();
+    }
+    private reservationControl(request: Request): Promise<Response> {
+      const action = request.headers.get(RESERVATION_ACTION_HEADER);
+      const encodedId = request.headers.get(ID_HEADER);
+      const bearer = request.headers.get(RESERVATION_HEADER);
+      if (
+        request.method !== "POST" ||
+        (action !== "commit" && action !== "abandon") ||
+        !encodedId ||
+        !bearer ||
+        !/^[a-f0-9]{64}$/u.test(bearer)
+      )
+        return Promise.resolve(new Response(null, { status: 404 }));
+      let actorId: string;
+      try {
+        actorId = decodeURIComponent(encodedId);
+      } catch {
+        return Promise.resolve(new Response(null, { status: 404 }));
+      }
+      const turn = this.tail.then(async () => {
+        await this.ready;
+        if (this.poisoned) return new Response(null, { status: 503 });
+        const row = this.requireStorage()
+          .sql.exec(
+            "SELECT socket_id AS socketId, expires_at AS expiresAt FROM actor_socket_reservations WHERE actor_id = ? AND bearer = ?",
+            actorId,
+            bearer,
+          )
+          [Symbol.iterator]()
+          .next().value;
+        if (!row || typeof row.socketId !== "string" || !alarmTime(row.expiresAt))
+          return new Response(null, { status: 404 });
+        const record = this.liveSocket(row.socketId);
+        if (
+          record?.status !== "transport-pending" ||
+          record.actorId !== actorId ||
+          record.reservationBearer !== bearer ||
+          record.reservationExpiresAt !== row.expiresAt
+        )
+          return new Response(null, { status: 404 });
+        if (
+          (SafeReflectApply(SafeNow, Date, []) as number) >= row.expiresAt ||
+          action === "abandon"
+        ) {
+          this.discardPending(record);
+          await this.reconcile();
+          return new Response(null, { status: action === "abandon" ? 204 : 404 });
+        }
+        try {
+          this.requireStorage().sql.exec(
+            "DELETE FROM actor_socket_reservations WHERE socket_id = ? AND bearer = ?",
+            record.socketId,
+            bearer,
+          );
+          record.status = "live";
+          record.reservationBearer = undefined;
+          record.reservationExpiresAt = undefined;
+          this.persistSocket(record);
+          await this.reconcile();
+          for (let index = 0; index < record.queued.length; index += 1)
+            record.socket?.send(record.queued[index] as string | Uint8Array);
+          record.queued.length = 0;
+          record.queuedBytes = 0;
+        } catch {
+          this.discardPending(record);
+          await this.reconcile();
+          return new Response(null, { status: 503 });
+        }
+        return new Response(null, { status: 204 });
+      });
+      this.tail = turn.then(
+        () => {},
+        () => {},
+      );
+      this.state.waitUntil(this.tail);
+      return turn;
     }
     private async socketControl(request: Request): Promise<Response> {
       const action = request.headers.get(SOCKET_ACTION_HEADER);
@@ -698,6 +909,10 @@ export function createActorNativeOwner(
         return action === "get"
           ? Response.json({ exists: false })
           : new Response(null, { status: 404 });
+      if (record.status === "transport-pending")
+        return action === "get"
+          ? Response.json({ exists: false })
+          : new Response(null, { status: 404 });
       if (record.status === "provisional" && (active.kind !== "fetch" || record.nonce !== nonce))
         return new Response(null, { status: 404 });
       if (action === "get") return Response.json({ exists: record.status === "live" });
@@ -782,7 +997,16 @@ export function createActorNativeOwner(
       // native retry count is finite and a queued callback can itself expire.
       const queuedWake = this.control(async () => {
         const state = this.readAlarm();
-        if (state.obligation || (state.pending !== null && state.pending <= Date.now()))
+        const pending = this.requireStorage()
+          .sql.exec("SELECT MIN(expires_at) AS expiresAt FROM actor_socket_reservations")
+          [Symbol.iterator]()
+          .next().value;
+        const now = SafeReflectApply(SafeNow, Date, []) as number;
+        if (
+          state.obligation ||
+          (state.pending !== null && state.pending <= now) ||
+          (alarmTime(pending?.expiresAt) && pending.expiresAt <= now)
+        )
           await this.requireStorage().setAlarm(Date.now() + ALARM_WATCHDOG_MS);
         else await this.reconcile();
       });
@@ -790,6 +1014,7 @@ export function createActorNativeOwner(
       const turn = this.tail.then(async () => {
         await queuedWake;
         if (this.poisoned) throw new Error("Actor facet retirement failed");
+        await this.expirePending();
         const claimed = await this.control(async () => {
           const state = this.readAlarm();
           const now = Date.now();
@@ -884,16 +1109,9 @@ export function createActorNativeOwner(
           if (variantIndex < 0) throw new Error("Actor alarm admission denied");
           if (timer) clearTimeout(timer);
           timer = undefined;
-          const bindingName = `CLASS_${variantIndex}`;
-          if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
-            throw new Error("Actor alarm variant unavailable");
-          const selectedClass = this.env[bindingName];
-          const child = this.state.facets.get("actor", () => ({
-            class: selectedClass,
-            id: claimed,
-          }));
+          const child = await this.selectedChild(claimed, variantIndex);
           const request = new Request("http://actor.invalid/", {
-            headers: { [DELIVERY_HEADER]: deliveryToken },
+            headers: { [DELIVERY_HEADER]: deliveryForEvent() },
             signal: deadline.signal,
           });
           const response = await Promise.race([
@@ -1089,6 +1307,12 @@ export function createActorNativeOwner(
         const socketId = metadata.socketId;
         const actorId = metadata.actorId;
         if (event.kind === "close" && this.suppressedCloses.has(socket)) return;
+        if (metadata.reservationBearer !== undefined) {
+          const pending = this.liveSocket(socketId);
+          if (pending?.status === "transport-pending") this.discardPending(pending);
+          await this.reconcile();
+          return;
+        }
         let record = this.liveSocket(socketId);
         if (!record && event.kind === "close") {
           record = {
@@ -1111,13 +1335,7 @@ export function createActorNativeOwner(
         let completionError: unknown;
         try {
           admission = await this.socketAdmission(actorId);
-          const bindingName = `CLASS_${admission.variantIndex}`;
-          if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
-            throw new Error("Actor socket variant unavailable");
-          const child = this.state.facets.get("actor", () => ({
-            class: this.env[bindingName],
-            id: actorId,
-          }));
+          const child = await this.selectedChild(actorId, admission.variantIndex);
           const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
           const controller = new AbortController();
           const body =
@@ -1129,7 +1347,7 @@ export function createActorNativeOwner(
                   wasClean: event.wasClean,
                 });
           const headers = new SafeHeaders({
-            [DELIVERY_HEADER]: deliveryToken,
+            [DELIVERY_HEADER]: deliveryForEvent(),
             [SOCKET_ACTION_HEADER]:
               event.kind === "message" ? "callback-message" : "callback-close",
             [SOCKET_NONCE_HEADER]: nonce,
@@ -1259,6 +1477,7 @@ export function createActorNativeOwner(
     fetch(request: Request): Promise<Response> {
       if (request.headers.has(ALARM_ACTION_HEADER)) return this.alarmControl(request);
       if (request.headers.has(SOCKET_ACTION_HEADER)) return this.socketControl(request);
+      if (request.headers.has(RESERVATION_ACTION_HEADER)) return this.reservationControl(request);
       let resolve!: (response: Response) => void;
       let reject!: (error: unknown) => void;
       const head = new Promise<Response>((accept, refuse) => {
@@ -1299,6 +1518,9 @@ export function createActorNativeOwner(
           UPGRADE_NONCE_HEADER,
           UPGRADE_DECISION_HEADER,
           UPGRADE_SOCKET_ID_HEADER,
+          EVENT_SECRET_HEADER,
+          RESERVATION_HEADER,
+          RESERVATION_ACTION_HEADER,
         ])
           headers.delete(name);
         let childRequest: Request | undefined;
@@ -1307,16 +1529,12 @@ export function createActorNativeOwner(
         const headExpired = Symbol("actor-head-expired");
         let headTimer: ReturnType<typeof setTimeout> | undefined;
         const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
+        const eventDeliveryToken = deliveryForEvent();
         let upgrade: SocketRecord | undefined;
         try {
-          const bindingName = `CLASS_${variantIndex}`;
-          if (!SafeHasOwn(this.env, bindingName) || this.env[bindingName] === undefined)
-            throw new Error("Actor variant unavailable");
-          const child = this.state.facets.get("actor", () => ({
-            class: this.env[bindingName],
-            id,
-          }));
+          const child = await this.selectedChild(id, variantIndex);
           headers.set(UPGRADE_NONCE_HEADER, nonce);
+          if (deliveryToken === undefined) headers.set(EVENT_SECRET_HEADER, eventDeliveryToken);
           childRequest = withHeaders(
             request,
             headers,
@@ -1352,7 +1570,7 @@ export function createActorNativeOwner(
               proposed.nonce !== nonce ||
               proposed.protocol !== protocol ||
               !(await verifyUpgradeDecision(
-                deliveryToken,
+                eventDeliveryToken,
                 nonce,
                 encodedId,
                 socketId as string,
@@ -1463,25 +1681,53 @@ export function createActorNativeOwner(
             const pair = new NativeWebSocketPair();
             const client = pair[0];
             server = pair[1];
+            const bearer = randomBearer();
+            const expiresAt = (SafeReflectApply(SafeNow, Date, []) as number) + RESERVATION_MS;
+            const storage = this.requireStorage();
+            const actorAlarm = this.readAlarm();
+            const actorWake = actorAlarm.obligation ? actorAlarm.retryAt : actorAlarm.pending;
+            const otherPending = storage.sql
+              .exec("SELECT MIN(expires_at) AS expiresAt FROM actor_socket_reservations")
+              [Symbol.iterator]()
+              .next().value?.expiresAt;
+            const wake = SafeReflectApply(SafeMathMin, Math, [
+              expiresAt,
+              actorWake ?? expiresAt,
+              alarmTime(otherPending) ? otherPending : expiresAt,
+            ]) as number;
+            await storage.setAlarm(wake);
+            storage.sql.exec(
+              "INSERT INTO actor_socket_reservations (socket_id, actor_id, bearer, expires_at) VALUES (?, ?, ?, ?)",
+              upgrade.socketId,
+              id,
+              bearer,
+              expiresAt,
+            );
             this.state.acceptWebSocket(server);
             upgrade.socket = server;
-            upgrade.status = "live";
+            upgrade.status = "transport-pending";
+            upgrade.reservationBearer = bearer;
+            upgrade.reservationExpiresAt = expiresAt;
             this.persistSocket(upgrade);
-            for (const data of upgrade.queued) server.send(data);
-            upgrade.queued.length = 0;
-            upgrade.queuedBytes = 0;
+            await this.reconcile();
             resolve(
               new Response(null, {
                 status: 101,
                 webSocket: client,
-                headers: upgrade.protocol
-                  ? { "sec-websocket-protocol": upgrade.protocol }
-                  : undefined,
+                headers: {
+                  [RESERVATION_HEADER]: bearer,
+                  ...(upgrade.protocol ? { "sec-websocket-protocol": upgrade.protocol } : {}),
+                },
               } as ResponseInit & { webSocket: NativeActorWebSocket }),
             );
           } catch (error) {
             upgrade.status = "closed";
             this.sockets.delete(upgrade.socketId);
+            if (this.state.storage)
+              this.requireStorage().sql.exec(
+                "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
+                upgrade.socketId,
+              );
             try {
               server?.close(1011, "socket establishment failed");
             } catch {
@@ -1535,6 +1781,9 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
           UPGRADE_NONCE_HEADER,
           UPGRADE_DECISION_HEADER,
           UPGRADE_SOCKET_ID_HEADER,
+          EVENT_SECRET_HEADER,
+          RESERVATION_HEADER,
+          RESERVATION_ACTION_HEADER,
         ])
           headers.delete(name);
       } else {

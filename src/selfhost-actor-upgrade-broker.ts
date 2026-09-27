@@ -16,7 +16,8 @@ export interface SelfhostActorDuplexLease {
     readonly socketPath: string;
     readonly headers: Readonly<Record<string, string>>;
   };
-  commit(): Promise<void>;
+  commitTransport(bearer: string): Promise<void>;
+  abandonTransport(bearer: string): Promise<void>;
   abandon(): void;
 }
 
@@ -32,6 +33,9 @@ interface Pending {
   readonly client: Socket;
   readonly upstream: Socket;
   readonly lease: SelfhostActorDuplexLease;
+  readonly ownerBearer: string;
+  readonly clientTail: Buffer;
+  readonly upstreamTail: Buffer;
   readonly timer: ReturnType<typeof setTimeout>;
   state: "provisional" | "committing" | "committed" | "abandoned";
 }
@@ -130,7 +134,7 @@ export async function openSelfhostActorUpgradeBroker(
     clearTimeout(entry.timer);
     pending.delete(id);
     try {
-      entry.lease.abandon();
+      void entry.lease.abandonTransport(entry.ownerBearer).catch(() => entry.lease.abandon());
     } catch {
       /* The Host lease also expires independently. */
     } finally {
@@ -144,6 +148,7 @@ export async function openSelfhostActorUpgradeBroker(
     void (async () => {
       let lease: SelfhostActorDuplexLease | undefined;
       let id: string | undefined;
+      let ownerBearer: string | undefined;
       let counted = false;
       const callerAbort = new AbortController();
       client.once("close", () => callerAbort.abort(new Error("request_aborted")));
@@ -182,12 +187,18 @@ export async function openSelfhostActorUpgradeBroker(
           }
           record.state = "committing";
           try {
-            await record.lease.commit();
+            await record.lease.commitTransport(record.ownerBearer);
             if (record.client.destroyed || record.upstream.destroyed)
               throw new Error("Actor socket transport closed before commit");
             record.state = "committed";
             clearTimeout(record.timer);
             pending.delete(reservationId);
+            if (record.upstreamTail.length) record.client.write(record.upstreamTail);
+            if (record.clientTail.length) record.upstream.write(record.clientTail);
+            record.client.pipe(record.upstream);
+            record.upstream.pipe(record.client);
+            record.client.resume();
+            record.upstream.resume();
             reply(client, 204);
           } catch {
             record.state = "provisional";
@@ -258,6 +269,10 @@ export async function openSelfhostActorUpgradeBroker(
           upstreamHead.headers.has(RESERVATION_HEADER)
         )
           throw new Error("Actor broker upstream did not accept WebSocket");
+        ownerBearer = upstreamHead.headers.get("x-takoserver-private-actor-reservation");
+        if (!ownerBearer || !/^[a-f0-9]{64}$/u.test(ownerBearer))
+          throw new Error("Actor owner reservation unavailable");
+        upstreamHead.headers.delete("x-takoserver-private-actor-reservation");
         const selected = upstreamHead.headers.get("sec-websocket-protocol");
         if (
           selected &&
@@ -273,6 +288,9 @@ export async function openSelfhostActorUpgradeBroker(
           client,
           upstream,
           lease,
+          ownerBearer,
+          clientTail: incoming.tail,
+          upstreamTail: response.tail,
           timer: setTimeout(() => abandon(id as string), RESERVATION_MS),
           state: "provisional",
         };
@@ -280,17 +298,13 @@ export async function openSelfhostActorUpgradeBroker(
         client.once("close", () => abandon(id as string));
         upstream.once("close", () => abandon(id as string));
         client.write(writeHead(upstreamHead.first, upstreamHead.headers));
-        if (response.tail.length) client.write(response.tail);
-        if (incoming.tail.length) upstream.write(incoming.tail);
-        client.pipe(upstream);
-        upstream.pipe(client);
-        client.resume();
-        upstream.resume();
       } catch {
         if (id) abandon(id);
         else {
           try {
-            lease?.abandon();
+            if (lease && ownerBearer)
+              await lease.abandonTransport(ownerBearer).catch(() => lease?.abandon());
+            else lease?.abandon();
           } catch {
             /* Broker expiry and caller disconnect remain independent. */
           }
