@@ -169,6 +169,8 @@ export interface RuntimeInputRecoveryInput {
   readonly resourceUid: string;
   readonly target: RuntimeInputClaimTarget;
   readonly bindingNames: readonly string[];
+  /** Exact original handoff generation, persisted by the operation owner. */
+  readonly expectedGeneration?: string;
 }
 
 export interface RuntimeInputClaimInput extends RuntimeInputRecoveryInput {
@@ -180,7 +182,6 @@ export interface RuntimeInputClaimInput extends RuntimeInputRecoveryInput {
    */
   readonly publicApply: ProviderRuntimeInputPublicApply;
   readonly claimFence?: ProviderRuntimeInputSqlPredicate;
-  readonly expectedGeneration?: string;
 }
 
 export interface RuntimeInputClaim {
@@ -191,6 +192,7 @@ export interface RuntimeInputClaim {
   readonly workerResourceUid: string;
   readonly hostOperationId: string;
   readonly fence: number;
+  readonly leaseGeneration: string;
   readonly bindings: Readonly<Record<string, string>>;
 }
 
@@ -202,6 +204,7 @@ export interface RuntimeInputClaimIdentity {
   readonly claimOwner: string;
   readonly resourceUid: string;
   readonly fence: number;
+  readonly leaseGeneration: string;
 }
 
 export interface RuntimeInputConsumption extends RuntimeInputClaimIdentity {
@@ -338,6 +341,7 @@ export function createRuntimeInputAuthority(
     readonly reference: string;
     readonly target: RuntimeInputClaimTarget;
     readonly bindingNames: readonly string[];
+    readonly expectedGeneration?: string;
   }): RuntimeInputRecoveryInput => ({
     organizationId: input.organizationId,
     operationKey: input.reference,
@@ -345,6 +349,7 @@ export function createRuntimeInputAuthority(
     resourceUid: input.resourceUid,
     target: input.target,
     bindingNames: input.bindingNames,
+    ...(input.expectedGeneration ? { expectedGeneration: input.expectedGeneration } : {}),
   });
 
   return {
@@ -383,6 +388,7 @@ export function createRuntimeInputAuthority(
           claimOwner: input.operationId,
           resourceUid: input.resourceUid,
           fence: claim.fence,
+          leaseGeneration: claim.leaseGeneration,
         };
         return {
           bindings: claim.bindings,
@@ -537,11 +543,11 @@ export function createRuntimeInputPreparations(
           `INSERT INTO worker_runtime_input_preparations
              (organization_id, operation_key, preparation_id, apply_commitment,
               canonical_public_origin, binding_names_json,
-              sealed_payload, seal_nonce, seal_key_id,
+              sealed_payload, seal_nonce, seal_key_id, lease_generation,
               state, fence, host_operation_id, claim_owner, claim_expires_at,
               claimed_resource_uid, space, worker_name, worker_resource_uid, bundle_name,
               consumed_receipt_digest, expires_at, created_at, updated_at, consumed_at, revoked_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 1,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 1,
                    NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, ?, ?, NULL, NULL)`,
           [
             normalized.organizationId,
@@ -553,6 +559,7 @@ export function createRuntimeInputPreparations(
             sealed.ciphertext,
             sealed.nonce,
             sealed.keyId,
+            sealed.nonce,
             normalized.authorizedSpace,
             expiresAt,
             now,
@@ -583,6 +590,7 @@ export function createRuntimeInputPreparations(
         sealed_payload: sealed.ciphertext,
         seal_nonce: sealed.nonce,
         seal_key_id: sealed.keyId,
+        lease_generation: sealed.nonce,
         state: "prepared",
         fence: 1,
         host_operation_id: null,
@@ -626,7 +634,10 @@ export function createRuntimeInputPreparations(
     async pinPrepared(input) {
       const normalized = normalizeClaimInput(input);
       const executing = await executingApplyCommitment(input.publicApply);
-      const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      const row = await ensureLiveGeneration(
+        options.sql,
+        await readRow(options.sql, normalized.organizationId, normalized.operationKey),
+      );
       if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(row, normalized);
       assertExecutingApply(row, executing);
@@ -634,17 +645,24 @@ export function createRuntimeInputPreparations(
       if (row.state !== "prepared" || rowExpired(row, options.clock().getTime())) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
-      return validatedGeneration(row.seal_nonce);
+      return validatedGeneration(row.lease_generation);
     },
 
     async noEffectRevocation(input) {
       const normalized = normalizeClaimInput(input);
       const generation = validatedGeneration(input.generation);
-      const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
+      const row = await ensureLiveGeneration(
+        options.sql,
+        await readRow(options.sql, normalized.organizationId, normalized.operationKey),
+      );
       if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(row, normalized);
       assertPreparedSpace(row, normalized.target.space);
-      if (row.seal_nonce !== generation || (row.state !== "prepared" && row.state !== "claimed")) {
+      if (
+        row.lease_generation !== generation ||
+        row.seal_nonce !== generation ||
+        (row.state !== "prepared" && row.state !== "claimed")
+      ) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
       if (row.state === "claimed") assertClaimedTarget(row, normalized);
@@ -658,7 +676,7 @@ export function createRuntimeInputPreparations(
                   fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
                   updated_at = ?, revoked_at = ?
               WHERE organization_id = ? AND operation_key = ? AND preparation_id = ?
-                AND seal_nonce = ?
+                AND seal_nonce = ? AND lease_generation = ?
                 AND binding_names_json = ? AND (space IS NULL OR space = ?)
                 AND (
                   state = 'prepared'
@@ -671,6 +689,7 @@ export function createRuntimeInputPreparations(
           normalized.organizationId,
           normalized.operationKey,
           row.preparation_id,
+          generation,
           generation,
           JSON.stringify(normalized.bindingNames),
           normalized.target.space,
@@ -694,10 +713,9 @@ export function createRuntimeInputPreparations(
       // commitment names.
       const executing = await executingApplyCommitment(input.publicApply);
       const now = options.clock().getTime();
-      let candidate = await readRow(
+      let candidate = await ensureLiveGeneration(
         options.sql,
-        normalized.organizationId,
-        normalized.operationKey,
+        await readRow(options.sql, normalized.organizationId, normalized.operationKey),
       );
       if (!candidate) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(candidate, normalized);
@@ -705,7 +723,7 @@ export function createRuntimeInputPreparations(
       assertPreparedSpace(candidate, normalized.target.space);
       if (
         input.expectedGeneration !== undefined &&
-        candidate.seal_nonce !== validatedGeneration(input.expectedGeneration)
+        candidate.lease_generation !== validatedGeneration(input.expectedGeneration)
       ) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
@@ -719,6 +737,10 @@ export function createRuntimeInputPreparations(
         await expireExact(options.sql, candidate, now);
         throw new RuntimeInputPreparationError("conflict", 409);
       }
+      if (candidate.lease_generation !== candidate.seal_nonce) {
+        throw new RuntimeInputPreparationError("backend_unavailable", 503);
+      }
+      const claimGeneration = validatedGeneration(candidate.lease_generation);
       if (candidate.state === "claimed") {
         assertClaimedTarget(candidate, normalized);
         await assertLeaseFence(options.sql, input.claimFence);
@@ -743,7 +765,8 @@ export function createRuntimeInputPreparations(
                claimed_resource_uid = ?, space = ?, worker_name = ?,
                worker_resource_uid = ?, bundle_name = ?, updated_at = ?
            WHERE organization_id = ? AND operation_key = ? AND state = 'prepared'
-             AND fence = ? AND seal_nonce = ? AND expires_at > ? AND apply_commitment = ?
+             AND fence = ? AND seal_nonce = ? AND lease_generation = ?
+             AND expires_at > ? AND apply_commitment = ?
              AND (space IS NULL OR space = ?)
              AND (${claimFence.sql})
              AND EXISTS (
@@ -764,6 +787,7 @@ export function createRuntimeInputPreparations(
             normalized.operationKey,
             candidate.fence,
             candidate.seal_nonce,
+            candidate.lease_generation,
             now,
             executing,
             normalized.target.space,
@@ -780,8 +804,8 @@ export function createRuntimeInputPreparations(
       assertNames(candidate, normalized);
       assertExecutingApply(candidate, executing);
       if (
-        input.expectedGeneration !== undefined &&
-        candidate.seal_nonce !== input.expectedGeneration
+        candidate.lease_generation !== candidate.seal_nonce ||
+        candidate.lease_generation !== claimGeneration
       ) {
         throw new RuntimeInputPreparationError("conflict", 409);
       }
@@ -807,13 +831,16 @@ export function createRuntimeInputPreparations(
                fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
                updated_at = ?, revoked_at = ?
            WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed'
-             AND fence = ? AND claim_owner = ? AND claimed_resource_uid = ?`,
+             AND fence = ? AND lease_generation = ? AND seal_nonce = ?
+             AND claim_owner = ? AND claimed_resource_uid = ?`,
           [
             now,
             now,
             input.organizationId,
             input.preparationId,
             input.fence,
+            input.leaseGeneration,
+            input.leaseGeneration,
             input.claimOwner,
             input.resourceUid,
           ],
@@ -827,6 +854,7 @@ export function createRuntimeInputPreparations(
       if (
         row.state === "revoked" &&
         row.fence === input.fence + 1 &&
+        row.lease_generation === input.leaseGeneration &&
         row.host_operation_id === input.claimOwner &&
         row.claimed_resource_uid === input.resourceUid &&
         row.sealed_payload === null &&
@@ -848,7 +876,8 @@ export function createRuntimeInputPreparations(
            SET state = 'dispatched', sealed_payload = NULL, seal_nonce = NULL, seal_key_id = NULL,
                fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
            WHERE organization_id = ? AND preparation_id = ? AND state = 'claimed'
-             AND fence = ? AND claim_owner = ? AND claimed_resource_uid = ?
+             AND fence = ? AND lease_generation = ? AND seal_nonce = ?
+             AND claim_owner = ? AND claimed_resource_uid = ?
              AND claim_expires_at > ?
              AND (${fence.sql})
              AND EXISTS (
@@ -876,6 +905,8 @@ export function createRuntimeInputPreparations(
             input.organizationId,
             input.preparationId,
             input.fence,
+            input.leaseGeneration,
+            input.leaseGeneration,
             input.claimOwner,
             input.resourceUid,
             now,
@@ -894,6 +925,7 @@ export function createRuntimeInputPreparations(
       if (
         row.state === "dispatched" &&
         row.fence === input.fence + 1 &&
+        row.lease_generation === input.leaseGeneration &&
         row.claimed_resource_uid === input.resourceUid &&
         row.host_operation_id === input.claimOwner
       ) {
@@ -929,15 +961,20 @@ export function createRuntimeInputPreparations(
         claimOwner: normalized.claimOwner,
         resourceUid: normalized.resourceUid,
         fence: row.fence,
+        leaseGeneration: validatedGeneration(row.lease_generation),
         receiptDigest: input.receiptDigest,
       });
     },
 
     async abandon(input) {
       const normalized = normalizeClaimInput(input);
+      const generation = requiredRecoveryGeneration(normalized);
       const row = await readRow(options.sql, normalized.organizationId, normalized.operationKey);
       if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
       assertNames(row, normalized);
+      if (row.lease_generation !== generation) {
+        throw new RuntimeInputPreparationError("conflict", 409);
+      }
       if (row.state === "revoked") {
         if (
           row.host_operation_id === normalized.claimOwner &&
@@ -965,6 +1002,7 @@ export function createRuntimeInputPreparations(
              fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
              updated_at = ?, revoked_at = ?
          WHERE organization_id = ? AND preparation_id = ? AND fence = ?
+           AND lease_generation = ?
            AND claimed_resource_uid = ? AND host_operation_id = ?
            AND state IN ('claimed', 'dispatched')`,
         [
@@ -973,6 +1011,7 @@ export function createRuntimeInputPreparations(
           normalized.organizationId,
           row.preparation_id,
           row.fence,
+          generation,
           normalized.resourceUid,
           normalized.claimOwner,
         ],
@@ -985,6 +1024,7 @@ export function createRuntimeInputPreparations(
       );
       if (
         observed?.state === "revoked" &&
+        observed.lease_generation === generation &&
         observed.host_operation_id === normalized.claimOwner &&
         observed.claimed_resource_uid === normalized.resourceUid
       ) {
@@ -1070,7 +1110,8 @@ async function consumeDispatched(
            fence = fence + 1, claim_owner = NULL, claim_expires_at = NULL,
            consumed_receipt_digest = ?, consumed_at = ?, updated_at = ?
        WHERE organization_id = ? AND preparation_id = ? AND state = 'dispatched'
-         AND fence = ? AND host_operation_id = ? AND claimed_resource_uid = ?`,
+         AND fence = ? AND lease_generation = ?
+         AND host_operation_id = ? AND claimed_resource_uid = ?`,
       [
         input.receiptDigest,
         now,
@@ -1078,6 +1119,7 @@ async function consumeDispatched(
         input.organizationId,
         input.preparationId,
         input.fence,
+        input.leaseGeneration,
         input.claimOwner,
         input.resourceUid,
       ],
@@ -1090,6 +1132,7 @@ async function consumeDispatched(
   if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
   if (
     row.state === "consumed" &&
+    row.lease_generation === input.leaseGeneration &&
     row.claimed_resource_uid === input.resourceUid &&
     row.host_operation_id === input.claimOwner &&
     row.consumed_receipt_digest === input.receiptDigest
@@ -1120,6 +1163,7 @@ type PreparationRow = Row & {
   readonly sealed_payload: string | null;
   readonly seal_nonce: string | null;
   readonly seal_key_id: string | null;
+  readonly lease_generation: string | null;
   readonly state:
     | "prepared"
     | "claimed"
@@ -1143,7 +1187,7 @@ type PreparationRow = Row & {
 
 const ROW_COLUMNS = `organization_id, operation_key, preparation_id, apply_commitment,
             canonical_public_origin, binding_names_json,
-            sealed_payload, seal_nonce, seal_key_id, state, fence,
+            sealed_payload, seal_nonce, seal_key_id, lease_generation, state, fence,
             host_operation_id, claim_owner, claim_expires_at, claimed_resource_uid,
             space, worker_name, worker_resource_uid, bundle_name,
             consumed_receipt_digest, expires_at`;
@@ -1176,6 +1220,47 @@ async function readByPreparationId(
   return rows.length === 0 ? null : (rows[0] as PreparationRow);
 }
 
+/**
+ * During an additive rollout the old writer may prepare a row after 0065 is
+ * applied but before the new code starts. Its live nonce still proves the
+ * generation; copy it with an exact-row CAS before issuing a lease. Terminal
+ * rows have erased the nonce and can never be backfilled by inference.
+ */
+async function ensureLiveGeneration(
+  sql: Sql,
+  row: PreparationRow | null,
+): Promise<PreparationRow | null> {
+  if (!row || (row.state !== "prepared" && row.state !== "claimed")) return row;
+  if (!row.seal_nonce) throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  if (row.lease_generation === row.seal_nonce) return row;
+  if (row.lease_generation !== null) {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  try {
+    await sql.run(
+      `UPDATE worker_runtime_input_preparations
+       SET lease_generation = seal_nonce
+       WHERE organization_id = ? AND operation_key = ? AND preparation_id = ?
+         AND state = ? AND fence = ? AND seal_nonce = ? AND lease_generation IS NULL`,
+      [
+        row.organization_id,
+        row.operation_key,
+        row.preparation_id,
+        row.state,
+        row.fence,
+        row.seal_nonce,
+      ],
+    );
+  } catch {
+    throw new RuntimeInputPreparationError("backend_unavailable", 503);
+  }
+  const observed = await readRow(sql, row.organization_id, row.operation_key);
+  if (!observed || observed.lease_generation !== row.seal_nonce) {
+    throw new RuntimeInputPreparationError("conflict", 409);
+  }
+  return observed;
+}
+
 interface NormalizedClaimInput extends RuntimeInputRecoveryInput {
   readonly bindingNames: readonly string[];
 }
@@ -1188,6 +1273,7 @@ function validateClaimIdentity(input: RuntimeInputClaimIdentity): void {
   if (!Number.isSafeInteger(input.fence) || input.fence < 1) {
     throw new RuntimeInputPreparationError("invalid_argument", 400);
   }
+  validatedGeneration(input.leaseGeneration);
 }
 
 function normalizeClaimInput(input: RuntimeInputRecoveryInput): NormalizedClaimInput {
@@ -1223,12 +1309,23 @@ function validatedLeaseFence(
 }
 
 function validatedGeneration(value: string | null): string {
-  // The sealing nonce is random, row-scoped, public-safe, and retained for the
-  // entire pre-dispatch lifetime. It is erased with ciphertext on closure.
+  // The random sealing nonce is a value-free row identity. The original nonce
+  // is erased with ciphertext on closure, while its separately persisted
+  // generation remains available for exact terminal readback.
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{16}$/u.test(value)) {
     throw new RuntimeInputPreparationError("backend_unavailable", 503);
   }
   return value;
+}
+
+function requiredRecoveryGeneration(input: RuntimeInputRecoveryInput): string {
+  // A stale caller and a replacement can share operationKey, preparationId,
+  // owner, Resource UID and integer fence. Native readback without the
+  // originally pinned generation is not an exact recovery proof.
+  if (!input.expectedGeneration) {
+    throw new RuntimeInputPreparationError("conflict", 409);
+  }
+  return validatedGeneration(input.expectedGeneration);
 }
 
 async function assertLeaseFence(
@@ -1334,11 +1431,13 @@ function assertClaimedTarget(row: PreparationRow, input: NormalizedClaimInput): 
 }
 
 async function readRecoveryRow(sql: Sql, input: NormalizedClaimInput): Promise<PreparationRow> {
+  const generation = requiredRecoveryGeneration(input);
   const row = await readRow(sql, input.organizationId, input.operationKey);
   if (!row) throw new RuntimeInputPreparationError("operation_not_found", 404);
   assertNames(row, input);
   if (
     (row.state !== "dispatched" && row.state !== "consumed") ||
+    row.lease_generation !== generation ||
     row.host_operation_id !== input.claimOwner ||
     row.claimed_resource_uid !== input.resourceUid ||
     row.space !== input.target.space ||
@@ -1363,6 +1462,7 @@ function recoveryIdentity(row: PreparationRow): RuntimeInputRecoveryIdentity {
     workerResourceUid: row.worker_resource_uid,
     hostOperationId: row.host_operation_id,
     fence: row.fence,
+    leaseGeneration: validatedGeneration(row.lease_generation),
   };
 }
 
@@ -1371,6 +1471,7 @@ function preparationIdentity(
 ): ProviderRuntimeInputPreparationIdentity {
   return {
     preparationId: claim.preparationId,
+    generation: claim.leaseGeneration,
     operationKey: claim.operationKey,
     workerResourceUid: claim.workerResourceUid,
     canonicalPublicOrigin: claim.canonicalPublicOrigin,
@@ -1498,6 +1599,7 @@ async function decryptClaim(
     row.state !== "claimed" ||
     !row.sealed_payload ||
     !row.seal_nonce ||
+    row.lease_generation !== row.seal_nonce ||
     !row.seal_key_id ||
     !row.host_operation_id ||
     !row.worker_resource_uid ||
@@ -1533,6 +1635,7 @@ async function decryptClaim(
     workerResourceUid: row.worker_resource_uid,
     hostOperationId: row.host_operation_id,
     fence: row.fence,
+    leaseGeneration: validatedGeneration(row.lease_generation),
     bindings: parseSealedPayload(row, plaintext),
   };
 }

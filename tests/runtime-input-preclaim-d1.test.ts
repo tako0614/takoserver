@@ -127,6 +127,15 @@ test("native D1 serializes preclaim closure against a same-key runtime-input cla
       publicApply: { method: "PUT", path: PATH, fences: { ifNoneMatch: "*" }, body: BODY },
       bindings: { SECRET_VALUE: "a-new-value" },
     });
+    const next = await pin(input);
+    const nextLease = await authority.leases.acquire({
+      ...input,
+      expectedGeneration: next.generation,
+    });
+    await nextLease.dispatch();
+    await expect(lease.dispatch({ sql: "EXISTS (SELECT 1)", params: [] })).rejects.toMatchObject({
+      code: "conflict",
+    });
     await expect(authority.leases.acquire(guarded)).rejects.toMatchObject({ code: "conflict" });
     await expect(
       authority.leases.acquire({ ...input, leaseFence: guarded.leaseFence }),
@@ -134,7 +143,7 @@ test("native D1 serializes preclaim closure against a same-key runtime-input cla
       code: "conflict",
     });
     expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
-      "prepared",
+      "dispatched",
     );
   } finally {
     await runtime.dispose();

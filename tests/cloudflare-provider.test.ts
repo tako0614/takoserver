@@ -77,6 +77,7 @@ const SENSITIVE_PUBLIC_APPLY = {
 } as const;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
+  generation: "abcdefghijklmnop",
   operationKey: SENSITIVE_OPERATION_KEY,
   workerResourceUid: "worker-uid",
   canonicalPublicOrigin: "https://api.takoserver.test",

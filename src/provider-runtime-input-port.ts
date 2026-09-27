@@ -85,12 +85,14 @@ export interface ProviderRuntimeInputNoEffectInput extends ProviderRuntimeInputR
  */
 export type ProviderRuntimeInputRecoveryInput = Omit<
   ProviderRuntimeInputAcquireInput,
-  "publicApply"
+  "publicApply" | "leaseFence"
 >;
 
 /** Value-free identity bound to the exact encrypted preparation. */
 export interface ProviderRuntimeInputPreparationIdentity {
   readonly preparationId: string;
+  /** Opaque original preparation generation retained through dispatch/settle. */
+  readonly generation: string;
   /** The exact operation key both the private handoff and the public apply carry. */
   readonly operationKey: string;
   readonly workerResourceUid: string;

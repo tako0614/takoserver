@@ -280,6 +280,7 @@ function fakeLeases(dataRoot: () => string): {
   };
   const preparation = {
     preparationId: "prep-selfhost",
+    generation: "abcdefghijklmnop",
     operationKey: SENSITIVE_OPERATION_KEY,
     workerResourceUid: "uid-ModuleWorker-hello",
     canonicalPublicOrigin: "https://api.takoserver.test",

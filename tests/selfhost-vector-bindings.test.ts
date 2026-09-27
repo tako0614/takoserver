@@ -335,6 +335,7 @@ function patchDeployment(
 
 function recoveryInputs(events: string[]): ProviderRuntimeInputLeasePort {
   const preparation = {
+    generation: "abcdefghijklmnop",
     preparationId: "preparation-vector",
     operationKey: "runtime-key",
     workerResourceUid: WORKER_ID.uid,
