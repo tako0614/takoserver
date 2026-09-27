@@ -37,7 +37,25 @@ export default {async fetch(request, env) {
   if (path === "/health") return new Response("ok");
   if (path === "/fake") return Object.freeze(Object.create(null));
   if (path === "/replay") return escaped;
+  if (path === "/forge") {
+    const headers = new Headers(request.headers);
+    headers.set("upgrade", "websocket");
+    const forged = new Request(request, {headers});
+    try { await env.ACTOR.fetch(forged); return new Response("accepted", {status:500}); }
+    catch (error) { return new Response(String(error.message), {status:409}); }
+  }
+  if (path === "/direct") {
+    const pair = new WebSocketPair();
+    pair[1].accept();
+    return new Response(null, {status:101, webSocket:pair[0]});
+  }
   const upgrade = await env.ACTOR.fetch(request);
+  if (path === "/late") { await new Promise(resolve => setTimeout(resolve, 100)); return upgrade; }
+  if (path === "/direct-after-reservation") {
+    const pair = new WebSocketPair();
+    pair[1].accept();
+    return new Response(null, {status:101, webSocket:pair[0]});
+  }
   if (path === "/inspect") {
     let hostImport = "blocked";
     try { await import("./wrapper.mjs"); hostImport = "allowed"; } catch {}
@@ -54,34 +72,37 @@ export default {async fetch(request, env) {
   return upgrade;
 }};`;
 
-const WRAPPER = `import application from "./application.mjs";
+const WRAPPER = `import { createActorUpgradeHandoff } from "./handoff.mjs";
+import application from "./application.mjs";
 const NativeResponse = Response;
-const NativeHeadersGet = Headers.prototype.get;
 export default {async fetch(request, env) {
-  const slots = new WeakMap();
-  let live = true;
-  const projected = Object.freeze({ACTOR:Object.freeze({
-    async fetch(input) {
-      if (!live) throw new Error("invocation_closed");
+  const handoff = createActorUpgradeHandoff(request, {
+    async open(input, ingress) {
+      if (ingress.method !== "GET" || ingress.upgrade?.toLowerCase() !== "websocket")
+        throw new Error("invalid_ingress");
+      if (new URL(input.url).pathname === "/valid" &&
+          (ingress.version !== "13" || !ingress.key ||
+           !ingress.connection?.toLowerCase().split(",").some(x => x.trim() === "upgrade")))
+        throw new Error("missing_client_handshake");
       const native = await env.ACTOR.fetch(input);
       if (native.status !== 101 || !native.webSocket) throw new Error("broker_unavailable");
-      const opaque = Object.freeze(Object.create(null));
-      slots.set(opaque, native);
-      return opaque;
+      const socket = native.webSocket;
+      return {
+        response:native,
+        commit() {},
+        abandon() {
+          try { socket.accept(); socket.close(1001, "abandoned"); } catch {}
+        }
+      };
     }
-  })});
+  }, new URL(request.url).pathname === "/late" ? 30 : 30000);
   let result;
-  try { result = await application.fetch(request, projected); }
-  catch { live = false; return new NativeResponse(null, {status:500}); }
-  live = false;
-  if (slots.has(result)) {
-    const native = slots.get(result);
-    slots.delete(result);
-    if (request.signal.aborted) return new NativeResponse(null, {status:499});
-    return native;
+  try { result = await application.fetch(request, Object.freeze({ACTOR:handoff.actor})); }
+  catch {
+    await handoff.abandon();
+    return new NativeResponse(null, {status:500});
   }
-  if (!(result instanceof NativeResponse)) return new NativeResponse(null, {status:422});
-  return result;
+  return handoff.finish(result);
 }};`;
 
 function actorConfig(root: string, socket: string): string {
@@ -112,6 +133,7 @@ const config :Workerd.Config = (
  services = [
   (name = "public", worker = (
    modules = [(name = "wrapper.mjs", esModule = embed "wrapper.mjs", role = hostPrivate),
+    (name = "handoff.mjs", esModule = embed "handoff.mjs", role = hostPrivate),
     (name = "application.mjs", esModule = embed "application.mjs", role = application)],
    modulePolicy = (applicationMain = "application.mjs"),
    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"],
@@ -148,6 +170,15 @@ test.skipIf(binary === undefined)(
       await writeFile(join(actorRoot, "child.mjs"), CHILD);
       await writeFile(join(publicRoot, "wrapper.mjs"), WRAPPER);
       await writeFile(join(publicRoot, "application.mjs"), APPLICATION);
+      const helper = await Bun.build({
+        entrypoints: [join(import.meta.dir, "../src/actor-upgrade-handoff.ts")],
+        target: "browser",
+        format: "esm",
+        minify: false,
+      });
+      if (!helper.success || !helper.outputs[0])
+        throw new Error("Actor handoff helper build failed");
+      await writeFile(join(publicRoot, "handoff.mjs"), await helper.outputs[0].text());
       const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
       const port = reserved.port;
       reserved.stop(true);
@@ -194,11 +225,22 @@ test.skipIf(binary === undefined)(
         envKeys: ["ACTOR"],
         hostImport: "blocked",
       });
-      expect((await fetch(`${origin}/fake`)).status).toBe(422);
+      expect((await fetch(`${origin}/fake`)).status).toBe(503);
+      const forged = await fetch(`${origin}/forge`);
+      expect(forged.status).toBe(409);
+      expect(await forged.text()).toBe("invalid_upgrade");
+      expect((await fetch(`${origin}/direct`)).status).toBe(503);
+      expect(
+        (await fetch(`${origin}/direct-after-reservation`, { headers: { upgrade: "websocket" } }))
+          .status,
+      ).toBe(503);
       expect((await fetch(`${origin}/hold`, { headers: { upgrade: "websocket" } })).status).toBe(
         200,
       );
-      expect((await fetch(`${origin}/replay`)).status).toBe(422);
+      expect((await fetch(`${origin}/replay`)).status).toBe(503);
+      expect((await fetch(`${origin}/late`, { headers: { upgrade: "websocket" } })).status).toBe(
+        503,
+      );
       const ws = new WebSocket(`${origin.replace(/^http:/u, "ws:")}/valid`);
       const echoed = await new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("socket response timeout")), 3000);
