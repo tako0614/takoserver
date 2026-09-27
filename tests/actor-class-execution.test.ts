@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import type { ActorUpgrade } from "../src/actor-class-execution.ts";
 import {
   ActorExecutionError,
   ActorRuntimeError,
@@ -558,6 +559,75 @@ describe("private Actor ordinary-class execution seam", () => {
     );
     expect(result).toBe(opaqueResponse);
     expect(await result?.text()).toBe("opaque");
+  });
+
+  test("passes through only Host-validated opaque Actor upgrades", async () => {
+    const upgrade = Object.freeze({ outcome: "opaque" }) as unknown as ActorUpgrade;
+    const accepted = new WeakSet<object>([upgrade]);
+    class Actor {
+      fetch() {
+        return upgrade;
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+      isUpgrade(value): value is ActorUpgrade {
+        return typeof value === "object" && value !== null && accepted.has(value);
+      },
+    });
+    const result = await execution.dispatch(
+      { kind: "fetch", request: new Request("https://actor.invalid/") },
+      turn(),
+    );
+    expect(result).toBe(upgrade);
+  });
+
+  test("rejects a structural upgrade lookalike when the Host validator refuses it", async () => {
+    const fake = Object.freeze({ outcome: "opaque" });
+    class Actor {
+      fetch() {
+        return fake;
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+      isUpgrade: () => false,
+    });
+    const result = await execution.dispatch(
+      { kind: "fetch", request: new Request("https://actor.invalid/") },
+      turn(),
+    );
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response | undefined)?.status).toBe(500);
+  });
+
+  test("keeps fetch Response-only when no upgrade validator is supplied", async () => {
+    class Actor {
+      fetch() {
+        return Object.freeze({ outcome: "opaque" });
+      }
+    }
+    completePrototype(Actor);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+    const result = await execution.dispatch(
+      { kind: "fetch", request: new Request("https://actor.invalid/") },
+      turn(),
+    );
+    expect(result).toBeInstanceOf(Response);
+    expect(result?.status).toBe(500);
   });
 
   test("context and turn are closed Host-created values", () => {

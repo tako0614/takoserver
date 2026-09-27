@@ -4,6 +4,8 @@ import {
   createActorNativeAlarmPort,
   createActorNativeIngress,
   createActorNativeOwner,
+  createActorNativeSocketPort,
+  signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
 
 function fixture(fetch: (request: Request) => Promise<Response>) {
@@ -59,6 +61,324 @@ test("native owner refuses an unreserved WebSocket 101 and still admits the next
   await expect(f.owner.fetch(f.request())).rejects.toThrow("Actor socket reservation unavailable");
   expect(await (await f.owner.fetch(f.request())).text()).toBe("ordinary");
   await Promise.all(f.retained);
+});
+
+test("native socket decision is invocation-bound and retires the child before attempting transport", async () => {
+  const deliveryToken = "a".repeat(64);
+  const secret = "b".repeat(64);
+  const actorId = "socket/日本語";
+  const encodedId = encodeURIComponent(actorId);
+  const retained: Promise<unknown>[] = [];
+  const order: string[] = [];
+  const ingress = createActorNativeIngress("ordinary-token", secret);
+  let owner!: InstanceType<ReturnType<typeof createActorNativeOwner>>;
+  const service = {
+    fetch(request: Request) {
+      return ingress.fetch(request, {
+        NAMESPACE: {
+          idFromName: (name) => name,
+          get: () => ({ fetch: (inner) => owner.fetch(inner) }),
+        },
+      });
+    },
+  };
+  const Owner = createActorNativeOwner(deliveryToken, "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            order.push("child");
+            expect(request.headers.has("x-takoserver-private-actor-id")).toBe(false);
+            const nonce = request.headers.get("x-takoserver-private-actor-upgrade-nonce");
+            expect(nonce).toBeTruthy();
+            const port = createActorNativeSocketPort(service, secret, actorId, nonce as string);
+            const socketId = await port.accept("chat", new Uint8Array([1, 2]));
+            expect(await port.get(socketId)).toBe(false);
+            expect(await port.list()).toEqual([]);
+            await port.send(socketId, "hello");
+            await port.setAttachment(socketId, new Uint8Array([3, 4]));
+            expect(await port.getAttachment(socketId)).toEqual(new Uint8Array([3, 4]));
+            const decision = await signActorNativeUpgradeDecision(
+              deliveryToken,
+              nonce as string,
+              encodedId,
+              socketId,
+              "chat",
+            );
+            return new Response(null, {
+              status: 204,
+              headers: {
+                "x-takoserver-private-actor-upgrade-decision": decision,
+                "x-takoserver-private-actor-upgrade-socket-id": socketId,
+                "sec-websocket-protocol": "chat",
+              },
+            });
+          },
+        }),
+        abort() {
+          order.push("retire");
+        },
+      },
+      waitUntil(promise) {
+        retained.push(promise);
+      },
+    },
+    { CLASS: {}, CLASS_0: {} },
+  );
+  await expect(
+    owner.fetch(
+      new Request("http://actor.invalid/", {
+        headers: {
+          "x-takoserver-private-actor-id": encodedId,
+          "x-takoserver-private-actor-variant": "default",
+          upgrade: "websocket",
+          connection: "Upgrade",
+          "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+          "sec-websocket-version": "13",
+          "sec-websocket-protocol": "chat",
+        },
+      }),
+    ),
+  ).rejects.toThrow("Actor socket transport unavailable");
+  expect(order).toEqual(["child", "retire"]);
+  await Promise.all(retained);
+});
+
+test("native owner abandons a provisional socket when the facet returns an ordinary response", async () => {
+  const secret = "b".repeat(64);
+  const actorId = "abandoned";
+  const ingress = createActorNativeIngress("ordinary-token", secret);
+  let owner!: InstanceType<ReturnType<typeof createActorNativeOwner>>;
+  let socketId = "";
+  const service = {
+    fetch(request: Request) {
+      return ingress.fetch(request, {
+        NAMESPACE: {
+          idFromName: (name) => name,
+          get: () => ({ fetch: (inner) => owner.fetch(inner) }),
+        },
+      });
+    },
+  };
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            const nonce = request.headers.get("x-takoserver-private-actor-upgrade-nonce");
+            expect(nonce).toBeTruthy();
+            const port = createActorNativeSocketPort(service, secret, actorId, nonce as string);
+            socketId = await port.accept();
+            await port.send(socketId, "not delivered");
+            return new Response("ordinary", { status: 409 });
+          },
+        }),
+        abort() {},
+      },
+      waitUntil() {},
+    },
+    { CLASS: {}, CLASS_0: {} },
+  );
+  const result = await owner.fetch(
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+        "x-takoserver-private-actor-variant": "default",
+        upgrade: "websocket",
+        connection: "Upgrade",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+      },
+    }),
+  );
+  expect(result.status).toBe(409);
+  expect(await result.text()).toBe("ordinary");
+  expect(socketId).not.toBe("");
+  expect((owner as unknown as { sockets: Map<string, unknown> }).sockets.size).toBe(0);
+});
+
+test("native owner rejects a copied or forged socket decision", async () => {
+  let calls = 0;
+  const f = fixture(async () => {
+    if (calls++ === 0)
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "x-takoserver-private-actor-upgrade-decision": "0".repeat(64),
+          "x-takoserver-private-actor-upgrade-socket-id": crypto.randomUUID(),
+        },
+      });
+    return new Response("still available");
+  });
+  await expect(f.owner.fetch(f.request())).rejects.toThrow("Actor socket reservation unavailable");
+  expect(await (await f.owner.fetch(f.request())).text()).toBe("still available");
+  await Promise.all(f.retained);
+});
+
+test("private socket port preserves closed application error names", async () => {
+  let status = 400;
+  const port = createActorNativeSocketPort(
+    {
+      async fetch() {
+        return new Response(null, { status });
+      },
+    },
+    "b".repeat(64),
+    "id",
+    crypto.randomUUID(),
+  );
+  await expect(port.accept()).rejects.toMatchObject({
+    name: "invalid_upgrade",
+    code: "invalid_upgrade",
+  });
+  status = 429;
+  await expect(port.accept()).rejects.toMatchObject({
+    name: "socket_limit_exceeded",
+    code: "socket_limit_exceeded",
+  });
+  await expect(port.send("socket", "message")).rejects.toMatchObject({
+    name: "socket_overloaded",
+    code: "socket_overloaded",
+  });
+  status = 413;
+  await expect(port.send("socket", "message")).rejects.toMatchObject({
+    name: "message_too_large",
+    code: "message_too_large",
+  });
+  await expect(port.setAttachment("socket", new Uint8Array([1]))).rejects.toMatchObject({
+    name: "attachment_too_large",
+    code: "attachment_too_large",
+  });
+  status = 404;
+  await expect(port.send("socket", "message")).rejects.toMatchObject({
+    name: "socket_closed",
+    code: "socket_closed",
+  });
+  await expect(port.accept(undefined, new Uint8Array(8_193))).rejects.toMatchObject({
+    name: "attachment_too_large",
+    code: "attachment_too_large",
+  });
+});
+
+test("native socket callbacks independently re-admit weighted variants and retire each child", async () => {
+  const actorId = "socket-owner";
+  const socketId = "socket-1";
+  const classes = [{ label: "version-zero" }, { label: "version-one" }];
+  const selected: unknown[] = [];
+  const completions: string[] = [];
+  const callbacks: string[] = [];
+  const retained: Promise<unknown>[] = [];
+  let retired = 0;
+  let metadata = { socketId, actorId, attachment: null as string | null };
+  const sent: (string | ArrayBuffer)[] = [];
+  const socket = {
+    deserializeAttachment: () => metadata,
+    serializeAttachment: (value: typeof metadata) => {
+      metadata = value;
+    },
+    send: (value: string | ArrayBuffer) => {
+      sent.push(value);
+    },
+    close: () => {},
+  } as Parameters<InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]>[0];
+  const ingress = createActorNativeIngress("ordinary-token", "b".repeat(64));
+  let owner!: InstanceType<ReturnType<typeof createActorNativeOwner>>;
+  const service = {
+    fetch(request: Request) {
+      return ingress.fetch(request, {
+        NAMESPACE: {
+          idFromName: (name) => name,
+          get: () => ({ fetch: (inner) => owner.fetch(inner) }),
+        },
+      });
+    },
+  };
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["zero", "one"],
+  });
+  let nextVariant = 0;
+  owner = new Owner(
+    {
+      facets: {
+        get(_name, create) {
+          selected.push(create().class);
+          return {
+            async fetch(request) {
+              const action = request.headers.get("x-takoserver-private-actor-socket-action");
+              callbacks.push(action ?? "missing");
+              const nonce = request.headers.get("x-takoserver-private-actor-socket-nonce");
+              const port = createActorNativeSocketPort(
+                service,
+                "b".repeat(64),
+                actorId,
+                nonce as string,
+              );
+              expect(await port.get(socketId)).toBe(true);
+              if (action === "callback-message") {
+                expect(await request.text()).toBe("incoming");
+                await port.setAttachment(socketId, new Uint8Array([7, 8]));
+                await port.send(socketId, "outgoing");
+              } else {
+                expect(await port.getAttachment(socketId)).toEqual(new Uint8Array([7, 8]));
+              }
+              return new Response(null, { status: 204 });
+            },
+          };
+        },
+        abort() {
+          retired += 1;
+        },
+      },
+      getWebSockets: () => [socket],
+      waitUntil(promise) {
+        retained.push(promise);
+      },
+    },
+    {
+      CLASS: {},
+      CLASS_0: classes[0],
+      CLASS_1: classes[1],
+      ADMISSION: {
+        async fetch(request) {
+          const body = (await request.json()) as Record<string, unknown>;
+          if (body.action === "socket-complete") {
+            completions.push(body.attemptNonce as string);
+            return new Response(null, { status: 204 });
+          }
+          expect(body.action).toBe("socket");
+          return Response.json({
+            id: actorId,
+            attemptNonce: body.attemptNonce,
+            generationKey: "d".repeat(64),
+            epoch: "epoch-1",
+            variantKey: nextVariant++ === 0 ? "zero" : "one",
+            leaseId: "lease",
+          });
+        },
+      },
+    },
+  );
+  await owner.webSocketMessage(socket, "incoming");
+  await owner.webSocketClose(socket, 1000, "done", true);
+  await owner.webSocketClose(socket, 1000, "duplicate", true);
+  expect(selected).toEqual(classes);
+  expect(callbacks).toEqual(["callback-message", "callback-close"]);
+  expect(sent).toEqual(["outgoing"]);
+  expect(retired).toBe(2);
+  expect(completions).toHaveLength(2);
+  await Promise.all(retained);
 });
 
 test("native per-ID owner holds next turn until body cancellation reaches the application stream", async () => {
@@ -160,7 +480,11 @@ test("private ingress and owner remove hop headers while retaining a streamed re
   const f = fixture(async (request) =>
     Response.json({
       body: await request.text(),
-      headers: [...request.headers],
+      // The Host-private child shim consumes this nonce before app dispatch.
+      privateNoncePresent: request.headers.has("x-takoserver-private-actor-upgrade-nonce"),
+      headers: [...request.headers].filter(
+        ([name]) => name !== "x-takoserver-private-actor-upgrade-nonce",
+      ),
     }),
   );
   const ingress = createActorNativeIngress("private-token");
@@ -191,7 +515,11 @@ test("private ingress and owner remove hop headers while retaining a streamed re
       },
     },
   );
-  expect(await response.json()).toEqual({ body: "payload", headers: [] });
+  expect(await response.json()).toEqual({
+    body: "payload",
+    privateNoncePresent: true,
+    headers: [],
+  });
   await Promise.all(f.retained);
 });
 

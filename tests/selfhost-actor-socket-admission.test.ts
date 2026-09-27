@@ -22,6 +22,11 @@ mock.module("../src/selfhost-actor-native-process.ts", () => ({
     });
     return {
       epoch: "test-epoch",
+      actorProxySocketPath: "/tmp/unused-actor-upgrade.sock",
+      duplexTarget: (id, variantKey) => ({
+        socketPath: "/tmp/unused-actor-upgrade.sock",
+        headers: { "x-test-id": id, "x-test-variant": variantKey },
+      }),
       exited,
       fetch: async (_id, _request, variantKey) => Response.json({ variantKey }),
       enableAlarmAdmission() {},
@@ -171,6 +176,70 @@ test("socket admission freshly selects a Version in its namespace and owns a dis
     await closing;
   } finally {
     if (leaseId) opened[0]?.completeSocket(leaseId);
+    await owner.close();
+    f.database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("duplex target lease is selected under live authority and fenced again at commit", async () => {
+  opened.length = 0;
+  const root = await mkdtemp(join(tmpdir(), "actor-duplex-authority-"));
+  const f = fixture();
+  let graphPresent = true;
+  await f.deployments.create({
+    tenantId: scope.tenantId,
+    id: "deployment-worker",
+    resourceUid: f.target.metadata.uid,
+    offeringId: "worker-local",
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+    nativeId: "selfhost-worker:worker:operation-1",
+    state: "active",
+    observed: {},
+    outputs: { scriptName: "worker" },
+  });
+  const runtime = createWorkerdRuntime({ root: join(root, "runtime"), isReady: () => true });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("worker", publication(f.target.metadata.uid));
+  const owner = createSelfhostActorExecutionHost({
+    runtimeRoot: join(root, "runtime"),
+    storageRoot: join(root, "storage"),
+    binary: "/mock-workerd",
+    graph: (identity, signal) => (graphPresent ? f.read(identity, signal) : Promise.resolve(null)),
+    deployments: f.deployments,
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+    basisPoint: () => 9_999,
+  });
+  const ingress = () =>
+    new Request("http://example.invalid/socket", {
+      headers: {
+        upgrade: "websocket",
+        connection: "keep-alive, Upgrade",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+      },
+    });
+  try {
+    await expect(
+      owner.reserveDuplex({ ...scope, id: "actor-a" }, new Request("http://example.invalid/")),
+    ).rejects.toThrow("invalid_upgrade");
+    expect(opened).toHaveLength(0);
+
+    const first = await owner.reserveDuplex({ ...scope, id: "actor-a" }, ingress());
+    expect(first.target.socketPath).toBe("/tmp/unused-actor-upgrade.sock");
+    expect(first.target.headers["x-test-id"]).toBe("actor-a");
+    expect(first.target.headers["x-test-variant"]).toBe(opened[0]?.graph.versions[1]?.variantKey);
+    await first.commit();
+    await expect(first.commit()).rejects.toThrow("expired");
+
+    const revoked = await owner.reserveDuplex({ ...scope, id: "actor-a" }, ingress());
+    graphPresent = false;
+    await expect(revoked.commit()).rejects.toThrow("authority changed");
+    revoked.abandon();
+    await expect(owner.reserveDuplex({ ...scope, id: "actor-a" }, ingress())).rejects.toThrow();
+  } finally {
     await owner.close();
     f.database.close();
     await rm(root, { recursive: true, force: true });

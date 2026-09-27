@@ -16,6 +16,9 @@ import {
 
 interface Session {
   readonly selection: string;
+  readonly resourceGraph: ActorResourceGraph;
+  readonly deploymentJson: string;
+  readonly script: string;
   readonly graph: WorkerdActiveActorGraph;
   readonly epoch: string;
   readonly process: WorkerdActorNamespace;
@@ -404,6 +407,9 @@ export function createSelfhostActorExecutionHost(options: {
         }
         const session: Session = {
           selection,
+          resourceGraph: graph,
+          deploymentJson: JSON.stringify(deployment),
+          script,
           graph: residentGraph,
           epoch: process.epoch,
           process,
@@ -654,6 +660,90 @@ export function createSelfhostActorExecutionHost(options: {
         });
       } catch (error) {
         releaseOnce();
+        throw error;
+      }
+    },
+    /**
+     * Host-private duplex lease. The caller must have attested that `request`
+     * came from the actual client upgrade ingress, not merely copied headers.
+     * No token, target or lease is projected to application code.
+     */
+    async reserveDuplex(
+      scope: ActorScope & { readonly id: string },
+      request: Request,
+    ): Promise<{
+      readonly target: ReturnType<WorkerdActorNamespace["duplexTarget"]>;
+      commit(): Promise<void>;
+      abandon(): void;
+    }> {
+      if (
+        request.method !== "GET" ||
+        request.headers.get("upgrade")?.toLowerCase() !== "websocket" ||
+        !request.headers
+          .get("connection")
+          ?.toLowerCase()
+          .split(",")
+          .some((part) => part.trim() === "upgrade") ||
+        !request.headers.get("sec-websocket-key") ||
+        request.headers.get("sec-websocket-version") !== "13"
+      )
+        throw new Error("invalid_upgrade");
+      if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
+      await ready;
+      const identity = { ...scope };
+      const acquired = await activate(identity, request.signal, true);
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        request.signal.removeEventListener("abort", finish);
+        release(acquired.session);
+      };
+      // This lease spans the Actor's bounded fetch plus the separate 30s
+      // outer handoff window; it must not expire before that handoff starts.
+      const timer = setTimeout(finish, 65_000);
+      request.signal.addEventListener("abort", finish, { once: true });
+      if (request.signal.aborted) {
+        finish();
+        throw new Error("request_aborted");
+      }
+      try {
+        const target = acquired.session.process.duplexTarget(identity.id, acquired.variantKey);
+        return Object.freeze({
+          target,
+          async commit(): Promise<void> {
+            if (settled) throw new Error("Actor socket reservation expired");
+            const session = acquired.session;
+            try {
+              const graphNow = await options.graph(identity, request.signal);
+              const deploymentNow = await options.deployments.active(
+                identity.tenantId,
+                session.resourceGraph.worker.uid,
+              );
+              const residentNow = await activeGraph(
+                session.script,
+                session.resourceGraph.worker.uid,
+              );
+              request.signal.throwIfAborted();
+              if (
+                stopped ||
+                session.dead ||
+                session.retiring ||
+                !sameGraph(session.resourceGraph, graphNow) ||
+                JSON.stringify(deploymentNow) !== session.deploymentJson ||
+                residentNow?.generationKey !== session.graph.generationKey ||
+                settled
+              )
+                throw new ActorAuthorityUnavailable("Actor authority changed before upgrade");
+            } finally {
+              finish();
+            }
+          },
+          abandon: finish,
+        });
+      } catch (error) {
+        finish();
         throw error;
       }
     },

@@ -4,4 +4,6 @@ export {
   createActorNativeAlarmPort,
   createActorNativeIngress,
   createActorNativeOwner,
+  createActorNativeSocketPort,
+  signActorNativeUpgradeDecision,
 } from "./actor-native-owner-worker.ts";

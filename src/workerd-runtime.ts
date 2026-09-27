@@ -2172,6 +2172,8 @@ export async function writeWorkerdPrivateExecution(options: {
     }[];
   };
   readonly runSocketPath: string;
+  /** Separate native duplex lane; the ordinary Bun/HTTP control lane stays unchanged. */
+  readonly actorProxySocketPath?: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
   readonly dataPlaneAddress?: string;
   /** Exact child-local guard listeners, not shared sockets or public endpoints. */
@@ -2215,6 +2217,19 @@ export async function writeWorkerdPrivateExecution(options: {
     servicePaths.add(mapping.socketPath);
   }
   const actor = options.actor;
+  const actorProxySocketPath = options.actorProxySocketPath;
+  if (
+    (actorProxySocketPath !== undefined && !actor) ||
+    (actor &&
+      (typeof actorProxySocketPath !== "string" ||
+        !isAbsolute(actorProxySocketPath) ||
+        actorProxySocketPath.includes("\u0000") ||
+        Buffer.byteLength(actorProxySocketPath) > 100 ||
+        dirname(actorProxySocketPath) !== root ||
+        actorProxySocketPath === runSocketPath ||
+        servicePaths.has(actorProxySocketPath)))
+  )
+    throw new Error("unusable private Actor duplex socket");
   if (
     actor &&
     (!/^[a-f0-9]{64}$/u.test(actor.namespaceKey) ||
@@ -2377,7 +2392,7 @@ const config :Workerd.Config = (
   ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorVersionServices}${actorServices}
   (name = "deny", network = (allow = []))
  ],
- sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})]
+ sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]
 );`;
   await writePreparedWorkerdSite(root, prepared);
   for (const { root: versionRoot, version } of actorPrepared) {

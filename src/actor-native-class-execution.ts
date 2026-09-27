@@ -9,10 +9,51 @@
  */
 import {
   ActorRuntimeError,
+  type ActorUpgrade,
   createActorClassExecution,
   createActorContext,
   createActorTurn,
 } from "./actor-class-execution.ts";
+
+const SafeObjectCreate = Object.create;
+const SafeObjectFreeze = Object.freeze;
+const SafeObjectKeys = Object.keys;
+const SafeArrayMap = Array.prototype.map;
+const SafeArraySome = Array.prototype.some;
+const SafeWeakMap = WeakMap;
+const SafeWeakMapGet = WeakMap.prototype.get;
+const SafeWeakMapSet = WeakMap.prototype.set;
+const SafeWeakMapDelete = WeakMap.prototype.delete;
+const SafeWeakMapHas = WeakMap.prototype.has;
+const SafeReflectApply = Reflect.apply;
+const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
+const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
+const SafeHeadersGet = Headers.prototype.get;
+const SafeStringLower = String.prototype.toLowerCase;
+const SafeUint8ArraySlice = Uint8Array.prototype.slice;
+const SafeNumberIsSafeInteger = Number.isSafeInteger;
+const SafeTextEncoder = TextEncoder;
+const SafeTextEncode = TextEncoder.prototype.encode;
+const SafeRegExpTest = RegExp.prototype.test;
+const SOCKET_PROTOCOL = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/u;
+const MAX_SOCKET_MESSAGE_BYTES = 8_388_608;
+const MAX_ATTACHMENT_BYTES = 8_192;
+
+export interface NativeActorSocketPort {
+  accept(protocol?: string, attachment?: Uint8Array): Promise<string>;
+  get(socketId: string): Promise<boolean>;
+  list(): Promise<readonly string[]>;
+  send(socketId: string, data: string | Uint8Array): Promise<void>;
+  close(socketId: string, code?: number, reason?: string): Promise<void>;
+  getAttachment(socketId: string): Promise<Uint8Array | null>;
+  setAttachment(socketId: string, value: Uint8Array | null): Promise<void>;
+}
+
+interface UpgradeRecord {
+  readonly nonce: string;
+  readonly socketId: string;
+  readonly protocol?: string;
+}
 
 export type ActorSqlValue =
   | null
@@ -335,7 +376,7 @@ function createSqlFacade(storage: NativeActorStorage): NativeActorSqlFacade {
   });
 }
 
-export function createNativeActorExecution(options: {
+export interface NativeActorExecutionOptions {
   readonly namespace: Readonly<Record<string, unknown>>;
   readonly exportName: string;
   readonly id: string;
@@ -344,20 +385,43 @@ export function createNativeActorExecution(options: {
   readonly alarm: NativeActorAlarmPort;
   /** Host-created broker facade. The adapter never creates native sockets. */
   readonly sockets?: Readonly<Record<string, unknown>>;
-}): {
-  fetch(request: Request): Promise<Response>;
+  /** Per-event Host-private broker port. Never projected to Actor code. */
+  readonly socketPort?: (nonce: string) => NativeActorSocketPort;
+}
+
+export interface NativeActorExecutionResult<TUpgrade extends object = never> {
+  fetch(request: Request, socketNonce?: string): Promise<Response | TUpgrade>;
+  takeUpgrade(value: unknown, socketNonce: string): UpgradeRecord | null;
   alarm(signal: AbortSignal): Promise<void>;
-  socketMessage(socket: object, data: string | Uint8Array, signal: AbortSignal): Promise<void>;
+  socketMessage(
+    socket: object | string,
+    data: string | Uint8Array,
+    signal: AbortSignal,
+    socketNonce?: string,
+  ): Promise<void>;
   socketClose(
-    socket: object,
+    socket: object | string,
     event: { readonly code: number; readonly reason: string; readonly wasClean: boolean },
     signal: AbortSignal,
+    socketNonce?: string,
   ): Promise<void>;
-} {
+}
+
+export function createNativeActorExecution(
+  options: NativeActorExecutionOptions & {
+    readonly socketPort: (nonce: string) => NativeActorSocketPort;
+  },
+): NativeActorExecutionResult<ActorUpgrade>;
+export function createNativeActorExecution(
+  options: NativeActorExecutionOptions,
+): NativeActorExecutionResult<never>;
+export function createNativeActorExecution(
+  options: NativeActorExecutionOptions,
+): NativeActorExecutionResult<ActorUpgrade> {
   const unavailable = async (): Promise<never> => {
     throw new ActorRuntimeError("backend_unavailable");
   };
-  const alarm = Object.freeze({
+  const alarm = SafeObjectFreeze({
     async set(atMillis: number): Promise<void> {
       if (!Number.isSafeInteger(atMillis) || atMillis < 0)
         throw new TypeError("Actor alarm time must be a nonnegative safe integer");
@@ -382,7 +446,155 @@ export function createNativeActorExecution(options: {
       }
     },
   });
-  const execution = createActorClassExecution({
+  type SocketTurn = {
+    readonly kind: "fetch" | "message" | "close";
+    readonly nonce: string;
+    readonly port: NativeActorSocketPort;
+  };
+  let socketTurn: SocketTurn | undefined;
+  const upgrades = new SafeWeakMap<object, UpgradeRecord>();
+  const socketUnavailable = (): never => {
+    throw new ActorRuntimeError("backend_unavailable");
+  };
+  const activePort = (): NativeActorSocketPort => socketTurn?.port ?? socketUnavailable();
+  const copyBytes = (value: Uint8Array, maximum: number): Uint8Array => {
+    let copy: Uint8Array;
+    try {
+      copy = SafeReflectApply(SafeUint8ArraySlice, value, []) as Uint8Array;
+    } catch {
+      throw new TypeError("Actor socket bytes must be Uint8Array");
+    }
+    if (copy.byteLength > maximum)
+      throw new ActorRuntimeError(
+        maximum === MAX_ATTACHMENT_BYTES ? "attachment_too_large" : "message_too_large",
+      );
+    return copy;
+  };
+  const handle = (id: string): object =>
+    SafeObjectFreeze({
+      id,
+      async send(value: string | Uint8Array): Promise<void> {
+        if (typeof value === "string") {
+          const size = (
+            SafeReflectApply(SafeTextEncode, new SafeTextEncoder(), [value]) as Uint8Array
+          ).byteLength;
+          if (size > MAX_SOCKET_MESSAGE_BYTES) throw new ActorRuntimeError("message_too_large");
+          await activePort().send(id, value);
+        } else await activePort().send(id, copyBytes(value, MAX_SOCKET_MESSAGE_BYTES));
+      },
+      async close(code?: number, reason?: string): Promise<void> {
+        if (
+          code !== undefined &&
+          (!SafeNumberIsSafeInteger(code) || (code !== 1000 && (code < 3000 || code > 4999)))
+        )
+          throw new TypeError("Actor socket close code is invalid");
+        if (
+          reason !== undefined &&
+          (typeof reason !== "string" ||
+            (SafeReflectApply(SafeTextEncode, new SafeTextEncoder(), [reason]) as Uint8Array)
+              .byteLength > 123)
+        )
+          throw new TypeError("Actor socket close reason is invalid");
+        await activePort().close(id, code, reason);
+      },
+      async getAttachment(): Promise<Uint8Array | null> {
+        const value = await activePort().getAttachment(id);
+        return value === null ? null : copyBytes(value, MAX_ATTACHMENT_BYTES);
+      },
+      async setAttachment(value: Uint8Array | null): Promise<void> {
+        await activePort().setAttachment(
+          id,
+          value === null ? null : copyBytes(value, MAX_ATTACHMENT_BYTES),
+        );
+      },
+    });
+  const sockets = options.socketPort
+    ? SafeObjectFreeze({
+        async accept(
+          request: Request,
+          acceptedOptions?: { readonly protocol?: string; readonly attachment?: Uint8Array },
+        ): Promise<{ readonly upgrade: ActorUpgrade; readonly socket: object }> {
+          const turn = socketTurn;
+          if (turn?.kind !== "fetch" || !SafeRequestMethod || !SafeRequestHeaders)
+            return socketUnavailable();
+          let method: string;
+          let upgrade: string | null;
+          try {
+            method = SafeReflectApply(SafeRequestMethod, request, []) as string;
+            const headers = SafeReflectApply(SafeRequestHeaders, request, []) as Headers;
+            upgrade = SafeReflectApply(SafeHeadersGet, headers, ["upgrade"]) as string | null;
+          } catch {
+            throw new TypeError("Actor socket request must be a Request");
+          }
+          if (
+            method !== "GET" ||
+            upgrade === null ||
+            SafeReflectApply(SafeStringLower, upgrade, []) !== "websocket"
+          )
+            throw new ActorRuntimeError("invalid_upgrade");
+          if (
+            acceptedOptions !== undefined &&
+            (typeof acceptedOptions !== "object" ||
+              acceptedOptions === null ||
+              SafeReflectApply(
+                SafeArraySome,
+                SafeReflectApply(SafeObjectKeys, Object, [acceptedOptions]),
+                [(key: string) => key !== "protocol" && key !== "attachment"],
+              ))
+          )
+            throw new TypeError("Actor socket options are invalid");
+          const protocol = acceptedOptions?.protocol;
+          if (
+            protocol !== undefined &&
+            (typeof protocol !== "string" ||
+              !SafeReflectApply(SafeRegExpTest, SOCKET_PROTOCOL, [protocol]))
+          )
+            throw new ActorRuntimeError("invalid_upgrade");
+          const attachment =
+            acceptedOptions?.attachment === undefined
+              ? undefined
+              : copyBytes(acceptedOptions.attachment, MAX_ATTACHMENT_BYTES);
+          const socketId = await turn.port.accept(protocol, attachment);
+          const outcome = SafeObjectFreeze(SafeObjectCreate(null)) as ActorUpgrade;
+          SafeReflectApply(SafeWeakMapSet, upgrades, [
+            outcome,
+            {
+              nonce: turn.nonce,
+              socketId,
+              protocol,
+            },
+          ]);
+          return SafeObjectFreeze({ upgrade: outcome, socket: handle(socketId) });
+        },
+        async get(id: string): Promise<object | null> {
+          if (typeof id !== "string" || !id) throw new TypeError("Actor socket ID is invalid");
+          return (await activePort().get(id)) ? handle(id) : null;
+        },
+        async list(): Promise<readonly object[]> {
+          const ids = await activePort().list();
+          return SafeObjectFreeze(
+            SafeReflectApply(SafeArrayMap, ids, [(id: string) => handle(id)]) as object[],
+          );
+        },
+      })
+    : (options.sockets ??
+      SafeObjectFreeze({ accept: unavailable, get: unavailable, list: unavailable }));
+  const withSocketTurn = async <T>(
+    kind: SocketTurn["kind"],
+    nonce: string | undefined,
+    callback: () => Promise<T>,
+  ): Promise<T> => {
+    if (!options.socketPort || nonce === undefined) return callback();
+    if (socketTurn) return socketUnavailable();
+    const turn: SocketTurn = { kind, nonce, port: options.socketPort(nonce) };
+    socketTurn = turn;
+    try {
+      return await callback();
+    } finally {
+      if (socketTurn === turn) socketTurn = undefined;
+    }
+  };
+  const classOptions = {
     namespace: options.namespace,
     exportName: options.exportName,
     env: options.env,
@@ -390,38 +602,76 @@ export function createNativeActorExecution(options: {
       id: options.id,
       storage: createSqlFacade(options.storage) as unknown as Readonly<Record<string, unknown>>,
       alarm,
-      sockets:
-        options.sockets ??
-        Object.freeze({ accept: unavailable, get: unavailable, list: unavailable }),
+      sockets,
     }),
-  });
-  return Object.freeze({
-    async fetch(request: Request): Promise<Response> {
-      const response = await execution.dispatch(
-        { kind: "fetch", request },
-        createActorTurn(request.signal),
-      );
-      if (response === undefined) throw new ActorRuntimeError("backend_unavailable");
-      // Preserve the real Response and its streaming body. The owner, not this
-      // adapter, retains the admission reservation through the chosen lifetime.
-      return response;
+  };
+  const execution = options.socketPort
+    ? createActorClassExecution({
+        ...classOptions,
+        isUpgrade: (value: unknown): boolean =>
+          typeof value === "object" &&
+          value !== null &&
+          (SafeReflectApply(SafeWeakMapHas, upgrades, [value]) as boolean),
+      })
+    : createActorClassExecution(classOptions);
+  return SafeObjectFreeze({
+    async fetch(request: Request, socketNonce?: string): Promise<Response | ActorUpgrade> {
+      return withSocketTurn("fetch", socketNonce, async () => {
+        const response = await execution.dispatch(
+          { kind: "fetch", request },
+          createActorTurn(request.signal),
+        );
+        if (response === undefined) throw new ActorRuntimeError("backend_unavailable");
+        // Preserve either the real streaming Response or a branded opaque
+        // upgrade; the child shim transfers the latter to the owner only.
+        return response;
+      });
+    },
+    takeUpgrade(value: unknown, socketNonce: string): UpgradeRecord | null {
+      if (typeof value !== "object" || value === null) return null;
+      const record = SafeReflectApply(SafeWeakMapGet, upgrades, [value]) as
+        | UpgradeRecord
+        | undefined;
+      if (!record || record.nonce !== socketNonce) return null;
+      SafeReflectApply(SafeWeakMapDelete, upgrades, [value]);
+      return record;
     },
     async alarm(signal: AbortSignal): Promise<void> {
       await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));
     },
     async socketMessage(
-      socket: object,
+      socket: object | string,
       data: string | Uint8Array,
       signal: AbortSignal,
+      socketNonce?: string,
     ): Promise<void> {
-      await execution.dispatch({ kind: "socketMessage", socket, data }, createActorTurn(signal));
+      await withSocketTurn("message", socketNonce, async () => {
+        await execution.dispatch(
+          {
+            kind: "socketMessage",
+            socket: typeof socket === "string" ? handle(socket) : socket,
+            data,
+          },
+          createActorTurn(signal),
+        );
+      });
     },
     async socketClose(
-      socket: object,
+      socket: object | string,
       event: { readonly code: number; readonly reason: string; readonly wasClean: boolean },
       signal: AbortSignal,
+      socketNonce?: string,
     ): Promise<void> {
-      await execution.dispatch({ kind: "socketClose", socket, event }, createActorTurn(signal));
+      await withSocketTurn("close", socketNonce, async () => {
+        await execution.dispatch(
+          {
+            kind: "socketClose",
+            socket: typeof socket === "string" ? handle(socket) : socket,
+            event,
+          },
+          createActorTurn(signal),
+        );
+      });
     },
   });
 }

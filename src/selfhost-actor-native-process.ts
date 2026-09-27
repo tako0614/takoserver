@@ -28,10 +28,22 @@ export interface WorkerdActorNamespaceOptions {
   /** Callback admission is a fresh Host decision, never an alarm retry grant. */
   readonly admitSocket: WorkerdActorNamespaceOptions["admitAlarm"];
   readonly completeSocket: (leaseId: string) => void;
+  /** Native negative-test seam only; production uses owner defaults. */
+  readonly ownerDeadlines?: { readonly handlerMs: number; readonly producerMs: number };
 }
 
 export interface WorkerdActorNamespace {
   fetch(id: string, request: Request, variantKey: string): Promise<Response>;
+  /** Private workerd-to-workerd duplex socket; never an untrusted URL or binding. */
+  readonly actorProxySocketPath: string;
+  /** Host-private target after live Resource and Version admission. */
+  duplexTarget(
+    id: string,
+    variantKey: string,
+  ): {
+    readonly socketPath: string;
+    readonly headers: Readonly<Record<string, string>>;
+  };
   /** Settles when the native child exits, including an intentional close. */
   readonly exited: Promise<void>;
   readonly epoch: string;
@@ -148,6 +160,14 @@ export async function openWorkerdActorNamespace(
     options.className.includes("\u0000")
   )
     throw new Error("unusable Actor namespace selection");
+  if (
+    options.ownerDeadlines &&
+    (!Number.isSafeInteger(options.ownerDeadlines.handlerMs) ||
+      options.ownerDeadlines.handlerMs <= 0 ||
+      !Number.isSafeInteger(options.ownerDeadlines.producerMs) ||
+      options.ownerDeadlines.producerMs <= 0)
+  )
+    throw new Error("unusable Actor owner test deadline");
   const graph = structuredClone(options.graph);
   if (
     !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
@@ -193,18 +213,36 @@ export async function openWorkerdActorNamespace(
     hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
     hostModules.set(
       entry,
-      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, inspectActorClass } from ${literal(`./${helper}`)};
+      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
 const SafeApply = Reflect.apply;
 const SafeHeadersGet = Headers.prototype.get;
 const SafeHeadersDelete = Headers.prototype.delete;
+const SafeHeadersSet = Headers.prototype.set;
 const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers").get;
 const SafeRequestSignal = Object.getOwnPropertyDescriptor(Request.prototype, "signal").get;
 const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method").get;
+const SafeRequestUrl = Object.getOwnPropertyDescriptor(Request.prototype, "url")?.get;
+const SafeRequestBody = Object.getOwnPropertyDescriptor(Request.prototype, "body")?.get;
+const SafeRequestArrayBuffer = Request.prototype.arrayBuffer;
+const SafeRequestJson = Request.prototype.json;
+const SafeTextDecoder = TextDecoder;
+const SafeTextDecode = TextDecoder.prototype.decode;
+const SafeUint8Array = Uint8Array;
+const SafeEncodeURIComponent = encodeURIComponent;
+const SafeNumberIsSafeInteger = Number.isSafeInteger;
 const INSPECTION_HEADER = "x-takoserver-private-actor-class-inspection";
 const INSPECTION_TOKEN = ${literal(inspectionToken)};
+const DELIVERY_TOKEN = ${literal(deliveryToken)};
+const UPGRADE_NONCE = "x-takoserver-private-actor-upgrade-nonce";
+const UPGRADE_DECISION = "x-takoserver-private-actor-upgrade-decision";
+const UPGRADE_SOCKET_ID = "x-takoserver-private-actor-upgrade-socket-id";
+const SOCKET_ACTION = "x-takoserver-private-actor-socket-action";
+const SOCKET_NONCE = "x-takoserver-private-actor-socket-nonce";
+const SOCKET_ID = "x-takoserver-private-actor-socket-id";
+const SOCKET_KIND = "x-takoserver-private-actor-socket-kind";
 let inspection;
 async function inspectVersion(request) {
   const headers = SafeApply(SafeRequestHeaders, request, []);
@@ -228,18 +266,51 @@ export class ActorChild {
   constructor(state, env) {
     const id = state.id.toString();
     const alarm = createActorNativeAlarmPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id);
-    this.execution = Promise.all([import(${literal(`./${wrapper}`)}), import(${literal(`./${site.mainModule}`)})]).then(([wrapper, namespace]) => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id, env: wrapper.${SELFHOST_WORKER_PROJECT_ENV_EXPORT}(env), storage: state.storage, alarm }));
+    this.id = id;
+    this.execution = Promise.all([import(${literal(`./${wrapper}`)}), import(${literal(`./${site.mainModule}`)})]).then(([wrapper, namespace]) => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id, env: wrapper.${SELFHOST_WORKER_PROJECT_ENV_EXPORT}(env), storage: state.storage, alarm, socketPort: nonce => createActorNativeSocketPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id, nonce) }));
   }
   async fetch(request) {
     const incoming = SafeApply(SafeRequestHeaders, request, []);
-    if (SafeApply(SafeHeadersGet, incoming, ["x-takoserver-private-actor-delivery"]) === ${literal(deliveryToken)}) {
-      await (await this.execution).alarm(SafeApply(SafeRequestSignal, request, []));
+    if (SafeApply(SafeHeadersGet, incoming, ["x-takoserver-private-actor-delivery"]) === DELIVERY_TOKEN) {
+      const action = SafeApply(SafeHeadersGet, incoming, [SOCKET_ACTION]);
+      const execution = await this.execution;
+      if (action === null) {
+        await execution.alarm(SafeApply(SafeRequestSignal, request, []));
+      } else {
+        const nonce = SafeApply(SafeHeadersGet, incoming, [SOCKET_NONCE]);
+        const socketId = SafeApply(SafeHeadersGet, incoming, [SOCKET_ID]);
+        if (!nonce || !socketId || SafeApply(SafeRequestMethod, request, []) !== "POST")
+          return new SafeResponse(null, { status: 503 });
+        if (action === "callback-message") {
+          const kind = SafeApply(SafeHeadersGet, incoming, [SOCKET_KIND]);
+          if (kind !== "text" && kind !== "binary") return new SafeResponse(null, { status: 503 });
+          const bytes = new SafeUint8Array(await SafeApply(SafeRequestArrayBuffer, request, []));
+          if (bytes.byteLength > 8388608) return new SafeResponse(null, { status: 503 });
+          const data = kind === "text" ? SafeApply(SafeTextDecode, new SafeTextDecoder("utf-8", { fatal: true }), [bytes]) : bytes;
+          await execution.socketMessage(socketId, data, SafeApply(SafeRequestSignal, request, []), nonce);
+        } else if (action === "callback-close") {
+          const event = await SafeApply(SafeRequestJson, request, []);
+          if (!event || typeof event !== "object" || !SafeNumberIsSafeInteger(event.code) || typeof event.reason !== "string" || typeof event.wasClean !== "boolean")
+            return new SafeResponse(null, { status: 503 });
+          await execution.socketClose(socketId, { code: event.code, reason: event.reason, wasClean: event.wasClean }, SafeApply(SafeRequestSignal, request, []), nonce);
+        } else return new SafeResponse(null, { status: 503 });
+      }
       return new SafeResponse(null, { status: 204 });
     }
     const headers = new SafeHeaders(incoming);
-    SafeApply(SafeHeadersDelete, headers, ["x-takoserver-private-actor-delivery"]);
-    SafeApply(SafeHeadersDelete, headers, ["x-takoserver-private-actor-variant"]);
-    return (await this.execution).fetch(new SafeRequest(request, { headers }));
+    const nonce = SafeApply(SafeHeadersGet, headers, [UPGRADE_NONCE]);
+    const privateNames = ["x-takoserver-private-actor-delivery", "x-takoserver-private-actor-variant", UPGRADE_NONCE, UPGRADE_DECISION, UPGRADE_SOCKET_ID, SOCKET_ACTION, SOCKET_NONCE, SOCKET_ID, SOCKET_KIND];
+    for (let index = 0; index < privateNames.length; index += 1)
+      SafeApply(SafeHeadersDelete, headers, [privateNames[index]]);
+    const appRequest = new SafeRequest(SafeRequestUrl ? SafeApply(SafeRequestUrl, request, []) : request.url, { method: SafeApply(SafeRequestMethod, request, []), headers, body: SafeRequestBody ? SafeApply(SafeRequestBody, request, []) : request.body, signal: SafeApply(SafeRequestSignal, request, []), redirect: "manual" });
+    const execution = await this.execution;
+    const result = await execution.fetch(appRequest, nonce ?? undefined);
+    const upgrade = nonce ? execution.takeUpgrade(result, nonce) : null;
+    if (!upgrade) return result;
+    const decision = await signActorNativeUpgradeDecision(DELIVERY_TOKEN, nonce, SafeEncodeURIComponent(this.id), upgrade.socketId, upgrade.protocol ?? "");
+    const responseHeaders = new SafeHeaders({ [UPGRADE_DECISION]: decision, [UPGRADE_SOCKET_ID]: upgrade.socketId });
+    if (upgrade.protocol) SafeApply(SafeHeadersSet, responseHeaders, ["sec-websocket-protocol", upgrade.protocol]);
+    return new SafeResponse(null, { status: 204, headers: responseHeaders });
   }
 }
 export default { fetch(request) { return inspectVersion(request); } };`),
@@ -279,7 +350,7 @@ export default { fetch(request) { return inspectVersion(request); } };`),
   ownerModules.set(
     owner,
     encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${first.helper}`)};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })});
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}${options.ownerDeadlines ? `, ${JSON.stringify(options.ownerDeadlines)}` : ""});
 const ingress = createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});
 const inspectionTokens = ${JSON.stringify(inspectionTokens)};
 let inspections;
@@ -412,6 +483,7 @@ export default {
   try {
     await mkdir(options.storagePath, { recursive: true, mode: 0o700 });
     const socket = join(root, "run.sock");
+    const actorProxySocketPath = join(root, "upgrade.sock");
     const config = await writeWorkerdPrivateExecution({
       root,
       site: {
@@ -421,6 +493,7 @@ export default {
       modules: first.modules,
       hostModules: ownerModules,
       runSocketPath: socket,
+      actorProxySocketPath,
       actor: {
         namespaceKey: options.namespaceKey,
         storagePath: options.storagePath,
@@ -511,7 +584,21 @@ export default {
           redirect: "manual",
         });
       },
+      duplexTarget(id, variantKey) {
+        if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (!id || id.includes("\u0000") || !variantKeys.includes(variantKey))
+          throw new Error("Actor Version selection unavailable");
+        return Object.freeze({
+          socketPath: actorProxySocketPath,
+          headers: Object.freeze({
+            "x-takoserver-private-actor-token": token,
+            "x-takoserver-private-actor-id": encodeURIComponent(id),
+            "x-takoserver-private-actor-variant": variantKey,
+          }),
+        });
+      },
       epoch,
+      actorProxySocketPath,
       close,
     };
   } catch (error) {
