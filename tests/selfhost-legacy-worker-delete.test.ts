@@ -86,6 +86,11 @@ async function legacyWorkerFixture(): Promise<LegacyWorkerFixture> {
       outcome: "valid",
       exportedHandlers: [...input.declaredHandlers],
     }),
+    async probe() {
+      // This fake fixture has no serving workerd process to probe. Tests that
+      // exercise runtime probing install an isolated probe server.
+      return null;
+    },
     async write(...args) {
       writes += 1;
       await baseRuntime.write(...args);
