@@ -599,6 +599,42 @@ test("lets exactly one abort-or-dispatch transition win", async () => {
   await expect(lease.abort()).rejects.toMatchObject({ code: "conflict", status: 409 });
 });
 
+test("a stale dispatch cannot adopt a same-key replacement's dispatched row", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  await old.abort();
+  await authority.preparations.prepare(preparationInput({
+    bindings: { ...BINDINGS, ENCRYPTION_KEY: "new-generation-secret" },
+  }));
+  const replacement = await authority.leases.acquire(leaseInput());
+  await replacement.dispatch();
+  await expect(old.dispatch()).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
+test("a stale settlement cannot consume a same-key replacement's dispatched row", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  const oldDispatched = await old.dispatch();
+  await authority.leases.abandon?.(leaseInput());
+  await authority.preparations.prepare(preparationInput({
+    bindings: { ...BINDINGS, ENCRYPTION_KEY: "new-generation-secret" },
+  }));
+  const replacement = await authority.leases.acquire(leaseInput());
+  await replacement.dispatch();
+  await expect(oldDispatched.settle(`sha256:${"7".repeat(64)}`)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
 test("recovers a dispatched handoff by value-free identity and never returns values", async () => {
   const { authority } = await runtimeInputFixture();
   const prepared = await authority.preparations.prepare(preparationInput());
