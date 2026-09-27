@@ -137,6 +137,36 @@ export type CloudflareManagedQueueDestroyPreparation =
       readonly failure: ProviderFailure;
     };
 
+/** Closed result for one exact EdgeKVNamespace helper-retirement handoff. */
+export type CloudflareManagedKvNamespaceDestroyPreparation =
+  | {
+      readonly state: "retired";
+      /** A durable marker or helper mutation now belongs to this exact delete. */
+      readonly effectsStarted: boolean;
+    }
+  | {
+      readonly state: "pending" | "unknown";
+      readonly effectsStarted: boolean;
+      readonly failure: ProviderFailure;
+    };
+
+/** Read-only proof that the exact KV incarnation's helper claims are retired. */
+export type CloudflareManagedKvNamespaceDestroyReadback =
+  | { readonly state: "retired" }
+  | { readonly state: "pending" | "unknown"; readonly retryable: boolean };
+
+/** Internal managed KV helper retirement; never a public provider/API contract. */
+export interface CloudflareManagedKvNamespaceDestroyAuthority {
+  prepareDestroy(
+    input: CloudflareWorkerDeleteInput,
+  ): Promise<CloudflareManagedKvNamespaceDestroyPreparation>;
+  readRetirement(input: {
+    readonly offering: ProviderOffering;
+    readonly descriptor: ProviderNativeReadbackDescriptor;
+    readonly target?: ProviderReadAuthorityTarget;
+  }): Promise<CloudflareManagedKvNamespaceDestroyReadback>;
+}
+
 /** Adoption identity shared by the Cloudflare provider and its Worker backend. */
 export interface CloudflareWorkerAdoptInput {
   readonly operationId: string;
@@ -189,6 +219,8 @@ export interface CloudflareWorkerBackend {
   prepareManagedQueueDestroy?(
     input: CloudflareWorkerDeleteInput,
   ): Promise<CloudflareManagedQueueDestroyPreparation>;
+  /** Optional internal handoff before deleting a managed EdgeKVNamespace. */
+  readonly managedKvNamespaceDestroy?: CloudflareManagedKvNamespaceDestroyAuthority;
   createNativeReadbackDescriptor(
     input: ProviderNativeReadbackInput,
   ): ProviderNativeReadbackDescriptor;

@@ -1807,6 +1807,79 @@ describe("released edge Form placement", () => {
     return { provider, calls };
   }
 
+  function kvDeleteProvider(
+    backend?: CloudflareWorkerBackend,
+    response: { readonly status: number; readonly body: unknown } = {
+      status: 200,
+      body: { success: true, errors: [], result: null },
+    },
+  ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
+    const calls: Call[] = [];
+    const kvOffering = technical("EdgeKVNamespace");
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [kvOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      ...(backend
+        ? { workerBackend: { kind: "workers-for-platforms" as const, create: () => backend } }
+        : {}),
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return new Response(JSON.stringify(response.body), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  function kvDeleteInput(
+    offering: ProviderOffering,
+    operationId: string,
+    nativeId = "kv:namespace-id",
+  ) {
+    return {
+      operationId,
+      operationMode: "initial" as const,
+      offering,
+      nativeId,
+      identity: {
+        ...IDENTITY,
+        uid: "resource-kv-retirement",
+        incarnationId: "deployment-kv-retirement",
+        generation: "7",
+      },
+      executionAuthority: {
+        tenantId: IDENTITY.tenantRef,
+        resourceUid: "resource-kv-retirement",
+        leaseToken: "lease-kv-retirement",
+        fingerprint: "fingerprint-kv-retirement",
+      },
+    };
+  }
+
+  function managedBackendWithKvRetirement(
+    prepareDestroy: NonNullable<
+      CloudflareWorkerBackend["managedKvNamespaceDestroy"]
+    >["prepareDestroy"],
+    readRetirement: NonNullable<
+      CloudflareWorkerBackend["managedKvNamespaceDestroy"]
+    >["readRetirement"],
+  ): CloudflareWorkerBackend {
+    return {
+      ...managedBackendThatDoesNotOwnQueues(),
+      managedKvNamespaceDestroy: { prepareDestroy, readRetirement },
+    };
+  }
+
   function queueDeleteInput(
     offering: ProviderOffering,
     operationId: string,
@@ -1820,6 +1893,255 @@ describe("released edge Form placement", () => {
       identity: { ...IDENTITY, name: "jobs" },
     };
   }
+
+  test("EdgeKVNamespace deletion waits for the managed helper retirement handoff", async () => {
+    const operationId = "op-kv-helper-retirement-pending";
+    const offering = technical("EdgeKVNamespace");
+    let preparedInput:
+      | Parameters<
+          NonNullable<CloudflareWorkerBackend["managedKvNamespaceDestroy"]>["prepareDestroy"]
+        >[0]
+      | undefined;
+    const backend = managedBackendWithKvRetirement(
+      async (input) => {
+        preparedInput = input;
+        return {
+          state: "pending",
+          effectsStarted: false,
+          failure: {
+            code: "unavailable",
+            message: "the managed KV helpers are still retiring",
+            retryable: true,
+          },
+        };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const input = kvDeleteInput(offering, operationId);
+    const ticket = await provider.delete(input);
+
+    expect(preparedInput).toMatchObject({
+      operationId,
+      nativeId: input.nativeId,
+      identity: input.identity,
+      executionAuthority: input.executionAuthority,
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("EdgeKVNamespace deletion proceeds only after retirement is proven", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let retirementPrepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        retirementPrepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(kvDeleteInput(offering, "op-kv-helper-retirement-ready"));
+
+    expect(retirementPrepared).toBe(true);
+    expect(ticket.phase).toBe("succeeded");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+    expect(calls[0]?.url).toContain("/storage/kv/namespaces/namespace-id");
+  });
+
+  test("KV convergence cannot bypass a lost helper-retirement acknowledgement", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = 0;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared += 1;
+        throw new TypeError("retirement acknowledgement lost");
+      },
+      async () => ({ state: "unknown", retryable: true }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const input = kvDeleteInput(offering, "op-kv-helper-retirement-lost-ack");
+    const ticket = await provider.convergeDelete({ ...input, operationMode: "recovery" });
+
+    expect(prepared).toBe(1);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("KV helper absence must be read before a namespace 404 can prove deletion", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let readTarget: unknown;
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async (input) => {
+        readTarget = input.target;
+        return { state: "pending", retryable: true };
+      },
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const identity = kvDeleteInput(offering, "op-kv-helper-readback").identity;
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering,
+      nativeId: "kv:namespace-id",
+      identity,
+      spec: {},
+    });
+    const proof = await provider.verifyNativeAbsence({
+      offering,
+      descriptor,
+      target: {
+        tenantId: identity.tenantRef,
+        resourceUid: "resource-kv-retirement",
+        incarnationId: "deployment-kv-retirement",
+        generation: "7",
+      },
+    });
+
+    expect(readTarget).toEqual({
+      tenantId: identity.tenantRef,
+      resourceUid: identity.uid,
+      incarnationId: identity.incarnationId,
+      generation: identity.generation,
+    });
+    expect(proof).toEqual({ outcome: "unknown", reason: "authority_unavailable", retryable: true });
+    expect(calls).toEqual([]);
+  });
+
+  test("managed KV readback without an exact target cannot prove absence", async () => {
+    const offering = technical("EdgeKVNamespace");
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering,
+      nativeId: "kv:namespace-id",
+      identity: { ...IDENTITY, uid: "resource-kv-retirement" },
+      spec: {},
+    });
+    const proof = await provider.verifyNativeAbsence({ offering, descriptor });
+
+    expect(proof).toEqual({
+      outcome: "unknown",
+      reason: "authority_unavailable",
+      retryable: false,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("KV lost-ack recovery cannot conclude from namespace 404 while helper retirement is unknown", async () => {
+    const offering = technical("EdgeKVNamespace");
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async () => ({ state: "unknown", retryable: true }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend, {
+      status: 404,
+      body: { success: false, errors: [], result: null },
+    });
+    const input = kvDeleteInput(offering, "op-kv-recovery-unknown");
+    const ticket = await provider.recoverDelete({ ...input, operationMode: "recovery" });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("unconfigured KV retirement keeps the existing namespace delete path", async () => {
+    const { provider, calls } = kvDeleteProvider();
+    const ticket = await provider.delete(
+      kvDeleteInput(technical("EdgeKVNamespace"), "op-kv-unconfigured"),
+    );
+
+    expect(ticket.phase).toBe("succeeded");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("managed KV retirement refuses a native identity from another resource kind", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(
+      kvDeleteInput(offering, "op-kv-stale-native-identity", "queue:foreign-id"),
+    );
+
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    expect(prepared).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("managed KV retirement cannot authorize a foreign Resource lease", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const base = kvDeleteInput(offering, "op-kv-foreign-lease");
+    const ticket = await provider.delete({
+      ...base,
+      executionAuthority: {
+        ...base.executionAuthority,
+        resourceUid: "resource-foreign",
+      },
+    });
+
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(prepared).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("a same-kind but stale KV identity stays blocked by the private retirement authority", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let inspectedNativeId: string | undefined;
+    const backend = managedBackendWithKvRetirement(
+      async (input) => {
+        inspectedNativeId = input.nativeId;
+        return {
+          state: "unknown",
+          effectsStarted: false,
+          failure: {
+            code: "unavailable",
+            message: "the namespace identity does not match this Resource incarnation",
+            retryable: true,
+          },
+        };
+      },
+      async () => ({ state: "unknown", retryable: false }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(
+      kvDeleteInput(offering, "op-kv-stale-namespace", "kv:stale-namespace-id"),
+    );
+
+    expect(inspectedNativeId).toBe("kv:stale-namespace-id");
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
 
   test("settles an exact Queue binding refusal as an operation-bound no-effect delete", async () => {
     const operationId = "op-queue-delete-referenced";

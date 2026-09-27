@@ -53,6 +53,9 @@ import {
 } from "./cloudflare-runtime-bindings.ts";
 import type {
   ArtifactBytes,
+  CloudflareManagedKvNamespaceDestroyAuthority,
+  CloudflareManagedKvNamespaceDestroyPreparation,
+  CloudflareManagedKvNamespaceDestroyReadback,
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
@@ -66,6 +69,9 @@ import { MigrationSqlCapacityError, prepareMigrationSql } from "./sqlite-migrati
 
 export type {
   ArtifactBytes,
+  CloudflareManagedKvNamespaceDestroyAuthority,
+  CloudflareManagedKvNamespaceDestroyPreparation,
+  CloudflareManagedKvNamespaceDestroyReadback,
   CloudflareManagedObjectBucketReceiptStatus,
   CloudflareManagedQueueDestroyPreparation,
   CloudflareManagedScheduleOperatorProof,
@@ -737,6 +743,19 @@ export class CloudflareProvider implements Provider {
       return unknownAbsence("malformed", false);
     }
     const { native } = validated;
+    if (cloudflareEdgeKvNamespaceOffering(input.offering)) {
+      const retirement = await readManagedKvNamespaceRetirement(
+        this.#workerBackend?.managedKvNamespaceDestroy,
+        {
+          offering: input.offering,
+          descriptor: input.descriptor,
+          ...(input.target === undefined ? {} : { target: input.target }),
+        },
+      );
+      if (retirement.state !== "retired") {
+        return unknownAbsence("authority_unavailable", retirement.retryable);
+      }
+    }
     const path = cloudflareReadbackPath(this.#accountId, native);
     if (!path) return unknownAbsence("unsupported", false);
     const read = await this.#call("GET", path);
@@ -1111,6 +1130,42 @@ export class CloudflareProvider implements Provider {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     const native = parseNativeId(input.nativeId);
     if (!native) return failed("not_found", "unrecognised native identity");
+    if (
+      (cloudflareEdgeKvNamespaceOffering(input.offering) && native.kind !== "kv") ||
+      (native.kind === "kv" && !cloudflareEdgeKvNamespaceOffering(input.offering))
+    ) {
+      return failed("invalid_spec", "the native identity does not match the Edge Form");
+    }
+    let managedKvEffectsStarted = false;
+    if (native.kind === "kv" && this.#workerBackend?.managedKvNamespaceDestroy) {
+      if (!hasExactKvDeleteIdentity(input)) {
+        return convergence
+          ? failed("unavailable", "the managed KV retirement identity is unavailable", true)
+          : failedWithoutProviderMutation(
+              input.operationId,
+              "unavailable",
+              "the managed KV retirement identity is unavailable",
+            );
+      }
+      let prepared: CloudflareManagedKvNamespaceDestroyPreparation;
+      try {
+        prepared = await this.#workerBackend.managedKvNamespaceDestroy.prepareDestroy(input);
+      } catch {
+        // The helper authority may have persisted its retirement fence before
+        // losing the acknowledgement; never let this fall through to DELETE.
+        return failed("unavailable", "the managed KV namespace retirement is unresolved", true);
+      }
+      if (!isManagedKvNamespaceDestroyPreparation(prepared)) {
+        return failed("unavailable", "the managed KV namespace retirement is unresolved", true);
+      }
+      if (prepared.state !== "retired") {
+        return {
+          phase: "failed",
+          failure: { ...prepared.failure, retryable: true },
+        };
+      }
+      managedKvEffectsStarted = prepared.effectsStarted;
+    }
     let managedQueueEffectsStarted = false;
     if (
       native.kind === "queue" &&
@@ -1214,6 +1269,13 @@ export class CloudflareProvider implements Provider {
     const removed = await this.#call("DELETE", path);
     // A resource that is already gone is a successful delete, not a failure.
     if (!removed.ok && removed.status !== 404) {
+      if (native.kind === "kv" && managedKvEffectsStarted) {
+        return failed(
+          "unavailable",
+          "the managed KV namespace retirement has effects but deletion was not confirmed; reconciliation is required",
+          true,
+        );
+      }
       if (
         native.kind === "queue" &&
         providerKind(input.offering) === "AtLeastOnceQueue" &&
@@ -1345,6 +1407,37 @@ export class CloudflareProvider implements Provider {
       return await this.poll({ operationId: input.operationId, handle: input.providerHandle });
     }
     const native = parseNativeId(input.nativeId);
+    if (
+      (cloudflareEdgeKvNamespaceOffering(input.offering) && native?.kind !== "kv") ||
+      (native?.kind === "kv" && !cloudflareEdgeKvNamespaceOffering(input.offering))
+    ) {
+      return failed("invalid_spec", "the native identity does not match the Edge Form");
+    }
+    if (native?.kind === "kv" && this.#workerBackend?.managedKvNamespaceDestroy) {
+      let descriptor: ProviderNativeReadbackDescriptor;
+      try {
+        descriptor = this.createNativeReadbackDescriptor({
+          offering: input.offering,
+          nativeId: input.nativeId,
+          identity: input.identity,
+          spec: input.spec ?? {},
+        });
+      } catch {
+        return failed("unavailable", "the managed KV retirement identity is unavailable", true);
+      }
+      const target = exactKvReadAuthorityTarget(input.identity);
+      const retirement = await readManagedKvNamespaceRetirement(
+        this.#workerBackend?.managedKvNamespaceDestroy,
+        {
+          offering: input.offering,
+          descriptor,
+          ...(target === undefined ? {} : { target }),
+        },
+      );
+      if (retirement.state !== "retired") {
+        return failed("unavailable", "the managed KV namespace retirement is unresolved", true);
+      }
+    }
     if (
       native?.kind === "r2" &&
       (providerKind(input.offering) === "ObjectBucket" ||
@@ -3200,7 +3293,50 @@ function hasValidWorkerBackendMethods(candidate: object): boolean {
     REQUIRED_WORKER_BACKEND_METHODS.every((method) => typeof backend[method] === "function") &&
     OPTIONAL_WORKER_BACKEND_METHODS.every(
       (method) => backend[method] === undefined || typeof backend[method] === "function",
-    )
+    ) &&
+    (backend.managedKvNamespaceDestroy === undefined ||
+      isManagedKvNamespaceDestroyAuthority(backend.managedKvNamespaceDestroy))
+  );
+}
+
+function isManagedKvNamespaceDestroyAuthority(
+  value: unknown,
+): value is CloudflareManagedKvNamespaceDestroyAuthority {
+  if (value === null || typeof value !== "object") return false;
+  const authority = value as Record<string, unknown>;
+  return (
+    typeof authority.prepareDestroy === "function" && typeof authority.readRetirement === "function"
+  );
+}
+
+function isManagedKvNamespaceDestroyPreparation(
+  value: unknown,
+): value is CloudflareManagedKvNamespaceDestroyPreparation {
+  if (value === null || typeof value !== "object") return false;
+  const preparation = value as Record<string, unknown>;
+  if (typeof preparation.effectsStarted !== "boolean") return false;
+  if (preparation.state === "retired") return true;
+  if (preparation.state !== "pending" && preparation.state !== "unknown") return false;
+  const failure = preparation.failure;
+  if (failure === null || typeof failure !== "object") return false;
+  const candidate = failure as Record<string, unknown>;
+  return (
+    typeof candidate.code === "string" &&
+    typeof candidate.message === "string" &&
+    candidate.message.length > 0 &&
+    typeof candidate.retryable === "boolean"
+  );
+}
+
+function isManagedKvNamespaceDestroyReadback(
+  value: unknown,
+): value is CloudflareManagedKvNamespaceDestroyReadback {
+  if (value === null || typeof value !== "object") return false;
+  const readback = value as Record<string, unknown>;
+  return (
+    readback.state === "retired" ||
+    ((readback.state === "pending" || readback.state === "unknown") &&
+      typeof readback.retryable === "boolean")
   );
 }
 
@@ -3256,6 +3392,85 @@ function unknownAbsence(
   retryable: boolean,
 ): ProviderNativeAbsence {
   return { outcome: "unknown", reason, retryable };
+}
+
+async function readManagedKvNamespaceRetirement(
+  authority: CloudflareManagedKvNamespaceDestroyAuthority | undefined,
+  input: {
+    readonly offering: ProviderOffering;
+    readonly descriptor: ProviderNativeReadbackDescriptor;
+    readonly target?: ProviderReadAuthorityTarget;
+  },
+): Promise<CloudflareManagedKvNamespaceDestroyReadback> {
+  if (!authority) return { state: "retired" };
+  if (
+    !cloudflareEdgeKvNamespaceOffering(input.offering) ||
+    input.descriptor.kind !== "EdgeKVNamespace" ||
+    !isExactKvReadAuthorityTarget(input.target)
+  ) {
+    return { state: "unknown", retryable: false };
+  }
+  try {
+    const result = await authority.readRetirement(input);
+    return isManagedKvNamespaceDestroyReadback(result)
+      ? result
+      : { state: "unknown", retryable: true };
+  } catch {
+    return { state: "unknown", retryable: true };
+  }
+}
+
+function exactKvReadAuthorityTarget(
+  identity: ResourceIdentity,
+): ProviderReadAuthorityTarget | undefined {
+  if (
+    !nonEmpty(identity.tenantRef) ||
+    !nonEmpty(identity.uid) ||
+    !nonEmpty(identity.incarnationId) ||
+    !nonEmpty(identity.generation)
+  ) {
+    return undefined;
+  }
+  return {
+    tenantId: identity.tenantRef,
+    resourceUid: identity.uid,
+    incarnationId: identity.incarnationId,
+    generation: identity.generation,
+  };
+}
+
+function isExactKvReadAuthorityTarget(
+  value: ProviderReadAuthorityTarget | undefined,
+): value is ProviderReadAuthorityTarget {
+  return (
+    value !== undefined &&
+    nonEmpty(value.tenantId) &&
+    nonEmpty(value.resourceUid) &&
+    nonEmpty(value.incarnationId) &&
+    nonEmpty(value.generation)
+  );
+}
+
+function hasExactKvDeleteIdentity(input: {
+  readonly operationId: string;
+  readonly executionAuthority?: ProviderExecutionAuthority;
+  readonly identity: ResourceIdentity;
+}): boolean {
+  const target = exactKvReadAuthorityTarget(input.identity);
+  const authority = input.executionAuthority;
+  return (
+    target !== undefined &&
+    nonEmpty(input.operationId) &&
+    authority !== undefined &&
+    authority.tenantId === target.tenantId &&
+    authority.resourceUid === target.resourceUid &&
+    nonEmpty(authority.leaseToken) &&
+    nonEmpty(authority.fingerprint)
+  );
+}
+
+function nonEmpty(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function absenceResult(
@@ -3745,6 +3960,14 @@ function cloudflareQueueOffering(offering: ProviderOffering): boolean {
     offering.kind.startsWith("takoform.") &&
     isEdgeFormsApiVersion(offering.form.apiVersion) &&
     offering.form.kind === "AtLeastOnceQueue"
+  );
+}
+
+function cloudflareEdgeKvNamespaceOffering(offering: ProviderOffering): boolean {
+  return (
+    offering.kind.startsWith("takoform.") &&
+    isEdgeFormsApiVersion(offering.form.apiVersion) &&
+    offering.form.kind === "EdgeKVNamespace"
   );
 }
 
