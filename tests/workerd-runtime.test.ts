@@ -1499,6 +1499,123 @@ test("publishes one canonical immutable weighted graph and retains old generatio
   expect(await readFile(join(firstRoot, "deployment.json"), "utf8")).toBe(firstManifest);
 });
 
+test("persists an opt-in Actor forward graph and rejects unmapped Host sockets", async () => {
+  const actorForward = {
+    schema: "takoserver.selfhost-actor-forward@v1",
+    bindings: [
+      {
+        publicName: "ROOM",
+        tenantId: "tenant-1",
+        namespaceResourceUid: "uid-actor-namespace-1",
+        httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+        upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+        token: "a".repeat(64),
+      },
+    ],
+  } as const;
+  const publication = weightedPublication("site", "generation-actor");
+  const withActors = {
+    ...publication,
+    versions: publication.versions.map((version) => ({
+      ...version,
+      site: { ...version.site, actorForward },
+    })),
+  };
+  const socketMapping = {
+    tenantId: "tenant-1",
+    namespaceResourceUid: "uid-actor-namespace-1",
+    httpSocketPath: join(root, "actor-http.sock"),
+    upgradeSocketPath: join(root, "actor-upgrade.sock"),
+  };
+  const runtime = createWorkerdRuntime({
+    root,
+    isReady: () => true,
+    actorForwardSockets: [socketMapping],
+  });
+  if (!runtime.publish) throw new Error("weighted publication unavailable");
+  await runtime.publish("site", withActors);
+  const rendered = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(rendered).toContain('name = "__TAKOSERVER_ACTOR_HTTP_00000"');
+  expect(rendered).toContain('name = "__TAKOSERVER_ACTOR_UPGRADE_00000"');
+  expect(rendered).toContain(`unix:${socketMapping.httpSocketPath}`);
+  expect(rendered).toContain(`unix:${socketMapping.upgradeSocketPath}`);
+  const selected = await readWorkerdSelectedActiveVersion(root, "site", {
+    expectedWorkerResourceUid: publication.workerResourceUid,
+    basisPoint: 0,
+  });
+  expect(selected?.site.actorForward).toEqual(actorForward);
+  const withoutHostSockets = createWorkerdRuntime({
+    root: join(root, "unmapped"),
+    isReady: () => true,
+  });
+  if (!withoutHostSockets.publish) throw new Error("weighted publication unavailable");
+  await expect(withoutHostSockets.publish("site", withActors)).rejects.toThrow(
+    "Actor forward Host socket unavailable",
+  );
+});
+
+test("restore rejects unknown legacy fields and malformed Actor forward authority", async () => {
+  const actorForward = {
+    schema: "takoserver.selfhost-actor-forward@v1",
+    bindings: [
+      {
+        publicName: "ROOM",
+        tenantId: "tenant-1",
+        namespaceResourceUid: "uid-actor-namespace-1",
+        httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+        upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+        token: "a".repeat(64),
+      },
+    ],
+  } as const;
+  const actorForwardSockets = [
+    {
+      tenantId: "tenant-1",
+      namespaceResourceUid: "uid-actor-namespace-1",
+      httpSocketPath: join(root, "actor-http.sock"),
+      upgradeSocketPath: join(root, "actor-upgrade.sock"),
+    },
+  ];
+  const runtime = createWorkerdRuntime({ root, isReady: () => true, actorForwardSockets });
+  for (const name of ["good", "unknown", "malformed"]) {
+    await runtime.write(
+      name,
+      {
+        directory: name,
+        mainModule: "index.js",
+        hostEntrypoint: HOST_ENTRYPOINT,
+        hostnames: [`${name}.localhost`],
+        actorForward,
+      },
+      MODULES,
+      undefined,
+      new Map([
+        [HOST_ENTRYPOINT, new TextEncoder().encode('export { default } from "./index.js";')],
+      ]),
+    );
+  }
+  const unknownPath = join(root, "workers", "unknown", "takoserver-site.json");
+  const unknown = JSON.parse(await readFile(unknownPath, "utf8")) as Record<string, unknown>;
+  unknown.unspecifiedCapability = true;
+  await writeFile(unknownPath, JSON.stringify(unknown));
+
+  const malformedPath = join(root, "workers", "malformed", "takoserver-site.json");
+  const malformed = JSON.parse(await readFile(malformedPath, "utf8")) as {
+    actorForward: { bindings: Array<{ token: string }> };
+  };
+  const malformedBinding = malformed.actorForward.bindings[0];
+  if (!malformedBinding) throw new Error("Actor forward fixture unavailable");
+  malformedBinding.token = "untrusted";
+  await writeFile(malformedPath, JSON.stringify(malformed));
+
+  const restarted = createWorkerdRuntime({ root, isReady: () => true, actorForwardSockets });
+  expect(await restarted.restore()).toEqual(["good"]);
+  const config = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
+  expect(config).toContain('name = "good"');
+  expect(config).not.toContain('name = "unknown"');
+  expect(config).not.toContain('name = "malformed"');
+});
+
 test("rejects a bad later weighted variant before staging any publication", async () => {
   const runtime = createWorkerdRuntime({ root, isReady: () => true });
   if (!runtime.publish) throw new Error("weighted publication is unavailable");

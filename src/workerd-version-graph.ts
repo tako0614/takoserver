@@ -24,7 +24,24 @@ import {
   type SelfhostWorkerBindingDescriptor,
   selfhostWorkerEntrypointSource,
 } from "./providers/selfhost-worker-wrapper.ts";
-import type { WorkerdModuleMediaType, WorkerdSite } from "./workerd-runtime.ts";
+import {
+  renderSelfhostActorForwardRuntimeModuleSource,
+  selfhostActorForwardEntrypointSource,
+} from "./selfhost-actor-forward-worker-wrapper.ts";
+import type {
+  WorkerdActorForward,
+  WorkerdActorForwardBinding,
+  WorkerdModuleMediaType,
+  WorkerdSite,
+} from "./workerd-runtime.ts";
+
+const SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE =
+  "__takoserver-selfhost-actor-forward-entrypoint.js" as const;
+const SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE =
+  "__takoserver-selfhost-actor-forward-runtime.js" as const;
+const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const ACTOR_FORWARD_RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
+const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
 
 type WorkerdDataBindingKind =
   | typeof SELFHOST_WORKER_EDGE_KV_BINDING_KIND
@@ -72,6 +89,13 @@ export interface WorkerdVersionGraphInput {
     readonly bindings: readonly WorkerdDataBinding[];
   };
   readonly serviceBindings: readonly WorkerdServiceBinding[];
+  /** Unpublished opt-in forwarding facades for exact Host-owned Actor namespaces. */
+  readonly actorForward?: readonly {
+    readonly publicName: string;
+    readonly tenantId: string;
+    readonly namespaceResourceUid: string;
+    readonly token: string;
+  }[];
   readonly hostnames: readonly string[];
   readonly generation?: string;
   readonly workerResourceUid?: string;
@@ -136,6 +160,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const environment = projectEnvironment(input.environment);
   const dataPlane = projectDataPlane(input.dataPlane);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
+  const actorForward = projectActorForward(input.actorForward);
   if (serviceBindings.length > 0 && input.workerResourceUid === undefined) invalid();
   const eventToken = projectOpaqueToken(input.eventToken);
 
@@ -158,7 +183,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const wrapperSource = selfhostWorkerEntrypointSource({
     originalMainModule: input.mainModule,
     declaredHandlers: input.declaredHandlers,
-    bindings,
+    bindings: [
+      ...bindings,
+      ...(actorForward?.bindings.map((binding) => ({
+        name: binding.publicName,
+        type: "json" as const,
+      })) ?? []),
+    ],
     publication: input.readiness.publication,
     probeHostname: input.readiness.probeHostname,
     ...(eventToken === undefined ? {} : { events: true }),
@@ -166,10 +197,33 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
 
   const preludeModule = selfhostWorkerPreludeModuleName(input.mainModule);
   const encoder = new TextEncoder();
+  const hostEntrypoint =
+    actorForward === undefined
+      ? SELFHOST_WORKER_ENTRYPOINT_MODULE
+      : SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE;
   const hostModules = new Map<string, Uint8Array>([
     [SELFHOST_WORKER_ENTRYPOINT_MODULE, encoder.encode(wrapperSource)],
     [preludeModule, encoder.encode(selfhostWorkerPreludeSource())],
   ]);
+  if (actorForward !== undefined) {
+    hostModules.set(
+      SELFHOST_ACTOR_FORWARD_ENTRYPOINT_MODULE,
+      encoder.encode(
+        selfhostActorForwardEntrypointSource({
+          runtimeModule: SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE,
+          innerModule: SELFHOST_WORKER_ENTRYPOINT_MODULE,
+          bindings: actorForward.bindings,
+          queue: input.declaredHandlers.includes("queue"),
+          scheduled: input.declaredHandlers.includes("scheduled"),
+          ...(eventToken === undefined ? {} : { events: true }),
+        }),
+      ),
+    );
+    hostModules.set(
+      SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE,
+      encoder.encode(renderSelfhostActorForwardRuntimeModuleSource()),
+    );
+  }
   if (dataPlane !== undefined) {
     hostModules.set(
       SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -186,8 +240,13 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const site: WorkerdSite = {
     directory: input.directory,
     mainModule: input.mainModule,
-    hostEntrypoint: SELFHOST_WORKER_ENTRYPOINT_MODULE,
-    hostModules: [preludeModule],
+    hostEntrypoint,
+    hostModules: [
+      preludeModule,
+      ...(actorForward === undefined
+        ? []
+        : [SELFHOST_WORKER_ENTRYPOINT_MODULE, SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE]),
+    ],
     hostnames: [...input.hostnames],
     modules: Object.keys(moduleMediaTypes).filter((name) => name !== input.mainModule),
     moduleMediaTypes,
@@ -199,6 +258,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           fetchHandler: input.declaredHandlers.includes("fetch"),
         }),
     ...(services.length === 0 ? {} : { serviceBindings: services }),
+    ...(actorForward === undefined ? {} : { actorForward }),
     ...(assets === undefined ? {} : { assets: assets.configuration }),
     ...(environment.vars.length === 0 ? {} : { vars: environment.vars }),
     ...(dataPlane === undefined
@@ -327,6 +387,43 @@ function projectServiceBindings(
     });
   }
   return copied;
+}
+
+function projectActorForward(
+  actorForward: WorkerdVersionGraphInput["actorForward"],
+): WorkerdActorForward | undefined {
+  if (actorForward === undefined) return undefined;
+  if (!Array.isArray(actorForward) || actorForward.length === 0 || actorForward.length > 32)
+    invalid();
+  const names = new Set<string>();
+  const bindings: WorkerdActorForwardBinding[] = actorForward.map((binding, index) => {
+    if (!isRecord(binding)) invalid();
+    if (
+      typeof binding.publicName !== "string" ||
+      !ACTOR_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
+      names.has(binding.publicName) ||
+      typeof binding.tenantId !== "string" ||
+      binding.tenantId.length === 0 ||
+      binding.tenantId.length > 256 ||
+      binding.tenantId.includes("\u0000") ||
+      typeof binding.namespaceResourceUid !== "string" ||
+      !ACTOR_FORWARD_RESOURCE_UID.test(binding.namespaceResourceUid) ||
+      typeof binding.token !== "string" ||
+      !ACTOR_FORWARD_TOKEN.test(binding.token)
+    ) {
+      invalid();
+    }
+    names.add(binding.publicName);
+    return {
+      publicName: binding.publicName,
+      tenantId: binding.tenantId,
+      namespaceResourceUid: binding.namespaceResourceUid,
+      httpService: `__TAKOSERVER_ACTOR_HTTP_${index.toString(10).padStart(5, "0")}`,
+      upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${index.toString(10).padStart(5, "0")}`,
+      token: binding.token,
+    };
+  });
+  return { schema: "takoserver.selfhost-actor-forward@v1", bindings };
 }
 
 function projectOpaqueToken(value: string | undefined): string | undefined {

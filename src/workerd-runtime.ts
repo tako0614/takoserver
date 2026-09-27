@@ -93,6 +93,28 @@ interface WorkerdAssetManifestEntry {
   readonly digest: `sha256:${string}`;
 }
 
+export interface WorkerdActorForwardBinding {
+  readonly publicName: string;
+  readonly tenantId: string;
+  readonly namespaceResourceUid: string;
+  readonly httpService: string;
+  readonly upgradeService: string;
+  /** Host-private bearer already embedded in the generated outer wrapper. */
+  readonly token: string;
+}
+
+export interface WorkerdActorForward {
+  readonly schema: "takoserver.selfhost-actor-forward@v1";
+  readonly bindings: readonly WorkerdActorForwardBinding[];
+}
+
+export interface WorkerdActorForwardSocket {
+  readonly tenantId: string;
+  readonly namespaceResourceUid: string;
+  readonly httpSocketPath: string;
+  readonly upgradeSocketPath: string;
+}
+
 interface WorkerdAssetManifest {
   readonly storageLayout: typeof WORKERD_ASSET_STORAGE_LAYOUT;
   readonly notFoundHandling: "none" | "single-page-application";
@@ -136,6 +158,8 @@ export interface WorkerdSite {
   readonly fetchHandler?: boolean;
   /** Logical fetch bindings; target selection never consults a request URL. */
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
+  /** Unpublished Host-only Actor forward projection; never a worker.service binding. */
+  readonly actorForward?: WorkerdActorForward;
   /**
    * How the Host-owned HTTP router composes this script with its asset lookup.
    * Absent means it declared no assets and public traffic reaches the script
@@ -410,6 +434,8 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
+  /** Current Host broker listeners, matched by exact tenant and Actor namespace UID. */
+  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -434,6 +460,7 @@ interface Manifest {
   readonly workerResourceUid?: string;
   readonly fetchHandler?: boolean;
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
+  readonly actorForward?: WorkerdActorForward;
   readonly assets?: WorkerdAssetManifest;
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
@@ -543,6 +570,7 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
+  const actorForwardSockets = validActorForwardSockets(options.actorForwardSockets);
   const serviceSocketDirectory = options.serviceBindingSocketDirectory;
   if (serviceSocketDirectory !== undefined) {
     validPrivateSocketDirectory(serviceSocketDirectory);
@@ -769,6 +797,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         internalReadinessCapability,
         dataPlaneAddress,
         privateServiceGraph(published),
+        actorForwardSockets,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -783,7 +812,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     // cannot prove serving truth, but `has()` will still fail closed unless its
     // composition supplies a live `isReady` probe.
     if (options.onReload === undefined) return;
-    const expected = publishedGraphIdentity(published, privateServiceGraph(published));
+    const expected = publishedGraphIdentity(
+      published,
+      privateServiceGraph(published),
+      actorForwardSockets,
+    );
     const deadline = Date.now() + 5_000;
     for (;;) {
       let confirmed = false;
@@ -1308,6 +1341,14 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       if (serviceBindings.length > 0 && workerResourceUid === undefined) {
         throw new Error("unusable worker service binding");
       }
+      const actorForward =
+        site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+      validActorForwardCollision(
+        actorForward,
+        validBindings(site.vars ?? []),
+        serviceBindings,
+        hostEntrypoint,
+      );
       // Replaced rather than merged: a module the new bundle does not contain
       // must not survive from the old one, where it would be loadable and
       // wrong.
@@ -1358,6 +1399,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
           ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
           ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
+          ...(actorForward === undefined ? {} : { actorForward }),
           ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
           ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
           ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -1563,6 +1605,150 @@ const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
 const INTERNAL_SERVICE_BINDING = /^__TAKOSERVER_SELFHOST_SERVICE_[0-9]{5}$/u;
 const SERVICE_UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
+const ACTOR_FORWARD_SCHEMA = "takoserver.selfhost-actor-forward@v1" as const;
+const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
+const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
+  "mainModule",
+  "hostEntrypoint",
+  "hostModules",
+  "moduleStorageLayout",
+  "moduleFiles",
+  "hostnames",
+  "generation",
+  "workerResourceUid",
+  "fetchHandler",
+  "serviceBindings",
+  "actorForward",
+  "assets",
+  "vars",
+  "modules",
+  "moduleMediaTypes",
+  "dataPlane",
+  "events",
+]);
+
+function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): string {
+  return `__TAKOSERVER_ACTOR_${kind}_${index.toString(10).padStart(5, "0")}`;
+}
+
+function actorForwardIdentity(tenantId: string, namespaceResourceUid: string): string {
+  return JSON.stringify([tenantId, namespaceResourceUid]);
+}
+
+function validActorForward(value: unknown): WorkerdActorForward {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "bindings,schema"
+  )
+    throw new Error("unusable Actor forward graph");
+  const candidate = value as WorkerdActorForward;
+  if (
+    candidate.schema !== ACTOR_FORWARD_SCHEMA ||
+    !Array.isArray(candidate.bindings) ||
+    candidate.bindings.length === 0 ||
+    candidate.bindings.length > 32
+  )
+    throw new Error("unusable Actor forward graph");
+  const names = new Set<string>();
+  const bindings = candidate.bindings.map((binding, index) => {
+    if (
+      typeof binding !== "object" ||
+      binding === null ||
+      Array.isArray(binding) ||
+      Object.keys(binding).sort().join(",") !==
+        "httpService,namespaceResourceUid,publicName,tenantId,token,upgradeService" ||
+      typeof binding.publicName !== "string" ||
+      !ACTOR_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
+      names.has(binding.publicName) ||
+      typeof binding.tenantId !== "string" ||
+      binding.tenantId.length === 0 ||
+      binding.tenantId.length > 256 ||
+      binding.tenantId.includes("\u0000") ||
+      typeof binding.namespaceResourceUid !== "string" ||
+      !RESOURCE_UID.test(binding.namespaceResourceUid) ||
+      binding.httpService !== actorForwardServiceName("HTTP", index) ||
+      binding.upgradeService !== actorForwardServiceName("UPGRADE", index) ||
+      typeof binding.token !== "string" ||
+      !ACTOR_FORWARD_TOKEN.test(binding.token)
+    )
+      throw new Error("unusable Actor forward graph");
+    names.add(binding.publicName);
+    capnpText(binding.publicName);
+    capnpText(binding.tenantId);
+    capnpText(binding.namespaceResourceUid);
+    return { ...binding };
+  });
+  return { schema: ACTOR_FORWARD_SCHEMA, bindings };
+}
+
+function validActorForwardSockets(
+  value: WorkerdRuntimeOptions["actorForwardSockets"],
+): ReadonlyMap<string, WorkerdActorForwardSocket> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value) || value.length > 128)
+    throw new Error("unusable Actor forward socket graph");
+  const selected = new Map<string, WorkerdActorForwardSocket>();
+  const paths = new Set<string>();
+  for (const candidate of value) {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !==
+        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" ||
+      typeof candidate.tenantId !== "string" ||
+      candidate.tenantId.length === 0 ||
+      candidate.tenantId.length > 256 ||
+      candidate.tenantId.includes("\u0000") ||
+      typeof candidate.namespaceResourceUid !== "string" ||
+      !RESOURCE_UID.test(candidate.namespaceResourceUid)
+    )
+      throw new Error("unusable Actor forward socket graph");
+    for (const path of [candidate.httpSocketPath, candidate.upgradeSocketPath]) {
+      if (
+        typeof path !== "string" ||
+        !isAbsolute(path) ||
+        resolve(path) !== path ||
+        path.includes("\u0000") ||
+        Buffer.byteLength(path) > 100 ||
+        paths.has(path)
+      )
+        throw new Error("unusable Actor forward socket graph");
+      paths.add(path);
+    }
+    const identity = actorForwardIdentity(candidate.tenantId, candidate.namespaceResourceUid);
+    if (selected.has(identity)) throw new Error("unusable Actor forward socket graph");
+    selected.set(identity, { ...candidate });
+  }
+  return selected;
+}
+
+function validActorForwardCollision(
+  actorForward: WorkerdActorForward | undefined,
+  vars: readonly WorkerdBinding[],
+  serviceBindings: readonly WorkerdServiceBinding[],
+  hostEntrypoint: string | undefined,
+): void {
+  if (!actorForward) return;
+  if (hostEntrypoint === undefined) throw new Error("unusable Actor forward entrypoint");
+  const names = new Set([
+    INTERNAL_READINESS_CAPABILITY_BINDING,
+    DATA_SERVICE_BINDING,
+    ...vars.map((binding) => binding.name),
+    ...serviceBindings.map((binding) => binding.name),
+  ]);
+  for (const binding of actorForward.bindings) {
+    if (
+      names.has(binding.publicName) ||
+      names.has(binding.httpService) ||
+      names.has(binding.upgradeService)
+    )
+      throw new Error("unusable Actor forward binding collision");
+  }
+}
 
 function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBinding[] {
   const seen = new Set<string>();
@@ -2089,6 +2275,14 @@ async function prepareWorkerdSite(
   if (serviceBindings.length > 0 && workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
+  const actorForward =
+    site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+  validActorForwardCollision(
+    actorForward,
+    validBindings(site.vars ?? []),
+    serviceBindings,
+    hostEntrypoint,
+  );
   return {
     manifest: {
       mainModule: site.mainModule,
@@ -2106,6 +2300,7 @@ async function prepareWorkerdSite(
       ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
       ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
       ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
+      ...(actorForward === undefined ? {} : { actorForward }),
       ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
       ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
       ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -2705,6 +2900,10 @@ async function readValidatedManifest(
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker runtime manifest");
   }
+  // The legacy schema is the same known field set without actorForward. Never
+  // reinterpret an unknown old field as a new capability on restore.
+  if (Object.keys(value).some((key) => !ACTOR_FORWARD_MANIFEST_KEYS.has(key)))
+    throw new Error("unusable worker runtime manifest");
   let manifest = value as Manifest;
   if (
     typeof manifest.mainModule !== "string" ||
@@ -2719,7 +2918,7 @@ async function readValidatedManifest(
   manifest = { ...manifest, moduleFiles };
   const assets = await readPublishedAssetSnapshot(assetRoot, manifest.assets, capture?.assets);
   if (assets) manifest = { ...manifest, assets };
-  validBindings(manifest.vars ?? []);
+  const vars = validBindings(manifest.vars ?? []);
   if (manifest.workerResourceUid !== undefined) {
     validWorkerResourceUid(manifest.workerResourceUid);
   }
@@ -2733,6 +2932,10 @@ async function readValidatedManifest(
   if (serviceBindings.length > 0 && manifest.workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
+  const actorForward =
+    manifest.actorForward === undefined ? undefined : validActorForward(manifest.actorForward);
+  validActorForwardCollision(actorForward, vars, serviceBindings, manifest.hostEntrypoint);
+  if (actorForward) manifest = { ...manifest, actorForward };
   if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
   if (manifest.events !== undefined) validEventGate(manifest.events);
   return manifest;
@@ -3146,6 +3349,14 @@ export async function readWorkerdSelectedActiveVersion(
               unavailableToken: binding.unavailableToken,
             })),
           }),
+      ...(manifest.actorForward === undefined
+        ? {}
+        : {
+            actorForward: {
+              schema: manifest.actorForward.schema,
+              bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
+            },
+          }),
       ...(manifest.assets === undefined
         ? {}
         : {
@@ -3335,6 +3546,14 @@ export async function readWorkerdActiveActorGraph(
         ...(manifest.serviceBindings === undefined
           ? {}
           : { serviceBindings: manifest.serviceBindings.map((binding) => ({ ...binding })) }),
+        ...(manifest.actorForward === undefined
+          ? {}
+          : {
+              actorForward: {
+                schema: manifest.actorForward.schema,
+                bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
+              },
+            }),
         ...(manifest.vars === undefined
           ? {}
           : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
@@ -3596,9 +3815,46 @@ function logicalEventService(entry: PublishedDeployment): string | null {
   return variant?.manifest.events ? `${variant.name}-selfhost-events` : null;
 }
 
+interface ResolvedActorForwardService {
+  readonly httpBinding: string;
+  readonly upgradeBinding: string;
+  readonly httpService: string;
+  readonly upgradeService: string;
+  readonly httpSocketPath: string;
+  readonly upgradeSocketPath: string;
+}
+
+function resolveActorForwardServices(
+  published: readonly PublishedDeployment[],
+  sockets: ReadonlyMap<string, WorkerdActorForwardSocket>,
+): ReadonlyMap<string, readonly ResolvedActorForwardService[]> {
+  const resolved = new Map<string, readonly ResolvedActorForwardService[]>();
+  for (const variant of published.flatMap((deployment) => deployment.variants)) {
+    if (variant.manifest.actorForward === undefined) continue;
+    const actorForward = validActorForward(variant.manifest.actorForward);
+    const services = actorForward.bindings.map((binding, index) => {
+      const current = sockets.get(
+        actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid),
+      );
+      if (!current) throw new Error("Actor forward Host socket unavailable");
+      return {
+        httpBinding: binding.httpService,
+        upgradeBinding: binding.upgradeService,
+        httpService: `${variant.name}-actor-http-${index}`,
+        upgradeService: `${variant.name}-actor-upgrade-${index}`,
+        httpSocketPath: current.httpSocketPath,
+        upgradeSocketPath: current.upgradeSocketPath,
+      };
+    });
+    resolved.set(variant.name, services);
+  }
+  return resolved;
+}
+
 function publishedGraphIdentity(
   published: readonly PublishedDeployment[],
   privateServices?: PrivateServiceGraph,
+  actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -3630,6 +3886,12 @@ function publishedGraphIdentity(
         routers: [...privateServices.bindings.keys()],
       }),
     );
+  }
+  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  if (actorServices.size > 0) {
+    hash
+      .update("\u0000actor-forward-sockets\u0000")
+      .update(JSON.stringify([...actorServices.entries()]));
   }
   return hash.digest("hex");
 }
@@ -3687,9 +3949,11 @@ function renderConfig(
   internalReadinessCapability = "",
   dataPlaneAddress?: string,
   privateServices?: PrivateServiceGraph,
+  actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
-  const graphIdentity = publishedGraphIdentity(published, privateServices);
+  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  const graphIdentity = publishedGraphIdentity(published, privateServices, actorForwardSockets);
   const services = variants
     .map((entry) => {
       const bindings = [
@@ -3705,6 +3969,10 @@ function renderConfig(
           (binding) =>
             `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
         ),
+        ...(actorServices.get(entry.name) ?? []).flatMap((binding) => [
+          `(name = ${capnpText(binding.httpBinding)}, service = ${capnpText(binding.httpService)})`,
+          `(name = ${capnpText(binding.upgradeBinding)}, service = ${capnpText(binding.upgradeService)})`,
+        ]),
         ...validBindings(entry.manifest.vars ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -3731,6 +3999,15 @@ function renderConfig(
     )
   ),`;
     })
+    .join("\n");
+
+  const actorExternalServices = [...actorServices.values()]
+    .flatMap((bindings) =>
+      bindings.flatMap((binding) => [
+        `  (name = ${capnpText(binding.httpService)}, external = (address = ${capnpText(`unix:${binding.httpSocketPath}`)}, http = ())),`,
+        `  (name = ${capnpText(binding.upgradeService)}, external = (address = ${capnpText(`unix:${binding.upgradeSocketPath}`)}, http = (style = proxy))),`,
+      ]),
+    )
     .join("\n");
 
   // Absolute, because a `disk` path is resolved against the process's working
@@ -3992,7 +4269,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

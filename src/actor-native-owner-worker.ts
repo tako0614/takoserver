@@ -70,6 +70,7 @@ const SafeEncodeURIComponent = encodeURIComponent;
 const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
 const SafeArrayIsArray = Array.isArray;
+const SafeArrayIndexOf = Array.prototype.indexOf;
 const SafeIsSafeInteger = Number.isSafeInteger;
 const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
@@ -232,6 +233,9 @@ interface SocketRecord {
   status: "provisional" | "transport-pending" | "live" | "closed";
   reservationBearer?: string | undefined;
   reservationExpiresAt?: number | undefined;
+  reservationGenerationKey?: string | undefined;
+  reservationEpoch?: string | undefined;
+  reservationVariantKey?: string | undefined;
   socket?: NativeActorWebSocket;
 }
 
@@ -241,6 +245,9 @@ interface SocketAttachment {
   readonly attachment: string | null;
   readonly reservationBearer?: string | undefined;
   readonly reservationExpiresAt?: number | undefined;
+  readonly reservationGenerationKey?: string | undefined;
+  readonly reservationEpoch?: string | undefined;
+  readonly reservationVariantKey?: string | undefined;
 }
 
 function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
@@ -255,7 +262,17 @@ function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
       (typeof record.reservationBearer !== "string" ||
         !/^[a-f0-9]{64}$/u.test(record.reservationBearer))) ||
     (record.reservationExpiresAt !== undefined && !alarmTime(record.reservationExpiresAt)) ||
-    (record.reservationBearer === undefined) !== (record.reservationExpiresAt === undefined)
+    (record.reservationGenerationKey !== undefined &&
+      !/^[a-f0-9]{64}$/u.test(record.reservationGenerationKey)) ||
+    (record.reservationEpoch !== undefined &&
+      (typeof record.reservationEpoch !== "string" || record.reservationEpoch.length === 0)) ||
+    (record.reservationVariantKey !== undefined &&
+      (typeof record.reservationVariantKey !== "string" ||
+        record.reservationVariantKey.length === 0)) ||
+    (record.reservationBearer === undefined) !== (record.reservationExpiresAt === undefined) ||
+    (record.reservationBearer === undefined) !== (record.reservationGenerationKey === undefined) ||
+    (record.reservationBearer === undefined) !== (record.reservationEpoch === undefined) ||
+    (record.reservationBearer === undefined) !== (record.reservationVariantKey === undefined)
   )
     return null;
   return record as SocketAttachment;
@@ -709,6 +726,9 @@ export function createActorNativeOwner(
           status: metadata.reservationBearer === undefined ? "live" : "transport-pending",
           reservationBearer: metadata.reservationBearer,
           reservationExpiresAt: metadata.reservationExpiresAt,
+          reservationGenerationKey: metadata.reservationGenerationKey,
+          reservationEpoch: metadata.reservationEpoch,
+          reservationVariantKey: metadata.reservationVariantKey,
           socket,
         };
         this.sockets.set(socketId, record);
@@ -725,6 +745,9 @@ export function createActorNativeOwner(
           ? {
               reservationBearer: record.reservationBearer,
               reservationExpiresAt: record.reservationExpiresAt,
+              reservationGenerationKey: record.reservationGenerationKey,
+              reservationEpoch: record.reservationEpoch,
+              reservationVariantKey: record.reservationVariantKey,
             }
           : {}),
       } satisfies SocketAttachment);
@@ -821,6 +844,26 @@ export function createActorNativeOwner(
           await this.reconcile();
           return new Response(null, { status: action === "abandon" ? 204 : 404 });
         }
+        // The Host may have replaced or revoked this Actor graph while the
+        // outer Worker was deciding whether to hand off its native 101. A
+        // provisional socket is never promoted under a different graph.
+        let graph: ActorOwnerGraph;
+        try {
+          graph = await this.currentGraph();
+        } catch {
+          this.discardPending(record);
+          await this.reconcile();
+          return new Response(null, { status: 503 });
+        }
+        if (
+          record.reservationGenerationKey !== graph.generationKey ||
+          record.reservationEpoch !== graph.epoch ||
+          SafeReflectApply(SafeArrayIndexOf, graph.variantKeys, [record.reservationVariantKey]) < 0
+        ) {
+          this.discardPending(record);
+          await this.reconcile();
+          return new Response(null, { status: 404 });
+        }
         try {
           this.requireStorage().sql.exec(
             "DELETE FROM actor_socket_reservations WHERE socket_id = ? AND bearer = ?",
@@ -830,6 +873,9 @@ export function createActorNativeOwner(
           record.status = "live";
           record.reservationBearer = undefined;
           record.reservationExpiresAt = undefined;
+          record.reservationGenerationKey = undefined;
+          record.reservationEpoch = undefined;
+          record.reservationVariantKey = undefined;
           this.persistSocket(record);
           await this.reconcile();
           for (let index = 0; index < record.queued.length; index += 1)
@@ -1755,6 +1801,13 @@ export function createActorNativeOwner(
         if (upgrade) {
           let server: NativeActorWebSocket | undefined;
           try {
+            const graphAtHandoff = await this.currentGraph();
+            if (
+              graphAtHandoff.generationKey !== currentGraph.generationKey ||
+              graphAtHandoff.epoch !== currentGraph.epoch ||
+              graphAtHandoff.variantKeys[variantIndex] !== variantKey
+            )
+              throw new Error("Actor graph changed before socket handoff");
             if (!this.state.acceptWebSocket || !NativeWebSocketPair)
               throw new Error("Actor socket transport unavailable");
             const pair = new NativeWebSocketPair();
@@ -1787,6 +1840,9 @@ export function createActorNativeOwner(
             upgrade.status = "transport-pending";
             upgrade.reservationBearer = bearer;
             upgrade.reservationExpiresAt = expiresAt;
+            upgrade.reservationGenerationKey = currentGraph.generationKey;
+            upgrade.reservationEpoch = currentGraph.epoch;
+            upgrade.reservationVariantKey = variantKey as string;
             this.persistSocket(upgrade);
             await this.reconcile();
             resolve(

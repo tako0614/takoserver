@@ -176,6 +176,90 @@ test("dynamic owner graph rejects a rollout between selection and child dispatch
   expect(childCalls).toBe(1);
 });
 
+for (const [cause, epoch, variantKeys] of [
+  ["deployment replacement", "replacement-epoch", ["selected"]],
+  ["selected target revocation", "original-epoch", ["other"]],
+] as const)
+  test(`pending socket commit is abandoned after ${cause}`, async () => {
+    const database = new Database(":memory:");
+    const sql = {
+      exec(statement: string, ...params: (string | number | null)[]) {
+        if (statement.startsWith("SELECT"))
+          return database.query(statement).all(...params) as Record<string, unknown>[];
+        database.query(statement).run(...params);
+        return [];
+      },
+    };
+    const Owner = createActorNativeOwner(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => ({}),
+      async () => ({
+        generationKey: "d".repeat(64),
+        epoch,
+        variantKeys,
+      }),
+    );
+    let closed = false;
+    const owner = new Owner(
+      {
+        facets: { get: () => ({ fetch: async () => new Response() }), abort() {} },
+        storage: { sql, setAlarm() {}, deleteAlarm() {} },
+        waitUntil() {},
+      },
+      { CLASS: {} },
+    );
+    const actorId = "pending-actor";
+    const socketId = "pending-socket";
+    const bearer = "b".repeat(64);
+    const expiresAt = Date.now() + 30_000;
+    sql.exec(
+      "INSERT INTO actor_socket_reservations (socket_id, actor_id, bearer, expires_at) VALUES (?, ?, ?, ?)",
+      socketId,
+      actorId,
+      bearer,
+      expiresAt,
+    );
+    const sockets = (owner as unknown as { sockets: Map<string, unknown> }).sockets;
+    sockets.set(socketId, {
+      socketId,
+      actorId,
+      nonce: "",
+      protocol: "",
+      attachment: null,
+      queued: [],
+      queuedBytes: 0,
+      status: "transport-pending",
+      reservationBearer: bearer,
+      reservationExpiresAt: expiresAt,
+      reservationGenerationKey: "d".repeat(64),
+      reservationEpoch: "original-epoch",
+      reservationVariantKey: "selected",
+      socket: {
+        close() {
+          closed = true;
+        },
+      },
+    });
+    const response = await owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+          "x-takoserver-private-actor-reservation": bearer,
+          "x-takoserver-private-actor-reservation-action": "commit",
+        },
+      }),
+    );
+    expect(response.status).toBe(404);
+    expect(closed).toBe(true);
+    expect(sockets.has(socketId)).toBe(false);
+    expect(sql.exec("SELECT socket_id FROM actor_socket_reservations")).toEqual([]);
+    database.close();
+  });
+
 test("structural WfP owner omits admission and control bearers only in dynamic mode", async () => {
   const graph = { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["selected"] };
   expect(() => createActorNativeOwner("a".repeat(64), undefined, graph)).toThrow();

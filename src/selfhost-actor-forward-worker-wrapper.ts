@@ -1,5 +1,10 @@
 import { SELFHOST_ACTOR_FORWARD_RUNTIME_SOURCE } from "./generated/selfhost-actor-forward-runtime-source.ts";
-import type { SelfhostActorForwardBinding } from "./selfhost-actor-forward-runtime.ts";
+import type { WorkerdActorForwardBinding } from "./workerd-runtime.ts";
+
+type SelfhostActorForwardBinding = Pick<
+  WorkerdActorForwardBinding,
+  "publicName" | "httpService" | "upgradeService" | "token"
+>;
 
 const MODULE = /^[A-Za-z0-9_.][A-Za-z0-9._-]*$/u;
 const BINDING = /^[A-Za-z_$][A-Za-z0-9_$]*$/u;
