@@ -104,7 +104,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0063 lineage and verifies its canonical schema, then creates the
+audited 0001–0064 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
@@ -412,7 +412,7 @@ bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
 `takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0063 migration lineage,
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0064 migration lineage,
 and canonical migrated schema before preparation and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
@@ -1175,7 +1175,7 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0063 names and SHA-256 inventory, so a checkout with unreviewed 0064+
+  0001–0064 names and SHA-256 inventory, so a checkout with unreviewed 0065+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
@@ -1195,7 +1195,7 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes audited 0058–0063 for fresh, explicitly
+The current source includes audited 0058–0064 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
 `--through-migration=0059`, `--through-migration=0060`,
@@ -1330,9 +1330,12 @@ for protected data.
 The no-selector `takoserver-d1-schema` integration lane accepts one further
 standalone transition: the exact audited 0062 prefix with only
 `0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
-must be exactly 0001–0063 with the audited 0063 SHA-256, and the selected D1
+must be exactly 0001–0064 with the audited 0063 SHA-256, and the selected D1
 must have the canonical 0062 application shape. Protected rehearsal and
-production selectors remain capped at 0057; an unreviewed 0064 tail is refused.
+production selectors remain capped at 0057. The audited 0064 Actor-owner
+table has no in-place existing-D1 schema wave in this change. A fresh
+integration storage generation can use the full audited lineage; an unreviewed
+0065 tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and

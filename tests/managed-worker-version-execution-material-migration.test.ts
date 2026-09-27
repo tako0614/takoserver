@@ -135,6 +135,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     ACCEPTED_AUTHORITY_CONTINUITY_MIGRATION,
     "0062_takoform_import_provider_selection.sql",
     "0063_cloudflare_managed_queue_retirement.sql",
+    "0064_cloudflare_managed_actor_owner_claims.sql",
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();

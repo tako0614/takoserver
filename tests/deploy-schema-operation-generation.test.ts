@@ -426,7 +426,7 @@ describe("0060 operation-generation cutover", () => {
             .query("UPDATE d1_migrations SET name = '0059_rogue.sql' WHERE name = ?")
             .run(APPLY_PROVIDER_SELECTION);
         },
-        message: "exact audited source inventory 0001-0063",
+        message: "exact audited source inventory 0001-0064",
       },
       {
         label: "rogue predecessor shape",

@@ -875,7 +875,7 @@ function assertCompleteDatabase(
   if (JSON.stringify(state.applied) !== JSON.stringify(expectedMigrations)) {
     throw completeDatabaseReadbackError(
       phase,
-      "does not contain the exact audited 0001-0063 lineage",
+      "does not contain the exact audited 0001-0064 lineage",
       JSON.stringify({ databaseId, expectedMigrations, appliedMigrations: state.applied }),
     );
   }

@@ -183,7 +183,7 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     try {
       expect(await f.invoke("apply")).toMatchObject({
         pendingMigrations: [RETIREMENT],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
         managedQueueRetirementCutover: { status: "ready" },
         providerAcknowledgement: "acknowledged",
       });
@@ -210,7 +210,7 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     const f = fixture({ lostAck: true });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
@@ -221,16 +221,16 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     }
   });
 
-  test("refuses an unreviewed 0064 tail instead of adopting it", async () => {
+  test("refuses an unreviewed 0065 tail instead of adopting it", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0064_unreviewed_extension.sql"),
+      join(unreviewed, "0065_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0063");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0064");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();

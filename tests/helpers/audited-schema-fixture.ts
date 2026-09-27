@@ -23,13 +23,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * VectorIndex SQL store, the 0057 execution-material tables, 0058 managed
  * Worker domain receipts, 0059 apply provider selection, 0060 operation
  * generation, 0061 accepted authority continuity, and 0062 import provider
- * selection, followed by 0063 managed Queue retirement fencing. */
+ * selection, 0063 managed Queue retirement fencing, and 0064 staged Actor
+ * owner claims. */
 export function copyCurrentSchemaFixture(directory: string): string {
   if (
-    MIGRATIONS.length !== 63 ||
-    MIGRATIONS.at(-1)?.name !== "0063_cloudflare_managed_queue_retirement.sql"
+    MIGRATIONS.length !== 64 ||
+    MIGRATIONS.at(-1)?.name !== "0064_cloudflare_managed_actor_owner_claims.sql"
   ) {
-    throw new Error("current schema fixture requires the audited 0001-0063 lineage");
+    throw new Error("current schema fixture requires the audited 0001-0064 lineage");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {

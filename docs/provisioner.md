@@ -26,6 +26,18 @@ space for the transaction's temporary copies; an older build refuses a database
 with this newer lineage. This local upgrade is not qualification for a
 protected Cloudflare D1 upgrade; see the [0058 deploy boundary](deploy.md#0058-domain-receipt-schema-protected-wave-unavailable).
 
+Migration 0064 adds a separate, forward-only `cloudflare_managed_actor_owner_claims`
+table for the private WfP Actor owner publisher. An ActorNamespace UID, not a
+Worker Version, holds its stable identity. The existing Worker receipt kind and
+its applied migration history are unchanged: Actor claims have a one-shot
+`claimed → upload_authorized → committed` lifecycle rather than Worker
+replacement/delete semantics. The private adapter may authorize a single
+native PUT only after exact script absence, and may settle an authorized claim
+after a lost acknowledgement through exact native readback without another
+PUT. This schema does not admit Actor Resources to the public Host or enable
+production Actor bindings. Applying it to a protected D1 target remains a
+separate reviewed operator action, not a consequence of this source change.
+
 ## Ordinary stable mode
 
 The normal `bun src/entry-bun.ts` process uses the stable self-host Provider3
