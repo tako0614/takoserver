@@ -50,6 +50,17 @@ test("native per-ID owner releases failed head and strips private identity befor
   await Promise.all(f.retained);
 });
 
+test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {
+  let calls = 0;
+  const f = fixture(async () => {
+    if (calls++ === 0) return { status: 101, body: null } as Response;
+    return new Response("ordinary");
+  });
+  await expect(f.owner.fetch(f.request())).rejects.toThrow("Actor socket reservation unavailable");
+  expect(await (await f.owner.fetch(f.request())).text()).toBe("ordinary");
+  await Promise.all(f.retained);
+});
+
 test("native per-ID owner holds next turn until body cancellation reaches the application stream", async () => {
   let calls = 0;
   let cancelled = false;

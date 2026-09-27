@@ -342,7 +342,18 @@ export function createNativeActorExecution(options: {
   readonly env: Readonly<Record<string, unknown>>;
   readonly storage: NativeActorStorage;
   readonly alarm: NativeActorAlarmPort;
-}): { fetch(request: Request): Promise<Response>; alarm(signal: AbortSignal): Promise<void> } {
+  /** Host-created broker facade. The adapter never creates native sockets. */
+  readonly sockets?: Readonly<Record<string, unknown>>;
+}): {
+  fetch(request: Request): Promise<Response>;
+  alarm(signal: AbortSignal): Promise<void>;
+  socketMessage(socket: object, data: string | Uint8Array, signal: AbortSignal): Promise<void>;
+  socketClose(
+    socket: object,
+    event: { readonly code: number; readonly reason: string; readonly wasClean: boolean },
+    signal: AbortSignal,
+  ): Promise<void>;
+} {
   const unavailable = async (): Promise<never> => {
     throw new ActorRuntimeError("backend_unavailable");
   };
@@ -379,7 +390,9 @@ export function createNativeActorExecution(options: {
       id: options.id,
       storage: createSqlFacade(options.storage) as unknown as Readonly<Record<string, unknown>>,
       alarm,
-      sockets: Object.freeze({ accept: unavailable, get: unavailable, list: unavailable }),
+      sockets:
+        options.sockets ??
+        Object.freeze({ accept: unavailable, get: unavailable, list: unavailable }),
     }),
   });
   return Object.freeze({
@@ -395,6 +408,20 @@ export function createNativeActorExecution(options: {
     },
     async alarm(signal: AbortSignal): Promise<void> {
       await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));
+    },
+    async socketMessage(
+      socket: object,
+      data: string | Uint8Array,
+      signal: AbortSignal,
+    ): Promise<void> {
+      await execution.dispatch({ kind: "socketMessage", socket, data }, createActorTurn(signal));
+    },
+    async socketClose(
+      socket: object,
+      event: { readonly code: number; readonly reason: string; readonly wasClean: boolean },
+      signal: AbortSignal,
+    ): Promise<void> {
+      await execution.dispatch({ kind: "socketClose", socket, event }, createActorTurn(signal));
     },
   });
 }

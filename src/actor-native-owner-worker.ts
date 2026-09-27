@@ -576,6 +576,10 @@ export function createActorNativeOwner(
           ]);
           if (headTimer) clearTimeout(headTimer);
           headTimer = undefined;
+          // Until a broker-owned, invocation-bound reservation is transferred,
+          // a native 101 (including an application-created WebSocketPair) must
+          // never escape this facet as an Actor upgrade.
+          if (response.status === 101) throw new Error("Actor socket reservation unavailable");
           if (response.body === null) {
             resolve(response);
           } else {

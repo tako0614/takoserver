@@ -102,6 +102,8 @@ test.skipIf(binary === undefined)(
         signal: new AbortController().signal,
         admitAlarm: async () => null,
         completeAlarm() {},
+        admitSocket: async () => null,
+        completeSocket() {},
       };
       namespace = await openWorkerdActorNamespace(binary, options);
       await namespace.close();

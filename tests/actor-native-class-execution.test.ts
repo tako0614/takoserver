@@ -24,6 +24,67 @@ function storage(database: Database): NativeActorStorage {
   };
 }
 
+test("native adapter dispatches broker-created socket events with the exact facade and turn", async () => {
+  const db = new Database(":memory:");
+  const socket = Object.freeze({ id: "opaque-socket" });
+  const sockets = Object.freeze({
+    async get(id: string) {
+      return id === socket.id ? socket : null;
+    },
+    async list() {
+      return [socket];
+    },
+  });
+  const received: unknown[] = [];
+  class SocketActor {
+    constructor(context: { sockets: typeof sockets }) {
+      expect(context.sockets).toBe(sockets);
+    }
+    fetch() {
+      return new Response();
+    }
+    alarm() {}
+    socketMessage(given: object, data: string | Uint8Array, turn: { signal: AbortSignal }) {
+      received.push(["message", given, data, turn.signal]);
+    }
+    socketClose(
+      given: object,
+      event: { code: number; reason: string; wasClean: boolean },
+      turn: { signal: AbortSignal },
+    ) {
+      received.push(["close", given, event, turn.signal]);
+    }
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { SocketActor },
+      exportName: "SocketActor",
+      id: "actor-id",
+      env: {},
+      storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
+      sockets,
+    });
+    const signal = new AbortController().signal;
+    const data = new Uint8Array([0, 1, 255]);
+    const close = { code: 1006, reason: "transport_error", wasClean: false };
+    await actor.socketMessage(socket, data, signal);
+    await actor.socketClose(socket, close, signal);
+    expect(received).toEqual([
+      ["message", socket, data, signal],
+      ["close", socket, close, signal],
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
 test("native class adapter initializes once and exposes SQL and a host-owned alarm facade", async () => {
   const db = new Database(":memory:");
   const events: string[] = [];

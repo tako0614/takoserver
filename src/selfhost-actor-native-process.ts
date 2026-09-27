@@ -25,6 +25,9 @@ export interface WorkerdActorNamespaceOptions {
     readonly leaseId: string;
   } | null>;
   readonly completeAlarm: (leaseId: string) => void;
+  /** Callback admission is a fresh Host decision, never an alarm retry grant. */
+  readonly admitSocket: WorkerdActorNamespaceOptions["admitAlarm"];
+  readonly completeSocket: (leaseId: string) => void;
 }
 
 export interface WorkerdActorNamespace {
@@ -315,6 +318,7 @@ export default {
   let closing: Promise<void> | undefined;
   let verified = false;
   const attempts = createActorAlarmAttemptRegistry(options.completeAlarm);
+  const socketAttempts = createActorAlarmAttemptRegistry(options.completeSocket);
   const validAttemptNonce = (value: unknown): value is string =>
     typeof value === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
@@ -337,17 +341,20 @@ export default {
         }
         const record = value as Record<string, unknown>;
         if (
-          record.action === "complete" &&
+          (record.action === "complete" || record.action === "socket-complete") &&
           validAttemptNonce(record.attemptNonce) &&
           typeof record.deadlineAt === "number" &&
           Number.isSafeInteger(record.deadlineAt)
         ) {
-          attempts.complete(record.attemptNonce, record.deadlineAt);
+          (record.action === "complete" ? attempts : socketAttempts).complete(
+            record.attemptNonce,
+            record.deadlineAt,
+          );
           return new Response(null, { status: 204 });
         }
         if (!verified) return new Response(null, { status: 503 });
         if (
-          record.action !== undefined ||
+          (record.action !== undefined && record.action !== "socket") ||
           typeof record.id !== "string" ||
           !record.id ||
           !validAttemptNonce(record.attemptNonce) ||
@@ -356,12 +363,13 @@ export default {
         ) {
           return new Response(null, { status: 503 });
         }
-        const admissionResult = await attempts.begin(
+        const registry = record.action === "socket" ? socketAttempts : attempts;
+        const admitEvent = record.action === "socket" ? options.admitSocket : options.admitAlarm;
+        const admissionResult = await registry.begin(
           record.id,
           record.attemptNonce,
           record.deadlineAt,
-          (signal) =>
-            options.admitAlarm(record.id as string, record.attemptNonce as string, signal),
+          (signal) => admitEvent(record.id as string, record.attemptNonce as string, signal),
         );
         if (!admissionResult) return new Response(null, { status: 503 });
         if (
@@ -372,7 +380,7 @@ export default {
           !variantKeys.includes(admissionResult.variantKey) ||
           !admissionResult.leaseId
         ) {
-          attempts.complete(record.attemptNonce, record.deadlineAt);
+          registry.complete(record.attemptNonce, record.deadlineAt);
           return new Response(null, { status: 503 });
         }
         return Response.json(

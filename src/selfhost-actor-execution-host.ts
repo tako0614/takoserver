@@ -20,6 +20,7 @@ interface Session {
   readonly epoch: string;
   readonly process: WorkerdActorNamespace;
   readonly alarmLeases: Set<string>;
+  readonly socketLeases: Set<string>;
   active: number;
   readonly idle: Set<() => void>;
   dead: boolean;
@@ -284,7 +285,8 @@ export function createSelfhostActorExecutionHost(options: {
         }
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
-        const admittedAlarm = async (
+        const admitEvent = async (
+          kind: "alarm" | "socket",
           id: string,
           attemptNonce: string,
           gateSignal: AbortSignal,
@@ -294,12 +296,13 @@ export function createSelfhostActorExecutionHost(options: {
           readonly epoch: string;
           readonly leaseId: string;
         } | null> => {
-          // This runs on the private bridge, never on `exclusive`: a native
-          // startup alarm can arrive while activate awaits child readiness.
+          // This runs on a private bridge, never on `exclusive`: a native
+          // startup event can arrive while activate awaits child readiness.
           const session = admittedSession;
           if (
             stopped ||
             !id ||
+            id.includes("\u0000") ||
             !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
               attemptNonce,
             ) ||
@@ -322,7 +325,7 @@ export function createSelfhostActorExecutionHost(options: {
             if (await hasCurrentRealization(graphNow, identity)) scheduleRefresh(current, identity);
             return null;
           }
-          // Entropy is drawn once, at this eligible alarm attempt. A retry
+          // Entropy is drawn once, at this eligible event attempt. A retry
           // draws afresh; neither a stale resident graph nor an exception may
           // silently fall back to another weighted Version.
           const basisPoint = (options.basisPoint ?? (() => randomInt(10_000)))();
@@ -367,7 +370,7 @@ export function createSelfhostActorExecutionHost(options: {
             return null;
           }
           const leaseId = randomBytes(16).toString("hex");
-          session.alarmLeases.add(leaseId);
+          (kind === "alarm" ? session.alarmLeases : session.socketLeases).add(leaseId);
           session.active += 1;
           return {
             variantKey: variant.variantKey,
@@ -383,10 +386,16 @@ export function createSelfhostActorExecutionHost(options: {
             className: graph.namespace.className,
             graph: residentGraph,
             signal,
-            admitAlarm: admittedAlarm,
+            admitAlarm: (id, nonce, gateSignal) => admitEvent("alarm", id, nonce, gateSignal),
             completeAlarm(leaseId) {
               const session = admittedSession;
               if (!session?.alarmLeases.delete(leaseId)) return;
+              release(session);
+            },
+            admitSocket: (id, nonce, gateSignal) => admitEvent("socket", id, nonce, gateSignal),
+            completeSocket(leaseId) {
+              const session = admittedSession;
+              if (!session?.socketLeases.delete(leaseId)) return;
               release(session);
             },
           });
@@ -399,6 +408,7 @@ export function createSelfhostActorExecutionHost(options: {
           epoch: process.epoch,
           process,
           alarmLeases: new Set(),
+          socketLeases: new Set(),
           active: 0,
           idle: new Set(),
           dead: false,
