@@ -85,14 +85,18 @@ export function createCloudflareProviderSurface(input: {
   }
 
   const forms = edgeFormMap(input.forms);
-  const retained = edgeFormMap(input.retainedForms ?? []);
+  // A current authoring selection has one Form per kind; recovery instead
+  // preserves every exact historical identity, including multiple versions.
+  const retained = retainedEdgeForms(input.retainedForms ?? []);
   const suppliedIdentityKinds = new Set(
     input.edgeSupplies?.offerings.map((offering) => offering.formKind) ?? [],
   );
   const offerings: ProviderOffering[] = [];
   const recoveryOfferings: ProviderOffering[] = [];
   const nativeReadbackAuthorities: ProviderNativeReadbackAuthority[] = [];
-  const retainedObjectBucket = retained.get("ObjectBucket");
+  const retainedObjectBuckets = retained.filter(
+    (form) => form.identity.formRef.kind === "ObjectBucket",
+  );
   for (const supply of cloudflareObjects) {
     if (input.edgeSupplies) {
       const objectBucket = requiredForm(forms, "ObjectBucket", "edge.forms.takoform.com");
@@ -104,7 +108,7 @@ export function createCloudflareProviderSurface(input: {
         }),
       );
     }
-    if (retainedObjectBucket) {
+    for (const retainedObjectBucket of retainedObjectBuckets) {
       recoveryOfferings.push(
         edgeProviderOffering(retainedObjectBucket, {
           id: supply.offeringId,
@@ -127,8 +131,9 @@ export function createCloudflareProviderSurface(input: {
         regions: installation.regions.map((region) => region.id),
       }),
     );
-    const retainedForm = retained.get(supply.formKind);
-    if (retainedForm) {
+    for (const retainedForm of retained.filter(
+      (form) => form.identity.formRef.kind === supply.formKind,
+    )) {
       recoveryOfferings.push(
         edgeProviderOffering(retainedForm, {
           id: supply.offeringId,
@@ -160,7 +165,7 @@ export function createCloudflareProviderSurface(input: {
         });
       }
     }
-    for (const form of retained.values()) {
+    for (const form of retained) {
       const kind = form.identity.formRef.kind;
       if (HOST_INTRINSIC_FORM_KINDS.has(kind) || kind === "ObjectBucket") continue;
       // Identity offerings above retain the exact commercial offering id.
@@ -169,7 +174,10 @@ export function createCloudflareProviderSurface(input: {
       // the same authority id.
       if (!CLOUDFLARE_RELATION_FORM_KINDS.has(kind)) continue;
       const offering = edgeProviderOffering(form, {
-        id: `cloudflare.edge.${kind.toLowerCase()}`,
+        id:
+          form.identity.formRef.apiVersion === "edge.forms.takoform.com"
+            ? `cloudflare.edge.stable-v1.${kind.toLowerCase()}`
+            : `cloudflare.edge.${kind.toLowerCase()}`,
       });
       recoveryOfferings.push(offering);
       if (relationReadbackAnchorsPresent(offering.form.kind, suppliedIdentityKinds)) {
@@ -183,7 +191,7 @@ export function createCloudflareProviderSurface(input: {
   }
 
   uniqueIds(offerings, "Cloudflare technical offering");
-  uniqueIds(recoveryOfferings, "Cloudflare recovery offering");
+  uniqueRecoveryIdentities(recoveryOfferings);
   uniqueReadbackAuthorities(nativeReadbackAuthorities);
   return {
     providerInstallationId: installation.id,
@@ -239,6 +247,33 @@ function uniqueExact<T>(values: readonly T[], label: string): T {
 function uniqueIds(offerings: readonly ProviderOffering[], label: string): void {
   const ids = offerings.map((offering) => offering.id);
   if (new Set(ids).size !== ids.length) throw new TypeError(`${label} ids must be unique`);
+}
+
+function retainedEdgeForms(
+  forms: readonly InstalledTakoformForm[],
+): readonly InstalledTakoformForm[] {
+  const result = new Map<string, InstalledTakoformForm>();
+  for (const form of forms) {
+    const ref = form.identity.formRef;
+    if (
+      ref.apiVersion !== "edge.forms.takoform.com" &&
+      ref.apiVersion !== "edge.forms.takoform.com/v1beta1"
+    )
+      continue;
+    const key = [ref.apiVersion, ref.kind, ref.definitionVersion, ref.schemaDigest].join("\u0000");
+    if (result.has(key))
+      throw new TypeError(`mapped retained Takoform Edge Form is ambiguous: ${ref.kind}`);
+    result.set(key, form);
+  }
+  return [...result.values()];
+}
+
+function uniqueRecoveryIdentities(offerings: readonly ProviderOffering[]): void {
+  const keys = offerings.map(({ id, form }) =>
+    [id, form.apiVersion, form.kind, form.definitionVersion, form.schemaDigest].join("\u0000"),
+  );
+  if (new Set(keys).size !== keys.length)
+    throw new TypeError("Cloudflare recovery offering identities must be unique");
 }
 
 function uniqueReadbackAuthorities(authorities: readonly ProviderNativeReadbackAuthority[]): void {

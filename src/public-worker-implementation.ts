@@ -1,4 +1,5 @@
 import { isSha256Digest } from "./json.ts";
+import type { Provider } from "./provider-port.ts";
 import type { PublicFormImplementationIdentity } from "./public-host-identity.ts";
 
 export type {
@@ -12,6 +13,8 @@ import {
   TAKOSERVER_INTRINSIC_HANDLER_KINDS,
 } from "./public-form-runtime.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
+import { sameFormRef } from "./takoform/forms.ts";
+import { selectTakoformCandidates } from "./takoform/forward-candidates.ts";
 import {
   deriveImplementationCatalog,
   exactPublisherFormCandidates,
@@ -22,6 +25,7 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "./takoform/implementation-catalog.ts";
 import type { TakoformOperation } from "./takoform/types.ts";
+import { supportsClassHolderRuntime } from "./takoform/worker-runtime-contract.ts";
 
 const RESOURCE_OPERATION_ORDER = [
   "create",
@@ -41,6 +45,14 @@ const CURRENT_PUBLISHER_FORM_KINDS = new Set(
 export interface PublicFormImplementationConfiguration {
   readonly implementationPayloadDigest: `sha256:${string}`;
   readonly capabilities: TakoformLifecycleCapabilityManifest;
+  /** Explicit source composition, never publication, admission or activation. */
+  readonly candidate?: "actor-forward";
+  /** Real composed technical supply and runtime. Source selection alone is
+   * deliberately insufficient to claim executable Actor support. */
+  readonly actorProvider?: Pick<
+    Provider,
+    "offerings" | "workerClassRuntime" | "apply" | "delete" | "adopt" | "observe"
+  >;
 }
 
 /**
@@ -49,13 +61,18 @@ export interface PublicFormImplementationConfiguration {
  * Target validation separately requires the provider supplies needed to make
  * this exact code-owned manifest truthful.
  */
-export function publicFormCapabilityManifest(): TakoformLifecycleCapabilityManifest {
+export function publicFormCapabilityManifest(
+  candidate?: "actor-forward",
+): TakoformLifecycleCapabilityManifest {
+  if (candidate !== undefined && candidate !== "actor-forward")
+    throw new TypeError("unknown Form implementation candidate");
   const yurucommu = yurucommuLifecycleCapabilityManifest(YURUCOMMU_IDENTITY_CAPABILITY_KINDS);
   return {
     ...yurucommu,
     forms: {
       ...yurucommu.forms,
       WorkerCustomDomain: ["create", "read", "delete", "import", "observe"],
+      ...(candidate === "actor-forward" ? { ActorNamespace: RESOURCE_OPERATION_ORDER } : {}),
     },
   };
 }
@@ -83,12 +100,27 @@ export async function deriveRuntimeImplementationCatalog(
   if (!isSha256Digest(implementationPayloadDigest)) {
     throw new TypeError("public Form implementation payload digest is invalid");
   }
-  const forms = exactPublisherFormCandidates(currentTakoformCandidates().forms);
+  if (configuration.candidate !== undefined && configuration.candidate !== "actor-forward")
+    throw new TypeError("unknown Form implementation candidate");
+  const selection = selectTakoformCandidates(configuration.candidate);
+  const forms = exactPublisherFormCandidates([...selection.forms, ...selection.retainedForms]);
   const providerOperations = providerResourceOperationHandlers(
     CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,
   );
   const intrinsicKinds = new Set<string>(TAKOSERVER_INTRINSIC_HANDLER_KINDS);
   const cloudflareKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);
+  const actor = selection.forms.find(({ identity }) => identity.formRef.kind === "ActorNamespace");
+  const actorProvider = configuration.actorProvider;
+  const actorOfferings =
+    actorProvider?.offerings.filter(
+      (offering) => actor !== undefined && sameFormRef(offering.form, actor.identity.formRef),
+    ) ?? [];
+  const actorReady =
+    configuration.candidate === "actor-forward" &&
+    actor !== undefined &&
+    typeof actorProvider?.workerClassRuntime?.inspect === "function" &&
+    supportsClassHolderRuntime(actor, actorProvider.workerClassRuntime) &&
+    actorOfferings.length > 0;
   const handlers: TakoformHandlerManifest = {
     apiVersion: "takoserver.form-handlers@v1",
     artifact: implementationPayloadDigest,
@@ -105,14 +137,66 @@ export async function deriveRuntimeImplementationCatalog(
             ? RESOURCE_OPERATION_ORDER
             : cloudflareKinds.has(identity.formRef.kind)
               ? providerOperations
-              : [],
+              : actorReady && identity.formRef.kind === "ActorNamespace"
+                ? providerResourceOperationHandlers({
+                    apply: actorProvider.apply,
+                    delete: actorProvider.delete,
+                    adopt: actorProvider.adopt,
+                    observe: actorProvider.observe,
+                  }).filter(
+                    (operation) =>
+                      operation === "read" ||
+                      actorOfferings.some((offering) => offering.capabilities.includes(operation)),
+                  )
+                : [],
         ]),
     ),
   };
+  // Kind-level manifests describe the selected software generation. They
+  // must not grant a forward ABI to a retained Form that happens to share its
+  // name. Historical resources keep only their exact management operations.
+  const exactOperations =
+    configuration.candidate === undefined
+      ? undefined
+      : forms.map((form) => {
+          const retained = selection.retainedForms.some(
+            (old) =>
+              sameFormRef(old.identity.formRef, form.identity.formRef) &&
+              old.identity.packageDigest === form.identity.packageDigest,
+          );
+          const kind = form.identity.formRef.kind;
+          const operations = retained
+            ? kind === "ActorNamespace" || kind === "DurableWorkflow"
+              ? []
+              : (handlers.forms[kind] ?? []).filter(
+                  (operation) =>
+                    operation === "read" ||
+                    operation === "update" ||
+                    operation === "delete" ||
+                    operation === "observe",
+                )
+            : (handlers.forms[kind] ?? []);
+          return {
+            formRef: form.identity.formRef,
+            packageDigest: form.identity.packageDigest as `sha256:${string}`,
+            operations,
+          };
+        });
   return await deriveImplementationCatalog({
     forms,
     capabilities: configuration.capabilities,
     handlers,
+    ...(exactOperations
+      ? {
+          exactHandlers: exactOperations,
+          exactCapabilities: exactOperations.map((entry) => ({
+            ...entry,
+            operations: entry.operations.filter((operation) =>
+              configuration.capabilities.forms[entry.formRef.kind]?.includes(operation),
+            ),
+          })),
+        }
+      : {}),
   });
 }
 

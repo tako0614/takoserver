@@ -115,6 +115,11 @@ const LAYERS: readonly Layer[] = [
 ];
 
 function layerOf(path: string): Layer | undefined {
+  // Unpublished source projections are domain inputs, not released data or
+  // authority bundles. Their presence cannot confer publisher verification.
+  if (path === "src/generated/takoform-forward-candidate-catalog.ts") {
+    return LAYERS.find((layer) => layer.name === "domain");
+  }
   return LAYERS.find((layer) => layer.match.test(path));
 }
 

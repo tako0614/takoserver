@@ -250,6 +250,10 @@ export { createD1Sql } from "./sql-d1.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 export {
+  forwardTakoformCandidates,
+  selectTakoformCandidates,
+} from "./takoform/forward-candidates.ts";
+export {
   MAXIMUM_REQUEST_BODY_BYTES,
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,

@@ -1,5 +1,41 @@
 # Forward Actor Response implementation candidate
 
+## Explicit source adoption
+
+`selectTakoformCandidates("actor-forward")` selects the separately generated,
+unpublished source closure and retains displaced published Form and Binding
+identities for exact historical management. With no argument it returns the
+unchanged published selection. Neither choice changes Host admission or
+activation. `scripts/generate-forward-form-catalog.ts` owns reproduction from
+the pinned Forms source; the published catalog, package receipts and authority
+closure are not overwritten.
+
+The runtime catalog accepts the same explicit software candidate through
+`deriveRuntimeImplementationCatalog`. An Actor capability declaration alone
+does not enable support: the caller must supply its composed Actor Provider,
+with the exact Offering, exact registered class contract and inspection and
+lifecycle methods. Retained definitions are matched by complete FormRef and
+package digest; their existing read/update/delete/observe operations cannot
+inherit a forward class ABI. DurableWorkflow remains unimplemented in the
+managed Provider and receives no handler entry.
+
+This is a source qualification path, not a production toggle. The default
+public entrypoint and publication-verifying admission path remain unchanged.
+The private managed source candidate consumes the exact selection through its
+existing runtime configuration, but the official commercial composition still
+lacks an Actor identity class and meter source. ActorNamespace is an identity,
+not a relation that inherits a ModuleWorker price. Qualification fixtures may
+inject an explicit technical Actor Offering; that does not establish resale,
+pricing, metering, native qualification, publication or activation.
+
+The generic identity/meter schema is owned by `hosted-edge-supplies.ts` and
+`providers/cloudflare-edge-meter-contract.ts`; the operator's private composition
+consumes that schema. A future additive Actor supply
+extension needs its own truthful meter source and operator-owned terms and
+price inputs. It must not reuse ModuleWorker billing by default.
+
+## Response implementation
+
 This dormant source implements the application-facing Response portion of the
 forward Actor proposal. It does not change released Form identities, the current
 runtime contract, Host admission, or a serving native binary. Both backend
