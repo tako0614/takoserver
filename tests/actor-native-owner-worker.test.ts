@@ -73,6 +73,13 @@ function inboundFixture(callback?: (request: Request) => Promise<Response>) {
     closes,
     delivered,
     retained,
+    forgetNativeSocket(socket: Socket) {
+      const index = sockets.indexOf(socket);
+      if (index >= 0) sockets.splice(index, 1);
+    },
+    cachedSocketIds() {
+      return [...(owner as unknown as { sockets: Map<string, unknown> }).sockets.keys()];
+    },
     accounting() {
       const state = owner as unknown as {
         inboundCount: number;
@@ -186,6 +193,55 @@ test("native inbound actor bytes ceiling spans connections without failing alrea
   await Promise.all(pending);
   expect(f.delivered).toEqual(["first", "second"]);
   expect(f.accounting().bytes).toBe(0);
+});
+
+test("native inbound overloaded close retires a warm socket cache without dropping peer events", async () => {
+  const f = inboundFixture();
+  const warm = f.socket("warm");
+  await f.owner.webSocketMessage(warm, "warm cache");
+  expect(f.cachedSocketIds()).toContain("warm");
+  const drain = await f.holdProducer();
+  const pending: Promise<void>[] = [];
+  for (let connection = 0; connection < 4; connection++) {
+    const peer = f.socket(`peer-${connection}`);
+    for (let message = 0; message < 64; message++) pending.push(f.owner.webSocketMessage(peer, ""));
+  }
+  f.forgetNativeSocket(warm);
+  await f.owner.webSocketClose(warm, 1000, "done", true);
+  await drain();
+  await Promise.all(pending);
+  await f.owner.webSocketClose(warm, 1000, "duplicate", true);
+  expect(f.cachedSocketIds()).not.toContain("warm");
+  expect(f.delivered.filter((id) => id === "warm")).toHaveLength(1);
+  expect(f.delivered).toHaveLength(257);
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
+});
+
+test("native inbound terminal overload retires the cache but retains an active callback charge", async () => {
+  let started!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = inboundFixture(async () => {
+    started();
+    await held;
+    return new Response(null, { status: 204 });
+  });
+  const socket = f.socket("active");
+  const active = f.owner.webSocketMessage(socket, new ArrayBuffer(8 * 1024 * 1024));
+  await entered;
+  expect(f.cachedSocketIds()).toContain("active");
+  f.forgetNativeSocket(socket);
+  await f.owner.webSocketClose(socket, 1000, "done", true);
+  expect(f.cachedSocketIds()).not.toContain("active");
+  expect(f.accounting()).toEqual({ count: 1, bytes: 8 * 1024 * 1024, queued: 0, connections: 1 });
+  release();
+  await active;
+  expect(f.accounting()).toEqual({ count: 0, bytes: 0, queued: 0, connections: 0 });
 });
 
 test("native inbound active callback remains charged and failure drops its queued messages", async () => {

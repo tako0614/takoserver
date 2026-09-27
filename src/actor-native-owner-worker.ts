@@ -1493,7 +1493,16 @@ export function createActorNativeOwner(
         this.inboundBytes + bytes > ACTOR_INBOUND_BYTES
       ) {
         this.discardInbound(socket);
-        if (event.kind === "close") this.suppressedCloses.add(socket);
+        if (event.kind === "close") {
+          this.suppressedCloses.add(socket);
+          // No later callback will retire this observed terminal connection.
+          // Keep the separate in-flight inbound charge until settlement.
+          for (const [socketId, record] of this.sockets) {
+            if (record.socket !== socket) continue;
+            record.status = "closed";
+            this.sockets.delete(socketId);
+          }
+        }
         try {
           socket.close(1013, "inbound queue overloaded");
         } catch {
