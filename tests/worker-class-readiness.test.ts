@@ -7,7 +7,9 @@ import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
+import { formKey } from "../src/takoform/forms.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { resolveRelations } from "../src/takoform/relations.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { ResourceWithRelations, TakoformStore } from "../src/takoform/store.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
@@ -262,6 +264,71 @@ test("Host allocates the explicit class identity without a deployment and overri
     },
   ]);
   expect(calls).toHaveLength(0);
+});
+
+test("normal Host relation resolution preserves weighted declaration paths for readiness", async () => {
+  const { input, rows, calls } = fixture();
+  const deployment = rows.get("deployment");
+  const version = rows.get("version-a");
+  if (!deployment || !version) throw new Error("fixture missing");
+  const versionRef = version.listing.resource.form.formRef;
+  const targetForm = { ...form, identity: { ...form.identity, formRef: versionRef } };
+  const resolved = await resolveRelations({
+    tenantId: "tenant",
+    space: "main",
+    form: {
+      ...form,
+      desiredSchema: {
+        type: "object",
+        properties: {
+          versions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                workerVersion: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["apiVersion", "kind", "name"],
+                  properties: {
+                    apiVersion: { const: versionRef.apiVersion },
+                    kind: { const: versionRef.kind },
+                    name: { type: "string" },
+                  },
+                  "x-takoform-target-formrefs": [{ ...versionRef }],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    spec: {
+      versions: ["version-a", "version-b"].map((name) => ({
+        workerVersion: { apiVersion: versionRef.apiVersion, kind: versionRef.kind, name },
+      })),
+    },
+    forms: new Map([[formKey(versionRef), targetForm]]),
+    bindings: new Map(),
+    store: {
+      async readResource(address) {
+        return rows.get(address.name)?.listing.resource ?? null;
+      },
+    },
+  });
+  expect(resolved.map(({ pointer, relation }) => ({ pointer, relation }))).toEqual([
+    { pointer: "/versions/0/workerVersion", relation: "/versions/*/workerVersion" },
+    { pointer: "/versions/1/workerVersion", relation: "/versions/*/workerVersion" },
+  ]);
+  rows.set("deployment", {
+    ...deployment,
+    relations: [
+      ...deployment.relations.filter((value) => value.relation === "/worker"),
+      ...resolved,
+    ],
+  });
+  expect(await workerClassCondition(input)).toMatchObject({ status: "True" });
+  expect(calls).toHaveLength(2);
 });
 
 test("readiness requires isolated inspection of every weighted exact Version and artifact", async () => {

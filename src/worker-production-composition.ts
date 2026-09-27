@@ -24,6 +24,7 @@ import {
 } from "./providers/cloudflare-provider-proxy.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
+import type { WorkerClassRuntimeContract } from "./worker-class-runtime-port.ts";
 
 export interface WorkerProductionCompositionEnv {
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
@@ -56,6 +57,8 @@ export function createWorkerProductionComposition(input: {
   readonly env: WorkerProductionCompositionEnv;
   readonly forms: readonly InstalledTakoformForm[];
   readonly retainedForms?: readonly InstalledTakoformForm[];
+  /** Explicit software capability only; does not install Forms or authorize supply. */
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   /** Retained for call-site compatibility; never sent across provider RPC. */
   readonly artifacts?: unknown;
   /** Retained for call-site compatibility; plaintext stays in the Host. */
@@ -113,6 +116,9 @@ export function createWorkerProductionComposition(input: {
     nativeReadbackAuthorities: surface.nativeReadbackAuthorities,
     managedBaseDomain,
     runtimeInputs: surface.runtimeInputs,
+    ...(input.workerClassRuntimeContracts
+      ? { workerClassRuntimeContracts: input.workerClassRuntimeContracts }
+      : {}),
     binding,
   });
 

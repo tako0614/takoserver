@@ -10,6 +10,11 @@ const executorModule = `
 import { WorkerEntrypoint } from "cloudflare:workers";
 
 export class Executor extends WorkerEntrypoint {
+  async inspectWorkerClass(input) {
+    return input.providerInstallationRef === "cloudflare.installation" &&
+      input.version.uid === "version-1" && input.className === "Counter" &&
+      input.bundle.manifestDigest === "sha256:" + "d".repeat(64) ? "valid" : "invalid";
+  }
   async concludeApplyNoEffect() {
     return {
       phase: "unsupported",
@@ -87,7 +92,28 @@ export class Caller extends WorkerEntrypoint {
       binding,
     });
     const restored = await proxy.concludeApplyNoEffect(input);
+    const classContract = {
+      formRef: { apiVersion: "edge.forms.takoform.com", kind: "ActorNamespace", definitionVersion: "0.2.0", schemaDigest: "sha256:" + "a".repeat(64) },
+      packageDigest: "sha256:" + "b".repeat(64),
+      runtimeClassRef: { apiVersion: "interfaces.takoform.com/v1alpha1", name: "worker.actor", version: "2.0.0", schemaDigest: "sha256:" + "c".repeat(64) },
+    };
+    const facts = { uid: "holder-1", generation: "1", revision: "revision-1", formRef: classContract.formRef };
+    const classProxy = new CloudflareProviderProxy({
+      providerInstallationId: "cloudflare.installation",
+      offerings: [],
+      managedBaseDomain: "workers.example.test",
+      binding: this.env.EXECUTOR,
+      workerClassRuntimeContracts: [classContract],
+    });
+    const classVerdict = await classProxy.workerClassRuntime.inspect({
+      contract: classContract, tenantId: "tenant-1", space: "main", className: "Counter",
+      holder: facts, worker: { ...facts, uid: "worker-1" }, deployment: { ...facts, uid: "deployment-1" },
+      version: { ...facts, uid: "version-1" }, weight: 10000,
+      bundle: { ...facts, uid: "bundle-1", manifestDigest: "sha256:" + "d".repeat(64) },
+      providerInstallationRef: "cloudflare.installation", holderNativeId: "actor:" + "e".repeat(32), versionNativeId: "worker:version-1",
+    });
     return {
+      classVerdict,
       rawType: typeof raw,
       rawPrototypeIsObject,
       rawRootKeys,
@@ -186,6 +212,7 @@ export default { fetch() { return new Response("ok"); } };
       const outerDispose = outerDescriptor?.value as (() => void) | undefined;
       try {
         const expectedStringKeys = [
+          "classVerdict",
           "rawType",
           "rawPrototypeIsObject",
           "rawRootKeys",
@@ -196,6 +223,7 @@ export default { fetch() { return new Response("ok"); } };
           "restoredRootKeys",
         ];
         const outerKeys = Reflect.ownKeys(result);
+        expect(result.classVerdict).toBe("valid");
         expect(outerKeys.filter((key): key is string => typeof key === "string")).toEqual(
           expectedStringKeys,
         );

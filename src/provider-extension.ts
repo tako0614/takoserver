@@ -140,6 +140,7 @@ export type {
   CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
   CloudflareProviderInitialMutationResult,
+  CloudflareProviderInspectWorkerClassInput,
   CloudflareProviderMeterReadInput,
   CloudflareProviderObserveInput,
   CloudflareProviderPollInput,

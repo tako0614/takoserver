@@ -15,7 +15,15 @@ import type {
   ProviderTicket,
   ProviderValue,
 } from "../provider-port.ts";
+import type {
+  ProviderWorkerClassRuntime,
+  WorkerClassInspectionVerdict,
+} from "../worker-class-runtime-port.ts";
 import type { ProviderMeterError } from "./provider-meter.ts";
+
+export type CloudflareProviderInspectWorkerClassInput = Parameters<
+  ProviderWorkerClassRuntime["inspect"]
+>[0];
 
 export const CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA =
   "takoserver.cloudflare-provider-executor-no-mutation@v1" as const;
@@ -214,6 +222,10 @@ export type CloudflareProviderMeterReadResult =
  * bridge and no general provider escape hatch.
  */
 export interface CloudflareProviderExecutorRpc {
+  /** Trusted Host facts; the executor must independently revalidate ownership and source. */
+  inspectWorkerClass?(
+    input: CloudflareProviderInspectWorkerClassInput,
+  ): Promise<WorkerClassInspectionVerdict>;
   apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<CloudflareProviderApplyConvergenceResult>;

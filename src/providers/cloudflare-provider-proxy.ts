@@ -33,6 +33,10 @@ import {
   canonicalWorkerEndpointOrigin,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
+import type {
+  ProviderWorkerClassRuntime,
+  WorkerClassRuntimeContract,
+} from "../worker-class-runtime-port.ts";
 import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
@@ -66,6 +70,8 @@ export interface CloudflareProviderProxyOptions {
   readonly managedBaseDomain: string;
   /** Static capability projection; no secret or lease value enters this object. */
   readonly runtimeInputs?: boolean;
+  /** Explicit installed software capability; never inferred from remote discovery or Offerings. */
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   readonly binding: CloudflareProviderExecutorRpc;
 }
 
@@ -77,6 +83,7 @@ export interface CloudflareProviderProxyOptions {
  * runtime-input plaintext are resolved inside the executor from shared D1/R2.
  */
 export class CloudflareProviderProxy implements Provider {
+  readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
@@ -104,6 +111,29 @@ export class CloudflareProviderProxy implements Provider {
     }
     this.#binding = options.binding;
     this.#providerInstallationId = options.providerInstallationId;
+    if (options.workerClassRuntimeContracts?.length) {
+      const contracts = structuredClone(options.workerClassRuntimeContracts);
+      this.workerClassRuntime = {
+        contracts: structuredClone(contracts),
+        inspect: async (input) => {
+          try {
+            if (
+              input.providerInstallationRef !== this.#providerInstallationId ||
+              !contracts.some(
+                (contract) => canonicalJson(contract) === canonicalJson(input.contract),
+              )
+            )
+              return "unavailable";
+            const verdict: unknown = await this.#binding.inspectWorkerClass?.(
+              structuredClone(input),
+            );
+            return verdict === "valid" || verdict === "invalid" ? verdict : "unavailable";
+          } catch {
+            return "unavailable";
+          }
+        },
+      };
+    }
     const managedBaseDomain = normalizeManagedBaseDomain(options.managedBaseDomain);
     this.workerEndpointOriginReservations = {
       derive: async ({ requestedSubdomain }) => {
