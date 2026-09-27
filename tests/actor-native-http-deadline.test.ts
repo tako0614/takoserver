@@ -4,6 +4,7 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createActorNativeOwner } from "../src/actor-native-owner-worker.ts";
+import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "../src/generated/actor-native-bootstrap.ts";
 
 const headers = {
   "x-takoserver-private-actor-id": "same-id",
@@ -123,7 +124,7 @@ const candidate = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
 const candidateDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 test.skipIf(candidate === undefined)(
-  "exact native candidate retires a stuck response producer before same-ID readmission",
+  "exact native candidate stops captured callbacks and producer work before same-ID readmission",
   async () => {
     if (!candidate || !candidateDigest || !/^[a-f0-9]{64}$/u.test(candidateDigest))
       throw new Error("explicit candidate binary and SHA256 required");
@@ -147,34 +148,95 @@ test.skipIf(candidate === undefined)(
       });
       if (!built.success || !built.outputs[0]) throw new Error("Actor owner bundle failed");
       await writeFile(join(root, "owner.mjs"), await built.outputs[0].text());
+      await writeFile(join(root, "helper.mjs"), ACTOR_NATIVE_BOOTSTRAP_SOURCE);
       await writeFile(
         join(root, "supervisor.mjs"),
-        `import { createActorNativeOwner } from "./owner.mjs";
+        `import { createActorNativeOwner, createActorNativeIngress } from "./owner.mjs";
 export const Owner = createActorNativeOwner("${"a".repeat(64)}", "${"c".repeat(64)}", {
   generationKey: "${"d".repeat(64)}", epoch: "epoch-1", variantKeys: ["default"],
 }, { handlerMs: 500, producerMs: 250 });
+const ingress = createActorNativeIngress("${"e".repeat(64)}", "${"b".repeat(64)}");
 export default {
   fetch(request, env) {
     if (new URL(request.url).pathname === "/health") return new Response("ready");
+    if (request.headers.has("x-takoserver-private-alarm-action")) return ingress.fetch(request, env);
     const id = new URL(request.url).searchParams.get("id") || "same-id";
     const headers = new Headers(request.headers);
+    headers.set("x-takoserver-private-actor-token", "${"e".repeat(64)}");
     headers.set("x-takoserver-private-actor-id", encodeURIComponent(id));
     headers.set("x-takoserver-private-actor-variant", "default");
-    return env.NAMESPACE.get(env.NAMESPACE.idFromName(id)).fetch(new Request(request, { headers }));
+    return ingress.fetch(new Request(request, { headers }), env);
   },
 };`,
       );
       await writeFile(
         join(root, "child.mjs"),
-        `export class Child {
-  fetch(request) {
+        `import { createNativeActorExecution, createActorNativeAlarmPort } from "./helper.mjs";
+class Application {
+  constructor(context) {
+    this.context = context;
+    this.instance = crypto.randomUUID();
+  }
+  async fetch(request) {
     const path = new URL(request.url).pathname;
     if (path === "/head-stuck") return new Promise(() => {});
+    if (path === "/captured-producer") {
+      await this.context.storage.execute("CREATE TABLE IF NOT EXISTS retirement_probe (stage TEXT NOT NULL)");
+      const context = this.context;
+      return new Response(new ReadableStream({
+        start(controller) { controller.enqueue(new TextEncoder().encode("first")); },
+        async pull(controller) {
+          await context.storage.execute("INSERT INTO retirement_probe (stage) VALUES ('armed')");
+          console.error("actor-probe:producer-armed");
+          await new Promise((resolve) => setTimeout(resolve, 700));
+          console.error("actor-probe:producer-resumed");
+          await Promise.allSettled([
+            context.storage.execute("INSERT INTO retirement_probe (stage) VALUES ('late')"),
+            context.alarm.set(Date.now() + 60_000),
+          ]);
+          controller.enqueue(new TextEncoder().encode("late"));
+        },
+      }), { status: 202, headers: { "x-actor-instance": this.instance } });
+    }
+    if (path === "/detached-callback") {
+      await this.context.storage.execute("INSERT INTO retirement_probe (stage) VALUES ('detached-armed')");
+      const context = this.context;
+      console.error("actor-probe:detached-armed");
+      setTimeout(async () => {
+        console.error("actor-probe:detached-resumed");
+        await Promise.allSettled([
+          context.storage.execute("INSERT INTO retirement_probe (stage) VALUES ('detached-late')"),
+          context.alarm.set(Date.now() + 60_000),
+        ]);
+      }, 700);
+      return new Response("detached");
+    }
+    if (path === "/retirement-state") {
+      const result = await this.context.storage.query("SELECT stage FROM retirement_probe ORDER BY rowid");
+      return Response.json({ stages: result.rows.map((row) => row.stage), alarmAt: await this.context.alarm.get() });
+    }
     if (path === "/stuck") return new Response(new ReadableStream({
       start(controller) { controller.enqueue(new TextEncoder().encode("first")); },
     }), { status: 202 });
-    return new Response(path === "/next" ? "next" : "sibling");
+    return new Response(path === "/next" ? "next" : "sibling", {
+      headers: { "x-actor-instance": this.instance },
+    });
   }
+  alarm() {}
+  socketMessage() {}
+  socketClose() {}
+  socketError() {}
+}
+export class Child {
+  constructor(state, env) {
+    const id = state.id.toString();
+    this.execution = createNativeActorExecution({
+      namespace: { Application }, exportName: "Application", id,
+      env: {}, storage: state.storage,
+      alarm: createActorNativeAlarmPort(env.ALARM_OWNER, "${"b".repeat(64)}", id),
+    });
+  }
+  fetch(request) { return this.execution.fetch(request); }
 }
 export default { fetch() { return new Response("private", { status: 404 }); } };`,
       );
@@ -199,9 +261,11 @@ const config :Workerd.Config = (
       durableObjectStorage = (localDisk = "state")
     )),
     (name = "child", worker = (
-      modules = [(name = "child.mjs", esModule = embed "child.mjs")],
+      modules = [(name = "child.mjs", esModule = embed "child.mjs"),
+        (name = "helper.mjs", esModule = embed "helper.mjs")],
       compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental"],
-      globalOutbound = "deny"
+      globalOutbound = "deny",
+      bindings = [(name = "ALARM_OWNER", service = "owner")]
     )),
     (name = "state", disk = (path = ${JSON.stringify(join(root, "state"))}, writable = true)),
     (name = "deny", network = (allow = []))
@@ -242,6 +306,54 @@ const config :Workerd.Config = (
       expect(
         await (await fetch(`${origin}/next`, { signal: AbortSignal.timeout(5_000) })).text(),
       ).toBe("next");
+      const captured = await fetch(`${origin}/captured-producer`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(captured.status).toBe(202);
+      const capturedInstance = captured.headers.get("x-actor-instance");
+      const capturedReader = captured.body?.getReader();
+      expect(new TextDecoder().decode((await capturedReader?.read())?.value)).toBe("first");
+      expect(
+        await (
+          await fetch(`${origin}/sibling?id=other`, { signal: AbortSignal.timeout(5_000) })
+        ).text(),
+      ).toBe("sibling");
+      try {
+        await capturedReader?.read();
+      } catch {
+        // The producer deadline can reset the external HTTP body transport.
+      }
+      const nextAfterRetirement = await fetch(`${origin}/next`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(await nextAfterRetirement.text()).toBe("next");
+      await Bun.sleep(900);
+      const retirementState = await fetch(`${origin}/retirement-state`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(retirementState.status).toBe(200);
+      expect(await retirementState.json()).toEqual({ stages: ["armed"], alarmAt: null });
+      expect(nextAfterRetirement.headers.get("x-actor-instance")).not.toBe(capturedInstance);
+      const detached = await fetch(`${origin}/detached-callback`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(await detached.text()).toBe("detached");
+      expect(
+        await (
+          await fetch(`${origin}/sibling?id=other`, { signal: AbortSignal.timeout(5_000) })
+        ).text(),
+      ).toBe("sibling");
+      expect(
+        await (await fetch(`${origin}/next`, { signal: AbortSignal.timeout(5_000) })).text(),
+      ).toBe("next");
+      await Bun.sleep(900);
+      const afterDetached = await fetch(`${origin}/retirement-state`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      expect(await afterDetached.json()).toEqual({
+        stages: ["armed", "detached-armed"],
+        alarmAt: null,
+      });
       const expiredHead = await fetch(`${origin}/head-stuck`, {
         signal: AbortSignal.timeout(5_000),
       });
@@ -260,6 +372,10 @@ const config :Workerd.Config = (
     // The candidate's HTTP socket can surface the errored body as EOF rather
     // than a JS rejection. Its own runtime diagnostic proves the error reason.
     expect(stderr).toContain("response_aborted");
+    expect(stderr).toContain("actor-probe:producer-armed");
+    expect(stderr).toContain("actor-probe:detached-armed");
+    expect(stderr).not.toContain("actor-probe:producer-resumed");
+    expect(stderr).not.toContain("actor-probe:detached-resumed");
   },
   15_000,
 );
