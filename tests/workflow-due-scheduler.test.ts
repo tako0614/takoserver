@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createWorkflowDueScheduler } from "../src/workflow-due-scheduler.ts";
 import {
@@ -287,6 +288,79 @@ describe("private Workflow due-row scheduler", () => {
     expect(r.calls).toEqual(["tenant/workflow/a-later", "tenant/workflow/b-due"]);
   });
 
+  test("sparse rows are examined in bounded primary-key windows until the due tail is reached", async () => {
+    const f = fixture();
+    const r = recorder();
+    await f.create("a-busy");
+    f.set("a-busy", "status = 'errored', run_owner = 'owner', run_lease_until = ?", [
+      START + 1_000,
+    ]);
+    for (let index = 0; index < 64; index += 1) {
+      const id = `b-${String(index).padStart(3, "0")}`;
+      await f.create(id);
+      f.set(id, "status = 'complete'");
+    }
+    await f.create("z-due");
+    const observed: { sql: string; params: readonly (string | number)[]; rows: number }[] = [];
+    const sql: Sql = {
+      ...f.sql,
+      async query(statement, params) {
+        const rows = await f.sql.query(statement, params);
+        observed.push({
+          sql: statement,
+          params: (params ?? []) as readonly (string | number)[],
+          rows: rows.length,
+        });
+        return rows;
+      },
+    };
+    const scheduler = createWorkflowDueScheduler({
+      sql,
+      clock: f.clock,
+      runtime: r.runtime,
+      batchSize: 1,
+      scanLimit: 8,
+      concurrency: 1,
+    });
+    const results = [];
+    const readRowsPerPoll: number[] = [];
+    for (let poll = 0; poll < 12 && !r.calls.includes("tenant/workflow/z-due"); poll += 1) {
+      const before = observed.length;
+      results.push(await scheduler.pollDue());
+      readRowsPerPoll.push(observed.slice(before).reduce((sum, query) => sum + query.rows, 0));
+    }
+    expect(r.calls).toContain("tenant/workflow/z-due");
+    expect(results.every((result) => result.examined <= 8)).toBe(true);
+    expect(readRowsPerPoll.every((rows) => rows <= 8)).toBe(true);
+    expect(observed.every((query) => !query.sql.includes("retention_until >"))).toBe(true);
+    const first = observed[0];
+    expect(first).toBeDefined();
+    if (first === undefined) throw new Error("first query was not observed");
+    const firstPlan = f.db.query(`EXPLAIN QUERY PLAN ${first.sql}`).all(...first.params) as {
+      detail: string;
+    }[];
+    expect(
+      firstPlan.some((step) =>
+        step.detail.includes(
+          "SCAN tf_workflow_instances USING INDEX sqlite_autoindex_tf_workflow_instances_1",
+        ),
+      ),
+    ).toBe(true);
+    const keyset = observed.find((query) => query.sql.includes("WHERE ("));
+    expect(keyset).toBeDefined();
+    if (keyset === undefined) throw new Error("keyset query was not observed");
+    const plan = f.db.query(`EXPLAIN QUERY PLAN ${keyset.sql}`).all(...keyset.params) as {
+      detail: string;
+    }[];
+    expect(
+      plan.some((step) =>
+        step.detail.includes(
+          "SEARCH tf_workflow_instances USING INDEX sqlite_autoindex_tf_workflow_instances_1",
+        ),
+      ),
+    ).toBe(true);
+  });
+
   test("bounded slots coalesce overlapping polls and await every selected run before rejecting", async () => {
     const f = fixture();
     for (const id of ["a", "b", "c", "d"]) await f.create(id);
@@ -394,6 +468,15 @@ describe("private Workflow due-row scheduler", () => {
         runtime: r.runtime,
         batchSize: 1,
         concurrency: 2,
+      }),
+    ).toThrow();
+    expect(() =>
+      createWorkflowDueScheduler({
+        sql: f.sql,
+        clock: f.clock,
+        runtime: r.runtime,
+        batchSize: 2,
+        scanLimit: 1,
       }),
     ).toThrow();
   });

@@ -17,9 +17,13 @@ export interface WorkflowDueSchedulerOptions {
   readonly runtime: Pick<WorkflowRuntime, "runOne">;
   readonly batchSize?: number;
   readonly concurrency?: number;
+  /** Maximum primary-key rows fetched by one poll, including rows not due. */
+  readonly scanLimit?: number;
 }
 
 export interface WorkflowDuePollResult {
+  /** Rows actually checked for due status; SQL may prefetch more, up to scanLimit. */
+  readonly examined: number;
   readonly selected: number;
   readonly outcomes: readonly WorkflowRunOutcome[];
 }
@@ -30,16 +34,18 @@ export interface WorkflowDueScheduler {
 
 type Candidate = { readonly scope: WorkflowScope; readonly id: string };
 type Cursor = readonly [tenantId: string, workflowResourceUid: string, instanceId: string];
+type ScannedRow = { readonly candidate: Candidate; readonly cursor: Cursor; readonly due: boolean };
 
 const KEY = ["tenant_id", "workflow_resource_uid", "instance_id"] as const;
-const ACTIVE = "'queued', 'running', 'sleeping', 'waiting'";
-const TERMINAL = "'complete', 'errored', 'terminated'";
+const ACTIVE = new Set(["queued", "running", "sleeping", "waiting"]);
+const TERMINAL = new Set(["complete", "errored", "terminated"]);
 
 export function createWorkflowDueScheduler(
   options: WorkflowDueSchedulerOptions,
 ): WorkflowDueScheduler {
   const batchSize = options.batchSize ?? 64;
   const concurrency = options.concurrency ?? Math.min(4, batchSize);
+  const scanLimit = options.scanLimit ?? Math.max(256, batchSize);
   if (
     !Number.isSafeInteger(batchSize) ||
     batchSize < 1 ||
@@ -47,6 +53,9 @@ export function createWorkflowDueScheduler(
     !Number.isSafeInteger(concurrency) ||
     concurrency < 1 ||
     concurrency > batchSize ||
+    !Number.isSafeInteger(scanLimit) ||
+    scanLimit < batchSize ||
+    scanLimit > 1_024 ||
     typeof options.sql?.query !== "function" ||
     typeof options.clock !== "function" ||
     typeof options.runtime?.runOne !== "function"
@@ -54,6 +63,9 @@ export function createWorkflowDueScheduler(
     throw new WorkflowRuntimeError("invalid_runtime_input");
   }
 
+  // Process-local round robin. Repeated polls eventually cross a sparse table;
+  // one poll does not promise to find every due row, and a restart begins at
+  // the first key again. No durable scheduling cursor or daemon is introduced.
   let cursor: Cursor | null = null;
   let inFlight: Promise<WorkflowDuePollResult> | null = null;
 
@@ -65,43 +77,44 @@ export function createWorkflowDueScheduler(
     return timestamp;
   }
 
-  async function select(
-    timestamp: number,
-    after: Cursor | null,
-    limit: number,
-    wrap: boolean,
-  ): Promise<readonly Candidate[]> {
-    // A current-state hint only: races and replacement incarnations are
-    // resolved by runOne's claim CAS. In particular, termination intent and
-    // a terminal row with a residual owner cannot wait for wake_at.
-    const due =
-      "retention_until > ? AND (termination_requested = 1 OR " +
-      `status IN (${TERMINAL}) AND run_owner IS NOT NULL OR ` +
-      `status IN (${ACTIVE}) AND (deadline_at <= ? OR ` +
-      "(wake_at IS NULL OR wake_at <= ?) AND " +
-      "(run_owner IS NULL OR run_lease_until <= ?)))";
+  async function scan(after: Cursor | null, limit: number, wrap: boolean): Promise<readonly Row[]> {
+    // No due predicate in SQL: applying it before LIMIT would still scan an
+    // unbounded sparse prefix. The primary-key window is the work budget.
     const keyFilter =
-      after === null ? "" : ` AND (${KEY.join(", ")}) ${wrap ? "<=" : ">"} (?, ?, ?)`;
+      after === null ? "" : `WHERE (${KEY.join(", ")}) ${wrap ? "<=" : ">"} (?, ?, ?)`;
     const rows = await options.sql.query(
-      `SELECT ${KEY.join(", ")} FROM tf_workflow_instances WHERE ${due}${keyFilter} ` +
+      `SELECT ${KEY.join(", ")}, status, deadline_at, retention_until, ` +
+        "termination_requested, run_owner, run_lease_until, wake_at " +
+        `FROM tf_workflow_instances ${keyFilter} ` +
         `ORDER BY ${KEY.join(", ")} LIMIT ?`,
-      [timestamp, timestamp, timestamp, timestamp, ...(after ?? []), limit],
+      [...(after ?? []), limit],
     );
     if (rows.length > limit) throw new WorkflowRuntimeError("backend_unavailable");
-    return rows.map(candidate);
+    return rows;
   }
 
   async function pollOnce(): Promise<WorkflowDuePollResult> {
     const timestamp = now();
-    const first = await select(timestamp, cursor, batchSize, false);
-    const selected =
-      cursor !== null && first.length < batchSize
-        ? [...first, ...(await select(timestamp, cursor, batchSize - first.length, true))]
-        : first;
-    if (selected.length === 0) return { selected: 0, outcomes: [] };
-    const last = selected[selected.length - 1];
-    if (last === undefined) throw new WorkflowRuntimeError("backend_unavailable");
-    cursor = [last.scope.tenantId, last.scope.workflowResourceUid, last.id];
+    const start = cursor;
+    const selected: Candidate[] = [];
+    let examined = 0;
+    let lastExamined: Cursor | null = null;
+    const consume = (rows: readonly Row[]): void => {
+      for (const row of rows) {
+        if (selected.length === batchSize) break;
+        const scanned = parseScannedRow(row, timestamp);
+        examined += 1;
+        lastExamined = scanned.cursor;
+        if (scanned.due) selected.push(scanned.candidate);
+      }
+    };
+    const first = await scan(start, scanLimit, false);
+    consume(first);
+    if (start !== null && first.length < scanLimit && selected.length < batchSize) {
+      consume(await scan(start, scanLimit - examined, true));
+    }
+    if (lastExamined !== null) cursor = lastExamined;
+    if (selected.length === 0) return { examined, selected: 0, outcomes: [] };
 
     // Wait for every started run even when one fails. A rejected poll must not
     // leave still-running work orphaned while its caller starts another poll.
@@ -131,6 +144,7 @@ export function createWorkflowDueScheduler(
       throw new AggregateError(errors, `workflow due poll failed for ${errors.length} rows`);
     }
     return {
+      examined,
       selected: selected.length,
       outcomes: settled.map((result) => {
         if (result?.status !== "fulfilled") throw new WorkflowRuntimeError("backend_unavailable");
@@ -150,19 +164,58 @@ export function createWorkflowDueScheduler(
   };
 }
 
-function candidate(row: Row): Candidate {
+function parseScannedRow(row: Row, timestamp: number): ScannedRow {
   const tenantId = row.tenant_id;
   const workflowResourceUid = row.workflow_resource_uid;
   const id = row.instance_id;
+  const status = row.status;
+  const owner = row.run_owner;
+  const terminationRequested = row.termination_requested;
   if (
     typeof tenantId !== "string" ||
     tenantId.length === 0 ||
     typeof workflowResourceUid !== "string" ||
     workflowResourceUid.length === 0 ||
     typeof id !== "string" ||
-    id.length === 0
+    id.length === 0 ||
+    typeof status !== "string" ||
+    (owner !== null && typeof owner !== "string") ||
+    (terminationRequested !== 0 && terminationRequested !== 1)
   ) {
     throw new WorkflowRuntimeError("backend_unavailable");
   }
-  return { scope: { tenantId, workflowResourceUid }, id };
+  const deadlineAt = integer(row.deadline_at);
+  const retentionUntil = integer(row.retention_until);
+  const wakeAt = optionalInteger(row.wake_at);
+  const leaseUntil = optionalInteger(row.run_lease_until);
+  if (owner === null ? leaseUntil !== null : leaseUntil === null) {
+    throw new WorkflowRuntimeError("backend_unavailable");
+  }
+  if (!ACTIVE.has(status) && !TERMINAL.has(status)) {
+    throw new WorkflowRuntimeError("backend_unavailable");
+  }
+  const due =
+    retentionUntil > timestamp &&
+    (terminationRequested === 1 ||
+      (TERMINAL.has(status) && owner !== null) ||
+      (ACTIVE.has(status) &&
+        (deadlineAt <= timestamp ||
+          ((wakeAt === null || wakeAt <= timestamp) &&
+            (owner === null || (leaseUntil !== null && leaseUntil <= timestamp))))));
+  return {
+    candidate: { scope: { tenantId, workflowResourceUid }, id },
+    cursor: [tenantId, workflowResourceUid, id],
+    due,
+  };
+}
+
+function integer(value: unknown): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new WorkflowRuntimeError("backend_unavailable");
+  }
+  return value;
+}
+
+function optionalInteger(value: unknown): number | null {
+  return value === null ? null : integer(value);
 }
