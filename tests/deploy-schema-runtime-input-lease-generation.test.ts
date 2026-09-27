@@ -258,7 +258,7 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
     const f = fixture();
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 65).map(({ name }) => name),
         runtimeInputLeaseGenerationCutover: { status: "ready" },
         providerAcknowledgement: "acknowledged",
       });
@@ -295,7 +295,7 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
     const f = fixture({ lostAck: true });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 65).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
@@ -306,16 +306,16 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
     }
   });
 
-  test("refuses unreviewed 0066 source tail before provider I/O", async () => {
+  test("refuses unreviewed 0067 source tail before provider I/O", async () => {
     const unreviewed = join(root, "unreviewed");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0066_unreviewed_extension.sql"),
+      join(unreviewed, "0067_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0065");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0066");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();
