@@ -228,13 +228,27 @@ export interface ProviderApplyNoEffectConclusionInput {
 }
 
 /**
+ * A closed, pre-compensation nomination for the same accepted create. It is
+ * neither whole-operation no-effect proof nor permission to skip Host checks.
+ * The provider must independently revalidate this authority on compensation.
+ */
+export interface ProviderApplyCompensationNomination {
+  readonly phase: "compensation_required";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/**
  * `unsupported` is a trusted pre-attempt answer: the provider did not begin a
- * conclusion or mutate its abort fence. Every other non-proof result remains
- * an ordinary ProviderTicket and therefore leaves the accepted saga held.
+ * conclusion or mutate its abort fence. A compensation nomination is a
+ * separate pre-attempt signal, not no-effect proof or cleanup authority.
+ * Ordinary ProviderTickets leave the accepted saga held.
  */
 export type ProviderApplyNoEffectConclusionResult =
   | ProviderTicket
-  | { readonly phase: "unsupported" };
+  | { readonly phase: "unsupported" }
+  | ProviderApplyCompensationNomination;
 
 /**
  * Closed authority for compensating one already-dispatched accepted create.

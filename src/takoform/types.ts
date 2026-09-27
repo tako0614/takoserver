@@ -1,6 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
+import type { ProviderApplyCompensationNomination } from "../provider-port.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
 import type { RequestLifetime } from "../request-lifetime.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
@@ -282,7 +283,8 @@ export interface TakoformResourceDriver {
   /**
    * Attempts only to close an already-dispatched accepted create as no-effect.
    * Implementations return no receipt: conclusive proof is raised as the
-   * driver's whole-operation refusal, while every other result remains held.
+   * driver's whole-operation refusal. An exact pre-compensation nomination
+   * only permits the Host to consider its separate compensation checks.
    */
   readonly concludeApplyNoEffect?: (input: {
     readonly operationId: string;
@@ -294,7 +296,7 @@ export interface TakoformResourceDriver {
     readonly space: string;
     readonly selection: TakoformApplySelection;
     readonly commercialAuthority?: TakoformCommercialAuthority;
-  }) => Promise<void>;
+  }) => Promise<undefined | ProviderApplyCompensationNomination>;
   /**
    * Compensates provider effects for one exact accepted create. This has the
    * same closed Host authority as no-effect conclusion, but it never proves

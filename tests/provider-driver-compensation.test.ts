@@ -11,6 +11,8 @@ import {
   type Provider,
   type ProviderApplyCompensationInput,
   type ProviderApplyCompensationResult,
+  type ProviderApplyNoEffectConclusionInput,
+  type ProviderApplyNoEffectConclusionResult,
   type ProviderOffering,
   running,
   succeeded,
@@ -46,6 +48,9 @@ const operationId = "compensation-driver-operation";
 function fixture(
   compensate: (input: ProviderApplyCompensationInput) => Promise<ProviderApplyCompensationResult>,
   amountMinor = 0,
+  conclude?: (
+    input: ProviderApplyNoEffectConclusionInput,
+  ) => Promise<ProviderApplyNoEffectConclusionResult>,
 ) {
   const sql = createEphemeralSql();
   const clock = () => new Date("2026-09-23T10:00:00.000Z");
@@ -67,6 +72,7 @@ function fixture(
       calls.push(structuredClone(input));
       return compensate(input);
     },
+    ...(conclude ? { concludeApplyNoEffect: conclude } : {}),
   };
   const input: Input = {
     operationId,
@@ -112,6 +118,63 @@ function fixture(
     deployments: createResourceDeploymentStore(sql, clock),
   });
   return { driver, input, calls, ledger, provider };
+}
+
+test("driver returns only an exact pre-compensation nomination, never no-effect proof", async () => {
+  const f = fixture(
+    async () => ({ phase: "unsupported" }),
+    0,
+    async (input) => ({
+      phase: "compensation_required",
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: { ...input.executionAuthority },
+    }),
+  );
+  const nomination = await f.driver.concludeApplyNoEffect?.(f.input);
+  expect(nomination).toEqual({
+    phase: "compensation_required",
+    operationId,
+    providerInstallationRef: "compensation-probe-provider.primary",
+    executionAuthority: f.input.executionAuthority,
+  });
+  expect(f.calls).toHaveLength(0);
+});
+
+for (const mismatch of [
+  "operation",
+  "installation",
+  "tenant",
+  "resource",
+  "fingerprint",
+  "lease",
+] as const) {
+  test(`driver refuses a ${mismatch}-mismatched compensation nomination`, async () => {
+    const f = fixture(
+      async () => ({ phase: "unsupported" }),
+      0,
+      async (input) => {
+        const nomination = {
+          phase: "compensation_required" as const,
+          operationId: input.operationId,
+          providerInstallationRef: input.providerInstallationRef,
+          executionAuthority: { ...input.executionAuthority },
+        };
+        if (mismatch === "operation") nomination.operationId = "other-operation";
+        if (mismatch === "installation") nomination.providerInstallationRef = "other-installation";
+        if (mismatch === "tenant") nomination.executionAuthority.tenantId = "other-tenant";
+        if (mismatch === "resource") nomination.executionAuthority.resourceUid = "other-resource";
+        if (mismatch === "fingerprint")
+          nomination.executionAuthority.fingerprint = "other-fingerprint";
+        if (mismatch === "lease") nomination.executionAuthority.leaseToken = "other-lease";
+        return nomination;
+      },
+    );
+    await expect(f.driver.concludeApplyNoEffect?.(f.input)).rejects.toBeInstanceOf(
+      Driver.ProviderMutationRecoveryError,
+    );
+    expect(f.calls).toHaveLength(0);
+  });
 }
 
 test("compensation carries the exact hold to distinct atomic settlement without releasing it", async () => {

@@ -45,6 +45,7 @@ import {
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
@@ -175,14 +176,16 @@ export class CloudflareProviderProxy implements Provider {
           rawPhaseValue === "succeeded" ||
           rawPhaseValue === "failed" ||
           rawPhaseValue === "running" ||
-          rawPhaseValue === "unsupported"
+          rawPhaseValue === "unsupported" ||
+          rawPhaseValue === "compensation_required"
             ? rawPhaseValue
             : "unknown";
         const restoredPhase =
           restoredPhaseValue === "succeeded" ||
           restoredPhaseValue === "failed" ||
           restoredPhaseValue === "running" ||
-          restoredPhaseValue === "unsupported"
+          restoredPhaseValue === "unsupported" ||
+          restoredPhaseValue === "compensation_required"
             ? restoredPhaseValue
             : "unknown";
         console.error(
@@ -494,6 +497,7 @@ function restoreInitialMutationResult(
   if (
     Object.hasOwn(value, "executorApplyNoEffect") ||
     Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyCompensationRequired") ||
     Object.hasOwn(value, "executorApplyCompensation") ||
     Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
     Object.hasOwn(value, "executorApplyAbort")
@@ -585,6 +589,7 @@ function restoreAdoptionRecoveryResult(
   if (
     Object.hasOwn(value, "executorApplyNoEffect") ||
     Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyCompensationRequired") ||
     Object.hasOwn(value, "executorApplyCompensation") ||
     Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
     Object.hasOwn(value, "executorApplyAbort")
@@ -728,6 +733,48 @@ function restoreApplyNoEffectConclusionResult(
   context: ApplyNoEffectContext,
 ): ProviderApplyNoEffectConclusionResult {
   if (typeof value !== "object" || value === null) return value as ProviderTicket;
+  if (Object.hasOwn(value, "executorApplyCompensationRequired")) {
+    const nominated = maybeExactRecord(value, ["phase", "executorApplyCompensationRequired"]);
+    const evidence = nominated
+      ? maybeExactRecord(nominated.executorApplyCompensationRequired, [
+          "schema",
+          "action",
+          "operationId",
+          "providerInstallationRef",
+          "executionAuthority",
+        ])
+      : null;
+    const authority = evidence
+      ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+      : null;
+    if (
+      nominated?.phase === "compensation_required" &&
+      evidence?.schema === CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA &&
+      evidence.action === "nominateCompensateApply" &&
+      evidence.operationId === context.operationId &&
+      evidence.providerInstallationRef === context.providerInstallationId &&
+      context.selectionMatchesInstallation &&
+      context.executionAuthority &&
+      context.executionAuthority.tenantId === context.tenantId &&
+      context.executionAuthority.resourceUid === context.resourceUid &&
+      authority?.tenantId === context.executionAuthority.tenantId &&
+      authority.resourceUid === context.executionAuthority.resourceUid &&
+      authority.leaseToken === context.executionAuthority.leaseToken &&
+      authority.fingerprint === context.executionAuthority.fingerprint
+    ) {
+      return {
+        phase: "compensation_required",
+        operationId: context.operationId,
+        providerInstallationRef: context.providerInstallationId,
+        executionAuthority: { ...context.executionAuthority },
+      };
+    }
+    return failed(
+      "unavailable",
+      "Provider executor returned invalid compensation nomination",
+      true,
+    );
+  }
   if (Object.hasOwn(value, "executorApplyNoEffectUnsupported")) {
     const unsupported = maybeExactRecord(value, ["phase", "executorApplyNoEffectUnsupported"]);
     const evidence = unsupported
@@ -768,7 +815,8 @@ function restoreApplyNoEffectConclusionResult(
   if (!Object.hasOwn(value, "executorApplyNoEffect")) {
     if (
       Object.hasOwn(value, "phase") &&
-      (value as { readonly phase?: unknown }).phase === "unsupported"
+      ((value as { readonly phase?: unknown }).phase === "unsupported" ||
+        (value as { readonly phase?: unknown }).phase === "compensation_required")
     ) {
       return failed(
         "unavailable",
@@ -928,6 +976,7 @@ function rejectUnexpectedExecutorEvidence(value: unknown): ProviderTicket {
     value !== null &&
     (Object.hasOwn(value, "executorApplyNoEffect") ||
       Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+      Object.hasOwn(value, "executorApplyCompensationRequired") ||
       Object.hasOwn(value, "executorApplyCompensation") ||
       Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
       Object.hasOwn(value, "executorApplyAbort") ||

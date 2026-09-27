@@ -100,7 +100,19 @@ export interface CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence {
   readonly executionAuthority: ProviderExecutionAuthority;
 }
 
-/** Only the closed no-effect conclusion seam may carry this proof. */
+export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA =
+  "takoserver.cloudflare-provider-executor-apply-compensation-required@v1" as const;
+
+/** Pre-attempt nomination; it is not no-effect or compensated proof. */
+export interface CloudflareProviderExecutorApplyCompensationRequiredEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA;
+  readonly action: "nominateCompensateApply";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only the closed conclusion seam may carry these disjoint evidence forms. */
 export type CloudflareProviderApplyNoEffectConclusionResult =
   | ProviderTicket
   | {
@@ -111,6 +123,10 @@ export type CloudflareProviderApplyNoEffectConclusionResult =
   | {
       readonly phase: "unsupported";
       readonly executorApplyNoEffectUnsupported: CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence;
+    }
+  | {
+      readonly phase: "compensation_required";
+      readonly executorApplyCompensationRequired: CloudflareProviderExecutorApplyCompensationRequiredEvidence;
     };
 
 export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA =

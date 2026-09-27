@@ -13,6 +13,7 @@ import type { ProviderPack } from "./provider-pack.ts";
 import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
 import {
   type Provider,
+  type ProviderApplyCompensationNomination,
   type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
@@ -1573,7 +1574,7 @@ export function createProviderDriver(
       ? {
           async concludeApplyNoEffect(
             input: Parameters<NonNullable<TakoformResourceDriver["concludeApplyNoEffect"]>>[0],
-          ): Promise<void> {
+          ): Promise<undefined | ProviderApplyCompensationNomination> {
             const selection = input.selection;
             if (
               selection.kind !== "provider" ||
@@ -1638,6 +1639,23 @@ export function createProviderDriver(
             }
             if (conclusion.phase === "unsupported") {
               throw new ProviderApplyNoEffectUnsupportedError();
+            }
+            if (conclusion.phase === "compensation_required") {
+              // This signal is not a failure ticket and must never become
+              // whole-operation no-effect proof or a settlement. Bind it to
+              // the accepted selection and current Host lease before return.
+              const authority = conclusion.executionAuthority;
+              if (
+                conclusion.operationId !== input.operationId ||
+                conclusion.providerInstallationRef !== selection.providerInstallationRef ||
+                authority.tenantId !== input.executionAuthority.tenantId ||
+                authority.resourceUid !== input.executionAuthority.resourceUid ||
+                authority.fingerprint !== input.executionAuthority.fingerprint ||
+                authority.leaseToken !== input.executionAuthority.leaseToken
+              ) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              return structuredClone(conclusion);
             }
             const ticket = conclusion;
             try {

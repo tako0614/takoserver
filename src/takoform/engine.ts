@@ -1524,9 +1524,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                   ? { commercialAuthority: context.commercialAuthority }
                   : {}),
               } as const;
+              let nominatedForCurrentDependencies = false;
               if (concludeApplyNoEffect) {
                 try {
-                  await concludeApplyNoEffect(recoveryInput);
+                  const conclusion = await concludeApplyNoEffect(recoveryInput);
+                  if (conclusion !== undefined) {
+                    if (
+                      conclusion.phase !== "compensation_required" ||
+                      applySelection.kind !== "provider" ||
+                      conclusion.operationId !== proposedOperationId ||
+                      conclusion.providerInstallationRef !==
+                        applySelection.providerInstallationRef ||
+                      conclusion.executionAuthority.tenantId !== context.tenantId ||
+                      conclusion.executionAuthority.resourceUid !== proposedResourceUid ||
+                      conclusion.executionAuthority.fingerprint !== fingerprint ||
+                      conclusion.executionAuthority.leaseToken !== leaseToken
+                    ) {
+                      throw new ProviderMutationRecoveryError("indeterminate");
+                    }
+                    nominatedForCurrentDependencies = true;
+                  }
                 } catch (error) {
                   if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) throw error;
                   logRecoveryStage("unsupported-accepted");
@@ -1546,7 +1563,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 throw error;
               }
               logRecoveryStage("dependency-status", { dependencyStatus });
-              if (dependencyStatus === "current") {
+              if (dependencyStatus === "current" && !nominatedForCurrentDependencies) {
                 throw new ProviderApplyNoEffectUnsupportedError();
               }
               if (dependencyStatus === null) {
