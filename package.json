@@ -8,6 +8,7 @@
     ".": "./src/index.ts",
     "./provider-extension": "./src/provider-extension.ts",
     "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",
+    "./takoform-worker-store": "./src/takoform/worker-store.ts",
     "./workflow-runtime": "./src/workflow-runtime.ts",
     "./workflow-runtime/workerd": "./src/workflow-runtime-workerd.ts",
     "./actor-upgrade-handoff-source": "./src/actor-upgrade-handoff-source.ts",
