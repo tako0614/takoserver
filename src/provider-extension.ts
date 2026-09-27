@@ -65,6 +65,7 @@ export {
   PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderApplyCompensationInput,
+  type ProviderApplyCompensationNomination,
   type ProviderApplyCompensationResult,
   type ProviderApplyNoEffectConclusionInput,
   type ProviderApplyNoEffectConclusionResult,
@@ -132,6 +133,7 @@ export type {
   CloudflareProviderExecutorAdoptionAbortEvidence,
   CloudflareProviderExecutorApplyAbortEvidence,
   CloudflareProviderExecutorApplyCompensationEvidence,
+  CloudflareProviderExecutorApplyCompensationRequiredEvidence,
   CloudflareProviderExecutorApplyCompensationUnsupportedEvidence,
   CloudflareProviderExecutorApplyNoEffectEvidence,
   CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence,
@@ -149,6 +151,7 @@ export type {
 export {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,

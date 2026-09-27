@@ -46,16 +46,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0065_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0065_container_runtime_input_custody (id TEXT);\n",
+    "0066_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0066_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0066_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0066_container_runtime_input_rewrap (id TEXT);\n",
+    "0067_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0067_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0067_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0067_container_runtime_input_acceptance (id TEXT);\n",
+    "0068_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0068_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -68,7 +68,7 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0064 source. Historical 0001-0049 fixtures are passed explicitly by
+// 0001-0065 source. Historical 0001-0049 fixtures are passed explicitly by
 // tests that exercise frozen import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
   return runSchema(invocation, selectedTarget, {
@@ -695,7 +695,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0064");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0065");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1124,21 +1124,21 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0064");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0065");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0064 inventory", async () => {
+  test("a fixed wave refuses migrations outside the exact audited 0001-0065 inventory", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
     try {
       const migrationDirectory = join(root, "migrations");
       cpSync(currentMigrations, migrationDirectory, { recursive: true });
       copyFileSync(
         join(migrationDirectory, "0052_workflow_termination_intent.sql"),
-        join(migrationDirectory, "0065_unreviewed_extension.sql"),
+        join(migrationDirectory, "0066_unreviewed_extension.sql"),
       );
       const failure = await runD1Schema(
         {
@@ -1155,13 +1155,22 @@ describe("production-shaped D1 migration lane", () => {
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
-      expect(failure.message).toContain("exact audited source inventory 0001-0064");
+      expect(failure.message).toContain("exact audited source inventory 0001-0065");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  for (const refusedBoundary of ["0058", "0059", "0060", "0061", "0062", "0063"] as const) {
+  for (const refusedBoundary of [
+    "0058",
+    "0059",
+    "0060",
+    "0061",
+    "0062",
+    "0063",
+    "0064",
+    "0065",
+  ] as const) {
     test(`${refusedBoundary} remains unavailable as a rehearsal or production fixed-wave boundary`, async () => {
       for (const environment of ["rehearsal", "production"] as const) {
         const root = mkdtempSync(

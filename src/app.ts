@@ -66,6 +66,7 @@ import type {
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
+import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 import {
   createTokenService,
   type SigningKey,
@@ -363,10 +364,10 @@ export function buildApp(ports: AppPorts): App {
         claims,
         principal: {
           tenantId: claims.organizationId,
-          // Keep the existing per-credential principal identity. Tenant-run
-          // authorization is canonically Space-wide; runRef is issuance
-          // correlation, not a second resource-plane scope.
-          principalId: `run:${claims.tokenId}`,
+          // A Hosted logical principal can survive a fresh Run credential so
+          // the same owner can resume its principal-bound Host operation.
+          // Legacy credentials retain their original per-token identity.
+          principalId: await tenantRunPrincipalId(claims),
           scope: {
             space: claims.spaceRef,
             mode: "tenant-run",
@@ -656,10 +657,10 @@ export function buildApp(ports: AppPorts): App {
   return {
     fetch:
       integrationOrganizationBootstrapRoute || integrationE2eCredentialRoute
-        ? async (request) =>
+        ? async (request, lifetime) =>
             (await integrationOrganizationBootstrapRoute?.(request)) ??
             (await integrationE2eCredentialRoute?.(request)) ??
-            (await router(request))
+            (await router(request, lifetime))
         : router,
     maintenance: { artifacts: artifactReconciler },
     async tick(): Promise<TickReport> {

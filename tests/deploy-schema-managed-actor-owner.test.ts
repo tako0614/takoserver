@@ -8,12 +8,14 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
 
-const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "takoserver-queue-retirement-schema-"));
+const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-owner-schema-"));
 const migrations = copyCurrentSchemaFixture(join(root, "migrations"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 const COMMIT = "a".repeat(40);
-const RETIREMENT = "0063_cloudflare_managed_queue_retirement.sql";
+const ACTOR_CLAIM = "0064_cloudflare_managed_actor_owner_claims.sql";
+const QUEUE_RETIREMENT = "0063_cloudflare_managed_queue_retirement.sql";
+const DIGEST = "a".repeat(64);
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -21,14 +23,14 @@ const target = {
   workerName: "takoserver-api-integration",
   d1: {
     databaseName: "takoserver-runtime-integration",
-    databaseId: "00000000-0000-4000-8000-000000000063",
+    databaseId: "00000000-0000-4000-8000-000000000064",
   },
   r2: { bucketName: "takoserver-objects-integration" },
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "current" },
 } satisfies DeployTarget;
 
-// Match Wrangler's statement-at-a-time D1 migration transaction in the local fixture.
+// Match Wrangler's statement-at-a-time migration transaction, including triggers.
 function executeMigration(db: Database, sql: string): void {
   let rest = sql.replace(/^\s*--.*$/gmu, "").trim();
   while (rest) {
@@ -53,10 +55,24 @@ function fixture(
   db.exec(
     "PRAGMA foreign_keys=ON; CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, applied_at TEXT NOT NULL)",
   );
-  for (const { name } of MIGRATIONS.slice(0, 62)) {
+  for (const { name } of MIGRATIONS.slice(0, 63)) {
     db.exec(readFileSync(join(migrations, name), "utf8"));
     db.query("INSERT INTO d1_migrations(name,applied_at) VALUES (?, 'fixture')").run(name);
   }
+  // A protected predecessor has durable rows, not just migration metadata.
+  db.exec(`INSERT INTO cloudflare_managed_worker_receipts
+    (provider_id, resource_uid, native_id, kind, logical_worker_id, operation_id,
+     generation, descriptor_digest, state)
+    VALUES ('provider-a', 'worker-a', 'worker:worker-a', 'worker', 'worker-a',
+      'create-worker-a', 1, 'sha256:${DIGEST}', 'pending'),
+      ('provider-a', 'worker-b', 'worker:worker-b', 'worker', 'worker-b',
+      'create-worker-b', 2, 'sha256:${DIGEST}', 'committed')`);
+  const workerReceipts = db
+    .query("SELECT * FROM cloudflare_managed_worker_receipts ORDER BY resource_uid")
+    .all();
+  const workerSchema = db
+    .query("SELECT sql FROM sqlite_schema WHERE name = 'cloudflare_managed_worker_receipts'")
+    .get();
   if (options.malformedPredecessor) db.exec("CREATE TABLE rogue_predecessor(value TEXT)");
 
   const directory = mkdtempSync(join(root, "case-"));
@@ -79,11 +95,11 @@ function fixture(
       return ok(JSON.stringify([{ success: true, results: db.query(sql).all() }]));
     }
     if (key === "git rev-parse HEAD") return ok(COMMIT);
-    if (key === "git branch --show-current") return ok("candidate/queue-retirement-schema");
+    if (key === "git branch --show-current") return ok("candidate/actor-owner-schema");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (
       key === "bun run check:migrations" ||
-      key === "bun test tests/deploy-schema-managed-queue-retirement.test.ts"
+      key === "bun test tests/deploy-schema-managed-actor-owner.test.ts"
     ) {
       return ok("green");
     }
@@ -117,6 +133,8 @@ function fixture(
   };
   return {
     db,
+    workerReceipts,
+    workerSchema,
     applies: () => applies,
     commands: () => commands,
     invoke: (action: "status" | "apply") => {
@@ -133,16 +151,15 @@ function fixture(
   };
 }
 
-describe("0062 to 0063 managed Queue retirement transition", () => {
-  test("selects only the exact audited 0063 suffix from canonical 0062", async () => {
+describe("0063 to 0064 durable Actor owner claim transition", () => {
+  test("selects only the audited 0064 suffix from exact nonempty 0063", async () => {
     const f = fixture();
     try {
       expect(await f.invoke("status")).toMatchObject({
-        fromMigration: "0062_takoform_import_provider_selection.sql",
-        throughMigration: RETIREMENT,
-        pendingMigrations: [RETIREMENT],
-        applyProviderSelectionCutover: { status: "not_pending" },
-        managedQueueRetirementCutover: { status: "ready" },
+        fromMigration: QUEUE_RETIREMENT,
+        throughMigration: ACTOR_CLAIM,
+        pendingMigrations: [ACTOR_CLAIM],
+        managedActorOwnerCutover: { status: "ready" },
         readyForApply: true,
       });
       expect(f.applies()).toBe(0);
@@ -151,11 +168,11 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     }
   });
 
-  test("refuses a malformed predecessor before source qualification or mutation", async () => {
+  test("refuses a malformed 0063 predecessor before source qualification or mutation", async () => {
     const f = fixture({ malformedPredecessor: true });
     try {
       expect(await f.invoke("status")).toMatchObject({
-        managedQueueRetirementCutover: { status: "predecessor_schema_mismatch" },
+        managedActorOwnerCutover: { status: "predecessor_schema_mismatch" },
         readyForApply: false,
       });
       await expect(f.invoke("apply")).rejects.toThrow("predecessor_schema_mismatch");
@@ -166,11 +183,11 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     }
   });
 
-  test("re-reads and refuses predecessor drift at the immediate mutation fence", async () => {
+  test("rechecks the exact 0063 predecessor at the immediate mutation fence", async () => {
     const f = fixture({ driftAtShapeRead: 4 });
     try {
       await expect(f.invoke("apply")).rejects.toThrow(
-        "immediate 0063 managed Queue retirement migration fence",
+        "immediate 0064 Actor owner claim migration fence",
       );
       expect(f.applies()).toBe(0);
     } finally {
@@ -178,16 +195,43 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     }
   });
 
-  test("requires the exact canonical all-0063 post-shape", async () => {
+  test("refuses predecessor drift after source qualification", async () => {
+    const f = fixture({ driftAtShapeRead: 2 });
+    try {
+      await expect(f.invoke("apply")).rejects.toThrow(
+        "D1 lineage or schema shape changed during qualification",
+      );
+      expect(f.applies()).toBe(0);
+    } finally {
+      f.db.close();
+    }
+  });
+
+  test("preserves old Worker data/schema and requires exact all-0064 post-shape", async () => {
     const f = fixture();
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        pendingMigrations: [RETIREMENT],
-        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
-        managedQueueRetirementCutover: { status: "ready" },
+        pendingMigrations: [ACTOR_CLAIM],
+        appliedMigrations: MIGRATIONS.slice(0, 64).map(({ name }) => name),
+        managedActorOwnerCutover: { status: "ready" },
         providerAcknowledgement: "acknowledged",
       });
       expect(f.applies()).toBe(1);
+      expect(
+        f.db.query("SELECT * FROM cloudflare_managed_worker_receipts ORDER BY resource_uid").all(),
+      ).toEqual(f.workerReceipts);
+      expect(
+        f.db
+          .query("SELECT sql FROM sqlite_schema WHERE name = 'cloudflare_managed_worker_receipts'")
+          .get(),
+      ).toEqual(f.workerSchema);
+      expect(
+        f.db
+          .query(
+            "SELECT name FROM sqlite_schema WHERE name = 'cloudflare_managed_actor_owner_claims'",
+          )
+          .get(),
+      ).not.toBeNull();
     } finally {
       f.db.close();
     }
@@ -199,26 +243,25 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
       const failure = await drifted.invoke("apply").catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.phase).toBe("verification");
-      expect(String(failure)).toContain("managed Queue retirement cutover post-shape differs");
+      expect(String(failure)).toContain("Actor owner claim cutover post-shape differs");
       expect(drifted.applies()).toBe(1);
     } finally {
       drifted.db.close();
     }
   });
 
-  test("reconciles a lost acknowledgement and never replays completed 0063", async () => {
+  test("settles lost acknowledgement from authoritative lineage without replay", async () => {
     const f = fixture({ lostAck: true });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 64).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
       expect(await f.invoke("status")).toMatchObject({
-        fromMigration: RETIREMENT,
-        throughMigration: "0064_cloudflare_managed_actor_owner_claims.sql",
-        pendingMigrations: ["0064_cloudflare_managed_actor_owner_claims.sql"],
-        managedActorOwnerCutover: { status: "ready" },
+        fromMigration: ACTOR_CLAIM,
+        throughMigration: "0065_worker_runtime_input_lease_generation.sql",
+        pendingMigrations: ["0065_worker_runtime_input_lease_generation.sql"],
       });
       expect(f.applies()).toBe(1);
     } finally {
@@ -226,7 +269,7 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     }
   });
 
-  test("refuses an unreviewed 0066 tail instead of adopting it", async () => {
+  test("rejects any unreviewed 0066 source tail before provider I/O", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(

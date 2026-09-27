@@ -77,6 +77,7 @@ const SENSITIVE_PUBLIC_APPLY = {
 } as const;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
+  generation: "abcdefghijklmnop",
   operationKey: SENSITIVE_OPERATION_KEY,
   workerResourceUid: "worker-uid",
   canonicalPublicOrigin: "https://api.takoserver.test",
@@ -4114,6 +4115,11 @@ describe("released edge Form placement", () => {
         },
         {
           type: "plain_text",
+          name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+          text: SENSITIVE_PREPARATION.generation,
+        },
+        {
+          type: "plain_text",
           name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
           text: expect.stringMatching(/^tsop-v1:[0-9a-f]{64}$/u),
         },
@@ -4133,11 +4139,13 @@ describe("released edge Form placement", () => {
     const versionOffering = technical("WorkerVersion");
     let marker = "";
     let commitment = "";
+    let generation = "";
     let uploads = 0;
     let acquires = 0;
     let recoveries = 0;
     let recoveredInput: ProviderRuntimeInputRecoveryInput | undefined;
     let recoveredReceipt: string | undefined;
+    let recoveryPreparation = SENSITIVE_PREPARATION;
     const runtimeInputs: ProviderRuntimeInputLeasePort = {
       async acquire(input) {
         acquires += 1;
@@ -4174,7 +4182,7 @@ describe("released edge Form placement", () => {
         recoveries += 1;
         recoveredInput = input;
         return {
-          preparation: SENSITIVE_PREPARATION,
+          preparation: recoveryPreparation,
           bindingNames: ["ENCRYPTION_KEY"],
           async settle(receiptDigest) {
             recoveredReceipt = receiptDigest;
@@ -4206,6 +4214,10 @@ describe("released edge Form placement", () => {
             metadata.bindings?.find(
               (binding) => binding.name === "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
             )?.text ?? "";
+          generation =
+            metadata.bindings?.find(
+              (binding) => binding.name === "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+            )?.text ?? "";
           throw new TypeError("connection closed after provider commit");
         }
         if (request.method === "GET" && url.pathname.endsWith("/versions")) {
@@ -4235,6 +4247,15 @@ describe("released edge Form placement", () => {
                     name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
                     text: commitment,
                   },
+                  ...(generation
+                    ? [
+                        {
+                          type: "plain_text",
+                          name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+                          text: generation,
+                        },
+                      ]
+                    : []),
                   { type: "secret_text", name: "ENCRYPTION_KEY" },
                 ],
               },
@@ -4295,8 +4316,26 @@ describe("released edge Form placement", () => {
         bundleName: "workerbundle",
       },
       bindingNames: ["ENCRYPTION_KEY"],
+      expectedGeneration: SENSITIVE_PREPARATION.generation,
     });
     expect(recoveredReceipt).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    recoveredReceipt = undefined;
+    recoveryPreparation = {
+      ...SENSITIVE_PREPARATION,
+      generation: "qrstuvwxyzABCDEF",
+    };
+    expect(await provider.apply({ ...input, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(recoveredReceipt).toBeUndefined();
+    expect(uploads).toBe(1);
+    generation = "";
+    expect(await provider.apply({ ...input, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "provider_error", retryable: false },
+    });
+    expect(recoveries).toBe(2);
   });
 
   test("rejects sensitive recovery for every exact secret_text closure mismatch", async () => {
@@ -4356,6 +4395,7 @@ describe("released edge Form placement", () => {
               bundleName: "workerbundle",
             },
             bindingNames: ["ENCRYPTION_KEY"],
+            expectedGeneration: SENSITIVE_PREPARATION.generation,
           });
           return {
             preparation: SENSITIVE_PREPARATION,
@@ -4409,6 +4449,11 @@ describe("released edge Form placement", () => {
                       name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
                       text: SENSITIVE_PREPARATION.commitment,
                     },
+                    {
+                      type: "plain_text",
+                      name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+                      text: SENSITIVE_PREPARATION.generation,
+                    },
                     ...scenario.bindings,
                   ],
                 },
@@ -4448,7 +4493,7 @@ describe("released edge Form placement", () => {
         failure: { code: "provider_error", retryable: false },
       });
       expect({ recoveries, posts, settlements }).toEqual({
-        recoveries: 1,
+        recoveries: 0,
         posts: 0,
         settlements: 0,
       });

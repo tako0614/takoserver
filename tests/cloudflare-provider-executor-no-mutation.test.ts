@@ -16,6 +16,7 @@ import {
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
@@ -561,6 +562,88 @@ describe("Cloudflare provider executor no-mutation bridge", () => {
     expect(await createProxy(binding).concludeApplyNoEffect(input)).toMatchObject({
       phase: "failed",
       failure: { code: "unavailable", retryable: true },
+    });
+  });
+
+  test("accepts compensation nomination only for the exact conclusion operation and lease", async () => {
+    const input = applyNoEffectInput();
+    const nominated = {
+      phase: "compensation_required" as const,
+      executorApplyCompensationRequired: {
+        schema: CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
+        action: "nominateCompensateApply" as const,
+        operationId: input.operationId,
+        providerInstallationRef: input.providerInstallationRef,
+        executionAuthority: { ...input.executionAuthority },
+      },
+    };
+    const binding = createBinding(() => failed("unavailable", "unused", true));
+    binding.concludeApplyNoEffect = async () => structuredClone(nominated);
+    const accepted = await createProxy(binding).concludeApplyNoEffect(input);
+    expect(accepted).toEqual({
+      phase: "compensation_required",
+      operationId: input.operationId,
+      providerInstallationRef: input.providerInstallationRef,
+      executionAuthority: input.executionAuthority,
+    });
+    expect(
+      providerFailureProvesWholeOperationNoMutation(accepted as ProviderTicket, input.operationId),
+    ).toBe(false);
+
+    for (const mutate of [
+      (value: typeof nominated) => (value.executorApplyCompensationRequired.operationId = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.providerInstallationRef = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.executionAuthority.tenantId = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.executionAuthority.resourceUid = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.executionAuthority.leaseToken = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.executionAuthority.fingerprint = "other"),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.action = "unsupported" as never),
+      (value: typeof nominated) =>
+        (value.executorApplyCompensationRequired.schema = "other" as never),
+      (value: typeof nominated) =>
+        ((
+          value.executorApplyCompensationRequired as typeof nominated.executorApplyCompensationRequired & {
+            extra: boolean;
+          }
+        ).extra = true),
+      (value: typeof nominated) => ((value as typeof nominated & { extra: boolean }).extra = true),
+    ]) {
+      const invalid = structuredClone(nominated);
+      mutate(invalid);
+      binding.concludeApplyNoEffect = async () => invalid;
+      expect(await createProxy(binding).concludeApplyNoEffect(input)).toMatchObject({
+        phase: "failed",
+        failure: { code: "unavailable", retryable: true },
+      });
+    }
+    binding.concludeApplyNoEffect = async () => ({ phase: "compensation_required" }) as never;
+    expect(await createProxy(binding).concludeApplyNoEffect(input)).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+
+    const wrongSeam = await createProxy(
+      createBinding(() => nominated as unknown as CloudflareProviderInitialMutationResult),
+    ).apply(makeInput("apply"));
+    expectUnavailable(wrongSeam, "nomination on initial apply");
+    const compensationBinding = createBinding(() => failed("unavailable", "unused", true));
+    compensationBinding.compensateApply = async () =>
+      nominated as unknown as CloudflareProviderApplyCompensationResult;
+    expect(
+      await createProxy(compensationBinding).compensateApply(applyCompensationInput()),
+    ).toMatchObject({
+      phase: "failed",
+      failure: {
+        code: "unavailable",
+        message: "Provider executor returned evidence on an unauthorized seam",
+        retryable: true,
+      },
     });
   });
 

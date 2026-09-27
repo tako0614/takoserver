@@ -70,6 +70,19 @@ implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
 ### Self-host runner credentials
 
+Hosted sponsorship may supply a generic opaque `logicalPrincipalRef` when
+issuing a tenant-run credential. The signed claim selects a stable Host
+operation principal across short-lived credentials in the same organization,
+tenant reference, and exact Space, while `runRef` remains
+issuance correlation and each JWT keeps its own token ID and expiry. The Host
+still binds operations to the exact authenticated tenant and principal under
+the frozen Host API; it does not interpret the reference as a Workspace or
+Capsule ID. A credential without the claim, including the current self-host
+route, keeps its per-token principal. There is no legacy-operation alias:
+pending operations owned by old token principals must be drained or repaired
+before a Hosted cutover. The public Host must accept the new closed claim
+before Hosted begins sending it; neither side changes Form or Host API v1 bytes.
+
 The optional runner-credential endpoint is Host-specific authenticated HTTP on
 the ordinary public listener. It is not route-less and it is not protected by
 being on a private network. Only an organization API key with
@@ -335,6 +348,16 @@ retains the bound selection and claims; the same caller may retry that claim,
 but recovery must not skip an unconfirmed claim by treating it as provider
 dispatch. Provision redemption remains synchronous and is not enrolled in the
 deferred-operation repair scheduler.
+
+For a provider-backed Host request, the 15-second inline budget limits only
+how long HTTP waits for a Resource response. When it answers with a pending
+Operation, the Cloudflare invocation retains the unfinished provider RPC with
+`waitUntil`; that extension is bounded, not a promise of completion. The
+durable saga, leases, and scheduled repair remain responsible if the runtime
+ends first. A GET of the pending Operation can acquire a lease and resume the
+same command, so it is not a read-only status probe. Repeated GET polling can
+also occupy the lease at a scheduled repair boundary; operator diagnosis uses
+exact state and invocation-log reads without triggering another execution.
 
 Standard-service material is resolved only on the initial execution after the
 dispatch marker and before SQLite or provider effects. Recovery does not issue

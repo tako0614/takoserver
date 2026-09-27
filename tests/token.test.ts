@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { Sql } from "../src/ports.ts";
 import { createSponsorshipCredentialIssuer } from "../src/sponsorship-credential.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { tenantRunPrincipalId } from "../src/tenant-run-credential.ts";
 import {
   createTokenService,
   type SigningKey,
@@ -250,6 +251,7 @@ describe("Takoform run tokens", () => {
       mode: "tenant-run",
     });
     expect(claims).not.toHaveProperty("runtimeMaterialization");
+    expect(await tenantRunPrincipalId(claims)).toBe(`run:${claims.tokenId}`);
   });
 
   test("binds only the opaque endpoint reservation authority into a tenant-run credential", async () => {
@@ -274,6 +276,60 @@ describe("Takoform run tokens", () => {
       runRef: "run_host_endpoint",
       mode: "tenant-run",
       workerEndpointOriginReservationId: "reservation_endpoint_01",
+    });
+  });
+
+  test("keeps an opaque logical principal across fresh Runs without reusing the token identity", async () => {
+    const key = await provisionKey("sponsorship-logical-principal");
+    const issuer = sponsorshipIssuer(key);
+    const tokens = service();
+    const firstInput = {
+      organizationId: "org_alpha",
+      tenantRef: "tenant_workspace_x",
+      spaceRef: "tsp_capsule_yurucommu",
+      runRef: "run_first",
+      logicalPrincipalRef: "tshlp_same_capsule",
+      ttlSeconds: 300,
+      issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+      tokenId: "tok_sponsor_first_run",
+    } as const;
+    const nextInput = {
+      ...firstInput,
+      runRef: "run_next",
+      tokenId: "tok_sponsor_next_run",
+    } as const;
+    const first = await issuer.issue(firstInput);
+    const next = await issuer.issue(nextInput);
+    await admitSponsorshipCredential(firstInput, key.keyId);
+    await admitSponsorshipCredential(nextInput, key.keyId);
+    const firstClaims = await tokens.verifyTakoformTenantRunToken(first.token);
+    const nextClaims = await tokens.verifyTakoformTenantRunToken(next.token);
+    expect(firstClaims.logicalPrincipalRef).toBe("tshlp_same_capsule");
+    expect(nextClaims.logicalPrincipalRef).toBe(firstClaims.logicalPrincipalRef);
+    expect(await tenantRunPrincipalId(nextClaims)).toMatch(/^run:owner_[0-9a-f]{64}$/u);
+    expect(await tenantRunPrincipalId(nextClaims)).toBe(await tenantRunPrincipalId(firstClaims));
+    expect(await tenantRunPrincipalId({ ...nextClaims, spaceRef: "space_other" })).not.toBe(
+      await tenantRunPrincipalId(firstClaims),
+    );
+    expect(
+      await tenantRunPrincipalId({ ...nextClaims, tenantRef: "tenant_workspace_other" }),
+    ).not.toBe(await tenantRunPrincipalId(firstClaims));
+    expect(await tenantRunPrincipalId({ ...nextClaims, organizationId: "org_other" })).not.toBe(
+      await tenantRunPrincipalId(firstClaims),
+    );
+    expect(nextClaims.runRef).not.toBe(firstClaims.runRef);
+    expect(nextClaims.tokenId).not.toBe(firstClaims.tokenId);
+    expect(nextClaims.expiresAtEpochSeconds - nextClaims.issuedAtEpochSeconds).toBe(300);
+    now = NOW + 301_000;
+    await expect(tokens.verifyTakoformTenantRunToken(next.token)).rejects.toMatchObject({
+      code: "token_expired",
+    });
+    now = NOW;
+    await sql.run("UPDATE runtime_grant_keys SET revoked_at_epoch_seconds = 1 WHERE key_id = ?", [
+      key.keyId,
+    ]);
+    await expect(service().verifyTakoformTenantRunToken(next.token)).rejects.toMatchObject({
+      code: "no_active_keys",
     });
   });
 

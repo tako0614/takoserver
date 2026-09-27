@@ -94,7 +94,7 @@ test("0064 adds an independent consume-once Actor owner claim without widening W
 test("0064 is in the forward-only self-host migration lineage", () => {
   const database = new Database(":memory:");
   const report = migrateSqlite(database);
-  expect(report.applied.at(-1)).toBe(MIGRATION);
+  expect(report.applied).toContain(MIGRATION);
   expect(migrateSqlite(database).applied).toEqual([]);
   database.close();
 });

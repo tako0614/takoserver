@@ -595,7 +595,11 @@ export default {
    * `/.well-known/takoserver` and every other route report the readable 503
    * reason class instead of a bare provider exception page.
    */
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: WorkerEnv,
+    context?: { waitUntil(work: Promise<unknown>): void },
+  ): Promise<Response> {
     let app: App;
     try {
       const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
@@ -609,7 +613,10 @@ export default {
     } catch (error) {
       return workerStartupFailureResponse(error);
     }
-    return await app.fetch(request);
+    return await app.fetch(
+      request,
+      context ? { waitUntil: (work) => context.waitUntil(work) } : undefined,
+    );
   },
 
   /** Background settlement: expiring reservations return their holds. */

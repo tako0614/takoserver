@@ -106,6 +106,8 @@ import {
   createSelfhostVersionBindingStore,
   normalizeSelfhostVersionBindingSet,
   SELFHOST_WORKER_HANDLER_NAMES,
+  type SelfhostRuntimeInputMarker,
+  type SelfhostRuntimeInputMarkerIdentity,
   type SelfhostVersionBinding,
   type SelfhostVersionBindingSet,
   SelfhostVersionBindingStoreError,
@@ -1547,6 +1549,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     };
   };
 
+  const runtimeInputMarkerIdentity = (
+    input: ApplyInput,
+    target: ProviderRuntimeInputTarget,
+  ): SelfhostRuntimeInputMarkerIdentity => ({
+    tenantId: input.identity.tenantRef,
+    operationId: input.operationId,
+    operationKey: input.operationKey as string,
+    resourceUid: input.identity.uid as string,
+    workerResourceUid: target.workerResourceUid,
+    space: target.space,
+    workerName: target.workerName,
+    bundleName: target.bundleName,
+  });
+
   /**
    * The Worker Version's own non-secret environment.
    *
@@ -2178,8 +2194,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     script: string,
     versionId: string,
     set: SelfhostVersionBindingSet,
+    marker?: SelfhostRuntimeInputMarker,
   ): Promise<void> => {
-    await bindingStoreOperation(() => versionBindings.write(script, versionId, set));
+    await bindingStoreOperation(() => versionBindings.write(script, versionId, set, marker));
   };
 
   const applyModuleWorker = async (input: ApplyInput): Promise<ProviderTicket> => {
@@ -2342,6 +2359,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         );
       }
     }
+    if (requiredSensitive.length > 0 && (await readVersionBindings(script, versionId))) {
+      return failed("conflict", "the Worker Version already has sensitive native bindings");
+    }
 
     // The lease is claimed only after the credential-free module check, and
     // before anything is materialized, so a Worker Version
@@ -2389,6 +2409,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         handlers,
         vars,
         sensitiveVars,
+        ...(lease ? { runtimeInputGeneration: lease.preparation.generation } : {}),
         serviceBindings,
         ...(externalServices.length > 0 ? { externalServices } : {}),
         ...(dataPlane ? { dataPlane } : {}),
@@ -2399,6 +2420,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       return aborted ?? failed("invalid_spec", "the Worker Version environment is invalid");
     }
 
+    const runtimeInputMarker: SelfhostRuntimeInputMarker | undefined =
+      lease && runtimeInputTarget
+        ? {
+            ...runtimeInputMarkerIdentity(input, runtimeInputTarget),
+            generation: lease.preparation.generation,
+          }
+        : undefined;
     let materialized: Awaited<ReturnType<typeof versionMaterializer.materialize>>;
     try {
       materialized = await versionMaterializer.materialize(
@@ -2419,6 +2447,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       throw error;
     }
 
+    if (runtimeInputMarker) {
+      try {
+        await bindingStoreOperation(() =>
+          versionBindings.pinRuntimeInput(script, versionId, runtimeInputMarker),
+        );
+      } catch (error) {
+        const aborted = await abortRuntimeLease(lease as ProviderRuntimeInputLease);
+        if (aborted) return aborted;
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
+      }
+    }
+
     // On this Host the "provider request" is the write itself: the values reach
     // a durable file and nothing else. Dispatch therefore happens immediately
     // before that write and after everything that could still refuse.
@@ -2431,7 +2472,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
     }
     try {
-      await writeVersionBindings(script, versionId, bindingSet);
+      await writeVersionBindings(script, versionId, bindingSet, runtimeInputMarker);
     } catch (error) {
       if (dispatched && error instanceof SelfhostFailure) {
         return failed("unavailable", "the Worker Version environment did not settle", true);
@@ -2455,11 +2496,12 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         dataBindings,
         serviceBindings,
         input.spec,
-      )
+      ) ||
+      (lease && recorded?.runtimeInputGeneration !== lease.preparation.generation)
     ) {
       return failed("unavailable", "the Worker Version did not settle on this machine", true);
     }
-    if (dispatched) {
+    if (dispatched && runtimeInputMarker) {
       try {
         await dispatched.settle(
           await versionRuntimeInputReceiptDigest({
@@ -2468,6 +2510,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             materializationDigest: inspected.digest,
             bindingsDigest: recorded?.digest ?? null,
             bindingNames: requiredSensitive,
+            generation: runtimeInputMarker.generation,
           }),
         );
       } catch (error) {
@@ -2574,12 +2617,65 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const failure = assetContractFailure(materialized.prepared);
       if (failure) return failure;
     }
+    let originalMarker: SelfhostRuntimeInputMarker | undefined;
+    if (requiredSensitive.length > 0 && runtimeInputTarget) {
+      try {
+        const identity = runtimeInputMarkerIdentity(input, runtimeInputTarget);
+        const retained = await bindingStoreOperation(() =>
+          versionBindings.readRuntimeInput(script, versionId, identity),
+        );
+        if (!retained || (recorded && retained.state === "closed")) {
+          return failed("conflict", "the Worker Version runtime-input generation is ambiguous");
+        }
+        originalMarker = { ...identity, generation: retained.generation };
+        if (recorded && recorded.runtimeInputGeneration !== retained.generation) {
+          return failed("conflict", "the Worker Version runtime-input generation is mismatched");
+        }
+        if (!recorded) {
+          const closed = await bindingStoreOperation(() =>
+            versionBindings.closeAbsentRuntimeInput(
+              script,
+              versionId,
+              originalMarker as SelfhostRuntimeInputMarker,
+            ),
+          );
+          if (!closed) {
+            return failed(
+              "unavailable",
+              "the Worker Version environment outcome is indeterminate",
+              true,
+            );
+          }
+        }
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
+      }
+    }
     // Readback-only from here down. Recovery never materializes, never writes a
     // binding, and never asks for the values again: a dispatched handoff has
     // already erased its ciphertext, and a second dispatch is not a thing this
     // seam can do.
+    if (!recorded && originalMarker && runtimeInputTarget) {
+      // The local closure was committed under the same cross-process lock as
+      // the native binding writer. Abandon accepts both claimed and dispatched
+      // original generations; recover would refuse a crash before dispatch.
+      try {
+        await (runtimeInputs as ProviderRuntimeInputLeasePort).abandon?.({
+          organizationId: input.identity.tenantRef,
+          operationId: input.operationId,
+          resourceUid: input.identity.uid as string,
+          reference: input.operationKey as string,
+          target: runtimeInputTarget,
+          bindingNames: requiredSensitive,
+          expectedGeneration: originalMarker.generation,
+        });
+      } catch (error) {
+        return runtimeInputFailure(error, "abort");
+      }
+    }
     let recoveryLease: ProviderRuntimeInputRecoveryLease | undefined;
-    if (requiredSensitive.length > 0 && runtimeInputTarget) {
+    if (recorded && requiredSensitive.length > 0 && runtimeInputTarget) {
       try {
         recoveryLease = await (runtimeInputs as ProviderRuntimeInputLeasePort).recover({
           organizationId: input.identity.tenantRef,
@@ -2588,11 +2684,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           reference: input.operationKey as string,
           target: runtimeInputTarget,
           bindingNames: requiredSensitive,
+          expectedGeneration: (originalMarker as SelfhostRuntimeInputMarker).generation,
         });
       } catch (error) {
         return runtimeInputFailure(error, "recover");
       }
-      if (!sameStrings(recoveryLease.bindingNames, requiredSensitive)) {
+      if (
+        !sameStrings(recoveryLease.bindingNames, requiredSensitive) ||
+        recoveryLease.preparation.generation !== originalMarker?.generation
+      ) {
         return failed("denied", "required sensitive Worker runtime inputs are unavailable");
       }
     }
@@ -2604,21 +2704,6 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // write failed after dispatch: the directory was there, `abandon` was
     // skipped, and the plan-derived operation key could never be prepared again.
     // Revoking the handoff is what lets the ordinary retry re-prepare it.
-    const absent = recorded === null;
-    if (absent && requiredSensitive.length > 0 && runtimeInputTarget) {
-      try {
-        await (runtimeInputs as ProviderRuntimeInputLeasePort).abandon?.({
-          organizationId: input.identity.tenantRef,
-          operationId: input.operationId,
-          resourceUid: input.identity.uid as string,
-          reference: input.operationKey as string,
-          target: runtimeInputTarget,
-          bindingNames: requiredSensitive,
-        });
-      } catch (error) {
-        return runtimeInputFailure(error, "abort");
-      }
-    }
     if (materialized.state === "absent") {
       return failed("not_found", "the Worker Version is not materialized");
     }
@@ -2647,7 +2732,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         dataBindings,
         serviceBindings,
         input.spec,
-      )
+      ) ||
+      (recoveryLease && recorded?.runtimeInputGeneration !== recoveryLease.preparation.generation)
     ) {
       return failed("not_found", "the Worker Version environment was not recorded");
     }
@@ -2662,6 +2748,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             materializationDigest: materialized.prepared.materializationDigest,
             bindingsDigest: recorded?.digest ?? null,
             bindingNames: requiredSensitive,
+            generation: recoveryLease.preparation.generation,
           }),
         );
       } catch (error) {
@@ -5578,14 +5665,18 @@ async function versionRuntimeInputReceiptDigest(input: {
   readonly materializationDigest: string;
   readonly bindingsDigest: string | null;
   readonly bindingNames: readonly string[];
+  readonly generation?: string;
 }): Promise<`sha256:${string}`> {
   const canonical = JSON.stringify({
-    format: "takoserver.selfhost-worker-version-runtime-input-receipt@v1",
+    format: input.generation
+      ? "takoserver.selfhost-worker-version-runtime-input-receipt@v2"
+      : "takoserver.selfhost-worker-version-runtime-input-receipt@v1",
     script: input.script,
     versionId: input.versionId,
     materializationDigest: input.materializationDigest,
     bindingsDigest: input.bindingsDigest,
     bindingNames: [...input.bindingNames].sort(),
+    ...(input.generation ? { generation: input.generation } : {}),
   });
   const bytes = new Uint8Array(
     await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical)),
