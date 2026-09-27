@@ -14,6 +14,7 @@
       "!!form-authority-worker-configuration.d.ts",
       "!!integration-form-authority-worker-configuration.d.ts",
       "!!integration-form-authority-operator-worker-configuration.d.ts",
+      "!!existing-space-operator-worker-configuration.d.ts",
       "!!.deploy",
       "!!.wrangler-realized.jsonc",
       "!!src/db-schema.ts",
