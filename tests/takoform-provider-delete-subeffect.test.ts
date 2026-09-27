@@ -46,7 +46,11 @@ function ticket(
   };
 }
 
-async function seedAcceptedDelete(sql: Sql): Promise<void> {
+async function seedAcceptedDelete(
+  sql: Sql,
+  leaseUntil = NOW + 60_000,
+  createdAt = NOW,
+): Promise<void> {
   await sql.run(
     `INSERT INTO tf_resource_deletion_attestations
        (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
@@ -81,8 +85,8 @@ async function seedAcceptedDelete(sql: Sql): Promise<void> {
           operationMode: "initial",
         },
       ]),
-      NOW,
-      NOW,
+      createdAt,
+      createdAt,
     ],
   );
   await sql.run(
@@ -106,11 +110,11 @@ async function seedAcceptedDelete(sql: Sql): Promise<void> {
       ADDRESS.kind,
       ADDRESS.name,
       UID,
-      NOW,
-      NOW,
+      createdAt,
+      createdAt,
       "lease-initial",
-      NOW + 60_000,
-      NOW,
+      leaseUntil,
+      createdAt,
     ],
   );
   for (const phase of ["planned", "dispatched"]) {
@@ -204,6 +208,175 @@ test("Host subeffect CAS grants exactly one native writer and recovery terminali
       [TENANT, UID],
     );
     expect(open.map((row) => row.effect_id)).toEqual([OPERATION, OPERATION]);
+  } finally {
+    database.close();
+  }
+});
+
+test("a batch queued past lease expiry cannot grant a native write", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    const start = Date.now();
+    const leaseUntil = start + 500;
+    await seedAcceptedDelete(sql, leaseUntil, start);
+    let authorityObserved = false;
+    const delayedSql: Sql = {
+      ...sql,
+      async query(statement, params) {
+        const result = await sql.query(statement, params);
+        if (statement.startsWith("SELECT 1 AS valid WHERE") && result.length === 1)
+          authorityObserved = true;
+        return result;
+      },
+      async batch(statements) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, leaseUntil - Date.now() + 50)),
+        );
+        return await sql.batch(statements);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(delayedSql, () => start);
+    expect(await store.issue(ticket("actor-tombstone"))).toBe("conflict");
+    expect(authorityObserved).toBe(true);
+    expect(await rows(sql)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("recovery rejects an issued effect whose attestation mirror is missing", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    const tombstone = ticket("actor-tombstone");
+    expect(await store.issue(tombstone)).toBe("claimed");
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET effects_json = json_remove(effects_json, '$[3]')
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [TENANT, UID],
+    );
+    await rotateLease(sql);
+    const recovery = ticket("actor-tombstone", "recovery", "lease-recovery");
+    expect(await store.readExact(recovery)).toBe("conflict");
+    expect(await store.concludeExact(recovery)).toBe("conflict");
+  } finally {
+    database.close();
+  }
+});
+
+test("conclusion cannot terminalize when the mirror changes after its read", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    await seedAcceptedDelete(sql);
+    const tombstone = ticket("actor-tombstone");
+    expect(await createTakoformDeleteSubeffectStore(sql, () => NOW + 2).issue(tombstone)).toBe(
+      "claimed",
+    );
+    const raceSql: Sql = {
+      ...sql,
+      async batch(statements) {
+        await sql.run(
+          `UPDATE tf_resource_deletion_attestations
+           SET effects_json = json_remove(effects_json, '$[3]')
+           WHERE tenant_id = ? AND resource_uid = ?`,
+          [TENANT, UID],
+        );
+        return await sql.batch(statements);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(raceSql, () => NOW + 2);
+    expect(await store.concludeExact(tombstone)).toBe("conflict");
+    expect(await rows(sql)).toHaveLength(2);
+  } finally {
+    database.close();
+  }
+});
+
+test("conclusion does not repair an unmirrored terminal row inserted after its read", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    await seedAcceptedDelete(sql);
+    const tombstone = ticket("actor-tombstone");
+    expect(await createTakoformDeleteSubeffectStore(sql, () => NOW + 2).issue(tombstone)).toBe(
+      "claimed",
+    );
+    const raceSql: Sql = {
+      ...sql,
+      async batch(statements) {
+        await sql.run(
+          `INSERT INTO tf_resource_provider_effects
+             (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
+              operation_mode, provider_pack_ref, provider_installation_ref,
+              native_id, target_json, created_at)
+           SELECT tenant_id, resource_uid, effect_id || ':succeeded', effect_id,
+                  effect_kind, 'succeeded', operation_mode, provider_pack_ref,
+                  provider_installation_ref, native_id, target_json, ?
+           FROM tf_resource_provider_effects
+           WHERE tenant_id = ? AND resource_uid = ? AND event_id = ?`,
+          [NOW + 2, TENANT, UID, `${OPERATION}:actor-tombstone:dispatched`],
+        );
+        return await sql.batch(statements);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(raceSql, () => NOW + 2);
+    expect(await store.concludeExact(tombstone)).toBe("conflict");
+    const snapshot = await sql.query(
+      `SELECT effects_json FROM tf_resource_deletion_attestations
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [TENANT, UID],
+    );
+    expect(JSON.parse(String(snapshot[0]?.effects_json))).toHaveLength(4);
+    expect(await store.readExact(tombstone)).toBe("conflict");
+  } finally {
+    database.close();
+  }
+});
+
+test("exact reads reject changed issued and missing terminal mirrors", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    const tombstone = ticket("actor-tombstone");
+    expect(await store.issue(tombstone)).toBe("claimed");
+    const original = await sql.query(
+      `SELECT effects_json FROM tf_resource_deletion_attestations
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [TENANT, UID],
+    );
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET effects_json = json_set(effects_json, '$[2].nativeId', 'actor:wrong')
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [TENANT, UID],
+    );
+    expect(await store.readExact(tombstone)).toBe("conflict");
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations SET effects_json = ?
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [String(original[0]?.effects_json), TENANT, UID],
+    );
+    expect(await store.concludeExact(tombstone)).toBe("recorded");
+    await sql.run(
+      `UPDATE tf_resource_deletion_attestations
+       SET effects_json = json_remove(effects_json, '$[4]')
+       WHERE tenant_id = ? AND resource_uid = ?`,
+      [TENANT, UID],
+    );
+    expect(await store.readExact(tombstone)).toBe("conflict");
+    expect(await store.concludeExact(tombstone)).toBe("conflict");
   } finally {
     database.close();
   }

@@ -7,6 +7,10 @@ const EFFECTS = "tf_resource_provider_effects";
 const GUARDS = "tf_operation_commit_guards";
 const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const SUBEFFECT = /^[a-z][a-z0-9-]{0,63}$/u;
+// Use the database clock at the guarded statement's execution point. A Worker
+// can queue a D1 batch after sampling its JS clock and outlive the lease.
+const SQL_NOW_MS =
+  "(CAST(strftime('%s', 'now') AS INTEGER) * 1000 + CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER))";
 
 /** An internal Host-ledger ticket, not a native-effect receipt or public Host API. */
 export interface TakoformDeleteSubeffectInput {
@@ -56,16 +60,22 @@ export function createTakoformDeleteSubeffectStore(sql: Sql, now: () => number =
     if (!expected) return "conflict";
     try {
       if (!(await currentAuthority(sql, input, now()))) return "conflict";
-      const rows = await sql.query(
-        `SELECT event_id, effect_id, effect_kind, phase, operation_mode,
-                provider_pack_ref, provider_installation_ref, native_id, target_json
-         FROM ${EFFECTS}
-         WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?`,
-        [input.tenantId, input.resourceUid, expected.effectId],
+      const snapshot = await sql.query(
+        `SELECT attestation.effects_json,
+                effect.event_id, effect.effect_id, effect.effect_kind, effect.phase,
+                effect.operation_mode, effect.provider_pack_ref,
+                effect.provider_installation_ref, effect.native_id, effect.target_json
+         FROM ${ATTESTATIONS} AS attestation
+         LEFT JOIN ${EFFECTS} AS effect
+           ON effect.tenant_id = attestation.tenant_id
+          AND effect.resource_uid = attestation.resource_uid AND effect.effect_id = ?
+         WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+           AND attestation.state = 'pending'`,
+        [expected.effectId, input.tenantId, input.resourceUid],
       );
-      if (rows.length === 0) return "absent";
-      if (rows.length > 3) return "conflict";
-      const phases = new Map<string, string>();
+      if (snapshot.length === 0 || snapshot.length > 3) return "conflict";
+      const rows = snapshot.filter((row) => row.effect_id !== null);
+      const phases = new Map<Phase, "initial" | "recovery">();
       for (const row of rows) {
         const phase = row.phase;
         if (
@@ -83,6 +93,8 @@ export function createTakoformDeleteSubeffectStore(sql: Sql, now: () => number =
           return "conflict";
         phases.set(phase, row.operation_mode);
       }
+      if (!mirrorsMatch(snapshot[0]?.effects_json, input, expected, phases)) return "conflict";
+      if (rows.length === 0) return "absent";
       if (
         !phases.has("planned") ||
         (phases.has("dispatched") && phases.get("planned") !== phases.get("dispatched")) ||
@@ -119,7 +131,7 @@ export function createTakoformDeleteSubeffectStore(sql: Sql, now: () => number =
         insertEvent(input, expected, "dispatched", timestamp),
         mirrorEvent(input, expected, "planned", planned, timestamp),
         mirrorEvent(input, expected, "dispatched", dispatched, timestamp),
-        exactPairGuard(input, expected, planned, dispatched, finalGuard),
+        exactPairGuard(input, expected, planned, dispatched, input.operationMode, finalGuard),
         { sql: `DELETE FROM ${GUARDS} WHERE token IN (?, ?)`, params: [firstGuard, finalGuard] },
       ];
       const results = await sql.batch(statements);
@@ -145,15 +157,40 @@ export function createTakoformDeleteSubeffectStore(sql: Sql, now: () => number =
     const before = await readExact(input);
     if (before === "succeeded") return "existing";
     if (before !== "issued") return "conflict";
-    const timestamp = now();
-    const firstGuard = guardToken();
-    const finalGuard = guardToken();
-    const succeeded = event(input, expected, "succeeded");
-    const terminalGuard = guardToken();
     try {
+      // The issuer mode is durable and need not match this recovery caller's
+      // mode. Carry it into the batch's exact row-and-mirror guard.
+      const issued = await sql.query(
+        `SELECT phase, operation_mode FROM ${EFFECTS}
+         WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+           AND phase IN ('planned', 'dispatched')`,
+        [input.tenantId, input.resourceUid, expected.effectId],
+      );
+      if (
+        issued.length !== 2 ||
+        !issued.some((row) => row.phase === "planned") ||
+        !issued.some((row) => row.phase === "dispatched") ||
+        (issued[0]?.operation_mode !== "initial" && issued[0]?.operation_mode !== "recovery") ||
+        issued[1]?.operation_mode !== issued[0]?.operation_mode
+      )
+        return "conflict";
+      const issuerMode = issued[0].operation_mode as "initial" | "recovery";
+      const issuer = { ...input, operationMode: issuerMode };
+      const timestamp = now();
+      const firstGuard = guardToken();
+      const finalGuard = guardToken();
+      const succeeded = event(input, expected, "succeeded");
+      const terminalGuard = guardToken();
       const results = await sql.batch([
         authorityGuard(input, timestamp, firstGuard),
-        exactPairGuard(input, expected, undefined, undefined, finalGuard),
+        exactPairGuard(
+          input,
+          expected,
+          event(issuer, expected, "planned"),
+          event(issuer, expected, "dispatched"),
+          issuerMode,
+          finalGuard,
+        ),
         insertEvent(input, expected, "succeeded", timestamp),
         mirrorEvent(input, expected, "succeeded", succeeded, timestamp),
         exactTerminalGuard(input, expected, succeeded, terminalGuard),
@@ -239,6 +276,7 @@ function authorityPredicate(input: TakoformDeleteSubeffectInput, timestamp: numb
         AND saga.fingerprint = ? AND saga.phase = 'planned'
         AND saga.receipt_json IS NULL AND saga.execution_started_at IS NOT NULL
         AND saga.execution_lease_token = ? AND saga.execution_lease_until > ?
+        AND saga.execution_lease_until > ${SQL_NOW_MS}
         AND saga.accepted_uid = saga.resource_uid
         AND saga.accepted_generation IS NOT NULL AND saga.accepted_revision IS NOT NULL
         AND saga.target_space = ? AND saga.target_api_version = ?
@@ -356,12 +394,14 @@ function insertEvent(
   phase: Phase,
   timestamp: number,
 ): SqlStatement {
+  const authority = authorityPredicate(input, timestamp);
   return {
     sql: `INSERT OR IGNORE INTO ${EFFECTS}
       (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
        operation_mode, provider_pack_ref, provider_installation_ref,
        native_id, target_json, created_at)
-      VALUES (?, ?, ?, ?, 'delete', ?, ?, ?, ?, ?, ?, ?)`,
+      SELECT ?, ?, ?, ?, 'delete', ?, ?, ?, ?, ?, ?, ?
+      WHERE ${authority.sql}`,
     params: [
       input.tenantId,
       input.resourceUid,
@@ -374,6 +414,7 @@ function insertEvent(
       input.nativeId,
       expected.targetJson,
       timestamp,
+      ...authority.params,
     ],
   };
 }
@@ -390,6 +431,37 @@ function event(input: TakoformDeleteSubeffectInput, expected: Expected, phase: P
     nativeId: input.nativeId,
     target: JSON.parse(expected.targetJson) as Record<string, string>,
   });
+}
+
+function mirrorsMatch(
+  raw: unknown,
+  input: TakoformDeleteSubeffectInput,
+  expected: Expected,
+  phases: ReadonlyMap<Phase, "initial" | "recovery">,
+): boolean {
+  if (typeof raw !== "string") return false;
+  const events = JSON.parse(raw) as unknown;
+  if (!Array.isArray(events)) return false;
+  let matched = 0;
+  for (const value of events) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+    const candidate = value as Record<string, unknown>;
+    if (
+      candidate.operationId !== expected.effectId &&
+      !(
+        typeof candidate.eventId === "string" &&
+        candidate.eventId.startsWith(`${expected.effectId}:`)
+      )
+    )
+      continue;
+    const phase = candidate.phase;
+    if (phase !== "planned" && phase !== "dispatched" && phase !== "succeeded") return false;
+    const mode = phases.get(phase);
+    if (!mode || canonicalJson(value) !== event({ ...input, operationMode: mode }, expected, phase))
+      return false;
+    matched += 1;
+  }
+  return matched === phases.size;
 }
 
 function mirrorEvent(
@@ -489,23 +561,42 @@ function exactMirror(input: TakoformDeleteSubeffectInput, eventJson: string, eve
 function exactPairGuard(
   input: TakoformDeleteSubeffectInput,
   expected: Expected,
-  plannedJson: string | undefined,
-  dispatchedJson: string | undefined,
+  plannedJson: string,
+  dispatchedJson: string,
+  issuedMode: "initial" | "recovery",
   token: string,
 ): SqlStatement {
-  const requiredMode = plannedJson && dispatchedJson ? input.operationMode : undefined;
-  const planned = exactEffect(input, expected, "planned", requiredMode);
-  const dispatched = exactEffect(input, expected, "dispatched", requiredMode);
-  const plannedMirror = plannedJson
-    ? exactMirror(input, plannedJson, `${expected.effectId}:planned`)
-    : { sql: "1 = 1", params: [] as SqlParam[] };
-  const dispatchedMirror = dispatchedJson
-    ? exactMirror(input, dispatchedJson, `${expected.effectId}:dispatched`)
-    : { sql: "1 = 1", params: [] as SqlParam[] };
+  const planned = exactEffect(input, expected, "planned", issuedMode);
+  const dispatched = exactEffect(input, expected, "dispatched", issuedMode);
+  const plannedMirror = exactMirror(input, plannedJson, `${expected.effectId}:planned`);
+  const dispatchedMirror = exactMirror(input, dispatchedJson, `${expected.effectId}:dispatched`);
+  const terminalAbsent = {
+    sql: `NOT EXISTS (
+      SELECT 1 FROM ${EFFECTS}
+      WHERE tenant_id = ? AND resource_uid = ? AND effect_id = ?
+        AND phase IN ('succeeded', 'cancelled')
+    )`,
+    params: [input.tenantId, input.resourceUid, expected.effectId] satisfies SqlParam[],
+  };
+  const ownMirrorCount = {
+    sql: `(SELECT COUNT(*) FROM ${ATTESTATIONS} AS attestation,
+      json_each(attestation.effects_json) AS item
+      WHERE attestation.tenant_id = ? AND attestation.resource_uid = ?
+        AND (json_extract(item.value, '$.operationId') = ?
+          OR substr(json_extract(item.value, '$.eventId'), 1, length(?)) = ?)) = 2`,
+    params: [
+      input.tenantId,
+      input.resourceUid,
+      expected.effectId,
+      `${expected.effectId}:`,
+      `${expected.effectId}:`,
+    ] satisfies SqlParam[],
+  };
   return {
     sql: `INSERT INTO ${GUARDS} (token, valid)
       SELECT ?, CASE WHEN ${planned.sql} AND ${dispatched.sql}
         AND ${plannedMirror.sql} AND ${dispatchedMirror.sql}
+        AND ${ownMirrorCount.sql} AND ${terminalAbsent.sql}
         THEN 1 ELSE 0 END`,
     params: [
       token,
@@ -513,6 +604,8 @@ function exactPairGuard(
       ...dispatched.params,
       ...plannedMirror.params,
       ...dispatchedMirror.params,
+      ...ownMirrorCount.params,
+      ...terminalAbsent.params,
     ],
   };
 }
