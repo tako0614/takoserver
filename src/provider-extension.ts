@@ -274,4 +274,11 @@ export {
   type VectorIndexStore,
   VectorIndexStoreError,
 } from "./vector-index-store.ts";
+export type {
+  ProviderWorkerClassRuntime,
+  WorkerClassInspectionInput,
+  WorkerClassInspectionVerdict,
+  WorkerClassResourceIdentity,
+  WorkerClassRuntimeContract,
+} from "./worker-class-runtime-port.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";

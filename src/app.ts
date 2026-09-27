@@ -428,6 +428,7 @@ export function buildApp(ports: AppPorts): App {
             ? { implementationDigest: ports.formImplementationDigest }
             : {}),
           candidates: ports.hostForms,
+          ...(driver.workerClassRuntime ? { workerClassRuntime: driver.workerClassRuntime } : {}),
           bindings: ports.hostBindings ?? [],
           technicalAvailability: availability ?? {
             async resolve() {

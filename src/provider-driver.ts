@@ -64,6 +64,8 @@ import type {
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { increment } from "./takoform/wire.ts";
+import { validateClassHolderRuntime } from "./takoform/worker-runtime-contract.ts";
+import type { WorkerClassRuntime } from "./worker-class-runtime-port.ts";
 import {
   type WorkerEndpointOriginAssignment,
   WorkerEndpointOriginReservationError,
@@ -1398,13 +1400,98 @@ export function createProviderDriver(
     throw new TakoformHostError(...failureToWire(result.failure.code));
   };
 
+  const classRuntimes = new Map(
+    providers.flatMap((provider) =>
+      provider.workerClassRuntime
+        ? [
+            [
+              provider.id,
+              {
+                contracts: structuredClone(provider.workerClassRuntime.contracts),
+                inspect: provider.workerClassRuntime.inspect.bind(provider.workerClassRuntime),
+              },
+            ] as const,
+          ]
+        : [],
+    ),
+  );
+  const workerClassRuntime: WorkerClassRuntime | undefined =
+    classRuntimes.size === 0
+      ? undefined
+      : {
+          contracts: [...classRuntimes.values()].flatMap((runtime) =>
+            structuredClone(runtime.contracts),
+          ),
+          async inspect(inputs) {
+            if (inputs.length === 0 || inputs.length > 100) return "unavailable";
+            const snapshots = await Promise.all(
+              inputs.map(async (input) => {
+                const holder = await active(input.tenantId, input.holder.uid);
+                const version = await active(input.tenantId, input.version.uid);
+                if (
+                  holder.providerPackRef !== version.providerPackRef ||
+                  holder.providerInstallationRef !== version.providerInstallationRef
+                )
+                  return null;
+                const owner = installed(holder, input.holder.formRef).provider;
+                if (installed(version, input.version.formRef).provider.id !== owner.id) return null;
+                const runtime = classRuntimes.get(owner.id);
+                if (
+                  !runtime?.contracts.some(
+                    (contract) => canonicalJson(contract) === canonicalJson(input.contract),
+                  )
+                )
+                  return null;
+                return { input: structuredClone(input), holder, version, runtime };
+              }),
+            );
+            if (snapshots.some((snapshot) => snapshot === null)) return "unavailable";
+            for (const snapshot of snapshots) {
+              if (!snapshot) return "unavailable";
+              const { input, holder, version, runtime } = snapshot;
+              const verdict = await runtime.inspect({
+                ...structuredClone(input),
+                providerInstallationRef: holder.providerInstallationRef,
+                holderNativeId: holder.nativeId,
+                versionNativeId: version.nativeId,
+              });
+              if (verdict !== "valid") return verdict === "invalid" ? "invalid" : "unavailable";
+            }
+            // A later inspection may race an earlier Version's placement.
+            // Re-read the whole set only after all inspections have finished.
+            for (const snapshot of snapshots) {
+              if (!snapshot) return "unavailable";
+              const { input, holder, version } = snapshot;
+              const afterHolder = await active(input.tenantId, input.holder.uid);
+              const afterVersion = await active(input.tenantId, input.version.uid);
+              if (
+                canonicalJson(holder) !== canonicalJson(afterHolder) ||
+                canonicalJson(version) !== canonicalJson(afterVersion)
+              )
+                return "unavailable";
+            }
+            return "valid";
+          },
+        };
+
   return {
+    ...(workerClassRuntime ? { workerClassRuntime } : {}),
     runtimeInputPolicy,
     async selectApply(input) {
-      return structuredClone((await resolveApplySelection(input)).selection);
+      const resolved = await resolveApplySelection(input);
+      validateClassHolderRuntime(
+        input.form,
+        "provider" in resolved ? classRuntimes.get(resolved.provider.id) : undefined,
+      );
+      return structuredClone(resolved.selection);
     },
     async selectImport(input) {
-      return structuredClone((await resolveImportSelection(input)).selection);
+      const resolved = await resolveImportSelection(input);
+      validateClassHolderRuntime(
+        input.form,
+        "provider" in resolved ? classRuntimes.get(resolved.provider.id) : undefined,
+      );
+      return structuredClone(resolved.selection);
     },
     artifactConsumerRepair: {
       async verifyNativeAbsence(input) {
@@ -1810,6 +1897,7 @@ export function createProviderDriver(
           throw new TakoformHostError("backend_unavailable", 503);
         }
         const provider = resolved.provider;
+        validateClassHolderRuntime(input.form, classRuntimes.get(provider.id));
         const offering = structuredClone(resolved.selection.technicalOffering);
         // Recovery adopts the retained runtime binding, not today's integration
         // registry. Initial delivery is fenced before placement or native work.
@@ -2820,6 +2908,7 @@ export function createProviderDriver(
         throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
       }
       const provider = resolved.provider;
+      validateClassHolderRuntime(input.form, classRuntimes.get(provider.id));
       // The provider object is selected only after the persisted snapshot has
       // been revalidated. The offering and installation sent to it are the
       // retained values, never a fresh catalog projection.

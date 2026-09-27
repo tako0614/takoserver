@@ -6,6 +6,7 @@ import type {
   ProviderRuntimeInputPublicApply,
 } from "./provider-runtime-input-port.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "./standard-service-port.ts";
+import type { ProviderWorkerClassRuntime } from "./worker-class-runtime-port.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -497,6 +498,7 @@ export interface ProviderNativeReadbackInput {
 }
 
 export interface Provider {
+  readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];

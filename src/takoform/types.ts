@@ -52,6 +52,8 @@ export interface InstalledTakoformForm {
   };
   /** Explicit family adapter for a Form-provided worker class Interface. */
   readonly workerClassRuntime?: {
+    /** Explicit executable ABI identity; absent on historical inferred adapters. */
+    readonly runtimeClassRef?: TakoformInterfaceRef;
     readonly providedInterface: string;
     readonly className: `/${string}`;
     readonly workerRelation: `/${string}`;
@@ -248,6 +250,7 @@ export interface TakoformStandardServiceResolver {
 }
 
 export interface TakoformResourceDriver {
+  readonly workerClassRuntime?: import("../worker-class-runtime-port.ts").WorkerClassRuntime;
   readonly runtimeInputPolicy?: TakoformRuntimeInputPolicy;
   /**
    * Pure, bounded placement decision persisted by the Host before callbacks or

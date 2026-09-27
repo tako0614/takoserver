@@ -51,12 +51,35 @@ Technical routing does not advertise Actor support or create an Offering.
 `ActorNamespace` remains an identity Form, not a relation that inherits a
 Worker's commercial Offering. The hosted edge supply parser has no Actor
 resource-class, metering or price-plan contract, and continues to reject Actor
-supply configuration. The Host also still refuses class-holder admission;
+supply configuration. The shipped Host composition still refuses class-holder admission;
 native owner allocation alone is not evidence that every weighted active
 Worker version exports the required class or that the Actor Form is Ready.
 Normal hosted admission therefore remains unavailable until provider-qualified
 class readiness, the backend lifecycle and the separately owned commercial
 supply composition are implemented and qualified.
+
+The dormant `Provider.workerClassRuntime` software port separates identity
+allocation from runtime readiness. An adapter must register an exact FormRef,
+package digest and explicit runtime InterfaceRef; the historical inferred
+Actor adapter has no such ABI registration. The same capability is checked by
+Host authority and before apply/import, including the selected provider. A
+successful class identity allocation starts with `Ready=False`, even if a
+provider receipt optimistically claims readiness. It need not wait for the
+WorkerVersion that will bind that identity.
+
+Current read/observe and non-replay apply derive readiness from the same
+tenant/Space and UID-pinned graph. Every nonzero weighted Version must pass
+isolated class inspection against its exact bundle manifest. The selected
+holder and Version Deployments must belong to the same provider installation;
+both the Resource graph and native Deployment facts are re-read after
+inspection. Missing graphs, mismatches and unavailable inspection never yield
+Ready. The inspector must not construct the class or receive live Actor state
+or sensitive environment values. Wrapper identity and declared-handler checks
+alone are insufficient. No shipped adapter registers this capability yet.
+
+Exact idempotency replay still returns its historical mutation response. It
+does not re-evaluate current readiness or grant traffic admission; current
+read/observe and the runtime's own live admission answer those questions.
 
 ## Ordinary stable mode
 
