@@ -58,7 +58,6 @@ test("native class adapter initializes once and exposes SQL and a host-owned ala
     }
     socketMessage() {}
     socketClose() {}
-    socketError() {}
   }
   try {
     const actor = createNativeActorExecution({
@@ -239,7 +238,6 @@ test("adapter returns the original streaming Response without reading or bufferi
     alarm() {}
     socketMessage() {}
     socketClose() {}
-    socketError() {}
   }
   try {
     const actor = createNativeActorExecution({

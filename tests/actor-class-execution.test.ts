@@ -27,14 +27,13 @@ function requiredMethods(base: Record<string, unknown> = {}): Record<string, unk
     alarm() {},
     socketMessage() {},
     socketClose() {},
-    socketError() {},
     ...base,
   };
 }
 
 function completePrototype(Actor: { readonly prototype: object }): void {
   const methods = requiredMethods();
-  for (const name of ["fetch", "alarm", "socketMessage", "socketClose", "socketError"]) {
+  for (const name of ["fetch", "alarm", "socketMessage", "socketClose"]) {
     if (Object.getOwnPropertyDescriptor(Actor.prototype, name) !== undefined) continue;
     Object.defineProperty(Actor.prototype, name, {
       value: methods[name],
@@ -71,10 +70,6 @@ describe("private Actor ordinary-class execution seam", () => {
       socketClose(this: unknown, socket: object, event: object, receivedTurn: object) {
         receivers.push(this);
         seen.push({ kind: "socketClose", args: [socket, event, receivedTurn] });
-      },
-      socketError(this: unknown, socket: object, event: object, receivedTurn: object) {
-        receivers.push(this);
-        seen.push({ kind: "socketError", args: [socket, event, receivedTurn] });
       },
     };
     class Actor {
@@ -117,7 +112,60 @@ describe("private Actor ordinary-class execution seam", () => {
     expect(seen[1]?.args).toEqual([currentTurn]);
     expect(seen[2]?.args).toEqual([socket, "message", currentTurn]);
     expect(seen[3]?.args).toEqual([socket, closeEvent, currentTurn]);
-    expect(seen[4]?.args).toEqual([socket, errorEvent, currentTurn]);
+    expect(seen[4]?.kind).toBe("socketClose");
+    expect(seen[4]?.args).toEqual([
+      socket,
+      { code: 1006, reason: "transport_error", wasClean: false },
+      currentTurn,
+    ]);
+  });
+
+  test("accepts all four required handlers while ignoring an extra socketError getter", async () => {
+    let getterCalls = 0;
+    class Actor {
+      fetch() {
+        return new Response("ok");
+      }
+      alarm() {}
+      socketMessage() {}
+      socketClose() {}
+      get socketError() {
+        getterCalls += 1;
+        throw new Error("untrusted getter must not run");
+      }
+    }
+
+    const inspection = inspectActorClass({ Actor }, "Actor");
+    expect(inspection.handlers.socketClose).toBeTypeOf("function");
+    expect(Object.hasOwn(inspection.handlers, "socketError")).toBe(false);
+    const execution = createActorClassExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      env: {},
+      context: context(),
+    });
+    expect(
+      await execution.dispatch(
+        { kind: "fetch", request: new Request("https://actor.invalid/") },
+        turn(),
+      ),
+    ).toBeInstanceOf(Response);
+    expect(getterCalls).toBe(0);
+  });
+
+  test("refuses a class missing any one of the four required handlers", () => {
+    const names = ["fetch", "alarm", "socketMessage", "socketClose"] as const;
+    for (const missing of names) {
+      class Actor {}
+      for (const name of names) {
+        if (name === missing) continue;
+        Object.defineProperty(Actor.prototype, name, {
+          value: name === "fetch" ? () => new Response("ok") : () => {},
+          configurable: true,
+        });
+      }
+      expect(() => inspectActorClass({ Actor }, "Actor")).toThrow(ActorRuntimeError);
+    }
   });
 
   test("refuses an accessor handler without invoking its getter", () => {

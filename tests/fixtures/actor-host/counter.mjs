@@ -35,5 +35,4 @@ export class Counter {
   async alarm() {}
   async socketMessage() {}
   async socketClose() {}
-  async socketError() {}
 }

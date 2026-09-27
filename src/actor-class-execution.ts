@@ -185,10 +185,6 @@ export interface ActorSocketCloseEvent {
   readonly wasClean: boolean;
 }
 
-export interface ActorSocketErrorEvent {
-  readonly code: "transport_error";
-}
-
 export type ActorEvent =
   | { readonly kind: "fetch"; readonly request: Request }
   | { readonly kind: "alarm" }
@@ -201,12 +197,14 @@ export type ActorEvent =
       readonly kind: "socketClose";
       readonly socket: ActorSocket;
       readonly event: ActorSocketCloseEvent;
-    }
-  | {
-      readonly kind: "socketError";
-      readonly socket: ActorSocket;
-      readonly event: ActorSocketErrorEvent;
     };
+
+/** Private native carrier event; never passed to Actor application code. */
+type ActorTransportFailureEvent = {
+  readonly kind: "socketError";
+  readonly socket: ActorSocket;
+  readonly event: { readonly code: "transport_error" };
+};
 
 export interface ActorInstance {
   start?(turn: ActorTurn): void | Promise<void>;
@@ -222,14 +220,9 @@ export interface ActorInstance {
     event: ActorSocketCloseEvent,
     turn: ActorTurn,
   ): void | Promise<void>;
-  socketError(
-    socket: ActorSocket,
-    event: ActorSocketErrorEvent,
-    turn: ActorTurn,
-  ): void | Promise<void>;
 }
 
-type HandlerName = "fetch" | "alarm" | "socketMessage" | "socketClose" | "socketError";
+type HandlerName = "fetch" | "alarm" | "socketMessage" | "socketClose";
 type Handler = (...args: never[]) => unknown;
 type ActorConstructor = new (...args: never[]) => object;
 
@@ -242,7 +235,6 @@ export interface ActorClassInspection {
     readonly alarm: Handler;
     readonly socketMessage: Handler;
     readonly socketClose: Handler;
-    readonly socketError: Handler;
     readonly start?: Handler;
   }>;
 }
@@ -252,7 +244,6 @@ const REQUIRED_HANDLERS: readonly HandlerName[] = [
   "alarm",
   "socketMessage",
   "socketClose",
-  "socketError",
 ];
 
 /**
@@ -295,7 +286,6 @@ export function inspectActorClass(namespace: unknown, exportName: string): Actor
       alarm: Handler;
       socketMessage: Handler;
       socketClose: Handler;
-      socketError: Handler;
       start?: Handler;
     };
     for (const name of REQUIRED_HANDLERS) {
@@ -343,7 +333,10 @@ export interface ActorClassExecution {
   /** Initializes the constructor and optional `start` hook without an event. */
   initialize(turn: ActorTurn): Promise<void>;
   /** Dispatches one Host-admitted event. The caller owns per-id serialization. */
-  dispatch(event: ActorEvent, turn: ActorTurn): Promise<Response | undefined>;
+  dispatch(
+    event: ActorEvent | ActorTransportFailureEvent,
+    turn: ActorTurn,
+  ): Promise<Response | undefined>;
 }
 
 /**
@@ -399,7 +392,10 @@ export function createActorClassExecution(
     if (failed) throw initializationFailure;
   }
 
-  async function dispatch(event: ActorEvent, turnInput: ActorTurn): Promise<Response | undefined> {
+  async function dispatch(
+    event: ActorEvent | ActorTransportFailureEvent,
+    turnInput: ActorTurn,
+  ): Promise<Response | undefined> {
     const normalizedEvent = normalizeEvent(event);
     const turn = normalizeTurn(turnInput);
     const handlerName = normalizedEvent.kind;
@@ -598,9 +594,13 @@ function normalizeEvent(value: unknown): ActorEvent {
         const event = closedRecord(record.event, ["code"], "Actor socket error event");
         if (event.code !== "transport_error") throw new SafeTypeError("Actor socket error invalid");
         return {
-          kind: "socketError",
+          kind: "socketClose",
           socket: record.socket,
-          event: record.event as ActorSocketErrorEvent,
+          event: {
+            code: 1006,
+            reason: "transport_error",
+            wasClean: false,
+          },
         };
       }
       default:
@@ -646,8 +646,6 @@ function eventArguments(event: ActorEvent, turn: ActorTurn): readonly unknown[] 
     case "socketMessage":
       return [event.socket, event.data, turn];
     case "socketClose":
-      return [event.socket, event.event, turn];
-    case "socketError":
       return [event.socket, event.event, turn];
   }
 }

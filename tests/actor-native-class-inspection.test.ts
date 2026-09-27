@@ -22,7 +22,6 @@ function graph(invalidSecond = false): WorkerdActiveActorGraph {
   alarm() {}
   socketMessage() {}
   socketClose() {}
-  socketError() {}
 }`;
   const otherValidActor = `export class Actor {
   constructor() { throw new Error("tenant constructor must not run during class inspection"); }
@@ -30,14 +29,12 @@ function graph(invalidSecond = false): WorkerdActiveActorGraph {
   alarm() {}
   socketMessage() {}
   socketClose() {}
-  socketError() {}
 }`;
   const invalidActor = `export class Actor {
   constructor() { throw new Error("tenant constructor must not run during class inspection"); }
   fetch() { return new Response("ok"); }
   socketMessage() {}
   socketClose() {}
-  socketError() {}
 }`;
   return {
     generation: "inspection-generation",

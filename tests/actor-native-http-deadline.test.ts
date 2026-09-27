@@ -225,7 +225,6 @@ class Application {
   alarm() {}
   socketMessage() {}
   socketClose() {}
-  socketError() {}
 }
 export class Child {
   constructor(state, env) {
