@@ -426,7 +426,7 @@ describe("0060 operation-generation cutover", () => {
             .query("UPDATE d1_migrations SET name = '0059_rogue.sql' WHERE name = ?")
             .run(APPLY_PROVIDER_SELECTION);
         },
-        message: "exact audited source inventory 0001-0064",
+        message: "exact audited source inventory 0001-0065",
       },
       {
         label: "rogue predecessor shape",
@@ -511,7 +511,7 @@ describe("0060 operation-generation cutover", () => {
   });
 
   test("keeps the no-op refusal and rehearsal/production fixed-wave selectors unchanged", async () => {
-    const complete = createDatabaseThrough(64);
+    const complete = createDatabaseThrough(65);
     const root = mkdtempSync(join(process.env.TMPDIR ?? "/tmp", "takoserver-opgen-noop-"));
     try {
       const fixture = databaseProcess(complete);

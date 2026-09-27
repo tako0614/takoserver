@@ -212,7 +212,7 @@ describe("0063 to 0064 durable Actor owner claim transition", () => {
     try {
       expect(await f.invoke("apply")).toMatchObject({
         pendingMigrations: [ACTOR_CLAIM],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 64).map(({ name }) => name),
         managedActorOwnerCutover: { status: "ready" },
         providerAcknowledgement: "acknowledged",
       });
@@ -254,27 +254,31 @@ describe("0063 to 0064 durable Actor owner claim transition", () => {
     const f = fixture({ lostAck: true });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 64).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
-      await expect(f.invoke("apply")).rejects.toThrow("already complete");
+      expect(await f.invoke("status")).toMatchObject({
+        fromMigration: ACTOR_CLAIM,
+        throughMigration: "0065_worker_runtime_input_lease_generation.sql",
+        pendingMigrations: ["0065_worker_runtime_input_lease_generation.sql"],
+      });
       expect(f.applies()).toBe(1);
     } finally {
       f.db.close();
     }
   });
 
-  test("rejects any unreviewed 0065 source tail before provider I/O", async () => {
+  test("rejects any unreviewed 0066 source tail before provider I/O", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0065_unreviewed_extension.sql"),
+      join(unreviewed, "0066_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0064");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0065");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();

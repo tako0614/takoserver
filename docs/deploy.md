@@ -104,7 +104,7 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 Both new resource names are `takoserver-i-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
-audited 0001–0064 lineage and verifies its canonical schema, then creates the
+audited 0001–0065 lineage and verifies its canonical schema, then creates the
 new R2 bucket. Creating the bucket last means older object operations cannot
 reach it while 0043 runs. The ordinary schema and rehearsal lanes stay strict.
 
@@ -412,7 +412,7 @@ bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
 `takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0064 migration lineage,
+D1 UUID-to-name mapping, R2 existence, exact audited 0001–0065 migration lineage,
 and canonical migrated schema before preparation and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
@@ -1175,7 +1175,7 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0064 names and SHA-256 inventory, so a checkout with unreviewed 0065+
+  0001–0065 names and SHA-256 inventory, so a checkout with unreviewed 0066+
   migrations is refused before any provider command. The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
@@ -1183,7 +1183,8 @@ managed customer runtime.
   `integration-protected-wave` result is never accepted by rehearsal or
   production. The no-selector integration lane additionally permits only the
   exact existing-data 0058/0059 to 0060, separate 0060 to 0061, separate
-  0061 to 0062, separate 0062 to 0063, and separate 0063 to 0064 transitions
+  0061 to 0062, separate 0062 to 0063, separate 0063 to 0064, and separate
+  0064 to 0065 transitions
   described below. Earlier
   predecessors cannot use this exception to skip the unqualified 0058 upgrade.
   If the selected wave includes 0043, integration uses the staged compatibility
@@ -1195,12 +1196,13 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected wave unavailable
 
-The current source includes audited 0058–0064 for fresh, explicitly
+The current source includes audited 0058–0065 for fresh, explicitly
 disposable integration storage. Protected wave selectors still stop at 0057:
 neither rehearsal nor production accepts `--through-migration=0058`,
 `--through-migration=0059`, `--through-migration=0060`,
 `--through-migration=0061`, `--through-migration=0062`,
-`--through-migration=0063`, or `--through-migration=0064`.
+`--through-migration=0063`, `--through-migration=0064`, or
+`--through-migration=0065`.
 
 0058 expands a private receipt-kind CHECK. SQLite requires table replacement,
 so the migration preserves the receipt-coupled version material and sealed
@@ -1330,12 +1332,12 @@ for protected data.
 The no-selector `takoserver-d1-schema` integration lane accepts one further
 standalone transition: the exact audited 0062 prefix with only
 `0063_cloudflare_managed_queue_retirement.sql` pending. The source inventory
-must be exactly 0001–0064 with the audited 0063 SHA-256, and the selected D1
+must be exactly 0001–0065 with the audited 0063 SHA-256, and the selected D1
 must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
 table has a separate in-place integration wave only after exact 0063; a fresh
 integration storage generation can use the full audited lineage. An unreviewed
-0065 tail is refused.
+0066 tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and
@@ -1360,7 +1362,7 @@ separate post-publication evidence; local schema success does not claim either.
 The no-selector integration lane accepts one further standalone additive wave
 from exact all-0063 lineage and canonical 0063 application shape to only
 `0064_cloudflare_managed_actor_owner_claims.sql`. It requires the exact audited
-0001–0064 source inventory and bytes; it does not extend the protected
+0001–0065 source inventory and bytes; it does not extend the protected
 rehearsal/production selectors beyond 0057. The existing D1 is protected and
 non-disposable: this is a forward-only migration, never a reset or a raw SQL
 workaround. The 0064 table is separate from the existing Worker receipt table;
@@ -1380,6 +1382,36 @@ For an actual release, independently review the exact source and D1 state,
 then use the owner deploy lane and its authoritative readback before publishing
 matching private CPE and Host code. Actor admission and end-to-end runtime
 readiness remain separate evidence.
+
+### 0065: runtime-input lease generation integration cutover
+
+The no-selector integration lane accepts only the next standalone wave from
+exact all-0064 lineage and canonical 0064 application shape to
+`0065_worker_runtime_input_lease_generation.sql`. The source inventory and
+bytes must be exactly the audited 0001–0065 set; protected rehearsal and
+production selectors remain capped at 0057. This is a protected, forward-only
+D1 transition, not a database reset or a raw SQL repair.
+
+The migration adds a value-free `lease_generation` to Worker runtime-input
+preparations. Prepared and claimed rows still have their sealed nonce, so the
+migration backfills that nonce into the new generation. Previously dispatched,
+consumed, or other terminal rows cannot recover a nonce after payload erasure;
+their historical NULL generation remains closed to ambiguous late dispatch or
+settle acknowledgements. This does not authorize adopting old acknowledgements
+by operation key, preparation ID, or an integer fence that can reset after
+replacement.
+
+The owner checks exact 0064 predecessor lineage and shape at initial preflight,
+after source and focused-test qualification, and with a fresh authoritative
+read immediately before the single migration request. The audited SQL and
+migration-ledger insert execute in one D1 transaction. Success requires exact
+all-0065 lineage and canonical 0065 post-shape. A lost acknowledgement is
+settled only from authoritative readback; no blind second apply or down
+migration is permitted. A local nonempty production-shaped rehearsal covers
+prepared, claimed, dispatched and terminal rows, but neither qualifies live D1
+nor authorizes release. Independently review the exact source and live D1
+state before any owner-lane mutation; publish compatible runtime code only
+after schema readback, then obtain separate end-to-end readiness evidence.
 
 ### 0043 artifact blob-I/O compatibility protocol
 

@@ -128,6 +128,7 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0062_takoform_import_provider_selection.sql",
   "0063_cloudflare_managed_queue_retirement.sql",
   "0064_cloudflare_managed_actor_owner_claims.sql",
+  "0065_worker_runtime_input_lease_generation.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -259,6 +260,8 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:fb247f28b621ebe800711013ff3ea4b11fa276c41f1a5c6ffc4344a51dd2cc66",
   "0064_cloudflare_managed_actor_owner_claims.sql":
     "sha256:8a08edaee06b9adcd5c974cfb56ba2f115153b7f87b1a0512d1137dc2c68c645",
+  "0065_worker_runtime_input_lease_generation.sql":
+    "sha256:b3b5a9f7533eccbac1a7e31008ae5737e5e68b2d532685fea2eb553cab86e94c",
 };
 const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
 const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(
@@ -432,6 +435,7 @@ const ACCEPTED_AUTHORITY_MIGRATION = "0061_takoform_accepted_authority_continuit
 const IMPORT_PROVIDER_SELECTION_MIGRATION = "0062_takoform_import_provider_selection.sql";
 const MANAGED_QUEUE_RETIREMENT_MIGRATION = "0063_cloudflare_managed_queue_retirement.sql";
 const MANAGED_ACTOR_OWNER_CLAIM_MIGRATION = "0064_cloudflare_managed_actor_owner_claims.sql";
+const RUNTIME_INPUT_LEASE_GENERATION_MIGRATION = "0065_worker_runtime_input_lease_generation.sql";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER =
   "takoserver_0037_worker_runtime_input_preparations_quiescence";
 const RUNTIME_INPUT_QUIESCENCE_TRIGGER_SQL = `CREATE TRIGGER ${RUNTIME_INPUT_QUIESCENCE_TRIGGER}
@@ -843,10 +847,17 @@ export async function runD1Schema(
       state: initial,
       artifact: sourceMigrations,
     });
+    const runtimeInputLeaseGenerationCutover = inspectRuntimeInputLeaseGenerationCutover({
+      invocation,
+      wave,
+      state: initial,
+      artifact: sourceMigrations,
+    });
     if (invocation.action === "apply") {
       assertApplyProviderSelectionCutoverReady(applyProviderSelectionCutover);
       assertManagedQueueRetirementCutoverReady(managedQueueRetirementCutover);
       assertManagedActorOwnerCutoverReady(managedActorOwnerCutover);
+      assertRuntimeInputLeaseGenerationCutoverReady(runtimeInputLeaseGenerationCutover);
     }
     const dataPreflights = await inspectDataPreflights({
       phase: "preflight",
@@ -914,6 +925,7 @@ export async function runD1Schema(
         applyProviderSelectionCutover,
         managedQueueRetirementCutover,
         managedActorOwnerCutover,
+        runtimeInputLeaseGenerationCutover,
         readyForApply:
           wave.pending.length > 0 &&
           dataPreflights.status === "ready" &&
@@ -929,7 +941,9 @@ export async function runD1Schema(
           (managedQueueRetirementCutover.status === "not_pending" ||
             managedQueueRetirementCutover.status === "ready") &&
           (managedActorOwnerCutover.status === "not_pending" ||
-            managedActorOwnerCutover.status === "ready"),
+            managedActorOwnerCutover.status === "ready") &&
+          (runtimeInputLeaseGenerationCutover.status === "not_pending" ||
+            runtimeInputLeaseGenerationCutover.status === "ready"),
       };
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
@@ -995,6 +1009,14 @@ export async function runD1Schema(
         "tests/deploy-schema-managed-actor-owner.test.ts",
       ]);
     }
+    if (wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)) {
+      await checked(run, "preflight", "runtime-input lease generation transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-runtime-input-lease-generation.test.ts",
+        "tests/runtime-input-preparations.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -1020,7 +1042,8 @@ export async function runD1Schema(
     const additiveCutoverPostShape =
       applyProviderSelectionCutover.status === "ready" ||
       managedQueueRetirementCutover.status === "ready" ||
-      managedActorOwnerCutover.status === "ready"
+      managedActorOwnerCutover.status === "ready" ||
+      runtimeInputLeaseGenerationCutover.status === "ready"
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
@@ -1064,6 +1087,14 @@ export async function runD1Schema(
     );
     assertManagedActorOwnerCutoverReady(
       inspectManagedActorOwnerCutover({
+        invocation,
+        wave: requalifiedWave,
+        state: requalified,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertRuntimeInputLeaseGenerationCutoverReady(
+      inspectRuntimeInputLeaseGenerationCutover({
         invocation,
         wave: requalifiedWave,
         state: requalified,
@@ -1151,6 +1182,14 @@ export async function runD1Schema(
     );
     assertManagedActorOwnerCutoverReady(
       inspectManagedActorOwnerCutover({
+        invocation,
+        wave: fencedWave,
+        state: fenced,
+        artifact: sourceMigrations,
+      }),
+    );
+    assertRuntimeInputLeaseGenerationCutoverReady(
+      inspectRuntimeInputLeaseGenerationCutover({
         invocation,
         wave: fencedWave,
         state: fenced,
@@ -1399,6 +1438,28 @@ export async function runD1Schema(
           }),
         );
       }
+      if (fencedWave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)) {
+        const immediateState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(
+          fenced,
+          immediateState,
+          "at the immediate 0065 runtime-input lease generation migration fence",
+        );
+        assertRuntimeInputLeaseGenerationCutoverReady(
+          inspectRuntimeInputLeaseGenerationCutover({
+            invocation,
+            wave: fencedWave,
+            state: immediateState,
+            artifact: sourceMigrations,
+          }),
+        );
+      }
       const apply = await run(
         wranglerCommand(
           migrationImportPath === null
@@ -1514,15 +1575,17 @@ export async function runD1Schema(
       );
     }
     if (additiveCutoverPostShape !== null) {
-      const cutoverName = wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
-        ? "Actor owner claim"
-        : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
-          ? "managed Queue retirement"
-          : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
-            ? "import-selection"
-            : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-              ? "accepted-authority"
-              : "operation-generation";
+      const cutoverName = wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)
+        ? "runtime-input lease generation"
+        : wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
+          ? "Actor owner claim"
+          : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+            ? "managed Queue retirement"
+            : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+              ? "import-selection"
+              : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+                ? "accepted-authority"
+                : "operation-generation";
       const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
@@ -1655,6 +1718,7 @@ export async function runD1Schema(
       applyProviderSelectionCutover,
       managedQueueRetirementCutover,
       managedActorOwnerCutover,
+      runtimeInputLeaseGenerationCutover,
       runtimeInputQuiescence,
       preShapeDigest: requalified.shapeDigest,
       postShapeDigest: post.shapeDigest,
@@ -1724,12 +1788,13 @@ function selectSchemaWave(
         IMPORT_PROVIDER_SELECTION_MIGRATION,
         MANAGED_QUEUE_RETIREMENT_MIGRATION,
         MANAGED_ACTOR_OWNER_CLAIM_MIGRATION,
+        RUNTIME_INPUT_LEASE_GENERATION_MIGRATION,
       ].includes(name),
     );
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0064",
+          "integration D1 cutover requires the exact audited source inventory 0001-0065",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -1743,7 +1808,9 @@ function selectSchemaWave(
             ? 62
             : applied.length === 62
               ? 63
-              : 64
+              : applied.length === 63
+                ? 64
+                : 65
       : artifact.names.length;
     const throughPrefixNames = artifact.names.slice(0, throughCount);
     const throughPrefixFiles = artifact.files.slice(0, throughCount);
@@ -1766,7 +1833,7 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0064",
+      "selected D1 wave requires the exact audited source inventory 0001-0065",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
@@ -1842,7 +1909,7 @@ function assertOperationGenerationMigrationHashes(
 }
 
 /**
- * Reads the current audited 0001-0064 migration corpus without changing the ordinary
+ * Reads the current audited 0001-0065 migration corpus without changing the ordinary
  * integration or protected schema lanes.  Callers that need the historical
  * lineage (for example, a frozen 0049 import fixture) use an explicit
  * historical fixture instead of weakening the current source checks.
@@ -1853,7 +1920,7 @@ export function readAuditedMigrationArtifact(
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0064",
+      "audited migration lineage must contain exactly 0001-0065",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -1863,7 +1930,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0064 source inventory: the
+ * intentionally separate from the current 0001-0065 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -2152,6 +2219,14 @@ interface ManagedActorOwnerCutover {
     | "managed_actor_owner_cutover_unqualified";
 }
 
+interface RuntimeInputLeaseGenerationCutover {
+  readonly status:
+    | "not_pending"
+    | "ready"
+    | "predecessor_schema_mismatch"
+    | "runtime_input_lease_generation_cutover_unqualified";
+}
+
 interface DataPreflights {
   readonly status: "ready" | "data_repair_required";
   readonly resourceDeletionAttestation: ResourceDeletionAttestationPreflight;
@@ -2252,7 +2327,7 @@ function inspectManagedQueueRetirementCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "managed Queue retirement cutover requires the exact audited source inventory 0001-0064",
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0065",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -2292,7 +2367,7 @@ function inspectManagedActorOwnerCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor owner claim cutover requires the exact audited source inventory 0001-0064",
+      "Actor owner claim cutover requires the exact audited source inventory 0001-0065",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -2308,6 +2383,49 @@ function assertManagedActorOwnerCutoverReady(cutover: ManagedActorOwnerCutover):
   if (cutover.status !== "not_pending" && cutover.status !== "ready") {
     throw preflightError(
       `Actor owner claim cutover is unavailable: ${cutover.status}`,
+      JSON.stringify(cutover),
+    );
+  }
+}
+
+function inspectRuntimeInputLeaseGenerationCutover(input: {
+  readonly invocation: SchemaInvocation;
+  readonly wave: SelectedSchemaWave;
+  readonly state: D1SchemaState;
+  readonly artifact: MigrationArtifact;
+}): RuntimeInputLeaseGenerationCutover {
+  if (!input.wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)) {
+    return { status: "not_pending" };
+  }
+  if (
+    input.invocation.environment !== "integration" ||
+    input.invocation.throughMigration !== undefined ||
+    input.state.applied.length !== 64 ||
+    JSON.stringify(input.wave.pending) !==
+      JSON.stringify([RUNTIME_INPUT_LEASE_GENERATION_MIGRATION])
+  ) {
+    return { status: "runtime_input_lease_generation_cutover_unqualified" };
+  }
+  if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    throw preflightError(
+      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0065",
+    );
+  }
+  assertAuditedMigrationHashes(input.artifact.files);
+  return applicationSchemaMatches(
+    input.state,
+    deriveExpectedApplicationShape(input.artifact.files.slice(0, 64)),
+  )
+    ? { status: "ready" }
+    : { status: "predecessor_schema_mismatch" };
+}
+
+function assertRuntimeInputLeaseGenerationCutoverReady(
+  cutover: RuntimeInputLeaseGenerationCutover,
+): void {
+  if (cutover.status !== "not_pending" && cutover.status !== "ready") {
+    throw preflightError(
+      `runtime-input lease generation cutover is unavailable: ${cutover.status}`,
       JSON.stringify(cutover),
     );
   }
@@ -2369,7 +2487,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0064",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0065",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -2411,7 +2529,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0064",
+      "operation-generation cutover requires the exact audited source inventory 0001-0065",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
