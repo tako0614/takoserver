@@ -474,7 +474,7 @@ describe("self-host WorkerVersion Vector binding projection", () => {
     }
   });
 
-  test("abandons a one-shot sensitive handoff when the vector record is absent", async () => {
+  test("does not abandon a sensitive handoff without its original marker", async () => {
     const { local, input, scriptName } = await baseVersionInput();
     const applied = await local.apply(input);
     expect(applied.phase).toBe("succeeded");
@@ -501,8 +501,8 @@ describe("self-host WorkerVersion Vector binding projection", () => {
       spec: { ...input.spec, requiredSensitiveVars: ["SECRET"] },
     });
     expect(recovered.phase).toBe("failed");
-    if (recovered.phase === "failed") expect(recovered.failure.code).toBe("not_found");
-    expect(events).toEqual(["recover", "abandon"]);
+    if (recovered.phase === "failed") expect(recovered.failure.code).toBe("conflict");
+    expect(events).toEqual([]);
     expect(existsSync(bindingsPath)).toBe(false);
   });
 
