@@ -107,6 +107,22 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
     });
   });
 
+  test("accepts GraphQL success envelopes with errors absent, null, or empty", async () => {
+    for (const errors of [undefined, null, []]) {
+      const reply = payload();
+      if (errors !== undefined) Object.assign(reply, { errors });
+      const reader = createCloudflareActorNamespaceMetricsReader({
+        accountId: "account-id",
+        apiToken: "provider-token",
+        fetch: async () => Response.json(reply),
+      });
+      await expect(reader.read({ deployment, from, until })).resolves.toMatchObject({
+        finality: "unfinalized",
+        requests: { value: 22 },
+      });
+    }
+  });
+
   test("rejects wrong provider/native identity and unbounded or noncanonical windows", async () => {
     const reader = createCloudflareActorNamespaceMetricsReader({
       accountId: "account-id",
@@ -138,6 +154,7 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
   test("rejects partial, duplicate, malformed, and identity-mixed upstream data", async () => {
     const replies = [
       { ...payload(), errors: [{ message: "private upstream text must not escape" }] },
+      { ...payload(), errors: { message: "malformed error envelope" } },
       payload({ durableObjectsPeriodicGroups: undefined }),
       payload({
         durableObjectsPeriodicGroups: [
@@ -229,5 +246,73 @@ describe("Cloudflare Actor namespace metric observation reader", () => {
     await expect(networkFailure.read({ deployment, from, until })).rejects.not.toThrow(
       "sensitive transport diagnostic",
     );
+  });
+
+  test("bounds stalled fetches and bodies, aborts transport, and accepts caller cancellation", async () => {
+    const watchdog = async (promise: Promise<unknown>) =>
+      Promise.race([
+        promise.then(
+          () => null,
+          (error) => error,
+        ),
+        new Promise((resolve) => setTimeout(() => resolve("stalled"), 100)),
+      ]);
+    let fetchCalls = 0;
+    let fetchSignal: AbortSignal | undefined;
+    const stalledFetch = createCloudflareActorNamespaceMetricsReader({
+      accountId: "account-id",
+      apiToken: "provider-token",
+      timeoutMs: 5,
+      fetch: async (request) => {
+        fetchCalls += 1;
+        fetchSignal = request.signal;
+        return await new Promise<Response>(() => undefined);
+      },
+    });
+    const fetchFailure = await watchdog(stalledFetch.read({ deployment, from, until }));
+    expect(fetchFailure).toMatchObject({ code: "upstream_unavailable" });
+    expect(fetchSignal?.aborted).toBe(true);
+    expect(fetchCalls).toBe(1);
+
+    let bodySignal: AbortSignal | undefined;
+    let bodyCancelCalled = false;
+    const stalledBody = createCloudflareActorNamespaceMetricsReader({
+      accountId: "account-id",
+      apiToken: "provider-token",
+      timeoutMs: 5,
+      fetch: async (request) => {
+        bodySignal = request.signal;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull: () => new Promise<void>(() => undefined),
+            cancel: () => {
+              bodyCancelCalled = true;
+              return new Promise<void>(() => undefined);
+            },
+          }),
+        );
+      },
+    });
+    const bodyFailure = await watchdog(stalledBody.read({ deployment, from, until }));
+    expect(bodyFailure).toMatchObject({ code: "upstream_unavailable" });
+    expect(bodySignal?.aborted).toBe(true);
+    expect(bodyCancelCalled).toBe(true);
+
+    const caller = new AbortController();
+    let callerSignal: AbortSignal | undefined;
+    const callerCancelled = createCloudflareActorNamespaceMetricsReader({
+      accountId: "account-id",
+      apiToken: "provider-token",
+      timeoutMs: 5_000,
+      fetch: async (request) => {
+        callerSignal = request.signal;
+        return await new Promise<Response>(() => undefined);
+      },
+    });
+    const callerRead = callerCancelled.read({ deployment, from, until, signal: caller.signal });
+    caller.abort();
+    const callerFailure = await watchdog(callerRead);
+    expect(callerFailure).toMatchObject({ code: "upstream_unavailable" });
+    expect(callerSignal?.aborted).toBe(true);
   });
 });
