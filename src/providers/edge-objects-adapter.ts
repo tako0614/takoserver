@@ -592,6 +592,9 @@ function s3Target(
 ): URL {
   const path = `/${awsEncode(backend.bucketName)}${key === null ? "" : `/${key.split("/").map(awsEncode).join("/")}`}`;
   const target = new URL(`${backend.endpoint}${path}`);
+  // WHATWG URL removes dot segments, including valid opaque object keys such as a/../b.
+  // Never sign or send a request for a different object (or bucket) than the caller named.
+  if (target.pathname !== path) edgeError("backend_unavailable");
   for (const [name, value] of Object.entries(query)) target.searchParams.set(name, value);
   return target;
 }
