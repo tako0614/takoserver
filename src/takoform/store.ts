@@ -4427,7 +4427,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const relation = matching[0];
       if (
         !relation ||
-        relation.relation !== pointer ||
+        !relationDeclarationMatchesPointer(relation.relation, pointer) ||
         relation.targetApiVersion !== target.apiVersion ||
         relation.targetKind !== target.kind ||
         relation.targetName !== target.name ||
@@ -6989,6 +6989,23 @@ function liveSnapshotAttestation(
   }
   const formRef = snapshotFormRefFromJson(value("form_ref_json"));
   return formRef !== null && sameSnapshotFormRef(formRef, listing.resource.form.formRef);
+}
+
+function relationDeclarationMatchesPointer(declaration: string, pointer: string): boolean {
+  // The resolver retains the schema declaration, expanding only whole array
+  // wildcard segments into canonical indices in the concrete instance pointer.
+  // The SQL selection above remains exact; a declaration is never a selector.
+  const declared = declaration.split("/");
+  const concrete = pointer.split("/");
+  return (
+    declaration.startsWith("/") &&
+    declared.length === concrete.length &&
+    declared.every((segment, index) =>
+      segment === "*"
+        ? /^(0|[1-9][0-9]*)$/u.test(concrete[index] ?? "")
+        : segment === concrete[index],
+    )
+  );
 }
 
 function snapshotRelations(value: unknown): readonly TakoformStoredRelation[] | null {

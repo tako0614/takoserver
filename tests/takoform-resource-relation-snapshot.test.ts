@@ -3,9 +3,14 @@ import { expect, test } from "bun:test";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
-import type { TakoformStoredRelation } from "../src/takoform/relations.ts";
+import { formKey } from "../src/takoform/forms.ts";
+import { resolveRelations, type TakoformStoredRelation } from "../src/takoform/relations.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
-import type { TakoformStoredResource, TakoformV1Alpha3FormRef } from "../src/takoform/types.ts";
+import type {
+  InstalledTakoformForm,
+  TakoformStoredResource,
+  TakoformV1Alpha3FormRef,
+} from "../src/takoform/types.ts";
 
 const TENANT_ID = "tenant-resource-relation-snapshot";
 const SPACE = "main";
@@ -208,6 +213,92 @@ function fixture(options: FixtureOptions = {}): Fixture {
   };
 }
 
+test("reads a resolver-produced array relation through its concrete pointer", async () => {
+  const target = resource({ formRef: TARGET_FORM_REF, name: "target", uid: TARGET_UID });
+  const source = {
+    ...resource({ formRef: SOURCE_FORM_REF, name: "source", uid: SOURCE_UID }),
+    spec: {
+      versions: [
+        {
+          workerVersion: {
+            apiVersion: target.apiVersion,
+            kind: target.kind,
+            name: target.metadata.name,
+          },
+        },
+      ],
+    },
+  };
+  const f = fixture({ source, target, relations: [] });
+  const targetForm: InstalledTakoformForm = {
+    identity: { formRef: TARGET_FORM_REF },
+    desiredSchema: {},
+    operations: [],
+  };
+  const resolved = await resolveRelations({
+    tenantId: TENANT_ID,
+    space: SPACE,
+    form: {
+      identity: { formRef: SOURCE_FORM_REF },
+      operations: [],
+      desiredSchema: {
+        type: "object",
+        properties: {
+          versions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                workerVersion: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["apiVersion", "kind", "name"],
+                  properties: {
+                    apiVersion: { const: target.apiVersion },
+                    kind: { const: target.kind },
+                    name: { type: "string" },
+                  },
+                  "x-takoform-target-formrefs": [{ ...TARGET_FORM_REF }],
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    spec: source.spec,
+    forms: new Map([[formKey(TARGET_FORM_REF), targetForm]]),
+    bindings: new Map(),
+    store: f.store,
+  });
+  expect(resolved).toMatchObject([
+    { pointer: "/versions/0/workerVersion", relation: "/versions/*/workerVersion" },
+  ]);
+  expect(
+    await f.store.writeResource({
+      address: {
+        tenantId: TENANT_ID,
+        space: SPACE,
+        apiVersion: source.apiVersion,
+        kind: source.kind,
+        name: source.metadata.name,
+      },
+      resource: source,
+      relations: resolved,
+      expectedRevision: source.metadata.revision,
+    }),
+  ).toBe(true);
+  const beforeQueries = f.queryCount();
+  const snapshot = await f.store.resourceWithRelationTargetByUid(
+    TENANT_ID,
+    SOURCE_UID,
+    "/versions/0/workerVersion",
+  );
+  expect(snapshot?.relation).toEqual(resolved[0]);
+  expect(snapshot?.target.resource).toEqual(target);
+  expect(f.queryCount() - beforeQueries).toBe(1);
+});
+
 test("reads one live relation target snapshot atomically and does not write", async () => {
   const target = resource({
     formRef: TARGET_FORM_REF,
@@ -260,6 +351,86 @@ test("reads one live relation target snapshot atomically and does not write", as
   ).toEqual(beforeAttestations);
 });
 
+for (const candidate of [
+  {
+    name: "another declaration property",
+    pointer: "/versions/0/workerVersion",
+    declaration: "/versions/*/other",
+  },
+  {
+    name: "another declaration index",
+    pointer: "/versions/0/workerVersion",
+    declaration: "/versions/1/workerVersion",
+  },
+  {
+    name: "a shorter declaration",
+    pointer: "/versions/0/workerVersion",
+    declaration: "/versions/*",
+  },
+  {
+    name: "a longer declaration",
+    pointer: "/versions/0/workerVersion",
+    declaration: "/versions/*/workerVersion/extra",
+  },
+  {
+    name: "a partial wildcard",
+    pointer: "/versions/10/workerVersion",
+    declaration: "/versions/1*/workerVersion",
+  },
+  ...["*", "named", "01", "-1", "1.5", "1e0", ""].map((index) => ({
+    name: `a noncanonical array index ${JSON.stringify(index)}`,
+    pointer: `/versions/${index}/workerVersion`,
+    declaration: "/versions/*/workerVersion",
+  })),
+]) {
+  test(`refuses an expanded relation with ${candidate.name}`, async () => {
+    const target = resource({ formRef: TARGET_FORM_REF, name: "target", uid: TARGET_UID });
+    const f = fixture({
+      target,
+      relations: [
+        relationFor(target, {
+          pointer: candidate.pointer,
+          relation: candidate.declaration,
+        }),
+      ],
+    });
+    expect(
+      await f.store.resourceWithRelationTargetByUid(TENANT_ID, SOURCE_UID, candidate.pointer),
+    ).toBeNull();
+    expect(f.queryCount()).toBe(1);
+  });
+}
+
+test("an array declaration cannot select an instance or hide a wrong target identity", async () => {
+  const pointer = "/versions/0/workerVersion";
+  const declaration = "/versions/*/workerVersion";
+  const target = resource({ formRef: TARGET_FORM_REF, name: "target", uid: TARGET_UID });
+  const relation = relationFor(target, { pointer, relation: declaration });
+  const f = fixture({ target, relations: [relation] });
+  expect(
+    await f.store.resourceWithRelationTargetByUid(TENANT_ID, SOURCE_UID, declaration),
+  ).toBeNull();
+  expect(
+    await f.store.resourceWithRelationTargetByUid(
+      TENANT_ID,
+      SOURCE_UID,
+      "/versions/1/workerVersion",
+    ),
+  ).toBeNull();
+  for (const overrides of [
+    { targetName: "wrong" },
+    { targetUid: "uid_missing" },
+    { targetFormRef: { ...TARGET_FORM_REF, definitionVersion: "2.0.0" } },
+  ]) {
+    const invalid = fixture({ target, relations: [{ ...relation, ...overrides }] });
+    expect(
+      await invalid.store.resourceWithRelationTargetByUid(TENANT_ID, SOURCE_UID, pointer),
+    ).toBeNull();
+    invalid.database.close();
+  }
+  f.database.close();
+});
+
 for (const state of ["pending", "closed", "cancelled"] as const) {
   test(`refuses a ${state} source lifecycle attestation`, async () => {
     const f = fixture({ sourceAttestation: { state } });
@@ -295,6 +466,8 @@ const identityCases: readonly {
 }[] = [
   { name: "unknown source UID", sourceUid: "uid_missing_source" },
   { name: "source indexed metadata mismatch", options: { sourceIndex: { name: "wrong" } } },
+  { name: "source indexed revision mismatch", options: { sourceIndex: { revision: "2" } } },
+  { name: "target indexed revision mismatch", options: { targetIndex: { revision: "1" } } },
   {
     name: "target resource in another tenant",
     options: { targetIndex: { tenantId: "tenant-other" } },
