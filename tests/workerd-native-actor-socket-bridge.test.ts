@@ -3,12 +3,16 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderActorUpgradeHandoffModuleSource } from "../src/actor-upgrade-handoff-source.ts";
+import { createActorAddressing } from "../src/actor-addressing.ts";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
+import {
+  renderSelfhostActorForwardRuntimeModuleSource,
+  selfhostActorForwardEntrypointSource,
+} from "../src/selfhost-actor-forward-worker-wrapper.ts";
 import { openSelfhostActorHttpBroker } from "../src/selfhost-actor-http-broker.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import { openSelfhostActorUpgradeBroker } from "../src/selfhost-actor-upgrade-broker.ts";
@@ -98,11 +102,13 @@ const config :Workerd.Config = (
  services = [
   (name = "public", worker = (
    modules = [(name = "wrapper.mjs", esModule = embed "wrapper.mjs", role = hostPrivate),
-    (name = "handoff.mjs", esModule = embed "handoff.mjs", role = hostPrivate),
+    (name = "forward-runtime.mjs", esModule = embed "forward-runtime.mjs", role = hostPrivate),
+    (name = "inner.mjs", esModule = embed "inner.mjs", role = hostPrivate),
+    (name = "${SELFHOST_WORKER_PRELUDE_MODULE}", esModule = embed "${SELFHOST_WORKER_PRELUDE_MODULE}", role = hostPrivate),
     (name = "application.mjs", esModule = embed "application.mjs", role = application)],
    modulePolicy = (applicationMain = "application.mjs"),
    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"],
-   globalOutbound = "deny", bindings = [(name = "ACTOR", service = "actor"), (name = "ACTOR_HTTP", service = "actor-http")]
+   globalOutbound = "deny", bindings = [(name = "__TAKOSERVER_ACTOR_UPGRADE", service = "actor"), (name = "__TAKOSERVER_ACTOR_HTTP", service = "actor-http")]
   )),
   (name = "actor", external = (address = ${JSON.stringify(`unix:${actorSocketPath}`)}, http = (style = proxy))),
   (name = "actor-http", external = (address = ${JSON.stringify(`unix:${actorHttpPath}`)}, http = ())),
@@ -159,12 +165,14 @@ test.skipIf(binary === undefined)(
       epoch = namespace.epoch;
       namespace.enableAlarmAdmission();
       const activeNamespace = namespace;
+      const actorId = createActorAddressing().idFromName("room");
       const brokerToken = randomBytes(32).toString("hex");
       let admittedFetches = 0;
       broker = await openSelfhostActorUpgradeBroker({
         socketPath: join(root, "broker.sock"),
         token: brokerToken,
         reserve: async (actorId) => {
+          expect(actorId).toBe(createActorAddressing().idFromName("room"));
           admittedFetches += 1;
           return {
             target: activeNamespace.duplexTarget(actorId, "variant-one"),
@@ -185,7 +193,7 @@ test.skipIf(binary === undefined)(
             unix: httpBroker.socketPath,
             headers: {
               "x-takoserver-private-broker-token": brokerToken,
-              "x-takoserver-private-broker-actor-id": "actor-id",
+              "x-takoserver-private-broker-actor-id": encodeURIComponent(actorId),
             },
           })
         ).status,
@@ -199,61 +207,54 @@ test.skipIf(binary === undefined)(
         ).status,
       ).toBe(404);
       expect(admittedFetches).toBe(0);
-      await writeFile(join(publicRoot, "handoff.mjs"), renderActorUpgradeHandoffModuleSource());
+      await writeFile(
+        join(publicRoot, "forward-runtime.mjs"),
+        renderSelfhostActorForwardRuntimeModuleSource(),
+      );
+      await writeFile(
+        join(publicRoot, SELFHOST_WORKER_PRELUDE_MODULE),
+        selfhostWorkerPreludeSource(),
+      );
+      await writeFile(
+        join(publicRoot, "inner.mjs"),
+        selfhostWorkerEntrypointSource({
+          originalMainModule: "application.mjs",
+          declaredHandlers: ["fetch"],
+          bindings: [{ name: "ROOM", type: "json" }],
+          publication: "forward-native",
+          probeHostname: "actor.invalid",
+        }),
+      );
       await writeFile(
         join(publicRoot, "application.mjs"),
         `export default {async fetch(request, env) {
   if (new URL(request.url).pathname === "/health") return new Response("ok");
   if (new URL(request.url).searchParams.get("ticket") !== "authorized")
     return new Response("denied", {status:403});
+  const room = env.ROOM.get(env.ROOM.idFromName("room"));
+  if (new URL(request.url).pathname === "/id")
+    return Response.json({id:env.ROOM.idFromName("room"), unique:env.ROOM.newUniqueId()});
   if (new URL(request.url).pathname === "/actor-http")
-    return env.ACTOR_HTTP.fetch(new Request("http://actor.invalid/probe"));
+    return room.fetch(new Request("http://actor.invalid/probe"));
   if (new URL(request.url).pathname === "/actor-http-echo")
-    return env.ACTOR_HTTP.fetch(new Request("http://actor.invalid/echo", {method:"POST", body:request.body}));
-  return env.ACTOR.fetch(request);
+    return room.fetch(new Request("http://actor.invalid/echo", {method:"POST", body:request.body}));
+  return room.fetch(request);
 }};`,
       );
       await writeFile(
         join(publicRoot, "wrapper.mjs"),
-        `import { createActorUpgradeHandoff } from "./handoff.mjs";
-import application from "./application.mjs";
-const NativeResponse = Response;
-const brokerToken = ${JSON.stringify(brokerToken)};
-export default {async fetch(request, env) {
-  const actorHttp = Object.freeze({fetch(actorRequest) {
-    const headers = new Headers(actorRequest.headers);
-    headers.set("x-takoserver-private-broker-token", brokerToken);
-    headers.set("x-takoserver-private-broker-actor-id", "actor-id");
-    return env.ACTOR_HTTP.fetch(new Request(actorRequest, {headers}));
-  }});
-  const handoff = createActorUpgradeHandoff(request, {
-    async open(actorRequest, ingress) {
-      if (ingress.method !== "GET" || ingress.version !== "13" || !ingress.key)
-        throw new Error("invalid_client_handshake");
-      const headers = new Headers(actorRequest.headers);
-      headers.set("x-takoserver-private-broker-token", brokerToken);
-      headers.set("x-takoserver-private-broker-actor-id", "actor-id");
-      const native = await env.ACTOR.fetch(new Request(actorRequest, {headers}));
-      if (native.status !== 101 || !native.webSocket) throw new Error("actor_upgrade_unavailable");
-      const reservationId = native.headers.get("x-takoserver-private-broker-reservation");
-      if (!reservationId) throw new Error("broker_reservation_missing");
-      const control = async (action, expected = 204) => {
-        const result = await env.ACTOR.fetch(new Request("http://actor.invalid/__broker/" + action + "/" + reservationId, {
-          method:"POST", headers:{"x-takoserver-private-broker-token":brokerToken}
-        }));
-        if (result.status !== expected) throw new Error("broker_" + action + "_failed");
-      };
-      return {response:native, async commit() {
-        await control("commit");
-        await control("commit", 404);
-      }, abandon() {
-        return control("abandon");
-      }};
-    }
-  });
-  try { return await handoff.finish(await application.fetch(request, Object.freeze({ACTOR:handoff.actor, ACTOR_HTTP:actorHttp}))); }
-  catch { await handoff.abandon(); return new NativeResponse(null, {status:500}); }
-}};`,
+        selfhostActorForwardEntrypointSource({
+          runtimeModule: "forward-runtime.mjs",
+          innerModule: "inner.mjs",
+          bindings: [
+            {
+              publicName: "ROOM",
+              httpService: "__TAKOSERVER_ACTOR_HTTP",
+              upgradeService: "__TAKOSERVER_ACTOR_UPGRADE",
+              token: brokerToken,
+            },
+          ],
+        }),
       );
       const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
       const port = reserved.port;
@@ -337,7 +338,7 @@ export default {async fetch(request, env) {
       let live = -1;
       for (let attempt = 0; attempt < 100; attempt += 1) {
         const probe = await namespace.fetch(
-          "actor-id",
+          actorId,
           new Request("http://actor.invalid/probe"),
           "variant-two",
         );
@@ -349,6 +350,12 @@ export default {async fetch(request, env) {
       await Bun.sleep(100);
       expect(completed).toEqual(["socket-event-1", "socket-event-2", "socket-event-3"]);
       expect(admittedFetches).toBe(2);
+      const addressing = (await (await fetch(`${origin}/id?ticket=authorized`)).json()) as {
+        id: string;
+        unique: string;
+      };
+      expect(addressing.id).toBe(actorId);
+      expect(addressing.unique).toMatch(/^u1_[a-f0-9]{64}$/u);
       const ordinary = await fetch(`${origin}/actor-http?ticket=authorized`);
       expect(ordinary.status).toBe(200);
       expect(await ordinary.json()).toEqual({ live: 0 });

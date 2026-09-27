@@ -69,6 +69,7 @@ const SafeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "
 const SafeEncodeURIComponent = encodeURIComponent;
 const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
+const SafeArrayIsArray = Array.isArray;
 const SafeIsSafeInteger = Number.isSafeInteger;
 const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
@@ -193,6 +194,31 @@ interface AlarmState {
   readonly pending: number | null;
   readonly obligation: boolean;
   readonly retryAt: number | null;
+}
+
+interface ActorOwnerGraph {
+  readonly generationKey: string;
+  readonly epoch: string;
+  readonly variantKeys: readonly string[];
+}
+
+function validActorOwnerGraph(value: ActorOwnerGraph | undefined): value is ActorOwnerGraph {
+  if (
+    !value ||
+    !/^[a-f0-9]{64}$/u.test(value.generationKey) ||
+    typeof value.epoch !== "string" ||
+    value.epoch.length === 0 ||
+    !SafeArrayIsArray(value.variantKeys) ||
+    value.variantKeys.length === 0
+  )
+    return false;
+  for (let index = 0; index < value.variantKeys.length; index += 1) {
+    const key = value.variantKeys[index];
+    if (typeof key !== "string" || key.length === 0) return false;
+    for (let previous = 0; previous < index; previous += 1)
+      if (value.variantKeys[previous] === key) return false;
+  }
+  return true;
 }
 
 interface SocketRecord {
@@ -436,11 +462,7 @@ function withHeaders(request: Request, headers: Headers, signal = request.signal
 export function createActorNativeOwner(
   deliveryToken: string | undefined,
   admissionToken: string,
-  graph: {
-    readonly generationKey: string;
-    readonly epoch: string;
-    readonly variantKeys: readonly string[];
-  },
+  graph: ActorOwnerGraph | undefined,
   // Host-private timing seam for focused qualification; public admission does
   // not accept or forward deadline values.
   deadlines: { readonly handlerMs: number; readonly producerMs: number } = {
@@ -448,6 +470,7 @@ export function createActorNativeOwner(
     producerMs: HTTP_PRODUCER_MS,
   },
   loadVariantClass?: (env: Record<string, unknown>, variantKey: string) => Promise<unknown>,
+  readCurrentGraph?: (env: Record<string, unknown>) => Promise<ActorOwnerGraph>,
 ) {
   if (
     (deliveryToken !== undefined && !/^[a-f0-9]{64}$/u.test(deliveryToken)) ||
@@ -458,13 +481,9 @@ export function createActorNativeOwner(
   // no static secret may be embedded in immutable/recoverable WfP WorkerCode.
   const deliveryForEvent = (): string => deliveryToken ?? randomBearer();
   if (
-    !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
-    typeof graph.epoch !== "string" ||
-    !graph.epoch ||
-    !Array.isArray(graph.variantKeys) ||
-    graph.variantKeys.length === 0 ||
-    graph.variantKeys.some((key) => typeof key !== "string" || !key) ||
-    new Set(graph.variantKeys).size !== graph.variantKeys.length
+    (graph !== undefined && !validActorOwnerGraph(graph)) ||
+    (graph === undefined && (!readCurrentGraph || !loadVariantClass)) ||
+    (graph !== undefined && readCurrentGraph !== undefined)
   )
     throw new Error("Actor alarm graph bindings unavailable");
   if (
@@ -474,7 +493,10 @@ export function createActorNativeOwner(
     deadlines.producerMs <= 0
   )
     throw new Error("Actor HTTP deadlines unavailable");
-  const variantKeys = Object.freeze([...graph.variantKeys]);
+  const staticGraph =
+    graph === undefined
+      ? undefined
+      : Object.freeze({ ...graph, variantKeys: Object.freeze([...graph.variantKeys]) });
   return class ActorOwner {
     readonly state: NativeState;
     readonly env: {
@@ -556,9 +578,18 @@ export function createActorNativeOwner(
       if (!this.state.storage) throw new Error("Actor alarm storage unavailable");
       return this.state.storage;
     }
-    private async selectedChild(actorId: string, variantIndex: number) {
-      const key = variantKeys[variantIndex];
-      if (key === undefined) throw new Error("Actor variant unavailable");
+    private async currentGraph(): Promise<ActorOwnerGraph> {
+      if (staticGraph) return staticGraph;
+      const selected = await readCurrentGraph?.(this.env);
+      if (!validActorOwnerGraph(selected)) throw new Error("Actor graph unavailable");
+      // The Host reader may reuse mutable storage across awaits. Keep this
+      // event's comparison independent of later graph updates.
+      const variantKeys: string[] = [];
+      for (let index = 0; index < selected.variantKeys.length; index += 1)
+        variantKeys[index] = selected.variantKeys[index] as string;
+      return { generationKey: selected.generationKey, epoch: selected.epoch, variantKeys };
+    }
+    private async selectedChild(actorId: string, key: string, variantIndex: number) {
       const bindingName = `CLASS_${variantIndex}`;
       const selectedClass = loadVariantClass
         ? await loadVariantClass(this.env, key)
@@ -1097,19 +1128,27 @@ export function createActorNativeOwner(
             !SafeHasOwn(selection, "leaseId")
           )
             throw new Error("Actor alarm admission denied");
+          const currentGraph = await this.currentGraph();
           if (
-            selected.generationKey !== graph.generationKey ||
-            selected.epoch !== graph.epoch ||
+            selected.generationKey !== currentGraph.generationKey ||
+            selected.epoch !== currentGraph.epoch ||
             selected.id !== claimed ||
             selected.attemptNonce !== attemptNonce
           )
             throw new Error("Actor alarm admission denied");
           if (Date.now() >= grantDeadlineAt) throw new Error("Actor alarm admission deadline");
-          const variantIndex = variantKeys.indexOf(selected.variantKey);
+          const variantIndex = currentGraph.variantKeys.indexOf(selected.variantKey);
           if (variantIndex < 0) throw new Error("Actor alarm admission denied");
           if (timer) clearTimeout(timer);
           timer = undefined;
-          const child = await this.selectedChild(claimed, variantIndex);
+          const child = await this.selectedChild(claimed, selected.variantKey, variantIndex);
+          const graphBeforeDelivery = await this.currentGraph();
+          if (
+            graphBeforeDelivery.generationKey !== currentGraph.generationKey ||
+            graphBeforeDelivery.epoch !== currentGraph.epoch ||
+            graphBeforeDelivery.variantKeys[variantIndex] !== selected.variantKey
+          )
+            throw new Error("Actor alarm graph changed before delivery");
           const request = new Request("http://actor.invalid/", {
             headers: { [DELIVERY_HEADER]: deliveryForEvent() },
             signal: deadline.signal,
@@ -1218,6 +1257,9 @@ export function createActorNativeOwner(
     }
     private async socketAdmission(actorId: string): Promise<{
       readonly variantIndex: number;
+      readonly variantKey: string;
+      readonly generationKey: string;
+      readonly epoch: string;
       readonly attemptNonce: string;
       readonly deadlineAt: number;
     }> {
@@ -1244,19 +1286,29 @@ export function createActorNativeOwner(
         if (typeof selection !== "object" || selection === null)
           throw new Error("Actor socket admission denied");
         const selected = selection as Record<string, unknown>;
+        const currentGraph = await this.currentGraph();
         const variantIndex =
-          typeof selected.variantKey === "string" ? variantKeys.indexOf(selected.variantKey) : -1;
+          typeof selected.variantKey === "string"
+            ? currentGraph.variantKeys.indexOf(selected.variantKey)
+            : -1;
         if (
           selected.id !== actorId ||
           selected.attemptNonce !== attemptNonce ||
-          selected.generationKey !== graph.generationKey ||
-          selected.epoch !== graph.epoch ||
+          selected.generationKey !== currentGraph.generationKey ||
+          selected.epoch !== currentGraph.epoch ||
           typeof selected.leaseId !== "string" ||
           !selected.leaseId ||
           variantIndex < 0
         )
           throw new Error("Actor socket admission denied");
-        return { variantIndex, attemptNonce, deadlineAt };
+        return {
+          variantIndex,
+          variantKey: selected.variantKey as string,
+          generationKey: currentGraph.generationKey,
+          epoch: currentGraph.epoch,
+          attemptNonce,
+          deadlineAt,
+        };
       } finally {
         clearTimeout(timer);
       }
@@ -1335,7 +1387,22 @@ export function createActorNativeOwner(
         let completionError: unknown;
         try {
           admission = await this.socketAdmission(actorId);
-          const child = await this.selectedChild(actorId, admission.variantIndex);
+          const graphNow = await this.currentGraph();
+          const key = graphNow.variantKeys[admission.variantIndex];
+          if (
+            key !== admission.variantKey ||
+            graphNow.generationKey !== admission.generationKey ||
+            graphNow.epoch !== admission.epoch
+          )
+            throw new Error("Actor socket variant unavailable");
+          const child = await this.selectedChild(actorId, key, admission.variantIndex);
+          const graphBeforeDelivery = await this.currentGraph();
+          if (
+            graphBeforeDelivery.generationKey !== admission.generationKey ||
+            graphBeforeDelivery.epoch !== admission.epoch ||
+            graphBeforeDelivery.variantKeys[admission.variantIndex] !== admission.variantKey
+          )
+            throw new Error("Actor socket graph changed before delivery");
           const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
           const controller = new AbortController();
           const body =
@@ -1494,7 +1561,9 @@ export function createActorNativeOwner(
         if (!encodedId) throw new Error("Actor identity unavailable");
         const id = decodeURIComponent(encodedId);
         const variantKey = request.headers.get(VARIANT_HEADER);
-        const variantIndex = variantKey === null ? -1 : variantKeys.indexOf(variantKey);
+        const currentGraph = await this.currentGraph();
+        const variantIndex =
+          variantKey === null ? -1 : currentGraph.variantKeys.indexOf(variantKey);
         if (variantIndex < 0) throw new Error("Actor variant unavailable");
         if (this.state.storage) {
           await this.control(async () => {
@@ -1532,7 +1601,14 @@ export function createActorNativeOwner(
         const eventDeliveryToken = deliveryForEvent();
         let upgrade: SocketRecord | undefined;
         try {
-          const child = await this.selectedChild(id, variantIndex);
+          const child = await this.selectedChild(id, variantKey as string, variantIndex);
+          const graphBeforeDelivery = await this.currentGraph();
+          if (
+            graphBeforeDelivery.generationKey !== currentGraph.generationKey ||
+            graphBeforeDelivery.epoch !== currentGraph.epoch ||
+            graphBeforeDelivery.variantKeys[variantIndex] !== variantKey
+          )
+            throw new Error("Actor graph changed before dispatch");
           headers.set(UPGRADE_NONCE_HEADER, nonce);
           if (deliveryToken === undefined) headers.set(EVENT_SECRET_HEADER, eventDeliveryToken);
           childRequest = withHeaders(

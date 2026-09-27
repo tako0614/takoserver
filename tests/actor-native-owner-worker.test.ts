@@ -126,6 +126,56 @@ test("structural facet lane overwrites a forged event secret before child dispat
   expect(captured).not.toBe("attacker-chosen");
 });
 
+test("dynamic owner graph rejects a rollout between selection and child dispatch", async () => {
+  let epoch = "epoch-1";
+  let rollOnLoad = true;
+  let childCalls = 0;
+  const Owner = createActorNativeOwner(
+    undefined,
+    "c".repeat(64),
+    undefined,
+    undefined,
+    async () => {
+      if (rollOnLoad) {
+        epoch = "epoch-2";
+        rollOnLoad = false;
+      }
+      return {};
+    },
+    async () => ({
+      generationKey: "d".repeat(64),
+      epoch,
+      variantKeys: ["selected"],
+    }),
+  );
+  const owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch() {
+            childCalls += 1;
+            return new Response("selected");
+          },
+        }),
+        abort() {},
+      },
+      waitUntil() {},
+    },
+    { CLASS: {} },
+  );
+  const request = () =>
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": "loaded-id",
+        "x-takoserver-private-actor-variant": "selected",
+      },
+    });
+  await expect(owner.fetch(request())).rejects.toThrow("Actor graph changed before dispatch");
+  expect(childCalls).toBe(0);
+  expect(await (await owner.fetch(request())).text()).toBe("selected");
+  expect(childCalls).toBe(1);
+});
+
 test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {
   let calls = 0;
   const f = fixture(async () => {
