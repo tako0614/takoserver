@@ -250,6 +250,14 @@ export {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export {
+  createTakoformDeleteSubeffectStore,
+  type TakoformDeleteSubeffectConclusion,
+  type TakoformDeleteSubeffectInput,
+  type TakoformDeleteSubeffectIssue,
+  type TakoformDeleteSubeffectIssueInput,
+  type TakoformDeleteSubeffectRead,
+} from "./takoform/provider-delete-subeffect.ts";
 export { isSpaceId } from "./takoform/space-id.ts";
 export {
   parseVectorIndexConfig,
