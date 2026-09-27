@@ -143,10 +143,13 @@ const WORKER_VERSION_OPERATION_MARKER_PREFIX = "tsop-v1:";
 const WORKER_VERSION_ARTIFACT_MANIFEST_BINDING = "TAKOSERVER_INTERNAL_ARTIFACT_MANIFEST";
 const WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING =
   "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT";
+const WORKER_VERSION_RUNTIME_INPUT_GENERATION_BINDING =
+  "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION";
 const WORKER_VERSION_INTERNAL_BINDING_NAMES = new Set<string>([
   WORKER_VERSION_OPERATION_MARKER_BINDING,
   WORKER_VERSION_ARTIFACT_MANIFEST_BINDING,
   WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
+  WORKER_VERSION_RUNTIME_INPUT_GENERATION_BINDING,
 ]);
 
 const SQLITE_MIGRATION_LEDGER = "_takoform_sqlite_migrations";
@@ -1997,10 +2000,19 @@ export class CloudflareProvider implements Provider {
     }
 
     if (input.operationMode !== "initial") {
+      const recovered = await this.#recoverWorkerVersion(
+        scriptName,
+        operationMarker,
+        requiredSensitive,
+      );
+      if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
       let runtimeInputRecovery:
         | Awaited<ReturnType<ProviderRuntimeInputLeasePort["recover"]>>
         | undefined;
       if (requiredSensitive.length > 0) {
+        if (!recovered.value.runtimeInputGeneration) {
+          return failed("conflict", "the Worker Version runtime-input generation is ambiguous");
+        }
         try {
           runtimeInputRecovery = await (
             this.#runtimeInputs as ProviderRuntimeInputLeasePort
@@ -2016,29 +2028,28 @@ export class CloudflareProvider implements Provider {
               bundleName: bundleResourceName,
             },
             bindingNames: requiredSensitive,
+            expectedGeneration: recovered.value.runtimeInputGeneration,
           });
         } catch (error) {
           return runtimeInputFailure(error, "recover");
         }
-        if (!sameStrings(runtimeInputRecovery.bindingNames, requiredSensitive)) {
-          return failed("denied", "required sensitive Worker runtime inputs are unavailable");
+        if (
+          !sameStrings(runtimeInputRecovery.bindingNames, requiredSensitive) ||
+          runtimeInputRecovery.preparation.generation !== recovered.value.runtimeInputGeneration ||
+          runtimeInputRecovery.preparation.commitment !== recovered.value.runtimeInputCommitment
+        ) {
+          return failed("conflict", "the Worker Version runtime-input generation is mismatched");
         }
       }
-      const recovered = await this.#recoverWorkerVersion(
-        scriptName,
-        operationMarker,
-        requiredSensitive,
-        runtimeInputRecovery?.preparation.commitment,
-      );
-      if (!recovered.ok) return { phase: "failed", failure: recovered.failure };
       if (runtimeInputRecovery) {
         const receiptDigest = await workerVersionReceiptDigest(
           this.#accountId,
           operationMarker,
           scriptName,
-          recovered.value,
+          recovered.value.versionId,
           requiredSensitive,
           runtimeInputRecovery.preparation.commitment,
+          runtimeInputRecovery.preparation.generation,
         );
         try {
           await runtimeInputRecovery.settle(receiptDigest);
@@ -2047,9 +2058,9 @@ export class CloudflareProvider implements Provider {
         }
       }
       return succeeded({
-        nativeId: `version:${scriptName}:${recovered.value}`,
-        observed: { scriptName, versionId: recovered.value },
-        outputs: { scriptName, versionId: recovered.value },
+        nativeId: `version:${scriptName}:${recovered.value.versionId}`,
+        observed: { scriptName, versionId: recovered.value.versionId },
+        outputs: { scriptName, versionId: recovered.value.versionId },
       });
     }
 
@@ -2135,6 +2146,11 @@ export class CloudflareProvider implements Provider {
                         name: WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
                         text: runtimeInputLease.preparation.commitment,
                       },
+                      {
+                        type: "plain_text",
+                        name: WORKER_VERSION_RUNTIME_INPUT_GENERATION_BINDING,
+                        text: runtimeInputLease.preparation.generation,
+                      },
                     ]
                   : []),
                 {
@@ -2214,6 +2230,7 @@ export class CloudflareProvider implements Provider {
         versionId,
         requiredSensitive,
         runtimeInputLease?.preparation.commitment,
+        runtimeInputLease?.preparation.generation,
       );
       try {
         await dispatchedLease.settle(receiptDigest);
@@ -2232,11 +2249,20 @@ export class CloudflareProvider implements Provider {
     scriptName: string,
     operationMarker: string,
     expectedSecretTextNames: readonly string[],
-    expectedRuntimeInputCommitment?: `sha256:${string}`,
-  ): Promise<ProviderValue<string>> {
+  ): Promise<
+    ProviderValue<{
+      readonly versionId: string;
+      readonly runtimeInputCommitment?: `sha256:${string}`;
+      readonly runtimeInputGeneration?: string;
+    }>
+  > {
     const versionPath = `/accounts/${this.#accountId}/workers/scripts/${encodeURIComponent(scriptName)}/versions`;
     const seen = new Set<string>();
-    let recovered: string | null = null;
+    let recovered: {
+      versionId: string;
+      runtimeInputCommitment?: `sha256:${string}`;
+      runtimeInputGeneration?: string;
+    } | null = null;
     for (let page = 1; page <= WORKER_VERSION_RECOVERY_PAGE_LIMIT; page += 1) {
       const listed = await this.#call(
         "GET",
@@ -2332,15 +2358,30 @@ export class CloudflareProvider implements Provider {
           (binding) => record(binding)?.name === WORKER_VERSION_RUNTIME_INPUT_COMMITMENT_BINDING,
         );
         if (
-          expectedRuntimeInputCommitment === undefined
+          expectedSecretTextNames.length === 0
             ? runtimeCommitmentBindings.length !== 0
             : runtimeCommitmentBindings.length !== 1 ||
               record(runtimeCommitmentBindings[0])?.type !== "plain_text" ||
-              record(runtimeCommitmentBindings[0])?.text !== expectedRuntimeInputCommitment
+              !/^sha256:[0-9a-f]{64}$/u.test(String(record(runtimeCommitmentBindings[0])?.text))
         ) {
           return providerValueFailure(
             "provider_error",
             "the Worker Version recovery runtime-input commitment is mismatched",
+          );
+        }
+        const runtimeGenerationBindings = (bindingsValue ?? []).filter(
+          (binding) => record(binding)?.name === WORKER_VERSION_RUNTIME_INPUT_GENERATION_BINDING,
+        );
+        if (
+          expectedSecretTextNames.length === 0
+            ? runtimeGenerationBindings.length !== 0
+            : runtimeGenerationBindings.length !== 1 ||
+              record(runtimeGenerationBindings[0])?.type !== "plain_text" ||
+              !/^[A-Za-z0-9_-]{16}$/u.test(String(record(runtimeGenerationBindings[0])?.text))
+        ) {
+          return providerValueFailure(
+            "provider_error",
+            "the Worker Version recovery runtime-input generation is mismatched",
           );
         }
         const recoveredSecretNames = (bindingsValue ?? [])
@@ -2360,7 +2401,16 @@ export class CloudflareProvider implements Provider {
             "the Worker Version recovery marker is ambiguous",
           );
         }
-        recovered = versionId;
+        recovered = {
+          versionId,
+          ...(expectedSecretTextNames.length > 0
+            ? {
+                runtimeInputCommitment: record(runtimeCommitmentBindings[0])
+                  ?.text as `sha256:${string}`,
+                runtimeInputGeneration: record(runtimeGenerationBindings[0])?.text as string,
+              }
+            : {}),
+        };
       }
     }
     return recovered
@@ -4402,15 +4452,19 @@ async function workerVersionReceiptDigest(
   versionId: string,
   secretTextNames: readonly string[],
   runtimeInputCommitment?: `sha256:${string}`,
+  runtimeInputGeneration?: string,
 ): Promise<`sha256:${string}`> {
   const canonical = JSON.stringify({
-    format: "takoserver.cloudflare-worker-version-receipt@v2",
+    format: runtimeInputGeneration
+      ? "takoserver.cloudflare-worker-version-receipt@v3"
+      : "takoserver.cloudflare-worker-version-receipt@v2",
     accountId,
     operationMarker,
     scriptName,
     versionId,
     secretTextNames: [...secretTextNames].sort(),
     runtimeInputCommitment: runtimeInputCommitment ?? null,
+    ...(runtimeInputGeneration ? { runtimeInputGeneration } : {}),
   });
   const digest = new Uint8Array(
     await crypto.subtle.digest(

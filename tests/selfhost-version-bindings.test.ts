@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -35,6 +35,18 @@ const SET = {
   sensitiveVars: [{ name: "ENCRYPTION_KEY", value: "placeholder-secret", kind: "text" as const }],
   serviceBindings: [],
 };
+
+const MARKER = {
+  tenantId: "tenant-a",
+  operationId: "operation-a",
+  operationKey: "operation-key-a",
+  resourceUid: "uid-WorkerVersion-hello",
+  workerResourceUid: "uid-ModuleWorker-hello",
+  space: "default",
+  workerName: "hello",
+  bundleName: "bundle",
+  generation: "abcdefghijklmnop",
+} as const;
 
 test("complete external binding envelope is bounded before a runtime write", () => {
   const value = JSON.stringify({ value: "a".repeat(3 * 1024 * 1024) });
@@ -94,6 +106,153 @@ test("stores and returns one version's bindings", async () => {
   expect(written.sensitiveVars).toEqual(SET.sensitiveVars);
   expect(written.digest).toMatch(/^sha256:[0-9a-f]{64}$/u);
   expect(await store.read("sw-a", "v-1")).toEqual(written);
+});
+
+test("pins the original sensitive lease generation in the private native record", async () => {
+  const generation = "abcdefghijklmnop";
+  const set = { ...SET, runtimeInputGeneration: generation };
+  await store.pinRuntimeInput("sw-a", "v-1", MARKER);
+  const written = await store.write("sw-a", "v-1", set, MARKER);
+  const path = join(root, "sw-a", "v-1.json");
+  const raw = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+  expect(raw.format).toBe("takoserver.selfhost-version-bindings@v7");
+  expect(raw.runtimeInputGeneration).toBe(generation);
+  expect((await store.read("sw-a", "v-1"))?.runtimeInputGeneration).toBe(generation);
+  expect(await store.write("sw-a", "v-1", set, MARKER)).toEqual(written);
+  expect(await readFile(path, "utf8")).toBe(JSON.stringify(raw));
+  await expect(
+    store.write(
+      "sw-a",
+      "v-1",
+      { ...set, runtimeInputGeneration: "qrstuvwxyzABCDEF" },
+      { ...MARKER, generation: "qrstuvwxyzABCDEF" },
+    ),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  expect((await store.read("sw-a", "v-1"))?.runtimeInputGeneration).toBe(generation);
+});
+
+test("does not backfill a historical sensitive record with a later lease generation", async () => {
+  const old = await store.write("sw-a", "v-1", SET);
+  expect(old.runtimeInputGeneration).toBeUndefined();
+  await expect(
+    store.write("sw-a", "v-1", { ...SET, runtimeInputGeneration: "abcdefghijklmnop" }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  expect(await store.read("sw-a", "v-1")).toEqual(old);
+});
+
+test("closes a pre-dispatch marker before an absent native binding can be abandoned", async () => {
+  const set = { ...SET, runtimeInputGeneration: MARKER.generation };
+  await store.pinRuntimeInput("sw-a", "v-1", MARKER);
+  expect(await store.readRuntimeInput("sw-a", "v-1", MARKER)).toEqual({
+    generation: MARKER.generation,
+    state: "active",
+  });
+  expect(await store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).toBe(true);
+  expect(await store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).toBe(true);
+  await expect(store.write("sw-a", "v-1", set, MARKER)).rejects.toMatchObject({ code: "corrupt" });
+  expect(await store.read("sw-a", "v-1")).toBeNull();
+  expect(await store.readRuntimeInput("sw-a", "v-1", MARKER)).toEqual({
+    generation: MARKER.generation,
+    state: "closed",
+  });
+  await expect(
+    store.pinRuntimeInput("sw-a", "v-1", { ...MARKER, generation: "qrstuvwxyzABCDEF" }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await expect(
+    store.pinRuntimeInput("sw-a", "v-1", {
+      ...MARKER,
+      operationKey: "different-key-same-operation",
+      generation: "qrstuvwxyzABCDEF",
+    }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  expect(await store.readRuntimeInput("sw-a", "v-1", MARKER)).toEqual({
+    generation: MARKER.generation,
+    state: "closed",
+  });
+  const replacement = {
+    ...MARKER,
+    operationId: "operation-b",
+    generation: "qrstuvwxyzABCDEF",
+  };
+  await store.pinRuntimeInput("sw-a", "v-1", replacement);
+  await expect(store.write("sw-a", "v-1", set, MARKER)).rejects.toMatchObject({ code: "corrupt" });
+  expect(await store.readRuntimeInput("sw-a", "v-1", replacement)).toEqual({
+    generation: replacement.generation,
+    state: "active",
+  });
+});
+
+test("does not close a marker after its exact native binding reached disk", async () => {
+  await store.pinRuntimeInput("sw-a", "v-1", MARKER);
+  await store.write("sw-a", "v-1", { ...SET, runtimeInputGeneration: MARKER.generation }, MARKER);
+  expect(await store.readRuntimeInput("sw-a", "v-1", MARKER)).toEqual({
+    generation: MARKER.generation,
+    state: "written",
+  });
+  expect(await store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).toBe(false);
+  await expect(
+    store.pinRuntimeInput("sw-a", "v-1", { ...MARKER, generation: "qrstuvwxyzABCDEF" }),
+  ).rejects.toMatchObject({ code: "corrupt" });
+  await rm(join(root, "sw-a", "v-1.json"));
+  await expect(store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).rejects.toMatchObject({
+    code: "corrupt",
+  });
+});
+
+test("a different process cannot land an old native binding after the marker closes", async () => {
+  await store.pinRuntimeInput("sw-a", "v-1", MARKER);
+  expect(await store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).toBe(true);
+  const source = `
+    import { createSelfhostVersionBindingStore } from ${JSON.stringify(new URL("../src/providers/selfhost-version-bindings.ts", import.meta.url).href)};
+    const store = createSelfhostVersionBindingStore({ root: ${JSON.stringify(root)} });
+    try {
+      await store.write("sw-a", "v-1", ${JSON.stringify({ ...SET, runtimeInputGeneration: MARKER.generation })}, ${JSON.stringify(MARKER)});
+      process.exit(2);
+    } catch (error) {
+      process.exit(error?.code === "corrupt" ? 0 : 3);
+    }
+  `;
+  const child = Bun.spawn([process.execPath, "-e", source], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(await child.exited).toBe(0);
+  expect(await store.read("sw-a", "v-1")).toBeNull();
+});
+
+test("a killed writer after native fsync cannot be mistaken for no effect", async () => {
+  await store.pinRuntimeInput("sw-a", "v-1", MARKER);
+  const signal = join(root, "native-written.signal");
+  const source = `
+    import { writeFile } from "node:fs/promises";
+    import { createSelfhostVersionBindingStore } from ${JSON.stringify(new URL("../src/providers/selfhost-version-bindings.ts", import.meta.url).href)};
+    const store = createSelfhostVersionBindingStore({
+      root: ${JSON.stringify(root)},
+      async afterNativeWriteBeforeCommit() {
+        await writeFile(${JSON.stringify(signal)}, "ready");
+        await Bun.sleep(60_000);
+      },
+    });
+    await store.write("sw-a", "v-1", ${JSON.stringify({ ...SET, runtimeInputGeneration: MARKER.generation })}, ${JSON.stringify(MARKER)});
+  `;
+  const child = Bun.spawn([process.execPath, "-e", source], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  try {
+    for (let attempt = 0; attempt < 200 && !existsSync(signal); attempt += 1) {
+      await Bun.sleep(10);
+    }
+    expect(existsSync(signal)).toBe(true);
+    await expect(store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).rejects.toMatchObject({
+      code: "unavailable",
+    });
+  } finally {
+    child.kill();
+    await child.exited;
+  }
+  expect((await store.read("sw-a", "v-1"))?.runtimeInputGeneration).toBe(MARKER.generation);
+  expect(await store.closeAbsentRuntimeInput("sw-a", "v-1", MARKER)).toBe(false);
 });
 
 test("stores v5 external declarations, optional omission, and JSON runtime values privately", async () => {
