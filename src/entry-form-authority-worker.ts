@@ -12,6 +12,7 @@ import {
 import { createR2ObjectStore } from "./objects-r2.ts";
 import type { PublicHostIdentityRpc } from "./public-host-identity.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { createExistingSpaceAdmissionAuthority } from "./takoform/existing-space-admission.ts";
 import { readReleasedCoreVerifierIdentity } from "./takoform/form-authority-verification.ts";
 import type {
   FormAuthorityPlan,
@@ -58,6 +59,18 @@ export class FormAuthorityEntrypoint extends WorkerEntrypoint<FormAuthorityWorke
 
   readback(request: FormAuthorityPlanRequest) {
     return productionComposition(this.env).then(({ endpoint }) => endpoint.readback(request));
+  }
+
+  /** Full operator capability only; never exposed to the credential issuer. */
+  async reconcileExistingSpaces(input: unknown) {
+    return await createExistingSpaceAdmissionAuthority({
+      policy: this.env.TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY,
+      compose: async (policy) => {
+        const composition = await productionComposition(this.env, policy);
+        const closure = await loadPublisherSetClosure();
+        return { ...composition, evidence: closure.evidence };
+      },
+    }).reconcileExistingSpaces(input);
   }
 }
 

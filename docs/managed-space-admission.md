@@ -131,6 +131,57 @@ An application uninstall must not deactivate its Space: several applications
 may share it. Tenant decommission is a separate lifecycle and is not implemented
 by this foundation.
 
+## Existing Spaces after a software update
+
+Changing the Host's semantic implementation identity invalidates older positive
+activation heads. Credential replay is not an update hook: an existing issuance
+still returns its original token and times without repeating admission.
+
+The full operator-only `FormAuthorityEntrypoint.reconcileExistingSpaces` RPC
+provides bounded positive convergence for an explicit selection:
+
+```ts
+{ policyDigest: "sha256:...", spaces: ["space-a", "space-b"] }
+```
+
+The digest must match the configured `TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY`.
+There must be 1–100 distinct valid Space references. The policy alone selects
+the organization and exact Form/package identities. This operator operation
+does not infer a sponsorship tenant from a Space; arbitrary retained Spaces and
+managed tenant Spaces keep their distinct ownership contracts. It is available
+only on the existing full operator capability, never the credential issuer's
+`TenantSpaceAdmissionEntrypoint` or a customer API.
+
+The operation captures all selected Spaces before its first mutation and
+intersects the policy with each Space's durable **positive** activation heads.
+Absent, inactive, excluded and other-Space activation heads are not changed.
+The coordinator still verifies the complete package closure and reconciles Host
+support, which is Host-wide rather than Space-local. A changed activation head
+between capture and planning refuses the update; this prevents a concurrent
+deactivation from being resurrected by a fresh plan. The normal coordinator
+then checks the plan and predecessor fences during apply. A fresh final
+readback of every selected Space must match the exact applied positive heads
+and current implementation identity, while excluded heads remain unchanged.
+
+Success returns `{ policyDigest, identity, spaces: [{ space, forms }] }`, where
+each Form includes its exact package identity and activation head. Empty
+`forms` means that no retained positive Form matched the policy; it is **not**
+a claim that the Space or an application is ready. Repeating a converged
+selection appends no new activation events.
+
+Input/policy failures refuse before mutation. An apply failure or readback
+conflict throws without batch success, even if an earlier Space already
+converged. Completed appends remain durable; there is no rollback or automatic
+retry. Inspect the existing full operator `readback` RPC for each exact Space
+before deciding on a fresh invocation. A transport timeout is indeterminate,
+not evidence that nothing changed.
+
+This RPC and its portable tests are a source foundation. The owning deployment
+still needs an explicitly authorized operator transport, exact configured-policy
+readback and live multi-Space update proof. The singleton integration fixture
+gateway, its sealed tenant/Space scope, and the read-only identity probe are not
+repurposed or widened by this operation.
+
 Live acceptance must demonstrate two independently derived tenants coexisting,
 unchanged activation heads for the existing Space, repeated request convergence,
 and normal install/update/destroy through the unchanged public provider path.
