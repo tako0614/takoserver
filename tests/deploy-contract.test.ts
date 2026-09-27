@@ -47,6 +47,8 @@ async function deployThroughPipe(): Promise<{
 }
 
 const SURFACES = [
+  ["takoserver-existing-space-operator-worker", ["authority"]],
+  ["takoserver-existing-space-reconciliation", ["authority"]],
   ["takoserver-worker", []],
   ["takoserver-integration-worker-bootstrap", ["irreversible", "authority"]],
   ["takoserver-sponsorship-authority-worker", ["irreversible", "authority", "published-identity"]],

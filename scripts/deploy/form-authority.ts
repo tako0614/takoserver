@@ -111,6 +111,7 @@ export const FORM_AUTHORITY_DESCRIPTOR_BINDINGS: DescriptorBindingMap = {
 
 export type FormAuthoritySurface =
   | "takoserver-form-authority-worker"
+  | "takoserver-existing-space-operator-worker"
   | "takoserver-integration-form-authority-worker"
   | "takoserver-integration-form-authority-operator-worker";
 
@@ -196,7 +197,7 @@ export interface FormAuthorityCoreVerifierReadback {
 }
 
 export interface SelectedFormAuthorityTarget {
-  readonly kind: "authority" | "operator-gateway";
+  readonly kind: "authority" | "operator-gateway" | "existing-space-operator";
   readonly workerName: string;
   readonly hostId: string;
   readonly main: string;
@@ -371,7 +372,8 @@ export async function runFormAuthority(
   if (invocation.scopeTransition) {
     if (
       invocation.environment !== "integration" ||
-      invocation.surface === "takoserver-form-authority-worker"
+      invocation.surface === "takoserver-form-authority-worker" ||
+      invocation.surface === "takoserver-existing-space-operator-worker"
     ) {
       throw preflightError("Form authority scope transition is integration-only");
     }
@@ -407,7 +409,10 @@ export async function runFormAuthority(
       "the verifier-bridge bootstrap is one forward-only first publication, not another transition",
     );
   }
-  if (bootstrapVerifierBridge && selected.verificationMode !== "released-core") {
+  if (
+    bootstrapVerifierBridge &&
+    (selected.kind !== "authority" || selected.verificationMode !== "released-core")
+  ) {
     throw preflightError(
       "only the released-Core Form authority Worker has a Core-verifier readback bridge to bootstrap",
     );
@@ -462,17 +467,25 @@ export async function runFormAuthority(
         capabilities: capabilityManifest,
       })
     : null;
+  const dependencySurface: FormAuthoritySurface =
+    selected.kind === "existing-space-operator"
+      ? "takoserver-form-authority-worker"
+      : "takoserver-integration-form-authority-worker";
+  // A bridge transition never authorizes a transition of its dependency.
+  const dependencyInvocation: FormAuthorityDeployInvocation = {
+    surface: dependencySurface,
+    action: invocation.action,
+    environment: invocation.environment,
+    commit: invocation.commit,
+  };
   const dependencySelected =
-    selected.kind === "operator-gateway"
-      ? selectTarget(
-          { ...invocation, surface: "takoserver-integration-form-authority-worker" },
-          target,
-        )
-      : null;
+    selected.kind !== "authority" ? selectTarget(dependencyInvocation, target) : null;
   const dependencyBefore = dependencySelected
     ? await inspectFormAuthority(
         "preflight",
-        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        selected.kind === "existing-space-operator"
+          ? dependencyInvocation
+          : { ...invocation, surface: dependencySurface },
         target,
         dependencySelected,
         publicBefore,
@@ -489,14 +502,16 @@ export async function runFormAuthority(
     capabilityManifestJson,
     state,
   );
+  const verifierAuthority = selected.kind === "existing-space-operator" ? dependencyBefore : before;
   const statusCoreVerifierReadback =
-    invocation.action === "status" && selected.verificationMode === "released-core"
-      ? before === null
+    (invocation.action === "status" || selected.kind === "existing-space-operator") &&
+    selected.verificationMode === "released-core"
+      ? verifierAuthority === null
         ? unavailableCoreVerifierReadback()
         : await readFormAuthorityCoreVerifierIdentityProbe(
             {
               probeOrigin: requiredIdentityProbeOrigin(target),
-              authorityWorkerVersionId: before.history.versionId,
+              authorityWorkerVersionId: verifierAuthority.history.versionId,
               artifactDigest: takoformCoreVerifierArtifactDigest(),
             },
             options.fetcher ?? fetch,
@@ -592,9 +607,15 @@ export async function runFormAuthority(
       statusCoreVerifierReadback?.ready !== true
         ? {
             coreVerifierBridgeRemedy:
-              before === null
-                ? bootstrapVerifierBridgeRemedy(invocation, target)
-                : verifierBridgeRemedy(invocation, target),
+              verifierAuthority === null
+                ? bootstrapVerifierBridgeRemedy(
+                    selected.kind === "existing-space-operator" ? dependencyInvocation : invocation,
+                    target,
+                  )
+                : verifierBridgeRemedy(
+                    selected.kind === "existing-space-operator" ? dependencyInvocation : invocation,
+                    target,
+                  ),
           }
         : {}),
       publicIdentityRpcReady: publicIdentityReadback.ready,
@@ -627,6 +648,8 @@ export async function runFormAuthority(
       // closure-changing commit is precisely what the declaration exists for.
       ready: invocation.transition
         ? before?.bindingTransitionProfile === "declared-delta-predecessor" &&
+          (selected.kind !== "existing-space-operator" ||
+            statusCoreVerifierReadback?.ready === true) &&
           publicIdentityReadback.ready &&
           operatorIdentity !== null &&
           publicBefore.commit === invocation.commit &&
@@ -646,12 +669,28 @@ export async function runFormAuthority(
           (dependencySelected === null ||
             (dependencyBefore?.commit === invocation.commit &&
               dependencyBefore.publicWorkerBindingProfile === "dynamic-public-rpc" &&
-              dependencyBefore.scopeBindingProfile === "exact-target")),
+              dependencyBefore.scopeBindingProfile === "exact-target" &&
+              (selected.kind !== "existing-space-operator" ||
+                dependencyBefore.bindingTransitionProfile === "none"))),
     };
   }
 
   if (!publicIdentityReadback.ready || operatorIdentity === null) {
     throw preflightError("public Host identity RPC is unavailable or inconsistent");
+  }
+  if (
+    selected.kind === "existing-space-operator" &&
+    (dependencyBefore === null ||
+      dependencyBefore.commit !== invocation.commit ||
+      dependencyBefore.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
+      dependencyBefore.scopeBindingProfile !== "exact-target" ||
+      dependencyBefore.bindingTransitionProfile !== "none" ||
+      dependencyBefore.drift.length !== 0 ||
+      statusCoreVerifierReadback?.ready !== true)
+  ) {
+    throw preflightError(
+      "existing Space operator requires the exact current released-Core authority source, policy closure and verifier identity",
+    );
   }
 
   if (bootstrapVerifierBridge && before !== null) {
@@ -664,6 +703,7 @@ export async function runFormAuthority(
   if (
     !bootstrapVerifierBridge &&
     before === null &&
+    selected.kind === "authority" &&
     selected.verificationMode === "released-core"
   ) {
     throw preflightError(
@@ -807,7 +847,9 @@ export async function runFormAuthority(
     selected.kind !== "authority" ||
     isGeneratedIntegrationStorageTarget(target, invocation.environment);
   const releasedCoreVerifierAlreadyReusable =
-    selected.verificationMode !== "released-core" || reusableCoreVerifierIdentity !== null;
+    selected.verificationMode !== "released-core" ||
+    reusableCoreVerifierIdentity !== null ||
+    (selected.kind === "existing-space-operator" && statusCoreVerifierReadback?.ready === true);
   const routineIntegrationCodeGateEligible =
     invocation.action === "apply" &&
     invocation.environment === "integration" &&
@@ -893,13 +935,28 @@ export async function runFormAuthority(
     }
     const publicProofArtifact = publicProof.seal();
     publicProofArtifact.assertUnchanged();
+    if (selected.kind === "existing-space-operator") {
+      const dependencyArtifactDigest = await buildReleasedCoreFormAuthorityArtifactDigest({
+        target,
+        commit: source.commit,
+        run,
+        environment,
+      });
+      if (dependencyArtifactDigest !== dependencyBefore?.authorityArtifactDigest) {
+        throw preflightError(
+          "released-Core authority artifact differs from the exact operator bridge source build",
+        );
+      }
+    }
     const prepared = await prepareWorkerArtifact({
       root,
       target,
       commit: source.commit,
       run,
       environment,
-      ...(reusableCoreVerifierIdentity === null ? {} : { containersRollout: "none" as const }),
+      ...(reusableCoreVerifierIdentity === null && selected.kind !== "existing-space-operator"
+        ? {}
+        : { containersRollout: "none" as const }),
       main: resolve(REPOSITORY, selected.main),
       writeConfig: ({ path, main }) =>
         writeFormAuthorityConfig({
@@ -930,7 +987,9 @@ export async function runFormAuthority(
     if (dependencySelected) {
       const dependencyLast = await inspectFormAuthority(
         "preflight",
-        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        selected.kind === "existing-space-operator"
+          ? dependencyInvocation
+          : { ...invocation, surface: dependencySurface },
         target,
         dependencySelected,
         publicBefore,
@@ -938,6 +997,26 @@ export async function runFormAuthority(
         state,
       );
       assertSameVersion(dependencyBefore, dependencyLast);
+      if (selected.kind === "existing-space-operator") {
+        assertExactBridgeDependency("preflight", dependencyLast, source.commit);
+        const verifierLast = await readFormAuthorityCoreVerifierIdentityProbe(
+          {
+            probeOrigin: requiredIdentityProbeOrigin(target),
+            authorityWorkerVersionId: dependencyLast.history.versionId,
+            artifactDigest: takoformCoreVerifierArtifactDigest(),
+          },
+          options.fetcher ?? fetch,
+        );
+        if (
+          !verifierLast.ready ||
+          canonicalJson(verifierLast.identity) !==
+            canonicalJson(statusCoreVerifierReadback?.identity)
+        ) {
+          throw preflightError(
+            "released-Core authority verifier identity changed before operator bridge publication",
+          );
+        }
+      }
     }
     if (bootstrapProbeBefore !== null) {
       const bootstrapProbeLast = await inspectBootstrapProbePredecessor(
@@ -962,7 +1041,9 @@ export async function runFormAuthority(
       "--strict",
       "--message",
       message(invocation.surface, source.commit, authorityArtifactDigest),
-      ...(reusableCoreVerifierIdentity === null ? [] : ["--containers-rollout", "none"]),
+      ...(reusableCoreVerifierIdentity === null && selected.kind !== "existing-space-operator"
+        ? []
+        : ["--containers-rollout", "none"]),
     ]);
     if (reusableCoreVerifierIdentity !== null && coreVerifierReusePredecessorVersionId !== null) {
       const finalCoreVerifierReadback = await readFormAuthorityCoreVerifierIdentityProbe(
@@ -1034,7 +1115,9 @@ export async function runFormAuthority(
     if (dependencySelected) {
       const dependencyAfter = await inspectFormAuthority(
         "verification",
-        { ...invocation, surface: "takoserver-integration-form-authority-worker" },
+        selected.kind === "existing-space-operator"
+          ? dependencyInvocation
+          : { ...invocation, surface: dependencySurface },
         target,
         dependencySelected,
         publicBefore,
@@ -1042,6 +1125,9 @@ export async function runFormAuthority(
         state,
       );
       assertSameVersion(dependencyBefore, dependencyAfter, "verification");
+      if (selected.kind === "existing-space-operator") {
+        assertExactBridgeDependency("verification", dependencyAfter, source.commit);
+      }
       if (
         !dependencyAfter ||
         dependencyAfter.history.versionId !== dependencyBefore?.history.versionId ||
@@ -1081,12 +1167,17 @@ export async function runFormAuthority(
     // The bootstrap upload deliberately does not read the bridge: the probe
     // cannot have bound a script that did not exist when this run started, so
     // asking would only spend a timeout proving what the order already says.
+    let verifierAuthorityVersionId = after.history.versionId;
+    if (selected.kind === "existing-space-operator") {
+      assertExactBridgeDependency("verification", dependencyBefore, source.commit);
+      verifierAuthorityVersionId = dependencyBefore.history.versionId;
+    }
     const coreVerifierAfter =
       selected.verificationMode === "released-core" && !bootstrapVerifierBridge
         ? await readFormAuthorityCoreVerifierIdentityProbe(
             {
               probeOrigin: requiredIdentityProbeOrigin(target),
-              authorityWorkerVersionId: after.history.versionId,
+              authorityWorkerVersionId: verifierAuthorityVersionId,
               artifactDigest: takoformCoreVerifierArtifactDigest(),
             },
             options.fetcher ?? fetch,
@@ -1229,6 +1320,14 @@ export function writeFormAuthorityConfig(input: {
     input.selected.kind === "authority" && input.selected.verificationMode === "released-core"
       ? input.target.formAuthority?.managedSpaceAdmissionPolicy
       : undefined;
+  if (input.selected.kind === "existing-space-operator") {
+    writeFileSync(
+      input.path,
+      `${JSON.stringify(existingSpaceOperatorConfiguration(input, shared), null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    return input.path;
+  }
   const configuration =
     input.selected.kind === "operator-gateway"
       ? operatorGatewayConfiguration(input, shared)
@@ -1381,6 +1480,67 @@ function operatorGatewayConfiguration(
   };
 }
 
+function existingSpaceOperatorConfiguration(
+  input: Parameters<typeof writeFormAuthorityConfig>[0],
+  shared: Readonly<Record<string, unknown>>,
+) {
+  const { selected, target, invocation } = input;
+  const policy = target.formAuthority?.managedSpaceAdmissionPolicy;
+  if (
+    !selected.operatorOrigin ||
+    !selected.operatorPublicJwk ||
+    !selected.authorityWorkerName ||
+    !policy
+  ) {
+    throw preflightError(
+      "existing Space operator target requires explicit ingress, key and managed Space policy",
+    );
+  }
+  return {
+    ...shared,
+    vars: {
+      TAKOSERVER_ENVIRONMENT: invocation.environment,
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: selected.hostId,
+      TAKOSERVER_EXISTING_SPACE_OPERATOR_ORIGIN: selected.operatorOrigin,
+      TAKOSERVER_EXISTING_SPACE_OPERATOR_PUBLIC_JWK: canonicalJson(selected.operatorPublicJwk),
+      TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: canonicalJson(policy),
+    },
+    routes: [{ pattern: new URL(selected.operatorOrigin).hostname, custom_domain: true }],
+    services: [
+      {
+        binding: "PUBLIC_HOST_IDENTITY",
+        service: target.workerName,
+        entrypoint: "PublicHostIdentityEntrypoint",
+      },
+      {
+        binding: "FORM_AUTHORITY",
+        service: selected.authorityWorkerName,
+        entrypoint: "FormAuthorityEntrypoint",
+      },
+    ],
+  };
+}
+
+function assertExactBridgeDependency(
+  phase: DeployPhase,
+  dependency: FormAuthorityInspection | null,
+  commit: string,
+): asserts dependency is FormAuthorityInspection {
+  if (
+    !dependency ||
+    dependency.commit !== commit ||
+    dependency.publicWorkerBindingProfile !== "dynamic-public-rpc" ||
+    dependency.scopeBindingProfile !== "exact-target" ||
+    dependency.bindingTransitionProfile !== "none" ||
+    dependency.drift.length !== 0
+  ) {
+    throw phaseError(
+      phase,
+      "existing Space operator requires the exact released-Core authority source and policy closure",
+    );
+  }
+}
+
 async function inspectFormAuthority(
   phase: DeployPhase,
   invocation: FormAuthorityDeployInvocation,
@@ -1397,7 +1557,7 @@ async function inspectFormAuthority(
   const scriptPresent = scripts.includes(selected.workerName);
   const domains = await state.workerDomains();
   const ownedDomains = domains.filter(({ service }) => service === selected.workerName);
-  if (selected.kind === "operator-gateway") {
+  if (selected.kind !== "authority") {
     const expectedHostname = new URL(selected.operatorOrigin as string).hostname;
     const expectedDomains = domains.filter(({ hostname }) => hostname === expectedHostname);
     if (expectedDomains.length > 1) {
@@ -1590,14 +1750,17 @@ async function classifyPublicWorkerBinding(
     };
   }
 
-  const pinned = await inspectLegacyPinnedPublicWorker(
-    phase,
-    target,
-    authorityVersionId,
-    authorityVersion,
-    state,
-    transition === undefined,
-  );
+  const pinned =
+    selected.kind === "existing-space-operator"
+      ? null
+      : await inspectLegacyPinnedPublicWorker(
+          phase,
+          target,
+          authorityVersionId,
+          authorityVersion,
+          state,
+          transition === undefined,
+        );
   if (pinned !== null) {
     const legacyTarget = expectedLegacyBindings(
       invocation.environment,
@@ -1887,6 +2050,40 @@ function expectedBindings(
   scopeOverride?: FormAuthorityScope,
 ) {
   const operatorScope = scopeOverride ?? selected.operatorScope;
+  if (selected.kind === "existing-space-operator") {
+    if (
+      !selected.authorityWorkerName ||
+      !selected.operatorOrigin ||
+      !selected.operatorPublicJwk ||
+      !target.formAuthority?.managedSpaceAdmissionPolicy
+    ) {
+      throw preflightError("existing Space operator target is incomplete");
+    }
+    return {
+      PUBLIC_HOST_IDENTITY: {
+        type: "service",
+        fields: { service: target.workerName, entrypoint: "PublicHostIdentityEntrypoint" },
+      },
+      FORM_AUTHORITY: {
+        type: "service",
+        fields: { service: selected.authorityWorkerName, entrypoint: "FormAuthorityEntrypoint" },
+      },
+      TAKOSERVER_ENVIRONMENT: { type: "plain_text", fields: { text: environment } },
+      TAKOSERVER_FORM_AUTHORITY_HOST_ID: { type: "plain_text", fields: { text: selected.hostId } },
+      TAKOSERVER_EXISTING_SPACE_OPERATOR_ORIGIN: {
+        type: "plain_text",
+        fields: { text: selected.operatorOrigin },
+      },
+      TAKOSERVER_EXISTING_SPACE_OPERATOR_PUBLIC_JWK: {
+        type: "plain_text",
+        fields: { text: canonicalJson(selected.operatorPublicJwk) },
+      },
+      TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY: {
+        type: "plain_text",
+        fields: { text: canonicalJson(target.formAuthority.managedSpaceAdmissionPolicy) },
+      },
+    } as const;
+  }
   if (selected.kind === "operator-gateway") {
     if (
       !selected.authorityWorkerName ||
@@ -2233,6 +2430,27 @@ function selectTarget(
 ): SelectedFormAuthorityTarget {
   const authority = target.formAuthority;
   if (!authority) throw preflightError("selected target has no formAuthority configuration");
+  if (invocation.surface === "takoserver-existing-space-operator-worker") {
+    const operator = authority.existingSpaceOperator;
+    if (!operator || !authority.managedSpaceAdmissionPolicy || !authority.hostId) {
+      throw preflightError(
+        "selected target has no complete existing Space operator bridge and managed Space policy",
+      );
+    }
+    return {
+      kind: "existing-space-operator",
+      workerName: operator.workerName,
+      hostId: authority.hostId,
+      main: "src/entry-existing-space-operator-worker.ts",
+      operatorOrigin: operator.origin,
+      authorityWorkerName: authority.workerName,
+      operatorPublicJwk: operator.publicJwk,
+      policyAuthority: "takoserver-host",
+      verificationMode: "released-core",
+      verificationAvailable: true,
+      productionEligible: false,
+    };
+  }
   if (invocation.surface === "takoserver-integration-form-authority-operator-worker") {
     if (
       !authority.integrationWorkerName ||
@@ -2314,7 +2532,18 @@ function adoptLive(
   options: FormAuthorityDeployOptions,
 ): AdoptionReadback | null {
   if (invocation.action !== "status") return null;
-  const plan = planTargetAdoption(drift, FORM_AUTHORITY_DESCRIPTOR_BINDINGS);
+  const descriptorBindings: DescriptorBindingMap =
+    invocation.surface === "takoserver-existing-space-operator-worker"
+      ? {
+          TAKOSERVER_FORM_AUTHORITY_HOST_ID: { field: "text", pointer: "/formAuthority/hostId" },
+          TAKOSERVER_EXISTING_SPACE_OPERATOR_ORIGIN: {
+            field: "text",
+            pointer: "/formAuthority/existingSpaceOperator/origin",
+          },
+          FORM_AUTHORITY: { field: "service", pointer: "/formAuthority/workerName" },
+        }
+      : FORM_AUTHORITY_DESCRIPTOR_BINDINGS;
+  const plan = planTargetAdoption(drift, descriptorBindings);
   if (invocation.adoptLivePath === undefined) return { plan, candidate: null };
   return {
     plan,
@@ -2350,13 +2579,18 @@ function requiredOperatorScope(
 }
 
 function isIntegrationOnlySurface(surface: FormAuthoritySurface): boolean {
-  return surface !== "takoserver-form-authority-worker";
+  return (
+    surface === "takoserver-integration-form-authority-worker" ||
+    surface === "takoserver-integration-form-authority-operator-worker"
+  );
 }
 
 function routeMode(selected: SelectedFormAuthorityTarget): string {
-  return selected.kind === "operator-gateway"
-    ? "authenticated-integration-custom-domain"
-    : "service-binding-rpc-only";
+  return selected.kind === "existing-space-operator"
+    ? "authenticated-existing-space-custom-domain"
+    : selected.kind === "operator-gateway"
+      ? "authenticated-integration-custom-domain"
+      : "service-binding-rpc-only";
 }
 
 async function inspectPublicWorker(

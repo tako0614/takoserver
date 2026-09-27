@@ -20,7 +20,8 @@ package reader, but they must not import `admission-store.ts`, `admission.ts`,
 Form mutation belongs to two separately named, route-less Cloudflare Workers:
 
 - `takoserver-form-authority-worker` exposes only service-binding RPC methods
-  `plan`, `apply`, `readback`, and the read-only `verifierIdentity`. Its
+  `plan`, `apply`, `readback`, the bounded operator-only
+  `reconcileExistingSpaces`, and the read-only `verifierIdentity`. Its
   production composition binds the embedded exact publisher-set closure (see
   [Exact publisher-set import](#exact-publisher-set-import)) as the package
   set, the package source, and the evidence every request must carry verbatim.

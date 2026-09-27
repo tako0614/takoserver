@@ -8,6 +8,18 @@ const output = mkdtempSync(join(tmpdir(), "takoserver-form-authority-build-"));
 try {
   for (const [name, config, fixture, requiredBindings, forbiddenBindings] of [
     [
+      "existing-space-operator",
+      "wrangler.existing-space-operator.jsonc",
+      false,
+      [
+        "FORM_AUTHORITY",
+        "PUBLIC_HOST_IDENTITY",
+        "TAKOSERVER_EXISTING_SPACE_OPERATOR_PUBLIC_JWK",
+        "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY",
+      ],
+      ["STATE_DB", "OBJECTS"],
+    ],
+    [
       "identity-probe",
       "wrangler.form-authority-identity-probe.jsonc",
       false,
@@ -106,7 +118,10 @@ try {
     }
     if (name === "production") {
       for (const [entrypointName, expectedMethods] of [
-        ["FormAuthorityEntrypoint", ["verifierIdentity", "plan", "apply", "readback"]],
+        [
+          "FormAuthorityEntrypoint",
+          ["verifierIdentity", "plan", "apply", "readback", "reconcileExistingSpaces"],
+        ],
         [managedEntrypoint, ["ensureTenantSpaceAdmission"]],
       ] as const) {
         const start = source.indexOf(`${entrypointName} = class extends WorkerEntrypoint`);

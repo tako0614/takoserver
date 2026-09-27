@@ -3,6 +3,7 @@ import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
+import { runExistingSpaceOperator } from "./deploy/existing-space-operator.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
 import { runFormAuthorityIdentityProbe } from "./deploy/form-authority-identity-probe.ts";
 import { runFormAuthorityInvoke } from "./deploy/form-authority-invoke.ts";
@@ -1056,6 +1057,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         target,
       );
     case "takoserver-form-authority-worker":
+    case "takoserver-existing-space-operator-worker":
     case "takoserver-integration-form-authority-worker":
     case "takoserver-integration-form-authority-operator-worker":
       return await runFormAuthority(
@@ -1103,6 +1105,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           environment: invocation.environment,
           commit: invocation.commit,
           ...(scopeTransition === undefined ? {} : { scopeTransition }),
+        },
+        target,
+      );
+    case "takoserver-existing-space-reconciliation":
+      return await runExistingSpaceOperator(
+        {
+          surface: invocation.surface,
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
         },
         target,
       );

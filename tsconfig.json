@@ -16,6 +16,8 @@
   },
   "include": ["src/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
   "exclude": [
+    "src/entry-existing-space-operator-worker.ts",
+    "existing-space-operator-worker-configuration.d.ts",
     "src/entry-worker.ts",
     "src/entry-cloudflare-worker.ts",
     "src/entry-sponsorship-authority-worker.ts",
