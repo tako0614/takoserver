@@ -1421,8 +1421,12 @@ separate immutable claim for one exact target deployment incarnation and its
 WfP Actor KV namespace. Its state allows `claimed → upload_authorized →
 committed`, plus `claimed → revoked` before upload authority is consumed. An
 authorized claim with an unknown upload outcome cannot be revoked or reused;
-the provider etag is present only on the committed readback. This does not add
-a public Host state API or alter the existing Actor owner-claim table.
+the provider etag is present only on the committed readback. An insert collision
+on either the target-incarnation key or account/dispatch/script identity is
+ignored before SQLite conflict handling, so `INSERT OR REPLACE` cannot reset a
+claim; the private adapter still requires exact readback to recognize a retry.
+This does not add a public Host state API or alter the existing Actor
+owner-claim table.
 
 This source-only addition has no 0065→0066 live migration gate or apply
 authorization. A future protected application needs a separately reviewed

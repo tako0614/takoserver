@@ -264,7 +264,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0065_worker_runtime_input_lease_generation.sql":
     "sha256:b3b5a9f7533eccbac1a7e31008ae5737e5e68b2d532685fea2eb553cab86e94c",
   "0066_cloudflare_managed_actor_kv_capability_claims.sql":
-    "sha256:d6f13070a6dc535b88f6d2977422eb6dfc01207ca2161381a541626c7c0955d0",
+    "sha256:14d9f1ba2d44c2628192d0b07d7f02e0ab9e3b1f1268c0517248dedfb47848e4",
 };
 const OPERATION_GENERATION_AUDITED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(0, 60);
 const OPERATION_GENERATION_AUDITED_MIGRATION_SHA256 = Object.fromEntries(

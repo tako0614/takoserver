@@ -29,7 +29,33 @@ CREATE TABLE cloudflare_managed_actor_kv_capability_claims (
   ),
   PRIMARY KEY (provider_id, target_resource_uid, target_generation, target_deployment_id),
   UNIQUE (account_id, dispatch_namespace, script_name)
-);
+) WITHOUT ROWID;
+
+-- SQLite REPLACE may delete a conflicted row without firing its DELETE
+-- trigger when recursive_triggers is off. Refuse every reuse of either
+-- identity before conflict resolution runs. IGNORE is deliberate: the private
+-- claim adapter depends on changes=0 followed by an exact read to distinguish
+-- idempotent recovery from a conflicting incarnation, and it also turns an
+-- OR REPLACE attempt into a no-op without resetting the durable claim.
+CREATE TRIGGER cloudflare_managed_actor_kv_capability_claims_no_replace
+BEFORE INSERT ON cloudflare_managed_actor_kv_capability_claims
+WHEN EXISTS (
+  SELECT 1
+  FROM cloudflare_managed_actor_kv_capability_claims AS existing
+  WHERE (
+    existing.provider_id = NEW.provider_id AND
+    existing.target_resource_uid = NEW.target_resource_uid AND
+    existing.target_generation = NEW.target_generation AND
+    existing.target_deployment_id = NEW.target_deployment_id
+  ) OR (
+    existing.account_id = NEW.account_id AND
+    existing.dispatch_namespace = NEW.dispatch_namespace AND
+    existing.script_name = NEW.script_name
+  )
+)
+BEGIN
+  SELECT RAISE(IGNORE);
+END;
 
 CREATE TRIGGER cloudflare_managed_actor_kv_capability_claims_once
 BEFORE UPDATE ON cloudflare_managed_actor_kv_capability_claims
