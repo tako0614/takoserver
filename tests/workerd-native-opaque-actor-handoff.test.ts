@@ -23,7 +23,9 @@ const OWNER = `export class ActorOwner {
     this.ctx.facets.abort("actor", "retired-before-socket-head");
     const pair = new WebSocketPair();
     this.ctx.acceptWebSocket(pair[1]);
-    return new Response(null, {status:101, webSocket:pair[0]});
+    return new Response(null, {status:101, webSocket:pair[0],
+      headers:new URL(request.url).pathname === "/bad-protocol" ?
+        {"sec-websocket-protocol":"unoffered"} : undefined});
   }
   webSocketMessage(socket, data) { socket.send("owner:" + data); }
 }
@@ -98,9 +100,9 @@ export default {async fetch(request, env) {
   }, new URL(request.url).pathname === "/late" ? 30 : 30000);
   let result;
   try { result = await application.fetch(request, Object.freeze({ACTOR:handoff.actor})); }
-  catch {
+  catch (error) {
     await handoff.abandon();
-    return new NativeResponse(null, {status:500});
+    return new NativeResponse(null, {status:error?.message === "invalid_upgrade" ? 409 : 500});
   }
   return handoff.finish(result);
 }};`;
@@ -238,6 +240,13 @@ test.skipIf(binary === undefined)(
         200,
       );
       expect((await fetch(`${origin}/replay`)).status).toBe(503);
+      expect(
+        (
+          await fetch(`${origin}/bad-protocol`, {
+            headers: { upgrade: "websocket", "sec-websocket-protocol": "offered" },
+          })
+        ).status,
+      ).toBe(409);
       expect((await fetch(`${origin}/late`, { headers: { upgrade: "websocket" } })).status).toBe(
         503,
       );

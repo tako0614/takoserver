@@ -5,6 +5,7 @@
  */
 const NativeResponse = Response;
 const NativeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
+const NativeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
 const NativeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
 const NativeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
 const NativeRequestSignal = Object.getOwnPropertyDescriptor(Request.prototype, "signal")?.get;
@@ -25,6 +26,8 @@ const NativeSetDelete = Set.prototype.delete;
 const NativeSetValues = Set.prototype.values;
 const NativeSetClear = Set.prototype.clear;
 const NativeStringLower = String.prototype.toLowerCase;
+const NativeStringSplit = String.prototype.split;
+const NativeStringTrim = String.prototype.trim;
 const NativeNumberIsSafeInteger = Number.isSafeInteger;
 const NativeSetTimeout = setTimeout;
 const NativeClearTimeout = clearTimeout;
@@ -81,6 +84,7 @@ export function createActorUpgradeHandoff(
 } {
   if (
     !NativeResponseStatus ||
+    !NativeResponseHeaders ||
     !NativeRequestMethod ||
     !NativeRequestHeaders ||
     !NativeRequestSignal ||
@@ -142,10 +146,39 @@ export function createActorUpgradeHandoff(
       )
         throw new Error("invalid_upgrade");
       const reservation = await transport.open(request, ingress);
-      const status = NativeReflectApply(NativeResponseStatus, reservation.response, []);
+      let status: number;
+      let selected: string | null;
+      try {
+        status = NativeReflectApply(NativeResponseStatus, reservation.response, []) as number;
+        const responseHeaders = NativeReflectApply(
+          NativeResponseHeaders,
+          reservation.response,
+          [],
+        ) as Headers;
+        selected = NativeReflectApply(NativeHeadersGet, responseHeaders, [
+          "sec-websocket-protocol",
+        ]) as string | null;
+      } catch {
+        await reservation.abandon();
+        throw new Error("backend_unavailable");
+      }
       if (status !== 101) {
         await reservation.abandon();
         throw new Error("backend_unavailable");
+      }
+      if (selected !== null) {
+        const offered =
+          ingress.protocols === null
+            ? []
+            : (NativeReflectApply(NativeStringSplit, ingress.protocols, [","]) as string[]);
+        let matched = false;
+        for (let i = 0; i < offered.length; i += 1) {
+          if (NativeReflectApply(NativeStringTrim, offered[i], []) === selected) matched = true;
+        }
+        if (!matched) {
+          await reservation.abandon();
+          throw new Error("invalid_upgrade");
+        }
       }
       if (closed || aborted()) {
         await reservation.abandon();
