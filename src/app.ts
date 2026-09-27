@@ -66,7 +66,7 @@ import type {
   TakoformStandardServiceResolver,
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
-import { tenantRunPrincipalId } from "./tenant-run-credential.ts";
+import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 import {
   createTokenService,
   type SigningKey,
