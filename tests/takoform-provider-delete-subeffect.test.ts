@@ -11,7 +11,6 @@ import {
   type TakoformDeleteSubeffectInput,
 } from "../src/takoform/provider-delete-subeffect.ts";
 
-const NOW = 1_790_500_000_000;
 const OPERATION = "op_actor_delete_1";
 const TENANT = "tenant-actor-delete";
 const UID = "uid_actor_namespace_1";
@@ -48,9 +47,11 @@ function ticket(
 
 async function seedAcceptedDelete(
   sql: Sql,
-  leaseUntil = NOW + 60_000,
-  createdAt = NOW,
-): Promise<void> {
+  createdAt = Date.now(),
+  leaseUntil = createdAt + 60_000,
+): Promise<number> {
+  // Authority also checks the real database clock. Sample per fixture, after
+  // migration/setup, rather than using a fixed date or the file's import time.
   await sql.run(
     `INSERT INTO tf_resource_deletion_attestations
        (tenant_id, resource_uid, space, api_version, kind, name, form_ref_json,
@@ -123,17 +124,18 @@ async function seedAcceptedDelete(
          (tenant_id, resource_uid, event_id, effect_id, effect_kind, phase,
           operation_mode, created_at)
        VALUES (?, ?, ?, ?, 'delete', ?, 'initial', ?)`,
-      [TENANT, UID, `${OPERATION}:${phase}`, OPERATION, phase, NOW],
+      [TENANT, UID, `${OPERATION}:${phase}`, OPERATION, phase, createdAt],
     );
   }
+  return createdAt;
 }
 
-async function rotateLease(sql: Sql): Promise<void> {
+async function rotateLease(sql: Sql, now: number): Promise<void> {
   await sql.run(
     `UPDATE tf_provider_mutation_sagas_selection_v1
      SET execution_lease_token = 'lease-recovery', execution_lease_until = ?, updated_at = ?
      WHERE operation_id = ?`,
-    [NOW + 120_000, NOW + 1, OPERATION],
+    [now + 120_000, now + 1, OPERATION],
   );
 }
 
@@ -151,8 +153,8 @@ test("Host subeffect CAS grants exactly one native writer and recovery terminali
   try {
     migrateSqlite(database);
     const sql = createSqliteSql(database);
-    await seedAcceptedDelete(sql);
-    const store = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    const now = await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
     const tombstone = ticket("actor-tombstone");
     expect(await store.readExact(tombstone)).toBe("absent");
     const outcomes = await Promise.all([store.issue(tombstone), store.issue(tombstone)]);
@@ -166,7 +168,7 @@ test("Host subeffect CAS grants exactly one native writer and recovery terminali
       }),
     ).toBe("conflict");
 
-    await rotateLease(sql);
+    await rotateLease(sql, now);
     expect(await store.readExact(tombstone)).toBe("conflict");
     expect(await store.issue(tombstone)).toBe("conflict");
     expect(await store.concludeExact(tombstone)).toBe("conflict");
@@ -213,6 +215,25 @@ test("Host subeffect CAS grants exactly one native writer and recovery terminali
   }
 });
 
+test("an expired database lease is refused even when the injected clock is still valid", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    const sql = createSqliteSql(database);
+    const start = Date.now() - 120_000;
+    await seedAcceptedDelete(sql, start, start + 60_000);
+    const store = createTakoformDeleteSubeffectStore(sql, () => start + 2);
+    const tombstone = ticket("actor-tombstone");
+    expect(await store.readExact(tombstone)).toBe("conflict");
+    expect(await store.issue(tombstone)).toBe("conflict");
+    expect(await store.concludeExact(tombstone)).toBe("conflict");
+    expect(await rows(sql)).toEqual([]);
+    expect(await sql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
 test("a batch queued past lease expiry cannot grant a native write", async () => {
   const database = new Database(":memory:");
   try {
@@ -220,7 +241,7 @@ test("a batch queued past lease expiry cannot grant a native write", async () =>
     const sql = createSqliteSql(database);
     const start = Date.now();
     const leaseUntil = start + 500;
-    await seedAcceptedDelete(sql, leaseUntil, start);
+    await seedAcceptedDelete(sql, start, leaseUntil);
     let authorityObserved = false;
     const delayedSql: Sql = {
       ...sql,
@@ -251,8 +272,8 @@ test("recovery rejects an issued effect whose attestation mirror is missing", as
   try {
     migrateSqlite(database);
     const sql = createSqliteSql(database);
-    await seedAcceptedDelete(sql);
-    const store = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    const now = await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
     const tombstone = ticket("actor-tombstone");
     expect(await store.issue(tombstone)).toBe("claimed");
     await sql.run(
@@ -261,7 +282,7 @@ test("recovery rejects an issued effect whose attestation mirror is missing", as
        WHERE tenant_id = ? AND resource_uid = ?`,
       [TENANT, UID],
     );
-    await rotateLease(sql);
+    await rotateLease(sql, now);
     const recovery = ticket("actor-tombstone", "recovery", "lease-recovery");
     expect(await store.readExact(recovery)).toBe("conflict");
     expect(await store.concludeExact(recovery)).toBe("conflict");
@@ -275,9 +296,9 @@ test("conclusion cannot terminalize when the mirror changes after its read", asy
   try {
     migrateSqlite(database);
     const sql = createSqliteSql(database);
-    await seedAcceptedDelete(sql);
+    const now = await seedAcceptedDelete(sql);
     const tombstone = ticket("actor-tombstone");
-    expect(await createTakoformDeleteSubeffectStore(sql, () => NOW + 2).issue(tombstone)).toBe(
+    expect(await createTakoformDeleteSubeffectStore(sql, () => now + 2).issue(tombstone)).toBe(
       "claimed",
     );
     const raceSql: Sql = {
@@ -292,7 +313,7 @@ test("conclusion cannot terminalize when the mirror changes after its read", asy
         return await sql.batch(statements);
       },
     };
-    const store = createTakoformDeleteSubeffectStore(raceSql, () => NOW + 2);
+    const store = createTakoformDeleteSubeffectStore(raceSql, () => now + 2);
     expect(await store.concludeExact(tombstone)).toBe("conflict");
     expect(await rows(sql)).toHaveLength(2);
   } finally {
@@ -305,9 +326,9 @@ test("conclusion does not repair an unmirrored terminal row inserted after its r
   try {
     migrateSqlite(database);
     const sql = createSqliteSql(database);
-    await seedAcceptedDelete(sql);
+    const now = await seedAcceptedDelete(sql);
     const tombstone = ticket("actor-tombstone");
-    expect(await createTakoformDeleteSubeffectStore(sql, () => NOW + 2).issue(tombstone)).toBe(
+    expect(await createTakoformDeleteSubeffectStore(sql, () => now + 2).issue(tombstone)).toBe(
       "claimed",
     );
     const raceSql: Sql = {
@@ -323,12 +344,12 @@ test("conclusion does not repair an unmirrored terminal row inserted after its r
                   provider_installation_ref, native_id, target_json, ?
            FROM tf_resource_provider_effects
            WHERE tenant_id = ? AND resource_uid = ? AND event_id = ?`,
-          [NOW + 2, TENANT, UID, `${OPERATION}:actor-tombstone:dispatched`],
+          [now + 2, TENANT, UID, `${OPERATION}:actor-tombstone:dispatched`],
         );
         return await sql.batch(statements);
       },
     };
-    const store = createTakoformDeleteSubeffectStore(raceSql, () => NOW + 2);
+    const store = createTakoformDeleteSubeffectStore(raceSql, () => now + 2);
     expect(await store.concludeExact(tombstone)).toBe("conflict");
     const snapshot = await sql.query(
       `SELECT effects_json FROM tf_resource_deletion_attestations
@@ -347,8 +368,8 @@ test("exact reads reject changed issued and missing terminal mirrors", async () 
   try {
     migrateSqlite(database);
     const sql = createSqliteSql(database);
-    await seedAcceptedDelete(sql);
-    const store = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    const now = await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
     const tombstone = ticket("actor-tombstone");
     expect(await store.issue(tombstone)).toBe("claimed");
     const original = await sql.query(
@@ -412,7 +433,7 @@ test("real D1 rolls back row and JSON mirror together and never reissues after a
         await database.prepare(statement).run();
     }
     const sql = createD1Sql(database);
-    await seedAcceptedDelete(sql);
+    const now = await seedAcceptedDelete(sql);
     const tombstone = ticket("actor-tombstone");
     const faultSql: Sql = {
       ...sql,
@@ -426,7 +447,7 @@ test("real D1 rolls back row and JSON mirror together and never reissues after a
         ]);
       },
     };
-    const faultStore = createTakoformDeleteSubeffectStore(faultSql, () => NOW + 2);
+    const faultStore = createTakoformDeleteSubeffectStore(faultSql, () => now + 2);
     expect(await faultStore.issue(tombstone)).toBe("conflict");
     expect(await rows(sql)).toEqual([]);
     const before = await sql.query(
@@ -449,7 +470,7 @@ test("real D1 rolls back row and JSON mirror together and never reissues after a
         return result;
       },
     };
-    const lostAckStore = createTakoformDeleteSubeffectStore(lostAckSql, () => NOW + 2);
+    const lostAckStore = createTakoformDeleteSubeffectStore(lostAckSql, () => now + 2);
     expect(await lostAckStore.issue(tombstone)).toBe("conflict");
     expect(await rows(sql)).toHaveLength(2);
     const after = await sql.query(
@@ -459,8 +480,8 @@ test("real D1 rolls back row and JSON mirror together and never reissues after a
     );
     expect(after[0]?.closure_fence).toBe(5);
     expect(JSON.parse(String(after[0]?.effects_json))).toHaveLength(4);
-    await rotateLease(sql);
-    const recoveryStore = createTakoformDeleteSubeffectStore(sql, () => NOW + 2);
+    await rotateLease(sql, now);
+    const recoveryStore = createTakoformDeleteSubeffectStore(sql, () => now + 2);
     const recovery = ticket("actor-tombstone", "recovery", "lease-recovery");
     expect(await recoveryStore.readExact(recovery)).toBe("issued");
     expect(await recoveryStore.issue(recovery)).toBe("already-issued");
