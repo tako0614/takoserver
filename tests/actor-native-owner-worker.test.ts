@@ -176,6 +176,78 @@ test("dynamic owner graph rejects a rollout between selection and child dispatch
   expect(childCalls).toBe(1);
 });
 
+test("structural WfP owner omits admission and control bearers only in dynamic mode", async () => {
+  const graph = { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["selected"] };
+  expect(() => createActorNativeOwner("a".repeat(64), undefined, graph)).toThrow();
+  const controlRequests: Request[] = [];
+  const controlService = {
+    async fetch(request: Request): Promise<Response> {
+      controlRequests.push(request);
+      expect(request.headers.has("x-takoserver-private-actor-token")).toBe(false);
+      if (request.headers.has("x-takoserver-private-alarm-action"))
+        return Response.json({ at: null });
+      return new Response(null, { status: 204 });
+    },
+  };
+  expect(await createActorNativeAlarmPort(controlService, undefined, "id").get()).toBeNull();
+  await createActorNativeSocketPort(controlService, undefined, "id", crypto.randomUUID()).send(
+    "socket-1",
+    "message",
+  );
+  expect(controlRequests).toHaveLength(2);
+
+  const actorId = "structural-id";
+  const socket = {
+    deserializeAttachment: () => ({ socketId: "socket-1", actorId, attachment: null }),
+    serializeAttachment() {},
+    send() {},
+    close() {},
+  } as unknown as Parameters<
+    InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
+  >[0];
+  const selectedClass = {};
+  const Owner = createActorNativeOwner(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    async () => selectedClass,
+    async () => graph,
+  );
+  const owner = new Owner(
+    {
+      facets: {
+        get(_name, create) {
+          expect(create().class).toBe(selectedClass);
+          return { fetch: async () => new Response(null, { status: 204 }) };
+        },
+        abort() {},
+      },
+      getWebSockets: () => [socket],
+      waitUntil() {},
+    },
+    {
+      CLASS: {},
+      ADMISSION: {
+        async fetch(request) {
+          expect(request.headers.has("x-takoserver-private-alarm-admission")).toBe(false);
+          const body = (await request.json()) as Record<string, unknown>;
+          if (body.action === "socket-complete") return new Response(null, { status: 204 });
+          return Response.json({
+            id: actorId,
+            attemptNonce: body.attemptNonce,
+            generationKey: graph.generationKey,
+            epoch: graph.epoch,
+            variantKey: "selected",
+            leaseId: "lease",
+          });
+        },
+      },
+    },
+  );
+  await owner.webSocketMessage(socket, "event");
+});
+
 test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {
   let calls = 0;
   const f = fixture(async () => {

@@ -297,18 +297,20 @@ function alarmTime(value: unknown): value is number {
 /** Private owner transport; the actor cannot choose another namespace or ID. */
 export function createActorNativeAlarmPort(
   service: { fetch(request: Request): Promise<Response> },
-  secret: string,
+  /** Undefined only for a route-less, Host-owned structural control binding. */
+  secret: string | undefined,
   id: string,
 ) {
   const fetch = service.fetch;
   const encodedId = SafeEncodeURIComponent(id);
-  const bearer = actorAlarmBearer(secret)(encodedId);
+  const bearer = secret === undefined ? undefined : actorAlarmBearer(secret)(encodedId);
   const call = async (action: "set" | "get" | "clear", at?: number): Promise<number | null> => {
     const headers = new SafeHeaders({
-      [TOKEN_HEADER]: await bearer,
       [ID_HEADER]: encodedId,
       [ALARM_ACTION_HEADER]: action,
     });
+    if (bearer !== undefined)
+      SafeReflectApply(SafeHeadersSet, headers, [TOKEN_HEADER, await bearer]);
     if (at !== undefined)
       SafeReflectApply(SafeHeadersSet, headers, [ALARM_AT_HEADER, SafeString(at)]);
     const response = await SafeReflectApply(fetch, service, [
@@ -339,13 +341,14 @@ export function createActorNativeAlarmPort(
 /** Invocation-bound private socket RPC; never hand this object to application code. */
 export function createActorNativeSocketPort(
   service: { fetch(request: Request): Promise<Response> },
-  secret: string,
+  /** Undefined only for a route-less, Host-owned structural control binding. */
+  secret: string | undefined,
   id: string,
   nonce: string,
 ) {
   const fetch = service.fetch;
   const encodedId = SafeEncodeURIComponent(id);
-  const bearer = actorAlarmBearer(secret)(encodedId);
+  const bearer = secret === undefined ? undefined : actorAlarmBearer(secret)(encodedId);
   const call = async (
     action: "accept" | "get" | "list" | "send" | "close" | "set-attachment" | "get-attachment",
     socketId?: string,
@@ -353,11 +356,12 @@ export function createActorNativeSocketPort(
     kind?: "text" | "binary" | "null",
   ): Promise<Response> => {
     const headers = new SafeHeaders({
-      [TOKEN_HEADER]: await bearer,
       [ID_HEADER]: encodedId,
       [SOCKET_ACTION_HEADER]: action,
       [SOCKET_NONCE_HEADER]: nonce,
     });
+    if (bearer !== undefined)
+      SafeReflectApply(SafeHeadersSet, headers, [TOKEN_HEADER, await bearer]);
     if (socketId) SafeReflectApply(SafeHeadersSet, headers, [SOCKET_ID_HEADER, socketId]);
     if (kind) SafeReflectApply(SafeHeadersSet, headers, [SOCKET_KIND_HEADER, kind]);
     const response = await SafeReflectApply(fetch, service, [
@@ -461,7 +465,7 @@ function withHeaders(request: Request, headers: Headers, signal = request.signal
  */
 export function createActorNativeOwner(
   deliveryToken: string | undefined,
-  admissionToken: string,
+  admissionToken: string | undefined,
   graph: ActorOwnerGraph | undefined,
   // Host-private timing seam for focused qualification; public admission does
   // not accept or forward deadline values.
@@ -474,7 +478,7 @@ export function createActorNativeOwner(
 ) {
   if (
     (deliveryToken !== undefined && !/^[a-f0-9]{64}$/u.test(deliveryToken)) ||
-    !/^[a-f0-9]{64}$/u.test(admissionToken)
+    (admissionToken !== undefined && !/^[a-f0-9]{64}$/u.test(admissionToken))
   )
     throw new Error("Actor delivery capability unavailable");
   // Undefined is only for a route-less, structurally Host-owned facet loader:
@@ -483,9 +487,16 @@ export function createActorNativeOwner(
   if (
     (graph !== undefined && !validActorOwnerGraph(graph)) ||
     (graph === undefined && (!readCurrentGraph || !loadVariantClass)) ||
-    (graph !== undefined && readCurrentGraph !== undefined)
+    (graph !== undefined && readCurrentGraph !== undefined) ||
+    (admissionToken === undefined && graph !== undefined)
   )
     throw new Error("Actor alarm graph bindings unavailable");
+  // Dynamic WfP owner only: a route-less Host-owned ADMISSION binding supplies
+  // authority, while self-host retains its mandatory static bearer.
+  const admissionHeaders = (): Headers =>
+    admissionToken === undefined
+      ? new SafeHeaders()
+      : new SafeHeaders({ "x-takoserver-private-alarm-admission": admissionToken });
   if (
     !SafeIsSafeInteger(deadlines.handlerMs) ||
     deadlines.handlerMs <= 0 ||
@@ -1084,9 +1095,7 @@ export function createActorNativeOwner(
               const admit = await (SafeReflectApply(admission.fetch, admission, [
                 new SafeRequest("http://actor.invalid/", {
                   method: "POST",
-                  headers: new SafeHeaders({
-                    "x-takoserver-private-alarm-admission": admissionToken,
-                  }),
+                  headers: admissionHeaders(),
                   body: SafeReflectApply(SafeJsonStringify, JSON, [
                     { id: claimed, attemptNonce, deadlineAt: grantDeadlineAt },
                   ]),
@@ -1220,9 +1229,7 @@ export function createActorNativeOwner(
               SafeReflectApply(admission.fetch, admission, [
                 new SafeRequest("http://actor.invalid/", {
                   method: "POST",
-                  headers: new SafeHeaders({
-                    "x-takoserver-private-alarm-admission": admissionToken,
-                  }),
+                  headers: admissionHeaders(),
                   body: SafeReflectApply(SafeJsonStringify, JSON, [
                     { action: "complete", attemptNonce, deadlineAt: grantDeadlineAt },
                   ]),
@@ -1273,9 +1280,7 @@ export function createActorNativeOwner(
         const response = (await SafeReflectApply(admission.fetch, admission, [
           new SafeRequest("http://actor.invalid/", {
             method: "POST",
-            headers: new SafeHeaders({
-              "x-takoserver-private-alarm-admission": admissionToken,
-            }),
+            headers: admissionHeaders(),
             body: SafeJsonStringify({ action: "socket", id: actorId, attemptNonce, deadlineAt }),
             signal: controller.signal,
           }),
@@ -1323,9 +1328,7 @@ export function createActorNativeOwner(
           const response = (await SafeReflectApply(admission.fetch, admission, [
             new SafeRequest("http://actor.invalid/", {
               method: "POST",
-              headers: new SafeHeaders({
-                "x-takoserver-private-alarm-admission": admissionToken,
-              }),
+              headers: admissionHeaders(),
               body: SafeJsonStringify({ action: "socket-complete", attemptNonce, deadlineAt }),
               signal: controller.signal,
             }),

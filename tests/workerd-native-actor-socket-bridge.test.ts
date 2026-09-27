@@ -108,7 +108,7 @@ const config :Workerd.Config = (
     (name = "application.mjs", esModule = embed "application.mjs", role = application)],
    modulePolicy = (applicationMain = "application.mjs"),
    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"],
-   globalOutbound = "deny", bindings = [(name = "__TAKOSERVER_ACTOR_UPGRADE", service = "actor"), (name = "__TAKOSERVER_ACTOR_HTTP", service = "actor-http")]
+   globalOutbound = "deny", bindings = [(name = "__TAKOSERVER_ACTOR_UPGRADE", service = "actor"), (name = "__TAKOSERVER_ACTOR_HTTP", service = "actor-http"), (name = "APP_VALUE", text = "visible"), (name = "__TAKOSERVER_INTERNAL_SECRET", text = "not-for-tenant")]
   )),
   (name = "actor", external = (address = ${JSON.stringify(`unix:${actorSocketPath}`)}, http = (style = proxy))),
   (name = "actor-http", external = (address = ${JSON.stringify(`unix:${actorHttpPath}`)}, http = ())),
@@ -220,7 +220,10 @@ test.skipIf(binary === undefined)(
         selfhostWorkerEntrypointSource({
           originalMainModule: "application.mjs",
           declaredHandlers: ["fetch"],
-          bindings: [{ name: "ROOM", type: "json" }],
+          bindings: [
+            { name: "ROOM", type: "json" },
+            { name: "APP_VALUE", type: "plain_text" },
+          ],
           publication: "forward-native",
           probeHostname: "actor.invalid",
         }),
@@ -229,6 +232,16 @@ test.skipIf(binary === undefined)(
         join(publicRoot, "application.mjs"),
         `export default {async fetch(request, env) {
   if (new URL(request.url).pathname === "/health") return new Response("ok");
+  if (new URL(request.url).pathname === "/env") return Response.json({
+    own:Reflect.ownKeys(env).sort(),
+    nullPrototype:Object.getPrototypeOf(env) === null,
+    appValue:env.APP_VALUE,
+    brokerIn:"__TAKOSERVER_ACTOR_HTTP" in env,
+    brokerValue:env.__TAKOSERVER_ACTOR_HTTP === undefined,
+    upgradeIn:"__TAKOSERVER_ACTOR_UPGRADE" in env,
+    secretIn:"__TAKOSERVER_INTERNAL_SECRET" in env,
+    inherited:Object.getPrototypeOf(env)?.__TAKOSERVER_INTERNAL_SECRET ?? null,
+  });
   if (new URL(request.url).searchParams.get("ticket") !== "authorized")
     return new Response("denied", {status:403});
   const room = env.ROOM.get(env.ROOM.idFromName("room"));
@@ -285,6 +298,16 @@ test.skipIf(binary === undefined)(
         await Bun.sleep(25);
       }
       expect(ready).toBe(true);
+      expect(await (await fetch(`${origin}/env`)).json()).toEqual({
+        own: ["APP_VALUE", "ROOM"],
+        nullPrototype: true,
+        appValue: "visible",
+        brokerIn: false,
+        brokerValue: true,
+        upgradeIn: false,
+        secretIn: false,
+        inherited: null,
+      });
       expect((await fetch(`${origin}/socket`)).status).toBe(403);
       const messages: string[] = [];
       const ws = new WebSocket(
