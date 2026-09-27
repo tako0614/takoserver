@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import {
 } from "../src/providers/selfhost-worker-prelude.ts";
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
+import { openSelfhostActorUpgradeBroker } from "../src/selfhost-actor-upgrade-broker.ts";
 import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
 
 // An explicit local candidate, never the accepted serving pin or release gate.
@@ -119,6 +120,7 @@ test.skipIf(binary === undefined)(
     const root = await mkdtemp(join(tmpdir(), "actor-native-socket-bridge-"));
     const publicRoot = join(root, "public");
     let namespace: Awaited<ReturnType<typeof openWorkerdActorNamespace>> | undefined;
+    let broker: Awaited<ReturnType<typeof openSelfhostActorUpgradeBroker>> | undefined;
     let publicProcess: ReturnType<typeof Bun.spawn> | undefined;
     try {
       await mkdir(publicRoot, { mode: 0o700 });
@@ -151,7 +153,30 @@ test.skipIf(binary === undefined)(
       });
       epoch = namespace.epoch;
       namespace.enableAlarmAdmission();
-      const target = namespace.duplexTarget("actor-id", "variant-one");
+      const activeNamespace = namespace;
+      const brokerToken = randomBytes(32).toString("hex");
+      let admittedFetches = 0;
+      broker = await openSelfhostActorUpgradeBroker({
+        socketPath: join(root, "broker.sock"),
+        token: brokerToken,
+        reserve: async (actorId) => {
+          admittedFetches += 1;
+          return {
+            target: activeNamespace.duplexTarget(actorId, "variant-one"),
+            async commit() {},
+            abandon() {},
+          };
+        },
+      });
+      expect(
+        (
+          await fetch("http://actor.invalid/socket", {
+            unix: broker.socketPath,
+            redirect: "manual",
+          })
+        ).status,
+      ).toBe(404);
+      expect(admittedFetches).toBe(0);
       await writeFile(join(publicRoot, "handoff.mjs"), renderActorUpgradeHandoffModuleSource());
       await writeFile(
         join(publicRoot, "application.mjs"),
@@ -167,18 +192,30 @@ test.skipIf(binary === undefined)(
         `import { createActorUpgradeHandoff } from "./handoff.mjs";
 import application from "./application.mjs";
 const NativeResponse = Response;
-const targetHeaders = ${JSON.stringify(target.headers)};
+const brokerToken = ${JSON.stringify(brokerToken)};
 export default {async fetch(request, env) {
   const handoff = createActorUpgradeHandoff(request, {
     async open(actorRequest, ingress) {
       if (ingress.method !== "GET" || ingress.version !== "13" || !ingress.key)
         throw new Error("invalid_client_handshake");
       const headers = new Headers(actorRequest.headers);
-      for (const [name, value] of Object.entries(targetHeaders)) headers.set(name, value);
+      headers.set("x-takoserver-private-broker-token", brokerToken);
+      headers.set("x-takoserver-private-broker-actor-id", "actor-id");
       const native = await env.ACTOR.fetch(new Request(actorRequest, {headers}));
       if (native.status !== 101 || !native.webSocket) throw new Error("actor_upgrade_unavailable");
-      return {response:native, commit() {}, abandon() {
-        try { native.webSocket.accept(); native.webSocket.close(1001, "abandoned"); } catch {}
+      const reservationId = native.headers.get("x-takoserver-private-broker-reservation");
+      if (!reservationId) throw new Error("broker_reservation_missing");
+      const control = async (action, expected = 204) => {
+        const result = await env.ACTOR.fetch(new Request("http://actor.invalid/__broker/" + action + "/" + reservationId, {
+          method:"POST", headers:{"x-takoserver-private-broker-token":brokerToken}
+        }));
+        if (result.status !== expected) throw new Error("broker_" + action + "_failed");
+      };
+      return {response:native, async commit() {
+        await control("commit");
+        await control("commit", 404);
+      }, abandon() {
+        return control("abandon");
       }};
     }
   });
@@ -190,7 +227,7 @@ export default {async fetch(request, env) {
       const port = reserved.port;
       reserved.stop(true);
       if (!port) throw new Error("ephemeral port unavailable");
-      await writeFile(join(publicRoot, "config.capnp"), publicConfig(target.socketPath, port));
+      await writeFile(join(publicRoot, "config.capnp"), publicConfig(broker.socketPath, port));
       publicProcess = Bun.spawn(
         [binary, "serve", "--experimental", join(publicRoot, "config.capnp")],
         {
@@ -271,10 +308,12 @@ export default {async fetch(request, env) {
         await Bun.sleep(10);
       }
       expect(live).toBe(0);
+      expect(admittedFetches).toBe(2);
     } finally {
       publicProcess?.kill(9);
       await publicProcess?.exited;
       await namespace?.close();
+      await broker?.close();
       await rm(root, { recursive: true, force: true });
     }
   },
