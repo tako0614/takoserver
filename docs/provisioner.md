@@ -38,6 +38,26 @@ PUT. This schema does not admit Actor Resources to the public Host or enable
 production Actor bindings. Applying it to a protected D1 target remains a
 separate reviewed operator action, not a consequence of this source change.
 
+The public provider-extension seam classifies `ActorNamespace` for the managed
+backend and accepts only `actor:<32 lowercase hexadecimal characters>` as its
+native readback identity. Its existing readback envelope carries the exact
+Resource UID in `data.resourceUid`; it carries no owner script, credentials,
+class implementation or provider configuration. The public proxy constructs
+this descriptor locally, while the selected private backend owns native
+observation and lifecycle execution. This is a software extension contract,
+not a new Host API route or a change to the published Actor Form.
+
+Technical routing does not advertise Actor support or create an Offering.
+`ActorNamespace` remains an identity Form, not a relation that inherits a
+Worker's commercial Offering. The hosted edge supply parser has no Actor
+resource-class, metering or price-plan contract, and continues to reject Actor
+supply configuration. The Host also still refuses class-holder admission;
+native owner allocation alone is not evidence that every weighted active
+Worker version exports the required class or that the Actor Form is Ready.
+Normal hosted admission therefore remains unavailable until provider-qualified
+class readiness, the backend lifecycle and the separately owned commercial
+supply composition are implemented and qualified.
+
 ## Ordinary stable mode
 
 The normal `bun src/entry-bun.ts` process uses the stable self-host Provider3

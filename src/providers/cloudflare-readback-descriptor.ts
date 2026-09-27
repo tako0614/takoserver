@@ -24,7 +24,7 @@ export type CloudflareNativeReadbackAddress =
 
 type CloudflareManagedNativeReadbackAddress =
   | {
-      readonly kind: "worker" | "endpoint" | "domain" | "sqlite" | "vector";
+      readonly kind: "worker" | "endpoint" | "domain" | "sqlite" | "vector" | "actor";
       readonly name: string;
     }
   | {
@@ -54,6 +54,7 @@ const MANAGED_FORM_NATIVE_KINDS = {
   WorkerCustomDomain: "domain",
   SQLiteDatabase: "sqlite",
   VectorIndex: "vector",
+  ActorNamespace: "actor",
 } as const satisfies Readonly<Record<string, CloudflareManagedNativeReadbackAddress["kind"]>>;
 
 /** Provider kind projection shared by construction and readback validation. */
@@ -222,6 +223,16 @@ export function parseCloudflareNativeId(value: string): CloudflareNativeReadback
 function parseManagedNativeId(value: string): CloudflareManagedNativeReadbackAddress | null {
   const parts = value.split(":");
   const kind = parts[0];
+  // The managed owner publisher reads this exact namespace identity back from
+  // the native backend. It is not a Worker script name or a caller hint.
+  if (
+    kind === "actor" &&
+    parts.length === 2 &&
+    parts[1]?.length === 32 &&
+    /^[0-9a-f]{32}$/u.test(parts[1])
+  ) {
+    return { kind, name: parts[1] };
+  }
   if (
     (kind === "worker" ||
       kind === "endpoint" ||
