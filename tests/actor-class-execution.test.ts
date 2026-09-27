@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import type { ActorUpgrade } from "../src/actor-class-execution.ts";
 import {
   ActorExecutionError,
   ActorRuntimeError,
@@ -9,6 +8,7 @@ import {
   createActorTurn,
   inspectActorClass,
 } from "../src/actor-class-execution.ts";
+import { createActorUpgradeResponse } from "../src/actor-upgrade-handoff.ts";
 
 const signal = new AbortController().signal;
 
@@ -561,9 +561,8 @@ describe("private Actor ordinary-class execution seam", () => {
     expect(await result?.text()).toBe("opaque");
   });
 
-  test("passes through only Host-validated opaque Actor upgrades", async () => {
-    const upgrade = Object.freeze({ outcome: "opaque" }) as unknown as ActorUpgrade;
-    const accepted = new WeakSet<object>([upgrade]);
+  test("passes through an Actor upgrade as an ordinary Response result", async () => {
+    const upgrade = createActorUpgradeResponse(new Headers());
     class Actor {
       fetch() {
         return upgrade;
@@ -575,9 +574,6 @@ describe("private Actor ordinary-class execution seam", () => {
       exportName: "Actor",
       env: {},
       context: context(),
-      isUpgrade(value): value is ActorUpgrade {
-        return typeof value === "object" && value !== null && accepted.has(value);
-      },
     });
     const result = await execution.dispatch(
       { kind: "fetch", request: new Request("https://actor.invalid/") },
@@ -586,7 +582,7 @@ describe("private Actor ordinary-class execution seam", () => {
     expect(result).toBe(upgrade);
   });
 
-  test("rejects a structural upgrade lookalike when the Host validator refuses it", async () => {
+  test("rejects a structural upgrade lookalike", async () => {
     const fake = Object.freeze({ outcome: "opaque" });
     class Actor {
       fetch() {
@@ -599,7 +595,6 @@ describe("private Actor ordinary-class execution seam", () => {
       exportName: "Actor",
       env: {},
       context: context(),
-      isUpgrade: () => false,
     });
     const result = await execution.dispatch(
       { kind: "fetch", request: new Request("https://actor.invalid/") },

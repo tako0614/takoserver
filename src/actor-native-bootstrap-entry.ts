@@ -7,3 +7,4 @@ export {
   createActorNativeSocketPort,
   signActorNativeUpgradeDecision,
 } from "./actor-native-owner-worker.ts";
+export { installActorResponseRuntime } from "./actor-upgrade-handoff.ts";

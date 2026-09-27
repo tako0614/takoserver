@@ -2,6 +2,8 @@ import { createActorAddressing } from "./actor-addressing.ts";
 import { createActorNamespace } from "./actor-namespace-facade.ts";
 import { createActorUpgradeHandoff } from "./actor-upgrade-handoff.ts";
 
+export { installActorResponseRuntime } from "./actor-upgrade-handoff.ts";
+
 /** Unpublished self-host forward binding. This module evaluates before tenant code. */
 const NativeRequest = Request;
 const NativeHeaders = Headers;
@@ -15,6 +17,7 @@ const SafeWeakMapGet = WeakMap.prototype.get;
 const SafeWeakMapSet = WeakMap.prototype.set;
 const SafeHeadersGet = Headers.prototype.get;
 const SafeHeadersSet = Headers.prototype.set;
+const SafeHeadersAppend = Headers.prototype.append;
 const SafeHeadersDelete = Headers.prototype.delete;
 const SafeHeadersForEach = Headers.prototype.forEach;
 const SafeStringStartsWith = String.prototype.startsWith;
@@ -130,13 +133,17 @@ export function createSelfhostActorForwardContext(options: {
             !/^[a-f0-9-]{36}$/u.test(reservation)
           )
             throw new Error("Actor transport unavailable");
-          const protocol = SafeApply(SafeHeadersGet, headers, ["sec-websocket-protocol"]) as
-            | string
-            | null;
+          const publicHeaders = new NativeHeaders();
+          SafeApply(SafeHeadersForEach, headers, [
+            (value: string, name: string) => {
+              if (!SafeApply(SafeStringStartsWith, name, ["x-takoserver-private-"]))
+                SafeApply(SafeHeadersAppend, publicHeaders, [name, value]);
+            },
+          ]);
           const response = new NativeResponse(null, {
             status: 101,
             webSocket: socket,
-            headers: protocol ? { "sec-websocket-protocol": protocol } : undefined,
+            headers: publicHeaders,
           } as ResponseInit & { webSocket: WebSocket });
           const control = async (action: "commit" | "abandon"): Promise<void> => {
             const controlRequest = new NativeRequest(

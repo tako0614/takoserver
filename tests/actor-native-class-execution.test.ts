@@ -6,6 +6,7 @@ import {
   type NativeActorSqlFacade,
   type NativeActorStorage,
 } from "../src/actor-native-class-execution.ts";
+import { installActorResponseRuntime } from "../src/actor-upgrade-handoff.ts";
 
 function storage(database: Database): NativeActorStorage {
   return {
@@ -23,6 +24,91 @@ function storage(database: Database): NativeActorStorage {
     transactionSync: (callback) => database.transaction(callback)(),
   };
 }
+
+test("accept returns Response and transfers a reconstructed alias once with public headers", async () => {
+  const NativeResponse = Response;
+  installActorResponseRuntime();
+  const db = new Database(":memory:");
+  let accepted: Response | undefined;
+  class Actor {
+    constructor(
+      readonly context: {
+        sockets: {
+          accept(
+            request: Request,
+            options: { protocol: string },
+          ): Promise<{ response: Response; socket: object }>;
+        };
+      },
+    ) {}
+    async fetch(request: Request): Promise<Response> {
+      const result = await this.context.sockets.accept(request, { protocol: "chat" });
+      expect(Object.keys(result).sort()).toEqual(["response", "socket"]);
+      accepted = result.response;
+      expect(accepted.status).toBe(101);
+      expect(accepted.body).toBeNull();
+      expect(accepted).toBeInstanceOf(Response);
+      const alias = new Response(accepted.body, accepted.clone());
+      alias.headers.set("x-actor", "kept");
+      return alias;
+    }
+    alarm() {}
+    socketMessage() {}
+    socketClose() {}
+  }
+  try {
+    const actor = createNativeActorExecution({
+      namespace: { Actor },
+      exportName: "Actor",
+      id: "actor-id",
+      env: {},
+      storage: storage(db),
+      alarm: {
+        async set() {},
+        async get() {
+          return null;
+        },
+        async clear() {},
+      },
+      socketPort: () => ({
+        async accept() {
+          return "socket-id";
+        },
+        async get() {
+          return false;
+        },
+        async list() {
+          return [];
+        },
+        async send() {},
+        async close() {},
+        async getAttachment() {
+          return null;
+        },
+        async setAttachment() {},
+      }),
+    });
+    const result = await actor.fetch(
+      new Request("http://actor.invalid", { headers: { upgrade: "websocket" } }),
+      "nonce",
+    );
+    expect(actor.takeUpgrade(result, "other-request")).toBeNull();
+    expect(actor.takeUpgrade(result, "nonce")).toEqual({
+      nonce: "nonce",
+      socketId: "socket-id",
+      protocol: "chat",
+      headers: [
+        ["sec-websocket-protocol", "chat"],
+        ["x-actor", "kept"],
+      ],
+    });
+    expect(actor.takeUpgrade(accepted, "nonce")).toBeNull();
+    expect(actor.takeUpgrade(result.clone(), "nonce")).toBeNull();
+  } finally {
+    db.close();
+    globalThis.Response = NativeResponse;
+  }
+});
 
 test("native adapter dispatches broker-created socket events with the exact facade and turn", async () => {
   const db = new Database(":memory:");

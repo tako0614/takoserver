@@ -9,13 +9,16 @@
  */
 import {
   ActorRuntimeError,
-  type ActorUpgrade,
   createActorClassExecution,
   createActorContext,
   createActorTurn,
 } from "./actor-class-execution.ts";
+import {
+  actorUpgradeResponseSource,
+  createActorUpgradeResponse,
+  validActorUpgradeHeaders,
+} from "./actor-upgrade-handoff.ts";
 
-const SafeObjectCreate = Object.create;
 const SafeObjectFreeze = Object.freeze;
 const SafeObjectKeys = Object.keys;
 const SafeArrayMap = Array.prototype.map;
@@ -24,7 +27,9 @@ const SafeWeakMap = WeakMap;
 const SafeWeakMapGet = WeakMap.prototype.get;
 const SafeWeakMapSet = WeakMap.prototype.set;
 const SafeWeakMapDelete = WeakMap.prototype.delete;
-const SafeWeakMapHas = WeakMap.prototype.has;
+const SafeHeaders = Headers;
+const SafeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
+const SafeHeadersForEach = Headers.prototype.forEach;
 const SafeReflectApply = Reflect.apply;
 const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
 const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
@@ -53,6 +58,7 @@ interface UpgradeRecord {
   readonly nonce: string;
   readonly socketId: string;
   readonly protocol?: string;
+  readonly headers: [string, string][];
 }
 
 export type ActorSqlValue =
@@ -389,8 +395,8 @@ export interface NativeActorExecutionOptions {
   readonly socketPort?: (nonce: string) => NativeActorSocketPort;
 }
 
-export interface NativeActorExecutionResult<TUpgrade extends object = never> {
-  fetch(request: Request, socketNonce?: string): Promise<Response | TUpgrade>;
+export interface NativeActorExecutionResult {
+  fetch(request: Request, socketNonce?: string): Promise<Response>;
   takeUpgrade(value: unknown, socketNonce: string): UpgradeRecord | null;
   alarm(signal: AbortSignal): Promise<void>;
   socketMessage(
@@ -408,16 +414,8 @@ export interface NativeActorExecutionResult<TUpgrade extends object = never> {
 }
 
 export function createNativeActorExecution(
-  options: NativeActorExecutionOptions & {
-    readonly socketPort: (nonce: string) => NativeActorSocketPort;
-  },
-): NativeActorExecutionResult<ActorUpgrade>;
-export function createNativeActorExecution(
   options: NativeActorExecutionOptions,
-): NativeActorExecutionResult<never>;
-export function createNativeActorExecution(
-  options: NativeActorExecutionOptions,
-): NativeActorExecutionResult<ActorUpgrade> {
+): NativeActorExecutionResult {
   const unavailable = async (): Promise<never> => {
     throw new ActorRuntimeError("backend_unavailable");
   };
@@ -513,7 +511,7 @@ export function createNativeActorExecution(
         async accept(
           request: Request,
           acceptedOptions?: { readonly protocol?: string; readonly attachment?: Uint8Array },
-        ): Promise<{ readonly upgrade: ActorUpgrade; readonly socket: object }> {
+        ): Promise<{ readonly response: Response; readonly socket: object }> {
           const turn = socketTurn;
           if (turn?.kind !== "fetch" || !SafeRequestMethod || !SafeRequestHeaders)
             return socketUnavailable();
@@ -555,16 +553,19 @@ export function createNativeActorExecution(
               ? undefined
               : copyBytes(acceptedOptions.attachment, MAX_ATTACHMENT_BYTES);
           const socketId = await turn.port.accept(protocol, attachment);
-          const outcome = SafeObjectFreeze(SafeObjectCreate(null)) as ActorUpgrade;
+          const outcome = createActorUpgradeResponse(
+            new SafeHeaders(protocol ? { "sec-websocket-protocol": protocol } : undefined),
+          );
           SafeReflectApply(SafeWeakMapSet, upgrades, [
             outcome,
             {
               nonce: turn.nonce,
               socketId,
               protocol,
+              headers: [],
             },
           ]);
-          return SafeObjectFreeze({ upgrade: outcome, socket: handle(socketId) });
+          return SafeObjectFreeze({ response: outcome, socket: handle(socketId) });
         },
         async get(id: string): Promise<object | null> {
           if (typeof id !== "string" || !id) throw new TypeError("Actor socket ID is invalid");
@@ -605,36 +606,41 @@ export function createNativeActorExecution(
       sockets,
     }),
   };
-  const execution = options.socketPort
-    ? createActorClassExecution({
-        ...classOptions,
-        isUpgrade: (value: unknown): boolean =>
-          typeof value === "object" &&
-          value !== null &&
-          (SafeReflectApply(SafeWeakMapHas, upgrades, [value]) as boolean),
-      })
-    : createActorClassExecution(classOptions);
+  const execution = createActorClassExecution(classOptions);
   return SafeObjectFreeze({
-    async fetch(request: Request, socketNonce?: string): Promise<Response | ActorUpgrade> {
+    async fetch(request: Request, socketNonce?: string): Promise<Response> {
       return withSocketTurn("fetch", socketNonce, async () => {
         const response = await execution.dispatch(
           { kind: "fetch", request },
           createActorTurn(request.signal),
         );
         if (response === undefined) throw new ActorRuntimeError("backend_unavailable");
-        // Preserve either the real streaming Response or a branded opaque
-        // upgrade; the child shim transfers the latter to the owner only.
+        // The child shim alone converts a branded Response into a private
+        // owner decision; no native socket enters the application Response.
         return response;
       });
     },
     takeUpgrade(value: unknown, socketNonce: string): UpgradeRecord | null {
-      if (typeof value !== "object" || value === null) return null;
-      const record = SafeReflectApply(SafeWeakMapGet, upgrades, [value]) as
+      const source = actorUpgradeResponseSource(value);
+      if (!source || !SafeResponseHeaders) return null;
+      const record = SafeReflectApply(SafeWeakMapGet, upgrades, [source]) as
         | UpgradeRecord
         | undefined;
       if (!record || record.nonce !== socketNonce) return null;
-      SafeReflectApply(SafeWeakMapDelete, upgrades, [value]);
-      return record;
+      const headers = SafeReflectApply(SafeResponseHeaders, value, []) as Headers;
+      const handshake = new SafeHeaders(
+        record.protocol ? { "sec-websocket-protocol": record.protocol } : undefined,
+      );
+      if (!validActorUpgradeHeaders(headers, handshake))
+        throw new ActorRuntimeError("invalid_upgrade");
+      const snapshot: [string, string][] = [];
+      SafeReflectApply(SafeHeadersForEach, headers, [
+        (value: string, name: string) => {
+          snapshot[snapshot.length] = [name, value];
+        },
+      ]);
+      SafeReflectApply(SafeWeakMapDelete, upgrades, [source]);
+      return { ...record, headers: snapshot };
     },
     async alarm(signal: AbortSignal): Promise<void> {
       await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));

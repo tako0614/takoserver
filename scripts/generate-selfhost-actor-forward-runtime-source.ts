@@ -8,7 +8,7 @@ if (args.length !== 1 || (args[0] !== "--check" && args[0] !== "--write"))
 const root = resolve(import.meta.dir, "..");
 const output = resolve(root, "src/generated/selfhost-actor-forward-runtime-source.ts");
 const built = await Bun.build({
-  entrypoints: [resolve(root, "src/selfhost-actor-forward-runtime.ts")],
+  entrypoints: [resolve(root, "src/selfhost-actor-forward-runtime-entry.ts")],
   root,
   target: "browser",
   format: "esm",

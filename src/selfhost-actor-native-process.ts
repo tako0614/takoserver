@@ -215,7 +215,7 @@ export async function openWorkerdActorNamespace(
     hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
     hostModules.set(
       entry,
-      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass } from ${literal(`./${helper}`)};
+      encoder.encode(`import { createNativeActorExecution, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass, installActorResponseRuntime } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
@@ -235,6 +235,7 @@ const SafeTextDecode = TextDecoder.prototype.decode;
 const SafeUint8Array = Uint8Array;
 const SafeEncodeURIComponent = encodeURIComponent;
 const SafeNumberIsSafeInteger = Number.isSafeInteger;
+installActorResponseRuntime();
 const INSPECTION_HEADER = "x-takoserver-private-actor-class-inspection";
 const INSPECTION_TOKEN = ${literal(inspectionToken)};
 const DELIVERY_TOKEN = ${literal(deliveryToken)};
@@ -311,7 +312,9 @@ export class ActorChild {
     const upgrade = nonce ? execution.takeUpgrade(result, nonce) : null;
     if (!upgrade) return result;
     const decision = await signActorNativeUpgradeDecision(DELIVERY_TOKEN, nonce, SafeEncodeURIComponent(this.id), upgrade.socketId, upgrade.protocol ?? "");
-    const responseHeaders = new SafeHeaders({ [UPGRADE_DECISION]: decision, [UPGRADE_SOCKET_ID]: upgrade.socketId });
+    const responseHeaders = new SafeHeaders(upgrade.headers);
+    SafeApply(SafeHeadersSet, responseHeaders, [UPGRADE_DECISION, decision]);
+    SafeApply(SafeHeadersSet, responseHeaders, [UPGRADE_SOCKET_ID, upgrade.socketId]);
     if (upgrade.protocol) SafeApply(SafeHeadersSet, responseHeaders, ["sec-websocket-protocol", upgrade.protocol]);
     return new SafeResponse(null, { status: 204, headers: responseHeaders });
   }

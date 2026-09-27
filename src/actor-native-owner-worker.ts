@@ -1676,6 +1676,7 @@ export function createActorNativeOwner(
         const nonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
         const eventDeliveryToken = deliveryForEvent();
         let upgrade: SocketRecord | undefined;
+        let upgradeHeaders: Headers | undefined;
         try {
           const child = await this.selectedChild(
             id,
@@ -1737,6 +1738,9 @@ export function createActorNativeOwner(
             )
               throw new Error("Actor socket reservation unavailable");
             upgrade = proposed;
+            upgradeHeaders = new Headers(response.headers);
+            upgradeHeaders.delete(UPGRADE_DECISION_HEADER);
+            upgradeHeaders.delete(UPGRADE_SOCKET_ID_HEADER);
           } else {
             this.discardProvisional(nonce);
             // Until a broker-owned, invocation-bound reservation is transferred,
@@ -1877,14 +1881,13 @@ export function createActorNativeOwner(
             upgrade.reservationVariantKey = variantKey as string;
             this.persistSocket(upgrade);
             await this.reconcile();
+            const transportHeaders = new Headers(upgradeHeaders);
+            transportHeaders.set(RESERVATION_HEADER, bearer);
             resolve(
               new Response(null, {
                 status: 101,
                 webSocket: client,
-                headers: {
-                  [RESERVATION_HEADER]: bearer,
-                  ...(upgrade.protocol ? { "sec-websocket-protocol": upgrade.protocol } : {}),
-                },
+                headers: transportHeaders,
               } as ResponseInit & { webSocket: NativeActorWebSocket }),
             );
           } catch (error) {

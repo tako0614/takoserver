@@ -11,11 +11,11 @@ export interface ActorAddressingPort {
   isValidActorId(value: unknown): boolean;
 }
 
-export interface ActorNamespaceFacade<TUpgrade extends object> {
+export interface ActorNamespaceFacade {
   idFromName(name: string): string;
   newUniqueId(): string;
   get(id: string): Readonly<{
-    fetch(input: Request | string, init?: RequestInit): Promise<Response | TUpgrade>;
+    fetch(input: Request | string, init?: RequestInit): Promise<Response>;
   }>;
 }
 
@@ -32,10 +32,10 @@ function fixed(target: object, name: string, value: unknown): void {
  * `invoke` is a lexical Host cap. The returned object never contains the
  * broker token, native socket, selected Version, or raw service binding.
  */
-export function createActorNamespace<TUpgrade extends object>(options: {
+export function createActorNamespace(options: {
   readonly addressing: ActorAddressingPort;
-  readonly invoke: (id: string, request: Request) => Promise<Response | TUpgrade>;
-}): ActorNamespaceFacade<TUpgrade> {
+  readonly invoke: (id: string, request: Request) => Promise<Response>;
+}): ActorNamespaceFacade {
   const addressing = options.addressing;
   const invoke = options.invoke;
   if (
@@ -49,7 +49,7 @@ export function createActorNamespace<TUpgrade extends object>(options: {
   const idFromName = addressing.idFromName;
   const newUniqueId = addressing.newUniqueId;
   const isValidActorId = addressing.isValidActorId;
-  const namespace = SafeObjectCreate(null) as ActorNamespaceFacade<TUpgrade>;
+  const namespace = SafeObjectCreate(null) as ActorNamespaceFacade;
   fixed(
     namespace,
     "idFromName",
@@ -63,7 +63,7 @@ export function createActorNamespace<TUpgrade extends object>(options: {
   fixed(namespace, "get", (id: string) => {
     if (SafeReflectApply(isValidActorId, addressing, [id]) !== true)
       throw new TypeError("Actor ID is invalid");
-    const stub = SafeObjectCreate(null) as ReturnType<ActorNamespaceFacade<TUpgrade>["get"]>;
+    const stub = SafeObjectCreate(null) as ReturnType<ActorNamespaceFacade["get"]>;
     fixed(stub, "fetch", async (input: Request | string, init?: RequestInit) => {
       const request = new NativeRequest(input, init);
       return await invoke(id, request);

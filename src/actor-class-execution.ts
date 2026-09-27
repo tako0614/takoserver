@@ -140,10 +140,6 @@ export interface ActorTurn {
   readonly signal: AbortSignal;
 }
 
-declare const actorUpgradeBrand: unique symbol;
-/** Host-validated, opaque socket-upgrade outcome. No runtime property is added. */
-export type ActorUpgrade = Readonly<{ [actorUpgradeBrand]: true }>;
-
 const actorContexts = new SafeWeakSet<object>();
 const actorTurns = new SafeWeakSet<object>();
 
@@ -212,10 +208,7 @@ type ActorTransportFailureEvent = {
 
 export interface ActorInstance {
   start?(turn: ActorTurn): void | Promise<void>;
-  fetch(
-    request: Request,
-    turn: ActorTurn,
-  ): Response | ActorUpgrade | Promise<Response | ActorUpgrade>;
+  fetch(request: Request, turn: ActorTurn): Response | Promise<Response>;
   alarm(turn: ActorTurn): void | Promise<void>;
   socketMessage(
     socket: ActorSocket,
@@ -331,11 +324,9 @@ export interface ActorClassExecutionOptions {
   readonly env: Readonly<Record<string, unknown>>;
   /** Host-created closed context for this fresh child execution. */
   readonly context: ActorContext;
-  /** Host-owned authenticity check for an opaque Actor upgrade result. */
-  readonly isUpgrade?: ((value: unknown) => boolean) | undefined;
 }
 
-export interface ActorClassExecution<TUpgrade extends ActorUpgrade | never = ActorUpgrade> {
+export interface ActorClassExecution {
   readonly inspection: ActorClassInspection;
   readonly context: ActorContext;
   readonly env: Readonly<Record<string, unknown>>;
@@ -345,7 +336,7 @@ export interface ActorClassExecution<TUpgrade extends ActorUpgrade | never = Act
   dispatch(
     event: ActorEvent | ActorTransportFailureEvent,
     turn: ActorTurn,
-  ): Promise<Response | TUpgrade | undefined>;
+  ): Promise<Response | undefined>;
 }
 
 /**
@@ -354,13 +345,6 @@ export interface ActorClassExecution<TUpgrade extends ActorUpgrade | never = Act
  * session is required after eviction. Every later handler uses the same
  * instance receiver.
  */
-export function createActorClassExecution(
-  options: ActorClassExecutionOptions & { readonly isUpgrade: (value: unknown) => boolean },
-): ActorClassExecution;
-export function createActorClassExecution(
-  options: ActorClassExecutionOptions & { readonly isUpgrade?: undefined },
-): ActorClassExecution<never>;
-export function createActorClassExecution(options: ActorClassExecutionOptions): ActorClassExecution;
 export function createActorClassExecution(
   options: ActorClassExecutionOptions,
 ): ActorClassExecution {
@@ -411,7 +395,7 @@ export function createActorClassExecution(
   async function dispatch(
     event: ActorEvent | ActorTransportFailureEvent,
     turnInput: ActorTurn,
-  ): Promise<Response | ActorUpgrade | undefined> {
+  ): Promise<Response | undefined> {
     const normalizedEvent = normalizeEvent(event);
     const turn = normalizeTurn(turnInput);
     const handlerName = normalizedEvent.kind;
@@ -431,8 +415,7 @@ export function createActorClassExecution(
       const result = await SafeReflectApply(inspection.handlers[handlerName], instance, args);
       if (handlerName === "fetch") {
         if (result instanceof SafeResponse) return result;
-        if (options.isUpgrade?.(result) === true) return result as ActorUpgrade;
-        throw new SafeTypeError("Actor fetch must return a Response or Host-validated upgrade");
+        throw new SafeTypeError("Actor fetch must return a Response");
       }
       return undefined;
     } catch (error) {

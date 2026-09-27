@@ -1,11 +1,26 @@
 /**
- * Host-private, request-local handoff for an unpublished opaque Actor upgrade.
+ * Host-private, request-local handoff for an unpublished Actor Response upgrade.
  * This module must load before untrusted Worker code. It never projects the
  * native 101 Response, WebSocket, reservation ID, or broker control methods.
  */
 const NativeResponse = Response;
 const NativeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
 const NativeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
+const NativeResponseOk = Object.getOwnPropertyDescriptor(Response.prototype, "ok")?.get;
+const NativeResponseStatusText = Object.getOwnPropertyDescriptor(
+  Response.prototype,
+  "statusText",
+)?.get;
+const NativeResponseClone = Response.prototype.clone;
+const NativeResponseWebSocket = Object.getOwnPropertyDescriptor(
+  Response.prototype,
+  "webSocket",
+)?.get;
+const NativeHeaders = Headers;
+const NativeHeadersAppend = Headers.prototype.append;
+const NativeHeadersForEach = Headers.prototype.forEach;
+const NativeObjectDefineProperty = Object.defineProperty;
+const NativeTypeError = TypeError;
 const NativeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
 const NativeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
 const NativeRequestSignal = Object.getOwnPropertyDescriptor(Request.prototype, "signal")?.get;
@@ -14,12 +29,10 @@ const NativeAbortAdd = AbortSignal.prototype.addEventListener;
 const NativeAbortRemove = AbortSignal.prototype.removeEventListener;
 const NativeAbortAborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
 const NativeReflectApply = Reflect.apply;
-const NativeObjectCreate = Object.create;
 const NativeObjectFreeze = Object.freeze;
 const NativeWeakMap = WeakMap;
 const NativeWeakMapGet = WeakMap.prototype.get;
 const NativeWeakMapSet = WeakMap.prototype.set;
-const NativeWeakMapDelete = WeakMap.prototype.delete;
 const NativeSet = Set;
 const NativeSetAdd = Set.prototype.add;
 const NativeSetDelete = Set.prototype.delete;
@@ -28,6 +41,7 @@ const NativeSetClear = Set.prototype.clear;
 const NativeStringLower = String.prototype.toLowerCase;
 const NativeStringSplit = String.prototype.split;
 const NativeStringTrim = String.prototype.trim;
+const NativeStringStartsWith = String.prototype.startsWith;
 const NativeNumberIsSafeInteger = Number.isSafeInteger;
 const NativeSetTimeout = setTimeout;
 const NativeClearTimeout = clearTimeout;
@@ -66,11 +80,158 @@ export interface NativeActorUpgradeTransport {
 }
 
 type Slot = {
-  readonly outcome: object;
+  readonly owner: object;
   readonly reservation: NativeActorUpgradeReservation;
+  readonly handshake: Headers;
   timer: ReturnType<typeof setTimeout> | undefined;
   state: "provisional" | "committing" | "committed" | "abandoned";
 };
+
+// Never expose this map, its values or a constructor parameter that can mint a slot.
+const responseSlots = new NativeWeakMap<object, Response>();
+/** Host-only alias resolution. Application modules cannot import this module. */
+export function actorUpgradeResponseSource(value: unknown): Response | undefined {
+  return (typeof value === "object" && value !== null) || typeof value === "function"
+    ? (NativeReflectApply(NativeWeakMapGet, responseSlots, [value]) as Response | undefined)
+    : undefined;
+}
+function copyHeaders(source: Headers): Headers {
+  const result = new NativeHeaders();
+  NativeReflectApply(NativeHeadersForEach, source, [
+    (value: string, name: string) => {
+      NativeReflectApply(NativeHeadersAppend, result, [name, value]);
+    },
+  ]);
+  return result;
+}
+function responseHeaders(response: Response): Headers {
+  return NativeReflectApply(
+    NativeResponseHeaders as NonNullable<typeof NativeResponseHeaders>,
+    response,
+    [],
+  ) as Headers;
+}
+
+/**
+ * Forward app ABI only. Native workerd disallows a socket-free native 101, so
+ * the Response subclass holds a null-body 200 backing and exposes logical 101.
+ * Its native backing never holds a socket. Only finish() emits the native 101.
+ */
+class ActorResponse extends NativeResponse {
+  constructor(body?: BodyInit | null, init?: ResponseInit) {
+    const slot = actorUpgradeResponseSource(init);
+    if (slot) {
+      if (body != null || init?.status !== 101)
+        throw new NativeTypeError("Actor upgrade requires status 101 and null body");
+      super(null, {
+        status: 200,
+        statusText: "Switching Protocols",
+        headers: copyHeaders(responseHeaders(init as Response)),
+      });
+      NativeReflectApply(NativeWeakMapSet, responseSlots, [this, slot]);
+    } else {
+      super(body, init);
+      // Let the native constructor perform WebIDL coercion/getter reads once.
+      // Reject even a string/coercing status or a native webSocket initializer.
+      if (
+        NativeReflectApply(
+          NativeResponseStatus as NonNullable<typeof NativeResponseStatus>,
+          this,
+          [],
+        ) === 101
+      )
+        throw new NativeTypeError("Actor upgrade reservation required");
+    }
+  }
+  static override [Symbol.hasInstance](value: unknown): boolean {
+    try {
+      NativeReflectApply(
+        NativeResponseStatus as NonNullable<typeof NativeResponseStatus>,
+        value,
+        [],
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  override get status(): number {
+    return actorUpgradeResponseSource(this)
+      ? 101
+      : (NativeReflectApply(
+          NativeResponseStatus as NonNullable<typeof NativeResponseStatus>,
+          this,
+          [],
+        ) as number);
+  }
+  override get ok(): boolean {
+    return actorUpgradeResponseSource(this)
+      ? false
+      : (NativeReflectApply(
+          NativeResponseOk as NonNullable<typeof NativeResponseOk>,
+          this,
+          [],
+        ) as boolean);
+  }
+  override get statusText(): string {
+    return actorUpgradeResponseSource(this)
+      ? "Switching Protocols"
+      : (NativeReflectApply(
+          NativeResponseStatusText as NonNullable<typeof NativeResponseStatusText>,
+          this,
+          [],
+        ) as string);
+  }
+  override clone(): Response {
+    return actorUpgradeResponseSource(this)
+      ? new ActorResponse(null, this)
+      : (NativeReflectApply(NativeResponseClone, this, []) as Response);
+  }
+}
+
+/** Host-only mint, called only after the broker accepts. No token is stored on the Response. */
+export function createActorUpgradeResponse(headers: Headers): Response {
+  const response = new ActorResponse(null, { headers: copyHeaders(headers) });
+  NativeReflectApply(NativeWeakMapSet, responseSlots, [response, response]);
+  return response;
+}
+
+/** Call at forward Host-module evaluation, before importing/evaluating application modules. */
+export function installActorResponseRuntime(): void {
+  NativeObjectDefineProperty(globalThis, "Response", {
+    value: ActorResponse,
+    writable: true,
+    configurable: true,
+  });
+}
+
+const RESERVED_HEADERS = [
+  "upgrade",
+  "connection",
+  "sec-websocket-accept",
+  "sec-websocket-protocol",
+  "sec-websocket-extensions",
+  "content-length",
+  "transfer-encoding",
+];
+export function validActorUpgradeHeaders(headers: Headers, handshake: Headers): boolean {
+  for (let index = 0; index < RESERVED_HEADERS.length; index += 1) {
+    const name = RESERVED_HEADERS[index];
+    if (
+      NativeReflectApply(NativeHeadersGet, headers, [name]) !==
+      NativeReflectApply(NativeHeadersGet, handshake, [name])
+    )
+      return false;
+  }
+  let valid = true;
+  NativeReflectApply(NativeHeadersForEach, headers, [
+    (_value: string, name: string) => {
+      if (NativeReflectApply(NativeStringStartsWith, name, ["x-takoserver-private-"]))
+        valid = false;
+    },
+  ]);
+  return valid;
+}
 
 /** One scope per original incoming client request; never reuse across fetches. */
 export function createActorUpgradeHandoff(
@@ -78,7 +239,7 @@ export function createActorUpgradeHandoff(
   transport: NativeActorUpgradeTransport,
   reservationMs = 30_000,
 ): {
-  readonly actor: Readonly<{ fetch(request: Request): Promise<object> }>;
+  readonly actor: Readonly<{ fetch(request: Request): Promise<Response> }>;
   finish(value: unknown): Promise<Response>;
   abandon(): Promise<void>;
 } {
@@ -107,7 +268,8 @@ export function createActorUpgradeHandoff(
     origin: ingressGet("origin"),
   });
   const aborted = (): boolean => NativeReflectApply(NativeAbortAborted, signal, []) as boolean;
-  const slots = new NativeWeakMap<object, Slot>();
+  const owner = NativeObjectFreeze({});
+  const slots = new NativeWeakMap<Response, Slot>();
   const open = new NativeSet<Slot>();
   let closed = false;
   const unavailable = (): Response => new NativeResponse(null, { status: 503 });
@@ -117,7 +279,6 @@ export function createActorUpgradeHandoff(
     slot.state = "abandoned";
     if (slot.timer !== undefined) NativeClearTimeout(slot.timer);
     NativeReflectApply(NativeSetDelete, open, [slot]);
-    NativeReflectApply(NativeWeakMapDelete, slots, [slot.outcome]);
     try {
       await slot.reservation.abandon();
     } catch {
@@ -137,7 +298,7 @@ export function createActorUpgradeHandoff(
   if (aborted()) abortListener();
 
   const actor = NativeObjectFreeze({
-    async fetch(request: Request): Promise<object> {
+    async fetch(request: Request): Promise<Response> {
       if (closed || aborted()) throw new Error("request_aborted");
       if (
         ingress.method !== "GET" ||
@@ -184,8 +345,9 @@ export function createActorUpgradeHandoff(
         await reservation.abandon();
         throw new Error("request_aborted");
       }
-      const outcome = NativeObjectFreeze(NativeObjectCreate(null)) as object;
-      const slot: Slot = { outcome, reservation, state: "provisional", timer: undefined };
+      const handshake = copyHeaders(responseHeaders(reservation.response));
+      const outcome = createActorUpgradeResponse(handshake);
+      const slot: Slot = { owner, handshake, reservation, state: "provisional", timer: undefined };
       NativeReflectApply(NativeWeakMapSet, slots, [outcome, slot]);
       NativeReflectApply(NativeSetAdd, open, [slot]);
       slot.timer = NativeSetTimeout(() => {
@@ -198,15 +360,16 @@ export function createActorUpgradeHandoff(
   return NativeObjectFreeze({
     actor,
     async finish(value: unknown): Promise<Response> {
+      const alreadyClosed = closed;
       closed = true;
-      NativeReflectApply(NativeAbortRemove, signal, ["abort", abortListener]);
-      const slot =
-        (typeof value === "object" && value !== null) || typeof value === "function"
-          ? (NativeReflectApply(NativeWeakMapGet, slots, [value]) as Slot | undefined)
-          : undefined;
-      if (slot?.state !== "provisional" || aborted()) {
+      const source = actorUpgradeResponseSource(value);
+      const slot = source
+        ? (NativeReflectApply(NativeWeakMapGet, slots, [source]) as Slot | undefined)
+        : undefined;
+      if (alreadyClosed || slot?.owner !== owner || slot.state !== "provisional" || aborted()) {
         await abandonOpen();
-        if (aborted()) return unavailable();
+        NativeReflectApply(NativeAbortRemove, signal, ["abort", abortListener]);
+        if (alreadyClosed || source || aborted()) return unavailable();
         try {
           // An app-created native 101 is not an Actor reservation. This new
           // Actor path does not yet contract unrelated ordinary Worker WS.
@@ -215,6 +378,13 @@ export function createActorUpgradeHandoff(
         } catch {
           return unavailable();
         }
+      }
+      // Snapshot once, before any await. Later app mutation cannot alter the head.
+      const headers = copyHeaders(responseHeaders(value as Response));
+      if (!validActorUpgradeHeaders(headers, slot.handshake)) {
+        await abandonOpen();
+        NativeReflectApply(NativeAbortRemove, signal, ["abort", abortListener]);
+        return unavailable();
       }
       await abandonOpen(slot);
       if (slot.state !== "provisional" || aborted()) {
@@ -227,19 +397,30 @@ export function createActorUpgradeHandoff(
       if (slot.timer !== undefined) NativeClearTimeout(slot.timer);
       const wasAbandoned = (): boolean => slot.state === "abandoned";
       try {
+        // Use captured native getters, not app-mutable ResponseInit accessors.
+        // This response and its native socket never enter application code.
+        const socket = NativeResponseWebSocket
+          ? NativeReflectApply(NativeResponseWebSocket, slot.reservation.response, [])
+          : undefined;
+        const response = new NativeResponse(null, {
+          status: 101,
+          headers,
+          webSocket: socket,
+        } as ResponseInit);
         await slot.reservation.commit();
+        if (wasAbandoned() || aborted()) {
+          await settleAbandoned(slot);
+          return unavailable();
+        }
+        slot.state = "committed";
+        NativeReflectApply(NativeSetDelete, open, [slot]);
+        return response;
       } catch {
         await settleAbandoned(slot);
         return unavailable();
+      } finally {
+        NativeReflectApply(NativeAbortRemove, signal, ["abort", abortListener]);
       }
-      if (wasAbandoned() || aborted()) {
-        await settleAbandoned(slot);
-        return unavailable();
-      }
-      slot.state = "committed";
-      NativeReflectApply(NativeSetDelete, open, [slot]);
-      NativeReflectApply(NativeWeakMapDelete, slots, [slot.outcome]);
-      return slot.reservation.response;
     },
     async abandon(): Promise<void> {
       closed = true;

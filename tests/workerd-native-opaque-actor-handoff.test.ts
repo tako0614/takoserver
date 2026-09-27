@@ -222,7 +222,7 @@ test.skipIf(binary === undefined)(
       expect(inspected).toEqual({
         keys: [],
         nativeSocket: false,
-        response: false,
+        response: true,
         token: false,
         envKeys: ["ACTOR"],
         hostImport: "blocked",

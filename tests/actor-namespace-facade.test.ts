@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import { createActorNamespace } from "../src/actor-namespace-facade.ts";
 import { renderActorNamespaceFacadeModuleSource } from "../src/actor-namespace-facade-source.ts";
 
-test("Actor namespace facade mints synchronously and dispatches ordinary and opaque outcomes", async () => {
+test("Actor namespace facade mints synchronously and keeps fetch Promise<Response>", async () => {
   const calls: Array<{ id: string; url: string; method: string }> = [];
-  const outcome = Object.freeze(Object.create(null)) as object;
+  const outcome = new Response(null, { status: 101 });
   const namespace = createActorNamespace({
     addressing: Object.freeze({
       idFromName(name: string) {
@@ -29,7 +29,8 @@ test("Actor namespace facade mints synchronously and dispatches ordinary and opa
   expect(Object.isFrozen(stub)).toBe(true);
   const ordinary = await stub.fetch("http://actor.invalid/ordinary");
   expect(ordinary).toBeInstanceOf(Response);
-  expect(await (ordinary as Response).text()).toBe("ordinary");
+  expect(ordinary.ok).toBe(true);
+  expect(await ordinary.text()).toBe("ordinary");
   expect(await stub.fetch(new Request("http://actor.invalid/socket"))).toBe(outcome);
   expect(calls).toEqual([
     { id: "opaque:room", url: "http://actor.invalid/ordinary", method: "GET" },

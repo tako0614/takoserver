@@ -37,7 +37,7 @@ export class Actor {
       return NativeResponse.json({live:(await this.ctx.sockets.list()).length});
     if (new URL(request.url).pathname === "/echo")
       return new NativeResponse(request.body, {headers:{"content-type":"text/plain"}});
-    const {upgrade, socket} = await this.ctx.sockets.accept(request, {protocol:"chat", attachment:new Uint8Array([7])});
+    const {response, socket} = await this.ctx.sockets.accept(request, {protocol:"chat", attachment:new Uint8Array([7])});
     await socket.send("provisional");
     const abandoned = new URL(request.url).pathname === "/poison" ?
       new NativeResponse("abandoned", {status:409}) : null;
@@ -47,7 +47,7 @@ export class Actor {
       Array.prototype[Symbol.iterator] = function*() {};
       return abandoned;
     }
-    return upgrade;
+    return response;
   }
   alarm() {}
   async socketMessage(socket, data) {
