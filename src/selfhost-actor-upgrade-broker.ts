@@ -6,6 +6,7 @@ import { dirname, isAbsolute } from "node:path";
 const HEAD_LIMIT = 16 * 1024;
 const HEAD_MS = 5_000;
 const RESERVATION_MS = 30_000;
+const MAX_BROKER_PROVISIONAL = 1_024;
 const TOKEN_HEADER = "x-takoserver-private-broker-token";
 const ACTOR_ID_HEADER = "x-takoserver-private-broker-actor-id";
 const RESERVATION_HEADER = "x-takoserver-private-broker-reservation";
@@ -121,6 +122,7 @@ export async function openSelfhostActorUpgradeBroker(
   await mkdir(dirname(options.socketPath), { recursive: true, mode: 0o700 });
   const pending = new Map<string, Pending>();
   const sockets = new Set<Socket>();
+  let admitting = 0;
   const abandon = (id: string): void => {
     const entry = pending.get(id);
     if (!entry || entry.state === "committed" || entry.state === "abandoned") return;
@@ -142,6 +144,7 @@ export async function openSelfhostActorUpgradeBroker(
     void (async () => {
       let lease: SelfhostActorDuplexLease | undefined;
       let id: string | undefined;
+      let counted = false;
       const callerAbort = new AbortController();
       client.once("close", () => callerAbort.abort(new Error("request_aborted")));
       try {
@@ -216,6 +219,12 @@ export async function openSelfhostActorUpgradeBroker(
           return;
         }
         const actorId = decodeURIComponent(encodedId);
+        if (pending.size + admitting >= MAX_BROKER_PROVISIONAL) {
+          reply(client, 429);
+          return;
+        }
+        admitting += 1;
+        counted = true;
         parsed.headers.delete(TOKEN_HEADER);
         parsed.headers.delete(ACTOR_ID_HEADER);
         parsed.headers.delete(RESERVATION_HEADER);
@@ -287,6 +296,8 @@ export async function openSelfhostActorUpgradeBroker(
           }
         }
         reply(client, 503);
+      } finally {
+        if (counted) admitting -= 1;
       }
     })();
   });
