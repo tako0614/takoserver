@@ -111,11 +111,7 @@ export interface ResourceIdentity {
   readonly name: string;
   /** Stable Host Resource UID. Required by adapters that consume one-shot inputs. */
   readonly uid?: string;
-  /**
-   * Exact provider Deployment incarnation; replacements never share lifecycle
-   * authority. Creates receive the deterministic ID the Host will commit after
-   * a successful provider call, while updates reuse the active Deployment ID.
-   */
+  /** Exact provider Deployment incarnation; replacements never share lifecycle authority. */
   readonly incarnationId?: string;
   /** Exact Host Resource generation represented by this provider call. */
   readonly generation?: string;
@@ -208,6 +204,18 @@ export interface ProviderExecutionAuthority {
   readonly resourceUid: string;
   readonly leaseToken: string;
   readonly fingerprint: string;
+}
+
+/**
+ * In-process context for one provider mutation dispatch.
+ *
+ * This is deliberately separate from `ApplyInput`: it is not serialized into
+ * Host/provider RPC input or included in mutation digests. It gives a composed
+ * adapter the exact Deployment identity the Host will commit when a create has
+ * no incumbent Deployment yet.
+ */
+export interface ProviderMutationExecutionContext {
+  readonly prospectiveDeploymentId?: string;
 }
 
 /**
@@ -516,7 +524,7 @@ export interface Provider {
   readonly runtimeInputCapabilities?: ProviderRuntimeInputCapabilities;
   /** Explicitly composed runtime integrations; absence means no standard-service delivery. */
   readonly standardServiceProtocols?: readonly StandardServiceSlot["service"][];
-  apply(input: ApplyInput): Promise<ProviderTicket>;
+  apply(input: ApplyInput, context?: ProviderMutationExecutionContext): Promise<ProviderTicket>;
   /**
    * Captures an opaque, versioned provider readback descriptor before the
    * logical Resource row disappears. This method is pure and synchronous:
@@ -579,7 +587,10 @@ export interface Provider {
    * This is deliberately distinct from `recoverApply`, which remains a
    * strictly read-only inspection seam.
    */
-  convergeApply?(input: ApplyInput): Promise<ProviderTicket>;
+  convergeApply?(
+    input: ApplyInput,
+    context?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket>;
   poll?(input: {
     readonly operationId: string;
     readonly handle: string;

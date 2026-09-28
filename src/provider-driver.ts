@@ -85,8 +85,9 @@ type TakoformImportProviderSelection = Extract<
 
 /**
  * The Host commits this exact Deployment ID after a successful provider create.
- * It must be available to the provider before that call so native identity and
- * any provider-private custody can bind to the same incarnation.
+ * The driver passes it as in-process execution context so native identity and
+ * any provider-private custody can bind to the same incarnation without adding
+ * it to the provider's serialized mutation input.
  */
 function deterministicDeploymentId(operationId: string): string {
   return `dep_${operationId}`;
@@ -1931,8 +1932,9 @@ export function createProviderDriver(
           space: input.space,
           name: input.name,
           uid: input.resourceUid,
-          incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
-          ...(current && input.previous ? { generation: input.previous.metadata.generation } : {}),
+          ...(current && input.previous
+            ? { incarnationId: current.id, generation: input.previous.metadata.generation }
+            : {}),
         } as const;
         return {
           provider,
@@ -2147,6 +2149,9 @@ export function createProviderDriver(
           : {}),
         ...(previous ? { previous } : {}),
       } satisfies import("./provider-port.ts").ApplyInput;
+      const executionContext = current
+        ? undefined
+        : { prospectiveDeploymentId: deterministicDeploymentId(input.operationId) };
       let providerBoundaryEntered = false;
       let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
       const mutation: {
@@ -2169,7 +2174,7 @@ export function createProviderDriver(
               )
             : input.operationMode === "recovery"
               ? provider.convergeApply
-                ? await provider.convergeApply(providerInput)
+                ? await provider.convergeApply(providerInput, executionContext)
                 : (() => {
                     // A Host recovery lease may resume a mutation only through
                     // an explicitly operation-keyed convergence seam. The
@@ -2177,7 +2182,7 @@ export function createProviderDriver(
                     // into mutation authority here.
                     throw new ProviderMutationRecoveryError("indeterminate");
                   })()
-              : await provider.apply(providerInput);
+              : await provider.apply(providerInput, executionContext);
           if (
             input.operationMode === "recovery" &&
             !input.providerHandle &&
@@ -2959,9 +2964,8 @@ export function createProviderDriver(
                 space: input.space,
                 name: input.name,
                 uid: input.resourceUid,
-                incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
                 ...(current && input.previous
-                  ? { generation: input.previous.metadata.generation }
+                  ? { incarnationId: current.id, generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,
@@ -2991,9 +2995,8 @@ export function createProviderDriver(
                 space: input.space,
                 name: input.name,
                 uid: input.resourceUid,
-                incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
                 ...(current && input.previous
-                  ? { generation: input.previous.metadata.generation }
+                  ? { incarnationId: current.id, generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,

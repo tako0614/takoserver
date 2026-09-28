@@ -94,6 +94,12 @@ describe("provider-driver import selection", () => {
     expect(context.adoptCalls).toHaveLength(1);
     expect(context.adoptCalls[0]?.offering).toEqual(selection.technicalOffering);
     expect(context.adoptCalls[0]?.nativeId).toBe(selection.nativeId);
+    expect(context.adoptCalls[0]?.identity).toEqual({
+      tenantRef: tenantId,
+      space: "main",
+      name: "imported",
+      uid: "import-resource",
+    });
   });
 
   test("rejects native, provider, relation, and claim drift before adoption", async () => {
