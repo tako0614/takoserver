@@ -79,6 +79,42 @@ test("old CPE cannot silently discard a fresh-create context", async () => {
   expect(legacyCalls).toBe(0);
 });
 
+for (const operation of ["apply", "convergeApply"] as const) {
+  test(`${operation} invokes the RPC member without Function prototype helpers`, async () => {
+    const calls: unknown[] = [];
+    const methodName =
+      operation === "apply" ? "applyWithExecutionContextV1" : "convergeApplyWithExecutionContextV1";
+    const binding: Partial<CloudflareProviderExecutorRpc> = {};
+    binding[methodName] = new Proxy(
+      async function (this: unknown, envelope: unknown) {
+        expect(this).toBe(binding);
+        calls.push(envelope);
+        return failed;
+      },
+      {
+        get(target, key, receiver) {
+          if (key === "call" || key === "apply" || key === "bind") {
+            throw new Error("RPC method members are remote properties, not Function helpers");
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      },
+    );
+    const selectedInput =
+      operation === "apply" ? input : { ...input, operationMode: "recovery" as const };
+    await proxy(binding)[operation](selectedInput, {
+      prospectiveDeploymentId: "dep_op-context-1",
+    });
+    expect(calls).toEqual([
+      {
+        schema: "takoserver.cloudflare-provider-mutation-context@v1",
+        input: selectedInput,
+        prospectiveDeploymentId: "dep_op-context-1",
+      },
+    ]);
+  });
+}
+
 test("context cannot turn a caller-selected incarnation into create custody", async () => {
   let calls = 0;
   const provider = proxy({

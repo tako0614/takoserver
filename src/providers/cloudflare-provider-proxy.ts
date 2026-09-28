@@ -173,12 +173,13 @@ export class CloudflareProviderProxy implements Provider {
         prospectiveDeploymentId !== `dep_${input.operationId}`
       )
         return failed("unavailable", "Provider executor context does not match create", true);
-      const method = this.#binding.applyWithExecutionContextV1;
-      if (!method)
+      const binding = this.#binding;
+      if (!binding.applyWithExecutionContextV1)
         return failed("unavailable", "Provider executor does not support create context", true);
-      let result: Awaited<ReturnType<typeof method>>;
+      let result: Awaited<ReturnType<typeof binding.applyWithExecutionContextV1>>;
       try {
-        result = await method.call(this.#binding, {
+        // RPC method properties are remote members, not Function.prototype helpers.
+        result = await binding.applyWithExecutionContextV1({
           schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
           input,
           prospectiveDeploymentId,
@@ -224,16 +225,16 @@ export class CloudflareProviderProxy implements Provider {
           "Provider executor context does not match create recovery",
           true,
         );
-      const method = this.#binding.convergeApplyWithExecutionContextV1;
-      if (!method)
+      const binding = this.#binding;
+      if (!binding.convergeApplyWithExecutionContextV1)
         return failed(
           "unavailable",
           "Provider executor does not support create recovery context",
           true,
         );
-      let result: Awaited<ReturnType<typeof method>>;
+      let result: Awaited<ReturnType<typeof binding.convergeApplyWithExecutionContextV1>>;
       try {
-        result = await method.call(this.#binding, {
+        result = await binding.convergeApplyWithExecutionContextV1({
           schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
           input,
           prospectiveDeploymentId,
