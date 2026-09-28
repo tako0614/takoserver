@@ -16,7 +16,7 @@ export {
 export { type Catalog, createCatalog, type Offering } from "../catalog.ts";
 export { createProvisioningProviderPack } from "../deployment-composition.ts";
 export { createLedger, type Ledger } from "../ledger.ts";
-export { createOperatorIdentity } from "../operator-credentials.ts";
+export { createOperatorIdentity, createOperatorPurposeVerifier } from "../operator-credentials.ts";
 export { createProviderDriver, createProviderFormAvailability } from "../provider-driver.ts";
 export {
   type PublicHostIdentity,

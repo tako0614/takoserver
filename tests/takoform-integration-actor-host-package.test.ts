@@ -5,7 +5,10 @@ import { createAccounts, createApiKeyAdministration, grants } from "../src/auth.
 import { createCatalog } from "../src/catalog.ts";
 import { createProvisioningProviderPack } from "../src/deployment-composition.ts";
 import { createLedger } from "../src/ledger.ts";
-import { createOperatorIdentity } from "../src/operator-credentials.ts";
+import {
+  createOperatorIdentity,
+  createOperatorPurposeVerifier,
+} from "../src/operator-credentials.ts";
 import { createProviderDriver, createProviderFormAvailability } from "../src/provider-driver.ts";
 import { publicHostIdentity } from "../src/public-host-identity.ts";
 import {
@@ -23,6 +26,7 @@ test("integration Host subpath exposes only the selected composition constructor
     "createCatalog",
     "createLedger",
     "createOperatorIdentity",
+    "createOperatorPurposeVerifier",
     "createProviderDriver",
     "createProviderFormAvailability",
     "createProvisioningProviderPack",
@@ -40,6 +44,7 @@ test("integration Host subpath exposes only the selected composition constructor
   expect(integrationHost.createCatalog).toBe(createCatalog);
   expect(integrationHost.createLedger).toBe(createLedger);
   expect(integrationHost.createOperatorIdentity).toBe(createOperatorIdentity);
+  expect(integrationHost.createOperatorPurposeVerifier).toBe(createOperatorPurposeVerifier);
   expect(integrationHost.createProviderDriver).toBe(createProviderDriver);
   expect(integrationHost.createProviderFormAvailability).toBe(createProviderFormAvailability);
   expect(integrationHost.createProvisioningProviderPack).toBe(createProvisioningProviderPack);
