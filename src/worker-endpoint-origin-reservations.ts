@@ -433,6 +433,7 @@ export function createWorkerEndpointOriginReservations(options: {
       selection: await selectedPlacement(input.offeringId),
     });
 
+  /** Host mint follows the Worker's active Deployment, never the endpoint's Offering. */
   const selectedHostMintPlacement = async (input: {
     readonly organizationId: string;
     readonly space: string;
@@ -1102,23 +1103,6 @@ export function createWorkerEndpointOriginReservations(options: {
    * placement, and the CAS re-proves the revision it is moving to, so this
    * advances a binding rather than inventing one. Nothing here touches a
    * reservation a caller made: those keep the exact-replay semantics they had.
-   */
-  /**
-   * The Offering a Host-minted reservation is placed on: the ModuleWorker's.
-   *
-   * A reservation's placement is compared, everywhere downstream, against the
-   * Worker's **active provider Deployment** — `validateWorker` refuses a row
-   * whose `offering_id` is not that Deployment's. So the one authoritative
-   * answer to "which Offering is this reservation on" is the Deployment's own,
-   * and reading it here means the mint can never prepare a row `bind` will
-   * then refuse.
-   *
-   * The alternative — letting the WorkerEndpoint mutation name the Offering —
-   * is what broke: the only Offering that mutation holds is the endpoint's,
-   * and looking an endpoint Offering up in the ModuleWorker candidate list can
-   * never match, so every Host-minted reservation was refused 422. Omitting it
-   * instead would silently work only where exactly one ModuleWorker Offering
-   * is sold, which is a property of the catalog rather than of this Worker.
    */
   const advanceHostMintToCurrentRevision = async (input: {
     readonly organizationId: string;
