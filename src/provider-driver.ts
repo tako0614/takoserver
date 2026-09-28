@@ -83,6 +83,15 @@ type TakoformImportProviderSelection = Extract<
   { readonly kind: "provider" }
 >;
 
+/**
+ * The Host commits this exact Deployment ID after a successful provider create.
+ * It must be available to the provider before that call so native identity and
+ * any provider-private custody can bind to the same incarnation.
+ */
+function deterministicDeploymentId(operationId: string): string {
+  return `dep_${operationId}`;
+}
+
 function selectStandardServiceProjections(
   provider: Provider,
   input: Parameters<TakoformResourceDriver["apply"]>[0],
@@ -1922,12 +1931,8 @@ export function createProviderDriver(
           space: input.space,
           name: input.name,
           uid: input.resourceUid,
-          ...(current && input.previous
-            ? {
-                incarnationId: current.id,
-                generation: input.previous.metadata.generation,
-              }
-            : {}),
+          incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
+          ...(current && input.previous ? { generation: input.previous.metadata.generation } : {}),
         } as const;
         return {
           provider,
@@ -2280,7 +2285,7 @@ export function createProviderDriver(
             kind: "create",
             deployment: {
               tenantId: input.tenantId,
-              id: `dep_${input.operationId}`,
+              id: deterministicDeploymentId(input.operationId),
               resourceUid: input.resourceUid,
               offeringId: offering.id,
               providerPackRef: provider.id,
@@ -2326,7 +2331,7 @@ export function createProviderDriver(
         try {
           await deployments.create({
             tenantId: input.tenantId,
-            id: `dep_${input.operationId}`,
+            id: deterministicDeploymentId(input.operationId),
             resourceUid: input.resourceUid,
             offeringId: offering.id,
             providerPackRef: provider.id,
@@ -2954,11 +2959,9 @@ export function createProviderDriver(
                 space: input.space,
                 name: input.name,
                 uid: input.resourceUid,
+                incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
                 ...(current && input.previous
-                  ? {
-                      incarnationId: current.id,
-                      generation: input.previous.metadata.generation,
-                    }
+                  ? { generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,
@@ -2988,11 +2991,9 @@ export function createProviderDriver(
                 space: input.space,
                 name: input.name,
                 uid: input.resourceUid,
+                incarnationId: current?.id ?? deterministicDeploymentId(input.operationId),
                 ...(current && input.previous
-                  ? {
-                      incarnationId: current.id,
-                      generation: input.previous.metadata.generation,
-                    }
+                  ? { generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,
@@ -3046,7 +3047,7 @@ export function createProviderDriver(
                 kind: "create",
                 deployment: {
                   tenantId: input.tenantId,
-                  id: `dep_${input.operationId}`,
+                  id: deterministicDeploymentId(input.operationId),
                   resourceUid: input.resourceUid,
                   offeringId: offering.id,
                   providerPackRef: provider.id,
@@ -3084,7 +3085,7 @@ export function createProviderDriver(
         try {
           await deployments.create({
             tenantId: input.tenantId,
-            id: `dep_${input.operationId}`,
+            id: deterministicDeploymentId(input.operationId),
             resourceUid: input.resourceUid,
             offeringId: offering.id,
             providerPackRef: provider.id,

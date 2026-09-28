@@ -79,6 +79,7 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
     readonly method: "apply" | "convergeApply";
     readonly input: Parameters<Provider["apply"]>[0];
   }> = [];
+  let activeAtInitialDispatch: unknown;
   const result = (input: Parameters<Provider["apply"]>[0]) =>
     succeeded({ nativeId: `native:${input.identity.uid}`, observed: input.spec, outputs: {} });
   const provider: Provider = {
@@ -86,6 +87,9 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
     offerings: [technicalOffering],
     async apply(input) {
       calls.push({ method: "apply", input: structuredClone(input) });
+      if (input.operationId === "generation-driver-0001") {
+        activeAtInitialDispatch = await deployments.active("tenant-a", input.identity.uid ?? "");
+      }
       return result(input);
     },
     async convergeApply(input) {
@@ -151,13 +155,46 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
       leaseToken: "lease-generation-driver-2",
     },
   });
+  await applyWithSelection(driver, {
+    ...baseInput,
+    operationId: "generation-driver-update",
+    operationKey: "generation-driver-update-key",
+    spec: { value: "updated" },
+    desiredGeneration: "2",
+    previous: {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: {
+        name: "probe",
+        space: "main",
+        uid: "uid-generation-driver",
+        generation: "1",
+        revision: "1",
+      },
+      spec: { value: "first" },
+      status: { observedGeneration: "1", conditions: [] },
+    },
+  });
 
-  expect(calls.map(({ method }) => method)).toEqual(["apply", "convergeApply", "apply"]);
+  expect(calls.map(({ method }) => method)).toEqual(["apply", "convergeApply", "apply", "apply"]);
+  expect(calls[0]?.input.identity.incarnationId).toBe("dep_generation-driver-0001");
+  expect(calls[1]?.input.identity.incarnationId).toBe("dep_generation-driver-0001");
+  expect(calls[2]?.input.identity.incarnationId).toBe("dep_generation-driver-0002");
+  expect(calls[3]?.input.identity.incarnationId).toBe("dep_generation-driver-0001");
   expect(calls[0]?.input.desiredGeneration).toBe("9223372036854775807");
   expect(calls[1]?.input.desiredGeneration).toBe("9223372036854775807");
   expect(calls[2]?.input.desiredGeneration).toBeUndefined();
+  expect(calls[3]?.input.desiredGeneration).toBe("2");
   expect(Object.hasOwn(calls[1]?.input ?? {}, "desiredGeneration")).toBe(true);
   expect(Object.hasOwn(calls[2]?.input ?? {}, "desiredGeneration")).toBe(false);
+  expect(activeAtInitialDispatch).toBeNull();
+  expect(await deployments.active("tenant-a", "uid-generation-driver")).toMatchObject({
+    id: "dep_generation-driver-0001",
+  });
+  expect(await deployments.active("tenant-a", "uid-generation-driver-2")).toMatchObject({
+    id: "dep_generation-driver-0002",
+  });
 });
 
 test("atomic generation updates keep same-id refreshes but never replace an imported native claim", async () => {

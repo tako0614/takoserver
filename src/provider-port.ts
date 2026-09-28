@@ -111,7 +111,11 @@ export interface ResourceIdentity {
   readonly name: string;
   /** Stable Host Resource UID. Required by adapters that consume one-shot inputs. */
   readonly uid?: string;
-  /** Exact provider Deployment incarnation; replacements never share lifecycle authority. */
+  /**
+   * Exact provider Deployment incarnation; replacements never share lifecycle
+   * authority. Creates receive the deterministic ID the Host will commit after
+   * a successful provider call, while updates reuse the active Deployment ID.
+   */
   readonly incarnationId?: string;
   /** Exact Host Resource generation represented by this provider call. */
   readonly generation?: string;
