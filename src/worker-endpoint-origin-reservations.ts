@@ -433,13 +433,40 @@ export function createWorkerEndpointOriginReservations(options: {
       selection: await selectedPlacement(input.offeringId),
     });
 
+  const exactInstalledEdgeForm = (
+    snapshot: ResourceWithRelations,
+    kind: "ModuleWorker" | "WorkerEndpoint",
+    role: "identity" | "attachment",
+  ): InstalledTakoformForm | undefined => {
+    const identity = snapshot.listing.resource.form;
+    if (
+      !identity.packageDigest ||
+      identity.formRef.apiVersion !== MODULE_WORKER_FORM_REF.apiVersion ||
+      identity.formRef.kind !== kind
+    ) {
+      return undefined;
+    }
+    const matches = options.noncommercialPlacement?.installedForms.filter(
+      (candidate) =>
+        candidate.role === role && canonicalJson(candidate.identity) === canonicalJson(identity),
+    );
+    return matches?.length === 1 ? matches[0] : undefined;
+  };
+
+  const noncommercialRow = (row: ReservationRow): boolean =>
+    row.reservation_id.startsWith(HOST_MINTED_RESERVATION_PREFIX) &&
+    !options.catalog.hasOfferingId(row.offering_id);
+
   /** Host mint follows the Worker's active Deployment, never the endpoint's Offering. */
-  const selectedHostMintPlacement = async (input: {
-    readonly organizationId: string;
-    readonly space: string;
-    readonly workerName: string;
-    readonly workerResourceUid: string;
-  }): Promise<PlannedPlacement> => {
+  const selectedHostMintPlacement = async (
+    input: {
+      readonly organizationId: string;
+      readonly space: string;
+      readonly workerName: string;
+      readonly workerResourceUid: string;
+    },
+    requireNoCommercialCandidate = true,
+  ): Promise<PlannedPlacement> => {
     const deployment = await activeDeployment(
       options.deployments,
       input.organizationId,
@@ -462,11 +489,6 @@ export function createWorkerEndpointOriginReservations(options: {
     if (!noncommercialPlacements) {
       throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
     }
-    // The driver selects commercial supply whenever this Form has a sellable
-    // candidate. Origin minting cannot reinterpret that same Worker as free.
-    if (options.catalog.offeringsFor(MODULE_WORKER_FORM_REF).length > 0) {
-      throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
-    }
     const snapshot = await resourceSnapshot(
       options.resources,
       input.organizationId,
@@ -476,18 +498,21 @@ export function createWorkerEndpointOriginReservations(options: {
       !snapshot ||
       snapshot.listing.space !== input.space ||
       snapshot.listing.name !== input.workerName ||
-      !currentIncarnation(snapshot, "ModuleWorker") ||
-      !sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF) ||
-      !snapshot.listing.resource.form.packageDigest
+      !currentIncarnation(snapshot, "ModuleWorker")
     ) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
     }
-    const forms = options.noncommercialPlacement?.installedForms.filter(
-      (candidate) =>
-        candidate.role === "identity" &&
-        canonicalJson(candidate.identity) === canonicalJson(snapshot.listing.resource.form),
-    );
-    if (forms?.length !== 1 || !forms[0]) {
+    const form = exactInstalledEdgeForm(snapshot, "ModuleWorker", "identity");
+    if (!form) {
+      throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+    }
+    // New mints cannot choose free supply while the exact Form is sellable.
+    // A retained technical row instead rechecks its durable tuple and digest;
+    // a later commercial listing must not strand its read/delete lifecycle.
+    if (
+      requireNoCommercialCandidate &&
+      options.catalog.offeringsFor(form.identity.formRef).length > 0
+    ) {
       throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
     }
     let selected: Awaited<ReturnType<typeof noncommercialPlacements.select>>;
@@ -495,7 +520,7 @@ export function createWorkerEndpointOriginReservations(options: {
       selected = await noncommercialPlacements.select({
         tenantId: input.organizationId,
         space: input.space,
-        form: forms[0],
+        form,
       });
     } catch (error) {
       throw reservationPlacementError(error);
@@ -575,9 +600,7 @@ export function createWorkerEndpointOriginReservations(options: {
       readonly workerResourceUid: string;
     },
   ): Promise<void> => {
-    const noncommercial =
-      row.reservation_id.startsWith(HOST_MINTED_RESERVATION_PREFIX) &&
-      !options.catalog.hasOfferingId(row.offering_id);
+    const noncommercial = noncommercialRow(row);
     const worker =
       identity ??
       (row.bound_space && row.bound_worker_name && row.worker_resource_uid
@@ -592,7 +615,7 @@ export function createWorkerEndpointOriginReservations(options: {
     }
     const selected =
       noncommercial && worker
-        ? await selectedHostMintPlacement({ organizationId: row.organization_id, ...worker })
+        ? await selectedHostMintPlacement({ organizationId: row.organization_id, ...worker }, false)
         : await selectedPlacement(row.offering_id);
     if (
       selected.providerPackRef !== row.provider_pack_ref ||
@@ -665,13 +688,16 @@ export function createWorkerEndpointOriginReservations(options: {
       row.organization_id,
       identity.workerResourceUid,
     );
+    const validForm = noncommercialRow(row)
+      ? snapshot && !!exactInstalledEdgeForm(snapshot, "ModuleWorker", "identity")
+      : snapshot && sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF);
     if (
       !snapshot ||
       snapshot.listing.uid !== identity.workerResourceUid ||
       snapshot.listing.space !== identity.space ||
       snapshot.listing.name !== identity.workerName ||
       !currentIncarnation(snapshot, "ModuleWorker") ||
-      !sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF) ||
+      !validForm ||
       !(await workerReady(row.organization_id, snapshot))
     ) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
@@ -1426,6 +1452,9 @@ export function createWorkerEndpointOriginReservations(options: {
         input.organizationId,
         input.endpointResourceUid,
       );
+      const validEndpointForm = noncommercialRow(row)
+        ? endpoint && !!exactInstalledEdgeForm(endpoint, "WorkerEndpoint", "attachment")
+        : endpoint && sameForm(endpoint.listing.resource.form.formRef, WORKER_ENDPOINT_FORM_REF);
       if (
         !endpoint ||
         endpoint.listing.uid !== input.endpointResourceUid ||
@@ -1433,9 +1462,14 @@ export function createWorkerEndpointOriginReservations(options: {
         (row.reservation_format === LEGACY_WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT &&
           endpoint.listing.name !== row.legacy_endpoint_name) ||
         !readyCurrent(endpoint, "WorkerEndpoint") ||
-        !sameForm(endpoint.listing.resource.form.formRef, WORKER_ENDPOINT_FORM_REF) ||
+        !validEndpointForm ||
         !endpointOriginEquals(endpoint, row.canonical_public_origin) ||
-        !exactWorkerRelation(endpoint, row.worker_resource_uid, row.bound_worker_name)
+        !exactWorkerRelation(
+          endpoint,
+          row.worker_resource_uid,
+          row.bound_worker_name,
+          worker.listing.resource.form.formRef,
+        )
       ) {
         throw new WorkerEndpointOriginReservationError("conflict", 409);
       }
@@ -2696,11 +2730,12 @@ function exactWorkerRelation(
   endpoint: ResourceWithRelations,
   workerResourceUid: string,
   workerName: string,
+  workerFormRef: TakoformV1Alpha3FormRef,
 ): boolean {
   const desiredWorker = endpoint.listing.resource.spec.worker;
   if (
     !isRecord(desiredWorker) ||
-    desiredWorker.apiVersion !== MODULE_WORKER_FORM_REF.apiVersion ||
+    desiredWorker.apiVersion !== workerFormRef.apiVersion ||
     desiredWorker.kind !== "ModuleWorker" ||
     desiredWorker.name !== workerName
   ) {
@@ -2712,10 +2747,10 @@ function exactWorkerRelation(
   return (
     relations.length === 1 &&
     relations[0]?.targetKind === "ModuleWorker" &&
-    relations[0].targetApiVersion === MODULE_WORKER_FORM_REF.apiVersion &&
+    relations[0].targetApiVersion === workerFormRef.apiVersion &&
     relations[0].targetUid === workerResourceUid &&
     relations[0].targetName === workerName &&
-    sameForm(relations[0].targetFormRef, MODULE_WORKER_FORM_REF)
+    sameForm(relations[0].targetFormRef, workerFormRef)
   );
 }
 
