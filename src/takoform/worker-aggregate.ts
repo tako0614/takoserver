@@ -1,3 +1,4 @@
+import { canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import { exclusiveRelationClaimKey, type TakoformStoredRelation } from "./relations.ts";
@@ -14,6 +15,13 @@ const WORKER_DEPLOYMENT = "WorkerDeployment";
 const WORKER_RELATION = "/worker";
 const DEPLOYMENT_VERSION_RELATION = "/versions/*/workerVersion";
 const SERVICE_BINDING_RELATION = "/serviceBindings/*/resource";
+const CONTAINER_HTTP_BINDING_RELATION = "/containerHttpBindings/*/resource";
+const CONTAINER_HTTP_BINDING_REF = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.container-http",
+  version: "0.1.0",
+  schemaDigest: "sha256:caf35e19cd375a9115310dead9e4985f772e044d84dd3449cc347cd0ab49f301",
+} as const;
 const QUEUE_RELATION = "/queue";
 const ATTACHMENT_HANDLER: Readonly<Record<string, string>> = {
   WorkerCustomDomain: "fetch",
@@ -187,8 +195,11 @@ export async function validateWorkerAggregate(input: {
   if (input.form.identity.formRef.kind === "WorkerVersion" && input.form.role === "revision") {
     validateEnvironmentNamespace(input.spec);
     for (const relation of input.relations) {
-      if (relation.relation !== SERVICE_BINDING_RELATION) continue;
-      await requireServingWorker(input, relation, "fetch", edgeApiVersion);
+      if (relation.relation === SERVICE_BINDING_RELATION) {
+        await requireServingWorker(input, relation, "fetch", edgeApiVersion);
+      } else if (relation.relation === CONTAINER_HTTP_BINDING_RELATION) {
+        await requireReadyContainerHttpTarget(input, relation);
+      }
     }
     return;
   }
@@ -258,6 +269,66 @@ export async function validateWorkerAggregate(input: {
         message: `another QueueConsumer already consumes the Queue ${queue.targetName}; delete it first, then apply again`,
       });
     }
+  }
+}
+
+/**
+ * The candidate container binding is not a worker.service call. Relation
+ * resolution has already checked the installed Binding/Interface/target Form
+ * graph and pinned the target incarnation. Recheck that pin and the generic
+ * Resource lifecycle immediately before the provider receives the Version;
+ * no provider-specific container readiness or runtime support is inferred.
+ */
+async function requireReadyContainerHttpTarget(
+  input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly form: InstalledTakoformForm;
+    readonly store: Pick<TakoformStore, "readResource" | "readResourceDeletion">;
+  },
+  relation: TakoformStoredRelation,
+): Promise<void> {
+  if (
+    canonicalJson(relation.bindingRef) !== canonicalJson(CONTAINER_HTTP_BINDING_REF) ||
+    !input.form.acceptedBindings?.some(
+      (accepted) => canonicalJson(accepted) === canonicalJson(CONTAINER_HTTP_BINDING_REF),
+    ) ||
+    relation.targetApiVersion !== input.form.identity.formRef.apiVersion ||
+    relation.targetKind !== "ContainerService" ||
+    relation.targetFormRef.apiVersion !== relation.targetApiVersion ||
+    relation.targetFormRef.kind !== relation.targetKind ||
+    !relation.targetRevision
+  ) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  const target = await input.store.readResource({
+    tenantId: input.tenantId,
+    space: input.space,
+    apiVersion: relation.targetApiVersion,
+    kind: relation.targetKind,
+    name: relation.targetName,
+  });
+  if (
+    !target ||
+    target.apiVersion !== relation.targetApiVersion ||
+    target.kind !== relation.targetKind ||
+    target.metadata.name !== relation.targetName ||
+    target.metadata.space !== input.space ||
+    target.metadata.uid !== relation.targetUid ||
+    target.metadata.revision !== relation.targetRevision ||
+    canonicalJson(target.form.formRef) !== canonicalJson(relation.targetFormRef) ||
+    target.status.observedGeneration !== target.metadata.generation ||
+    !target.status.conditions.some(
+      (condition) => condition.type === "Ready" && condition.status === "True",
+    ) ||
+    target.status.operationId ||
+    (await input.store.readResourceDeletion(input.tenantId, relation.targetUid))?.state ===
+      "pending"
+  ) {
+    throw crossResourcePrecondition({
+      details: { pointer: relation.pointer },
+      message: `the ContainerService ${relation.targetName} is no longer the Ready incarnation selected by this WorkerVersion; re-resolve it after it is Ready, then apply again`,
+    });
   }
 }
 
@@ -614,6 +685,10 @@ function validateEnvironmentNamespace(spec: JsonObject): void {
     "bucketBindings",
     "queueProducerBindings",
     "serviceBindings",
+    "workflowBindings",
+    "actorBindings",
+    "vectorBindings",
+    "containerHttpBindings",
   ]) {
     const bindings = spec[field];
     if (!Array.isArray(bindings)) continue;
