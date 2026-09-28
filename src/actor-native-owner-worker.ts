@@ -1371,18 +1371,18 @@ export function createActorNativeOwner(
       this.state.waitUntil(this.tail);
       return turn;
     }
-    private async socketAdmission(actorId: string): Promise<{
+    private async socketAdmission(
+      actorId: string,
+      attemptNonce: string,
+      deadlineAt: number,
+    ): Promise<{
       readonly variantIndex: number;
       readonly variantKey: string;
       readonly generationKey: string;
       readonly epoch: string;
-      readonly attemptNonce: string;
-      readonly deadlineAt: number;
     }> {
       const admission = this.env.ADMISSION;
       if (!admission || !SafeResponseStatus) throw new Error("Actor socket admission unavailable");
-      const attemptNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
-      const deadlineAt = Date.now() + 5_000;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5_000);
       try {
@@ -1420,8 +1420,6 @@ export function createActorNativeOwner(
           variantKey: selected.variantKey as string,
           generationKey: currentGraph.generationKey,
           epoch: currentGraph.epoch,
-          attemptNonce,
-          deadlineAt,
         };
       } finally {
         clearTimeout(timer);
@@ -1579,12 +1577,16 @@ export function createActorNativeOwner(
         this.sockets.set(socketId, record);
       }
       if (!record || record.socket !== socket) throw new Error("Actor socket unavailable");
+      // Keep the attempt identity outside selection validation. The Host may
+      // have granted a lease even when its reply is lost or rejected here.
+      const attemptNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
+      const deadlineAt = Date.now() + 5_000;
       let admission: Awaited<ReturnType<typeof this.socketAdmission>> | undefined;
       let failed = false;
       let retired = false;
       let completionError: unknown;
       try {
-        admission = await this.socketAdmission(actorId);
+        admission = await this.socketAdmission(actorId, attemptNonce, deadlineAt);
         const graphNow = await this.currentGraph();
         const key = graphNow.variantKeys[admission.variantIndex];
         if (
@@ -1675,13 +1677,13 @@ export function createActorNativeOwner(
             }
           }
         }
-        if (admission) {
-          try {
-            await this.completeSocketAdmission(admission.attemptNonce, admission.deadlineAt);
-          } catch (error) {
-            failed = true;
-            completionError = error;
-          }
+        try {
+          // Host completion is idempotent for a pending, granted or unknown
+          // nonce; it also fences a late grant after a lost admission reply.
+          await this.completeSocketAdmission(attemptNonce, deadlineAt);
+        } catch (error) {
+          failed = true;
+          completionError = error;
         }
       }
       if (failed || event.kind === "close") {

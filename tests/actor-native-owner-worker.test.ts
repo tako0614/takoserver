@@ -8,7 +8,10 @@ import {
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
 
-function inboundFixture(callback?: (request: Request) => Promise<Response>) {
+function inboundFixture(
+  callback?: (request: Request) => Promise<Response>,
+  admissionFetch?: (request: Request) => Promise<Response>,
+) {
   type Socket = Parameters<
     InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
   >[0];
@@ -53,6 +56,7 @@ function inboundFixture(callback?: (request: Request) => Promise<Response>) {
       CLASS_0: {},
       ADMISSION: {
         async fetch(request) {
+          if (admissionFetch) return admissionFetch(request);
           const body = (await request.json()) as Record<string, unknown>;
           return body.action === "socket-complete"
             ? new Response(null, { status: 204 })
@@ -122,6 +126,126 @@ function inboundFixture(callback?: (request: Request) => Promise<Response>) {
     },
   };
 }
+
+function hostSocketGrants() {
+  const active = new Set<string>();
+  const completed: string[] = [];
+  const grants = new Map<string, string>();
+  const settled = new Set<string>();
+  return {
+    active,
+    completed,
+    grant(nonce: string, leaseId: string) {
+      if (settled.has(nonce)) {
+        completed.push(leaseId); // a late Host grant observes the completed attempt
+        return;
+      }
+      grants.set(nonce, leaseId);
+      active.add(leaseId);
+    },
+    complete(nonce: string) {
+      if (settled.has(nonce)) return;
+      settled.add(nonce);
+      const leaseId = grants.get(nonce);
+      if (!leaseId) return;
+      grants.delete(nonce);
+      active.delete(leaseId);
+      completed.push(leaseId);
+    },
+  };
+}
+
+for (const failure of ["lost", "malformed", "stale", "late"] as const) {
+  test(`native socket admission completes a Host grant after a ${failure} reply`, async () => {
+    const host = hostSocketGrants();
+    const otherNonce = crypto.randomUUID();
+    host.grant(otherNonce, "other-lease");
+    let attemptedNonce = "";
+    let callbacks = 0;
+    let lateGrant: (() => void) | undefined;
+    const f = inboundFixture(
+      async () => {
+        callbacks += 1;
+        return new Response(null, { status: 204 });
+      },
+      async (request) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        if (body.action === "socket-complete") {
+          host.complete(body.attemptNonce as string);
+          return new Response(null, { status: 204 });
+        }
+        attemptedNonce = body.attemptNonce as string;
+        if (failure === "late") lateGrant = () => host.grant(attemptedNonce, "attempt-lease");
+        else host.grant(attemptedNonce, "attempt-lease");
+        if (failure === "lost") throw new Error("reply lost after grant");
+        if (failure === "late") throw new Error("reply lost before Host grant settles");
+        if (failure === "malformed") return Response.json({ invalid: true });
+        return Response.json({
+          id: body.id,
+          attemptNonce: body.attemptNonce,
+          generationKey: "d".repeat(64),
+          epoch: "stale-epoch",
+          variantKey: "default",
+          leaseId: "attempt-lease",
+        });
+      },
+    );
+    await f.owner.webSocketMessage(f.socket("failed-admission"), "event");
+    lateGrant?.();
+    expect(attemptedNonce).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(callbacks).toBe(0);
+    expect(host.completed).toEqual(["attempt-lease"]);
+    expect(host.active).toEqual(new Set(["other-lease"]));
+    expect(f.closes).toEqual([["failed-admission", 1011]]);
+    host.complete(attemptedNonce); // replay is inert
+    expect(host.active).toEqual(new Set(["other-lease"]));
+    host.complete(otherNonce);
+    expect(host.active.size).toBe(0); // retirement can drain after exact completion
+    await Promise.all(f.retained);
+  });
+}
+
+test("native socket grant stays active until its admitted callback settles", async () => {
+  const host = hostSocketGrants();
+  let release!: () => void;
+  let started!: () => void;
+  const callbackStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const callbackDone = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = inboundFixture(
+    async () => {
+      started();
+      await callbackDone;
+      return new Response(null, { status: 204 });
+    },
+    async (request) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      if (body.action === "socket-complete") {
+        host.complete(body.attemptNonce as string);
+        return new Response(null, { status: 204 });
+      }
+      host.grant(body.attemptNonce as string, "callback-lease");
+      return Response.json({
+        id: body.id,
+        attemptNonce: body.attemptNonce,
+        generationKey: "d".repeat(64),
+        epoch: "epoch-1",
+        variantKey: "default",
+        leaseId: "callback-lease",
+      });
+    },
+  );
+  const event = f.owner.webSocketMessage(f.socket("in-flight"), "event");
+  await callbackStarted;
+  expect(host.active).toEqual(new Set(["callback-lease"]));
+  release();
+  await event;
+  expect(host.active.size).toBe(0);
+  await Promise.all(f.retained);
+});
 
 test("native inbound count overflow discards zero-length backlog while HTTP producer holds the ID", async () => {
   const f = inboundFixture();
