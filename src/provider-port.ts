@@ -209,10 +209,11 @@ export interface ProviderExecutionAuthority {
 /**
  * In-process context for one provider mutation dispatch.
  *
- * This is deliberately separate from `ApplyInput`: it is not serialized into
- * Host/provider RPC input or included in mutation digests. It gives a composed
- * adapter the exact Deployment identity the Host will commit when a create has
- * no incumbent Deployment yet.
+ * This is deliberately separate from legacy `ApplyInput`, `ResourceIdentity`,
+ * and mutation digests. A route-less executor may receive it only through the
+ * explicitly versioned private context RPC. It gives a composed adapter the
+ * exact Deployment identity the Host will commit when a create has no
+ * incumbent Deployment yet.
  */
 export interface ProviderMutationExecutionContext {
   readonly prospectiveDeploymentId?: string;
