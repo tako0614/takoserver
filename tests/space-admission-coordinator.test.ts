@@ -5,7 +5,10 @@ import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { FormAdmissionHost } from "../src/takoform/admission.ts";
 import { createAdmissionHandleIssuer } from "../src/takoform/admission.ts";
 import { createFormAdmissionStore } from "../src/takoform/admission-store.ts";
-import { createIntegrationFixtureEvidenceVerifier } from "../src/takoform/form-authority-verification.ts";
+import {
+  createIntegrationFixtureEvidenceVerifier,
+  createUnavailableFormAuthorityEvidenceVerifier,
+} from "../src/takoform/form-authority-verification.ts";
 import { createFormPackageStore } from "../src/takoform/form-packages.ts";
 import {
   canonicalFormAuthorityPlanDigest,
@@ -87,6 +90,7 @@ async function fixture(input: { readonly failActivation?: boolean } = {}) {
     policy?: unknown,
     host = admission,
     catalogOverride: TakoformImplementationCatalog = catalog,
+    verifierOverride = verifier,
   ) =>
     createHostAdmissionCoordinator({
       identity,
@@ -97,7 +101,7 @@ async function fixture(input: { readonly failActivation?: boolean } = {}) {
       storedPackages,
       admission: host,
       handles,
-      verifier,
+      verifier: verifierOverride,
       assertMutationAuthority: async () => {},
     });
   const request = (space: string, desiredActive = true): FormAuthorityPlanRequest => ({
@@ -140,6 +144,92 @@ async function fixture(input: { readonly failActivation?: boolean } = {}) {
 }
 
 describe("space-scoped Host admission coordinator", () => {
+  test("a converged no-command apply reads one fresh authority snapshot", async () => {
+    const f = await fixture();
+    const initial = f.makeCoordinator(f.policy);
+    const request = f.request("space:already-admitted");
+    expect((await initial.apply(await initial.plan(request))).status).toBe("converged");
+
+    let historyReads = 0;
+    const counted: FormAdmissionHost = {
+      async inspect(query) {
+        if (query.kind === "History") historyReads++;
+        return await f.durable.inspect(query);
+      },
+      execute: async () => {
+        throw new Error("a no-command apply must not execute an admission command");
+      },
+    };
+    const coordinator = f.makeCoordinator(f.policy, counted);
+    const plan = await coordinator.plan(request);
+    expect(plan.commands).toEqual([]);
+    historyReads = 0;
+
+    const applied = await coordinator.apply(plan);
+    expect(applied.status).toBe("converged");
+    expect(applied.receipts).toEqual([]);
+    expect(applied.nextPlan).toEqual(plan);
+    expect(
+      applied.readback.forms.find((form) => form.formRef.kind === f.firstPackage.formRef.kind),
+    ).toMatchObject({ installed: true, supported: true, activationHead: { active: true } });
+    expect(historyReads).toBe(5);
+  });
+
+  test("a no-command apply rejects a head changed after planning", async () => {
+    const f = await fixture();
+    const request = f.request("space:stale-after-plan");
+    const scoped = f.makeCoordinator(f.policy);
+    expect((await scoped.apply(await scoped.plan(request))).status).toBe("converged");
+    const stale = await scoped.plan(request);
+    expect(stale.commands).toEqual([]);
+
+    const operator = f.makeCoordinator();
+    const deactivate = await operator.plan(f.request("space:stale-after-plan", false));
+    expect((await operator.apply(deactivate)).status).toBe("converged");
+    await expect(scoped.apply(stale)).rejects.toMatchObject({ code: "head_drift" });
+  });
+
+  test("a no-command apply rejects a head changed during its fresh authority read", async () => {
+    const f = await fixture();
+    const request = f.request("space:drift-during-apply");
+    const scoped = f.makeCoordinator(f.policy);
+    expect((await scoped.apply(await scoped.plan(request))).status).toBe("converged");
+    const stale = await scoped.plan(request);
+    expect(stale.commands).toEqual([]);
+
+    const operator = f.makeCoordinator();
+    const deactivate = await operator.plan(f.request("space:drift-during-apply", false));
+    let mutation: Promise<unknown> | undefined;
+    const host: FormAdmissionHost = {
+      async inspect(query) {
+        mutation ??= operator.apply(deactivate);
+        await mutation;
+        return await f.durable.inspect(query);
+      },
+      execute: (command) => f.durable.execute(command),
+    };
+    await expect(f.makeCoordinator(f.policy, host).apply(stale)).rejects.toMatchObject({
+      code: "head_drift",
+    });
+  });
+
+  test("a no-command apply still requires the verifier to be available", async () => {
+    const f = await fixture();
+    const request = f.request("space:verifier-unavailable");
+    const ready = f.makeCoordinator(f.policy);
+    expect((await ready.apply(await ready.plan(request))).status).toBe("converged");
+
+    const unavailable = f.makeCoordinator(
+      f.policy,
+      f.admission,
+      f.catalog,
+      createUnavailableFormAuthorityEvidenceVerifier(),
+    );
+    const plan = await unavailable.plan(request);
+    expect(plan.commands).toEqual([]);
+    await expect(unavailable.apply(plan)).rejects.toMatchObject({ code: "production_not_ready" });
+  });
+
   test("imports and verifies the full package set while activating only approved identities", async () => {
     const f = await fixture();
     const coordinator = f.makeCoordinator(f.policy);
