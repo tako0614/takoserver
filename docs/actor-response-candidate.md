@@ -30,11 +30,16 @@ an embedded public Form implementation identity refuses the source candidate:
 the released-Core admission closure cannot vouch for its newer package bytes.
 The publication-verifying admission path remains unchanged and OFF for Actor.
 The private managed source candidate consumes the exact selection through its
-existing runtime configuration, but the official commercial composition still
-lacks an Actor identity class and settled retail meter source. ActorNamespace
-is an identity, not a relation that inherits a ModuleWorker price. Qualification fixtures may
-inject an explicit technical Actor Offering; that does not establish resale,
-pricing, metering, native qualification, publication or activation.
+existing runtime configuration. The public Host composition now adds an exact
+technical Actor `ProviderOffering` to its Cloudflare proxy only when this
+`actor-forward` source is selected, the exact Form/package/class ABI is
+registered, and the route-less executor exposes class inspection. The proxy
+capability is not a sellable catalog entry: the hosted edge supply parser still
+rejects Actor supply, and no price or meter is inferred. ActorNamespace is an
+identity, not a relation that inherits a ModuleWorker price. This qualification
+does not establish resale, pricing, metering, native lifecycle qualification,
+publication, Host admission, or activation; normal identity create remains
+unavailable without an independently composed sellable catalog Offering.
 
 The generic identity/meter schema is owned by `hosted-edge-supplies.ts` and
 `providers/cloudflare-edge-meter-contract.ts`; the operator's private composition

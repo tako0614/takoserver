@@ -547,6 +547,9 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
       forms: formSource.forms,
       retainedForms: [...edge.forms, ...formSource.retainedForms],
       workerClassRuntimeContracts: formSource.workerClassRuntimeContracts,
+      ...(env.TAKOSERVER_FORM_SOURCE_CANDIDATE === "actor-forward"
+        ? { formSourceCandidate: "actor-forward" as const }
+        : {}),
       now: new Date(),
     }),
   );

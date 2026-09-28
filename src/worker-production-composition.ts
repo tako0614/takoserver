@@ -6,6 +6,7 @@ import {
   createProvisioningProviderPack,
   type DeploymentRuntimeBindingRelation,
 } from "./deployment-composition.ts";
+import { edgeProviderOffering } from "./edge-forms.ts";
 import {
   HOSTED_EDGE_IDENTITY_CLASSES,
   type HostedEdgeSupplies,
@@ -23,7 +24,9 @@ import {
   createCloudflareProviderMeterProxySources,
 } from "./providers/cloudflare-provider-proxy.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "./providers/cloudflare-runtime-bindings.ts";
+import { sameFormRef } from "./takoform/forms.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
+import { supportsClassHolderRuntime } from "./takoform/worker-runtime-contract.ts";
 import type { WorkerClassRuntimeContract } from "./worker-class-runtime-port.ts";
 
 export interface WorkerProductionCompositionEnv {
@@ -59,6 +62,8 @@ export function createWorkerProductionComposition(input: {
   readonly retainedForms?: readonly InstalledTakoformForm[];
   /** Explicit software capability only; does not install Forms or authorize supply. */
   readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
+  /** Exact unpublished source opt-in; default released Forms never expose Actor. */
+  readonly formSourceCandidate?: "actor-forward";
   /** Retained for call-site compatibility; never sent across provider RPC. */
   readonly artifacts?: unknown;
   /** Retained for call-site compatibility; plaintext stays in the Host. */
@@ -109,9 +114,13 @@ export function createWorkerProductionComposition(input: {
     edgeSupplies,
   });
   if (!surface) throw new TypeError("Cloudflare provider executor surface is unavailable");
+  const actorTechnicalOffering = actorForwardTechnicalOffering(input);
+  const providerOfferings = actorTechnicalOffering
+    ? [...surface.offerings, actorTechnicalOffering]
+    : surface.offerings;
   const provider = new CloudflareProviderProxy({
     providerInstallationId: surface.providerInstallationId,
-    offerings: surface.offerings,
+    offerings: providerOfferings,
     recoveryOfferings: surface.recoveryOfferings,
     nativeReadbackAuthorities: surface.nativeReadbackAuthorities,
     managedBaseDomain,
@@ -202,7 +211,7 @@ export function createWorkerProductionComposition(input: {
     providerType: "cloudflare",
     capabilities: {
       meterSources: createCloudflareProviderMeterProxySources({
-        offerings: surface.offerings,
+        offerings: providerOfferings,
         binding,
       }),
       runtimeBindingMaterializer: createCloudflareRuntimeBindingMaterializer("cloudflare"),
@@ -226,6 +235,56 @@ export function createWorkerProductionComposition(input: {
       (offering) => offering.form.apiVersion === "edge.forms.takoform.com",
     ),
   };
+}
+
+/** A technical runtime projection only: it never enters the sellable catalog. */
+function actorForwardTechnicalOffering(input: {
+  readonly env: WorkerProductionCompositionEnv;
+  readonly forms: readonly InstalledTakoformForm[];
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
+  readonly formSourceCandidate?: "actor-forward";
+}): ReturnType<typeof edgeProviderOffering> | undefined {
+  if (
+    input.formSourceCandidate !== "actor-forward" ||
+    typeof input.env.CLOUDFLARE_PROVIDER_EXECUTOR?.inspectWorkerClass !== "function"
+  ) {
+    return undefined;
+  }
+  const actors = input.forms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+      form.identity.formRef.kind === "ActorNamespace",
+  );
+  if (actors.length !== 1) return undefined;
+  const actor = actors[0];
+  if (
+    !actor ||
+    !input.workerClassRuntimeContracts ||
+    !supportsClassHolderRuntime(actor, { contracts: input.workerClassRuntimeContracts })
+  ) {
+    return undefined;
+  }
+  const contract = input.workerClassRuntimeContracts.find((candidate) =>
+    sameFormRef(candidate.formRef, actor.identity.formRef),
+  );
+  const matchingContracts = input.workerClassRuntimeContracts.filter((candidate) =>
+    sameFormRef(candidate.formRef, actor.identity.formRef),
+  );
+  if (
+    !contract ||
+    matchingContracts.length !== 1 ||
+    contract.packageDigest !== actor.identity.packageDigest ||
+    !actor.workerClassRuntime ||
+    contract.runtimeClassRef.name !== actor.workerClassRuntime.providedInterface ||
+    contract.runtimeClassRef.schemaDigest !==
+      actor.workerClassRuntime.runtimeClassRef?.schemaDigest ||
+    contract.runtimeClassRef.version !== actor.workerClassRuntime.runtimeClassRef?.version
+  ) {
+    return undefined;
+  }
+  return edgeProviderOffering(actor, {
+    id: "cloudflare.technical.actor-forward.v1",
+  });
 }
 
 function uniqueExact<T>(values: readonly T[], label: string): T {
