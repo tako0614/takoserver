@@ -291,6 +291,33 @@ export interface CreateProviderDriverOptions {
   /** Provider-private capabilities paired to the provisioners above. */
   readonly providerPacks?: readonly ProviderPack[];
   readonly catalog: Catalog;
+  /**
+   * Operator-composed, noncommercial placement for an exact installed identity
+   * Form. It is considered only when no sellable Offering exists and never
+   * grants catalog discovery, pricing, import, or commercial authority.
+   * Keep the composed Provider installation identity while its Deployments
+   * exist. Removing both this opt-in and that identity is a new, unqualified
+   * operator trust-root change, not a supported fallback for old resources.
+   */
+  readonly noncommercialPlacement?: {
+    /** The same operator composition that constructed the Provider instance. */
+    readonly installations: readonly {
+      readonly provider: Provider;
+      readonly providerInstallationRef: string;
+    }[];
+    resolve(input: {
+      readonly tenantId: string;
+      readonly space: string;
+      readonly form: InstalledTakoformForm["identity"];
+    }): Promise<{
+      readonly tenantId: string;
+      readonly space: string;
+      readonly form: InstalledTakoformForm["identity"];
+      readonly providerPackRef: string;
+      readonly providerInstallationRef: string;
+      readonly offeringId: string;
+    } | null>;
+  };
   readonly ledger: Ledger;
   readonly deployments: ResourceDeploymentStore;
   /** Host-private reservation lifecycle. Opaque refs never cross the Provider port. */
@@ -335,6 +362,16 @@ export function createProviderDriver(
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  const matchesInstalledInstallation = (provider: Provider, ref: string): boolean => {
+    if (provider.installedProviderInstallationRef !== undefined) {
+      return provider.installedProviderInstallationRef === ref;
+    }
+    // While the opt-in composition is installed, an adapter cannot drop its
+    // installation identity and silently regain the historical fallback.
+    return !options.noncommercialPlacement?.installations.some(
+      (installation) => installation.provider === provider,
+    );
+  };
   const packsById = new Map((options.providerPacks ?? []).map((pack) => [pack.id, pack]));
   const soldPlacements = createSoldProviderPlacementSelector({ providers, catalog });
   for (const provider of providers) {
@@ -351,6 +388,11 @@ export function createProviderDriver(
     refs.add(offering.providerInstallationRef);
     installationsByPack.set(offering.providerPackRef, refs);
   }
+  for (const installation of options.noncommercialPlacement?.installations ?? []) {
+    const refs = installationsByPack.get(installation.provider.id) ?? new Set<string>();
+    refs.add(installation.providerInstallationRef);
+    installationsByPack.set(installation.provider.id, refs);
+  }
 
   const selectSold = (
     form: InstalledTakoformForm,
@@ -362,11 +404,57 @@ export function createProviderDriver(
     priceMinor: number;
   } => {
     const { provider, offering, sold } = soldPlacements.select(form.identity.formRef, offeringId);
+    if (!matchesInstalledInstallation(provider, sold.providerInstallationRef)) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
     return {
       provider,
       offering,
       sold,
       priceMinor: sold.pricePlan.provisioning.amountMinor,
+    };
+  };
+
+  const selectNoncommercial = async (input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly form: InstalledTakoformForm;
+  }) => {
+    const placement = await options.noncommercialPlacement?.resolve({
+      tenantId: input.tenantId,
+      space: input.space,
+      form: structuredClone(input.form.identity),
+    });
+    if (!placement) throw new TakoformHostError("unsupported_capability", 422);
+    const provider = byId.get(placement.providerPackRef);
+    const offerings = provider?.offerings.filter(
+      (candidate) =>
+        candidate.id === placement.offeringId &&
+        sameForm(candidate.form, input.form.identity.formRef),
+    );
+    if (
+      !input.form.identity.packageDigest ||
+      placement.tenantId !== input.tenantId ||
+      placement.space !== input.space ||
+      canonicalJson(placement.form) !== canonicalJson(input.form.identity) ||
+      !placement.providerInstallationRef ||
+      catalog.findOffering(placement.offeringId) !== undefined ||
+      !provider ||
+      provider.installedProviderInstallationRef !== placement.providerInstallationRef ||
+      offerings?.length !== 1 ||
+      !offerings[0]?.capabilities.includes("create") ||
+      options.noncommercialPlacement?.installations.filter(
+        (installation) =>
+          installation.provider === provider &&
+          installation.providerInstallationRef === placement.providerInstallationRef,
+      ).length !== 1
+    ) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    return {
+      provider,
+      offering: offerings[0],
+      providerInstallationRef: placement.providerInstallationRef,
     };
   };
 
@@ -475,6 +563,9 @@ export function createProviderDriver(
     if (!provider || offerings?.length !== 1 || offerings[0] === undefined) {
       throw new TakoformHostError("unsupported_capability", 422);
     }
+    if (!matchesInstalledInstallation(provider, providerInstallationRef)) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
     return {
       provider,
       offering: offerings[0],
@@ -485,21 +576,40 @@ export function createProviderDriver(
 
   const selectForMutation = async (input: {
     readonly tenantId: string;
+    /** Runtime-input admission lacks Space; noncommercial identity stays closed there. */
+    readonly space?: string;
     readonly form: InstalledTakoformForm;
     readonly relations: readonly TakoformDriverRelation[];
     readonly offeringId?: string;
   }) => {
+    const catalogPlacements = catalog.offeringsFor(input.form.identity.formRef);
     const soldSelection =
-      input.form.role === "identity" || catalog.offeringsFor(input.form.identity.formRef).length > 0
-        ? selectSold(input.form, input.offeringId)
+      input.form.role === "identity" || catalogPlacements.length > 0
+        ? catalogPlacements.length > 0 || !options.noncommercialPlacement || input.offeringId
+          ? selectSold(input.form, input.offeringId)
+          : undefined
         : undefined;
-    const inheritedSelection = soldSelection
-      ? undefined
-      : await inherited(input.tenantId, input.form, input.relations);
-    const provider = soldSelection?.provider ?? inheritedSelection?.provider;
-    const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+    const noncommercialSelection =
+      input.form.role === "identity" && !soldSelection && input.space
+        ? await selectNoncommercial({
+            tenantId: input.tenantId,
+            space: input.space,
+            form: input.form,
+          })
+        : undefined;
+    if (input.form.role === "identity" && !soldSelection && !noncommercialSelection) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const inheritedSelection =
+      soldSelection || noncommercialSelection
+        ? undefined
+        : await inherited(input.tenantId, input.form, input.relations);
+    const provider =
+      soldSelection?.provider ?? noncommercialSelection?.provider ?? inheritedSelection?.provider;
+    const offering =
+      soldSelection?.offering ?? noncommercialSelection?.offering ?? inheritedSelection?.offering;
     if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
-    return { provider, offering, soldSelection, inheritedSelection };
+    return { provider, offering, soldSelection, noncommercialSelection, inheritedSelection };
   };
 
   const selectedDeployment = async (
@@ -617,6 +727,7 @@ export function createProviderDriver(
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
+    readonly space: string;
     readonly spec: JsonObject;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: Parameters<
@@ -658,12 +769,14 @@ export function createProviderDriver(
         } satisfies TakoformApplySelection,
       } as const;
     }
-    const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
-      tenantId: input.tenantId,
-      form: input.form,
-      relations: input.relations,
-      ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
-    });
+    const { provider, offering, soldSelection, noncommercialSelection, inheritedSelection } =
+      await selectForMutation({
+        tenantId: input.tenantId,
+        space: input.space,
+        form: input.form,
+        relations: input.relations,
+        ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+      });
     assertProviderRuntimeInputs(provider, input.spec);
     const sold = soldSelection?.sold;
     const offeringDigest = sold ? await catalog.digest(sold) : undefined;
@@ -677,6 +790,7 @@ export function createProviderDriver(
     }
     const providerInstallationRef =
       sold?.providerInstallationRef ??
+      noncommercialSelection?.providerInstallationRef ??
       inheritedSelection?.providerInstallationRef ??
       (() => {
         throw new TakoformHostError("backend_unavailable", 503);
@@ -1202,6 +1316,7 @@ export function createProviderDriver(
       sold && !sameForm(sold.form, form) ? recoveryOffering : (currentOffering ?? recoveryOffering);
     if (
       !provider ||
+      !matchesInstalledInstallation(provider, deployment.providerInstallationRef) ||
       !offering ||
       !sameForm(offering.form, form) ||
       (sold !== undefined &&
@@ -1394,7 +1509,8 @@ export function createProviderDriver(
               !selectedProvider ||
               !selectedOffering ||
               selectedProvider.id !== deployment.providerPackRef ||
-              current.providerInstallationRef !== deployment.providerInstallationRef
+              current.providerInstallationRef !== deployment.providerInstallationRef ||
+              !matchesInstalledInstallation(selectedProvider, deployment.providerInstallationRef)
             ) {
               throw new TakoformHostError("backend_unavailable", 503);
             }
@@ -1688,6 +1804,9 @@ export function createProviderDriver(
             if (!provider) {
               throw new ProviderMutationRecoveryError("indeterminate");
             }
+            if (!matchesInstalledInstallation(provider, selection.providerInstallationRef)) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
             // The accepted selection is still exact, and this provider has not been
             // called through the dedicated conclusion seam. Capability absence is
             // therefore the same closed pre-attempt unsupported result as the wire
@@ -1799,6 +1918,9 @@ export function createProviderDriver(
             }
             const provider = byId.get(selection.providerPackRef);
             if (!provider) throw new ProviderMutationRecoveryError("indeterminate");
+            if (!matchesInstalledInstallation(provider, selection.providerInstallationRef)) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
             const compensate = provider.compensateApply;
             if (!compensate) throw new ProviderApplyCompensationUnsupportedError();
 
@@ -2789,6 +2911,12 @@ export function createProviderDriver(
         // capability. Missing, retired, drifted, or ambiguous authority fails
         // closed without a native provider readback call.
         const provider = byId.get(deployment.providerPackRef);
+        if (
+          provider &&
+          !matchesInstalledInstallation(provider, deployment.providerInstallationRef)
+        ) {
+          return await attest("indeterminate", "provider_unavailable");
+        }
         const catalogOffering = catalog.findOffering(deployment.offeringId);
         if (
           catalogOffering &&

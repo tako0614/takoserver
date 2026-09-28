@@ -513,6 +513,13 @@ export interface ProviderNativeReadbackInput {
 export interface Provider {
   readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
+  /**
+   * Exact installed account/namespace identity for a single-installation
+   * Provider instance. Optional for historical adapters; noncommercial
+   * identity placement requires it and retained Deployments check it when
+   * present. This is not a customer-selectable installation.
+   */
+  readonly installedProviderInstallationRef?: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
   /** Exact historical capabilities usable only for recorded Deployment recovery. */

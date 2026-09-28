@@ -87,6 +87,7 @@ export interface CloudflareProviderProxyOptions {
 export class CloudflareProviderProxy implements Provider {
   readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
+  readonly installedProviderInstallationRef: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
@@ -99,6 +100,7 @@ export class CloudflareProviderProxy implements Provider {
 
   constructor(options: CloudflareProviderProxyOptions) {
     this.id = options.id ?? "cloudflare";
+    this.installedProviderInstallationRef = options.providerInstallationId;
     this.offerings = structuredClone(options.offerings);
     if (options.recoveryOfferings) {
       this.recoveryOfferings = structuredClone(options.recoveryOfferings);
