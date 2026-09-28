@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
@@ -164,6 +164,185 @@ describe("Wrangler OAuth Worker reader", () => {
         },
       }).workerDeployments(WORKER),
     ).rejects.toThrow("could not be started");
+  });
+});
+
+describe("Wrangler staged Version secrets option", () => {
+  const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-secrets-${crypto.randomUUID()}`;
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const lease = {
+    accountId: target.accountId,
+    workerName: WORKER,
+    release: async () => {},
+  };
+
+  test("omits the option by default and preserves the existing upload argv", async () => {
+    const commands: string[][] = [];
+    const failure = await publishWranglerVersion({
+      root: `${root}/omitted`,
+      bundlePath: `${root}/bundle.js`,
+      configPath: `${root}/wrangler.jsonc`,
+      accountId: target.accountId,
+      workerName: WORKER,
+      message: "staged-version",
+      lease,
+      wranglerPath: "wrangler",
+      assertPredecessorStillCurrent: async () => {
+        throw new Error("stop before traffic deployment");
+      },
+      run: async (command, options) => {
+        commands.push([...command]);
+        const outputPath = options?.env?.WRANGLER_OUTPUT_FILE_PATH;
+        if (!outputPath) throw new Error("missing upload output path");
+        await Bun.write(
+          outputPath,
+          JSON.stringify({
+            type: "version-upload",
+            version: 1,
+            worker_name: WORKER,
+            worker_tag: null,
+            version_id: VERSION,
+            preview_url: null,
+            preview_alias_url: null,
+            worker_name_overridden: false,
+          }),
+        );
+        return result("Uploaded\n");
+      },
+    }).catch((error) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(commands).toEqual([
+      [
+        "wrangler",
+        "versions",
+        "upload",
+        `${root}/bundle.js`,
+        "--name",
+        WORKER,
+        "--no-bundle",
+        "--config",
+        `${root}/wrangler.jsonc`,
+        "--strict",
+        "--message",
+        "staged-version",
+      ],
+    ]);
+  });
+
+  test("forwards one absolute secrets-file path only to the staged upload", async () => {
+    const commands: string[][] = [];
+    const secretsFilePath = `${root}/sealed-input.json`;
+    const failure = await publishWranglerVersion({
+      root: `${root}/provided`,
+      bundlePath: `${root}/bundle.js`,
+      configPath: `${root}/wrangler.jsonc`,
+      accountId: target.accountId,
+      workerName: WORKER,
+      message: "staged-version",
+      lease,
+      wranglerPath: "wrangler",
+      secretsFilePath,
+      assertPredecessorStillCurrent: async () => {
+        throw new Error("stop before traffic deployment");
+      },
+      run: async (command, options) => {
+        commands.push([...command]);
+        const outputPath = options?.env?.WRANGLER_OUTPUT_FILE_PATH;
+        if (!outputPath) throw new Error("missing upload output path");
+        await Bun.write(
+          outputPath,
+          JSON.stringify({
+            type: "version-upload",
+            version: 1,
+            worker_name: WORKER,
+            worker_tag: null,
+            version_id: VERSION,
+            preview_url: null,
+            preview_alias_url: null,
+            worker_name_overridden: false,
+          }),
+        );
+        return result("Uploaded\n");
+      },
+    }).catch((error) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(commands).toEqual([
+      [
+        "wrangler",
+        "versions",
+        "upload",
+        `${root}/bundle.js`,
+        "--name",
+        WORKER,
+        "--no-bundle",
+        "--config",
+        `${root}/wrangler.jsonc`,
+        "--strict",
+        "--message",
+        "staged-version",
+        "--secrets-file",
+        secretsFilePath,
+      ],
+    ]);
+  });
+
+  test("rejects a non-absolute path before subprocess and sanitizes upload failure", async () => {
+    let invocations = 0;
+    const invalid = await publishWranglerVersion({
+      root: `${root}/invalid`,
+      bundlePath: `${root}/bundle.js`,
+      configPath: `${root}/wrangler.jsonc`,
+      accountId: target.accountId,
+      workerName: WORKER,
+      message: "staged-version",
+      lease,
+      secretsFilePath: "relative/secrets.json",
+      assertPredecessorStillCurrent: async () => {},
+      run: async () => {
+        invocations += 1;
+        return result("unexpected");
+      },
+    }).catch((error) => error);
+    expect(invalid).toBeInstanceOf(DeployError);
+    expect((invalid as DeployError).phase).toBe("preflight");
+    expect(invocations).toBe(0);
+
+    const secretsFilePath = `${root}/synthetic-secret-value.json`;
+    const secretContents = "SYNTHETIC_SECRET_CONTENT_MUST_NOT_ESCAPE";
+    const commands: string[][] = [];
+    const failure = await publishWranglerVersion({
+      root: `${root}/failed`,
+      bundlePath: `${root}/bundle.js`,
+      configPath: `${root}/wrangler.jsonc`,
+      accountId: target.accountId,
+      workerName: WORKER,
+      message: "staged-version",
+      lease,
+      wranglerPath: "wrangler",
+      secretsFilePath,
+      assertPredecessorStillCurrent: async () => {},
+      run: async (command) => {
+        invocations += 1;
+        commands.push([...command]);
+        return {
+          exitCode: 17,
+          stdout: `upload failed: ${secretContents} ${secretsFilePath}`,
+          stderr: `upload failed: ${secretContents} ${secretsFilePath}`,
+        };
+      },
+    }).catch((error) => error);
+
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe("mutation");
+    expect((failure as DeployError).message).toContain("do not retry before --status");
+    expect(JSON.stringify(failure)).not.toContain(secretContents);
+    expect(JSON.stringify(failure)).not.toContain(secretsFilePath);
+    expect(invocations).toBe(1);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain("upload");
+    expect(commands[0]).not.toContain("deploy");
   });
 });
 
