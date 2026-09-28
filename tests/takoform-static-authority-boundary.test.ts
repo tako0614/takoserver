@@ -141,12 +141,14 @@ async function reachableModules(entrypoints: readonly string[]): Promise<Readonl
 }
 
 test("the generated 17-Form corpus is candidate input, never runtime admission", async () => {
-  const [appSource, bunEntrySource, workerEntrySource, edge] = await Promise.all([
-    source("src/app.ts"),
-    source("src/entry-bun.ts"),
-    source("src/entry-worker.ts"),
-    buildEdgeForms(),
-  ]);
+  const [appSource, bunEntrySource, workerEntrySource, hostSourceSelector, edge] =
+    await Promise.all([
+      source("src/app.ts"),
+      source("src/entry-bun.ts"),
+      source("src/entry-worker.ts"),
+      source("src/public-host-form-source.ts"),
+      buildEdgeForms(),
+    ]);
   const candidates = currentTakoformCandidates();
 
   expect(appSource).toMatch(/readonly\s+forms\s*:\s*readonly\s+InstalledTakoformForm\[\]/u);
@@ -162,11 +164,20 @@ test("the generated 17-Form corpus is candidate input, never runtime admission",
   expect(bunEntrySource).toMatch(/forms\s*:\s*currentCandidates\.forms\b/u);
   expect(bunEntrySource).toMatch(/hostForms\s*:\s*currentCandidates\.forms\b/u);
   expect(workerEntrySource).toMatch(
-    /const\s+currentCandidates\s*=\s*currentTakoformCandidates\s*\(\s*\)/u,
+    /selectPublicHostFormSource\(\s*env\.TAKOSERVER_FORM_SOURCE_CANDIDATE,\s*implementationIdentity\s*\)/u,
   );
-  expect(workerEntrySource).toMatch(/forms\s*:\s*currentCandidates\.forms\b/u);
-  expect(workerEntrySource).toMatch(/retainedForms\s*:\s*edge\.forms\b/u);
-  expect(workerEntrySource).toMatch(/hostForms\s*:\s*currentCandidates\.forms\b/u);
+  expect(hostSourceSelector).toMatch(
+    /const\s+selected\s*=\s*selectTakoformCandidates\(candidate\)/u,
+  );
+  expect(hostSourceSelector).toMatch(/if\s*\(candidate\s*===\s*"actor-forward"\)/u);
+  expect(workerEntrySource).toMatch(/forms\s*:\s*formSource\.forms\b/u);
+  expect(workerEntrySource).toMatch(
+    /retainedForms\s*:\s*\[\.\.\.edge\.forms,\s*\.\.\.formSource\.retainedForms\]/u,
+  );
+  expect(workerEntrySource).toMatch(
+    /hostForms\s*:\s*\[\.\.\.formSource\.forms,\s*\.\.\.formSource\.retainedForms\]/u,
+  );
+  expect(workerEntrySource).not.toContain("currentTakoformCandidates");
   expect(bunEntrySource).not.toContain("stableProductionTakoformCatalog");
   expect(workerEntrySource).not.toContain("stableProductionTakoformCatalog");
   expect(appSource).not.toContain("stableProductionTakoformCatalog");
