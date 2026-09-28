@@ -10,34 +10,37 @@ import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/
 import { actorForm, fixture, insert, resource, scope } from "./helpers/actor-resource-fixture.ts";
 
 const opened: WorkerdActorNamespaceOptions[] = [];
-mock.module("../src/selfhost-actor-native-process.ts", () => ({
-  openWorkerdActorNamespace: async (
-    _binary: string,
-    options: WorkerdActorNamespaceOptions,
-  ): Promise<WorkerdActorNamespace> => {
-    opened.push(options);
-    let exit!: () => void;
-    const exited = new Promise<void>((resolve) => {
-      exit = resolve;
-    });
-    return {
-      epoch: "test-epoch",
-      actorProxySocketPath: "/tmp/unused-actor-upgrade.sock",
-      duplexTarget: (id, variantKey) => ({
-        socketPath: "/tmp/unused-actor-upgrade.sock",
-        headers: { "x-test-id": id, "x-test-variant": variantKey },
-      }),
-      async settleDuplex() {},
-      exited,
-      fetch: async (_id, _request, variantKey) => Response.json({ variantKey }),
-      enableAlarmAdmission() {},
-      disableAlarmAdmission() {},
-      async close() {
-        exit();
-      },
-    };
-  },
-}));
+const childMode = process.env.TAKOS_SOCKET_ADMISSION_ISOLATED_CHILD === "1";
+
+if (childMode)
+  mock.module("../src/selfhost-actor-native-process.ts", () => ({
+    openWorkerdActorNamespace: async (
+      _binary: string,
+      options: WorkerdActorNamespaceOptions,
+    ): Promise<WorkerdActorNamespace> => {
+      opened.push(options);
+      let exit!: () => void;
+      const exited = new Promise<void>((resolve) => {
+        exit = resolve;
+      });
+      return {
+        epoch: "test-epoch",
+        actorProxySocketPath: "/tmp/unused-actor-upgrade.sock",
+        duplexTarget: (id, variantKey) => ({
+          socketPath: "/tmp/unused-actor-upgrade.sock",
+          headers: { "x-test-id": id, "x-test-variant": variantKey },
+        }),
+        async settleDuplex() {},
+        exited,
+        fetch: async (_id, _request, variantKey) => Response.json({ variantKey }),
+        enableAlarmAdmission() {},
+        disableAlarmAdmission() {},
+        async close() {
+          exit();
+        },
+      };
+    },
+  }));
 
 const { createSelfhostActorExecutionHost } = await import(
   "../src/selfhost-actor-execution-host.ts"
@@ -71,7 +74,7 @@ function publication(workerResourceUid: string): WorkerdDeploymentPublication {
   };
 }
 
-test("socket admission freshly selects a Version in its namespace and owns a distinct lease", async () => {
+const socketAdmissionTest = async () => {
   opened.length = 0;
   const root = await mkdtemp(join(tmpdir(), "actor-socket-admission-"));
   const f = fixture();
@@ -181,9 +184,46 @@ test("socket admission freshly selects a Version in its namespace and owns a dis
     f.database.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+};
 
-test("duplex target lease is selected under live authority and fenced again at commit", async () => {
+if (childMode) {
+  test(
+    "socket admission freshly selects a Version in its namespace and owns a distinct lease",
+    socketAdmissionTest,
+  );
+} else {
+  test("socket admission tests isolate their persistent module mock", async () => {
+    const child = Bun.spawn([process.execPath, "test", import.meta.path], {
+      cwd: process.cwd(),
+      env: { ...process.env, TAKOS_SOCKET_ADMISSION_ISOLATED_CHILD: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(exitCode).toBe(0, `${stdout}\n${stderr}`);
+
+    const { createActorAlarmAttemptRegistry } = await import(
+      "../src/selfhost-actor-native-process.ts"
+    );
+    const released: string[] = [];
+    const attempts = createActorAlarmAttemptRegistry((leaseId) => released.push(leaseId));
+    const grant = await attempts.begin("actor", "attempt", Date.now() + 5_000, async () => ({
+      variantKey: "version",
+      generationKey: "generation",
+      epoch: "epoch",
+      leaseId: "lease",
+    }));
+    expect(grant?.leaseId).toBe("lease");
+    attempts.complete("attempt", Date.now() + 5_000);
+    expect(released).toEqual(["lease"]);
+  });
+}
+
+const duplexTargetLeaseTest = async () => {
   opened.length = 0;
   const root = await mkdtemp(join(tmpdir(), "actor-duplex-authority-"));
   const f = fixture();
@@ -245,4 +285,10 @@ test("duplex target lease is selected under live authority and fenced again at c
     f.database.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+};
+
+if (childMode)
+  test(
+    "duplex target lease is selected under live authority and fenced again at commit",
+    duplexTargetLeaseTest,
+  );
