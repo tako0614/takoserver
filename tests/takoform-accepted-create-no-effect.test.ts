@@ -651,6 +651,28 @@ test("keeps current accepted dependencies on ordinary apply recovery", async () 
   expect(fixture.compensationInputs).toHaveLength(0);
 });
 
+test("compensates current accepted dependencies only after an exact provider nomination", async () => {
+  const fixture = await acceptedCompensationFixture({ nominateCurrent: true });
+  const terminal = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await terminal?.json()).toMatchObject({
+    id: fixture.operationId,
+    done: true,
+    error: { code: "conflict", message: "the accepted create was durably compensated" },
+  });
+  expect(fixture.recoverySequence).toEqual(["no-effect:open", "compensate:first"]);
+  expect(fixture.compensationInputs).toHaveLength(1);
+});
+
+test("a cross-operation nomination cannot start current-dependency compensation", async () => {
+  const fixture = await acceptedCompensationFixture({
+    nominateCurrent: true,
+    nominationOperationId: "wrong",
+  });
+  const terminal = await fixture.host.handle(request(`${lane}/operations/${fixture.operationId}`));
+  expect(await terminal?.json()).toMatchObject({ id: fixture.operationId, done: false });
+  expect(fixture.compensationInputs).toHaveLength(0);
+});
+
 test("holds instead of compensating when accepted dependency claims are incomplete", async () => {
   const fixture = await acceptedCompensationFixture();
   fixture.database
@@ -1058,6 +1080,8 @@ async function acceptedCompensationFixture(
   options: {
     readonly compensationChargeMinor?: number;
     readonly compensationOnly?: boolean;
+    readonly nominateCurrent?: boolean;
+    readonly nominationOperationId?: string;
     readonly invalidateSelectionVerification?: boolean;
     readonly loseFirstAcknowledgement?: boolean;
     readonly settlementFault?: "insert-deployment" | "invalidate-lease" | "lost-acknowledgement";
@@ -1199,8 +1223,18 @@ async function acceptedCompensationFixture(
     ...(options.compensationOnly
       ? {}
       : {
-          async concludeApplyNoEffect() {
+          async concludeApplyNoEffect(input) {
             recoverySequence.push(`no-effect:${compensationPersisted ? "compensated" : "open"}`);
+            if (options.nominateCurrent) {
+              if (input.selection.kind !== "provider")
+                throw new Error("expected provider selection");
+              return {
+                phase: "compensation_required" as const,
+                operationId: options.nominationOperationId ?? input.operationId,
+                providerInstallationRef: input.selection.providerInstallationRef,
+                executionAuthority: { ...input.executionAuthority },
+              };
+            }
             throw new ProviderApplyNoEffectUnsupportedError();
           },
         }),

@@ -235,9 +235,16 @@ export async function deriveImplementationCatalog(input: {
   readonly capabilities: TakoformLifecycleCapabilityManifest;
   readonly handlers: TakoformHandlerManifest;
   readonly operatorOperations?: Readonly<Record<string, readonly TakoformOperation[]>>;
+  /** Software-owned exact overrides when multiple definitions share a kind.
+   * Supplying a set is exhaustive: absent identities get no operations, never
+   * a fallback to another definition's kind-level declaration. */
+  readonly exactCapabilities?: readonly TakoformImplementationCatalogEntry[];
+  readonly exactHandlers?: readonly TakoformImplementationCatalogEntry[];
 }): Promise<TakoformImplementationCatalog> {
   validateManifestIdentity(input.capabilities.apiVersion, input.capabilities.implementation);
   validateManifestIdentity(input.handlers.apiVersion, input.handlers.artifact);
+  const exactCapabilities = exactOperationMap(input.exactCapabilities);
+  const exactHandlers = exactOperationMap(input.exactHandlers);
   const forms = [...input.forms].sort((left, right) =>
     canonicalJson(left.identity.formRef).localeCompare(canonicalJson(right.identity.formRef)),
   );
@@ -261,8 +268,17 @@ export async function deriveImplementationCatalog(input: {
     });
     const kind = form.identity.formRef.kind;
     const declared = operationSet(form.operations, `Form ${kind}`);
-    const capable = operationSet(input.capabilities.forms[kind] ?? [], `capability ${kind}`);
-    const handled = operationSet(input.handlers.forms[kind] ?? [], `handler ${kind}`);
+    const exactKey = `${key}\0${packageDigest}`;
+    const capable = operationSet(
+      exactCapabilities
+        ? (exactCapabilities.get(exactKey) ?? [])
+        : (input.capabilities.forms[kind] ?? []),
+      `capability ${kind}`,
+    );
+    const handled = operationSet(
+      exactHandlers ? (exactHandlers.get(exactKey) ?? []) : (input.handlers.forms[kind] ?? []),
+      `handler ${kind}`,
+    );
     const available = OPERATION_ORDER.filter(
       (operation) => declared.has(operation) && capable.has(operation) && handled.has(operation),
     );
@@ -287,9 +303,19 @@ export async function deriveImplementationCatalog(input: {
   }
   const normalizedCapabilities = normalizedManifest(input.capabilities);
   const normalizedHandlers = normalizedManifest(input.handlers);
-  const capabilityDigest = await canonicalDigest(normalizedCapabilities);
+  const capabilityDigest = await canonicalDigest(
+    exactCapabilities
+      ? {
+          ...normalizedCapabilities,
+          exactForms: [...exactCapabilities].sort(([left], [right]) => left.localeCompare(right)),
+        }
+      : normalizedCapabilities,
+  );
   const implementationDigest = await canonicalDigest({
     handlers: normalizedHandlers,
+    ...(exactHandlers
+      ? { exactHandlers: [...exactHandlers].sort(([left], [right]) => left.localeCompare(right)) }
+      : {}),
     capabilityDigest,
     candidates: candidateIdentities,
     entries,
@@ -300,6 +326,26 @@ export async function deriveImplementationCatalog(input: {
     implementationDigest,
     entries,
   };
+}
+
+function exactOperationMap(
+  entries: readonly TakoformImplementationCatalogEntry[] | undefined,
+): ReadonlyMap<string, readonly TakoformOperation[]> | undefined {
+  if (entries === undefined) return undefined;
+  const result = new Map<string, readonly TakoformOperation[]>();
+  for (const entry of entries) {
+    validateFormRef(entry.formRef);
+    if (!isSha256Digest(entry.packageDigest))
+      throw new TypeError("exact Form operations need a package digest");
+    const key = `${canonicalJson(entry.formRef)}\0${entry.packageDigest}`;
+    if (result.has(key)) throw new TypeError("exact Form operations contain a duplicate identity");
+    const operations = operationSet(entry.operations, "exact Form");
+    result.set(
+      key,
+      OPERATION_ORDER.filter((operation) => operations.has(operation)),
+    );
+  }
+  return result;
 }
 
 function normalizedManifest(

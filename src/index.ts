@@ -130,10 +130,14 @@ export {
   type ProviderRuntimeInputCapabilities,
   type ProviderRuntimeInputDispatchedLease,
   type ProviderRuntimeInputLease,
+  type ProviderRuntimeInputLeaseFence,
   type ProviderRuntimeInputLeasePort,
+  type ProviderRuntimeInputNoEffectInput,
+  type ProviderRuntimeInputPinnedGeneration,
   type ProviderRuntimeInputPreparationIdentity,
   type ProviderRuntimeInputRecoveryInput,
   type ProviderRuntimeInputRecoveryLease,
+  type ProviderRuntimeInputSqlPredicate,
   type ProviderRuntimeInputTarget,
 } from "./provider-runtime-input-port.ts";
 export {

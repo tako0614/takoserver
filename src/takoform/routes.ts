@@ -292,7 +292,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           },
         }
       : {}),
-    async handle(incoming): Promise<Response | null> {
+    async handle(incoming, lifetime): Promise<Response | null> {
       const request = laneRequest(incoming, configuration);
       const url = new URL(request.url);
       if (url.pathname.startsWith(`${PROVISION_LANE}/`)) {
@@ -320,6 +320,7 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
       const exactScope = principal.scope?.mode === "tenant-run" ? undefined : principal.scope;
       const context: EngineContext = {
         request,
+        ...(lifetime ? { lifetime } : {}),
         url,
         tenantId: boundedTenantReference(principal.tenantId),
         principalId: boundedTenantReference(principal.principalId),

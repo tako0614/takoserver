@@ -88,6 +88,61 @@ export const DEPLOY_CONTRACT = {
   kind: "takos.deploy-contract@v2",
   surfaces: [
     {
+      surface: "takoserver-existing-space-operator-worker",
+      target: "cloudflare-worker:explicit-existing-space-operator-ingress",
+      covers: [
+        "src/existing-space-operator.ts",
+        "src/existing-space-operator-proof.ts",
+        "src/entry-existing-space-operator-worker.ts",
+        "wrangler.existing-space-operator.jsonc",
+        "scripts/deploy/form-authority.ts",
+        "scripts/deploy/target.ts",
+      ],
+      requiresScripts: ["check", "build:form-authority-worker"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      triggers: ["authority"],
+      obligations: {
+        provenance: `${exactSource} Build exact bridge bytes and prove current public Host and released-Core authority source/identity/policy closure before one upload. Explicit formAuthority.existingSpaceOperator selects a dedicated HTTPS ingress and dedicated public key, never defaults. ${cloudflareTokenInput}`,
+        "post-conditions":
+          "Read exact Version/source, two service bindings, five vars, custom domain and disabled workers.dev/preview topology; confirm live Host and released-Core authority identities. The bridge exposes only signed existing-space reconciliation/readback and has no storage/provider/customer authority.",
+        reversal:
+          "Rollback code only to a known compatible provider Version after inspecting authority/policy closure. Ingress/key/policy changes require separate reviewed authority transition; never reactivate or deactivate Forms as rollback.",
+        "failure-handling": highRiskFailure,
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-existing-space-reconciliation",
+      target: "takoserver:explicit-existing-space-positive-head-reconciliation",
+      covers: [
+        "scripts/deploy/existing-space-operator.ts",
+        "src/existing-space-operator.ts",
+        "src/existing-space-operator-proof.ts",
+        "src/takoform/existing-space-admission.ts",
+      ],
+      requiresScripts: ["check"],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_EXISTING_SPACE_REQUEST_PATH",
+        "TAKOSERVER_EXISTING_SPACE_OPERATOR_PRIVATE_JWK_PATH",
+      ],
+      triggers: ["authority"],
+      obligations: {
+        provenance: `${exactSource} TAKOSERVER_EXISTING_SPACE_REQUEST_PATH selects an explicit owned 0600 request containing policyDigest and 1..100 unique Spaces, with no discovery/default scope. TAKOSERVER_EXISTING_SPACE_OPERATOR_PRIVATE_JWK_PATH selects the dedicated owned 0600 operator signing key. Both actions require exact deployed bridge/authority/Host/policy proof and dedicated operator key. Apply requires independent review and sends one closed signed reconciliation request. ${cloudflareTokenInput}`,
+        "post-conditions":
+          "Status invokes only signed POST readback, never reconcile/plan/apply. Apply performs one reconcile then exact existing v2 per-Space readback; only reported existing positive heads are proven, not new grants or application readiness.",
+        reversal:
+          "Positive reconciliation retains prior writes on partial/unknown outcome. Inspect status and explicitly forward repair; no automated retry, rollback, grant, or deactivation.",
+        "failure-handling":
+          highRiskFailure +
+          " All mutation HTTP/transport errors remain indeterminate; no implicit retry. Readback uses bounded signed POST bodies rather than unsupported GET bodies.",
+        "independent-review": applyReviewInput,
+      },
+    },
+    {
       surface: "takoserver-worker",
       target: "cloudflare-worker:environment-selected-takoserver-worker",
       covers: [
@@ -384,7 +439,7 @@ export const DEPLOY_CONTRACT = {
           "successor values; the predecessor must have exactly those old STATE_DB/OBJECTS bindings, " +
           "and all other closure names, types and fields remain exact. Before upload and again at the " +
           "immediate publication fence, read-only verification proves the target D1 UUID/name, exact " +
-          "R2 name, audited 0001-0063 lineage and canonical migrated schema. Production and rehearsal " +
+          "R2 name, audited 0001-0066 lineage and canonical migrated schema. Production and rehearsal " +
           "refuse this pair before provider effects. " +
           integrationServiceBindingRefresh +
           " This one integration rebind branch runs " +
@@ -997,11 +1052,11 @@ export const DEPLOY_CONTRACT = {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
           "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
-          "the fixed audited 0001-0063 names and bytes are sealed before creation. A separately " +
+          "the fixed audited 0001-0066 names and bytes are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "0001-0063 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
+          "0001-0066 lineage and canonical schema after one Wrangler file import, then creates and reads back one new R2 bucket. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1166,7 +1221,7 @@ export const DEPLOY_CONTRACT = {
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0063; unreviewed 0064+ tails are refused before any provider command. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0066; unreviewed 0067+ tails are refused before qualification or provider mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the full audited lineage. Protected wave selectors still end at 0057. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1193,6 +1248,9 @@ export const DEPLOY_CONTRACT = {
           "The 0056 boundary adds Host-owned bounded VectorIndex SQL storage after 0055: immutable cosine index configuration, per-Resource record quotas, binary32 vector records, and type-sensitive equality filter terms; it changes no published identity, binding or provider catalog. " +
           "The 0057 boundary adds receipt-coupled, provider-private execution-material tables for immutable managed Worker Versions after 0056; it stores only bounded execution descriptors and sealed values, and does not publish a Worker, activate custody, or apply any schema automatically. " +
           "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
+          "The separate integration-only 0063 to 0064 transition adds an Actor owner claim table without rewriting the Worker receipt table or admitting Actors; it performs no backfill and changes no protected selector. " +
+          "The separate integration-only 0064 to 0065 transition adds a value-free runtime-input lease generation and backfills prepared/claimed rows from their live seal nonce; historical dispatched and terminal rows with no nonce remain NULL and fail closed on ambiguous acknowledgement. It changes no protected selector. " +
+          "The separate integration-only 0065 to 0066 transition adds only an Actor KV capability claim WITHOUT ROWID table and three triggers. It performs no backfill, preserves existing data, and changes no public API, Actor admission or protected selector. " +
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
@@ -1226,7 +1284,7 @@ export const DEPLOY_CONTRACT = {
           "bundle it with the 0059/0060 transition. Have the compatible Host ready before migration; " +
           "publish it only after schema readback, then reconcile current Form authority as needed. " +
           "A separate exact 0061 to 0062 integration transition requires the audited 0061 predecessor " +
-          "and canonical 0061 application shape, from exact current 0001-0063 source. It requires zero planned current-generation imports " +
+          "and canonical 0061 application shape, from exact current 0001-0066 source. It requires zero planned current-generation imports " +
           "before qualification and at the final mutation fence; the migration, ledger insert and " +
           "old-writer fence are one atomic D1 transaction. New import writers explicitly insert immutable " +
           "import_selection_protocol=1; old inserts are refused before preparation. The import selection " +
@@ -1236,7 +1294,8 @@ export const DEPLOY_CONTRACT = {
           "order as a forward-only integration repair; it grants no production authorization. " +
           "The executor protocol generation is unchanged; unrelated components need not be republished. " +
           "This forward-only availability boundary is not a zero-downtime or historical recovery claim. " +
-          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0063 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition.",
+          "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0066 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition. " +
+          "The following exact 0063 to 0064 integration transition requires canonical all-0063 shape and only the audited 0064 suffix. It preserves existing Worker receipts, adds no Actor admission, and has no data backfill or generic quiescence claim. Its migration and ledger insert are atomic, exact all-0064 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. The next exact 0064 to 0065 integration transition requires canonical all-0064 shape and only the audited 0065 suffix. Its backfill retains the nonce for live prepared/claimed rows; historical dispatched/terminal NULL remains closed. The migration and ledger insert are atomic, exact all-0065 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. Both remain protected non-disposable D1 migrations, not resets or raw SQL workarounds; independent source and live-state review precedes any real release.",
         "pre-mutation-proof":
           "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
@@ -1249,6 +1308,9 @@ export const DEPLOY_CONTRACT = {
           "the exact 0061 predecessor shape, zero planned current-generation imports and the unique " +
           "native-destination reservation through receipt publication before the local D1 migration gate. " +
           "The separate 0062 to 0063 transition checks the exact canonical 0062 predecessor at initial preflight, after qualification and at an immediate mutation read, then requires the exact canonical 0063 post-shape. It admits no other pending suffix and leaves all protected selectors capped at 0057. " +
+          "The separate 0063 to 0064 transition likewise checks exact canonical 0063 shape at initial preflight, after qualification and immediately before mutation; it accepts only the audited 0064 suffix and requires exact canonical 0064 post-shape. " +
+          "The separate 0064 to 0065 transition checks exact canonical 0064 shape at the same three fences; it accepts only the audited 0065 suffix and requires exact canonical 0065 post-shape. " +
+          "The separate 0065 to 0066 transition checks exact canonical 0065 shape at initial preflight, after source and focused-test qualification, at final preflight and immediately before mutation. It accepts only the audited 0066 suffix, applies its SQL and d1_migrations insert in one transaction, and requires exact all-0066 lineage and canonical post-shape. Unknown acknowledgement requires authoritative readback, never blind replay. Status may show complete; apply refuses already-complete no-op mutation evidence. Local preservation and rollback tests do not grant live mutation authority; independent source and live-state review remain required. " +
           "Rehearsal writes " +
           "one no-overwrite 0600 receipt per wave outside every " +
           "repository. Production requires that exact commit, predecessor, through boundary, wave " +

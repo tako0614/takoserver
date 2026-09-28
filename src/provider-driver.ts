@@ -10,9 +10,14 @@ import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Ledger, LedgerHeldCharge } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
-import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
+import {
+  createNoncommercialProviderPlacementSelector,
+  createSoldProviderPlacementSelector,
+  type NoncommercialPlacementComposition,
+} from "./provider-placement.ts";
 import {
   type Provider,
+  type ProviderApplyCompensationNomination,
   type ProviderExecutionAuthority,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
@@ -63,6 +68,8 @@ import type {
 } from "./takoform/types.ts";
 import { TakoformHostError } from "./takoform/types.ts";
 import { increment } from "./takoform/wire.ts";
+import { validateClassHolderRuntime } from "./takoform/worker-runtime-contract.ts";
+import type { WorkerClassRuntime } from "./worker-class-runtime-port.ts";
 import {
   type WorkerEndpointOriginAssignment,
   WorkerEndpointOriginReservationError,
@@ -79,6 +86,16 @@ type TakoformImportProviderSelection = Extract<
   TakoformImportSelection,
   { readonly kind: "provider" }
 >;
+
+/**
+ * The Host commits this exact Deployment ID after a successful provider create.
+ * The driver passes it as in-process execution context so native identity and
+ * any provider-private custody can bind to the same incarnation without adding
+ * it to the provider's serialized mutation input.
+ */
+function deterministicDeploymentId(operationId: string): string {
+  return `dep_${operationId}`;
+}
 
 function selectStandardServiceProjections(
   provider: Provider,
@@ -278,6 +295,15 @@ export interface CreateProviderDriverOptions {
   /** Provider-private capabilities paired to the provisioners above. */
   readonly providerPacks?: readonly ProviderPack[];
   readonly catalog: Catalog;
+  /**
+   * Operator-composed, noncommercial placement for an exact installed identity
+   * Form. It is considered only when no sellable Offering exists and never
+   * grants catalog discovery, pricing, import, or commercial authority.
+   * Keep the composed Provider installation identity while its Deployments
+   * exist. Removing both this opt-in and that identity is a new, unqualified
+   * operator trust-root change, not a supported fallback for old resources.
+   */
+  readonly noncommercialPlacement?: NoncommercialPlacementComposition;
   readonly ledger: Ledger;
   readonly deployments: ResourceDeploymentStore;
   /** Host-private reservation lifecycle. Opaque refs never cross the Provider port. */
@@ -322,8 +348,25 @@ export function createProviderDriver(
     ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 
   const byId = new Map(providers.map((provider) => [provider.id, provider]));
+  const matchesInstalledInstallation = (provider: Provider, ref: string): boolean => {
+    if (provider.installedProviderInstallationRef !== undefined) {
+      return provider.installedProviderInstallationRef === ref;
+    }
+    // While the opt-in composition is installed, an adapter cannot drop its
+    // installation identity and silently regain the historical fallback.
+    return !options.noncommercialPlacement?.installations.some(
+      (installation) => installation.provider === provider,
+    );
+  };
   const packsById = new Map((options.providerPacks ?? []).map((pack) => [pack.id, pack]));
   const soldPlacements = createSoldProviderPlacementSelector({ providers, catalog });
+  const noncommercialPlacements = options.noncommercialPlacement
+    ? createNoncommercialProviderPlacementSelector({
+        providers,
+        catalog,
+        composition: options.noncommercialPlacement,
+      })
+    : undefined;
   for (const provider of providers) {
     validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
   }
@@ -338,6 +381,11 @@ export function createProviderDriver(
     refs.add(offering.providerInstallationRef);
     installationsByPack.set(offering.providerPackRef, refs);
   }
+  for (const installation of options.noncommercialPlacement?.installations ?? []) {
+    const refs = installationsByPack.get(installation.provider.id) ?? new Set<string>();
+    refs.add(installation.providerInstallationRef);
+    installationsByPack.set(installation.provider.id, refs);
+  }
 
   const selectSold = (
     form: InstalledTakoformForm,
@@ -349,12 +397,24 @@ export function createProviderDriver(
     priceMinor: number;
   } => {
     const { provider, offering, sold } = soldPlacements.select(form.identity.formRef, offeringId);
+    if (!matchesInstalledInstallation(provider, sold.providerInstallationRef)) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
     return {
       provider,
       offering,
       sold,
       priceMinor: sold.pricePlan.provisioning.amountMinor,
     };
+  };
+
+  const selectNoncommercial = async (input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly form: InstalledTakoformForm;
+  }) => {
+    if (!noncommercialPlacements) throw new TakoformHostError("unsupported_capability", 422);
+    return await noncommercialPlacements.select(input);
   };
 
   const providerRelations = async (
@@ -462,6 +522,9 @@ export function createProviderDriver(
     if (!provider || offerings?.length !== 1 || offerings[0] === undefined) {
       throw new TakoformHostError("unsupported_capability", 422);
     }
+    if (!matchesInstalledInstallation(provider, providerInstallationRef)) {
+      throw new TakoformHostError("backend_unavailable", 503);
+    }
     return {
       provider,
       offering: offerings[0],
@@ -472,21 +535,40 @@ export function createProviderDriver(
 
   const selectForMutation = async (input: {
     readonly tenantId: string;
+    /** Runtime-input admission lacks Space; noncommercial identity stays closed there. */
+    readonly space?: string;
     readonly form: InstalledTakoformForm;
     readonly relations: readonly TakoformDriverRelation[];
     readonly offeringId?: string;
   }) => {
+    const catalogPlacements = catalog.offeringsFor(input.form.identity.formRef);
     const soldSelection =
-      input.form.role === "identity" || catalog.offeringsFor(input.form.identity.formRef).length > 0
-        ? selectSold(input.form, input.offeringId)
+      input.form.role === "identity" || catalogPlacements.length > 0
+        ? catalogPlacements.length > 0 || !options.noncommercialPlacement || input.offeringId
+          ? selectSold(input.form, input.offeringId)
+          : undefined
         : undefined;
-    const inheritedSelection = soldSelection
-      ? undefined
-      : await inherited(input.tenantId, input.form, input.relations);
-    const provider = soldSelection?.provider ?? inheritedSelection?.provider;
-    const offering = soldSelection?.offering ?? inheritedSelection?.offering;
+    const noncommercialSelection =
+      input.form.role === "identity" && !soldSelection && input.space
+        ? await selectNoncommercial({
+            tenantId: input.tenantId,
+            space: input.space,
+            form: input.form,
+          })
+        : undefined;
+    if (input.form.role === "identity" && !soldSelection && !noncommercialSelection) {
+      throw new TakoformHostError("unsupported_capability", 422);
+    }
+    const inheritedSelection =
+      soldSelection || noncommercialSelection
+        ? undefined
+        : await inherited(input.tenantId, input.form, input.relations);
+    const provider =
+      soldSelection?.provider ?? noncommercialSelection?.provider ?? inheritedSelection?.provider;
+    const offering =
+      soldSelection?.offering ?? noncommercialSelection?.offering ?? inheritedSelection?.offering;
     if (!provider || !offering) throw new TakoformHostError("unsupported_capability", 422);
-    return { provider, offering, soldSelection, inheritedSelection };
+    return { provider, offering, soldSelection, noncommercialSelection, inheritedSelection };
   };
 
   const selectedDeployment = async (
@@ -604,6 +686,7 @@ export function createProviderDriver(
     readonly tenantId: string;
     readonly resourceUid: string;
     readonly form: InstalledTakoformForm;
+    readonly space: string;
     readonly spec: JsonObject;
     readonly relations: readonly TakoformDriverRelation[];
     readonly commercialAuthority?: Parameters<
@@ -645,12 +728,14 @@ export function createProviderDriver(
         } satisfies TakoformApplySelection,
       } as const;
     }
-    const { provider, offering, soldSelection, inheritedSelection } = await selectForMutation({
-      tenantId: input.tenantId,
-      form: input.form,
-      relations: input.relations,
-      ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
-    });
+    const { provider, offering, soldSelection, noncommercialSelection, inheritedSelection } =
+      await selectForMutation({
+        tenantId: input.tenantId,
+        space: input.space,
+        form: input.form,
+        relations: input.relations,
+        ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
+      });
     assertProviderRuntimeInputs(provider, input.spec);
     const sold = soldSelection?.sold;
     const offeringDigest = sold ? await catalog.digest(sold) : undefined;
@@ -664,6 +749,7 @@ export function createProviderDriver(
     }
     const providerInstallationRef =
       sold?.providerInstallationRef ??
+      noncommercialSelection?.providerInstallationRef ??
       inheritedSelection?.providerInstallationRef ??
       (() => {
         throw new TakoformHostError("backend_unavailable", 503);
@@ -1189,6 +1275,7 @@ export function createProviderDriver(
       sold && !sameForm(sold.form, form) ? recoveryOffering : (currentOffering ?? recoveryOffering);
     if (
       !provider ||
+      !matchesInstalledInstallation(provider, deployment.providerInstallationRef) ||
       !offering ||
       !sameForm(offering.form, form) ||
       (sold !== undefined &&
@@ -1381,7 +1468,8 @@ export function createProviderDriver(
               !selectedProvider ||
               !selectedOffering ||
               selectedProvider.id !== deployment.providerPackRef ||
-              current.providerInstallationRef !== deployment.providerInstallationRef
+              current.providerInstallationRef !== deployment.providerInstallationRef ||
+              !matchesInstalledInstallation(selectedProvider, deployment.providerInstallationRef)
             ) {
               throw new TakoformHostError("backend_unavailable", 503);
             }
@@ -1397,13 +1485,98 @@ export function createProviderDriver(
     throw new TakoformHostError(...failureToWire(result.failure.code));
   };
 
+  const classRuntimes = new Map(
+    providers.flatMap((provider) =>
+      provider.workerClassRuntime
+        ? [
+            [
+              provider.id,
+              {
+                contracts: structuredClone(provider.workerClassRuntime.contracts),
+                inspect: provider.workerClassRuntime.inspect.bind(provider.workerClassRuntime),
+              },
+            ] as const,
+          ]
+        : [],
+    ),
+  );
+  const workerClassRuntime: WorkerClassRuntime | undefined =
+    classRuntimes.size === 0
+      ? undefined
+      : {
+          contracts: [...classRuntimes.values()].flatMap((runtime) =>
+            structuredClone(runtime.contracts),
+          ),
+          async inspect(inputs) {
+            if (inputs.length === 0 || inputs.length > 100) return "unavailable";
+            const snapshots = await Promise.all(
+              inputs.map(async (input) => {
+                const holder = await active(input.tenantId, input.holder.uid);
+                const version = await active(input.tenantId, input.version.uid);
+                if (
+                  holder.providerPackRef !== version.providerPackRef ||
+                  holder.providerInstallationRef !== version.providerInstallationRef
+                )
+                  return null;
+                const owner = installed(holder, input.holder.formRef).provider;
+                if (installed(version, input.version.formRef).provider.id !== owner.id) return null;
+                const runtime = classRuntimes.get(owner.id);
+                if (
+                  !runtime?.contracts.some(
+                    (contract) => canonicalJson(contract) === canonicalJson(input.contract),
+                  )
+                )
+                  return null;
+                return { input: structuredClone(input), holder, version, runtime };
+              }),
+            );
+            if (snapshots.some((snapshot) => snapshot === null)) return "unavailable";
+            for (const snapshot of snapshots) {
+              if (!snapshot) return "unavailable";
+              const { input, holder, version, runtime } = snapshot;
+              const verdict = await runtime.inspect({
+                ...structuredClone(input),
+                providerInstallationRef: holder.providerInstallationRef,
+                holderNativeId: holder.nativeId,
+                versionNativeId: version.nativeId,
+              });
+              if (verdict !== "valid") return verdict === "invalid" ? "invalid" : "unavailable";
+            }
+            // A later inspection may race an earlier Version's placement.
+            // Re-read the whole set only after all inspections have finished.
+            for (const snapshot of snapshots) {
+              if (!snapshot) return "unavailable";
+              const { input, holder, version } = snapshot;
+              const afterHolder = await active(input.tenantId, input.holder.uid);
+              const afterVersion = await active(input.tenantId, input.version.uid);
+              if (
+                canonicalJson(holder) !== canonicalJson(afterHolder) ||
+                canonicalJson(version) !== canonicalJson(afterVersion)
+              )
+                return "unavailable";
+            }
+            return "valid";
+          },
+        };
+
   return {
+    ...(workerClassRuntime ? { workerClassRuntime } : {}),
     runtimeInputPolicy,
     async selectApply(input) {
-      return structuredClone((await resolveApplySelection(input)).selection);
+      const resolved = await resolveApplySelection(input);
+      validateClassHolderRuntime(
+        input.form,
+        "provider" in resolved ? classRuntimes.get(resolved.provider.id) : undefined,
+      );
+      return structuredClone(resolved.selection);
     },
     async selectImport(input) {
-      return structuredClone((await resolveImportSelection(input)).selection);
+      const resolved = await resolveImportSelection(input);
+      validateClassHolderRuntime(
+        input.form,
+        "provider" in resolved ? classRuntimes.get(resolved.provider.id) : undefined,
+      );
+      return structuredClone(resolved.selection);
     },
     artifactConsumerRepair: {
       async verifyNativeAbsence(input) {
@@ -1573,7 +1746,7 @@ export function createProviderDriver(
       ? {
           async concludeApplyNoEffect(
             input: Parameters<NonNullable<TakoformResourceDriver["concludeApplyNoEffect"]>>[0],
-          ): Promise<void> {
+          ): Promise<undefined | ProviderApplyCompensationNomination> {
             const selection = input.selection;
             if (
               selection.kind !== "provider" ||
@@ -1588,6 +1761,9 @@ export function createProviderDriver(
             const provider = byId.get(selection.providerPackRef);
             const concludeApplyNoEffect = provider?.concludeApplyNoEffect;
             if (!provider) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
+            if (!matchesInstalledInstallation(provider, selection.providerInstallationRef)) {
               throw new ProviderMutationRecoveryError("indeterminate");
             }
             // The accepted selection is still exact, and this provider has not been
@@ -1639,6 +1815,23 @@ export function createProviderDriver(
             if (conclusion.phase === "unsupported") {
               throw new ProviderApplyNoEffectUnsupportedError();
             }
+            if (conclusion.phase === "compensation_required") {
+              // This signal is not a failure ticket and must never become
+              // whole-operation no-effect proof or a settlement. Bind it to
+              // the accepted selection and current Host lease before return.
+              const authority = conclusion.executionAuthority;
+              if (
+                conclusion.operationId !== input.operationId ||
+                conclusion.providerInstallationRef !== selection.providerInstallationRef ||
+                authority.tenantId !== input.executionAuthority.tenantId ||
+                authority.resourceUid !== input.executionAuthority.resourceUid ||
+                authority.fingerprint !== input.executionAuthority.fingerprint ||
+                authority.leaseToken !== input.executionAuthority.leaseToken
+              ) {
+                throw new ProviderMutationRecoveryError("indeterminate");
+              }
+              return structuredClone(conclusion);
+            }
             const ticket = conclusion;
             try {
               // A successful or ordinary failure ticket is inconclusive on this
@@ -1684,6 +1877,9 @@ export function createProviderDriver(
             }
             const provider = byId.get(selection.providerPackRef);
             if (!provider) throw new ProviderMutationRecoveryError("indeterminate");
+            if (!matchesInstalledInstallation(provider, selection.providerInstallationRef)) {
+              throw new ProviderMutationRecoveryError("indeterminate");
+            }
             const compensate = provider.compensateApply;
             if (!compensate) throw new ProviderApplyCompensationUnsupportedError();
 
@@ -1792,6 +1988,7 @@ export function createProviderDriver(
           throw new TakoformHostError("backend_unavailable", 503);
         }
         const provider = resolved.provider;
+        validateClassHolderRuntime(input.form, classRuntimes.get(provider.id));
         const offering = structuredClone(resolved.selection.technicalOffering);
         // Recovery adopts the retained runtime binding, not today's integration
         // registry. Initial delivery is fenced before placement or native work.
@@ -1817,10 +2014,7 @@ export function createProviderDriver(
           name: input.name,
           uid: input.resourceUid,
           ...(current && input.previous
-            ? {
-                incarnationId: current.id,
-                generation: input.previous.metadata.generation,
-              }
+            ? { incarnationId: current.id, generation: input.previous.metadata.generation }
             : {}),
         } as const;
         return {
@@ -2036,6 +2230,9 @@ export function createProviderDriver(
           : {}),
         ...(previous ? { previous } : {}),
       } satisfies import("./provider-port.ts").ApplyInput;
+      const executionContext = current
+        ? undefined
+        : { prospectiveDeploymentId: deterministicDeploymentId(input.operationId) };
       let providerBoundaryEntered = false;
       let activatedAssignment: WorkerEndpointOriginAssignment | null = null;
       const mutation: {
@@ -2058,7 +2255,7 @@ export function createProviderDriver(
               )
             : input.operationMode === "recovery"
               ? provider.convergeApply
-                ? await provider.convergeApply(providerInput)
+                ? await provider.convergeApply(providerInput, executionContext)
                 : (() => {
                     // A Host recovery lease may resume a mutation only through
                     // an explicitly operation-keyed convergence seam. The
@@ -2066,7 +2263,7 @@ export function createProviderDriver(
                     // into mutation authority here.
                     throw new ProviderMutationRecoveryError("indeterminate");
                   })()
-              : await provider.apply(providerInput);
+              : await provider.apply(providerInput, executionContext);
           if (
             input.operationMode === "recovery" &&
             !input.providerHandle &&
@@ -2174,7 +2371,7 @@ export function createProviderDriver(
             kind: "create",
             deployment: {
               tenantId: input.tenantId,
-              id: `dep_${input.operationId}`,
+              id: deterministicDeploymentId(input.operationId),
               resourceUid: input.resourceUid,
               offeringId: offering.id,
               providerPackRef: provider.id,
@@ -2220,7 +2417,7 @@ export function createProviderDriver(
         try {
           await deployments.create({
             tenantId: input.tenantId,
-            id: `dep_${input.operationId}`,
+            id: deterministicDeploymentId(input.operationId),
             resourceUid: input.resourceUid,
             offeringId: offering.id,
             providerPackRef: provider.id,
@@ -2673,6 +2870,12 @@ export function createProviderDriver(
         // capability. Missing, retired, drifted, or ambiguous authority fails
         // closed without a native provider readback call.
         const provider = byId.get(deployment.providerPackRef);
+        if (
+          provider &&
+          !matchesInstalledInstallation(provider, deployment.providerInstallationRef)
+        ) {
+          return await attest("indeterminate", "provider_unavailable");
+        }
         const catalogOffering = catalog.findOffering(deployment.offeringId);
         if (
           catalogOffering &&
@@ -2802,6 +3005,7 @@ export function createProviderDriver(
         throw new ProviderMutationDefinitiveRefusalError("backend_unavailable", 503);
       }
       const provider = resolved.provider;
+      validateClassHolderRuntime(input.form, classRuntimes.get(provider.id));
       // The provider object is selected only after the persisted snapshot has
       // been revalidated. The offering and installation sent to it are the
       // retained values, never a fresh catalog projection.
@@ -2848,10 +3052,7 @@ export function createProviderDriver(
                 name: input.name,
                 uid: input.resourceUid,
                 ...(current && input.previous
-                  ? {
-                      incarnationId: current.id,
-                      generation: input.previous.metadata.generation,
-                    }
+                  ? { incarnationId: current.id, generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,
@@ -2882,10 +3083,7 @@ export function createProviderDriver(
                 name: input.name,
                 uid: input.resourceUid,
                 ...(current && input.previous
-                  ? {
-                      incarnationId: current.id,
-                      generation: input.previous.metadata.generation,
-                    }
+                  ? { incarnationId: current.id, generation: input.previous.metadata.generation }
                   : {}),
               },
               spec: input.spec,
@@ -2939,7 +3137,7 @@ export function createProviderDriver(
                 kind: "create",
                 deployment: {
                   tenantId: input.tenantId,
-                  id: `dep_${input.operationId}`,
+                  id: deterministicDeploymentId(input.operationId),
                   resourceUid: input.resourceUid,
                   offeringId: offering.id,
                   providerPackRef: provider.id,
@@ -2977,7 +3175,7 @@ export function createProviderDriver(
         try {
           await deployments.create({
             tenantId: input.tenantId,
-            id: `dep_${input.operationId}`,
+            id: deterministicDeploymentId(input.operationId),
             resourceUid: input.resourceUid,
             offeringId: offering.id,
             providerPackRef: provider.id,

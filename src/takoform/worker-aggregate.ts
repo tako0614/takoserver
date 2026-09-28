@@ -1,3 +1,4 @@
+import { canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import { exclusiveRelationClaimKey, type TakoformStoredRelation } from "./relations.ts";
@@ -14,6 +15,13 @@ const WORKER_DEPLOYMENT = "WorkerDeployment";
 const WORKER_RELATION = "/worker";
 const DEPLOYMENT_VERSION_RELATION = "/versions/*/workerVersion";
 const SERVICE_BINDING_RELATION = "/serviceBindings/*/resource";
+const CONTAINER_HTTP_BINDING_RELATION = "/containerHttpBindings/*/resource";
+const CONTAINER_HTTP_BINDING_REF = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.container-http",
+  version: "0.1.0",
+  schemaDigest: "sha256:caf35e19cd375a9115310dead9e4985f772e044d84dd3449cc347cd0ab49f301",
+} as const;
 const QUEUE_RELATION = "/queue";
 const ATTACHMENT_HANDLER: Readonly<Record<string, string>> = {
   WorkerCustomDomain: "fetch",
@@ -187,8 +195,11 @@ export async function validateWorkerAggregate(input: {
   if (input.form.identity.formRef.kind === "WorkerVersion" && input.form.role === "revision") {
     validateEnvironmentNamespace(input.spec);
     for (const relation of input.relations) {
-      if (relation.relation !== SERVICE_BINDING_RELATION) continue;
-      await requireServingWorker(input, relation, "fetch", edgeApiVersion);
+      if (relation.relation === SERVICE_BINDING_RELATION) {
+        await requireServingWorker(input, relation, "fetch", edgeApiVersion);
+      } else if (relation.relation === CONTAINER_HTTP_BINDING_RELATION) {
+        await requireReadyContainerHttpTarget(input, relation);
+      }
     }
     return;
   }
@@ -262,24 +273,77 @@ export async function validateWorkerAggregate(input: {
 }
 
 /**
+ * The candidate container binding is not a worker.service call. Relation
+ * resolution has already checked the installed Binding/Interface/target Form
+ * graph and pinned the target incarnation. Recheck that pin and the generic
+ * Resource lifecycle immediately before the provider receives the Version;
+ * no provider-specific container readiness or runtime support is inferred.
+ */
+async function requireReadyContainerHttpTarget(
+  input: {
+    readonly tenantId: string;
+    readonly space: string;
+    readonly form: InstalledTakoformForm;
+    readonly store: Pick<TakoformStore, "readResource" | "readResourceDeletion">;
+  },
+  relation: TakoformStoredRelation,
+): Promise<void> {
+  if (
+    canonicalJson(relation.bindingRef) !== canonicalJson(CONTAINER_HTTP_BINDING_REF) ||
+    !input.form.acceptedBindings?.some(
+      (accepted) => canonicalJson(accepted) === canonicalJson(CONTAINER_HTTP_BINDING_REF),
+    ) ||
+    relation.targetApiVersion !== input.form.identity.formRef.apiVersion ||
+    relation.targetKind !== "ContainerService" ||
+    relation.targetFormRef.apiVersion !== relation.targetApiVersion ||
+    relation.targetFormRef.kind !== relation.targetKind ||
+    !relation.targetRevision
+  ) {
+    throw new TakoformHostError("invalid_argument", 400);
+  }
+  const target = await input.store.readResource({
+    tenantId: input.tenantId,
+    space: input.space,
+    apiVersion: relation.targetApiVersion,
+    kind: relation.targetKind,
+    name: relation.targetName,
+  });
+  if (
+    !target ||
+    target.apiVersion !== relation.targetApiVersion ||
+    target.kind !== relation.targetKind ||
+    target.metadata.name !== relation.targetName ||
+    target.metadata.space !== input.space ||
+    target.metadata.uid !== relation.targetUid ||
+    target.metadata.revision !== relation.targetRevision ||
+    canonicalJson(target.form.formRef) !== canonicalJson(relation.targetFormRef) ||
+    target.status.observedGeneration !== target.metadata.generation ||
+    !target.status.conditions.some(
+      (condition) => condition.type === "Ready" && condition.status === "True",
+    ) ||
+    target.status.operationId ||
+    (await input.store.readResourceDeletion(input.tenantId, relation.targetUid))?.state ===
+      "pending"
+  ) {
+    throw crossResourcePrecondition({
+      details: { pointer: relation.pointer },
+      message: `the ContainerService ${relation.targetName} is no longer the Ready incarnation selected by this WorkerVersion; re-resolve it after it is Ready, then apply again`,
+    });
+  }
+}
+
+/**
  * Refuses an inward activation whose target Worker is not serving the handler.
  *
- * The refusal is about *what is missing*, which is two different facts and was
- * one wrong answer. A Worker for which nothing declares a `WorkerDeployment` is
- * a precondition the operator has to fix in the configuration; a Worker whose
- * deployment has simply not landed yet is ordering inside one apply wave, cured
- * by the wave itself and, failing that, by asking again. Neither is a Host
- * capability that does not exist, which is what this used to say — sending an
- * operator to "apply against a host whose Host Support Profile declares it"
- * while the only thing missing was a deployment their own graph creates.
+ * The frozen attachment gate distinguishes a settled absence from a transient
+ * one. No deployment, or a deployed version that definitively lacks the
+ * handler, is `unsupported_capability` (422). A deployment whose selected
+ * version has not become readable is still `resource_busy` (409). An in-flight
+ * deployment in the same wave is awaited before either refusal.
  *
- * The definitive half is still definitive — `invalid_argument` 400, not
- * retryable, surfaced to the operator now — but it is a
- * `crossResourcePrecondition`, because what makes it true is a *neighbour*.
- * Adding the missing `WorkerDeployment` changes nothing in this endpoint's
- * plan, so the cured `tofu apply` arrives under the identical plan-derived
- * idempotency key, and a Host that replayed the stored refusal would hand back
- * an answer that stopped being true the moment the deployment landed.
+ * The definitive answer retains `crossResourcePrecondition`: adding or changing
+ * the neighbour does not change this attachment's plan-derived idempotency
+ * key, so the next identical apply must not replay a stale settled refusal.
  */
 async function requireServingWorker(
   input: {
@@ -315,8 +379,50 @@ async function requireServingWorker(
   });
   if (deployments.length === 0) {
     throw crossResourcePrecondition({
+      code: "unsupported_capability",
+      status: 422,
       message: `the ModuleWorker ${worker.targetName} has no WorkerDeployment, so nothing serves its ${handler} handler; declare a WorkerDeployment that selects a WorkerVersion serving ${handler}, then apply again`,
     });
+  }
+  const deployment = deployments.length === 1 ? deployments[0] : undefined;
+  if (deployment) {
+    const versions = deployment.relations.filter(
+      (relation) => relation.relation === DEPLOYMENT_VERSION_RELATION,
+    );
+    if (versions.length > 0) {
+      const selected = await Promise.all(
+        versions.map(async (relation) => ({
+          relation,
+          version: await input.store.readResource({
+            tenantId: input.tenantId,
+            space: input.space,
+            apiVersion: relation.targetApiVersion,
+            kind: relation.targetKind,
+            name: relation.targetName,
+          }),
+        })),
+      );
+      if (
+        selected.every(
+          ({ relation, version }) =>
+            version?.metadata.uid === relation.targetUid && Array.isArray(version.spec.handlers),
+        )
+      ) {
+        if (
+          selected.every(
+            ({ version }) =>
+              Array.isArray(version?.spec.handlers) && version.spec.handlers.includes(handler),
+          )
+        ) {
+          return;
+        }
+        throw crossResourcePrecondition({
+          code: "unsupported_capability",
+          status: 422,
+          message: `the ModuleWorker ${worker.targetName} has an active WorkerDeployment whose selected WorkerVersion does not serve ${handler}; select only versions that serve ${handler}, then apply again`,
+        });
+      }
+    }
   }
   throw new TakoformHostError(
     "resource_busy",
@@ -579,6 +685,10 @@ function validateEnvironmentNamespace(spec: JsonObject): void {
     "bucketBindings",
     "queueProducerBindings",
     "serviceBindings",
+    "workflowBindings",
+    "actorBindings",
+    "vectorBindings",
+    "containerHttpBindings",
   ]) {
     const bindings = spec[field];
     if (!Array.isArray(bindings)) continue;

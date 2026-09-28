@@ -13,6 +13,8 @@ import {
   type TakoformArtifactManifest,
   type TakoformArtifactPrincipal,
 } from "../src/takoform/artifacts.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
+import { formSupportProfile } from "../src/takoform/forms.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 
 const PREFIX = "/apis/forms.takoform.com/v1/artifacts";
@@ -206,6 +208,66 @@ async function prepareDueBlobCandidate(input: {
 }
 
 describe("Takoform artifact lifecycle", () => {
+  test("advertises a larger StaticAssetBundle ceiling without widening Worker or migration bundles", () => {
+    const forms = currentTakoformCandidates().forms;
+    const ceiling = (kind: string) => {
+      const form = forms.find((candidate) => candidate.identity.formRef.kind === kind);
+      if (!form) throw new Error(`missing ${kind} Form`);
+      const profile = formSupportProfile(form, "support.takoform.com/v1") as {
+        limits: Record<string, number>;
+      };
+      return profile.limits["/maximumBundleBytes"];
+    };
+    expect(ceiling("StaticAssetBundle")).toBe(20_971_520);
+    expect(ceiling("WorkerBundle")).toBe(10_485_760);
+    expect(ceiling("SQLiteMigrationSet")).toBe(10_485_760);
+  });
+
+  test("commits an asset bundle above 10 MiB but refuses assets above 20 MiB", async () => {
+    const target = fixture();
+    const bytes = new Uint8Array(10_485_761);
+    const digest = (await bytesDigest(bytes)) as `sha256:${string}`;
+    const file = (size: number) => ({
+      path: "index.html",
+      mediaType: "text/html",
+      size,
+      digest,
+    });
+    const manifest = (kind: "StaticAssetBundle" | "MigrationBundle", size: number) => ({
+      apiVersion: "artifacts.takoform.com/v1alpha1" as const,
+      kind,
+      files: [file(size)],
+    });
+    const started = await startUpload(
+      target,
+      manifest("StaticAssetBundle", bytes.byteLength),
+      "assets-11m",
+    );
+    expect(started.response.status).toBe(201);
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await target.call(`uploads/${started.uploadId}/commit`, {
+          method: "POST",
+          headers: { "idempotency-key": "assets-11m-commit" },
+        })
+      ).status,
+    ).toBe(201);
+    await expect(
+      startUpload(target, manifest("StaticAssetBundle", 20_971_521), "assets-21m"),
+    ).rejects.toMatchObject({ name: "ArtifactInputError" });
+    await expect(
+      startUpload(target, manifest("MigrationBundle", 10_485_761), "migration-11m"),
+    ).rejects.toMatchObject({ name: "ArtifactInputError" });
+  });
+
   test("an object transport without exact write identity is rejected at composition", async () => {
     const sql = createEphemeralSql();
     let objectRequests = 0;
@@ -348,6 +410,48 @@ describe("Takoform artifact lifecycle", () => {
 
     expect((await target.call(manifestDigest, { method: "GET" })).status).toBe(200);
     expect((await target.call(`blobs/${digest}`, { method: "HEAD" })).status).toBe(200);
+  });
+
+  test("a committed upload returns its digest on a second commit key", async () => {
+    const target = fixture();
+    const bytes = new TextEncoder().encode(
+      "export default { fetch() { return new Response('ok') } }",
+    );
+    const manifest = await workerManifest(bytes);
+    const digest = manifest.modules?.[0]?.digest;
+    if (!digest) throw new Error("fixture digest is missing");
+
+    const { uploadId } = await startUpload(target, manifest, "recommit-start");
+    expect(
+      (
+        await target.call(`uploads/${uploadId}/blobs/${digest}`, {
+          method: "PUT",
+          body: bytes,
+        })
+      ).status,
+    ).toBe(201);
+    const commit = (key: string) =>
+      target.call(`uploads/${uploadId}/commit`, {
+        method: "POST",
+        headers: { "idempotency-key": key },
+      });
+    const first = await commit("recommit-first");
+    expect(first.status).toBe(201);
+    const firstBody = await first.json();
+
+    const second = await commit("recommit-second");
+    expect(second.status).toBe(200);
+    expect(await second.json()).toEqual(firstBody);
+    const replayed = await commit("recommit-second");
+    expect(replayed.status).toBe(200);
+    expect(await replayed.json()).toEqual(firstBody);
+    const foreign = await target.call(
+      `uploads/${uploadId}/commit`,
+      { method: "POST", headers: { "idempotency-key": "recommit-foreign" } },
+      SECOND_PRINCIPAL,
+    );
+    expect(foreign.status).toBe(404);
+    expect(await foreign.json()).toEqual({ error: { code: "artifact_missing" } });
   });
 
   test("an upload abandoned while its body is arriving cannot publish bytes or a hold", async () => {

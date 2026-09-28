@@ -77,7 +77,9 @@ interface LegacyWorkerFixture {
  * legacy runtime.write branch before the parent Worker is deleted.
  */
 async function legacyWorkerFixture(): Promise<LegacyWorkerFixture> {
-  const baseRuntime = createWorkerdRuntime({ root, isReady: () => true });
+  // This fixture publishes to disk but does not boot workerd. Avoid mistaking
+  // an unrelated process on the shared default port for its runtime.
+  const baseRuntime = createWorkerdRuntime({ root, isReady: () => true, port: 0 });
   let writes = 0;
   let publishes = 0;
   const runtime: WorkerdRuntime = {
@@ -86,6 +88,11 @@ async function legacyWorkerFixture(): Promise<LegacyWorkerFixture> {
       outcome: "valid",
       exportedHandlers: [...input.declaredHandlers],
     }),
+    async probe() {
+      // This fake fixture has no serving workerd process to probe. Tests that
+      // exercise runtime probing install an isolated probe server.
+      return null;
+    },
     async write(...args) {
       writes += 1;
       await baseRuntime.write(...args);

@@ -2,6 +2,7 @@ import type { ControlRoutes } from "./control.ts";
 import type { DataAiRoutes } from "./data-ai.ts";
 import { landingHtml } from "./landing.ts";
 import { createOpenApiDocument } from "./openapi.ts";
+import type { RequestLifetime } from "./request-lifetime.ts";
 import type { TakoformHost } from "./takoform/types.ts";
 
 /**
@@ -37,14 +38,14 @@ export interface CreateRouterOptions {
   readonly consoleOrigin?: string;
 }
 
-export type Router = (request: Request) => Promise<Response>;
+export type Router = (request: Request, lifetime?: RequestLifetime) => Promise<Response>;
 
 export function createRouter(options: CreateRouterOptions): Router {
   const origin = httpsOrigin(options.publicOrigin);
   const consoleOrigin = options.consoleOrigin;
   const route = dispatch(options, origin);
 
-  return async (request) => {
+  return async (request, lifetime) => {
     // A browser asking whether it may make the real call. Answering it is the
     // whole of preflight; nothing is routed and nothing is authenticated.
     if (request.method === "OPTIONS" && request.headers.get("origin")) {
@@ -53,7 +54,7 @@ export function createRouter(options: CreateRouterOptions): Router {
         headers: crossOrigin(request, consoleOrigin),
       });
     }
-    const response = await route(request);
+    const response = await route(request, lifetime);
     if (!request.headers.get("origin")) return response;
     const answered = new Response(response.body, response);
     for (const [name, value] of Object.entries(crossOrigin(request, consoleOrigin))) {
@@ -99,7 +100,7 @@ function crossOrigin(request: Request, consoleOrigin: string | undefined): Recor
 
 function dispatch(options: CreateRouterOptions, origin: string): Router {
   const console = options.consoleOrigin === undefined ? null : httpsOrigin(options.consoleOrigin);
-  return async (request) => {
+  return async (request, lifetime) => {
     const url = new URL(request.url);
 
     if (options.dataAi) {
@@ -108,7 +109,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
     }
 
     if (options.takoformHost) {
-      const handled = await options.takoformHost.handle(request);
+      const handled = await options.takoformHost.handle(request, lifetime);
       if (handled) return handled;
     }
 

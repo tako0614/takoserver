@@ -15,7 +15,25 @@ import type {
   ProviderTicket,
   ProviderValue,
 } from "../provider-port.ts";
+import type {
+  ProviderWorkerClassRuntime,
+  WorkerClassInspectionVerdict,
+} from "../worker-class-runtime-port.ts";
 import type { ProviderMeterError } from "./provider-meter.ts";
+
+export type CloudflareProviderInspectWorkerClassInput = Parameters<
+  ProviderWorkerClassRuntime["inspect"]
+>[0];
+
+export const CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA =
+  "takoserver.cloudflare-provider-mutation-context@v1" as const;
+
+/** Private CPE RPC only; never a legacy ApplyInput or ResourceIdentity member. */
+export interface CloudflareProviderMutationContextV1 {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA;
+  readonly input: ApplyInput;
+  readonly prospectiveDeploymentId: string;
+}
 
 export const CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA =
   "takoserver.cloudflare-provider-executor-no-mutation@v1" as const;
@@ -100,7 +118,19 @@ export interface CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence {
   readonly executionAuthority: ProviderExecutionAuthority;
 }
 
-/** Only the closed no-effect conclusion seam may carry this proof. */
+export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA =
+  "takoserver.cloudflare-provider-executor-apply-compensation-required@v1" as const;
+
+/** Pre-attempt nomination; it is not no-effect or compensated proof. */
+export interface CloudflareProviderExecutorApplyCompensationRequiredEvidence {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA;
+  readonly action: "nominateCompensateApply";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/** Only the closed conclusion seam may carry these disjoint evidence forms. */
 export type CloudflareProviderApplyNoEffectConclusionResult =
   | ProviderTicket
   | {
@@ -111,6 +141,10 @@ export type CloudflareProviderApplyNoEffectConclusionResult =
   | {
       readonly phase: "unsupported";
       readonly executorApplyNoEffectUnsupported: CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence;
+    }
+  | {
+      readonly phase: "compensation_required";
+      readonly executorApplyCompensationRequired: CloudflareProviderExecutorApplyCompensationRequiredEvidence;
     };
 
 export const CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA =
@@ -198,9 +232,21 @@ export type CloudflareProviderMeterReadResult =
  * bridge and no general provider escape hatch.
  */
 export interface CloudflareProviderExecutorRpc {
+  /** Trusted Host facts; the executor must independently revalidate ownership and source. */
+  inspectWorkerClass?(
+    input: CloudflareProviderInspectWorkerClassInput,
+  ): Promise<WorkerClassInspectionVerdict>;
   apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
+  /** Fresh create with the exact Deployment ID the Host will commit. */
+  applyWithExecutionContextV1?(
+    envelope: CloudflareProviderMutationContextV1,
+  ): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<CloudflareProviderApplyConvergenceResult>;
+  /** Operation-keyed recovery of the same fresh create; no initial replay. */
+  convergeApplyWithExecutionContextV1?(
+    envelope: CloudflareProviderMutationContextV1,
+  ): Promise<CloudflareProviderApplyConvergenceResult>;
   concludeApplyNoEffect(
     input: ProviderApplyNoEffectConclusionInput,
   ): Promise<CloudflareProviderApplyNoEffectConclusionResult>;

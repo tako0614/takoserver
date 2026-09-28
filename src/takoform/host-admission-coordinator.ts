@@ -432,8 +432,10 @@ export function createHostAdmissionCoordinator(options: {
     };
   };
 
-  const readback = async (request: FormAuthorityPlanRequest): Promise<FormAuthorityReadback> => {
-    const state = await readState(request);
+  const readbackFromState = (
+    request: FormAuthorityPlanRequest,
+    state: AuthorityState,
+  ): FormAuthorityReadback => {
     return {
       kind: "takoserver.form-authority-readback@v2",
       identity: structuredClone(options.identity),
@@ -458,6 +460,9 @@ export function createHostAdmissionCoordinator(options: {
       ),
     };
   };
+
+  const readback = async (request: FormAuthorityPlanRequest): Promise<FormAuthorityReadback> =>
+    readbackFromState(request, await readState(request));
 
   const buildPlan = async (
     request: FormAuthorityPlanRequest,
@@ -599,6 +604,29 @@ export function createHostAdmissionCoordinator(options: {
         "plan_digest_mismatch",
         "Form authority plan differs from code-derived current operations",
       );
+    }
+
+    // A no-command plan cannot perform a mutation or invoke the Core verifier.
+    // The checked current heads are therefore also its post-apply heads. Keep
+    // the exact Apply result, while the managed tenant caller independently
+    // rereads readiness and ownership before issuing a credential.
+    if (candidate.commands.length === 0) {
+      const verificationMode = preparedVerificationMode(new Map(), options.verifier);
+      return {
+        kind: "takoserver.form-authority-apply@v2",
+        status: "converged",
+        planDigest: candidate.planDigest,
+        receipts: [],
+        policyAuthority: "takoserver-host",
+        verificationMode,
+        productionEligible:
+          options.identity.environment === "production" &&
+          options.verifier.readiness.released &&
+          verificationMode === "released-core",
+        readback: readbackFromState(candidate.request, planned),
+        nextPlan: expected,
+        replanRequired: false,
+      };
     }
 
     // All package closure, verification, and Host policy work happens before

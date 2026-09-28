@@ -2,6 +2,8 @@ import { base64UrlEncode } from "./json.ts";
 import type { Clock } from "./ports.ts";
 import type { SigningKey } from "./token.ts";
 
+export { tenantRunPrincipalId } from "./tenant-run-principal.ts";
+
 const TOKEN_TYPE = "takoserver-token+jwt";
 const TAKOFORM_RUN_AUDIENCE = "takoform.run";
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$/u;
@@ -19,6 +21,7 @@ export interface TenantRunCredentialSigner {
     readonly tenantRef: string;
     readonly spaceRef: string;
     readonly runRef: string;
+    readonly logicalPrincipalRef?: string;
     readonly workerEndpointOriginReservationId?: string;
     readonly issuedAtEpochSeconds: number;
     readonly tokenId: string;
@@ -67,6 +70,9 @@ export function createTenantRunCredentialSigner(options: {
         nbf: input.issuedAtEpochSeconds,
         organizationId: reference(input.organizationId, errorLabel),
         runRef: reference(input.runRef, errorLabel),
+        ...(input.logicalPrincipalRef === undefined
+          ? {}
+          : { logicalPrincipalRef: reference(input.logicalPrincipalRef, errorLabel) }),
         spaceRef: reference(input.spaceRef, errorLabel),
         tenantRef: reference(input.tenantRef, errorLabel),
         ...(input.workerEndpointOriginReservationId === undefined

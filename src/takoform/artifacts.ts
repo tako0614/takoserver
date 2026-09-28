@@ -6,6 +6,7 @@ import { admitArtifactBlobWrite, commitArtifactBlobWrite } from "./artifact-blob
 import {
   MAXIMUM_REQUEST_BODY_BYTES,
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
 } from "./limits.ts";
@@ -387,7 +388,7 @@ export function createTakoformArtifacts(
         if (replay) return replayArtifactResponse(replay);
         const upload = await ownedUpload(principal, requiredSegment(match[1]));
         if (!upload) return failure("artifact_missing", 404);
-        if (upload.lifecycleState !== "open") return failure("artifact_invalid", 409);
+        if (upload.lifecycleState === "abandoned") return failure("artifact_invalid", 409);
         // The manifest is not parsed again here. The row exists only because a
         // strict parse already succeeded, and preserving its portable `path`
         // field is what keeps the content address equal to the caller's
@@ -431,6 +432,19 @@ export function createTakoformArtifacts(
               upload.manifestDigest,
             ])
           ).length === 1;
+        if (upload.lifecycleState === "committed") {
+          // A new idempotency key is still a valid re-commit of this upload.
+          // Keep it read-only: writing a new replay would extend the artifact's
+          // retention after the upload owner has intentionally released it.
+          if (
+            upload.rootState !== "active" ||
+            !(await holds(principal.tenantId, upload.manifestDigest, "manifest")) ||
+            !existed
+          ) {
+            return failure("artifact_missing", 404);
+          }
+          return Response.json({ manifestDigest: upload.manifestDigest }, { status: 200 });
+        }
         const result = {
           status: existed ? 200 : 201,
           body: { manifestDigest: upload.manifestDigest },
@@ -691,7 +705,12 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
   }
   exactKeys(input, ["apiVersion", "kind", "files"]);
   const files = fileDeclarations(input.files, TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES);
-  requireMaximumBundleBytes(files);
+  requireMaximumBundleBytes(
+    files,
+    kind === "StaticAssetBundle"
+      ? TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES
+      : TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+  );
   return {
     apiVersion: input.apiVersion,
     kind,
@@ -699,11 +718,14 @@ function parseManifest(input: unknown): TakoformArtifactManifest {
   };
 }
 
-function requireMaximumBundleBytes(declarations: readonly { readonly size: number }[]): void {
+function requireMaximumBundleBytes(
+  declarations: readonly { readonly size: number }[],
+  maximumBytes: number,
+): void {
   let total = 0;
   for (const declaration of declarations) {
     total += declaration.size;
-    if (!Number.isSafeInteger(total) || total > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) {
+    if (!Number.isSafeInteger(total) || total > maximumBytes) {
       throw new ArtifactInputError();
     }
   }

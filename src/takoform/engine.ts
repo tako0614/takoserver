@@ -10,6 +10,7 @@ import {
   ProviderMutationRecoveryError,
   ProviderMutationWholeOperationRefusalError,
 } from "../provider-driver.ts";
+import type { RequestLifetime } from "../request-lifetime.ts";
 import {
   type AcceptedAuthoritySummary,
   assertAcceptedAuthorityGrant,
@@ -91,7 +92,7 @@ import {
   validateWorkerDeploymentRemoval,
   workerServiceCondition,
 } from "./worker-aggregate.ts";
-import { validateClassHolderRuntime } from "./worker-runtime-contract.ts";
+import { validateClassHolderRuntime, workerClassCondition } from "./worker-runtime-contract.ts";
 
 /**
  * The Takoform resource lifecycle.
@@ -144,6 +145,8 @@ export function memoizeArtifacts(resolver: ArtifactResolver): ArtifactResolver {
 
 export interface EngineContext {
   readonly request: Request;
+  /** The live invocation owns post-response work; never retained in durable state. */
+  readonly lifetime?: RequestLifetime;
   readonly url: URL;
   readonly tenantId: string;
   readonly principalId: string;
@@ -298,6 +301,16 @@ export interface CreateTakoformEngineOptions {
 
 export function createTakoformEngine(options: CreateTakoformEngineOptions): TakoformEngine {
   const { store, forms, bindings, driver, artifacts, clock, randomId } = options;
+  const derivedWorkerCondition = async (input: {
+    readonly tenantId: string;
+    readonly resource: TakoformStoredResource;
+    readonly store: TakoformStore;
+    readonly form: InstalledTakoformForm;
+  }) =>
+    (await workerClassCondition({
+      ...input,
+      ...(driver.workerClassRuntime ? { runtime: driver.workerClassRuntime } : {}),
+    })) ?? (await workerServiceCondition(input));
   const resourceQueryKeys = options.resourceQueryIncludesPathIdentity
     ? (["space", "group", "kind", "definitionVersion", "schemaDigest"] as const)
     : (["space", "definitionVersion", "schemaDigest"] as const);
@@ -1173,7 +1186,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const workerCondition =
         drift || migrationCondition
           ? null
-          : await workerServiceCondition({
+          : await derivedWorkerCondition({
+              form,
               tenantId: context.tenantId,
               resource,
               store,
@@ -1521,9 +1535,26 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                   ? { commercialAuthority: context.commercialAuthority }
                   : {}),
               } as const;
+              let nominatedForCurrentDependencies = false;
               if (concludeApplyNoEffect) {
                 try {
-                  await concludeApplyNoEffect(recoveryInput);
+                  const conclusion = await concludeApplyNoEffect(recoveryInput);
+                  if (conclusion !== undefined) {
+                    if (
+                      conclusion.phase !== "compensation_required" ||
+                      applySelection.kind !== "provider" ||
+                      conclusion.operationId !== proposedOperationId ||
+                      conclusion.providerInstallationRef !==
+                        applySelection.providerInstallationRef ||
+                      conclusion.executionAuthority.tenantId !== context.tenantId ||
+                      conclusion.executionAuthority.resourceUid !== proposedResourceUid ||
+                      conclusion.executionAuthority.fingerprint !== fingerprint ||
+                      conclusion.executionAuthority.leaseToken !== leaseToken
+                    ) {
+                      throw new ProviderMutationRecoveryError("indeterminate");
+                    }
+                    nominatedForCurrentDependencies = true;
+                  }
                 } catch (error) {
                   if (!(error instanceof ProviderApplyNoEffectUnsupportedError)) throw error;
                   logRecoveryStage("unsupported-accepted");
@@ -1543,7 +1574,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
                 throw error;
               }
               logRecoveryStage("dependency-status", { dependencyStatus });
-              if (dependencyStatus === "current") {
+              if (dependencyStatus === "current" && !nominatedForCurrentDependencies) {
                 throw new ProviderApplyNoEffectUnsupportedError();
               }
               if (dependencyStatus === null) {
@@ -1638,7 +1669,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const currentMigrationCondition = currentWorkerCondition;
       const currentActualWorkerCondition =
         current && !currentDrift && !currentMigrationCondition
-          ? await workerServiceCondition({
+          ? await derivedWorkerCondition({
+              form,
               tenantId: context.tenantId,
               resource: current,
               store,
@@ -1750,7 +1782,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         relations,
       });
-      validateClassHolderRuntime(form);
+      validateClassHolderRuntime(form, driver.workerClassRuntime);
       const saga = await store.acceptProviderMutationSaga(proposedSaga);
       const opId = saga.operationId;
       const uid = saga.resourceUid;
@@ -2061,7 +2093,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         const initialWorkerCondition = initialMigrationCondition
           ? null
-          : await workerServiceCondition({
+          : await derivedWorkerCondition({
+              form,
               tenantId: context.tenantId,
               resource: materialized,
               store,
@@ -2218,7 +2251,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const workerCondition =
         drift || migrationCondition
           ? null
-          : await workerServiceCondition({
+          : await derivedWorkerCondition({
+              form,
               tenantId: context.tenantId,
               resource: observed,
               store,
@@ -2342,7 +2376,7 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         spec: body.spec,
         relations,
       });
-      validateClassHolderRuntime(form);
+      validateClassHolderRuntime(form, driver.workerClassRuntime);
       const proposedImportId = context.durableOperation?.id ?? operationId();
       const proposedResourceUid =
         current?.metadata.uid ?? context.durableOperation?.resourceUid ?? nextResourceUid(randomId);
@@ -2615,7 +2649,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
         });
         const initialWorkerCondition = initialMigrationCondition
           ? null
-          : await workerServiceCondition({
+          : await derivedWorkerCondition({
+              form,
               tenantId: context.tenantId,
               resource: materialized,
               store,
@@ -2748,7 +2783,8 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       });
       const workerCondition = drift
         ? null
-        : await workerServiceCondition({
+        : await derivedWorkerCondition({
+            form,
             tenantId: context.tenantId,
             resource: current,
             store,
@@ -3030,15 +3066,24 @@ function materializeResource(
     spec: structuredClone(input.spec),
     status: {
       observedGeneration: generation,
-      conditions: projection.conditions ?? [
-        {
-          type: "Ready",
-          status: "True",
-          reason: "Available",
-          lastTransitionTime: clock().toISOString(),
-        },
-      ],
       ...projection,
+      conditions: form.workerClassRuntime
+        ? [
+            {
+              type: "Ready",
+              status: "False",
+              reason: "Provisioning",
+              lastTransitionTime: clock().toISOString(),
+            },
+          ]
+        : (projection.conditions ?? [
+            {
+              type: "Ready",
+              status: "True",
+              reason: "Available",
+              lastTransitionTime: clock().toISOString(),
+            },
+          ]),
     },
   };
 }

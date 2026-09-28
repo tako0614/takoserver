@@ -6,7 +6,13 @@ import { createLedger } from "../src/ledger.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
-import { failed, type Provider, type ProviderOffering, succeeded } from "../src/provider-port.ts";
+import {
+  failed,
+  type Provider,
+  type ProviderMutationExecutionContext,
+  type ProviderOffering,
+  succeeded,
+} from "../src/provider-port.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import type { InstalledTakoformForm, TakoformStoredResource } from "../src/takoform/types.ts";
@@ -69,7 +75,7 @@ const soldOffering: Offering = {
   available: true,
 };
 
-test("provider driver forwards desiredGeneration to apply and convergence, omitting it when absent", async () => {
+test("provider driver keeps serialized identity stable and passes prospective creates in-process", async () => {
   const sql = createEphemeralSql();
   const deployments = createResourceDeploymentStore(
     sql,
@@ -78,18 +84,23 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
   const calls: Array<{
     readonly method: "apply" | "convergeApply";
     readonly input: Parameters<Provider["apply"]>[0];
+    readonly context: ProviderMutationExecutionContext | undefined;
   }> = [];
+  let activeAtInitialDispatch: unknown;
   const result = (input: Parameters<Provider["apply"]>[0]) =>
     succeeded({ nativeId: `native:${input.identity.uid}`, observed: input.spec, outputs: {} });
   const provider: Provider = {
     id: soldOffering.providerPackRef,
     offerings: [technicalOffering],
-    async apply(input) {
-      calls.push({ method: "apply", input: structuredClone(input) });
+    async apply(input, context) {
+      calls.push({ method: "apply", input: structuredClone(input), context });
+      if (input.operationId === "generation-driver-0001") {
+        activeAtInitialDispatch = await deployments.active("tenant-a", input.identity.uid ?? "");
+      }
       return result(input);
     },
-    async convergeApply(input) {
-      calls.push({ method: "convergeApply", input: structuredClone(input) });
+    async convergeApply(input, context) {
+      calls.push({ method: "convergeApply", input: structuredClone(input), context });
       return result(input);
     },
     async observe(input) {
@@ -151,13 +162,80 @@ test("provider driver forwards desiredGeneration to apply and convergence, omitt
       leaseToken: "lease-generation-driver-2",
     },
   });
+  await applyWithSelection(driver, {
+    ...baseInput,
+    operationId: "generation-driver-update",
+    operationKey: "generation-driver-update-key",
+    spec: { value: "updated" },
+    desiredGeneration: "2",
+    previous: {
+      apiVersion: formRef.apiVersion,
+      kind: formRef.kind,
+      form: { formRef },
+      metadata: {
+        name: "probe",
+        space: "main",
+        uid: "uid-generation-driver",
+        generation: "1",
+        revision: "1",
+      },
+      spec: { value: "first" },
+      status: { observedGeneration: "1", conditions: [] },
+    },
+  });
 
-  expect(calls.map(({ method }) => method)).toEqual(["apply", "convergeApply", "apply"]);
+  const recoveryCreateInput = {
+    ...baseInput,
+    operationId: "generation-driver-recovery-create",
+    operationKey: "generation-driver-recovery-create-key",
+    resourceUid: "uid-generation-driver-recovery",
+    executionAuthority: {
+      ...baseInput.executionAuthority,
+      resourceUid: "uid-generation-driver-recovery",
+      leaseToken: "lease-generation-driver-recovery",
+    },
+    atomicDeploymentCommit: true,
+  } as const;
+  await applyWithSelection(driver, recoveryCreateInput);
+  await applyWithSelection(driver, {
+    ...recoveryCreateInput,
+    operationMode: "recovery" as const,
+  });
+
+  expect(calls.map(({ method }) => method)).toEqual([
+    "apply",
+    "convergeApply",
+    "apply",
+    "apply",
+    "apply",
+    "convergeApply",
+  ]);
+  expect(calls[0]?.input.identity.incarnationId).toBeUndefined();
+  expect(calls[1]?.input.identity.incarnationId).toBeUndefined();
+  expect(calls[2]?.input.identity.incarnationId).toBeUndefined();
+  expect(calls[3]?.input.identity.incarnationId).toBe("dep_generation-driver-0001");
+  expect(calls[4]?.input.identity.incarnationId).toBeUndefined();
+  expect(calls[5]?.input.identity.incarnationId).toBeUndefined();
+  expect(calls[0]?.context?.prospectiveDeploymentId).toBe("dep_generation-driver-0001");
+  expect(calls[1]?.context).toBeUndefined();
+  expect(calls[2]?.context?.prospectiveDeploymentId).toBe("dep_generation-driver-0002");
+  expect(calls[3]?.context).toBeUndefined();
+  expect(calls[4]?.context?.prospectiveDeploymentId).toBe("dep_generation-driver-recovery-create");
+  expect(calls[5]?.context?.prospectiveDeploymentId).toBe("dep_generation-driver-recovery-create");
   expect(calls[0]?.input.desiredGeneration).toBe("9223372036854775807");
   expect(calls[1]?.input.desiredGeneration).toBe("9223372036854775807");
   expect(calls[2]?.input.desiredGeneration).toBeUndefined();
+  expect(calls[3]?.input.desiredGeneration).toBe("2");
   expect(Object.hasOwn(calls[1]?.input ?? {}, "desiredGeneration")).toBe(true);
   expect(Object.hasOwn(calls[2]?.input ?? {}, "desiredGeneration")).toBe(false);
+  expect(activeAtInitialDispatch).toBeNull();
+  expect(await deployments.active("tenant-a", "uid-generation-driver")).toMatchObject({
+    id: "dep_generation-driver-0001",
+  });
+  expect(await deployments.active("tenant-a", "uid-generation-driver-2")).toMatchObject({
+    id: "dep_generation-driver-0002",
+  });
+  expect(await deployments.active("tenant-a", "uid-generation-driver-recovery")).toBeNull();
 });
 
 test("atomic generation updates keep same-id refreshes but never replace an imported native claim", async () => {

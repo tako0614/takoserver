@@ -61,7 +61,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|cron|error-envelope|route-table|public-host-identity|form-ref|interface-ref|standard-service-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|cron|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|standard-service-port|worker-class-runtime-port|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -70,13 +70,13 @@ const LAYERS: readonly Layer[] = [
   {
     name: "adapter",
     match:
-      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|runtime|supervisor|version-graph|worker-module-inspector)\.ts$|^src\/providers\//u,
+      /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-weighted-deployment|selfhost-actor-forward-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|runtime|supervisor|version-graph|worker-module-inspector)\.ts$|^src\/generated\/selfhost-actor-forward-runtime-source\.ts$|^src\/providers\//u,
     may: ["core", "adapter"],
   },
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|worker-endpoint-origin-reservations|workflow-instances|workflow-resource-graph|workflow-data|workflow-driver|workflow-execution|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$)/u,
+      /^src\/(?:token|auth|ledger|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-resource-graph|worker-endpoint-origin-reservations|workflow-instances|workflow-resource-graph|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|identity-setup|stripe-settlement|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -90,7 +90,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/workflow-http-bootstrap\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-brokers)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-data-planes|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/(?:(?:workflow-http|actor-native)-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -109,12 +109,18 @@ const LAYERS: readonly Layer[] = [
   // to construct — but it stays below `entry`, which owns a running process.
   {
     name: "package-surface",
-    match: /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-workerd)\.ts$/u,
+    match:
+      /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
 ];
 
 function layerOf(path: string): Layer | undefined {
+  // Unpublished source projections are domain inputs, not released data or
+  // authority bundles. Their presence cannot confer publisher verification.
+  if (path === "src/generated/takoform-forward-candidate-catalog.ts") {
+    return LAYERS.find((layer) => layer.name === "domain");
+  }
   return LAYERS.find((layer) => layer.match.test(path));
 }
 
@@ -163,6 +169,8 @@ const HOST_ONLY = [
   "src/workerd-artifact.ts",
   "src/workerd-execution-guard.ts",
   "src/selfhost-workflow-execution-host.ts",
+  "src/selfhost-actor-execution-host.ts",
+  "src/selfhost-actor-native-process.ts",
   "src/selfhost-workflow-preparation.ts",
   "src/selfhost-workflow-http-transport.ts",
   "src/providers/docker-http-revision.ts",
@@ -252,6 +260,7 @@ const FORM_AUTHORITY_ENTRIES = [
   "src/entry-integration-form-authority-worker.ts",
 ];
 const FORM_AUTHORITY_OPERATOR_GATEWAY_ENTRIES = [
+  "src/entry-existing-space-operator-worker.ts",
   "src/entry-integration-form-authority-operator-worker.ts",
   "src/entry-form-authority-identity-probe.ts",
 ];

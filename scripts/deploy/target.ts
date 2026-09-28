@@ -135,6 +135,12 @@ export interface DeployTarget {
     };
     /** Operator-owned exact positive managed-Space Form identities. */
     readonly managedSpaceAdmissionPolicy?: SpaceAdmissionPolicyV1;
+    /** Dedicated released-Core existing-Space operator ingress; never a customer route. */
+    readonly existingSpaceOperator?: {
+      readonly workerName: string;
+      readonly origin: string;
+      readonly publicJwk: { readonly kty: "OKP"; readonly crv: "Ed25519"; readonly x: string };
+    };
     readonly hostId: string;
   };
   /** One incident-only route-less integration recovery Worker and owner retention authority. */
@@ -535,6 +541,31 @@ export function parseDeployTarget(
     throw preflightError("deploy target `integrationE2eCredentialAuthority` is integration-only");
   }
   if (target.formAuthority) {
+    const operator = target.formAuthority.existingSpaceOperator;
+    if (operator) {
+      if (
+        [
+          target.publicOrigin,
+          target.consoleOrigin,
+          target.formAuthority.identityProbeOrigin,
+          target.formAuthority.integrationOperatorOrigin,
+        ].includes(operator.origin) ||
+        target.aliases?.includes(new URL(operator.origin).hostname)
+      ) {
+        throw preflightError("existing-Space operator origin must be separate from other surfaces");
+      }
+      if (
+        [
+          target.operatorIdentity?.publicJwk.x,
+          target.formAuthority.operatorPublicJwk?.x,
+          target.integrationE2eCredentialAuthority?.publicJwk.x,
+          target.sponsorshipAuthority?.credentialPublicJwk.x,
+          target.sponsorshipAuthority?.receiptPublicJwk.x,
+        ].includes(operator.publicJwk.x)
+      ) {
+        throw preflightError("existing-Space operator must use a dedicated Ed25519 key");
+      }
+    }
     if (
       target.formAuthority.managedSpaceAdmissionPolicy !== undefined &&
       target.sponsorshipAuthority !== undefined &&
@@ -622,6 +653,9 @@ export function parseDeployTarget(
   }
   const allWorkerNames = [
     target.workerName,
+    ...(target.formAuthority?.existingSpaceOperator
+      ? [target.formAuthority.existingSpaceOperator.workerName]
+      : []),
     ...(target.sponsorshipAuthority ? [target.sponsorshipAuthority.workerName] : []),
     ...(target.cloudflareProviderExecutor
       ? [
@@ -777,6 +811,7 @@ function formAuthority(
       "operatorPublicJwk",
       "historicalPreExecutorPublicWorker",
       "managedSpaceAdmissionPolicy",
+      "existingSpaceOperator",
     ],
   );
   const integrationWorkerName =
@@ -827,6 +862,15 @@ function formAuthority(
     value.managedSpaceAdmissionPolicy === undefined
       ? undefined
       : parseManagedSpaceAdmissionPolicy(value.managedSpaceAdmissionPolicy);
+  const existingSpaceOperator =
+    value.existingSpaceOperator === undefined
+      ? undefined
+      : parseExistingSpaceOperator(value.existingSpaceOperator);
+  if (existingSpaceOperator && !managedSpaceAdmissionPolicy) {
+    throw preflightError(
+      "existing-Space operator requires explicit managed Space admission policy",
+    );
+  }
   if (historicalPreExecutorPublicWorker !== undefined && environment !== "integration") {
     throw preflightError(
       "deploy target `formAuthority.historicalPreExecutorPublicWorker` is integration-only",
@@ -877,7 +921,27 @@ function formAuthority(
       ? {}
       : { historicalPreExecutorPublicWorker }),
     ...(managedSpaceAdmissionPolicy === undefined ? {} : { managedSpaceAdmissionPolicy }),
+    ...(existingSpaceOperator === undefined ? {} : { existingSpaceOperator }),
     hostId: value.hostId,
+  };
+}
+
+function parseExistingSpaceOperator(
+  value: unknown,
+): NonNullable<NonNullable<DeployTarget["formAuthority"]>["existingSpaceOperator"]> {
+  if (!isRecord(value)) throw preflightError("existing-Space operator must be an object");
+  assertExactKeys(value, ["workerName", "origin", "publicJwk"]);
+  const origin = httpsOrigin(value.origin);
+  if (new URL(origin).hostname.endsWith(".workers.dev"))
+    throw preflightError("existing-Space operator requires a dedicated custom HTTPS origin");
+  return {
+    workerName: pattern(
+      value.workerName,
+      WORKER_NAME,
+      "formAuthority.existingSpaceOperator.workerName",
+    ),
+    origin,
+    publicJwk: publicEd25519Jwk(value.publicJwk, "formAuthority.existingSpaceOperator.publicJwk"),
   };
 }
 

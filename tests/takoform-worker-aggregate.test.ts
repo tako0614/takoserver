@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import type { JsonObject } from "../src/ports.ts";
 import type { TakoformStoredRelation } from "../src/takoform/relations.ts";
 import type { ResourceDeletionTombstone } from "../src/takoform/store.ts";
 import type { TakoformStoredResource } from "../src/takoform/types.ts";
@@ -58,6 +59,159 @@ const versionRelation: TakoformStoredRelation = {
   targetUid: version.metadata.uid,
   targetFormRef: version.form.formRef,
 };
+
+const containerBindingRef = {
+  apiVersion: "bindings.takoform.com/v1alpha2",
+  name: "module-worker.container-http",
+  version: "0.1.0",
+  schemaDigest: "sha256:caf35e19cd375a9115310dead9e4985f772e044d84dd3449cc347cd0ab49f301",
+} as const;
+const container: TakoformStoredResource = {
+  ...resource("ContainerService", "service", "container-uid", {}),
+  form: {
+    formRef: {
+      apiVersion: formRef.apiVersion,
+      kind: "ContainerService",
+      definitionVersion: "0.1.0-dev.1",
+      schemaDigest: "sha256:883002fb7f9cade8e8a817a14b406889afa024907348473fe0de28622b79e464",
+    },
+  },
+};
+const containerRelation: TakoformStoredRelation = {
+  pointer: "/containerHttpBindings/0/resource",
+  relation: "/containerHttpBindings/*/resource",
+  targetApiVersion: container.apiVersion,
+  targetKind: container.kind,
+  targetName: container.metadata.name,
+  targetUid: container.metadata.uid,
+  targetRevision: container.metadata.revision,
+  targetFormRef: container.form.formRef,
+  bindingRef: containerBindingRef,
+};
+
+async function validateContainerBinding(
+  input: {
+    readonly tenantId?: string;
+    readonly target?: TakoformStoredResource | null;
+    readonly relation?: TakoformStoredRelation;
+    readonly deletion?: ResourceDeletionTombstone | null;
+    readonly spec?: JsonObject;
+  } = {},
+): Promise<void> {
+  await validateWorkerAggregate({
+    tenantId: input.tenantId ?? "tenant-a",
+    space: "conformance",
+    resourceName: "version",
+    form: {
+      identity: {
+        formRef: { ...formRef, kind: "WorkerVersion", definitionVersion: "0.6.0-dev.1" },
+      },
+      role: "revision",
+      acceptedBindings: [containerBindingRef],
+      desiredSchema: {},
+      operations: ["create", "read", "delete"],
+    },
+    spec: input.spec ?? {
+      containerHttpBindings: [{ name: "SERVICE", resource: { name: "service" } }],
+    },
+    relations: [input.relation ?? containerRelation],
+    store: {
+      async hostnameClaims() {
+        return [];
+      },
+      async queuePathReaches() {
+        return false;
+      },
+      async resourcesByRelation() {
+        return [];
+      },
+      async readResource(address) {
+        return address.tenantId === "tenant-a" ? (input.target ?? container) : null;
+      },
+      async readRelations() {
+        return [];
+      },
+      ...noClaims,
+      async readResourceDeletion() {
+        return input.deletion ?? null;
+      },
+    },
+  });
+}
+
+test("candidate container HTTP Binding accepts the exact Ready target incarnation", async () => {
+  await expect(validateContainerBinding()).resolves.toBeUndefined();
+});
+
+test("candidate container HTTP Binding refuses wrong Binding digest or target kind", async () => {
+  for (const relation of [
+    {
+      ...containerRelation,
+      bindingRef: { ...containerBindingRef, schemaDigest: `sha256:${"f".repeat(64)}` as const },
+    },
+    { ...containerRelation, targetKind: "ModuleWorker" },
+  ]) {
+    await expect(validateContainerBinding({ relation })).rejects.toMatchObject({
+      code: "invalid_argument",
+      status: 400,
+    });
+  }
+});
+
+test("candidate container HTTP Binding refuses a cross-tenant, replaced, stale, unready, or deleting target", async () => {
+  const cases = [
+    { tenantId: "tenant-b" },
+    { target: { ...container, metadata: { ...container.metadata, uid: "replacement-uid" } } },
+    { target: { ...container, metadata: { ...container.metadata, revision: "2" } } },
+    {
+      target: {
+        ...container,
+        form: {
+          formRef: {
+            ...container.form.formRef,
+            schemaDigest: `sha256:${"f".repeat(64)}` as const,
+          },
+        },
+      },
+    },
+    { target: { ...container, status: { ...container.status, observedGeneration: "0" } } },
+    { target: { ...container, status: { ...container.status, conditions: [] } } },
+    {
+      deletion: tombstone(
+        container.metadata.uid,
+        "pending",
+        "ContainerService",
+        container.metadata.name,
+      ),
+    },
+  ];
+  for (const candidate of cases) {
+    await expect(validateContainerBinding(candidate)).rejects.toMatchObject({
+      code: "invalid_argument",
+      status: 400,
+      publicMessage: expect.stringContaining("Ready incarnation"),
+    });
+  }
+});
+
+test("candidate container HTTP names collide with existing WorkerVersion bindings", async () => {
+  for (const field of [
+    "vars",
+    "serviceBindings",
+    "workflowBindings",
+    "actorBindings",
+    "vectorBindings",
+  ]) {
+    await expect(
+      validateContainerBinding({
+        spec: {
+          [field]: field === "vars" ? { SERVICE: "value" } : [{ name: "SERVICE" }],
+          containerHttpBindings: [{ name: "SERVICE" }],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_argument", status: 400 });
+  }
+});
 
 function deploymentWorkerRelation(): TakoformStoredRelation {
   return {
@@ -198,8 +352,8 @@ test("an inward activation with no WorkerDeployment at all names the missing dep
       },
     }),
   ).rejects.toMatchObject({
-    code: "invalid_argument",
-    status: 400,
+    code: "unsupported_capability",
+    status: 422,
     publicMessage: expect.stringContaining("has no WorkerDeployment"),
   });
 });
@@ -249,8 +403,8 @@ test("an inbound service binding is rejected until its target worker serves fetc
       },
     }),
   ).rejects.toMatchObject({
-    code: "invalid_argument",
-    status: 400,
+    code: "unsupported_capability",
+    status: 422,
     publicMessage: expect.stringContaining("has no WorkerDeployment"),
   });
 });
@@ -697,6 +851,57 @@ test("an inward activation whose deployment has not become Ready is refused retr
     code: "resource_busy",
     status: 409,
     publicMessage: expect.stringContaining("no serving deployment yet"),
+  });
+});
+
+test("an inward activation refuses a deployed version that lacks its handler", async () => {
+  const workerRelation: TakoformStoredRelation = {
+    ...versionRelation,
+    pointer: "/worker",
+    relation: "/worker",
+    targetKind: "ModuleWorker",
+    targetName: worker.metadata.name,
+    targetUid: worker.metadata.uid,
+  };
+  await expect(
+    validateWorkerAggregate({
+      tenantId: "tenant-a",
+      space: "conformance",
+      resourceName: "trigger",
+      form: {
+        identity: { formRef: { ...formRef, kind: "WorkerCronTrigger" } },
+        role: "attachment",
+        desiredSchema: {},
+        operations: ["create", "read", "delete"],
+      },
+      spec: { cron: "*/5 * * * *" },
+      relations: [workerRelation],
+      wave: testWave(),
+      store: {
+        async hostnameClaims() {
+          return [];
+        },
+        async queuePathReaches() {
+          return false;
+        },
+        async resourcesByRelation(input) {
+          return input.sourceKind === "WorkerDeployment"
+            ? [{ resource: deployment, relations: [versionRelation] }]
+            : [];
+        },
+        async readResource() {
+          return { ...version, spec: { handlers: ["fetch"] } };
+        },
+        async readRelations() {
+          return [];
+        },
+        ...noClaims,
+      },
+    }),
+  ).rejects.toMatchObject({
+    code: "unsupported_capability",
+    status: 422,
+    publicMessage: expect.stringContaining("scheduled"),
   });
 });
 

@@ -18,6 +18,7 @@ import { resolvePayment } from "./payment-setup.ts";
 import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
 import type { CloudflareWorkersAiBinding } from "./providers/cloudflare-workers-ai.ts";
 import { embeddedPublicFormImplementationIdentity } from "./public-form-implementation-build.ts";
+import { selectPublicHostFormSource } from "./public-host-form-source.ts";
 import type {
   PublicFormImplementationIdentity,
   PublicWorkerImplementationIdentity,
@@ -28,7 +29,6 @@ import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
-import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
@@ -94,6 +94,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_OBJECT_BUCKET_SUPPLIES?: string;
   /** Reviewed Cloudflare sales for released identity Forms other than storage. */
   readonly TAKOSERVER_EDGE_SUPPLIES?: string;
+  /** Unpublished source qualification only; defaults to the released Forms. */
+  readonly TAKOSERVER_FORM_SOURCE_CANDIDATE?: string;
   /** Typed private provider authority; never an HTTP bearer bridge. */
   readonly CLOUDFLARE_PROVIDER_EXECUTOR?: CloudflareProviderExecutorRpc;
   /** Non-secret endpoint suffix used for synchronous public address derivation. */
@@ -514,8 +516,10 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     await proveSigningPublicJwk(env.TAKOSERVER_SIGNING_KEY, signingKey.privateKey);
   }
   const edge = await buildEdgeForms();
-  const currentCandidates = currentTakoformCandidates();
   const implementationIdentity = resolvePublicWorkerImplementationIdentity(env);
+  const formSource = startupStage("runtime-configuration", () =>
+    selectPublicHostFormSource(env.TAKOSERVER_FORM_SOURCE_CANDIDATE, implementationIdentity),
+  );
   const { identity, identityProviders, settlement, checkout } = workerCredentials(env, origin);
   const sql = createD1Sql(env.STATE_DB);
   const objects = createR2ObjectStore(env.OBJECTS);
@@ -540,8 +544,12 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
   const deployment = startupStage("supply-composition", () =>
     createWorkerProductionComposition({
       env,
-      forms: currentCandidates.forms,
-      retainedForms: edge.forms,
+      forms: formSource.forms,
+      retainedForms: [...edge.forms, ...formSource.retainedForms],
+      workerClassRuntimeContracts: formSource.workerClassRuntimeContracts,
+      ...(env.TAKOSERVER_FORM_SOURCE_CANDIDATE === "actor-forward"
+        ? { formSourceCandidate: "actor-forward" as const }
+        : {}),
       now: new Date(),
     }),
   );
@@ -576,10 +584,10 @@ async function appFor(env: WorkerEnv, origin: string): Promise<App> {
     ...dataServices,
     publicOrigin: origin,
     ...(env.TAKOSERVER_CONSOLE_ORIGIN ? { consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN } : {}),
-    forms: currentCandidates.forms,
-    bindings: currentCandidates.bindings,
-    hostForms: currentCandidates.forms,
-    hostBindings: currentCandidates.bindings,
+    forms: formSource.forms,
+    bindings: formSource.bindings,
+    hostForms: [...formSource.forms, ...formSource.retainedForms],
+    hostBindings: [...formSource.bindings, ...formSource.retainedBindings],
     providers: deployment.providers,
     providerPacks: deployment.providerPacks,
     offerings: deployment.offerings,
@@ -595,7 +603,11 @@ export default {
    * `/.well-known/takoserver` and every other route report the readable 503
    * reason class instead of a bare provider exception page.
    */
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: WorkerEnv,
+    context?: { waitUntil(work: Promise<unknown>): void },
+  ): Promise<Response> {
     let app: App;
     try {
       const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
@@ -609,7 +621,10 @@ export default {
     } catch (error) {
       return workerStartupFailureResponse(error);
     }
-    return await app.fetch(request);
+    return await app.fetch(
+      request,
+      context ? { waitUntil: (work) => context.waitUntil(work) } : undefined,
+    );
   },
 
   /** Background settlement: expiring reservations return their holds. */

@@ -24,6 +24,7 @@ import {
   providerFailureProvesNoMutation,
 } from "../src/provider-port.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
+import { derivedProviderResourceName } from "../src/provider-worker-endpoint-origin.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
 import {
   createSelfhostDataPlaneAccess,
@@ -258,6 +259,7 @@ interface LeaseLog {
   bindings: Record<string, string>;
   settleFails: boolean;
   recoveredNames: readonly string[];
+  recoveredGeneration?: string;
   /** Files under the data root at the moment `dispatch` was called. */
   filesAtDispatch: readonly string[];
 }
@@ -280,6 +282,7 @@ function fakeLeases(dataRoot: () => string): {
   };
   const preparation = {
     preparationId: "prep-selfhost",
+    generation: "abcdefghijklmnop",
     operationKey: SENSITIVE_OPERATION_KEY,
     workerResourceUid: "uid-ModuleWorker-hello",
     canonicalPublicOrigin: "https://api.takoserver.test",
@@ -314,7 +317,9 @@ function fakeLeases(dataRoot: () => string): {
       async recover() {
         log.events.push("recover");
         return {
-          preparation,
+          preparation: log.recoveredGeneration
+            ? { ...preparation, generation: log.recoveredGeneration }
+            : preparation,
           bindingNames: log.recoveredNames,
           async settle(digest) {
             if (log.settleFails) {
@@ -550,10 +555,19 @@ function probedMaterializingRuntime(
 
 function provider(options: ProviderCase = {}) {
   const modules = options.modules ?? { "index.js": TEST_WORKER_SOURCE };
+  const runtime =
+    options.runtime ??
+    Object.assign(materializingRuntime({ root, isReady: () => true, port: 0 }), {
+      async probe() {
+        // The default fixture has no serving workerd process to probe. Tests
+        // that exercise runtime probing install an isolated probe server.
+        return null;
+      },
+    });
   return createSelfhostProvider({
     offerings: [],
     dataRoot: root,
-    runtime: options.runtime ?? materializingRuntime({ root, isReady: () => true }),
+    runtime,
     ...(options.suffixes ? { suffixes: options.suffixes } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined
@@ -2501,9 +2515,9 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(ticket.phase).toBe("succeeded");
     expect(log.events[0]).toBe("acquire");
     expect(log.events[1]).toBe("dispatch");
-    // The dispatch CAS runs before this machine's own mutation: at that moment
-    // no file on it holds the value.
-    expect(log.filesAtDispatch).toEqual([]);
+    // Only the value-free generation marker exists before dispatch; the
+    // sensitive binding record is written afterward.
+    expect(log.filesAtDispatch).toEqual(["runtime-input-custody.sqlite"]);
     expect(log.events[2]).toMatch(/^settle:sha256:[0-9a-f]{64}$/u);
     expect(bindingFiles(root).length).toBeGreaterThan(0);
 
@@ -2590,6 +2604,34 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(JSON.stringify(recovered)).not.toContain(SECRET_VALUE);
   });
 
+  test("recovery never settles a replaced same-key generation", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "succeeded" });
+    log.events.length = 0;
+    log.recoveredGeneration = "qrstuvwxyzABCDEF";
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+      failure: { code: "denied", retryable: false },
+    });
+    expect(log.events).toEqual(["recover"]);
+  });
+
+  test("a retained sensitive native binding without original marker cannot be recovered", async () => {
+    const { port, log } = fakeLeases(() => root);
+    const local = provider({ runtimeInputs: port });
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "succeeded" });
+    rmSync(join(root, "selfhost", "version-bindings", "runtime-input-custody.sqlite"));
+    log.events.length = 0;
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(log.events).toEqual([]);
+  });
+
   /**
    * The whole one-shot lifecycle against the real authority rather than a fake
    * port, because the property under test is what the durable row does: a write
@@ -2672,17 +2714,74 @@ describe("publishing a Worker through the Edge Family", () => {
         },
         bindings: { ENCRYPTION_KEY: SECRET_VALUE },
       });
-    return { authority, prepare, local: provider({ runtimeInputs: authority.leases }) };
+    const script = await derivedProviderResourceName("sw", {
+      tenantRef: "org_demo",
+      space: "default",
+      name: "hello",
+    });
+    let failAfterDispatch = false;
+    let failBeforeDispatch = false;
+    const port: ProviderRuntimeInputLeasePort = {
+      ...authority.leases,
+      async acquire(input) {
+        const lease = await authority.leases.acquire(input);
+        return {
+          ...lease,
+          async dispatch(fence) {
+            if (failBeforeDispatch) {
+              failBeforeDispatch = false;
+              throw Object.assign(new Error("dispatch interruption"), { code: "unavailable" });
+            }
+            const dispatched = await lease.dispatch(fence);
+            if (failAfterDispatch) {
+              failAfterDispatch = false;
+              await writeFile(
+                join(root, "selfhost", "version-bindings", script),
+                "not a directory",
+              );
+            }
+            return dispatched;
+          },
+        };
+      },
+    };
+    return {
+      authority,
+      prepare,
+      local: provider({ runtimeInputs: port }),
+      failNextWrite: () => {
+        failAfterDispatch = true;
+      },
+      failNextDispatch: () => {
+        failBeforeDispatch = true;
+      },
+      script,
+    };
   };
 
+  test("a claimed lease interrupted after local pin is closed and abandoned exactly", async () => {
+    const { authority, prepare, local, failNextDispatch } = await sealedLane();
+    expect((await prepare()).status).toBe("prepared");
+    failNextDispatch();
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "failed" });
+    expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toMatchObject({
+      status: "accepted",
+    });
+    if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
+    expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
+      phase: "failed",
+      failure: { code: "not_found" },
+    });
+    expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toBeNull();
+  });
+
   test("a write that fails after dispatch is recovered, abandoned, and prepared again", async () => {
-    const { authority, prepare, local } = await sealedLane();
+    const { authority, prepare, local, failNextWrite, script } = await sealedLane();
     expect((await prepare()).status).toBe("prepared");
 
-    // A transient I/O failure that can only be discovered by writing: the store's
-    // own root is not a directory, so every path under it fails with ENOTDIR.
-    await mkdir(join(root, "selfhost"), { recursive: true });
-    await writeFile(join(root, "selfhost", "version-bindings"), "not a directory");
+    // The marker has been committed before dispatch. Obstruct only the native
+    // binding path at dispatch, so the value-free custody ledger survives.
+    failNextWrite();
 
     expect(await local.apply(sensitiveApply())).toMatchObject({
       phase: "failed",
@@ -2699,7 +2798,7 @@ describe("publishing a Worker through the Edge Family", () => {
     });
     await expect(prepare()).rejects.toMatchObject({ code: "conflict", status: 409 });
 
-    rmSync(join(root, "selfhost", "version-bindings"));
+    rmSync(join(root, "selfhost", "version-bindings", script));
     if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
     expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({
       phase: "failed",
@@ -2709,7 +2808,9 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toBeNull();
 
     expect((await prepare()).status).toBe("prepared");
-    const retried = await local.apply(sensitiveApply());
+    const retried = await local.apply(
+      sensitiveApply({ operationId: "op_sensitive_version_retry" }),
+    );
     expect(retried.phase).toBe("succeeded");
     expect(await authority.preparations.read("org_demo", SENSITIVE_OPERATION_KEY)).toMatchObject({
       status: "consumed",
@@ -2717,7 +2818,7 @@ describe("publishing a Worker through the Edge Family", () => {
     expect(JSON.stringify(retried)).not.toContain(SECRET_VALUE);
   });
 
-  test("recovery abandons a handoff whose values provably never landed", async () => {
+  test("recovery without an original local marker refuses to infer a current generation", async () => {
     const { port, log } = fakeLeases(() => root);
     const local = provider({ runtimeInputs: port });
 
@@ -2725,15 +2826,20 @@ describe("publishing a Worker through the Edge Family", () => {
     const recovered = await local.recoverApply(sensitiveApply({ operationMode: "recovery" }));
     expect(recovered).toMatchObject({
       phase: "failed",
-      failure: { code: "not_found", message: "the Worker Version is not materialized" },
+      failure: {
+        code: "conflict",
+        message: "the Worker Version runtime-input generation is ambiguous",
+      },
     });
-    expect(log.events).toEqual(["recover", "abandon"]);
+    expect(log.events).toEqual([]);
   });
 
   test("recovery refuses a handoff whose recovered names are not the declared ones", async () => {
     const { port, log } = fakeLeases(() => root);
-    log.recoveredNames = ["ENCRYPTION_KEY", "SOMETHING_ELSE"];
     const local = provider({ runtimeInputs: port });
+    expect(await local.apply(sensitiveApply())).toMatchObject({ phase: "succeeded" });
+    log.events.length = 0;
+    log.recoveredNames = ["ENCRYPTION_KEY", "SOMETHING_ELSE"];
 
     if (!local.recoverApply) throw new Error("the selfhost provider is missing apply recovery");
     expect(await local.recoverApply(sensitiveApply({ operationMode: "recovery" }))).toMatchObject({

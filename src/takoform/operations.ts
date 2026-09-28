@@ -5,6 +5,7 @@ import { acceptedAuthorityFromGrant } from "./accepted-authority.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
+import { awaitInlineExecution } from "./inline-lifetime.ts";
 import { receiptProjectable } from "./receipt-projection.ts";
 import {
   type DeferredOperationRecord,
@@ -56,10 +57,11 @@ export interface DeferredOperationsConfiguration {
   /**
    * Bounds how long a mutation or poll request waits on inline execution
    * before answering with the deferred contract (202 for a mutation, a pending
-   * Operation for a poll). The attempt is not cancelled: the durable record
-   * and its lease keep the saga resumable by the next poll or scheduled drain
-   * whether the detached work finishes, keeps running fenced by its lease, or
-   * dies with the isolate. Omit to keep every inline attempt unbounded.
+   * Operation for a poll). In a Worker, the request lifetime retains the
+   * unfinished attempt after this budget. That extension is finite (currently
+   * up to 30 seconds after response), so the durable lease and scheduled drain
+   * must still recover an attempt that outlives it or dies with the isolate.
+   * Omit to keep every inline attempt unbounded.
    */
   readonly inlineExecuteMilliseconds?: number;
 }
@@ -174,7 +176,7 @@ export function createDeferredOperations(input: {
           const retired = await input.store.retireDeferredOperation(replay.id, replay.replayKey);
           if (!retired) {
             return input.configuration.executeOnAccept
-              ? await executeAccepted(replay, accepted.lifecycleOperation)
+              ? await executeAccepted(replay, accepted.lifecycleOperation, context.lifetime)
               : acceptedResponse(replay.id, retryAfterSeconds);
           }
           if (replay.committedUid) {
@@ -182,7 +184,7 @@ export function createDeferredOperations(input: {
           }
         } else {
           return input.configuration.executeOnAccept
-            ? await executeAccepted(replay, accepted.lifecycleOperation)
+            ? await executeAccepted(replay, accepted.lifecycleOperation, context.lifetime)
             : acceptedResponse(replay.id, retryAfterSeconds);
         }
       }
@@ -238,7 +240,7 @@ export function createDeferredOperations(input: {
       );
       if (record.fingerprint !== fingerprint) throw new TakoformHostError();
       return input.configuration.executeOnAccept
-        ? await executeAccepted(record, accepted.lifecycleOperation)
+        ? await executeAccepted(record, accepted.lifecycleOperation, context.lifetime)
         : acceptedResponse(record.id, retryAfterSeconds);
     },
 
@@ -300,7 +302,7 @@ export function createDeferredOperations(input: {
       if (isTerminal(operation)) return terminalResponse(operation);
       if (!advanced.acquired) return pendingResponse(operation.id, retryAfterSeconds);
 
-      if (!(await executeInline(operation, leaseToken, "observe"))) {
+      if (!(await executeInline(operation, leaseToken, "observe", context.lifetime))) {
         return pendingResponse(operation.id, retryAfterSeconds);
       }
       const settled = await input.store.readDeferredOperation(
@@ -347,6 +349,7 @@ export function createDeferredOperations(input: {
   async function executeAccepted(
     record: DeferredOperationRecord,
     lifecycleOperation: "create" | "update" | "import" | "delete",
+    lifetime: EngineContext["lifetime"],
   ): Promise<Response> {
     const responseOperation =
       record.operation === "apply"
@@ -390,7 +393,7 @@ export function createDeferredOperations(input: {
     // executor reports a repair-needed error. The durable record is the public
     // authority in that case: reread it before answering so a pending repair
     // is tracked by its Operation handle rather than leaking the stale error.
-    if (!(await executeInline(advanced.operation, leaseToken, "observe"))) {
+    if (!(await executeInline(advanced.operation, leaseToken, "observe", lifetime))) {
       return acceptedResponse(record.id, retryAfterSeconds);
     }
     const settled = await input.store.readDeferredOperation(
@@ -588,36 +591,24 @@ export function createDeferredOperations(input: {
     operation: DeferredOperationRecord,
     leaseToken: string,
     deleteRecoveryAction: "observe" | "converge",
+    lifetime: EngineContext["lifetime"],
   ): Promise<boolean> {
-    if (inlineExecuteMilliseconds === undefined) {
-      await execute(operation, leaseToken, deleteRecoveryAction);
-      return true;
-    }
-    // The tracked promise resolves for both outcomes so an abandoned attempt
-    // can never surface as an unhandled rejection after the request answered.
-    const tracked = execute(operation, leaseToken, deleteRecoveryAction).then(
-      () => "settled" as const,
-      (error: unknown) => error,
+    const settled = await awaitInlineExecution(
+      execute(operation, leaseToken, deleteRecoveryAction),
+      inlineExecuteMilliseconds,
+      lifetime?.waitUntil,
+      (error) => {
+        console.error(
+          canonicalJson({
+            event: "takoform.deferred_operation.inline_attempt_failed",
+            operationId: operation.id,
+            operation: operation.operation,
+            errorClass: error instanceof Error ? error.name : "unknown",
+          }),
+        );
+      },
     );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const expired = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), inlineExecuteMilliseconds);
-    });
-    const outcome = await Promise.race([tracked, expired]);
-    if (timer !== undefined) clearTimeout(timer);
-    if (outcome === "timeout") {
-      void tracked.then((result) => {
-        if (result !== "settled") {
-          console.error(
-            canonicalJson({
-              event: "takoform.deferred_operation.inline_attempt_failed",
-              operationId: operation.id,
-              operation: operation.operation,
-              errorClass: result instanceof Error ? result.name : "unknown",
-            }),
-          );
-        }
-      });
+    if (!settled) {
       console.error(
         canonicalJson({
           event: "takoform.deferred_operation.inline_budget_exceeded",
@@ -629,7 +620,6 @@ export function createDeferredOperations(input: {
       );
       return false;
     }
-    if (outcome !== "settled") throw outcome;
     return true;
   }
 }
@@ -1080,8 +1070,8 @@ const REATTEMPTED_SETTLED_FAILURE_CODES: ReadonlySet<string> = new Set([
  * because the code taxonomy is closed and released and one of its codes carries
  * both shapes. `invalid_argument` is "your weights do not sum to 10000" — a
  * fact about the request that no repair elsewhere changes — and it is equally
- * "the ModuleWorker you name has no WorkerDeployment", "another resource holds
- * this hostname", "a second deployment already holds this Worker": facts about
+ * "another resource holds this hostname", "a second deployment already holds
+ * this Worker": facts about
  * a neighbour, each cured without one byte of this resource's plan moving. So
  * the site that knows says so, by marking its refusal
  * `CROSS_RESOURCE_PRECONDITION`, and a marked refusal is re-attempted whatever

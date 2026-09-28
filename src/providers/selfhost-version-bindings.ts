@@ -1,6 +1,7 @@
+import { Database } from "bun:sqlite";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { existsSync, constants as fsConstants } from "node:fs";
+import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { isJsonObject } from "../json.ts";
 import { isStableStandardServiceProtocol } from "../standard-service-port.ts";
@@ -72,6 +73,9 @@ const FORMAT_V5 = "takoserver.selfhost-version-bindings@v5";
  * and the immutable record must retain both values.
  */
 const FORMAT_V6 = "takoserver.selfhost-version-bindings@v6";
+/** Adds the original one-shot lease generation to the native receipt. */
+const FORMAT_V7 = "takoserver.selfhost-version-bindings@v7";
+const LEASE_GENERATION = /^[A-Za-z0-9_-]{16}$/u;
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
   "edge.kv",
@@ -180,6 +184,8 @@ export interface SelfhostVersionDataPlane {
 }
 
 export interface SelfhostVersionBindingSet {
+  /** Original one-shot lease generation; never inferred from a later row. */
+  readonly runtimeInputGeneration?: string;
   /** Exact ModuleWorker Resource this immutable Version revises. */
   readonly workerResourceUid: string;
   /**
@@ -202,7 +208,25 @@ export interface SelfhostVersionBindingSet {
   readonly dataPlane?: SelfhostVersionDataPlane;
 }
 
+/** Value-free custody of one accepted sensitive Worker Version operation. */
+export interface SelfhostRuntimeInputMarkerIdentity {
+  readonly tenantId: string;
+  readonly operationId: string;
+  readonly operationKey: string;
+  readonly resourceUid: string;
+  readonly workerResourceUid: string;
+  readonly space: string;
+  readonly workerName: string;
+  readonly bundleName: string;
+}
+
+export interface SelfhostRuntimeInputMarker extends SelfhostRuntimeInputMarkerIdentity {
+  readonly generation: string;
+}
+
 export interface StoredSelfhostVersionBindings {
+  /** Absent on historical records, which cannot settle a sensitive recovery. */
+  readonly runtimeInputGeneration?: string;
   /** Absent only on a retained @v1-@v3 record; it is never inferred. */
   readonly workerResourceUid?: string;
   /**
@@ -271,7 +295,29 @@ export interface SelfhostVersionBindingStore {
     script: string,
     versionId: string,
     set: SelfhostVersionBindingSet,
+    marker?: SelfhostRuntimeInputMarker,
   ): Promise<StoredSelfhostVersionBindings>;
+  /** Durable, exact operation custody before the one-shot lease is dispatched. */
+  pinRuntimeInput(
+    script: string,
+    versionId: string,
+    marker: SelfhostRuntimeInputMarker,
+  ): Promise<void>;
+  /** Never derives a generation from the current public preparation row. */
+  readRuntimeInput(
+    script: string,
+    versionId: string,
+    identity: SelfhostRuntimeInputMarkerIdentity,
+  ): Promise<{
+    readonly generation: string;
+    readonly state: "active" | "written" | "closed";
+  } | null>;
+  /** Fences every late native writer before proving the sensitive file absent. */
+  closeAbsentRuntimeInput(
+    script: string,
+    versionId: string,
+    marker: SelfhostRuntimeInputMarker,
+  ): Promise<boolean>;
   remove(script: string, versionId: string): Promise<boolean>;
   /** Forgets every version of one script. */
   removeScript(script: string): Promise<void>;
@@ -280,6 +326,8 @@ export interface SelfhostVersionBindingStore {
 export function createSelfhostVersionBindingStore(options: {
   readonly root: string;
   readonly randomBytes?: (length: number) => Uint8Array;
+  /** Fault-injection seam for crash tests; never supplied by provider composition. */
+  readonly afterNativeWriteBeforeCommit?: () => Promise<void>;
 }): SelfhostVersionBindingStore {
   const root = resolve(options.root);
   const randomBytes = options.randomBytes ?? ((length: number) => nodeRandomBytes(length));
@@ -311,102 +359,366 @@ export function createSelfhostVersionBindingStore(options: {
     return parseStored(bytes);
   };
 
+  const markerPath = join(root, "runtime-input-custody.sqlite");
+  const withMarkerTransaction = async <T>(operation: (db: Database) => Promise<T>): Promise<T> => {
+    let db: Database | undefined;
+    let begun = false;
+    try {
+      await mkdir(root, { recursive: true, mode: 0o700 });
+      await chmod(root, 0o700);
+      const handle = await open(
+        markerPath,
+        fsConstants.O_CREAT | fsConstants.O_RDWR | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      await handle.close();
+      await chmod(markerPath, 0o600);
+      await syncDirectory(root);
+      db = new Database(markerPath);
+      db.exec("PRAGMA busy_timeout = 0");
+      db.exec("PRAGMA synchronous = FULL");
+      db.exec(`CREATE TABLE IF NOT EXISTS runtime_input_custody (
+        script TEXT NOT NULL,
+        version_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        identity_json TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'written', 'closed')),
+        PRIMARY KEY (script, version_id)
+      )`);
+      db.exec("BEGIN IMMEDIATE");
+      begun = true;
+      const result = await operation(db);
+      db.exec("COMMIT");
+      begun = false;
+      return result;
+    } catch (error) {
+      if (begun) {
+        try {
+          db?.exec("ROLLBACK");
+        } catch {
+          // The original refusal remains authoritative.
+        }
+      }
+      if (error instanceof SelfhostVersionBindingStoreError) throw error;
+      throw new SelfhostVersionBindingStoreError("unavailable");
+    } finally {
+      db?.close();
+    }
+  };
+
+  const markerRow = (db: Database, script: string, versionId: string) =>
+    db
+      .query(
+        "SELECT operation_id, identity_json, generation, state FROM runtime_input_custody WHERE script = ? AND version_id = ?",
+      )
+      .get(script, versionId) as {
+      operation_id: string;
+      identity_json: string;
+      generation: string;
+      state: string;
+    } | null;
+
+  const markerIdentity = (marker: SelfhostRuntimeInputMarkerIdentity): string => {
+    const fields = [
+      marker.tenantId,
+      marker.operationId,
+      marker.operationKey,
+      marker.resourceUid,
+      marker.workerResourceUid,
+      marker.space,
+      marker.workerName,
+      marker.bundleName,
+    ];
+    if (
+      fields.some((value) => typeof value !== "string" || value.length < 1 || value.length > 512)
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    const identity = JSON.stringify({
+      tenantId: marker.tenantId,
+      operationId: marker.operationId,
+      operationKey: marker.operationKey,
+      resourceUid: marker.resourceUid,
+      workerResourceUid: marker.workerResourceUid,
+      space: marker.space,
+      workerName: marker.workerName,
+      bundleName: marker.bundleName,
+    });
+    if (identity.length > 4_096) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+    return identity;
+  };
+
+  const assertMarker = (
+    row: ReturnType<typeof markerRow>,
+    marker: SelfhostRuntimeInputMarker,
+    state: "active" | "written" | "closed",
+  ): void => {
+    if (
+      !row ||
+      row.identity_json !== markerIdentity(marker) ||
+      row.generation !== marker.generation ||
+      row.state !== state
+    ) {
+      throw new SelfhostVersionBindingStoreError("corrupt");
+    }
+  };
+
   return {
     async read(script, versionId) {
       return await locked(`${root}\u0000${script}\u0000${versionId}`, async () => {
-        await cleanAbandonedWrite(pathFor(script, versionId));
-        return await readCurrent(script, versionId);
+        pathFor(script, versionId);
+        // A sensitive writer creates the custody DB before any native temp
+        // file. Without it, do not unlink a temp that could be about to enter
+        // that cross-process critical section.
+        if (!existsSync(markerPath)) return await readCurrent(script, versionId);
+        return await withMarkerTransaction(async () => {
+          await cleanAbandonedWrite(pathFor(script, versionId));
+          return await readCurrent(script, versionId);
+        });
       });
     },
 
-    async write(script, versionId, set) {
-      const normalized = normalizeSet(set);
-      return await locked(`${root}\u0000${script}\u0000${versionId}`, async () => {
-        const path = pathFor(script, versionId);
-        await cleanAbandonedWrite(path);
-        const current = await readCurrent(script, versionId);
-        if (current && sameBindings(current, normalized)) return current;
-        try {
-          // 0700 so a second account on the machine cannot even enumerate which
-          // versions carry which binding names.
-          await mkdir(directoryFor(script), { recursive: true, mode: 0o700 });
-        } catch {
-          throw new SelfhostVersionBindingStoreError("unavailable");
-        }
-        const salt = base64Url(Uint8Array.from(randomBytes(SALT_BYTES)));
-        const planeToken = normalized.dataPlane
-          ? base64Url(Uint8Array.from(randomBytes(PLANE_TOKEN_BYTES)))
-          : undefined;
-        // Minted for every Version, because a Worker Version is immutable and
-        // the Consumer or Trigger that needs it is attached after this record
-        // is the only one there will ever be.
-        const eventToken = base64Url(Uint8Array.from(randomBytes(EVENT_TOKEN_BYTES)));
-        if (
-          decodedLength(salt) !== SALT_BYTES ||
-          decodedLength(eventToken) !== EVENT_TOKEN_BYTES ||
-          (planeToken !== undefined && decodedLength(planeToken) !== PLANE_TOKEN_BYTES)
-        ) {
-          throw new SelfhostVersionBindingStoreError("unavailable");
-        }
-        const format = formatForSet(normalized);
-        const raw = canonicalRecord(format, salt, normalized, planeToken, eventToken);
-        const bytes = new TextEncoder().encode(raw);
-        if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
-        const temporary = `${path}.tmp`;
-        let handle: Awaited<ReturnType<typeof open>> | undefined;
-        let closed = false;
-        try {
-          handle = await open(
-            temporary,
-            fsConstants.O_CREAT |
-              fsConstants.O_EXCL |
-              fsConstants.O_WRONLY |
-              fsConstants.O_NOFOLLOW,
-            0o600,
+    async pinRuntimeInput(script, versionId, marker) {
+      pathFor(script, versionId);
+      if (!LEASE_GENERATION.test(marker.generation)) {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      const identity = markerIdentity(marker);
+      await locked(`${root}\u0000${script}\u0000${versionId}`, async () => {
+        await withMarkerTransaction(async (db) => {
+          const row = markerRow(db, script, versionId);
+          if (!row) {
+            db.query(`INSERT INTO runtime_input_custody
+                (script, version_id, operation_id, identity_json, generation, state)
+                VALUES (?, ?, ?, ?, ?, 'active')`).run(
+              script,
+              versionId,
+              marker.operationId,
+              identity,
+              marker.generation,
+            );
+            return;
+          }
+          if (
+            row.state === "active" &&
+            row.identity_json === identity &&
+            row.generation === marker.generation
+          )
+            return;
+          if (
+            row.state !== "closed" ||
+            row.operation_id === marker.operationId ||
+            row.generation === marker.generation ||
+            (await readCurrent(script, versionId))
+          ) {
+            throw new SelfhostVersionBindingStoreError("corrupt");
+          }
+          db.query(`UPDATE runtime_input_custody SET operation_id = ?, identity_json = ?, generation = ?, state = 'active'
+            WHERE script = ? AND version_id = ? AND state = 'closed'`).run(
+            marker.operationId,
+            identity,
+            marker.generation,
+            script,
+            versionId,
           );
-          await handle.writeFile(bytes);
-          await handle.sync();
-          await handle.close();
-          closed = true;
-          await rename(temporary, path);
-          await syncDirectory(directoryFor(script));
-        } catch {
-          if (!closed) await handle?.close().catch(() => undefined);
-          throw new SelfhostVersionBindingStoreError("unavailable");
-        } finally {
-          await rm(temporary, { force: true }).catch(() => undefined);
-        }
-        return {
-          ...normalized,
-          digest: digestOf(format, salt, normalized, planeToken, eventToken),
-          ...(planeToken === undefined ? {} : { planeToken }),
-          eventToken,
+        });
+      });
+    },
+
+    async readRuntimeInput(script, versionId, identity) {
+      pathFor(script, versionId);
+      const expected = markerIdentity(identity);
+      return await locked(
+        `${root}\u0000${script}\u0000${versionId}`,
+        async () =>
+          await withMarkerTransaction(async (db) => {
+            const row = markerRow(db, script, versionId);
+            if (!row) return null;
+            if (
+              row.identity_json !== expected ||
+              !LEASE_GENERATION.test(row.generation) ||
+              (row.state !== "active" && row.state !== "written" && row.state !== "closed")
+            ) {
+              throw new SelfhostVersionBindingStoreError("corrupt");
+            }
+            return { generation: row.generation, state: row.state };
+          }),
+      );
+    },
+
+    async closeAbsentRuntimeInput(script, versionId, marker) {
+      pathFor(script, versionId);
+      return await locked(
+        `${root}\u0000${script}\u0000${versionId}`,
+        async () =>
+          await withMarkerTransaction(async (db) => {
+            const row = markerRow(db, script, versionId);
+            if (
+              !row ||
+              row.identity_json !== markerIdentity(marker) ||
+              row.generation !== marker.generation
+            ) {
+              throw new SelfhostVersionBindingStoreError("corrupt");
+            }
+            await cleanAbandonedWrite(pathFor(script, versionId));
+            if (await readCurrent(script, versionId)) return false;
+            // The binding once reached disk, even if it disappeared later.
+            // Absence now cannot prove that the handoff had no effect.
+            if (row.state === "written") throw new SelfhostVersionBindingStoreError("corrupt");
+            if (row.state === "closed") return true;
+            assertMarker(row, marker, "active");
+            db.query(`UPDATE runtime_input_custody SET state = 'closed'
+            WHERE script = ? AND version_id = ? AND identity_json = ? AND generation = ? AND state = 'active'`).run(
+              script,
+              versionId,
+              row.identity_json,
+              marker.generation,
+            );
+            return true;
+          }),
+      );
+    },
+
+    async write(script, versionId, set, marker) {
+      const normalized = normalizeSet(set);
+      if (
+        normalized.runtimeInputGeneration &&
+        (!marker || marker.generation !== normalized.runtimeInputGeneration)
+      ) {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      return await locked(`${root}\u0000${script}\u0000${versionId}`, async () => {
+        const performWrite = async (): Promise<StoredSelfhostVersionBindings> => {
+          const path = pathFor(script, versionId);
+          await cleanAbandonedWrite(path);
+          const current = await readCurrent(script, versionId);
+          // A native record with sensitive values belongs to one exact handoff.
+          // Neither a new generation nor a missing legacy marker can adopt it.
+          if (
+            current?.sensitiveVars.length &&
+            current.runtimeInputGeneration !== normalized.runtimeInputGeneration
+          ) {
+            throw new SelfhostVersionBindingStoreError("corrupt");
+          }
+          if (current && sameBindings(current, normalized)) return current;
+          try {
+            // 0700 so a second account on the machine cannot even enumerate which
+            // versions carry which binding names.
+            await mkdir(directoryFor(script), { recursive: true, mode: 0o700 });
+          } catch {
+            throw new SelfhostVersionBindingStoreError("unavailable");
+          }
+          const salt = base64Url(Uint8Array.from(randomBytes(SALT_BYTES)));
+          const planeToken = normalized.dataPlane
+            ? base64Url(Uint8Array.from(randomBytes(PLANE_TOKEN_BYTES)))
+            : undefined;
+          // Minted for every Version, because a Worker Version is immutable and
+          // the Consumer or Trigger that needs it is attached after this record
+          // is the only one there will ever be.
+          const eventToken = base64Url(Uint8Array.from(randomBytes(EVENT_TOKEN_BYTES)));
+          if (
+            decodedLength(salt) !== SALT_BYTES ||
+            decodedLength(eventToken) !== EVENT_TOKEN_BYTES ||
+            (planeToken !== undefined && decodedLength(planeToken) !== PLANE_TOKEN_BYTES)
+          ) {
+            throw new SelfhostVersionBindingStoreError("unavailable");
+          }
+          const format = formatForSet(normalized);
+          const raw = canonicalRecord(format, salt, normalized, planeToken, eventToken);
+          const bytes = new TextEncoder().encode(raw);
+          if (bytes.byteLength > MAX_BYTES) throw new SelfhostVersionBindingStoreError("corrupt");
+          const temporary = `${path}.tmp`;
+          let handle: Awaited<ReturnType<typeof open>> | undefined;
+          let closed = false;
+          try {
+            handle = await open(
+              temporary,
+              fsConstants.O_CREAT |
+                fsConstants.O_EXCL |
+                fsConstants.O_WRONLY |
+                fsConstants.O_NOFOLLOW,
+              0o600,
+            );
+            await handle.writeFile(bytes);
+            await handle.sync();
+            await handle.close();
+            closed = true;
+            await rename(temporary, path);
+            await syncDirectory(directoryFor(script));
+          } catch {
+            if (!closed) await handle?.close().catch(() => undefined);
+            throw new SelfhostVersionBindingStoreError("unavailable");
+          } finally {
+            await rm(temporary, { force: true }).catch(() => undefined);
+          }
+          return {
+            ...normalized,
+            digest: digestOf(format, salt, normalized, planeToken, eventToken),
+            ...(planeToken === undefined ? {} : { planeToken }),
+            eventToken,
+          };
         };
+        if (!marker) return await performWrite();
+        return await withMarkerTransaction(async (db) => {
+          const row = markerRow(db, script, versionId);
+          if (row?.state === "written") {
+            assertMarker(row, marker, "written");
+            const current = await readCurrent(script, versionId);
+            if (current && sameBindings(current, normalized)) return current;
+            throw new SelfhostVersionBindingStoreError("corrupt");
+          }
+          assertMarker(row, marker, "active");
+          const written = await performWrite();
+          db.query(`UPDATE runtime_input_custody SET state = 'written'
+            WHERE script = ? AND version_id = ? AND identity_json = ? AND generation = ? AND state = 'active'`).run(
+            script,
+            versionId,
+            markerIdentity(marker),
+            marker.generation,
+          );
+          await options.afterNativeWriteBeforeCommit?.();
+          return written;
+        });
       });
     },
 
     async remove(script, versionId) {
       return await locked(`${root}\u0000${script}\u0000${versionId}`, async () => {
-        const path = pathFor(script, versionId);
-        await cleanAbandonedWrite(path);
-        try {
-          await rm(path);
-          await syncDirectory(directoryFor(script));
-          return true;
-        } catch (error) {
-          if (errorCode(error) === "ENOENT") return false;
-          throw new SelfhostVersionBindingStoreError("unavailable");
-        }
+        return await withMarkerTransaction(async (db) => {
+          const path = pathFor(script, versionId);
+          await cleanAbandonedWrite(path);
+          let removed = false;
+          try {
+            await rm(path);
+            await syncDirectory(directoryFor(script));
+            removed = true;
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") {
+              throw new SelfhostVersionBindingStoreError("unavailable");
+            }
+          }
+          db.query("DELETE FROM runtime_input_custody WHERE script = ? AND version_id = ?").run(
+            script,
+            versionId,
+          );
+          return removed;
+        });
       });
     },
 
     async removeScript(script) {
-      try {
-        await rm(directoryFor(script), { recursive: true, force: true });
-      } catch (error) {
-        if (error instanceof SelfhostVersionBindingStoreError) throw error;
-        throw new SelfhostVersionBindingStoreError("unavailable");
-      }
+      await withMarkerTransaction(async (db) => {
+        try {
+          await rm(directoryFor(script), { recursive: true, force: true });
+        } catch (error) {
+          if (error instanceof SelfhostVersionBindingStoreError) throw error;
+          throw new SelfhostVersionBindingStoreError("unavailable");
+        }
+        db.query("DELETE FROM runtime_input_custody WHERE script = ?").run(script);
+      });
     },
   };
 }
@@ -476,12 +788,22 @@ export function normalizeSelfhostVersionBindingSet(
 }
 
 function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet {
+  if (
+    set.runtimeInputGeneration !== undefined &&
+    (typeof set.runtimeInputGeneration !== "string" ||
+      !LEASE_GENERATION.test(set.runtimeInputGeneration))
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   if (typeof set.workerResourceUid !== "string" || !RESOURCE_UID.test(set.workerResourceUid)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const handlers = normalizeHandlers(set.handlers);
   const vars = normalizeBindings(set.vars);
   const sensitiveVars = normalizeBindings(set.sensitiveVars);
+  if (set.runtimeInputGeneration && sensitiveVars.length === 0) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   const dataPlane = set.dataPlane === undefined ? undefined : normalizeDataPlane(set.dataPlane);
   const serviceBindings = normalizeServiceBindings(set.serviceBindings);
   const externalServices = normalizeExternalServices(set.externalServices);
@@ -501,6 +823,7 @@ function normalizeSet(set: SelfhostVersionBindingSet): SelfhostVersionBindingSet
     handlers,
     vars,
     sensitiveVars,
+    ...(set.runtimeInputGeneration ? { runtimeInputGeneration: set.runtimeInputGeneration } : {}),
     serviceBindings,
     ...(externalServices ? { externalServices } : {}),
     ...(dataPlane ? { dataPlane } : {}),
@@ -820,6 +1143,7 @@ function sameBindings(
   left: StoredSelfhostVersionBindings,
   right: SelfhostVersionBindingSet,
 ): boolean {
+  if (left.runtimeInputGeneration !== right.runtimeInputGeneration) return false;
   // A retained pre-v4 record stays byte-for-byte valid for a Version that did
   // not declare a service binding. Its owner UID is deliberately not inferred,
   // so it cannot become a worker.service target until a new Version is
@@ -851,6 +1175,9 @@ function sameBindings(
       handlers: left.handlers,
       vars: left.vars,
       sensitiveVars: left.sensitiveVars,
+      ...(left.runtimeInputGeneration
+        ? { runtimeInputGeneration: left.runtimeInputGeneration }
+        : {}),
       serviceBindings: left.serviceBindings,
       ...(left.externalServices ? { externalServices: left.externalServices } : {}),
       ...(left.dataPlane ? { dataPlane: left.dataPlane } : {}),
@@ -864,6 +1191,7 @@ function canonicalBindings(set: SelfhostVersionBindingSet): string {
     handlers: set.handlers,
     vars: set.vars,
     sensitiveVars: set.sensitiveVars,
+    ...(set.runtimeInputGeneration ? { runtimeInputGeneration: set.runtimeInputGeneration } : {}),
     serviceBindings: set.serviceBindings,
     externalServices: set.externalServices ?? null,
     dataPlane: set.dataPlane ?? null,
@@ -876,11 +1204,13 @@ type SelfhostVersionBindingFormat =
   | typeof FORMAT_V3
   | typeof FORMAT_V4
   | typeof FORMAT_V5
-  | typeof FORMAT_V6;
+  | typeof FORMAT_V6
+  | typeof FORMAT_V7;
 
 function formatForSet(
   set: SelfhostVersionBindingSet,
-): typeof FORMAT_V4 | typeof FORMAT_V5 | typeof FORMAT_V6 {
+): typeof FORMAT_V4 | typeof FORMAT_V5 | typeof FORMAT_V6 | typeof FORMAT_V7 {
+  if (set.runtimeInputGeneration) return FORMAT_V7;
   if (hasVectorDataBinding(set)) return FORMAT_V6;
   return set.externalServices ? FORMAT_V5 : FORMAT_V4;
 }
@@ -910,7 +1240,7 @@ function canonicalRecord(
     ? {
         bindings: set.dataPlane.bindings.map((binding) => {
           if (binding.kind === "edge.vector") {
-            if (format !== FORMAT_V6) {
+            if (format !== FORMAT_V6 && format !== FORMAT_V7) {
               throw new SelfhostVersionBindingStoreError("corrupt");
             }
             return {
@@ -999,8 +1329,9 @@ function canonicalRecord(
     });
   }
   return JSON.stringify({
-    format: FORMAT_V6,
+    format,
     salt,
+    ...(format === FORMAT_V7 ? { runtimeInputGeneration: current.runtimeInputGeneration } : {}),
     workerResourceUid: current.workerResourceUid,
     handlers: current.handlers,
     vars: current.vars,
@@ -1015,6 +1346,7 @@ function canonicalRecord(
 
 /** What a record read back carries, before it is proved to be one. */
 interface LegacySet {
+  readonly runtimeInputGeneration?: string;
   readonly workerResourceUid?: string;
   readonly handlers?: readonly SelfhostWorkerHandlerName[];
   readonly vars: readonly SelfhostVersionBinding[];
@@ -1067,7 +1399,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
               ? FORMAT_V5
               : record.format === FORMAT_V6 && isVersion6Keys(keys)
                 ? FORMAT_V6
-                : null;
+                : record.format === FORMAT_V7 && isVersion7Keys(keys)
+                  ? FORMAT_V7
+                  : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -1080,7 +1414,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     ((format === FORMAT_V3 ||
       format === FORMAT_V4 ||
       format === FORMAT_V5 ||
-      format === FORMAT_V6) &&
+      format === FORMAT_V6 ||
+      format === FORMAT_V7) &&
       "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
@@ -1090,14 +1425,19 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   const eventToken =
-    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
+    format === FORMAT_V3 ||
+    format === FORMAT_V4 ||
+    format === FORMAT_V5 ||
+    format === FORMAT_V6 ||
+    format === FORMAT_V7
       ? record.eventToken
       : undefined;
   if (
     (format === FORMAT_V3 ||
       format === FORMAT_V4 ||
       format === FORMAT_V5 ||
-      format === FORMAT_V6) &&
+      format === FORMAT_V6 ||
+      format === FORMAT_V7) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1106,13 +1446,17 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
   // because a Version with no binding declares them too.
   const legacyPlane = format === FORMAT_V2 ? parsedLegacyDataPlane(record.dataPlane) : null;
   const handlers =
-    format === FORMAT_V3 || format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
+    format === FORMAT_V3 ||
+    format === FORMAT_V4 ||
+    format === FORMAT_V5 ||
+    format === FORMAT_V6 ||
+    format === FORMAT_V7
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
         : undefined;
   const set = normalizeSetOrLegacy({
-    ...(format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6
+    ...(format === FORMAT_V4 || format === FORMAT_V5 || format === FORMAT_V6 || format === FORMAT_V7
       ? {
           workerResourceUid: parsedResourceUid(record.workerResourceUid),
           serviceBindings: parsedServiceBindings(record.serviceBindings),
@@ -1121,21 +1465,27 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     ...(handlers ? { handlers } : {}),
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
+    ...(format === FORMAT_V7
+      ? { runtimeInputGeneration: parsedRuntimeInputGeneration(record.runtimeInputGeneration) }
+      : {}),
     ...(hasPlane
       ? {
           dataPlane: parsedDataPlane(
             format === FORMAT_V2 ? { bindings: legacyPlane?.bindings } : record.dataPlane,
-            format === FORMAT_V6,
+            format === FORMAT_V6 || format === FORMAT_V7,
           ),
         }
       : {}),
-    ...(format === FORMAT_V5 || format === FORMAT_V6
+    ...(format === FORMAT_V5 || format === FORMAT_V6 || format === FORMAT_V7
       ? { externalServices: parsedExternalServices(record.externalServices) }
       : {}),
   });
   // `@v6` is reserved for the new scoped Vector entry. A record that claims
   // the format without one is neither a v5 record nor a valid v6 record.
   if (format === FORMAT_V6 && !hasVectorDataBinding(set)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (format === FORMAT_V7 && set.sensitiveVars.length === 0) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   if (
@@ -1201,6 +1551,22 @@ function isVersion6Keys(keys: string): boolean {
   );
 }
 
+function isVersion7Keys(keys: string): boolean {
+  return (
+    keys ===
+      "eventToken,externalServices,format,handlers,runtimeInputGeneration,salt,sensitiveVars,serviceBindings,vars,workerResourceUid" ||
+    keys ===
+      "dataPlane,eventToken,externalServices,format,handlers,planeToken,runtimeInputGeneration,salt,sensitiveVars,serviceBindings,vars,workerResourceUid"
+  );
+}
+
+function parsedRuntimeInputGeneration(value: unknown): string {
+  if (typeof value !== "string" || !LEASE_GENERATION.test(value)) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  return value;
+}
+
 function parsedResourceUid(value: unknown): string {
   if (typeof value !== "string" || !RESOURCE_UID.test(value)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1263,6 +1629,9 @@ function normalizeSetOrLegacy(set: LegacySet): LegacySet {
     names.add(name);
   }
   return {
+    ...(set.runtimeInputGeneration
+      ? { runtimeInputGeneration: parsedRuntimeInputGeneration(set.runtimeInputGeneration) }
+      : {}),
     ...(set.workerResourceUid ? { workerResourceUid: set.workerResourceUid } : {}),
     ...(set.handlers ? { handlers } : {}),
     vars,

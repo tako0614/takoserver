@@ -89,6 +89,19 @@ describe("Offering catalog", () => {
     expect(catalog.findOffering(beta.id)).toEqual(beta);
   });
 
+  test("keeps configured Offering identity reserved after sale is withdrawn", () => {
+    const unavailable = { ...offering("compute.edge.unavailable", "alpha"), available: false };
+    const retired = { ...offering("compute.edge.retired", "alpha"), retired: true };
+    const catalog = createCatalog([unavailable, retired]);
+
+    expect(catalog.hasOfferingId(unavailable.id)).toBe(true);
+    expect(catalog.hasOfferingId(retired.id)).toBe(true);
+    expect(catalog.hasOfferingId("compute.edge.unknown")).toBe(false);
+    expect(catalog.findOffering(unavailable.id)).toBeUndefined();
+    expect(catalog.offeringsFor(FORM)).toEqual([]);
+    expect(catalog.list()).toEqual([]);
+  });
+
   test("does not silently choose an Offering from the Form", () => {
     const catalog = createCatalog([
       offering("compute.edge.alpha.global", "alpha"),

@@ -26,6 +26,69 @@ space for the transaction's temporary copies; an older build refuses a database
 with this newer lineage. This local upgrade is not qualification for a
 protected Cloudflare D1 upgrade; see the [0058 deploy boundary](deploy.md#0058-domain-receipt-schema-protected-wave-unavailable).
 
+Migration 0064 adds a separate, forward-only `cloudflare_managed_actor_owner_claims`
+table for the private WfP Actor owner publisher. An ActorNamespace UID, not a
+Worker Version, holds its stable identity. The existing Worker receipt kind and
+its applied migration history are unchanged: Actor claims have a one-shot
+`claimed → upload_authorized → committed` lifecycle rather than Worker
+replacement/delete semantics. The private adapter may authorize a single
+native PUT only after exact script absence, and may settle an authorized claim
+after a lost acknowledgement through exact native readback without another
+PUT. This schema does not admit Actor Resources to the public Host or enable
+production Actor bindings. Applying it to a protected D1 target remains a
+separate reviewed operator action, not a consequence of this source change.
+
+The public provider-extension seam classifies `ActorNamespace` for the managed
+backend and accepts only `actor:<32 lowercase hexadecimal characters>` as its
+native readback identity. Its existing readback envelope carries the exact
+Resource UID in `data.resourceUid`; it carries no owner script, credentials,
+class implementation or provider configuration. The public proxy constructs
+this descriptor locally, while the selected private backend owns native
+observation and lifecycle execution. This is a software extension contract,
+not a new Host API route or a change to the published Actor Form.
+
+With the explicit `actor-forward` public source candidate, the Cloudflare proxy
+can expose a technical `ProviderOffering` for the exact Actor Form when its
+package/class ABI is registered and the executor provides class inspection.
+That proxy capability is not a sellable catalog `Offering` and does not itself
+admit Actor identity creates through the normal Host lane. Normal identity
+creation still requires an independently reviewed sellable catalog Offering.
+The hosted edge supply parser continues to reject Actor supply configuration;
+it has no Actor resource-class, metering, or price-plan contract. `ActorNamespace`
+remains an identity Form, not a relation that inherits a Worker's commercial
+Offering.
+
+This opt-in is source qualification, not publication or production admission.
+Native owner allocation or a technical proxy route alone does not prove that
+every weighted active Worker version exports the required class or that the
+Actor Form is Ready. Provider-qualified readiness, the backend lifecycle, and
+the separately owned commercial supply composition remain distinct work.
+
+The `Provider.workerClassRuntime` software port separates identity
+allocation from runtime readiness. An adapter must register an exact FormRef,
+package digest and explicit runtime InterfaceRef; the historical inferred
+Actor adapter has no such ABI registration. The same capability is checked by
+Host authority and before apply/import, including the selected provider. A
+successful class identity allocation starts with `Ready=False`, even if a
+provider receipt optimistically claims readiness. It need not wait for the
+WorkerVersion that will bind that identity.
+
+Current read/observe and non-replay apply derive readiness from the same
+tenant/Space and UID-pinned graph. Every nonzero weighted Version must pass
+isolated class inspection against its exact bundle manifest. The selected
+holder and Version Deployments must belong to the same provider installation;
+both the Resource graph and native Deployment facts are re-read after
+inspection. Missing graphs, mismatches and unavailable inspection never yield
+Ready. The inspector must not construct the class or receive live Actor state
+or sensitive environment values. Wrapper identity and declared-handler checks
+alone are insufficient. The public Cloudflare proxy registers the exact
+candidate ABI only for the explicit `actor-forward` composition when its class
+inspection RPC is available; the default released-Form composition does not.
+
+Exact idempotency replay still returns its historical mutation response. It
+does not re-evaluate current readiness or grant traffic admission; current
+read/observe and the runtime's own live admission answer those questions.
+
 ## Ordinary stable mode
 
 The normal `bun src/entry-bun.ts` process uses the stable self-host Provider3
@@ -57,6 +120,19 @@ Worker-route authority belongs to the private deployment owner. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
 
 ### Self-host runner credentials
+
+Hosted sponsorship may supply a generic opaque `logicalPrincipalRef` when
+issuing a tenant-run credential. The signed claim selects a stable Host
+operation principal across short-lived credentials in the same organization,
+tenant reference, and exact Space, while `runRef` remains
+issuance correlation and each JWT keeps its own token ID and expiry. The Host
+still binds operations to the exact authenticated tenant and principal under
+the frozen Host API; it does not interpret the reference as a Workspace or
+Capsule ID. A credential without the claim, including the current self-host
+route, keeps its per-token principal. There is no legacy-operation alias:
+pending operations owned by old token principals must be drained or repaired
+before a Hosted cutover. The public Host must accept the new closed claim
+before Hosted begins sending it; neither side changes Form or Host API v1 bytes.
 
 The optional runner-credential endpoint is Host-specific authenticated HTTP on
 the ordinary public listener. It is not route-less and it is not protected by
@@ -324,6 +400,16 @@ but recovery must not skip an unconfirmed claim by treating it as provider
 dispatch. Provision redemption remains synchronous and is not enrolled in the
 deferred-operation repair scheduler.
 
+For a provider-backed Host request, the 15-second inline budget limits only
+how long HTTP waits for a Resource response. When it answers with a pending
+Operation, the Cloudflare invocation retains the unfinished provider RPC with
+`waitUntil`; that extension is bounded, not a promise of completion. The
+durable saga, leases, and scheduled repair remain responsible if the runtime
+ends first. A GET of the pending Operation can acquire a lease and resume the
+same command, so it is not a read-only status probe. Repeated GET polling can
+also occupy the lease at a scheduled repair boundary; operator diagnosis uses
+exact state and invocation-log reads without triggering another execution.
+
 Standard-service material is resolved only on the initial execution after the
 dispatch marker and before SQLite or provider effects. Recovery does not issue
 that material again. Once placement is bound, a preparation failure cannot
@@ -532,6 +618,22 @@ does not prove managed WfP execution, cross-generation invocation exclusion,
 code-update socket continuity, storage-format upgrades or machine power-loss
 recovery. Actor/Workflow support remains unavailable until the relevant exact
 contracts and provider execution are implemented and verified.
+
+The unadmitted self-host Actor execution path also has a development-only
+alarm slice. Its native per-ID owner stores a pending time separately from an
+unsettled delivery, uses a native Durable Object alarm as a wake/watchdog, and
+dispatches the class alarm handler under the same owner queue as HTTP bodies.
+The child receives only `set/get/clear`; owner alarm metadata is outside its
+private application SQL. A failed handler retains its obligation and any
+successor time, with an explicit retry wake rather than dependence on the
+native six-retry limit. The opt-in candidate-binary test checks set/clear,
+failed-delivery successor settlement, ID isolation, and pending-time recovery
+after an owner process is reopened. It does **not** prove autonomous cold
+delivery while the self-host runtime is stopped: the execution process is
+opened on demand, so a pending alarm cannot wake an absent process. Weighted
+Version reselection for alarms, namespace deletion/retention, producer-tail
+retirement, sockets and managed WfP execution also remain unqualified. This
+slice does not enable Actor admission or change a published contract.
 
 Two additional opt-in fixtures investigate code handoff, separately from that
 capability check:

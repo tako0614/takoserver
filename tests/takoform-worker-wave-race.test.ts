@@ -153,10 +153,10 @@ test("a WorkerEndpoint whose ModuleWorker declares no WorkerDeployment names wha
   const refused = await apply(host, WORKER_ENDPOINT, "endpoint", {
     worker: named("ModuleWorker", "worker"),
   });
-  expect(refused.status).toBe(400);
+  expect(refused.status).toBe(422);
   expect(refused.body).toMatchObject({
     error: {
-      code: "invalid_argument",
+      code: "unsupported_capability",
       retryable: false,
       message: expect.stringContaining("has no WorkerDeployment"),
     },

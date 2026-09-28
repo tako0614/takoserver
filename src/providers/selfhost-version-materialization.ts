@@ -3,6 +3,10 @@ import { constants as fsConstants } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { bytesDigest, canonicalDigest, canonicalJson, isSha256Digest } from "../json.ts";
+import {
+  TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES,
+  TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+} from "../takoform/limits.ts";
 
 /**
  * The durable format for a self-hosted Worker Version.
@@ -28,8 +32,6 @@ const MAX_PATH_LENGTH = 240;
 const MAX_MEDIA_TYPE_LENGTH = 255;
 const MAX_WORKER_ENTRIES = 4_096;
 const MAX_ASSET_ENTRIES = 16_384;
-const MAX_BUNDLE_BYTES = 10_485_760;
-const MAX_DECLARED_BYTES = MAX_BUNDLE_BYTES;
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/u;
 const SAFE_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/u;
 const DIGEST = /^sha256:[A-Za-z0-9._-]{1,128}$/u;
@@ -422,7 +424,11 @@ export function createSelfhostVersionMaterializer(
         );
       }
     }
-    const resolvedModules = await resolveBytes(options.artifacts, modules, MAX_BUNDLE_BYTES);
+    const resolvedModules = await resolveBytes(
+      options.artifacts,
+      modules,
+      TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
+    );
     const normalizedModules = resolvedModules.entries;
     const moduleBytes = resolvedModules.bytes;
 
@@ -470,7 +476,11 @@ export function createSelfhostVersionMaterializer(
           "single-page application assets require index.html",
         );
       }
-      const resolvedAssets = await resolveBytes(options.artifacts, assets, MAX_BUNDLE_BYTES);
+      const resolvedAssets = await resolveBytes(
+        options.artifacts,
+        assets,
+        TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES,
+      );
       const normalizedAssets = resolvedAssets.entries;
       assetBytes = resolvedAssets.bytes;
       assetsMeta = {
@@ -721,6 +731,10 @@ async function resolveEntries(
   const declarations = expectedKind === "WorkerBundle" ? manifest.modules : manifest.files;
   const strict = manifest.apiVersion !== undefined;
   const maxEntries = expectedKind === "WorkerBundle" ? MAX_WORKER_ENTRIES : MAX_ASSET_ENTRIES;
+  const maximumBytes =
+    expectedKind === "WorkerBundle"
+      ? TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES
+      : TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES;
   if (
     !Array.isArray(declarations) ||
     declarations.length === 0 ||
@@ -791,14 +805,14 @@ async function resolveEntries(
       declaration.size !== undefined &&
       (!Number.isSafeInteger(declaration.size) ||
         declaration.size < 0 ||
-        declaration.size > MAX_DECLARED_BYTES)
+        declaration.size > maximumBytes)
     ) {
       throw new SelfhostVersionMaterializationError("invalid_spec", "an artifact size is invalid");
     }
     const size = declaration.size ?? -1;
     if (size >= 0) {
       total += size;
-      if (!Number.isSafeInteger(total) || total > MAX_BUNDLE_BYTES) {
+      if (!Number.isSafeInteger(total) || total > maximumBytes) {
         throw new SelfhostVersionMaterializationError(
           "invalid_spec",
           "the artifact inventory is too large",
@@ -1071,6 +1085,10 @@ function parseInventory(
   expectedKind: "WorkerBundle" | "StaticAssetBundle",
 ): readonly SelfhostVersionInventoryEntry[] | null {
   if (!Array.isArray(value) || value.length === 0 || value.length > maxEntries) return null;
+  const maximumBytes =
+    expectedKind === "WorkerBundle"
+      ? TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES
+      : TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES;
   const names = new Set<string>();
   const entries: SelfhostVersionInventoryEntry[] = [];
   let total = 0;
@@ -1090,7 +1108,7 @@ function parseInventory(
       !DIGEST.test(candidate.digest) ||
       !Number.isSafeInteger(candidateSize) ||
       (candidateSize as number) < 0 ||
-      (candidateSize as number) > MAX_DECLARED_BYTES ||
+      (candidateSize as number) > maximumBytes ||
       (candidate.mediaType !== undefined &&
         (typeof candidate.mediaType !== "string" ||
           candidate.mediaType.length === 0 ||
@@ -1100,7 +1118,7 @@ function parseInventory(
       return null;
     }
     total += candidateSize as number;
-    if (!Number.isSafeInteger(total) || total > MAX_BUNDLE_BYTES) return null;
+    if (!Number.isSafeInteger(total) || total > maximumBytes) return null;
     names.add(candidate.path);
     entries.push({
       path: candidate.path,

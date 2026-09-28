@@ -44,6 +44,7 @@ import {
   type TakoformOperation,
   type TakoformStoredResource,
 } from "./types.ts";
+import { supportsClassHolderRuntime } from "./worker-runtime-contract.ts";
 
 const PUBLISHER_TABLE = "tf_form_publisher_events" as const;
 const CHECKPOINT_TABLE = "tf_form_revocation_checkpoints" as const;
@@ -185,6 +186,7 @@ export interface TakoformHostAuthority {
 }
 
 export interface CreateTakoformHostAuthorityOptions {
+  readonly workerClassRuntime?: import("../worker-class-runtime-port.ts").WorkerClassRuntime;
   readonly sql: Sql;
   readonly objects?: Pick<ObjectStoreAccess, "get" | "list">;
   readonly packages?: FormPackageReader;
@@ -358,7 +360,7 @@ export function createTakoformHostAuthority(
       installSupportImplementationMatch &&
       currentImplementationProfile &&
       implementationCandidate !== null &&
-      !form.workerClassRuntime &&
+      supportsClassHolderRuntime(form, options.workerClassRuntime) &&
       narrowedOperations.length > 0;
     return {
       formRefKey,

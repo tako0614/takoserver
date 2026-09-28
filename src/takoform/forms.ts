@@ -2,6 +2,7 @@ import type { JsonObject } from "../ports.ts";
 import { isEdgeFormsApiVersion } from "./edge-family.ts";
 import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
+  TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES,
 } from "./limits.ts";
@@ -284,7 +285,9 @@ export function formSupportProfile(
   const limits: Record<string, number> = {};
   if (configuredArtifactFileLimit !== undefined || workerVersion) {
     limits[stableProfile ? "/maximumBundleBytes" : "maximumBundleBytes"] =
-      TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES;
+      form.identity.formRef.kind === "StaticAssetBundle"
+        ? TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES
+        : TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES;
   }
   if (configuredArtifactFileLimit !== undefined) {
     limits[stableProfile ? "/maximumBundleFiles" : "maximumBundleFiles"] =

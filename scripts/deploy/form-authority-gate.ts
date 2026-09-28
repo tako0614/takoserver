@@ -13,6 +13,15 @@ const COMMON_TESTS = [
 ];
 
 const SURFACE_TESTS: Record<FormCodeSurface, readonly string[]> = {
+  "takoserver-existing-space-operator-worker": [
+    "tests/deploy-existing-space-operator-publication.test.ts",
+    "tests/existing-space-operator.test.ts",
+    "tests/deploy-existing-space-operator.test.ts",
+    "tests/existing-space-admission.test.ts",
+    "tests/deploy-form-authority.test.ts",
+    "tests/form-authority-verifier-readback.test.ts",
+    "tests/takoform-operator-authority.test.ts",
+  ],
   "takoserver-form-authority-identity-probe": [
     "tests/form-authority-identity-probe.test.ts",
     "tests/form-authority-verifier-readback.test.ts",

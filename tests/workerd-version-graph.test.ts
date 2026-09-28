@@ -25,6 +25,10 @@ import {
   selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
+  renderSelfhostActorForwardRuntimeModuleSource,
+  selfhostActorForwardEntrypointSource,
+} from "../src/selfhost-actor-forward-worker-wrapper.ts";
+import {
   compileWorkerdVersionGraph,
   type WorkerdVersionGraph,
   type WorkerdVersionGraphInput,
@@ -131,6 +135,124 @@ test("compiles the plain Version projection and exact generated Host bytes", () 
   expect(graph.site.dataPlane).toBeUndefined();
   expect(graph.site.events).toBeUndefined();
   expect(graph.site.serviceBindings).toBeUndefined();
+});
+
+test("compiles the opt-in Actor forward outer Host entrypoint without changing the inner wrapper", () => {
+  const withoutForwarding = graphInput({
+    modules: new Map([
+      ["index.js", encoder.encode("export default { fetch() {}, queue() {}, scheduled() {} };\n")],
+      ["module.txt", encoder.encode("auxiliary module\n")],
+    ]),
+    declaredHandlers: ["fetch", "queue", "scheduled"],
+  });
+  const input = graphInput({
+    modules: withoutForwarding.modules,
+    declaredHandlers: withoutForwarding.declaredHandlers,
+    eventToken: EVENT_TOKEN,
+    actorForward: [
+      {
+        publicName: "ROOM",
+        tenantId: "tenant-actor-1",
+        namespaceResourceUid: "actor-namespace-001",
+        token: SERVICE_TOKEN,
+      },
+    ],
+  });
+  const graph = compileWorkerdVersionGraph(input);
+  const innerModule = SELFHOST_WORKER_ENTRYPOINT_MODULE;
+  const outerModule = "__takoserver-selfhost-actor-forward-entrypoint.js";
+  const runtimeModule = "__takoserver-selfhost-actor-forward-runtime.js";
+  const actorBinding = {
+    publicName: "ROOM",
+    tenantId: "tenant-actor-1",
+    namespaceResourceUid: "actor-namespace-001",
+    httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+    upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+    token: SERVICE_TOKEN,
+  };
+  expect(graph.site.hostEntrypoint).toBe(outerModule);
+  expect(graph.site.hostModules).toContain(innerModule);
+  expect(graph.site.hostModules).toContain(runtimeModule);
+  expect(source(graph.hostModules.get(innerModule))).toBe(
+    selfhostWorkerEntrypointSource({
+      originalMainModule: input.mainModule,
+      declaredHandlers: input.declaredHandlers,
+      bindings: [
+        { name: "PLAIN", type: "plain_text" },
+        { name: "JSON_VALUE", type: "json" },
+        { name: "SECRET", type: "secret_text" },
+        { name: "ROOM", type: "json" },
+      ],
+      publication: input.readiness.publication,
+      probeHostname: input.readiness.probeHostname,
+      events: true,
+    }),
+  );
+  expect(source(graph.hostModules.get(runtimeModule))).toBe(
+    renderSelfhostActorForwardRuntimeModuleSource(),
+  );
+  expect(source(graph.hostModules.get(outerModule))).toBe(
+    selfhostActorForwardEntrypointSource({
+      runtimeModule,
+      innerModule,
+      bindings: [actorBinding],
+      queue: true,
+      scheduled: true,
+      events: true,
+    }),
+  );
+  expect(graph.site.actorForward).toEqual({
+    schema: "takoserver.selfhost-actor-forward@v1",
+    bindings: [actorBinding],
+  });
+  expect(source(graph.hostModules.get(innerModule))).toContain('"name":"ROOM","type":"json"');
+});
+
+test("rejects malformed and colliding Actor forward projections", () => {
+  const binding = {
+    publicName: "ROOM",
+    tenantId: "tenant-actor-1",
+    namespaceResourceUid: "actor-namespace-001",
+    token: SERVICE_TOKEN,
+  };
+  const candidates: Partial<WorkerdVersionGraphInput>[] = [
+    { actorForward: [{ ...binding, publicName: "not-valid" }] },
+    { actorForward: [{ ...binding, tenantId: "" }] },
+    { actorForward: [{ ...binding, tenantId: "tenant\u0000invalid" }] },
+    { actorForward: [{ ...binding, namespaceResourceUid: "x" }] },
+    { actorForward: [{ ...binding, token: "not-a-token" }] },
+    { actorForward: [{ ...binding }, { ...binding }] },
+    {
+      actorForward: Array.from({ length: 33 }, (_, index) => ({
+        ...binding,
+        publicName: `ROOM_${index}`,
+        namespaceResourceUid: `actor-namespace-${index.toString().padStart(3, "0")}`,
+      })),
+    },
+    { actorForward: [binding], environment: [{ name: "ROOM", value: "{}", type: "json" }] },
+    {
+      actorForward: [binding],
+      dataPlane: {
+        address: "127.0.0.1:4666",
+        token: DATA_TOKEN,
+        bindings: [{ kind: SELFHOST_WORKER_EDGE_KV_BINDING_KIND, publicName: "ROOM" }],
+      },
+    },
+    {
+      actorForward: [binding],
+      serviceBindings: [
+        {
+          publicName: "ROOM",
+          target: "target-worker",
+          targetResourceUid: "uid-target-worker",
+          unavailableToken: SERVICE_TOKEN,
+        },
+      ],
+    },
+  ];
+  for (const candidate of candidates) {
+    expect(() => compileWorkerdVersionGraph(graphInput(candidate))).toThrow(TypeError);
+  }
 });
 
 test("compiles data, service, event, and asset projections with explicit publication", () => {

@@ -223,3 +223,17 @@ retained attestation atomically with retiring the saga. A crash must not leave
 an open effect after removing the control record that proves no mutation
 occurred. This restores the original safety property without an exception in
 the retained-effect conflict fence.
+
+## Correction — 2026-09-26: attachment readiness keeps its portable code
+
+The examples above described a missing `WorkerDeployment` as
+`invalid_argument` (400). That was an implementation observation, not the
+published attachment-gate rule: the frozen stable-v1 Edge family conformance
+checks `attachment-requires-active-deployment` and `handler-gated-attachments` require
+`unsupported_capability` (422) when an attachment's worker has no active
+deployment. Inbound service bindings to an unserved worker use the same rule.
+The Host now answers with that portable code and status while retaining
+`hostCode: cross_resource_precondition` and `retryable: false`. The marker still
+ensures a settled no-effect refusal is re-attempted when the caller presents
+the same key after installing a serving deployment; it does not authorize
+retrying an unresolved provider effect.

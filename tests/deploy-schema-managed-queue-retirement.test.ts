@@ -183,7 +183,7 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     try {
       expect(await f.invoke("apply")).toMatchObject({
         pendingMigrations: [RETIREMENT],
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
         managedQueueRetirementCutover: { status: "ready" },
         providerAcknowledgement: "acknowledged",
       });
@@ -210,27 +210,32 @@ describe("0062 to 0063 managed Queue retirement transition", () => {
     const f = fixture({ lostAck: true });
     try {
       expect(await f.invoke("apply")).toMatchObject({
-        appliedMigrations: MIGRATIONS.map(({ name }) => name),
+        appliedMigrations: MIGRATIONS.slice(0, 63).map(({ name }) => name),
         providerAcknowledgement: "provider-error-recovered-by-authoritative-readback",
       });
       expect(f.applies()).toBe(1);
-      await expect(f.invoke("apply")).rejects.toThrow("already complete");
+      expect(await f.invoke("status")).toMatchObject({
+        fromMigration: RETIREMENT,
+        throughMigration: "0064_cloudflare_managed_actor_owner_claims.sql",
+        pendingMigrations: ["0064_cloudflare_managed_actor_owner_claims.sql"],
+        managedActorOwnerCutover: { status: "ready" },
+      });
       expect(f.applies()).toBe(1);
     } finally {
       f.db.close();
     }
   });
 
-  test("refuses an unreviewed 0064 tail instead of adopting it", async () => {
+  test("refuses an unreviewed 0067 tail instead of adopting it", async () => {
     const unreviewed = join(root, "unreviewed-migrations");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0064_unreviewed_extension.sql"),
+      join(unreviewed, "0067_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed_extension(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0063");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0066");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();

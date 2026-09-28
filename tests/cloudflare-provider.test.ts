@@ -7,6 +7,7 @@ import {
 import { bytesDigest } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 import {
+  type Provider,
   type ProviderOffering,
   type ProviderRelation,
   type ProviderRuntimeBinding,
@@ -77,6 +78,7 @@ const SENSITIVE_PUBLIC_APPLY = {
 } as const;
 const SENSITIVE_PREPARATION: ProviderRuntimeInputPreparationIdentity = {
   preparationId: "prep_sensitive",
+  generation: "abcdefghijklmnop",
   operationKey: SENSITIVE_OPERATION_KEY,
   workerResourceUid: "worker-uid",
   canonicalPublicOrigin: "https://api.takoserver.test",
@@ -117,6 +119,72 @@ const artifacts: ArtifactBytes = {
     return digest === `sha256:${"e".repeat(64)}` ? MODULE_BYTES : null;
   },
 };
+
+describe("Cloudflare provider Worker class runtime option", () => {
+  const options = {
+    accountId: "acct_1",
+    offerings: [],
+    artifacts,
+    authorize: () => "Bearer test-token",
+  } satisfies CloudflareProviderOptions;
+
+  test("does not expose the optional capability when omitted", () => {
+    const provider = new CloudflareProvider(options);
+
+    expect(provider.workerClassRuntime).toBeUndefined();
+  });
+
+  test("exposes and delegates the exact configured inspection port", async () => {
+    const contract = {
+      formRef: FORM_REF,
+      packageDigest: `sha256:${"a".repeat(64)}` as const,
+      runtimeClassRef: {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.actor",
+        version: "2.0.0",
+        schemaDigest: `sha256:${"d".repeat(64)}` as const,
+      },
+    } as const;
+    const resourceIdentity = {
+      uid: "uid-1",
+      generation: "1",
+      revision: "1",
+      formRef: FORM_REF,
+    };
+    const input: Parameters<NonNullable<Provider["workerClassRuntime"]>["inspect"]>[0] = {
+      contract,
+      tenantId: "tenant-1",
+      space: "main",
+      className: "Counter",
+      holder: resourceIdentity,
+      worker: resourceIdentity,
+      deployment: resourceIdentity,
+      version: resourceIdentity,
+      weight: 10_000,
+      bundle: { ...resourceIdentity, manifestDigest: `sha256:${"b".repeat(64)}` },
+      providerInstallationRef: "installation-1",
+      holderNativeId: "holder-native-1",
+      versionNativeId: "version-native-1",
+    };
+    let receiver: unknown;
+    let inspectedInput: typeof input | undefined;
+    const runtime: NonNullable<CloudflareProviderOptions["workerClassRuntime"]> = {
+      contracts: [contract],
+      async inspect(value) {
+        receiver = this;
+        inspectedInput = value;
+        return "valid";
+      },
+    };
+    const provider = new CloudflareProvider({ ...options, workerClassRuntime: runtime });
+
+    expect(provider.workerClassRuntime).toBe(runtime);
+    expect(provider.workerClassRuntime?.contracts[0]).toBe(contract);
+    expect(await provider.workerClassRuntime?.inspect(input)).toBe("valid");
+    expect(receiver).toBe(runtime);
+    expect(inspectedInput).toBe(input);
+  });
+});
 
 const RELEASED_EDGE = await buildEdgeForms();
 
@@ -1806,6 +1874,79 @@ describe("released edge Form placement", () => {
     return { provider, calls };
   }
 
+  function kvDeleteProvider(
+    backend?: CloudflareWorkerBackend,
+    response: { readonly status: number; readonly body: unknown } = {
+      status: 200,
+      body: { success: true, errors: [], result: null },
+    },
+  ): { readonly provider: CloudflareProvider; readonly calls: Call[] } {
+    const calls: Call[] = [];
+    const kvOffering = technical("EdgeKVNamespace");
+    const provider = new CloudflareProvider({
+      accountId: "acct_1",
+      offerings: [kvOffering],
+      artifacts,
+      authorize: () => "Bearer secret-account-token",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      ...(backend
+        ? { workerBackend: { kind: "workers-for-platforms" as const, create: () => backend } }
+        : {}),
+      async fetch(request) {
+        calls.push({
+          method: request.method,
+          url: request.url,
+          authorization: request.headers.get("authorization"),
+          body: await request.clone().text(),
+        });
+        return new Response(JSON.stringify(response.body), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    return { provider, calls };
+  }
+
+  function kvDeleteInput(
+    offering: ProviderOffering,
+    operationId: string,
+    nativeId = "kv:namespace-id",
+  ) {
+    return {
+      operationId,
+      operationMode: "initial" as const,
+      offering,
+      nativeId,
+      identity: {
+        ...IDENTITY,
+        uid: "resource-kv-retirement",
+        incarnationId: "deployment-kv-retirement",
+        generation: "7",
+      },
+      executionAuthority: {
+        tenantId: IDENTITY.tenantRef,
+        resourceUid: "resource-kv-retirement",
+        leaseToken: "lease-kv-retirement",
+        fingerprint: "fingerprint-kv-retirement",
+      },
+    };
+  }
+
+  function managedBackendWithKvRetirement(
+    prepareDestroy: NonNullable<
+      CloudflareWorkerBackend["managedKvNamespaceDestroy"]
+    >["prepareDestroy"],
+    readRetirement: NonNullable<
+      CloudflareWorkerBackend["managedKvNamespaceDestroy"]
+    >["readRetirement"],
+  ): CloudflareWorkerBackend {
+    return {
+      ...managedBackendThatDoesNotOwnQueues(),
+      managedKvNamespaceDestroy: { prepareDestroy, readRetirement },
+    };
+  }
+
   function queueDeleteInput(
     offering: ProviderOffering,
     operationId: string,
@@ -1819,6 +1960,255 @@ describe("released edge Form placement", () => {
       identity: { ...IDENTITY, name: "jobs" },
     };
   }
+
+  test("EdgeKVNamespace deletion waits for the managed helper retirement handoff", async () => {
+    const operationId = "op-kv-helper-retirement-pending";
+    const offering = technical("EdgeKVNamespace");
+    let preparedInput:
+      | Parameters<
+          NonNullable<CloudflareWorkerBackend["managedKvNamespaceDestroy"]>["prepareDestroy"]
+        >[0]
+      | undefined;
+    const backend = managedBackendWithKvRetirement(
+      async (input) => {
+        preparedInput = input;
+        return {
+          state: "pending",
+          effectsStarted: false,
+          failure: {
+            code: "unavailable",
+            message: "the managed KV helpers are still retiring",
+            retryable: true,
+          },
+        };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const input = kvDeleteInput(offering, operationId);
+    const ticket = await provider.delete(input);
+
+    expect(preparedInput).toMatchObject({
+      operationId,
+      nativeId: input.nativeId,
+      identity: input.identity,
+      executionAuthority: input.executionAuthority,
+    });
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("EdgeKVNamespace deletion proceeds only after retirement is proven", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let retirementPrepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        retirementPrepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(kvDeleteInput(offering, "op-kv-helper-retirement-ready"));
+
+    expect(retirementPrepared).toBe(true);
+    expect(ticket.phase).toBe("succeeded");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+    expect(calls[0]?.url).toContain("/storage/kv/namespaces/namespace-id");
+  });
+
+  test("KV convergence cannot bypass a lost helper-retirement acknowledgement", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = 0;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared += 1;
+        throw new TypeError("retirement acknowledgement lost");
+      },
+      async () => ({ state: "unknown", retryable: true }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const input = kvDeleteInput(offering, "op-kv-helper-retirement-lost-ack");
+    const ticket = await provider.convergeDelete({ ...input, operationMode: "recovery" });
+
+    expect(prepared).toBe(1);
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("KV helper absence must be read before a namespace 404 can prove deletion", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let readTarget: unknown;
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async (input) => {
+        readTarget = input.target;
+        return { state: "pending", retryable: true };
+      },
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const identity = kvDeleteInput(offering, "op-kv-helper-readback").identity;
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering,
+      nativeId: "kv:namespace-id",
+      identity,
+      spec: {},
+    });
+    const proof = await provider.verifyNativeAbsence({
+      offering,
+      descriptor,
+      target: {
+        tenantId: identity.tenantRef,
+        resourceUid: "resource-kv-retirement",
+        incarnationId: "deployment-kv-retirement",
+        generation: "7",
+      },
+    });
+
+    expect(readTarget).toEqual({
+      tenantId: identity.tenantRef,
+      resourceUid: identity.uid,
+      incarnationId: identity.incarnationId,
+      generation: identity.generation,
+    });
+    expect(proof).toEqual({ outcome: "unknown", reason: "authority_unavailable", retryable: true });
+    expect(calls).toEqual([]);
+  });
+
+  test("managed KV readback without an exact target cannot prove absence", async () => {
+    const offering = technical("EdgeKVNamespace");
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const descriptor = provider.createNativeReadbackDescriptor({
+      offering,
+      nativeId: "kv:namespace-id",
+      identity: { ...IDENTITY, uid: "resource-kv-retirement" },
+      spec: {},
+    });
+    const proof = await provider.verifyNativeAbsence({ offering, descriptor });
+
+    expect(proof).toEqual({
+      outcome: "unknown",
+      reason: "authority_unavailable",
+      retryable: false,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("KV lost-ack recovery cannot conclude from namespace 404 while helper retirement is unknown", async () => {
+    const offering = technical("EdgeKVNamespace");
+    const backend = managedBackendWithKvRetirement(
+      async () => ({ state: "retired", effectsStarted: false }),
+      async () => ({ state: "unknown", retryable: true }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend, {
+      status: 404,
+      body: { success: false, errors: [], result: null },
+    });
+    const input = kvDeleteInput(offering, "op-kv-recovery-unknown");
+    const ticket = await provider.recoverDelete({ ...input, operationMode: "recovery" });
+
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("unconfigured KV retirement keeps the existing namespace delete path", async () => {
+    const { provider, calls } = kvDeleteProvider();
+    const ticket = await provider.delete(
+      kvDeleteInput(technical("EdgeKVNamespace"), "op-kv-unconfigured"),
+    );
+
+    expect(ticket.phase).toBe("succeeded");
+    expect(calls.map((call) => call.method)).toEqual(["DELETE"]);
+  });
+
+  test("managed KV retirement refuses a native identity from another resource kind", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(
+      kvDeleteInput(offering, "op-kv-stale-native-identity", "queue:foreign-id"),
+    );
+
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "invalid_spec" } });
+    expect(prepared).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("managed KV retirement cannot authorize a foreign Resource lease", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let prepared = false;
+    const backend = managedBackendWithKvRetirement(
+      async () => {
+        prepared = true;
+        return { state: "retired", effectsStarted: false };
+      },
+      async () => ({ state: "retired" }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const base = kvDeleteInput(offering, "op-kv-foreign-lease");
+    const ticket = await provider.delete({
+      ...base,
+      executionAuthority: {
+        ...base.executionAuthority,
+        resourceUid: "resource-foreign",
+      },
+    });
+
+    expect(ticket).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+    expect(prepared).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("a same-kind but stale KV identity stays blocked by the private retirement authority", async () => {
+    const offering = technical("EdgeKVNamespace");
+    let inspectedNativeId: string | undefined;
+    const backend = managedBackendWithKvRetirement(
+      async (input) => {
+        inspectedNativeId = input.nativeId;
+        return {
+          state: "unknown",
+          effectsStarted: false,
+          failure: {
+            code: "unavailable",
+            message: "the namespace identity does not match this Resource incarnation",
+            retryable: true,
+          },
+        };
+      },
+      async () => ({ state: "unknown", retryable: false }),
+    );
+    const { provider, calls } = kvDeleteProvider(backend);
+    const ticket = await provider.delete(
+      kvDeleteInput(offering, "op-kv-stale-namespace", "kv:stale-namespace-id"),
+    );
+
+    expect(inspectedNativeId).toBe("kv:stale-namespace-id");
+    expect(ticket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable", retryable: true },
+    });
+    expect(calls).toEqual([]);
+  });
 
   test("settles an exact Queue binding refusal as an operation-bound no-effect delete", async () => {
     const operationId = "op-queue-delete-referenced";
@@ -4114,6 +4504,11 @@ describe("released edge Form placement", () => {
         },
         {
           type: "plain_text",
+          name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+          text: SENSITIVE_PREPARATION.generation,
+        },
+        {
+          type: "plain_text",
           name: "TAKOSERVER_INTERNAL_OPERATION_MARKER",
           text: expect.stringMatching(/^tsop-v1:[0-9a-f]{64}$/u),
         },
@@ -4133,11 +4528,13 @@ describe("released edge Form placement", () => {
     const versionOffering = technical("WorkerVersion");
     let marker = "";
     let commitment = "";
+    let generation = "";
     let uploads = 0;
     let acquires = 0;
     let recoveries = 0;
     let recoveredInput: ProviderRuntimeInputRecoveryInput | undefined;
     let recoveredReceipt: string | undefined;
+    let recoveryPreparation = SENSITIVE_PREPARATION;
     const runtimeInputs: ProviderRuntimeInputLeasePort = {
       async acquire(input) {
         acquires += 1;
@@ -4174,7 +4571,7 @@ describe("released edge Form placement", () => {
         recoveries += 1;
         recoveredInput = input;
         return {
-          preparation: SENSITIVE_PREPARATION,
+          preparation: recoveryPreparation,
           bindingNames: ["ENCRYPTION_KEY"],
           async settle(receiptDigest) {
             recoveredReceipt = receiptDigest;
@@ -4206,6 +4603,10 @@ describe("released edge Form placement", () => {
             metadata.bindings?.find(
               (binding) => binding.name === "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
             )?.text ?? "";
+          generation =
+            metadata.bindings?.find(
+              (binding) => binding.name === "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+            )?.text ?? "";
           throw new TypeError("connection closed after provider commit");
         }
         if (request.method === "GET" && url.pathname.endsWith("/versions")) {
@@ -4235,6 +4636,15 @@ describe("released edge Form placement", () => {
                     name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
                     text: commitment,
                   },
+                  ...(generation
+                    ? [
+                        {
+                          type: "plain_text",
+                          name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+                          text: generation,
+                        },
+                      ]
+                    : []),
                   { type: "secret_text", name: "ENCRYPTION_KEY" },
                 ],
               },
@@ -4295,8 +4705,26 @@ describe("released edge Form placement", () => {
         bundleName: "workerbundle",
       },
       bindingNames: ["ENCRYPTION_KEY"],
+      expectedGeneration: SENSITIVE_PREPARATION.generation,
     });
     expect(recoveredReceipt).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    recoveredReceipt = undefined;
+    recoveryPreparation = {
+      ...SENSITIVE_PREPARATION,
+      generation: "qrstuvwxyzABCDEF",
+    };
+    expect(await provider.apply({ ...input, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "conflict", retryable: false },
+    });
+    expect(recoveredReceipt).toBeUndefined();
+    expect(uploads).toBe(1);
+    generation = "";
+    expect(await provider.apply({ ...input, operationMode: "recovery" })).toMatchObject({
+      phase: "failed",
+      failure: { code: "provider_error", retryable: false },
+    });
+    expect(recoveries).toBe(2);
   });
 
   test("rejects sensitive recovery for every exact secret_text closure mismatch", async () => {
@@ -4356,6 +4784,7 @@ describe("released edge Form placement", () => {
               bundleName: "workerbundle",
             },
             bindingNames: ["ENCRYPTION_KEY"],
+            expectedGeneration: SENSITIVE_PREPARATION.generation,
           });
           return {
             preparation: SENSITIVE_PREPARATION,
@@ -4409,6 +4838,11 @@ describe("released edge Form placement", () => {
                       name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_COMMITMENT",
                       text: SENSITIVE_PREPARATION.commitment,
                     },
+                    {
+                      type: "plain_text",
+                      name: "TAKOSERVER_INTERNAL_RUNTIME_INPUT_GENERATION",
+                      text: SENSITIVE_PREPARATION.generation,
+                    },
                     ...scenario.bindings,
                   ],
                 },
@@ -4448,7 +4882,7 @@ describe("released edge Form placement", () => {
         failure: { code: "provider_error", retryable: false },
       });
       expect({ recoveries, posts, settlements }).toEqual({
-        recoveries: 1,
+        recoveries: 0,
         posts: 0,
         settlements: 0,
       });

@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "takoserver-existing-space-operator",
+  "main": "src/entry-existing-space-operator-worker.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "unconfigured.invalid", "custom_domain": true }],
+  "vars": {
+    "TAKOSERVER_ENVIRONMENT": "unconfigured",
+    "TAKOSERVER_FORM_AUTHORITY_HOST_ID": "unconfigured.invalid",
+    "TAKOSERVER_EXISTING_SPACE_OPERATOR_ORIGIN": "https://unconfigured.invalid",
+    "TAKOSERVER_EXISTING_SPACE_OPERATOR_PUBLIC_JWK": "unconfigured",
+    "TAKOSERVER_MANAGED_SPACE_ADMISSION_POLICY": "unconfigured"
+  },
+  "services": [
+    {
+      "binding": "FORM_AUTHORITY",
+      "service": "takoserver-form-authority",
+      "entrypoint": "FormAuthorityEntrypoint"
+    },
+    {
+      "binding": "PUBLIC_HOST_IDENTITY",
+      "service": "takoserver-api",
+      "entrypoint": "PublicHostIdentityEntrypoint"
+    }
+  ]
+}

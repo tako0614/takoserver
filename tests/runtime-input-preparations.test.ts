@@ -125,6 +125,7 @@ async function runtimeInputFixture(
   return {
     sql,
     authority,
+    key,
     setNow(value: string) {
       now = new Date(value);
     },
@@ -254,6 +255,7 @@ test("claims the exact operation key with a commitment-bound preparation identit
   expect(lease.bindings).toEqual(BINDINGS);
   expect(lease.preparation).toEqual({
     preparationId: expect.stringMatching(/^prep-[0-9a-f]{32}$/u),
+    generation: expect.stringMatching(/^[A-Za-z0-9_-]{16}$/u),
     operationKey: OPERATION_KEY,
     workerResourceUid: WORKER_RESOURCE_UID,
     canonicalPublicOrigin: HOST_ORIGIN,
@@ -272,6 +274,142 @@ test("claims the exact operation key with a commitment-bound preparation identit
   await expect(
     authority.leases.acquire(leaseInput({ operationId: "op_other" })),
   ).rejects.toMatchObject({ code: "conflict", status: 409 });
+});
+
+test("fences plaintext claim and dispatch to the composition's durable phase", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await sql.run(
+    "CREATE TABLE private_preclaim (operation_id TEXT PRIMARY KEY, state TEXT NOT NULL)",
+  );
+  await sql.run("INSERT INTO private_preclaim (operation_id, state) VALUES (?, 'preclaim')", [
+    HOST_OPERATION_ID,
+  ]);
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  if (!pinPrepared) throw new Error("runtime-input pinning is unavailable");
+  const pinned = await pinPrepared(leaseInput());
+  const fence = {
+    claim: {
+      sql: "EXISTS (SELECT 1 FROM private_preclaim WHERE operation_id = ? AND state = 'preclaim')",
+      params: [HOST_OPERATION_ID],
+    },
+  };
+  const dispatchFence = {
+    sql: "EXISTS (SELECT 1 FROM private_preclaim WHERE operation_id = ? AND state = 'pending')",
+    params: [HOST_OPERATION_ID],
+  };
+  const input = { ...leaseInput(), expectedGeneration: pinned.generation, leaseFence: fence };
+  const lease = await authority.leases.acquire(input);
+  await expect(lease.dispatch()).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await expect(lease.dispatch(dispatchFence)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "claimed",
+  );
+  await sql.run("UPDATE private_preclaim SET state = 'pending' WHERE operation_id = ?", [
+    HOST_OPERATION_ID,
+  ]);
+  await expect(authority.leases.acquire(input)).rejects.toMatchObject({ code: "conflict" });
+  await lease.dispatch(dispatchFence);
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
+test("no-effect batch closes the exact generation and never revokes a replacement", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await sql.run(
+    "CREATE TABLE private_preclaim (operation_id TEXT PRIMARY KEY, state TEXT NOT NULL)",
+  );
+  await sql.run("INSERT INTO private_preclaim (operation_id, state) VALUES (?, 'preclaim')", [
+    HOST_OPERATION_ID,
+  ]);
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  const noEffectRevocation = authority.leases.noEffectRevocation;
+  if (!pinPrepared || !noEffectRevocation) {
+    throw new Error("runtime-input no-effect fence is unavailable");
+  }
+  const old = await pinPrepared(leaseInput());
+  const revoke = await noEffectRevocation({
+    ...leaseInput(),
+    generation: old.generation,
+  });
+  const outcome = await sql.batch([
+    {
+      sql: `UPDATE private_preclaim SET state = 'closed'
+            WHERE operation_id = ? AND state = 'preclaim'
+              AND EXISTS (SELECT 1 FROM worker_runtime_input_preparations
+                          WHERE organization_id = ? AND operation_key = ? AND seal_nonce = ?
+                            AND state IN ('prepared', 'claimed'))`,
+      params: [HOST_OPERATION_ID, "org_01", OPERATION_KEY, old.generation],
+    },
+    revoke,
+  ]);
+  expect(outcome.map((result) => result.changes)).toEqual([1, 1]);
+  expect(
+    (await sql.query("SELECT state, sealed_payload FROM worker_runtime_input_preparations"))[0],
+  ).toEqual({
+    state: "revoked",
+    sealed_payload: null,
+  });
+
+  await authority.preparations.prepare(preparationInput());
+  const next = await pinPrepared(leaseInput());
+  expect(next.generation).not.toBe(old.generation);
+  await expect(
+    noEffectRevocation({ ...leaseInput(), generation: old.generation }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await expect(
+    authority.leases.acquire({ ...leaseInput(), expectedGeneration: old.generation }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "prepared",
+  );
+});
+
+test("an old in-flight claim cannot claim a replacement after no-effect closure", async () => {
+  const { sql, authority, key } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const pinPrepared = authority.leases.pinPrepared;
+  const noEffectRevocation = authority.leases.noEffectRevocation;
+  if (!pinPrepared || !noEffectRevocation) {
+    throw new Error("runtime-input no-effect fence is unavailable");
+  }
+  const old = await pinPrepared(leaseInput());
+  const signals = { entered: () => {}, release: () => {} };
+  const atClaim = new Promise<void>((resolve) => (signals.entered = resolve));
+  const resume = new Promise<void>((resolve) => (signals.release = resolve));
+  const raced = createRuntimeInputAuthority({
+    sql: {
+      ...sql,
+      async run(statement, params) {
+        if (statement.includes("SET state = 'claimed'")) {
+          signals.entered();
+          await resume;
+        }
+        return sql.run(statement, params);
+      },
+    },
+    sealKeys: { current: { keyId: "runtime-input-test-key", key } },
+    canonicalPublicOrigin: HOST_ORIGIN,
+    clock: () => new Date(PREPARATION_TIME),
+  });
+  const acquisition = raced.leases.acquire({ ...leaseInput(), expectedGeneration: old.generation });
+  await atClaim;
+  const revoke = await noEffectRevocation({
+    ...leaseInput(),
+    generation: old.generation,
+  });
+  expect((await sql.batch([revoke]))[0]?.changes).toBe(1);
+  await authority.preparations.prepare(preparationInput());
+  signals.release();
+  await expect(acquisition).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "prepared",
+  );
 });
 
 test("claims a Worker in every stable Host Space the durable handoff can name", async () => {
@@ -462,13 +600,170 @@ test("lets exactly one abort-or-dispatch transition win", async () => {
   await expect(lease.abort()).rejects.toMatchObject({ code: "conflict", status: 409 });
 });
 
+test("a stale dispatch cannot adopt a same-key replacement's dispatched row", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  await old.abort();
+  await authority.preparations.prepare(
+    preparationInput({
+      bindings: { ...BINDINGS, ENCRYPTION_KEY: "new-generation-secret" },
+    }),
+  );
+  const replacement = await authority.leases.acquire(leaseInput());
+  await replacement.dispatch();
+  await expect(old.dispatch()).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
+test("a stale abort cannot revoke a same-key replacement's claimed row", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  await old.abort();
+  await authority.preparations.prepare(
+    preparationInput({ bindings: { ...BINDINGS, ENCRYPTION_KEY: "new-generation-secret" } }),
+  );
+  const replacement = await authority.leases.acquire(leaseInput());
+  await expect(old.abort()).rejects.toMatchObject({ code: "conflict", status: 409 });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "claimed",
+  );
+  await replacement.abort();
+});
+
+test("a stale settlement cannot consume a same-key replacement's dispatched row", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  const oldDispatched = await old.dispatch();
+  await authority.leases.abandon?.({
+    ...leaseInput(),
+    expectedGeneration: old.preparation.generation,
+  });
+  await authority.preparations.prepare(
+    preparationInput({
+      bindings: { ...BINDINGS, ENCRYPTION_KEY: "new-generation-secret" },
+    }),
+  );
+  const replacement = await authority.leases.acquire(leaseInput());
+  await replacement.dispatch();
+  await expect(oldDispatched.settle(`sha256:${"7".repeat(64)}`)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
+test("same-generation lost dispatch and settlement acknowledgements remain idempotent", async () => {
+  const { sql, key, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  let loseDispatchAck = true;
+  let loseSettleAck = true;
+  const interrupted = createRuntimeInputAuthority({
+    sql: {
+      ...sql,
+      async run(statement, params) {
+        if (loseDispatchAck && statement.includes("SET state = 'dispatched'")) {
+          loseDispatchAck = false;
+          await sql.run(statement, params);
+          throw new Error("dispatch acknowledgement lost after commit");
+        }
+        if (loseSettleAck && statement.includes("SET state = 'consumed'")) {
+          loseSettleAck = false;
+          await sql.run(statement, params);
+          throw new Error("settlement acknowledgement lost after commit");
+        }
+        return sql.run(statement, params);
+      },
+    },
+    sealKeys: { current: { keyId: "runtime-input-test-key", key } },
+    canonicalPublicOrigin: HOST_ORIGIN,
+    clock: () => new Date(PREPARATION_TIME),
+  });
+  const lease = await interrupted.leases.acquire(leaseInput());
+  const dispatched = await lease.dispatch();
+  await dispatched.settle(`sha256:${"8".repeat(64)}`);
+  await dispatched.settle(`sha256:${"8".repeat(64)}`);
+  const [row] = await sql.query(
+    "SELECT state, lease_generation, seal_nonce FROM worker_runtime_input_preparations",
+  );
+  expect(row).toEqual({
+    state: "consumed",
+    lease_generation: lease.preparation.generation,
+    seal_nonce: null,
+  });
+});
+
+test("pins a live pre-0065 writer row but refuses historical terminal inference", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const [prepared] = await sql.query("SELECT seal_nonce FROM worker_runtime_input_preparations");
+  await sql.run(
+    "UPDATE worker_runtime_input_preparations SET lease_generation = NULL WHERE state = 'prepared'",
+  );
+  const pinPrepared = authority.leases.pinPrepared;
+  if (!pinPrepared) throw new Error("runtime-input pinning is unavailable");
+  const pinned = await pinPrepared(leaseInput());
+  expect(pinned.generation).toBe(prepared?.seal_nonce as string);
+  const lease = await authority.leases.acquire({
+    ...leaseInput(),
+    expectedGeneration: pinned.generation,
+  });
+  const dispatched = await lease.dispatch();
+  // This is exactly what a pre-0065 dispatched row looks like: its original
+  // nonce was erased before the migration had anywhere else to retain it.
+  await sql.run(
+    "UPDATE worker_runtime_input_preparations SET lease_generation = NULL WHERE state = 'dispatched'",
+  );
+  await expect(
+    authority.leases.recover({ ...leaseInput(), expectedGeneration: pinned.generation }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await expect(dispatched.settle(`sha256:${"9".repeat(64)}`)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+});
+
+test("stale recovery and absence revocation cannot adopt a replacement generation", async () => {
+  const { sql, authority } = await runtimeInputFixture();
+  await authority.preparations.prepare(preparationInput());
+  const old = await authority.leases.acquire(leaseInput());
+  await old.dispatch();
+  await authority.leases.abandon?.({
+    ...leaseInput(),
+    expectedGeneration: old.preparation.generation,
+  });
+  await authority.preparations.prepare(
+    preparationInput({ bindings: { ...BINDINGS, ENCRYPTION_KEY: "replacement-secret" } }),
+  );
+  const replacement = await authority.leases.acquire(leaseInput());
+  await replacement.dispatch();
+  const stale = { ...leaseInput(), expectedGeneration: old.preparation.generation };
+  await expect(authority.leases.recover(stale)).rejects.toMatchObject({ code: "conflict" });
+  await expect(authority.leases.abandon?.(stale)).rejects.toMatchObject({ code: "conflict" });
+  expect((await sql.query("SELECT state FROM worker_runtime_input_preparations"))[0]?.state).toBe(
+    "dispatched",
+  );
+});
+
 test("recovers a dispatched handoff by value-free identity and never returns values", async () => {
   const { authority } = await runtimeInputFixture();
   const prepared = await authority.preparations.prepare(preparationInput());
   const lease = await authority.leases.acquire(leaseInput());
   await lease.dispatch();
 
-  const recovery = await authority.leases.recover(leaseInput());
+  await expect(authority.leases.recover(leaseInput())).rejects.toMatchObject({
+    code: "conflict",
+  });
+  const recovery = await authority.leases.recover({
+    ...leaseInput(),
+    expectedGeneration: lease.preparation.generation,
+  });
   expect(Object.keys(recovery)).toEqual(["preparation", "bindingNames", "settle"]);
   expect(recovery.bindingNames).toEqual([...BINDING_NAMES]);
   expect(recovery.preparation.commitment).toBe(prepared.applyCommitment);
@@ -485,8 +780,12 @@ test("abandons a dispatched handoff after proven provider absence", async () => 
   await authority.preparations.prepare(preparationInput());
   const lease = await authority.leases.acquire(leaseInput());
   await lease.dispatch();
-  await authority.leases.abandon?.(leaseInput());
-  await authority.leases.abandon?.(leaseInput());
+  const exact = { ...leaseInput(), expectedGeneration: lease.preparation.generation };
+  await expect(authority.leases.abandon?.(leaseInput())).rejects.toMatchObject({
+    code: "conflict",
+  });
+  await authority.leases.abandon?.(exact);
+  await authority.leases.abandon?.(exact);
   const [row] = await sql.query(
     "SELECT state FROM worker_runtime_input_preparations WHERE organization_id = ? AND operation_key = ?",
     ["org_01", OPERATION_KEY],

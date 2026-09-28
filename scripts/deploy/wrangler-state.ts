@@ -719,11 +719,18 @@ export async function publishWranglerVersion(input: {
   readonly assertPredecessorStillCurrent: () => Promise<void>;
   /** Prove the exact staged immutable Version before any traffic deployment. */
   readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
+  /** Optional prebuilt Wrangler secrets file, forwarded only to the staged upload. */
+  readonly secretsFilePath?: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly run?: WranglerProcess;
   readonly wranglerPath?: string;
 }): Promise<WranglerVersionPublication> {
-  if (!isAbsolute(input.root) || !isAbsolute(input.bundlePath) || !isAbsolute(input.configPath)) {
+  if (
+    !isAbsolute(input.root) ||
+    !isAbsolute(input.bundlePath) ||
+    !isAbsolute(input.configPath) ||
+    (input.secretsFilePath !== undefined && !isAbsolute(input.secretsFilePath))
+  ) {
     throw preflightError("Wrangler version publication requires absolute artifact paths");
   }
   if (!WORKER_NAME.test(input.workerName)) {
@@ -831,6 +838,7 @@ async function publishWranglerVersionWhileLeased(
     readonly lease: WranglerVersionPublicationLease;
     readonly assertPredecessorStillCurrent: () => Promise<void>;
     readonly assertUploadedVersion?: (versionId: string) => Promise<void>;
+    readonly secretsFilePath?: string;
     readonly environment?: Readonly<Record<string, string>>;
     readonly wranglerPath?: string;
   },
@@ -857,6 +865,7 @@ async function publishWranglerVersionWhileLeased(
       "--strict",
       "--message",
       input.message,
+      ...(input.secretsFilePath === undefined ? [] : ["--secrets-file", input.secretsFilePath]),
     ]),
     { ...environment, WRANGLER_OUTPUT_FILE_PATH: uploadOutputPath },
     "Worker Version upload could not be started; do not retry before --status",

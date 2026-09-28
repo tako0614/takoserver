@@ -6,6 +6,7 @@ import type {
   ProviderRuntimeInputPublicApply,
 } from "./provider-runtime-input-port.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "./standard-service-port.ts";
+import type { ProviderWorkerClassRuntime } from "./worker-class-runtime-port.ts";
 
 /**
  * The one seam between Takoserver and the clouds it provisions on.
@@ -206,6 +207,19 @@ export interface ProviderExecutionAuthority {
 }
 
 /**
+ * In-process context for one provider mutation dispatch.
+ *
+ * This is deliberately separate from legacy `ApplyInput`, `ResourceIdentity`,
+ * and mutation digests. A route-less executor may receive it only through the
+ * explicitly versioned private context RPC. It gives a composed adapter the
+ * exact Deployment identity the Host will commit when a create has no
+ * incumbent Deployment yet.
+ */
+export interface ProviderMutationExecutionContext {
+  readonly prospectiveDeploymentId?: string;
+}
+
+/**
  * Closed authority for concluding one already-dispatched create as no-effect.
  *
  * This input deliberately cannot describe a provider mutation. In particular,
@@ -228,13 +242,27 @@ export interface ProviderApplyNoEffectConclusionInput {
 }
 
 /**
+ * A closed, pre-compensation nomination for the same accepted create. It is
+ * neither whole-operation no-effect proof nor permission to skip Host checks.
+ * The provider must independently revalidate this authority on compensation.
+ */
+export interface ProviderApplyCompensationNomination {
+  readonly phase: "compensation_required";
+  readonly operationId: string;
+  readonly providerInstallationRef: string;
+  readonly executionAuthority: ProviderExecutionAuthority;
+}
+
+/**
  * `unsupported` is a trusted pre-attempt answer: the provider did not begin a
- * conclusion or mutate its abort fence. Every other non-proof result remains
- * an ordinary ProviderTicket and therefore leaves the accepted saga held.
+ * conclusion or mutate its abort fence. A compensation nomination is a
+ * separate pre-attempt signal, not no-effect proof or cleanup authority.
+ * Ordinary ProviderTickets leave the accepted saga held.
  */
 export type ProviderApplyNoEffectConclusionResult =
   | ProviderTicket
-  | { readonly phase: "unsupported" };
+  | { readonly phase: "unsupported" }
+  | ProviderApplyCompensationNomination;
 
 /**
  * Closed authority for compensating one already-dispatched accepted create.
@@ -483,7 +511,15 @@ export interface ProviderNativeReadbackInput {
 }
 
 export interface Provider {
+  readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
+  /**
+   * Exact installed account/namespace identity for a single-installation
+   * Provider instance. Optional for historical adapters; noncommercial
+   * identity placement requires it and retained Deployments check it when
+   * present. This is not a customer-selectable installation.
+   */
+  readonly installedProviderInstallationRef?: string;
   /** Static configuration, not a per-request discovery call. */
   readonly offerings: readonly ProviderOffering[];
   /** Exact historical capabilities usable only for recorded Deployment recovery. */
@@ -496,7 +532,7 @@ export interface Provider {
   readonly runtimeInputCapabilities?: ProviderRuntimeInputCapabilities;
   /** Explicitly composed runtime integrations; absence means no standard-service delivery. */
   readonly standardServiceProtocols?: readonly StandardServiceSlot["service"][];
-  apply(input: ApplyInput): Promise<ProviderTicket>;
+  apply(input: ApplyInput, context?: ProviderMutationExecutionContext): Promise<ProviderTicket>;
   /**
    * Captures an opaque, versioned provider readback descriptor before the
    * logical Resource row disappears. This method is pure and synchronous:
@@ -559,7 +595,10 @@ export interface Provider {
    * This is deliberately distinct from `recoverApply`, which remains a
    * strictly read-only inspection seam.
    */
-  convergeApply?(input: ApplyInput): Promise<ProviderTicket>;
+  convergeApply?(
+    input: ApplyInput,
+    context?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket>;
   poll?(input: {
     readonly operationId: string;
     readonly handle: string;

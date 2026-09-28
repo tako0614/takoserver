@@ -23,6 +23,7 @@ import {
   type SelfhostWeightedVersion,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import { TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES } from "./takoform/limits.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 
 /**
@@ -92,6 +93,28 @@ interface WorkerdAssetManifestEntry {
   readonly digest: `sha256:${string}`;
 }
 
+export interface WorkerdActorForwardBinding {
+  readonly publicName: string;
+  readonly tenantId: string;
+  readonly namespaceResourceUid: string;
+  readonly httpService: string;
+  readonly upgradeService: string;
+  /** Host-private bearer already embedded in the generated outer wrapper. */
+  readonly token: string;
+}
+
+export interface WorkerdActorForward {
+  readonly schema: "takoserver.selfhost-actor-forward@v1";
+  readonly bindings: readonly WorkerdActorForwardBinding[];
+}
+
+export interface WorkerdActorForwardSocket {
+  readonly tenantId: string;
+  readonly namespaceResourceUid: string;
+  readonly httpSocketPath: string;
+  readonly upgradeSocketPath: string;
+}
+
 interface WorkerdAssetManifest {
   readonly storageLayout: typeof WORKERD_ASSET_STORAGE_LAYOUT;
   readonly notFoundHandling: "none" | "single-page-application";
@@ -135,6 +158,8 @@ export interface WorkerdSite {
   readonly fetchHandler?: boolean;
   /** Logical fetch bindings; target selection never consults a request URL. */
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
+  /** Unpublished Host-only Actor forward projection; never a worker.service binding. */
+  readonly actorForward?: WorkerdActorForward;
   /**
    * How the Host-owned HTTP router composes this script with its asset lookup.
    * Absent means it declared no assets and public traffic reaches the script
@@ -233,6 +258,19 @@ export interface WorkerdSelectedActiveVersion {
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
   readonly assets?: ReadonlyMap<string, Uint8Array>;
+}
+
+/** The complete, atomically verified graph used by one native Actor owner. */
+export interface WorkerdActiveActorGraph {
+  readonly generation: string;
+  readonly generationKey: string;
+  readonly workerResourceUid: string;
+  readonly versions: readonly (SelfhostWeightedVersion & {
+    readonly variantKey: string;
+    readonly site: WorkerdSite;
+    readonly modules: ReadonlyMap<string, Uint8Array>;
+    readonly hostModules: ReadonlyMap<string, Uint8Array>;
+  })[];
 }
 
 /** The gate service one script receives its events through. */
@@ -396,6 +434,8 @@ export interface WorkerdRuntimeOptions {
    * Requires immutable weighted publish(); legacy write()/remove() are refused.
    */
   readonly serviceBindingSocketDirectory?: string;
+  /** Current Host broker listeners, matched by exact tenant and Actor namespace UID. */
+  readonly actorForwardSockets?: readonly WorkerdActorForwardSocket[];
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -420,6 +460,7 @@ interface Manifest {
   readonly workerResourceUid?: string;
   readonly fetchHandler?: boolean;
   readonly serviceBindings?: readonly WorkerdServiceBinding[];
+  readonly actorForward?: WorkerdActorForward;
   readonly assets?: WorkerdAssetManifest;
   readonly vars?: readonly WorkerdBinding[];
   readonly modules?: readonly string[];
@@ -529,6 +570,7 @@ function privateRuntimeToken(): string {
 }
 
 export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWorkerdRuntime {
+  const actorForwardSockets = validActorForwardSockets(options.actorForwardSockets);
   const serviceSocketDirectory = options.serviceBindingSocketDirectory;
   if (serviceSocketDirectory !== undefined) {
     validPrivateSocketDirectory(serviceSocketDirectory);
@@ -755,6 +797,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         internalReadinessCapability,
         dataPlaneAddress,
         privateServiceGraph(published),
+        actorForwardSockets,
       ),
       "utf8",
       () => transitionPrivateSockets(published),
@@ -769,7 +812,11 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
     // cannot prove serving truth, but `has()` will still fail closed unless its
     // composition supplies a live `isReady` probe.
     if (options.onReload === undefined) return;
-    const expected = publishedGraphIdentity(published, privateServiceGraph(published));
+    const expected = publishedGraphIdentity(
+      published,
+      privateServiceGraph(published),
+      actorForwardSockets,
+    );
     const deadline = Date.now() + 5_000;
     for (;;) {
       let confirmed = false;
@@ -1294,6 +1341,14 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       if (serviceBindings.length > 0 && workerResourceUid === undefined) {
         throw new Error("unusable worker service binding");
       }
+      const actorForward =
+        site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+      validActorForwardCollision(
+        actorForward,
+        validBindings(site.vars ?? []),
+        serviceBindings,
+        hostEntrypoint,
+      );
       // Replaced rather than merged: a module the new bundle does not contain
       // must not survive from the old one, where it would be loadable and
       // wrong.
@@ -1344,6 +1399,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
           ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
           ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
+          ...(actorForward === undefined ? {} : { actorForward }),
           ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
           ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
           ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -1549,6 +1605,150 @@ const SCRIPT_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/u;
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{2,254}$/u;
 const INTERNAL_SERVICE_BINDING = /^__TAKOSERVER_SELFHOST_SERVICE_[0-9]{5}$/u;
 const SERVICE_UNAVAILABLE_TOKEN = /^[0-9a-f]{64}$/u;
+const ACTOR_FORWARD_SCHEMA = "takoserver.selfhost-actor-forward@v1" as const;
+const ACTOR_FORWARD_PUBLIC_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
+const ACTOR_FORWARD_TOKEN = /^[a-f0-9]{64}$/u;
+const ACTOR_FORWARD_MANIFEST_KEYS = new Set([
+  "mainModule",
+  "hostEntrypoint",
+  "hostModules",
+  "moduleStorageLayout",
+  "moduleFiles",
+  "hostnames",
+  "generation",
+  "workerResourceUid",
+  "fetchHandler",
+  "serviceBindings",
+  "actorForward",
+  "assets",
+  "vars",
+  "modules",
+  "moduleMediaTypes",
+  "dataPlane",
+  "events",
+]);
+
+function actorForwardServiceName(kind: "HTTP" | "UPGRADE", index: number): string {
+  return `__TAKOSERVER_ACTOR_${kind}_${index.toString(10).padStart(5, "0")}`;
+}
+
+function actorForwardIdentity(tenantId: string, namespaceResourceUid: string): string {
+  return JSON.stringify([tenantId, namespaceResourceUid]);
+}
+
+function validActorForward(value: unknown): WorkerdActorForward {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    Object.keys(value).sort().join(",") !== "bindings,schema"
+  )
+    throw new Error("unusable Actor forward graph");
+  const candidate = value as WorkerdActorForward;
+  if (
+    candidate.schema !== ACTOR_FORWARD_SCHEMA ||
+    !Array.isArray(candidate.bindings) ||
+    candidate.bindings.length === 0 ||
+    candidate.bindings.length > 32
+  )
+    throw new Error("unusable Actor forward graph");
+  const names = new Set<string>();
+  const bindings = candidate.bindings.map((binding, index) => {
+    if (
+      typeof binding !== "object" ||
+      binding === null ||
+      Array.isArray(binding) ||
+      Object.keys(binding).sort().join(",") !==
+        "httpService,namespaceResourceUid,publicName,tenantId,token,upgradeService" ||
+      typeof binding.publicName !== "string" ||
+      !ACTOR_FORWARD_PUBLIC_NAME.test(binding.publicName) ||
+      names.has(binding.publicName) ||
+      typeof binding.tenantId !== "string" ||
+      binding.tenantId.length === 0 ||
+      binding.tenantId.length > 256 ||
+      binding.tenantId.includes("\u0000") ||
+      typeof binding.namespaceResourceUid !== "string" ||
+      !RESOURCE_UID.test(binding.namespaceResourceUid) ||
+      binding.httpService !== actorForwardServiceName("HTTP", index) ||
+      binding.upgradeService !== actorForwardServiceName("UPGRADE", index) ||
+      typeof binding.token !== "string" ||
+      !ACTOR_FORWARD_TOKEN.test(binding.token)
+    )
+      throw new Error("unusable Actor forward graph");
+    names.add(binding.publicName);
+    capnpText(binding.publicName);
+    capnpText(binding.tenantId);
+    capnpText(binding.namespaceResourceUid);
+    return { ...binding };
+  });
+  return { schema: ACTOR_FORWARD_SCHEMA, bindings };
+}
+
+function validActorForwardSockets(
+  value: WorkerdRuntimeOptions["actorForwardSockets"],
+): ReadonlyMap<string, WorkerdActorForwardSocket> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value) || value.length > 128)
+    throw new Error("unusable Actor forward socket graph");
+  const selected = new Map<string, WorkerdActorForwardSocket>();
+  const paths = new Set<string>();
+  for (const candidate of value) {
+    if (
+      typeof candidate !== "object" ||
+      candidate === null ||
+      Array.isArray(candidate) ||
+      Object.keys(candidate).sort().join(",") !==
+        "httpSocketPath,namespaceResourceUid,tenantId,upgradeSocketPath" ||
+      typeof candidate.tenantId !== "string" ||
+      candidate.tenantId.length === 0 ||
+      candidate.tenantId.length > 256 ||
+      candidate.tenantId.includes("\u0000") ||
+      typeof candidate.namespaceResourceUid !== "string" ||
+      !RESOURCE_UID.test(candidate.namespaceResourceUid)
+    )
+      throw new Error("unusable Actor forward socket graph");
+    for (const path of [candidate.httpSocketPath, candidate.upgradeSocketPath]) {
+      if (
+        typeof path !== "string" ||
+        !isAbsolute(path) ||
+        resolve(path) !== path ||
+        path.includes("\u0000") ||
+        Buffer.byteLength(path) > 100 ||
+        paths.has(path)
+      )
+        throw new Error("unusable Actor forward socket graph");
+      paths.add(path);
+    }
+    const identity = actorForwardIdentity(candidate.tenantId, candidate.namespaceResourceUid);
+    if (selected.has(identity)) throw new Error("unusable Actor forward socket graph");
+    selected.set(identity, { ...candidate });
+  }
+  return selected;
+}
+
+function validActorForwardCollision(
+  actorForward: WorkerdActorForward | undefined,
+  vars: readonly WorkerdBinding[],
+  serviceBindings: readonly WorkerdServiceBinding[],
+  hostEntrypoint: string | undefined,
+): void {
+  if (!actorForward) return;
+  if (hostEntrypoint === undefined) throw new Error("unusable Actor forward entrypoint");
+  const names = new Set([
+    INTERNAL_READINESS_CAPABILITY_BINDING,
+    DATA_SERVICE_BINDING,
+    ...vars.map((binding) => binding.name),
+    ...serviceBindings.map((binding) => binding.name),
+  ]);
+  for (const binding of actorForward.bindings) {
+    if (
+      names.has(binding.publicName) ||
+      names.has(binding.httpService) ||
+      names.has(binding.upgradeService)
+    )
+      throw new Error("unusable Actor forward binding collision");
+  }
+}
 
 function validBindings(bindings: readonly WorkerdBinding[]): readonly WorkerdBinding[] {
   const seen = new Set<string>();
@@ -1752,7 +1952,7 @@ const SAFE_ASSET_PATH = /^[A-Za-z0-9_][A-Za-z0-9._-]*(?:\/[A-Za-z0-9_][A-Za-z0-9
 const ASSET_MEDIA_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/u;
 const MAX_ASSET_MEDIA_TYPE_LENGTH = 255;
 const MAX_ASSET_ENTRIES = 16_384;
-const MAX_ASSET_BYTES = 10_485_760;
+const MAX_ASSET_BYTES = TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES;
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
 
 function validAssetPath(value: string): boolean {
@@ -2075,6 +2275,14 @@ async function prepareWorkerdSite(
   if (serviceBindings.length > 0 && workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
+  const actorForward =
+    site.actorForward === undefined ? undefined : validActorForward(site.actorForward);
+  validActorForwardCollision(
+    actorForward,
+    validBindings(site.vars ?? []),
+    serviceBindings,
+    hostEntrypoint,
+  );
   return {
     manifest: {
       mainModule: site.mainModule,
@@ -2092,6 +2300,7 @@ async function prepareWorkerdSite(
       ...(workerResourceUid === undefined ? {} : { workerResourceUid }),
       ...(site.fetchHandler === undefined ? {} : { fetchHandler: site.fetchHandler }),
       ...(serviceBindings.length > 0 ? { serviceBindings } : {}),
+      ...(actorForward === undefined ? {} : { actorForward }),
       ...(assetDeclaration ? { assets: assetDeclaration.configuration } : {}),
       ...(site.vars && site.vars.length > 0 ? { vars: validBindings(site.vars) } : {}),
       ...(site.modules && site.modules.length > 0 ? { modules: declaredModules } : {}),
@@ -2142,8 +2351,24 @@ export async function writeWorkerdPrivateExecution(options: {
   readonly site: WorkerdSite;
   readonly modules: ReadonlyMap<string, Uint8Array>;
   readonly hostModules: ReadonlyMap<string, Uint8Array>;
-  readonly companionAddress: string;
+  readonly companionAddress?: string;
+  /** Internal Actor composition only; never a provider/admission option. */
+  readonly actor?: {
+    readonly namespaceKey: string;
+    readonly storagePath: string;
+    readonly ownerModule: string;
+    readonly className: string;
+    readonly alarmAdmissionAddress: string;
+    readonly variants: readonly {
+      readonly site: WorkerdSite;
+      readonly modules: ReadonlyMap<string, Uint8Array>;
+      readonly hostModules: ReadonlyMap<string, Uint8Array>;
+      readonly className: string;
+    }[];
+  };
   readonly runSocketPath: string;
+  /** Separate native duplex lane; the ordinary Bun/HTTP control lane stays unchanged. */
+  readonly actorProxySocketPath?: string;
   /** Current Host-owned listener, never the persisted prior-process address. */
   readonly dataPlaneAddress?: string;
   /** Exact child-local guard listeners, not shared sockets or public endpoints. */
@@ -2186,7 +2411,37 @@ export async function writeWorkerdPrivateExecution(options: {
     }
     servicePaths.add(mapping.socketPath);
   }
-  const companion = validDataPlaneAddress(options.companionAddress);
+  const actor = options.actor;
+  const actorProxySocketPath = options.actorProxySocketPath;
+  if (
+    (actorProxySocketPath !== undefined && !actor) ||
+    (actor &&
+      (typeof actorProxySocketPath !== "string" ||
+        !isAbsolute(actorProxySocketPath) ||
+        actorProxySocketPath.includes("\u0000") ||
+        Buffer.byteLength(actorProxySocketPath) > 100 ||
+        dirname(actorProxySocketPath) !== root ||
+        actorProxySocketPath === runSocketPath ||
+        servicePaths.has(actorProxySocketPath)))
+  )
+    throw new Error("unusable private Actor duplex socket");
+  if (
+    actor &&
+    (!/^[a-f0-9]{64}$/u.test(actor.namespaceKey) ||
+      !isAbsolute(actor.storagePath) ||
+      actor.storagePath.includes("\u0000") ||
+      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(actor.className) ||
+      !/^127\.0\.0\.1:[1-9][0-9]{0,4}$/u.test(actor.alarmAdmissionAddress))
+  ) {
+    throw new Error("unusable private Actor execution declaration");
+  }
+  if (
+    actor &&
+    (!Array.isArray(actor.variants) || actor.variants.length === 0 || actor.variants.length > 100)
+  ) {
+    throw new Error("unusable private Actor version graph");
+  }
+  const companion = actor ? undefined : validDataPlaneAddress(options.companionAddress ?? "");
   const planeAddress = site.dataPlane
     ? validDataPlaneAddress(options.dataPlaneAddress ?? "")
     : undefined;
@@ -2215,7 +2470,7 @@ export async function writeWorkerdPrivateExecution(options: {
   ) {
     throw new Error("private execution internal binding collision");
   }
-  bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
+  if (companion) bindings.push(`(name = ${capnpText(companionBinding)}, service = "companion")`);
   const serviceExternals = serviceMappings
     .map((mapping, index) => {
       const name = `service-${index}`;
@@ -2242,23 +2497,102 @@ export async function writeWorkerdPrivateExecution(options: {
   )),
   (name = "data-origin", external = (address = ${capnpText(planeAddress as string)}, http = ())),`;
   }
+  let actorServices = "";
+  let actorVersionServices = "";
+  const actorPrepared: {
+    readonly root: string;
+    readonly version: Awaited<ReturnType<typeof prepareWorkerdSite>>;
+  }[] = [];
+  if (actor) {
+    requiredStoredModule(prepared.manifest.moduleFiles.hostPrivate, actor.ownerModule);
+    const actorInternalBindings = new Set([
+      "__TAKOSERVER_ACTOR_ALARM_OWNER",
+      "NAMESPACE",
+      "CLASS",
+      "ADMISSION",
+      ...actor.variants.map((_, index) => `INSPECT_${index}`),
+    ]);
+    if (prepared.manifest.vars?.some((binding) => actorInternalBindings.has(binding.name)))
+      throw new Error("private Actor alarm binding collision");
+    const actorBindings = [
+      '(name = "NAMESPACE", durableObjectNamespace = "ActorOwner")',
+      '(name = "ADMISSION", service = "actor-alarm-admission")',
+    ];
+    for (let index = 0; index < actor.variants.length; index += 1) {
+      const variant = actor.variants[index];
+      if (!variant || !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(variant.className)) {
+        throw new Error("unusable private Actor class binding");
+      }
+      const serviceName = `actor-version-${index}`;
+      actorBindings.push(
+        `(name = ${capnpText(`CLASS_${index}`)}, durableObjectClass = (name = ${capnpText(serviceName)}, entrypoint = ${capnpText(variant.className)}))`,
+      );
+      actorBindings.push(
+        `(name = ${capnpText(`INSPECT_${index}`)}, service = ${capnpText(serviceName)})`,
+      );
+      // Actor classes have no public asset/event ingress. Those declarations
+      // were verified from durable state, but are intentionally not composed
+      // into the private class service.
+      const { assets: _assets, events: _events, ...versionSite } = variant.site;
+      const version = await prepareWorkerdSite(
+        { ...versionSite, hostnames: [] },
+        variant.modules,
+        undefined,
+        variant.hostModules,
+      );
+      const versionRoot = join(root, "actor-versions", String(index));
+      const versionPrefix = `./actor-versions/${index}`;
+      actorPrepared.push({ root: versionRoot, version });
+      const versionBindings = validBindings(version.manifest.vars ?? []).map(
+        (binding) =>
+          `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
+      );
+      if (
+        version.manifest.vars?.some((binding) => binding.name === "__TAKOSERVER_ACTOR_ALARM_OWNER")
+      ) {
+        throw new Error("private Actor internal binding collision");
+      }
+      versionBindings.push('(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")');
+      actorVersionServices += `
+  (name = ${capnpText(serviceName)}, worker = (
+    modules = [${renderWorkerdModules(version.manifest, versionPrefix)}],
+    modulePolicy = (applicationMain = ${capnpText(version.manifest.mainModule)}),
+    compatibilityDate = "2026-01-01", compatibilityFlags = [${[...APPLICATION_COMPATIBILITY_FLAGS, "experimental"].map(capnpText).join(", ")}], globalOutbound = "deny",
+    bindings = [${versionBindings.join(", ")}]
+  )),`;
+    }
+    actorServices = `
+  (name = "actor-owner", worker = (
+    modules = [${renderWorkerdModules({ ...prepared.manifest, hostEntrypoint: actor.ownerModule }, ".")}],
+    modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
+    compatibilityDate = "2026-01-01", compatibilityFlags = ["experimental", "disallow_importable_env"], globalOutbound = "deny",
+    bindings = [${actorBindings.join(", ")}],
+    durableObjectNamespaces = [(className = "ActorOwner", uniqueKey = ${capnpText(actor.namespaceKey)}, enableSql = true)],
+    durableObjectStorage = (localDisk = "actor-storage")
+  )),
+  (name = "actor-storage", disk = (path = ${capnpText(actor.storagePath)}, writable = true)),
+  (name = "actor-alarm-admission", external = (address = ${capnpText(actor.alarmAdmissionAddress)}, http = ())),`;
+  }
   const config = `using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
  services = [
   (name = "application", worker = (
     modules = [${renderWorkerdModules(prepared.manifest, ".")}],
-    bindings = [${bindings.join(", ")}],
+    bindings = [${[...bindings, ...(actor ? ['(name = "__TAKOSERVER_ACTOR_ALARM_OWNER", service = "actor-owner")'] : [])].join(", ")}],
     modulePolicy = (applicationMain = ${capnpText(prepared.manifest.mainModule)}),
     compatibilityDate = "2026-01-01",
-    compatibilityFlags = [${APPLICATION_COMPATIBILITY_FLAGS.map(capnpText).join(", ")}],
+    compatibilityFlags = [${(actor ? [...APPLICATION_COMPATIBILITY_FLAGS, "experimental"] : APPLICATION_COMPATIBILITY_FLAGS).map(capnpText).join(", ")}],
     globalOutbound = "deny"
   )),
-  (name = "companion", external = (address = ${capnpText(companion)}, http = ())),${dataServices}${serviceExternals}
+  ${companion ? `(name = "companion", external = (address = ${capnpText(companion)}, http = ())),` : ""}${dataServices}${serviceExternals}${actorVersionServices}${actorServices}
   (name = "deny", network = (allow = []))
  ],
- sockets = [(name = "workflow", address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = "application")]
+ sockets = [(name = ${capnpText(actor ? "actor" : "workflow")}, address = ${capnpText(`unix:${runSocketPath}`)}, http = (), service = ${capnpText(actor ? "actor-owner" : "application")})${actor ? `, (name = "actor-duplex", address = ${capnpText(`unix:${actorProxySocketPath}`)}, http = (style = proxy), service = "actor-owner")` : ""}]
 );`;
   await writePreparedWorkerdSite(root, prepared);
+  for (const { root: versionRoot, version } of actorPrepared) {
+    await writePreparedWorkerdSite(versionRoot, version);
+  }
   const configPath = join(root, "workerd.capnp");
   await writeFile(configPath, config, { mode: 0o600, flag: "wx" });
   return configPath;
@@ -2566,6 +2900,10 @@ async function readValidatedManifest(
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("unusable worker runtime manifest");
   }
+  // The legacy schema is the same known field set without actorForward. Never
+  // reinterpret an unknown old field as a new capability on restore.
+  if (Object.keys(value).some((key) => !ACTOR_FORWARD_MANIFEST_KEYS.has(key)))
+    throw new Error("unusable worker runtime manifest");
   let manifest = value as Manifest;
   if (
     typeof manifest.mainModule !== "string" ||
@@ -2580,7 +2918,7 @@ async function readValidatedManifest(
   manifest = { ...manifest, moduleFiles };
   const assets = await readPublishedAssetSnapshot(assetRoot, manifest.assets, capture?.assets);
   if (assets) manifest = { ...manifest, assets };
-  validBindings(manifest.vars ?? []);
+  const vars = validBindings(manifest.vars ?? []);
   if (manifest.workerResourceUid !== undefined) {
     validWorkerResourceUid(manifest.workerResourceUid);
   }
@@ -2594,6 +2932,10 @@ async function readValidatedManifest(
   if (serviceBindings.length > 0 && manifest.workerResourceUid === undefined) {
     throw new Error("unusable worker service binding");
   }
+  const actorForward =
+    manifest.actorForward === undefined ? undefined : validActorForward(manifest.actorForward);
+  validActorForwardCollision(actorForward, vars, serviceBindings, manifest.hostEntrypoint);
+  if (actorForward) manifest = { ...manifest, actorForward };
   if (manifest.dataPlane !== undefined) validDataPlane(manifest.dataPlane);
   if (manifest.events !== undefined) validEventGate(manifest.events);
   return manifest;
@@ -3007,6 +3349,14 @@ export async function readWorkerdSelectedActiveVersion(
               unavailableToken: binding.unavailableToken,
             })),
           }),
+      ...(manifest.actorForward === undefined
+        ? {}
+        : {
+            actorForward: {
+              schema: manifest.actorForward.schema,
+              bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
+            },
+          }),
       ...(manifest.assets === undefined
         ? {}
         : {
@@ -3088,6 +3438,193 @@ export async function readWorkerdSelectedActiveVersion(
     modules,
     hostModules,
     ...(assets === undefined ? {} : { assets }),
+  };
+}
+
+/**
+ * Reads every Version in the active private publication without sampling the
+ * weighted selector. All module bytes are verified before the active marker
+ * and stable pointer are reread, so callers receive one closed graph or null.
+ */
+export async function readWorkerdActiveActorGraph(
+  root: string,
+  script: string,
+  expectedWorkerResourceUid: string,
+): Promise<WorkerdActiveActorGraph | null> {
+  if (!SCRIPT_NAME.test(script)) throw new Error("unusable script name");
+  expectedWorkerResourceUid = validWorkerResourceUid(expectedWorkerResourceUid);
+  const scriptsRoot = join(root, "workers");
+  const activationPath = join(scriptsRoot, ".takoserver-active.json");
+  let before: Record<string, string | null>;
+  try {
+    before = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  const activeGeneration = before[script];
+  if (typeof activeGeneration !== "string") return null;
+  const pointerPath = join(scriptsRoot, script, MANIFEST);
+  const pointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active Actor graph");
+  });
+  if (pointerRaw === null) return null;
+  let pointerValue: unknown;
+  try {
+    pointerValue = JSON.parse(pointerRaw);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  let deployment: WeightedDeploymentSnapshot;
+  try {
+    deployment = await readWeightedDeploymentSnapshot(scriptsRoot, script, pointerValue);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  if (
+    deployment.deployment.generation !== activeGeneration ||
+    deployment.deployment.workerResourceUid !== expectedWorkerResourceUid
+  )
+    return null;
+
+  const versions: WorkerdActiveActorGraph["versions"][number][] = [];
+  for (let index = 0; index < deployment.deployment.versions.length; index += 1) {
+    const stored = deployment.deployment.versions[index];
+    const weighted = deployment.canonical[index];
+    if (!stored || !weighted) throw new Error("unusable worker active Actor graph");
+    const identity = stored.manifest;
+    if (
+      typeof identity !== "object" ||
+      identity === null ||
+      Array.isArray(identity) ||
+      identity.generation !== deployment.deployment.generation ||
+      identity.workerResourceUid !== deployment.deployment.workerResourceUid ||
+      !Array.isArray(identity.hostnames) ||
+      identity.hostnames.length !== 0
+    )
+      throw new Error("unusable worker active Actor graph");
+
+    const capture: Required<ReadbackCapture> = {
+      application: new Map(),
+      hostPrivate: new Map(),
+      assets: new Map(),
+    };
+    let manifest: Manifest;
+    try {
+      const moduleRoot = join(deployment.generationRoot, stored.storageKey);
+      manifest = await readValidatedManifest(
+        moduleRoot,
+        join(moduleRoot, ASSETS_ROOT_DIRECTORY),
+        identity,
+        capture,
+      );
+    } catch {
+      throw new Error("unusable worker active Actor graph");
+    }
+    if (
+      manifest.generation !== deployment.deployment.generation ||
+      manifest.workerResourceUid !== deployment.deployment.workerResourceUid ||
+      manifest.hostnames.length !== 0
+    )
+      throw new Error("unusable worker active Actor graph");
+
+    let site: WorkerdSite;
+    try {
+      site = {
+        directory: script,
+        mainModule: manifest.mainModule,
+        ...(manifest.hostEntrypoint === undefined
+          ? {}
+          : { hostEntrypoint: manifest.hostEntrypoint }),
+        ...(manifest.hostModules === undefined ? {} : { hostModules: [...manifest.hostModules] }),
+        hostnames: [...manifest.hostnames],
+        ...(manifest.generation === undefined ? {} : { generation: manifest.generation }),
+        ...(manifest.workerResourceUid === undefined
+          ? {}
+          : { workerResourceUid: manifest.workerResourceUid }),
+        ...(manifest.fetchHandler === undefined ? {} : { fetchHandler: manifest.fetchHandler }),
+        ...(manifest.serviceBindings === undefined
+          ? {}
+          : { serviceBindings: manifest.serviceBindings.map((binding) => ({ ...binding })) }),
+        ...(manifest.actorForward === undefined
+          ? {}
+          : {
+              actorForward: {
+                schema: manifest.actorForward.schema,
+                bindings: manifest.actorForward.bindings.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.vars === undefined
+          ? {}
+          : { vars: manifest.vars.map((binding) => ({ ...binding })) }),
+        ...(manifest.modules === undefined ? {} : { modules: [...manifest.modules] }),
+        ...(manifest.moduleMediaTypes === undefined
+          ? {}
+          : { moduleMediaTypes: { ...manifest.moduleMediaTypes } }),
+        ...(manifest.dataPlane === undefined
+          ? {}
+          : {
+              dataPlane: {
+                ...manifest.dataPlane,
+                vars: manifest.dataPlane.vars.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.events === undefined
+          ? {}
+          : {
+              events: {
+                ...manifest.events,
+                vars: manifest.events.vars.map((binding) => ({ ...binding })),
+              },
+            }),
+        ...(manifest.assets === undefined
+          ? {}
+          : {
+              assets: {
+                notFoundHandling: manifest.assets.notFoundHandling,
+                runWorkerFirst: manifest.assets.runWorkerFirst,
+                mediaTypes: Object.fromEntries(
+                  Object.entries(manifest.assets.files).map(([path, entry]) => [
+                    path,
+                    entry.mediaType,
+                  ]),
+                ),
+              },
+            }),
+      };
+    } catch {
+      throw new Error("unusable worker active Actor graph");
+    }
+    versions.push({
+      ...weighted,
+      variantKey: weighted.workerVersionUid,
+      site,
+      modules: capture.application,
+      hostModules: capture.hostPrivate,
+    });
+  }
+
+  let after: Record<string, string | null>;
+  const finalPointerRaw = await readFile(pointerPath, "utf8").catch((error: unknown) => {
+    if ((error as { readonly code?: unknown }).code === "ENOENT") return null;
+    throw new Error("unusable worker active Actor graph");
+  });
+  try {
+    after = await readActivationStrict(activationPath);
+  } catch {
+    throw new Error("unusable worker active Actor graph");
+  }
+  if (
+    finalPointerRaw === null ||
+    after[script] !== activeGeneration ||
+    finalPointerRaw !== pointerRaw
+  )
+    return null;
+  return {
+    generation: deployment.deployment.generation,
+    generationKey: deployment.pointer.generationKey,
+    workerResourceUid: deployment.deployment.workerResourceUid,
+    versions,
   };
 }
 
@@ -3278,9 +3815,46 @@ function logicalEventService(entry: PublishedDeployment): string | null {
   return variant?.manifest.events ? `${variant.name}-selfhost-events` : null;
 }
 
+interface ResolvedActorForwardService {
+  readonly httpBinding: string;
+  readonly upgradeBinding: string;
+  readonly httpService: string;
+  readonly upgradeService: string;
+  readonly httpSocketPath: string;
+  readonly upgradeSocketPath: string;
+}
+
+function resolveActorForwardServices(
+  published: readonly PublishedDeployment[],
+  sockets: ReadonlyMap<string, WorkerdActorForwardSocket>,
+): ReadonlyMap<string, readonly ResolvedActorForwardService[]> {
+  const resolved = new Map<string, readonly ResolvedActorForwardService[]>();
+  for (const variant of published.flatMap((deployment) => deployment.variants)) {
+    if (variant.manifest.actorForward === undefined) continue;
+    const actorForward = validActorForward(variant.manifest.actorForward);
+    const services = actorForward.bindings.map((binding, index) => {
+      const current = sockets.get(
+        actorForwardIdentity(binding.tenantId, binding.namespaceResourceUid),
+      );
+      if (!current) throw new Error("Actor forward Host socket unavailable");
+      return {
+        httpBinding: binding.httpService,
+        upgradeBinding: binding.upgradeService,
+        httpService: `${variant.name}-actor-http-${index}`,
+        upgradeService: `${variant.name}-actor-upgrade-${index}`,
+        httpSocketPath: current.httpSocketPath,
+        upgradeSocketPath: current.upgradeSocketPath,
+      };
+    });
+    resolved.set(variant.name, services);
+  }
+  return resolved;
+}
+
 function publishedGraphIdentity(
   published: readonly PublishedDeployment[],
   privateServices?: PrivateServiceGraph,
+  actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
 ): string {
   const hash = createHash("sha256").update(
     JSON.stringify(
@@ -3312,6 +3886,12 @@ function publishedGraphIdentity(
         routers: [...privateServices.bindings.keys()],
       }),
     );
+  }
+  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  if (actorServices.size > 0) {
+    hash
+      .update("\u0000actor-forward-sockets\u0000")
+      .update(JSON.stringify([...actorServices.entries()]));
   }
   return hash.digest("hex");
 }
@@ -3369,9 +3949,11 @@ function renderConfig(
   internalReadinessCapability = "",
   dataPlaneAddress?: string,
   privateServices?: PrivateServiceGraph,
+  actorForwardSockets: ReadonlyMap<string, WorkerdActorForwardSocket> = new Map(),
 ): string {
   const variants = published.flatMap((deployment) => deployment.variants);
-  const graphIdentity = publishedGraphIdentity(published, privateServices);
+  const actorServices = resolveActorForwardServices(published, actorForwardSockets);
+  const graphIdentity = publishedGraphIdentity(published, privateServices, actorForwardSockets);
   const services = variants
     .map((entry) => {
       const bindings = [
@@ -3387,6 +3969,10 @@ function renderConfig(
           (binding) =>
             `(name = ${capnpText(binding.name)}, service = ${capnpText(serviceRouterName(binding))})`,
         ),
+        ...(actorServices.get(entry.name) ?? []).flatMap((binding) => [
+          `(name = ${capnpText(binding.httpBinding)}, service = ${capnpText(binding.httpService)})`,
+          `(name = ${capnpText(binding.upgradeBinding)}, service = ${capnpText(binding.upgradeService)})`,
+        ]),
         ...validBindings(entry.manifest.vars ?? []).map(
           (binding) =>
             `(name = ${capnpText(binding.name)}, ${binding.kind} = ${capnpText(binding.value)})`,
@@ -3413,6 +3999,15 @@ function renderConfig(
     )
   ),`;
     })
+    .join("\n");
+
+  const actorExternalServices = [...actorServices.values()]
+    .flatMap((bindings) =>
+      bindings.flatMap((binding) => [
+        `  (name = ${capnpText(binding.httpService)}, external = (address = ${capnpText(`unix:${binding.httpSocketPath}`)}, http = ())),`,
+        `  (name = ${capnpText(binding.upgradeService)}, external = (address = ${capnpText(`unix:${binding.upgradeSocketPath}`)}, http = (style = proxy))),`,
+      ]),
+    )
     .join("\n");
 
   // Absolute, because a `disk` path is resolved against the process's working
@@ -3674,7 +4269,7 @@ function renderConfig(
 const config :Workerd.Config = (
   services = [
 ${services}
-${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
+${assetServices}${serviceBindingServices === "" ? "" : `\n${serviceBindingServices}`}${dataServices === "" ? "" : `\n${dataServices}`}${actorExternalServices === "" ? "" : `\n${actorExternalServices}`}${eventGateServices === "" ? "" : `\n${eventGateServices}`}${deploymentRouterServices === "" ? "" : `\n${deploymentRouterServices}`}${eventDispatcherServices === "" ? "" : `\n${eventDispatcherServices}`}
   ( name = "router",
     worker = (
       modules = [ (name = "router.js", esModule = embed "router.js") ],

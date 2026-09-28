@@ -850,6 +850,83 @@ test("provider-private adapters expose only errors declared by each operation", 
   await expect(s3.head("key.bin")).rejects.toMatchObject({ name: "backend_unavailable" });
 });
 
+test("private S3 refuses URL-normalized opaque keys before every keyed transport operation", async () => {
+  const keys = ["a/../b", "../otherbucket/key", "/../otherbucket/key", "./at-root", "a/.", "a/.."];
+  for (const key of keys) {
+    const backend = new MemoryS3();
+    const objects = createPrivateS3EdgeObjects({
+      endpoint: "https://s3.internal.test",
+      bucketName: "private-bucket",
+      region: "ap-northeast-1",
+      credentials: { accessKeyId: "AKID", secretAccessKey: "private-secret" },
+      fetch: backend.fetch,
+      now: () => new Date("2026-09-01T00:00:00.000Z"),
+    });
+    const operations = [
+      () => objects.head(key),
+      () => objects.get(key),
+      () => objects.put(key, "body"),
+      () => objects.delete(key),
+      () => objects.createMultipartUpload(key),
+      () => objects.uploadPart(key, "upload-1", 1, "part"),
+      () => objects.completeMultipartUpload(key, "upload-1", [{ etag: '"part"', partNumber: 1 }]),
+      () => objects.abortMultipartUpload(key, "upload-1"),
+    ];
+    for (const operation of operations) {
+      await expect(operation()).rejects.toMatchObject({
+        name: "backend_unavailable",
+        message: "backend_unavailable",
+      });
+      expect(backend.calls).toHaveLength(0);
+      expect(backend.store.objects.size).toBe(0);
+      expect(backend.store.uploads.size).toBe(0);
+    }
+    expect(await objects.list()).toMatchObject({ objects: [], prefixes: [] });
+  }
+});
+
+test("private S3 preserves representable opaque keys in signed request paths", async () => {
+  const backend = new MemoryS3();
+  const objects = createPrivateS3EdgeObjects({
+    endpoint: "https://s3.internal.test",
+    bucketName: "private-bucket",
+    region: "ap-northeast-1",
+    credentials: { accessKeyId: "AKID", secretAccessKey: "private-secret" },
+    fetch: backend.fetch,
+    now: () => new Date("2026-09-01T00:00:00.000Z"),
+  });
+  const keys = [
+    "literal%2Fslash",
+    "literal%2epercent",
+    "a..b",
+    ".hidden",
+    "a//b",
+    "/leading",
+    "trailing/",
+    "punctuation!()'",
+    "界/🌊",
+  ];
+  for (const key of keys) {
+    await objects.put(key, "body");
+    expect(backend.store.objects.has(key)).toBe(true);
+    const request = backend.calls.at(-1);
+    expect(request?.url).toContain("/private-bucket/");
+    expect(
+      decodeURIComponent(new URL(request?.url as string).pathname.slice("/private-bucket/".length)),
+    ).toBe(key);
+    expect(await objects.head(key)).toMatchObject({ size: 4 });
+  }
+  expect(new URL(backend.calls[0]?.url as string).pathname).toBe(
+    "/private-bucket/literal%252Fslash",
+  );
+  expect(new URL(backend.calls[2]?.url as string).pathname).toBe(
+    "/private-bucket/literal%252epercent",
+  );
+  expect(new URL(backend.calls[14]?.url as string).pathname).toBe(
+    "/private-bucket/punctuation%21%28%29%27",
+  );
+});
+
 test("normalizes allowed provider errors to fresh exact-name errors", async () => {
   const source = new Error("provider secret: internal object id");
   source.name = "invalid_key";

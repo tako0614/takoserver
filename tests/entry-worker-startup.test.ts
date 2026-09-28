@@ -45,6 +45,18 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("selects unpublished Actor source only by exact opt-in and keeps absent supply non-sellable", async () => {
+    const env = workerEnv({ TAKOSERVER_FORM_SOURCE_CANDIDATE: "actor-forward" });
+    const discovery = await worker.fetch(new Request(`${ORIGIN}/.well-known/takoserver`), env);
+    expect(discovery.status).toBe(200);
+    const rejected = await worker.fetch(
+      new Request(`${ORIGIN}/.well-known/takoserver`),
+      workerEnv({ TAKOSERVER_FORM_SOURCE_CANDIDATE: "actor" }),
+    );
+    expect(rejected.status).toBe(503);
+    expect((await envelope(rejected)).error.details?.reason).toBe("runtime-configuration");
+  });
+
   test("composes organization bootstrap only from exact integration identity and JIT closures", () => {
     const exact = {
       OPERATOR_IDENTITY_PUBLIC_JWK: JSON.stringify({

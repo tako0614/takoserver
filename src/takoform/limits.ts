@@ -9,6 +9,9 @@
 /** Largest Worker bundle a tenant may commit. Advertised in support profiles. */
 export const TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES = 10_485_760;
 
+/** Largest StaticAssetBundle this Host can commit and materialize. */
+export const TAKOFORM_MAXIMUM_STATIC_ASSET_BUNDLE_BYTES = 20_971_520;
+
 /** Maximum module entries in one WorkerBundle manifest. */
 export const TAKOFORM_MAXIMUM_WORKER_BUNDLE_MODULES = 4_096;
 

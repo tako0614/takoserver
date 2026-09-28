@@ -1,9 +1,13 @@
 import type { Catalog } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "./generated/takoform-stable-v1-catalog.ts";
-import { canonicalDigest } from "./json.ts";
+import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Clock, JsonObject, Row, Sql, SqlWrite } from "./ports.ts";
-import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
+import {
+  createNoncommercialProviderPlacementSelector,
+  createSoldProviderPlacementSelector,
+  type NoncommercialPlacementComposition,
+} from "./provider-placement.ts";
 import type { Provider } from "./provider-port.ts";
 import {
   derivedProviderResourceIncarnationName,
@@ -13,6 +17,7 @@ import {
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
+import type { InstalledTakoformForm } from "./takoform/types.ts";
 import { workerServiceCondition } from "./takoform/worker-aggregate.ts";
 
 export const WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT =
@@ -323,11 +328,23 @@ export function createWorkerEndpointOriginReservations(options: {
     "resourceWithRelationsByUid" | "resourcesByRelation" | "readResource"
   >;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
+  /** Exact operator composition shared with the driver; only Host-minted Worker origins use it. */
+  readonly noncommercialPlacement?: {
+    readonly composition: NoncommercialPlacementComposition;
+    readonly installedForms: readonly InstalledTakoformForm[];
+  };
 }): WorkerEndpointOriginReservations {
   const placements = createSoldProviderPlacementSelector({
     providers: options.providers,
     catalog: options.catalog,
   });
+  const noncommercialPlacements = options.noncommercialPlacement
+    ? createNoncommercialProviderPlacementSelector({
+        providers: options.providers,
+        catalog: options.catalog,
+        composition: options.noncommercialPlacement.composition,
+      })
+    : undefined;
   const now = (): number => options.clock().getTime();
 
   const selectedPlacement = async (offeringId?: string): Promise<PlannedPlacement> => {
@@ -352,12 +369,12 @@ export function createWorkerEndpointOriginReservations(options: {
     };
   };
 
-  const planned = async (input: {
+  const plannedWithSelection = async (input: {
     readonly organizationId: string;
     readonly requestedSubdomain: string;
-    readonly offeringId?: string;
+    readonly selection: PlannedPlacement;
   }): Promise<PlannedOrigin> => {
-    const selection = await selectedPlacement(input.offeringId);
+    const selection = input.selection;
     const capability = selection.provider.workerEndpointOriginReservations;
     if (!capability) {
       throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
@@ -405,6 +422,134 @@ export function createWorkerEndpointOriginReservations(options: {
     };
   };
 
+  const planned = async (input: {
+    readonly organizationId: string;
+    readonly requestedSubdomain: string;
+    readonly offeringId?: string;
+  }): Promise<PlannedOrigin> =>
+    await plannedWithSelection({
+      organizationId: input.organizationId,
+      requestedSubdomain: input.requestedSubdomain,
+      selection: await selectedPlacement(input.offeringId),
+    });
+
+  const exactInstalledEdgeForm = (
+    snapshot: ResourceWithRelations,
+    kind: "ModuleWorker" | "WorkerEndpoint",
+    role: "identity" | "attachment",
+  ): InstalledTakoformForm | undefined => {
+    const identity = snapshot.listing.resource.form;
+    if (
+      !identity.packageDigest ||
+      identity.formRef.apiVersion !== MODULE_WORKER_FORM_REF.apiVersion ||
+      identity.formRef.kind !== kind
+    ) {
+      return undefined;
+    }
+    const matches = options.noncommercialPlacement?.installedForms.filter(
+      (candidate) =>
+        candidate.role === role && canonicalJson(candidate.identity) === canonicalJson(identity),
+    );
+    return matches?.length === 1 ? matches[0] : undefined;
+  };
+
+  const noncommercialRow = (row: ReservationRow): boolean =>
+    row.reservation_id.startsWith(HOST_MINTED_RESERVATION_PREFIX) &&
+    !options.catalog.hasOfferingId(row.offering_id);
+
+  /** Host mint follows the Worker's active Deployment, never the endpoint's Offering. */
+  const selectedHostMintPlacement = async (
+    input: {
+      readonly organizationId: string;
+      readonly space: string;
+      readonly workerName: string;
+      readonly workerResourceUid: string;
+    },
+    requireNoCommercialCandidate = true,
+  ): Promise<PlannedPlacement> => {
+    const deployment = await activeDeployment(
+      options.deployments,
+      input.organizationId,
+      input.workerResourceUid,
+    );
+    if (!deployment || deployment.resourceUid !== input.workerResourceUid) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    validateOpaque(deployment.offeringId);
+    if (options.catalog.hasOfferingId(deployment.offeringId)) {
+      const sold = await selectedPlacement(deployment.offeringId);
+      if (
+        sold.providerPackRef !== deployment.providerPackRef ||
+        sold.providerInstallationRef !== deployment.providerInstallationRef
+      ) {
+        throw new WorkerEndpointOriginReservationError("conflict", 409);
+      }
+      return sold;
+    }
+    if (!noncommercialPlacements) {
+      throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+    }
+    const snapshot = await resourceSnapshot(
+      options.resources,
+      input.organizationId,
+      input.workerResourceUid,
+    );
+    if (
+      !snapshot ||
+      snapshot.listing.space !== input.space ||
+      snapshot.listing.name !== input.workerName ||
+      !currentIncarnation(snapshot, "ModuleWorker")
+    ) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    const form = exactInstalledEdgeForm(snapshot, "ModuleWorker", "identity");
+    if (!form) {
+      throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+    }
+    // New mints cannot choose free supply while the exact Form is sellable.
+    // A retained technical row instead rechecks its durable tuple and digest;
+    // a later commercial listing must not strand its read/delete lifecycle.
+    if (
+      requireNoCommercialCandidate &&
+      options.catalog.offeringsFor(form.identity.formRef).length > 0
+    ) {
+      throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+    }
+    let selected: Awaited<ReturnType<typeof noncommercialPlacements.select>>;
+    try {
+      selected = await noncommercialPlacements.select({
+        tenantId: input.organizationId,
+        space: input.space,
+        form,
+      });
+    } catch (error) {
+      throw reservationPlacementError(error);
+    }
+    if (
+      selected.provider.id !== deployment.providerPackRef ||
+      selected.providerInstallationRef !== deployment.providerInstallationRef ||
+      selected.offering.id !== deployment.offeringId
+    ) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    return {
+      provider: selected.provider,
+      providerPackRef: selected.provider.id,
+      providerInstallationRef: selected.providerInstallationRef,
+      offeringId: selected.offering.id,
+      offeringDigest: await canonicalDigest({
+        kind: "host-minted-noncommercial-module-worker-v1",
+        tenantId: input.organizationId,
+        space: input.space,
+        workerResourceUid: input.workerResourceUid,
+        form: snapshot.listing.resource.form,
+        providerPackRef: selected.provider.id,
+        providerInstallationRef: selected.providerInstallationRef,
+        technicalOffering: selected.offering,
+      }),
+    };
+  };
+
   const expire = async (organizationId: string, reservationId: string): Promise<void> => {
     const timestamp = now();
     try {
@@ -447,8 +592,31 @@ export function createWorkerEndpointOriginReservations(options: {
     return row && liveState(row.state) ? row : null;
   };
 
-  const assertPlacement = async (row: ReservationRow): Promise<void> => {
-    const selected = await selectedPlacement(row.offering_id);
+  const assertPlacement = async (
+    row: ReservationRow,
+    identity?: {
+      readonly space: string;
+      readonly workerName: string;
+      readonly workerResourceUid: string;
+    },
+  ): Promise<void> => {
+    const noncommercial = noncommercialRow(row);
+    const worker =
+      identity ??
+      (row.bound_space && row.bound_worker_name && row.worker_resource_uid
+        ? {
+            space: row.bound_space,
+            workerName: row.bound_worker_name,
+            workerResourceUid: row.worker_resource_uid,
+          }
+        : undefined);
+    if (noncommercial && !worker) {
+      throw new WorkerEndpointOriginReservationError("conflict", 409);
+    }
+    const selected =
+      noncommercial && worker
+        ? await selectedHostMintPlacement({ organizationId: row.organization_id, ...worker }, false)
+        : await selectedPlacement(row.offering_id);
     if (
       selected.providerPackRef !== row.provider_pack_ref ||
       selected.providerInstallationRef !== row.provider_installation_ref ||
@@ -461,10 +629,10 @@ export function createWorkerEndpointOriginReservations(options: {
     if (!row.requested_subdomain) {
       throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
     }
-    const current = await planned({
+    const current = await plannedWithSelection({
       organizationId: row.organization_id,
       requestedSubdomain: row.requested_subdomain,
-      offeringId: row.offering_id,
+      selection: selected,
     });
     if (current.canonicalPublicOrigin !== row.canonical_public_origin) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
@@ -520,13 +688,16 @@ export function createWorkerEndpointOriginReservations(options: {
       row.organization_id,
       identity.workerResourceUid,
     );
+    const validForm = noncommercialRow(row)
+      ? snapshot && !!exactInstalledEdgeForm(snapshot, "ModuleWorker", "identity")
+      : snapshot && sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF);
     if (
       !snapshot ||
       snapshot.listing.uid !== identity.workerResourceUid ||
       snapshot.listing.space !== identity.space ||
       snapshot.listing.name !== identity.workerName ||
       !currentIncarnation(snapshot, "ModuleWorker") ||
-      !sameForm(snapshot.listing.resource.form.formRef, MODULE_WORKER_FORM_REF) ||
+      !validForm ||
       !(await workerReady(row.organization_id, snapshot))
     ) {
       throw new WorkerEndpointOriginReservationError("conflict", 409);
@@ -959,42 +1130,6 @@ export function createWorkerEndpointOriginReservations(options: {
    * advances a binding rather than inventing one. Nothing here touches a
    * reservation a caller made: those keep the exact-replay semantics they had.
    */
-  /**
-   * The Offering a Host-minted reservation is placed on: the ModuleWorker's.
-   *
-   * A reservation's placement is compared, everywhere downstream, against the
-   * Worker's **active provider Deployment** — `validateWorker` refuses a row
-   * whose `offering_id` is not that Deployment's. So the one authoritative
-   * answer to "which Offering is this reservation on" is the Deployment's own,
-   * and reading it here means the mint can never prepare a row `bind` will
-   * then refuse.
-   *
-   * The alternative — letting the WorkerEndpoint mutation name the Offering —
-   * is what broke: the only Offering that mutation holds is the endpoint's,
-   * and looking an endpoint Offering up in the ModuleWorker candidate list can
-   * never match, so every Host-minted reservation was refused 422. Omitting it
-   * instead would silently work only where exactly one ModuleWorker Offering
-   * is sold, which is a property of the catalog rather than of this Worker.
-   */
-  const hostMintedWorkerOfferingId = async (identity: {
-    readonly organizationId: string;
-    readonly workerResourceUid: string;
-  }): Promise<string> => {
-    const deployment = await activeDeployment(
-      options.deployments,
-      identity.organizationId,
-      identity.workerResourceUid,
-    );
-    // No active Deployment is not a placement problem: it means this is not
-    // the Ready, deployed Worker a reservation can be made for, which is the
-    // same refusal `validateWorker` gives one moment later.
-    if (!deployment || deployment.resourceUid !== identity.workerResourceUid) {
-      throw new WorkerEndpointOriginReservationError("conflict", 409);
-    }
-    validateOpaque(deployment.offeringId);
-    return deployment.offeringId;
-  };
-
   const advanceHostMintToCurrentRevision = async (input: {
     readonly organizationId: string;
     readonly reservationId: string;
@@ -1083,29 +1218,28 @@ export function createWorkerEndpointOriginReservations(options: {
     return boundProjection(row);
   };
 
-  const authority: WorkerEndpointOriginReservations = {
-    async prepare(input) {
-      normalizeIdentity(input.organizationId, input.reservationId);
-      validateRequestedSubdomain(input.requestedSubdomain);
-      const expiresInSeconds = ttl(input.expiresInSeconds);
-      if (input.offeringId !== undefined) validateOpaque(input.offeringId);
-      const plan = await planned({
-        organizationId: input.organizationId,
-        requestedSubdomain: input.requestedSubdomain,
-        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
-      });
-      await expire(input.organizationId, input.reservationId);
-      await expireConflicts(input.requestedSubdomain, plan.canonicalPublicOrigin);
-      const existing = await readRow(options.sql, input.organizationId, input.reservationId);
-      if (existing) {
-        return exactReplay(existing, input.requestedSubdomain, plan, expiresInSeconds);
-      }
+  const prepareWithPlan = async (
+    input: {
+      readonly organizationId: string;
+      readonly reservationId: string;
+      readonly requestedSubdomain: string;
+      readonly expiresInSeconds: number;
+    },
+    plan: PlannedOrigin,
+  ): Promise<WorkerEndpointOriginReservationProjection> => {
+    const expiresInSeconds = ttl(input.expiresInSeconds);
+    await expire(input.organizationId, input.reservationId);
+    await expireConflicts(input.requestedSubdomain, plan.canonicalPublicOrigin);
+    const existing = await readRow(options.sql, input.organizationId, input.reservationId);
+    if (existing) {
+      return exactReplay(existing, input.requestedSubdomain, plan, expiresInSeconds);
+    }
 
-      const timestamp = now();
-      const expiresAt = timestamp + expiresInSeconds * 1_000;
-      try {
-        const inserted = await options.sql.run(
-          `INSERT INTO worker_endpoint_origin_reservations
+    const timestamp = now();
+    const expiresAt = timestamp + expiresInSeconds * 1_000;
+    try {
+      const inserted = await options.sql.run(
+        `INSERT INTO worker_endpoint_origin_reservations
              (organization_id, reservation_id, reservation_format,
               legacy_space, legacy_worker_name, legacy_endpoint_name, requested_subdomain,
               canonical_public_origin, provider_pack_ref, provider_installation_ref,
@@ -1116,42 +1250,55 @@ export function createWorkerEndpointOriginReservations(options: {
               created_at, updated_at, released_at)
            VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 1,
                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)`,
-          [
-            input.organizationId,
-            input.reservationId,
-            WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
-            input.requestedSubdomain,
-            plan.canonicalPublicOrigin,
-            plan.providerPackRef,
-            plan.providerInstallationRef,
-            plan.offeringId,
-            plan.offeringDigest,
-            expiresInSeconds,
-            expiresAt,
-            timestamp,
-            timestamp,
-          ],
-        );
-        if (inserted.changes !== 1) {
-          throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
-        }
-      } catch (error) {
-        const raced = await readRow(options.sql, input.organizationId, input.reservationId);
-        if (raced) {
-          return exactReplay(raced, input.requestedSubdomain, plan, expiresInSeconds);
-        }
-        const collision = await liveCollision(
-          options.sql,
+        [
+          input.organizationId,
+          input.reservationId,
+          WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
           input.requestedSubdomain,
           plan.canonicalPublicOrigin,
-        );
-        if (collision) throw new WorkerEndpointOriginReservationError("conflict", 409);
-        if (error instanceof WorkerEndpointOriginReservationError) throw error;
+          plan.providerPackRef,
+          plan.providerInstallationRef,
+          plan.offeringId,
+          plan.offeringDigest,
+          expiresInSeconds,
+          expiresAt,
+          timestamp,
+          timestamp,
+        ],
+      );
+      if (inserted.changes !== 1) {
         throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
       }
-      const created = await readRow(options.sql, input.organizationId, input.reservationId);
-      if (!created) throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
-      return publicProjection(created);
+    } catch (error) {
+      const raced = await readRow(options.sql, input.organizationId, input.reservationId);
+      if (raced) {
+        return exactReplay(raced, input.requestedSubdomain, plan, expiresInSeconds);
+      }
+      const collision = await liveCollision(
+        options.sql,
+        input.requestedSubdomain,
+        plan.canonicalPublicOrigin,
+      );
+      if (collision) throw new WorkerEndpointOriginReservationError("conflict", 409);
+      if (error instanceof WorkerEndpointOriginReservationError) throw error;
+      throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    }
+    const created = await readRow(options.sql, input.organizationId, input.reservationId);
+    if (!created) throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+    return publicProjection(created);
+  };
+
+  const authority: WorkerEndpointOriginReservations = {
+    async prepare(input) {
+      normalizeIdentity(input.organizationId, input.reservationId);
+      validateRequestedSubdomain(input.requestedSubdomain);
+      if (input.offeringId !== undefined) validateOpaque(input.offeringId);
+      const plan = await planned({
+        organizationId: input.organizationId,
+        requestedSubdomain: input.requestedSubdomain,
+        ...(input.offeringId ? { offeringId: input.offeringId } : {}),
+      });
+      return await prepareWithPlan(input, plan);
     },
 
     async read(organizationId, reservationId) {
@@ -1175,7 +1322,7 @@ export function createWorkerEndpointOriginReservations(options: {
       ) {
         throw new WorkerEndpointOriginReservationError("conflict", 409);
       }
-      await assertPlacement(row);
+      await assertPlacement(row, input);
       const { snapshot } = await validateWorker(row, input);
       if (row.state === "bound" || row.state === "activated") {
         if (
@@ -1305,6 +1452,9 @@ export function createWorkerEndpointOriginReservations(options: {
         input.organizationId,
         input.endpointResourceUid,
       );
+      const validEndpointForm = noncommercialRow(row)
+        ? endpoint && !!exactInstalledEdgeForm(endpoint, "WorkerEndpoint", "attachment")
+        : endpoint && sameForm(endpoint.listing.resource.form.formRef, WORKER_ENDPOINT_FORM_REF);
       if (
         !endpoint ||
         endpoint.listing.uid !== input.endpointResourceUid ||
@@ -1312,9 +1462,14 @@ export function createWorkerEndpointOriginReservations(options: {
         (row.reservation_format === LEGACY_WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT &&
           endpoint.listing.name !== row.legacy_endpoint_name) ||
         !readyCurrent(endpoint, "WorkerEndpoint") ||
-        !sameForm(endpoint.listing.resource.form.formRef, WORKER_ENDPOINT_FORM_REF) ||
+        !validEndpointForm ||
         !endpointOriginEquals(endpoint, row.canonical_public_origin) ||
-        !exactWorkerRelation(endpoint, row.worker_resource_uid, row.bound_worker_name)
+        !exactWorkerRelation(
+          endpoint,
+          row.worker_resource_uid,
+          row.bound_worker_name,
+          worker.listing.resource.form.formRef,
+        )
       ) {
         throw new WorkerEndpointOriginReservationError("conflict", 409);
       }
@@ -1501,8 +1656,7 @@ export function createWorkerEndpointOriginReservations(options: {
       normalizeIdentity(input.organizationId, input.workerResourceUid);
       validateSpace(input.space);
       validateTargetName(input.workerName);
-      const offeringId = await hostMintedWorkerOfferingId(input);
-      const selection = await selectedPlacement(offeringId);
+      const selection = await selectedHostMintPlacement(input);
       const derive = selection.provider.workerEndpointOriginReservations?.hostMintedSubdomain;
       if (!derive) return null;
       let subdomain: string | null;
@@ -1553,13 +1707,19 @@ export function createWorkerEndpointOriginReservations(options: {
         workerName: input.workerName,
         workerResourceUid: input.workerResourceUid,
       });
-      await authority.prepare({
-        organizationId: input.organizationId,
-        reservationId,
-        requestedSubdomain: subdomain,
-        offeringId,
-        expiresInSeconds: HOST_MINTED_TTL_SECONDS,
-      });
+      await prepareWithPlan(
+        {
+          organizationId: input.organizationId,
+          reservationId,
+          requestedSubdomain: subdomain,
+          expiresInSeconds: HOST_MINTED_TTL_SECONDS,
+        },
+        await plannedWithSelection({
+          organizationId: input.organizationId,
+          requestedSubdomain: subdomain,
+          selection,
+        }),
+      );
       return await authority.bind({
         organizationId: input.organizationId,
         reservationId,
@@ -2570,11 +2730,12 @@ function exactWorkerRelation(
   endpoint: ResourceWithRelations,
   workerResourceUid: string,
   workerName: string,
+  workerFormRef: TakoformV1Alpha3FormRef,
 ): boolean {
   const desiredWorker = endpoint.listing.resource.spec.worker;
   if (
     !isRecord(desiredWorker) ||
-    desiredWorker.apiVersion !== MODULE_WORKER_FORM_REF.apiVersion ||
+    desiredWorker.apiVersion !== workerFormRef.apiVersion ||
     desiredWorker.kind !== "ModuleWorker" ||
     desiredWorker.name !== workerName
   ) {
@@ -2586,10 +2747,10 @@ function exactWorkerRelation(
   return (
     relations.length === 1 &&
     relations[0]?.targetKind === "ModuleWorker" &&
-    relations[0].targetApiVersion === MODULE_WORKER_FORM_REF.apiVersion &&
+    relations[0].targetApiVersion === workerFormRef.apiVersion &&
     relations[0].targetUid === workerResourceUid &&
     relations[0].targetName === workerName &&
-    sameForm(relations[0].targetFormRef, MODULE_WORKER_FORM_REF)
+    sameForm(relations[0].targetFormRef, workerFormRef)
   );
 }
 

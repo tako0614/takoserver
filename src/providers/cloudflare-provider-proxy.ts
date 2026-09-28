@@ -13,6 +13,7 @@ import type {
   ProviderArtifactConsumption,
   ProviderExecutionAuthority,
   ProviderFailure,
+  ProviderMutationExecutionContext,
   ProviderNativeAbsence,
   ProviderNativeReadbackAuthority,
   ProviderNativeReadbackDescriptor,
@@ -33,6 +34,10 @@ import {
   canonicalWorkerEndpointOrigin,
   derivedProviderResourceName,
 } from "../provider-worker-endpoint-origin.ts";
+import type {
+  ProviderWorkerClassRuntime,
+  WorkerClassRuntimeContract,
+} from "../worker-class-runtime-port.ts";
 import {
   type CloudflareProviderMeterSourceDescriptor,
   cloudflareProviderMeterSourceForOfferingKind,
@@ -45,9 +50,11 @@ import {
 import {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
   type CloudflareProviderExecutorRpc,
 } from "./cloudflare-provider-executor-port.ts";
 import {
@@ -65,6 +72,8 @@ export interface CloudflareProviderProxyOptions {
   readonly managedBaseDomain: string;
   /** Static capability projection; no secret or lease value enters this object. */
   readonly runtimeInputs?: boolean;
+  /** Explicit installed software capability; never inferred from remote discovery or Offerings. */
+  readonly workerClassRuntimeContracts?: readonly WorkerClassRuntimeContract[];
   readonly binding: CloudflareProviderExecutorRpc;
 }
 
@@ -76,7 +85,9 @@ export interface CloudflareProviderProxyOptions {
  * runtime-input plaintext are resolved inside the executor from shared D1/R2.
  */
 export class CloudflareProviderProxy implements Provider {
+  readonly workerClassRuntime?: ProviderWorkerClassRuntime;
   readonly id: string;
+  readonly installedProviderInstallationRef: string;
   readonly offerings: readonly ProviderOffering[];
   readonly recoveryOfferings?: readonly ProviderOffering[];
   readonly nativeReadbackAuthorities?: readonly ProviderNativeReadbackAuthority[];
@@ -89,6 +100,7 @@ export class CloudflareProviderProxy implements Provider {
 
   constructor(options: CloudflareProviderProxyOptions) {
     this.id = options.id ?? "cloudflare";
+    this.installedProviderInstallationRef = options.providerInstallationId;
     this.offerings = structuredClone(options.offerings);
     if (options.recoveryOfferings) {
       this.recoveryOfferings = structuredClone(options.recoveryOfferings);
@@ -103,6 +115,29 @@ export class CloudflareProviderProxy implements Provider {
     }
     this.#binding = options.binding;
     this.#providerInstallationId = options.providerInstallationId;
+    if (options.workerClassRuntimeContracts?.length) {
+      const contracts = structuredClone(options.workerClassRuntimeContracts);
+      this.workerClassRuntime = {
+        contracts: structuredClone(contracts),
+        inspect: async (input) => {
+          try {
+            if (
+              input.providerInstallationRef !== this.#providerInstallationId ||
+              !contracts.some(
+                (contract) => canonicalJson(contract) === canonicalJson(input.contract),
+              )
+            )
+              return "unavailable";
+            const verdict: unknown = await this.#binding.inspectWorkerClass?.(
+              structuredClone(input),
+            );
+            return verdict === "valid" || verdict === "invalid" ? verdict : "unavailable";
+          } catch {
+            return "unavailable";
+          }
+        },
+      };
+    }
     const managedBaseDomain = normalizeManagedBaseDomain(options.managedBaseDomain);
     this.workerEndpointOriginReservations = {
       derive: async ({ requestedSubdomain }) => {
@@ -125,8 +160,39 @@ export class CloudflareProviderProxy implements Provider {
     };
   }
 
-  async apply(input: ApplyInput): Promise<ProviderTicket> {
+  async apply(
+    input: ApplyInput,
+    executionContext?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("apply", input, this.#providerInstallationId);
+    const prospectiveDeploymentId = executionContext?.prospectiveDeploymentId;
+    if (executionContext !== undefined) {
+      if (
+        input.previous !== undefined ||
+        input.identity.incarnationId !== undefined ||
+        input.identity.generation !== undefined ||
+        input.operationMode !== "initial" ||
+        prospectiveDeploymentId !== `dep_${input.operationId}`
+      )
+        return failed("unavailable", "Provider executor context does not match create", true);
+      const binding = this.#binding;
+      if (!binding.applyWithExecutionContextV1)
+        return failed("unavailable", "Provider executor does not support create context", true);
+      let result: Awaited<ReturnType<typeof binding.applyWithExecutionContextV1>>;
+      try {
+        // RPC method properties are remote members, not Function.prototype helpers.
+        result = await binding.applyWithExecutionContextV1({
+          schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+          input,
+          prospectiveDeploymentId,
+        });
+      } catch {
+        // A Worker RPC stub may appear to expose a method that the older peer
+        // does not implement. No legacy replay or no-effect proof is safe.
+        return failed("unavailable", "Provider executor create context RPC is unavailable", true);
+      }
+      return restoreInitialMutationResult(providerRpcResult(result), context);
+    }
     return restoreInitialMutationResult(
       providerRpcResult(await this.#binding.apply(input)),
       context,
@@ -139,11 +205,51 @@ export class CloudflareProviderProxy implements Provider {
     );
   }
 
-  async convergeApply(input: ApplyInput): Promise<ProviderTicket> {
+  async convergeApply(
+    input: ApplyInput,
+    executionContext?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket> {
     const context = {
       ...snapshotAdoptionRecoveryContext(input, this.#providerInstallationId),
       hasPrevious: input.previous !== undefined,
     };
+    const prospectiveDeploymentId = executionContext?.prospectiveDeploymentId;
+    if (executionContext !== undefined) {
+      if (
+        input.previous !== undefined ||
+        input.identity.incarnationId !== undefined ||
+        input.identity.generation !== undefined ||
+        input.operationMode === "initial" ||
+        prospectiveDeploymentId !== `dep_${input.operationId}`
+      )
+        return failed(
+          "unavailable",
+          "Provider executor context does not match create recovery",
+          true,
+        );
+      const binding = this.#binding;
+      if (!binding.convergeApplyWithExecutionContextV1)
+        return failed(
+          "unavailable",
+          "Provider executor does not support create recovery context",
+          true,
+        );
+      let result: Awaited<ReturnType<typeof binding.convergeApplyWithExecutionContextV1>>;
+      try {
+        result = await binding.convergeApplyWithExecutionContextV1({
+          schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+          input,
+          prospectiveDeploymentId,
+        });
+      } catch {
+        return failed(
+          "unavailable",
+          "Provider executor create recovery context RPC is unavailable",
+          true,
+        );
+      }
+      return restoreApplyConvergenceResult(providerRpcResult(result), context);
+    }
     return restoreApplyConvergenceResult(
       providerRpcResult(await this.#binding.convergeApply(input)),
       context,
@@ -175,14 +281,16 @@ export class CloudflareProviderProxy implements Provider {
           rawPhaseValue === "succeeded" ||
           rawPhaseValue === "failed" ||
           rawPhaseValue === "running" ||
-          rawPhaseValue === "unsupported"
+          rawPhaseValue === "unsupported" ||
+          rawPhaseValue === "compensation_required"
             ? rawPhaseValue
             : "unknown";
         const restoredPhase =
           restoredPhaseValue === "succeeded" ||
           restoredPhaseValue === "failed" ||
           restoredPhaseValue === "running" ||
-          restoredPhaseValue === "unsupported"
+          restoredPhaseValue === "unsupported" ||
+          restoredPhaseValue === "compensation_required"
             ? restoredPhaseValue
             : "unknown";
         console.error(
@@ -494,6 +602,7 @@ function restoreInitialMutationResult(
   if (
     Object.hasOwn(value, "executorApplyNoEffect") ||
     Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyCompensationRequired") ||
     Object.hasOwn(value, "executorApplyCompensation") ||
     Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
     Object.hasOwn(value, "executorApplyAbort")
@@ -585,6 +694,7 @@ function restoreAdoptionRecoveryResult(
   if (
     Object.hasOwn(value, "executorApplyNoEffect") ||
     Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+    Object.hasOwn(value, "executorApplyCompensationRequired") ||
     Object.hasOwn(value, "executorApplyCompensation") ||
     Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
     Object.hasOwn(value, "executorApplyAbort")
@@ -728,6 +838,48 @@ function restoreApplyNoEffectConclusionResult(
   context: ApplyNoEffectContext,
 ): ProviderApplyNoEffectConclusionResult {
   if (typeof value !== "object" || value === null) return value as ProviderTicket;
+  if (Object.hasOwn(value, "executorApplyCompensationRequired")) {
+    const nominated = maybeExactRecord(value, ["phase", "executorApplyCompensationRequired"]);
+    const evidence = nominated
+      ? maybeExactRecord(nominated.executorApplyCompensationRequired, [
+          "schema",
+          "action",
+          "operationId",
+          "providerInstallationRef",
+          "executionAuthority",
+        ])
+      : null;
+    const authority = evidence
+      ? maybeExactRecord(evidence.executionAuthority, EXECUTION_AUTHORITY_KEYS)
+      : null;
+    if (
+      nominated?.phase === "compensation_required" &&
+      evidence?.schema === CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA &&
+      evidence.action === "nominateCompensateApply" &&
+      evidence.operationId === context.operationId &&
+      evidence.providerInstallationRef === context.providerInstallationId &&
+      context.selectionMatchesInstallation &&
+      context.executionAuthority &&
+      context.executionAuthority.tenantId === context.tenantId &&
+      context.executionAuthority.resourceUid === context.resourceUid &&
+      authority?.tenantId === context.executionAuthority.tenantId &&
+      authority.resourceUid === context.executionAuthority.resourceUid &&
+      authority.leaseToken === context.executionAuthority.leaseToken &&
+      authority.fingerprint === context.executionAuthority.fingerprint
+    ) {
+      return {
+        phase: "compensation_required",
+        operationId: context.operationId,
+        providerInstallationRef: context.providerInstallationId,
+        executionAuthority: { ...context.executionAuthority },
+      };
+    }
+    return failed(
+      "unavailable",
+      "Provider executor returned invalid compensation nomination",
+      true,
+    );
+  }
   if (Object.hasOwn(value, "executorApplyNoEffectUnsupported")) {
     const unsupported = maybeExactRecord(value, ["phase", "executorApplyNoEffectUnsupported"]);
     const evidence = unsupported
@@ -768,7 +920,8 @@ function restoreApplyNoEffectConclusionResult(
   if (!Object.hasOwn(value, "executorApplyNoEffect")) {
     if (
       Object.hasOwn(value, "phase") &&
-      (value as { readonly phase?: unknown }).phase === "unsupported"
+      ((value as { readonly phase?: unknown }).phase === "unsupported" ||
+        (value as { readonly phase?: unknown }).phase === "compensation_required")
     ) {
       return failed(
         "unavailable",
@@ -928,6 +1081,7 @@ function rejectUnexpectedExecutorEvidence(value: unknown): ProviderTicket {
     value !== null &&
     (Object.hasOwn(value, "executorApplyNoEffect") ||
       Object.hasOwn(value, "executorApplyNoEffectUnsupported") ||
+      Object.hasOwn(value, "executorApplyCompensationRequired") ||
       Object.hasOwn(value, "executorApplyCompensation") ||
       Object.hasOwn(value, "executorApplyCompensationUnsupported") ||
       Object.hasOwn(value, "executorApplyAbort") ||

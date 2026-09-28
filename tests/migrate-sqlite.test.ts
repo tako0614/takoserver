@@ -42,6 +42,10 @@ const TAKOFORM_OPERATION_GENERATION = "0060_takoform_operation_generation.sql";
 const TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY = "0061_takoform_accepted_authority_continuity.sql";
 const TAKOFORM_IMPORT_PROVIDER_SELECTION = "0062_takoform_import_provider_selection.sql";
 const CLOUDFLARE_MANAGED_QUEUE_RETIREMENT = "0063_cloudflare_managed_queue_retirement.sql";
+const CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS = "0064_cloudflare_managed_actor_owner_claims.sql";
+const WORKER_RUNTIME_INPUT_LEASE_GENERATION = "0065_worker_runtime_input_lease_generation.sql";
+const CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS =
+  "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -74,6 +78,9 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
   TAKOFORM_IMPORT_PROVIDER_SELECTION,
   CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+  CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+  WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+  CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -446,6 +453,9 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
       CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+      CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+      WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+      CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -720,6 +730,9 @@ describe("bringing a local database up to date", () => {
         TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
         TAKOFORM_IMPORT_PROVIDER_SELECTION,
         CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+        CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+        WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+        CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1287,6 +1300,9 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
       CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+      CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+      WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+      CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1431,6 +1447,9 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
       CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+      CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+      WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+      CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
     ]);
     expect(
       database
@@ -2382,6 +2401,9 @@ describe("bringing a local database up to date", () => {
       TAKOFORM_ACCEPTED_AUTHORITY_CONTINUITY,
       TAKOFORM_IMPORT_PROVIDER_SELECTION,
       CLOUDFLARE_MANAGED_QUEUE_RETIREMENT,
+      CLOUDFLARE_MANAGED_ACTOR_OWNER_CLAIMS,
+      WORKER_RUNTIME_INPUT_LEASE_GENERATION,
+      CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
     ]);
     expect(
       database

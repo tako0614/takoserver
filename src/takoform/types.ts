@@ -1,7 +1,9 @@
 import type { TakoformV1Alpha3FormRef } from "../form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../interface-ref.ts";
 import type { JsonObject } from "../ports.ts";
+import type { ProviderApplyCompensationNomination } from "../provider-port.ts";
 import type { ProviderRuntimeInputPublicApply } from "../provider-runtime-input-port.ts";
+import type { RequestLifetime } from "../request-lifetime.ts";
 import type { ResourceDeploymentMutation } from "../resource-deployments.ts";
 import type { StandardServiceProjection, StandardServiceSlot } from "../standard-service-port.ts";
 import type { TakoformApplySelection } from "./apply-selection.ts";
@@ -50,6 +52,8 @@ export interface InstalledTakoformForm {
   };
   /** Explicit family adapter for a Form-provided worker class Interface. */
   readonly workerClassRuntime?: {
+    /** Explicit executable ABI identity; absent on historical inferred adapters. */
+    readonly runtimeClassRef?: TakoformInterfaceRef;
     readonly providedInterface: string;
     readonly className: `/${string}`;
     readonly workerRelation: `/${string}`;
@@ -246,6 +250,7 @@ export interface TakoformStandardServiceResolver {
 }
 
 export interface TakoformResourceDriver {
+  readonly workerClassRuntime?: import("../worker-class-runtime-port.ts").WorkerClassRuntime;
   readonly runtimeInputPolicy?: TakoformRuntimeInputPolicy;
   /**
    * Pure, bounded placement decision persisted by the Host before callbacks or
@@ -281,7 +286,8 @@ export interface TakoformResourceDriver {
   /**
    * Attempts only to close an already-dispatched accepted create as no-effect.
    * Implementations return no receipt: conclusive proof is raised as the
-   * driver's whole-operation refusal, while every other result remains held.
+   * driver's whole-operation refusal. An exact pre-compensation nomination
+   * only permits the Host to consider its separate compensation checks.
    */
   readonly concludeApplyNoEffect?: (input: {
     readonly operationId: string;
@@ -293,7 +299,7 @@ export interface TakoformResourceDriver {
     readonly space: string;
     readonly selection: TakoformApplySelection;
     readonly commercialAuthority?: TakoformCommercialAuthority;
-  }) => Promise<void>;
+  }) => Promise<undefined | ProviderApplyCompensationNomination>;
   /**
    * Compensates provider effects for one exact accepted create. This has the
    * same closed Host authority as no-effect conclusion, but it never proves
@@ -528,7 +534,7 @@ export interface TakoformStoredResource {
 }
 
 export interface TakoformHost {
-  handle(request: Request): Promise<Response | null>;
+  handle(request: Request, lifetime?: RequestLifetime): Promise<Response | null>;
   /** Route-less Host maintenance; never exposed through the public API. */
   readonly maintenance?: {
     drainProviderRepairs(limit?: number): Promise<{
@@ -588,11 +594,10 @@ export class TakoformHostError extends Error {
  * "this document is wrong" — malformed weights, a duplicated binding name, a
  * relation the document does not declare — and that is a fact about the
  * request, so the stored answer stays the answer for as long as the request is
- * byte-identical. It also says "the ModuleWorker this endpoint names has no
- * WorkerDeployment", "another resource already claims this hostname", "a second
+ * byte-identical. It also says "another resource already claims this hostname", "a second
  * deployment already holds this Worker" — and none of those is a fact about the
  * request at all. Each is a fact about a *neighbour*, which the operator cures
- * by adding the deployment, releasing the hostname, or deleting the other
+ * by releasing the hostname or deleting the other
  * deployment, without touching one byte of this resource's plan.
  *
  * The released provider derives its idempotency key from that plan, so the

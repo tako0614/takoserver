@@ -30,7 +30,7 @@ export {
 
 export { createCloudflareProviderSurface } from "./cloudflare-provider-surface.ts";
 export { parseWorkerCron, type WorkerCronSchedule } from "./cron.ts";
-export { buildEdgeForms } from "./edge-forms.ts";
+export { buildEdgeForms, edgeProviderOffering } from "./edge-forms.ts";
 export { isEdgeFormsApiVersion } from "./form-ref.ts";
 export {
   HOSTED_EDGE_IDENTITY_CLASSES,
@@ -65,6 +65,7 @@ export {
   PROVIDER_READBACK_API_VERSION,
   type Provider,
   type ProviderApplyCompensationInput,
+  type ProviderApplyCompensationNomination,
   type ProviderApplyCompensationResult,
   type ProviderApplyNoEffectConclusionInput,
   type ProviderApplyNoEffectConclusionResult,
@@ -72,6 +73,7 @@ export {
   type ProviderArtifactConsumptionInput,
   type ProviderExecutionAuthority,
   type ProviderFailure,
+  type ProviderMutationExecutionContext,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
@@ -132,13 +134,16 @@ export type {
   CloudflareProviderExecutorAdoptionAbortEvidence,
   CloudflareProviderExecutorApplyAbortEvidence,
   CloudflareProviderExecutorApplyCompensationEvidence,
+  CloudflareProviderExecutorApplyCompensationRequiredEvidence,
   CloudflareProviderExecutorApplyCompensationUnsupportedEvidence,
   CloudflareProviderExecutorApplyNoEffectEvidence,
   CloudflareProviderExecutorApplyNoEffectUnsupportedEvidence,
   CloudflareProviderExecutorNoMutationEvidence,
   CloudflareProviderExecutorRpc,
   CloudflareProviderInitialMutationResult,
+  CloudflareProviderInspectWorkerClassInput,
   CloudflareProviderMeterReadInput,
+  CloudflareProviderMutationContextV1,
   CloudflareProviderObserveInput,
   CloudflareProviderPollInput,
   CloudflareProviderSqliteMigrationApplyInput,
@@ -149,9 +154,11 @@ export type {
 export {
   CLOUDFLARE_PROVIDER_EXECUTOR_ADOPTION_ABORT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_ABORT_SCHEMA,
+  CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_REQUIRED_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CloudflareProviderProxy,
@@ -246,10 +253,22 @@ export { createD1Sql } from "./sql-d1.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 export {
+  forwardTakoformCandidates,
+  selectTakoformCandidates,
+} from "./takoform/forward-candidates.ts";
+export {
   MAXIMUM_REQUEST_BODY_BYTES,
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "./takoform/limits.ts";
+export {
+  createTakoformDeleteSubeffectStore,
+  type TakoformDeleteSubeffectConclusion,
+  type TakoformDeleteSubeffectInput,
+  type TakoformDeleteSubeffectIssue,
+  type TakoformDeleteSubeffectIssueInput,
+  type TakoformDeleteSubeffectRead,
+} from "./takoform/provider-delete-subeffect.ts";
 export { isSpaceId } from "./takoform/space-id.ts";
 export {
   parseVectorIndexConfig,
@@ -263,4 +282,11 @@ export {
   type VectorIndexStore,
   VectorIndexStoreError,
 } from "./vector-index-store.ts";
+export type {
+  ProviderWorkerClassRuntime,
+  WorkerClassInspectionInput,
+  WorkerClassInspectionVerdict,
+  WorkerClassResourceIdentity,
+  WorkerClassRuntimeContract,
+} from "./worker-class-runtime-port.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";
