@@ -19,12 +19,20 @@ package digest; their existing read/update/delete/observe operations cannot
 inherit a forward class ABI. DurableWorkflow remains unimplemented in the
 managed Provider and receives no handler entry.
 
-This is a source qualification path, not a production toggle. The default
-public entrypoint and publication-verifying admission path remain unchanged.
+This is a source qualification path, not a production toggle. The public
+entrypoint defaults to the released Forms. Setting the exact
+`TAKOSERVER_FORM_SOURCE_CANDIDATE=actor-forward` selects the unpublished Forms
+and Bindings in that entrypoint, retains displaced identities for historical
+Host management and provider recovery, and registers only the exact selected
+Actor class ABI with its credential-free provider proxy. Unknown values refuse
+startup. A Worker with
+an embedded public Form implementation identity refuses the source candidate:
+the released-Core admission closure cannot vouch for its newer package bytes.
+The publication-verifying admission path remains unchanged and OFF for Actor.
 The private managed source candidate consumes the exact selection through its
 existing runtime configuration, but the official commercial composition still
-lacks an Actor identity class and meter source. ActorNamespace is an identity,
-not a relation that inherits a ModuleWorker price. Qualification fixtures may
+lacks an Actor identity class and settled retail meter source. ActorNamespace
+is an identity, not a relation that inherits a ModuleWorker price. Qualification fixtures may
 inject an explicit technical Actor Offering; that does not establish resale,
 pricing, metering, native qualification, publication or activation.
 
@@ -33,6 +41,18 @@ The generic identity/meter schema is owned by `hosted-edge-supplies.ts` and
 consumes that schema. A future additive Actor supply
 extension needs its own truthful meter source and operator-owned terms and
 price inputs. It must not reuse ModuleWorker billing by default.
+
+The remaining public Host cutover is explicit: add an Actor identity class to
+the common reviewed-supply parser, with a settled Actor `MeterSource` (the
+current `cloudflare-actor-meter-source.ts` returns only `unfinalized`
+observations); compose an exact operator-owned Supply Contract and price plan
+through the existing Catalog Compiler; qualify the private executor's Actor
+create/read/update/delete/import and class inspection against that exact
+Offering; then publish and verify the newer Form/Binding closure and derive a
+matching public Worker implementation identity before enabling admission.
+Finally exercise the Host Resource and bound Actor call end to end. None of
+these steps follows from selecting source bytes or receiving a provider RPC
+verdict, and the current parser continues to reject Actor supply.
 
 ## Response implementation
 
