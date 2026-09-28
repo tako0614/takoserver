@@ -348,3 +348,53 @@ let stored=null;try{stored=localStorage.getItem("takoserver.locale")}catch{}setL
 </html>
 `;
 }
+
+/**
+ * The 404 in the same machine room — same field and accents, a smaller
+ * stage: the mark, the code, one line, the way home. Served by the
+ * Pages host for paths that are not the landing page.
+ */
+export function notFoundHtml(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 | Takoserver</title>
+<meta name="robots" content="noindex">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 34 34'%3E%3Crect width='34' height='34' fill='%23b0301f'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #17100f; --panel: #1f1613; --ink-1: #f2ede8; --ink-2: #b8ada6; --ink-3: #8a7c74;
+  --line-1: #3a2c26; --accent: #e0533c; --mark-face: #0b0b0c;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px;
+  background: var(--bg); color: var(--ink-1);
+  font-family: ui-sans-serif, system-ui, "Hiragino Kaku Gothic ProN", "Yu Gothic UI", sans-serif;
+}
+main { max-width: 26rem; }
+.mark { display: block; margin-bottom: 20px; }
+.code { margin: 0; color: var(--ink-3); font: 12px/1.4 var(--mono); letter-spacing: .08em; }
+h1 { margin: 6px 0 10px; font-size: 22px; font-weight: 600; }
+p { margin: 0; color: var(--ink-2); font-size: 14px; line-height: 1.7; }
+a { display: inline-block; margin-top: 18px; color: var(--ink-1); font: 600 13px var(--mono); text-decoration: none; }
+a::before { content: "\\2192 "; color: var(--accent); }
+a:hover { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+${takoMark(34, "mark")}
+<p class="code">404</p>
+<h1>Not found</h1>
+<p>The path does not name a page on this machine.</p>
+<a href="/">takoserver.com</a>
+</main>
+</body>
+</html>
+`;
+}
