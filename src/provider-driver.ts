@@ -10,7 +10,11 @@ import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Ledger, LedgerHeldCharge } from "./ledger.ts";
 import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
-import { createSoldProviderPlacementSelector } from "./provider-placement.ts";
+import {
+  createNoncommercialProviderPlacementSelector,
+  createSoldProviderPlacementSelector,
+  type NoncommercialPlacementComposition,
+} from "./provider-placement.ts";
 import {
   type Provider,
   type ProviderApplyCompensationNomination,
@@ -299,25 +303,7 @@ export interface CreateProviderDriverOptions {
    * exist. Removing both this opt-in and that identity is a new, unqualified
    * operator trust-root change, not a supported fallback for old resources.
    */
-  readonly noncommercialPlacement?: {
-    /** The same operator composition that constructed the Provider instance. */
-    readonly installations: readonly {
-      readonly provider: Provider;
-      readonly providerInstallationRef: string;
-    }[];
-    resolve(input: {
-      readonly tenantId: string;
-      readonly space: string;
-      readonly form: InstalledTakoformForm["identity"];
-    }): Promise<{
-      readonly tenantId: string;
-      readonly space: string;
-      readonly form: InstalledTakoformForm["identity"];
-      readonly providerPackRef: string;
-      readonly providerInstallationRef: string;
-      readonly offeringId: string;
-    } | null>;
-  };
+  readonly noncommercialPlacement?: NoncommercialPlacementComposition;
   readonly ledger: Ledger;
   readonly deployments: ResourceDeploymentStore;
   /** Host-private reservation lifecycle. Opaque refs never cross the Provider port. */
@@ -374,6 +360,13 @@ export function createProviderDriver(
   };
   const packsById = new Map((options.providerPacks ?? []).map((pack) => [pack.id, pack]));
   const soldPlacements = createSoldProviderPlacementSelector({ providers, catalog });
+  const noncommercialPlacements = options.noncommercialPlacement
+    ? createNoncommercialProviderPlacementSelector({
+        providers,
+        catalog,
+        composition: options.noncommercialPlacement,
+      })
+    : undefined;
   for (const provider of providers) {
     validateMaximumRuntimeInputBindings(provider.runtimeInputCapabilities?.maximumBindings ?? 0);
   }
@@ -420,42 +413,8 @@ export function createProviderDriver(
     readonly space: string;
     readonly form: InstalledTakoformForm;
   }) => {
-    const placement = await options.noncommercialPlacement?.resolve({
-      tenantId: input.tenantId,
-      space: input.space,
-      form: structuredClone(input.form.identity),
-    });
-    if (!placement) throw new TakoformHostError("unsupported_capability", 422);
-    const provider = byId.get(placement.providerPackRef);
-    const offerings = provider?.offerings.filter(
-      (candidate) =>
-        candidate.id === placement.offeringId &&
-        sameForm(candidate.form, input.form.identity.formRef),
-    );
-    if (
-      !input.form.identity.packageDigest ||
-      placement.tenantId !== input.tenantId ||
-      placement.space !== input.space ||
-      canonicalJson(placement.form) !== canonicalJson(input.form.identity) ||
-      !placement.providerInstallationRef ||
-      catalog.hasOfferingId(placement.offeringId) ||
-      !provider ||
-      provider.installedProviderInstallationRef !== placement.providerInstallationRef ||
-      offerings?.length !== 1 ||
-      !offerings[0]?.capabilities.includes("create") ||
-      options.noncommercialPlacement?.installations.filter(
-        (installation) =>
-          installation.provider === provider &&
-          installation.providerInstallationRef === placement.providerInstallationRef,
-      ).length !== 1
-    ) {
-      throw new TakoformHostError("unsupported_capability", 422);
-    }
-    return {
-      provider,
-      offering: offerings[0],
-      providerInstallationRef: placement.providerInstallationRef,
-    };
+    if (!noncommercialPlacements) throw new TakoformHostError("unsupported_capability", 422);
+    return await noncommercialPlacements.select(input);
   };
 
   const providerRelations = async (

@@ -11,12 +11,21 @@ import {
   createWorkerEndpointOriginReservations,
   type Offering,
 } from "../src/index.ts";
+import { canonicalJson } from "../src/json.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createProviderDriver } from "../src/provider-driver.ts";
+import type { NoncommercialPlacementComposition } from "../src/provider-placement.ts";
 import type { ApplyInput, Provider, ProviderOffering } from "../src/provider-port.ts";
 import { succeeded } from "../src/provider-port.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createTakoformHost } from "../src/takoform/host.ts";
+import type {
+  TakoformAuthorityGrant,
+  TakoformHostAuthority,
+} from "../src/takoform/host-authority.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
+import type { InstalledTakoformForm } from "../src/takoform/types.ts";
 import { createWorkerEndpointOriginReservationBindingHandle } from "../src/worker-endpoint-origin-reservations.ts";
 import { applyWithSelection } from "./helpers/apply-with-selection.ts";
 
@@ -179,6 +188,8 @@ function fixture(
     readonly sql?: ReturnType<typeof createReservationV2Sql>;
     /** Replaces the fake provider's mutation, for driver-level cases. */
     readonly apply?: (input: ApplyInput) => ReturnType<Provider["apply"]>;
+    readonly noncommercialResolve?: NoncommercialPlacementComposition["resolve"];
+    readonly installedForms?: readonly InstalledTakoformForm[];
   } = {},
 ) {
   const sql = input.sql ?? createReservationV2Sql();
@@ -186,6 +197,7 @@ function fixture(
   const deriveCalls: { readonly tenantRef: string; readonly requestedSubdomain: string }[] = [];
   const base = new FakeProvider({ id: "fake", offerings: input.technical ?? [technical()] });
   const provider = Object.assign(base, {
+    ...(input.noncommercialResolve ? { installedProviderInstallationRef: "fake.primary" } : {}),
     ...(input.apply ? { apply: input.apply } : {}),
     workerEndpointOriginReservations: {
       ...(input.publishedScheme ? { publishedScheme: input.publishedScheme } : {}),
@@ -227,6 +239,12 @@ function fixture(
     },
   }) satisfies Provider;
   const catalog = createCatalog(input.offerings ?? [sold()]);
+  const noncommercialPlacement = input.noncommercialResolve
+    ? {
+        installations: [{ provider, providerInstallationRef: "fake.primary" }],
+        resolve: input.noncommercialResolve,
+      }
+    : undefined;
   const authority = createWorkerEndpointOriginReservations({
     sql,
     clock: () => current,
@@ -234,12 +252,21 @@ function fixture(
     providers: [provider],
     resources: createTakoformStore(sql, () => current),
     deployments: createResourceDeploymentStore(sql, () => current),
+    ...(noncommercialPlacement
+      ? {
+          noncommercialPlacement: {
+            composition: noncommercialPlacement,
+            installedForms: input.installedForms ?? STABLE_PRODUCTION_TAKOFORM_CATALOG.forms,
+          },
+        }
+      : {}),
   });
   return {
     sql,
     authority,
     catalog,
     provider,
+    noncommercialPlacement,
     clock: () => current,
     deriveCalls,
     advance(milliseconds: number) {
@@ -1816,6 +1843,7 @@ async function seedWorker(
     workerName: TARGET.workerName,
     workerResourceUid: "uid-worker-01",
   },
+  formIdentity?: InstalledTakoformForm["identity"],
 ): Promise<void> {
   await seedResource(sql, {
     organizationId: identity.organizationId,
@@ -1824,6 +1852,7 @@ async function seedWorker(
     kind: "ModuleWorker",
     name: identity.workerName,
     form: FORM,
+    ...(formIdentity ? { formIdentity } : {}),
     outputs: {},
     relations: [],
     deployment: {
@@ -1867,8 +1896,8 @@ async function seedServingDeployment(
     await sql.run(
       `INSERT INTO tf_resources
          (tenant_id, space, api_version, kind, name, uid, generation, revision,
-          resource_json, relations_json, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, '1', '1', ?, ?, ?)`,
+       resource_json, relations_json, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, '1', '1', ?, ?, ?)`,
       [
         identity.organizationId,
         identity.space,
@@ -1977,6 +2006,7 @@ async function seedResource(
     readonly name: string;
     readonly workerName?: string;
     readonly form: TakoformV1Alpha3FormRef;
+    readonly formIdentity?: InstalledTakoformForm["identity"];
     readonly outputs: Record<string, string>;
     readonly relations: readonly Record<string, unknown>[];
     readonly deployment: {
@@ -1990,7 +2020,7 @@ async function seedResource(
   const resource = {
     apiVersion: input.form.apiVersion,
     kind: input.kind,
-    form: { formRef: input.form },
+    form: input.formIdentity ?? { formRef: input.form },
     metadata: {
       name: input.name,
       space: input.space,
@@ -2024,8 +2054,8 @@ async function seedResource(
   await sql.run(
     `INSERT INTO tf_resources
        (tenant_id, space, api_version, kind, name, uid, generation, revision,
-        resource_json, relations_json, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, '1', '1', ?, ?, ?)`,
+        resource_json, relations_json, package_digest, implementation_digest, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, '1', '1', ?, ?, ?, ?, ?)`,
     [
       input.organizationId,
       input.space,
@@ -2035,6 +2065,8 @@ async function seedResource(
       input.uid,
       JSON.stringify(resource),
       JSON.stringify(input.relations),
+      input.formIdentity?.packageDigest ?? null,
+      input.formIdentity?.implementationDigest ?? null,
       timestamp,
     ],
   );
@@ -2068,7 +2100,7 @@ async function seedResource(
       input.form.apiVersion,
       input.kind,
       input.name,
-      JSON.stringify(input.form),
+      canonicalJson(input.form),
       timestamp,
       timestamp,
     ],
@@ -2203,6 +2235,352 @@ for (const { label, space, supplied } of [
     ]);
   });
 }
+
+test("public Host creates a noncommercial WorkerEndpoint with a Host-minted exact Worker origin", async () => {
+  const workerFormBase = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!workerFormBase) throw new Error("ModuleWorker Form missing");
+  const workerForm = {
+    ...workerFormBase,
+    identity: {
+      ...workerFormBase.identity,
+      implementationDigest: `sha256:${"a".repeat(64)}` as const,
+    },
+  };
+  const endpointFormBase = endpointFormDefinition();
+  const endpointForm = {
+    ...endpointFormBase,
+    identity: {
+      ...endpointFormBase.identity,
+      implementationDigest: `sha256:${"b".repeat(64)}` as const,
+    },
+  };
+  const resolve: NoncommercialPlacementComposition["resolve"] = async (input) => ({
+    ...input,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: "worker.module.technical",
+  });
+  const applied: ApplyInput[] = [];
+  const harness = fixture({
+    offerings: [],
+    technical: [
+      technical("worker.module.technical"),
+      technicalEndpointOffering("worker.endpoint.technical"),
+    ],
+    noncommercialResolve: resolve,
+    installedForms: [workerForm, endpointForm],
+    hostMintedSubdomain: "sw-community",
+    apply: async (input) => {
+      applied.push(input);
+      const origin = input.workerEndpointOriginAssignment?.canonicalPublicOrigin ?? "";
+      return succeeded({
+        nativeId: `endpoint:${input.identity.uid}`,
+        observed: { assigned: true },
+        outputs: { hostname: new URL(origin).hostname, url: `${origin}/` },
+      });
+    },
+  });
+  await seedWorker(harness.sql, undefined, workerForm.identity);
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.technical", "org_01", "uid-worker-01"],
+  );
+  const driver = createProviderDriver({
+    providers: [harness.provider],
+    catalog: harness.catalog,
+    ledger: createLedger(harness.sql, harness.clock),
+    deployments: createResourceDeploymentStore(harness.sql, harness.clock),
+    originReservations: harness.authority,
+    ...(harness.noncommercialPlacement
+      ? { noncommercialPlacement: harness.noncommercialPlacement }
+      : {}),
+  });
+  const forms = [workerForm, endpointForm];
+  // Admission is independently tested; this fixture grants only these exact installed Forms.
+  const authority: TakoformHostAuthority = {
+    async catalog() {
+      return {
+        forms: forms.map((form) => ({
+          form,
+          availability: { executable: true, activated: true, availableToPrincipal: true },
+          supported: true,
+          headDigest: `sha256:${"a".repeat(64)}` as const,
+        })),
+        bindings: [],
+      };
+    },
+    async supportCatalog() {
+      return await this.catalog({ tenantId: "org_01", principalId: "test", space: "default" });
+    },
+    async authorizeMutation(input) {
+      const form = forms.find(
+        (candidate) => JSON.stringify(candidate.identity.formRef) === JSON.stringify(input.formRef),
+      );
+      if (!form) throw new Error("unknown Form");
+      return { form } as unknown as TakoformAuthorityGrant;
+    },
+    async authorizeRetained(input) {
+      const form = forms.find(
+        (candidate) => JSON.stringify(candidate.identity) === JSON.stringify(input.resource.form),
+      );
+      if (!form) throw new Error("unknown retained Form");
+      return { form } as unknown as Awaited<ReturnType<TakoformHostAuthority["authorizeRetained"]>>;
+    },
+  };
+  const host = createTakoformHost({
+    sql: harness.sql,
+    objects: createMemoryObjectStore(),
+    clock: harness.clock,
+    authenticate: async () => ({ tenantId: "org_01", principalId: "test" }),
+    forms,
+    driver,
+    authority,
+  });
+  const desired = {
+    apiVersion: ENDPOINT_FORM.apiVersion,
+    kind: "WorkerEndpoint",
+    form: { formRef: ENDPOINT_FORM },
+    metadata: { name: TARGET.endpointName, space: TARGET.space },
+    spec: {
+      worker: { apiVersion: FORM.apiVersion, kind: "ModuleWorker", name: TARGET.workerName },
+    },
+  };
+  const lane = "/apis/forms.takoform.com/v1";
+  const send = async (path: string, init: RequestInit) =>
+    await host.handle(
+      new Request(`https://host.test${path}`, {
+        ...init,
+        headers: {
+          authorization: "Bearer test",
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers,
+        },
+      }),
+    );
+  const prepared = await send(`${lane}/resources/prepare`, {
+    method: "POST",
+    body: JSON.stringify(desired),
+  });
+  expect(prepared?.status).toBe(200);
+  if (!prepared) throw new Error("Host did not answer prepare");
+  const review = ((await prepared.json()) as { review: unknown }).review;
+  const response = await send(
+    `${lane}/resources/${ENDPOINT_FORM.apiVersion}/WorkerEndpoint/${TARGET.endpointName}`,
+    {
+      method: "PUT",
+      headers: { "if-none-match": "*", "idempotency-key": "noncommercial-endpoint" },
+      body: JSON.stringify({ ...desired, review }),
+    },
+  );
+  expect(response?.status).toBe(201);
+  expect(applied).toHaveLength(1);
+  expect(applied[0]?.workerEndpointOriginAssignment?.canonicalPublicOrigin).toBe(
+    "https://sw-community.org-01.workers.test",
+  );
+  expect(
+    await harness.sql.query(`SELECT offering_id, state FROM worker_endpoint_origin_reservations`),
+  ).toEqual([{ offering_id: "worker.module.technical", state: "activated" }]);
+  const reservation = (
+    await harness.sql.query(`SELECT reservation_id FROM worker_endpoint_origin_reservations`)
+  )[0];
+  expect(
+    await harness.authority.inspectBound({
+      organizationId: "org_01",
+      reservationId: String(reservation?.reservation_id),
+      space: TARGET.space,
+      workerName: TARGET.workerName,
+      workerResourceUid: "uid-worker-01",
+    }),
+  ).toMatchObject({ offeringId: "worker.module.technical", status: "activated" });
+  expect((await createLedger(harness.sql, harness.clock).wallet("org_01")).entries).toEqual([]);
+  const created = (await response?.json()) as { metadata: { uid: string; generation: string } };
+  const query = new URLSearchParams({
+    space: TARGET.space,
+    definitionVersion: ENDPOINT_FORM.definitionVersion,
+    schemaDigest: ENDPOINT_FORM.schemaDigest,
+  });
+  const resourcePath = `${lane}/resources/${ENDPOINT_FORM.apiVersion}/WorkerEndpoint/${TARGET.endpointName}?${query}`;
+  const read = await send(resourcePath, { method: "GET" });
+  expect(read?.status).toBe(200);
+  const removed = await send(resourcePath, {
+    method: "DELETE",
+    headers: {
+      "idempotency-key": "noncommercial-endpoint-delete",
+      "takoform-expected-generation": created.metadata.generation,
+    },
+  });
+  expect(removed?.status).toBe(204);
+  expect(await harness.authority.read("org_01", String(reservation?.reservation_id))).toMatchObject(
+    { status: "bound" },
+  );
+});
+
+test("Host mint refuses absent or wrong noncommercial Worker placement without a reservation", async () => {
+  const base = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!base) throw new Error("ModuleWorker Form missing");
+  const form = {
+    ...base,
+    identity: {
+      ...base.identity,
+      implementationDigest: `sha256:${"a".repeat(64)}` as const,
+    },
+  };
+  const exact = {
+    tenantId: "org_01",
+    space: TARGET.space,
+    form: form.identity,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: "worker.module.technical",
+  };
+  const cases = [
+    { resolve: undefined },
+    { resolve: async () => ({ ...exact, tenantId: "other" }) },
+    { resolve: async () => ({ ...exact, space: "other" }) },
+    {
+      resolve: async () => ({
+        ...exact,
+        form: { ...form.identity, packageDigest: `sha256:${"c".repeat(64)}` as const },
+      }),
+    },
+    {
+      resolve: async () => ({ ...exact, providerInstallationRef: "fake.other" }),
+    },
+  ] as const;
+  for (const scenario of cases) {
+    const harness = fixture({
+      offerings: [],
+      technical: [technical("worker.module.technical")],
+      ...(scenario.resolve
+        ? { noncommercialResolve: scenario.resolve, installedForms: [form] }
+        : {}),
+    });
+    await seedWorker(harness.sql, undefined, form.identity);
+    await harness.sql.run(
+      `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+      ["worker.module.technical", "org_01", "uid-worker-01"],
+    );
+    await expect(
+      harness.authority.mintForWorker({
+        organizationId: "org_01",
+        space: TARGET.space,
+        workerName: TARGET.workerName,
+        workerResourceUid: "uid-worker-01",
+      }),
+    ).rejects.toMatchObject({
+      code: "unsupported_capability",
+      status: 422,
+    });
+    expect(
+      await harness.sql.query(`SELECT reservation_id FROM worker_endpoint_origin_reservations`),
+    ).toEqual([]);
+  }
+});
+
+test("Host mint and retained bound checks fence deployed tuple, installation, and withdrawn catalog identity", async () => {
+  const base = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (candidate) => candidate.identity.formRef.kind === "ModuleWorker",
+  );
+  if (!base) throw new Error("ModuleWorker Form missing");
+  const form = {
+    ...base,
+    identity: {
+      ...base.identity,
+      implementationDigest: `sha256:${"a".repeat(64)}` as const,
+    },
+  };
+  const resolve: NoncommercialPlacementComposition["resolve"] = async (input) => ({
+    ...input,
+    providerPackRef: "fake",
+    providerInstallationRef: "fake.primary",
+    offeringId: "worker.module.technical",
+  });
+  const harness = fixture({
+    offerings: [],
+    technical: [technical("worker.module.technical")],
+    noncommercialResolve: resolve,
+    installedForms: [form],
+  });
+  await seedWorker(harness.sql, undefined, form.identity);
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.technical", "org_01", "uid-worker-01"],
+  );
+  const identity = {
+    organizationId: "org_01",
+    space: TARGET.space,
+    workerName: TARGET.workerName,
+    workerResourceUid: "uid-worker-01",
+  };
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET provider_installation_ref = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["fake.other", "org_01", "uid-worker-01"],
+  );
+  await expect(harness.authority.mintForWorker(identity)).rejects.toMatchObject({
+    code: "conflict",
+    status: 409,
+  });
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET provider_installation_ref = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["fake.primary", "org_01", "uid-worker-01"],
+  );
+  const minted = await harness.authority.mintForWorker(identity);
+  expect(minted).toMatchObject({ offeringId: "worker.module.technical" });
+  if (!minted) throw new Error("expected Host mint");
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.other", "org_01", "uid-worker-01"],
+  );
+  await expect(
+    harness.authority.inspectBound({ ...identity, reservationId: minted.reservationId }),
+  ).rejects.toMatchObject({ code: "conflict", status: 409 });
+  await harness.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.technical", "org_01", "uid-worker-01"],
+  );
+  Object.defineProperty(harness.provider, "installedProviderInstallationRef", {
+    value: "fake.other",
+  });
+  await expect(
+    harness.authority.inspectBound({ ...identity, reservationId: minted.reservationId }),
+  ).rejects.toMatchObject({ code: "unsupported_capability", status: 422 });
+
+  const withdrawn = fixture({
+    offerings: [{ ...sold("worker.module.technical"), available: false }],
+    technical: [technical("worker.module.technical")],
+    noncommercialResolve: resolve,
+    installedForms: [form],
+  });
+  await seedWorker(withdrawn.sql, undefined, form.identity);
+  await withdrawn.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.technical", "org_01", "uid-worker-01"],
+  );
+  await expect(withdrawn.authority.mintForWorker(identity)).rejects.toMatchObject({
+    code: "unsupported_capability",
+    status: 422,
+  });
+
+  const commercial = fixture({
+    offerings: [sold("worker.module.commercial")],
+    technical: [technical("worker.module.technical"), technical("worker.module.commercial")],
+    noncommercialResolve: resolve,
+    installedForms: [form],
+  });
+  await seedWorker(commercial.sql, undefined, form.identity);
+  await commercial.sql.run(
+    `UPDATE tf_resource_deployments SET offering_id = ? WHERE tenant_id = ? AND resource_uid = ?`,
+    ["worker.module.technical", "org_01", "uid-worker-01"],
+  );
+  await expect(commercial.authority.mintForWorker(identity)).rejects.toMatchObject({
+    code: "unsupported_capability",
+    status: 422,
+  });
+});
 
 /**
  * A create that fails after the provider was entered gives the origin back.
