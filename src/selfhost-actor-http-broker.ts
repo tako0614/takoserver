@@ -104,10 +104,12 @@ export async function openSelfhostActorHttpBroker(
         outgoing.writeHead(503).end();
         return;
       }
-      const responseHeaders: Record<string, string> = {};
+      const responseHeaders: Record<string, string | string[]> = {};
       response.headers.forEach((value, name) => {
-        if (!HOP_HEADERS.has(name)) responseHeaders[name] = value;
+        if (!HOP_HEADERS.has(name) && name !== "set-cookie") responseHeaders[name] = value;
       });
+      const setCookies = response.headers.getSetCookie();
+      if (setCookies.length > 0) responseHeaders["set-cookie"] = setCookies;
       outgoing.writeHead(response.status, responseHeaders);
       if (!response.body || incoming.method === "HEAD") {
         outgoing.end();

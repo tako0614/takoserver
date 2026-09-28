@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSelfhostActorForwardBrokers } from "../src/selfhost-actor-forward-brokers.ts";
@@ -63,6 +64,68 @@ test("Actor forward brokers bind exact Host scope and reject unauthenticated cal
       });
       expect(unauthenticatedUpgrade.status).toBe(404);
       expect(calls).toHaveLength(1);
+    } finally {
+      await brokers.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Actor HTTP broker preserves repeated Set-Cookie response fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-forward-cookies-"));
+  const token = "c".repeat(64);
+  const cookies = [
+    "session=one; Expires=Wed, 21 Oct 2030 07:28:00 GMT; Path=/; HttpOnly",
+    "csrf=two; Path=/; SameSite=Strict",
+  ];
+  try {
+    const brokers = await openSelfhostActorForwardBrokers({
+      tenantId: "tenant-one",
+      namespaceResourceUid: "uid-actor-namespace-one",
+      token,
+      httpSocketPath: join(root, "http.sock"),
+      upgradeSocketPath: join(root, "upgrade.sock"),
+      executionHost: {
+        async fetch() {
+          const headers = new Headers([["x-actor-response", "kept"]]);
+          for (const cookie of cookies) headers.append("set-cookie", cookie);
+          return new Response("cookie-bearing response", { status: 201, headers });
+        },
+        async reserveDuplex() {
+          throw new Error("unexpected duplex reservation");
+        },
+      },
+    });
+    try {
+      const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+        const request = httpRequest(
+          {
+            socketPath: brokers.socketMapping.httpSocketPath,
+            path: "http://actor.invalid/session",
+            headers: {
+              "x-takoserver-private-broker-token": token,
+              "x-takoserver-private-broker-actor-id": encodeURIComponent("room-one"),
+            },
+          },
+          resolve,
+        );
+        request.once("error", reject);
+        request.end();
+      });
+      const chunks: Buffer[] = [];
+      for await (const chunk of response) chunks.push(Buffer.from(chunk));
+      const responseCookies: string[] = [];
+      for (let index = 0; index < response.rawHeaders.length; index += 2) {
+        if (response.rawHeaders[index]?.toLowerCase() === "set-cookie") {
+          responseCookies.push(response.rawHeaders[index + 1] ?? "");
+        }
+      }
+
+      expect(response.statusCode).toBe(201);
+      expect(response.headers["x-actor-response"]).toBe("kept");
+      expect(responseCookies).toEqual(cookies);
+      expect(Buffer.concat(chunks).toString()).toBe("cookie-bearing response");
     } finally {
       await brokers.close();
     }
