@@ -61,6 +61,10 @@ function result(stdout: string, exitCode = 0): CommandResult {
   return { exitCode, stdout, stderr: "" };
 }
 
+function pinnedWranglerContainerError(headline: string, body: string): string {
+  return `\u001b[31m✘ \u001b[41;31m[\u001b[41;97mERROR\u001b[41;31m]\u001b[0m \u001b[1m${headline}\u001b[0m\n\n  ${body}\n\n`;
+}
+
 describe("Wrangler OAuth Worker reader", () => {
   test("uses only JSON Wrangler readers and never asks for credential metadata", async () => {
     const commands: string[][] = [];
@@ -230,25 +234,22 @@ describe("Wrangler version publication output", () => {
     // printing this category and formatError6(err). For a body without
     // `error`, formatError6 returns JSON.stringify(err.body), including the
     // provider's numeric errors[].code fields.
-    const pinnedContainerFailure = [
-      "Error creating application due to a misconfiguration",
-      JSON.stringify({
-        errors: [
-          {
-            code: 10061,
-            message: `Authorization: Bearer ${syntheticBearer} account=${syntheticAccount}`,
-          },
-          { code: 10062, message: "untrusted diagnostic two" },
-          { code: 10063, message: "untrusted diagnostic three" },
-          { code: 10064, message: "untrusted diagnostic four" },
-          { code: 1234567, message: "untrusted diagnostic five" },
-          { code: "10065", message: "not a numeric provider code" },
-        ],
-        request_id: syntheticRequestId,
-        status: 503,
-        success: false,
-      }),
-    ].join("\n");
+    const pinnedContainerFailure = JSON.stringify({
+      errors: [
+        {
+          code: 10061,
+          message: `Authorization: Bearer ${syntheticBearer} account=${syntheticAccount}`,
+        },
+        { code: 10062, message: "untrusted diagnostic two" },
+        { code: 10063, message: "untrusted diagnostic three" },
+        { code: 10064, message: "untrusted diagnostic four" },
+        { code: 1234567, message: "untrusted diagnostic five" },
+        { code: "10065", message: "not a numeric provider code" },
+      ],
+      request_id: syntheticRequestId,
+      status: 503,
+      success: false,
+    });
     const lease = {
       accountId: target.accountId,
       workerName: target.workerName,
@@ -267,7 +268,10 @@ describe("Wrangler version publication output", () => {
         run: async () => ({
           exitCode: 1,
           stdout: "",
-          stderr: `✘ [ERROR] ${pinnedContainerFailure}`,
+          stderr: pinnedWranglerContainerError(
+            "Error creating application due to a misconfiguration",
+            pinnedContainerFailure,
+          ),
         }),
       }).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
@@ -286,6 +290,42 @@ describe("Wrangler version publication output", () => {
       expect(detail).not.toContain(syntheticRequestId);
       expect(detail).not.toContain("Authorization");
       expect(detail).not.toContain("message");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not exceed the total code limit when Container JSON follows bracket codes", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-container-code-limit-${crypto.randomUUID()}`;
+    const lease = {
+      accountId: target.accountId,
+      workerName: target.workerName,
+      release: async () => {},
+    };
+    const apiBody = JSON.stringify({ errors: [{ code: 10061, message: "untrusted" }] });
+    try {
+      const failure = await deployWranglerLifecycleChange({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: `${root}/wrangler.jsonc`,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message: "safe-message",
+        lease,
+        assertCurrentStillExpected: async () => {},
+        run: async () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: `[code: 10021] [code: 10022] [code: 10023]\n${pinnedWranglerContainerError("Error creating application due to a misconfiguration", apiBody)}`,
+        }),
+      }).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      const detail = (failure as DeployError).detail ?? "";
+      expect(detail).toContain("[code: 10021]");
+      expect(detail).toContain("[code: 10022]");
+      expect(detail).toContain("[code: 10023]");
+      expect(detail).not.toContain("[code: 10061]");
+      expect((detail.match(/\[code:/gu) ?? []).length).toBe(3);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

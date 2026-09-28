@@ -51,6 +51,7 @@ const WRANGLER_CONTAINER_MISCONFIGURATION_PATTERN =
   /^(?:✘ \[ERROR\] )?Error (?:creating application|modifying application [^\r\n]{1,128}|rolling out application [^\r\n]{1,128}) due to a misconfiguration(?::|\r?$)/mu;
 const WRANGLER_CONTAINER_INTERNAL_ERROR_PATTERN =
   /^(?:✘ \[ERROR\] )?Error (?:creating application|modifying application [^\r\n]{1,128}|rolling out application [^\r\n]{1,128}) due to an internal error \(request id: [^\r\n)]{1,128}\):/mu;
+const WRANGLER_ANSI_SGR_PATTERN = new RegExp(`${String.fromCharCode(0x1b)}\\[[0-9;]*m`, "gu");
 const MAX_WRANGLER_CONTAINER_ERROR_BODY_CHARS = 16_384;
 
 export type WranglerProcess = (
@@ -1046,8 +1047,11 @@ async function runPublicationCommand(
  */
 function safeWranglerFailureDetail(result: CommandResult): string {
   const sources = [result.stdout, result.stderr];
-  const containerMisconfiguration = WRANGLER_CONTAINER_MISCONFIGURATION_PATTERN.test(result.stderr);
-  const containerInternalError = WRANGLER_CONTAINER_INTERNAL_ERROR_PATTERN.test(result.stderr);
+  const stderrForClassification = result.stderr.replace(WRANGLER_ANSI_SGR_PATTERN, "");
+  const containerMisconfiguration =
+    WRANGLER_CONTAINER_MISCONFIGURATION_PATTERN.test(stderrForClassification);
+  const containerInternalError =
+    WRANGLER_CONTAINER_INTERNAL_ERROR_PATTERN.test(stderrForClassification);
   const codes: string[] = [];
   for (const source of sources) {
     for (const match of source.matchAll(WRANGLER_FAILURE_CODE_PATTERN)) {
@@ -1058,7 +1062,10 @@ function safeWranglerFailureDetail(result: CommandResult): string {
     }
     if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
   }
-  if (containerMisconfiguration || containerInternalError) {
+  if (
+    (containerMisconfiguration || containerInternalError) &&
+    codes.length < MAX_WRANGLER_FAILURE_CODES
+  ) {
     for (const source of [result.stderr]) {
       for (const line of source.split(/\r?\n/u)) {
         const body = line.trim();
