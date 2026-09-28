@@ -139,6 +139,42 @@ test("old CPE cannot silently discard a recovery context", async () => {
   expect(legacyCalls).toBe(0);
 });
 
+test("dynamic RPC stub rejection stays uncertain without legacy replay", async () => {
+  let legacyCalls = 0;
+  const provider = proxy({
+    apply: async () => {
+      legacyCalls++;
+      return failed;
+    },
+    applyWithExecutionContextV1: async () => {
+      throw new Error("remote method unavailable");
+    },
+    convergeApply: async () => {
+      legacyCalls++;
+      return failed;
+    },
+    convergeApplyWithExecutionContextV1: async () => {
+      throw new Error("remote method unavailable");
+    },
+  });
+  expect(
+    await provider.apply(input, { prospectiveDeploymentId: "dep_op-context-1" }),
+  ).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+  });
+  expect(
+    await provider.convergeApply(
+      { ...input, operationMode: "recovery" },
+      { prospectiveDeploymentId: "dep_op-context-1" },
+    ),
+  ).toMatchObject({
+    phase: "failed",
+    failure: { code: "unavailable", retryable: true },
+  });
+  expect(legacyCalls).toBe(0);
+});
+
 test("legacy no-context and recovery calls keep their existing RPC shape", async () => {
   const calls: unknown[] = [];
   const provider = proxy({

@@ -176,16 +176,19 @@ export class CloudflareProviderProxy implements Provider {
       const method = this.#binding.applyWithExecutionContextV1;
       if (!method)
         return failed("unavailable", "Provider executor does not support create context", true);
-      return restoreInitialMutationResult(
-        providerRpcResult(
-          await method.call(this.#binding, {
-            schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
-            input,
-            prospectiveDeploymentId,
-          }),
-        ),
-        context,
-      );
+      let result: Awaited<ReturnType<typeof method>>;
+      try {
+        result = await method.call(this.#binding, {
+          schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+          input,
+          prospectiveDeploymentId,
+        });
+      } catch {
+        // A Worker RPC stub may appear to expose a method that the older peer
+        // does not implement. No legacy replay or no-effect proof is safe.
+        return failed("unavailable", "Provider executor create context RPC is unavailable", true);
+      }
+      return restoreInitialMutationResult(providerRpcResult(result), context);
     }
     return restoreInitialMutationResult(
       providerRpcResult(await this.#binding.apply(input)),
@@ -228,16 +231,21 @@ export class CloudflareProviderProxy implements Provider {
           "Provider executor does not support create recovery context",
           true,
         );
-      return restoreApplyConvergenceResult(
-        providerRpcResult(
-          await method.call(this.#binding, {
-            schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
-            input,
-            prospectiveDeploymentId,
-          }),
-        ),
-        context,
-      );
+      let result: Awaited<ReturnType<typeof method>>;
+      try {
+        result = await method.call(this.#binding, {
+          schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+          input,
+          prospectiveDeploymentId,
+        });
+      } catch {
+        return failed(
+          "unavailable",
+          "Provider executor create recovery context RPC is unavailable",
+          true,
+        );
+      }
+      return restoreApplyConvergenceResult(providerRpcResult(result), context);
     }
     return restoreApplyConvergenceResult(
       providerRpcResult(await this.#binding.convergeApply(input)),
