@@ -184,7 +184,7 @@ export async function createIntegrationActorFormAuthorityComposition(input: {
       "exact executable Actor Form package is unavailable",
     );
   }
-  return createComposition({ ...input, catalog });
+  return createComposition(input, catalog);
 }
 
 export function createExactFormPackageSource(
@@ -210,18 +210,20 @@ export function createExactFormPackageSource(
   };
 }
 
-async function createComposition(input: {
-  readonly configuration: FormAuthorityEndpointConfiguration;
-  readonly bindings: FormAuthorityEndpointBindings;
-  readonly verifier: FormAuthorityEvidenceVerifier;
-  readonly packages: FormAuthorityPackageSource;
-  readonly packageSet?: readonly FormAuthorityPackageIdentity[];
-  readonly expectedEvidence?: FormAuthorityVerificationEvidence;
-  readonly activationPolicy?: FormAuthorityActivationPolicy;
-  readonly catalog?: TakoformImplementationCatalog;
-}): Promise<FormAuthorityComposition> {
+async function createComposition(
+  input: {
+    readonly configuration: FormAuthorityEndpointConfiguration;
+    readonly bindings: FormAuthorityEndpointBindings;
+    readonly verifier: FormAuthorityEvidenceVerifier;
+    readonly packages: FormAuthorityPackageSource;
+    readonly packageSet?: readonly FormAuthorityPackageIdentity[];
+    readonly expectedEvidence?: FormAuthorityVerificationEvidence;
+    readonly activationPolicy?: FormAuthorityActivationPolicy;
+  },
+  selectedCatalog?: TakoformImplementationCatalog,
+): Promise<FormAuthorityComposition> {
   const catalog =
-    input.catalog ??
+    selectedCatalog ??
     (await deriveRuntimeImplementationCatalog({
       implementationPayloadDigest: input.configuration.implementationPayloadDigest,
       capabilities: input.configuration.capabilities,

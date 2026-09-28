@@ -125,6 +125,9 @@ test("ordinary Host authority never infers unpublished Actor from forward capabi
   await expect(createFormAuthorityComposition(options())).rejects.toMatchObject({
     code: "identity_mismatch",
   });
+  await expect(
+    createFormAuthorityComposition({ ...options(), catalog: {} } as never),
+  ).rejects.toMatchObject({ code: "identity_mismatch" });
 });
 
 test("source-only Actor authority rejects production and released verifier", async () => {
