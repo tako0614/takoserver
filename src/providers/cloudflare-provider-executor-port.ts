@@ -25,6 +25,16 @@ export type CloudflareProviderInspectWorkerClassInput = Parameters<
   ProviderWorkerClassRuntime["inspect"]
 >[0];
 
+export const CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA =
+  "takoserver.cloudflare-provider-mutation-context@v1" as const;
+
+/** Private CPE RPC only; never a legacy ApplyInput or ResourceIdentity member. */
+export interface CloudflareProviderMutationContextV1 {
+  readonly schema: typeof CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA;
+  readonly input: ApplyInput;
+  readonly prospectiveDeploymentId: string;
+}
+
 export const CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA =
   "takoserver.cloudflare-provider-executor-no-mutation@v1" as const;
 
@@ -227,8 +237,16 @@ export interface CloudflareProviderExecutorRpc {
     input: CloudflareProviderInspectWorkerClassInput,
   ): Promise<WorkerClassInspectionVerdict>;
   apply(input: ApplyInput): Promise<CloudflareProviderInitialMutationResult>;
+  /** Fresh create with the exact Deployment ID the Host will commit. */
+  applyWithExecutionContextV1?(
+    envelope: CloudflareProviderMutationContextV1,
+  ): Promise<CloudflareProviderInitialMutationResult>;
   recoverApply(input: ApplyInput): Promise<ProviderTicket>;
   convergeApply(input: ApplyInput): Promise<CloudflareProviderApplyConvergenceResult>;
+  /** Operation-keyed recovery of the same fresh create; no initial replay. */
+  convergeApplyWithExecutionContextV1?(
+    envelope: CloudflareProviderMutationContextV1,
+  ): Promise<CloudflareProviderApplyConvergenceResult>;
   concludeApplyNoEffect(
     input: ProviderApplyNoEffectConclusionInput,
   ): Promise<CloudflareProviderApplyNoEffectConclusionResult>;

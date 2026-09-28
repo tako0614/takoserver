@@ -142,6 +142,7 @@ export type {
   CloudflareProviderInitialMutationResult,
   CloudflareProviderInspectWorkerClassInput,
   CloudflareProviderMeterReadInput,
+  CloudflareProviderMutationContextV1,
   CloudflareProviderObserveInput,
   CloudflareProviderPollInput,
   CloudflareProviderSqliteMigrationApplyInput,
@@ -156,6 +157,7 @@ export {
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
 } from "./providers/cloudflare-provider-executor-port.ts";
 export {
   CloudflareProviderProxy,

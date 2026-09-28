@@ -13,6 +13,7 @@ import type {
   ProviderArtifactConsumption,
   ProviderExecutionAuthority,
   ProviderFailure,
+  ProviderMutationExecutionContext,
   ProviderNativeAbsence,
   ProviderNativeReadbackAuthority,
   ProviderNativeReadbackDescriptor,
@@ -53,6 +54,7 @@ import {
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_COMPENSATION_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_APPLY_NO_EFFECT_SCHEMA,
   CLOUDFLARE_PROVIDER_EXECUTOR_NO_MUTATION_SCHEMA,
+  CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
   type CloudflareProviderExecutorRpc,
 } from "./cloudflare-provider-executor-port.ts";
 import {
@@ -156,8 +158,33 @@ export class CloudflareProviderProxy implements Provider {
     };
   }
 
-  async apply(input: ApplyInput): Promise<ProviderTicket> {
+  async apply(
+    input: ApplyInput,
+    executionContext?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket> {
     const context = snapshotInitialMutationContext("apply", input, this.#providerInstallationId);
+    const prospectiveDeploymentId = executionContext?.prospectiveDeploymentId;
+    if (executionContext !== undefined) {
+      if (
+        input.previous !== undefined ||
+        input.operationMode !== "initial" ||
+        prospectiveDeploymentId !== `dep_${input.operationId}`
+      )
+        return failed("unavailable", "Provider executor context does not match create", true);
+      const method = this.#binding.applyWithExecutionContextV1;
+      if (!method)
+        return failed("unavailable", "Provider executor does not support create context", true);
+      return restoreInitialMutationResult(
+        providerRpcResult(
+          await method.call(this.#binding, {
+            schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+            input,
+            prospectiveDeploymentId,
+          }),
+        ),
+        context,
+      );
+    }
     return restoreInitialMutationResult(
       providerRpcResult(await this.#binding.apply(input)),
       context,
@@ -170,11 +197,44 @@ export class CloudflareProviderProxy implements Provider {
     );
   }
 
-  async convergeApply(input: ApplyInput): Promise<ProviderTicket> {
+  async convergeApply(
+    input: ApplyInput,
+    executionContext?: ProviderMutationExecutionContext,
+  ): Promise<ProviderTicket> {
     const context = {
       ...snapshotAdoptionRecoveryContext(input, this.#providerInstallationId),
       hasPrevious: input.previous !== undefined,
     };
+    const prospectiveDeploymentId = executionContext?.prospectiveDeploymentId;
+    if (executionContext !== undefined) {
+      if (
+        input.previous !== undefined ||
+        input.operationMode === "initial" ||
+        prospectiveDeploymentId !== `dep_${input.operationId}`
+      )
+        return failed(
+          "unavailable",
+          "Provider executor context does not match create recovery",
+          true,
+        );
+      const method = this.#binding.convergeApplyWithExecutionContextV1;
+      if (!method)
+        return failed(
+          "unavailable",
+          "Provider executor does not support create recovery context",
+          true,
+        );
+      return restoreApplyConvergenceResult(
+        providerRpcResult(
+          await method.call(this.#binding, {
+            schema: CLOUDFLARE_PROVIDER_MUTATION_CONTEXT_SCHEMA,
+            input,
+            prospectiveDeploymentId,
+          }),
+        ),
+        context,
+      );
+    }
     return restoreApplyConvergenceResult(
       providerRpcResult(await this.#binding.convergeApply(input)),
       context,
