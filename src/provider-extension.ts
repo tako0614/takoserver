@@ -73,6 +73,7 @@ export {
   type ProviderArtifactConsumptionInput,
   type ProviderExecutionAuthority,
   type ProviderFailure,
+  type ProviderMutationExecutionContext,
   type ProviderNativeAbsence,
   type ProviderNativeReadbackDescriptor,
   type ProviderNativeReadbackInput,
