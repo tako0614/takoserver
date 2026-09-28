@@ -1,6 +1,6 @@
 import { copyFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { landingHtml } from "../src/landing.ts";
+import { landingHtml, notFoundHtml } from "../src/landing.ts";
 
 /**
  * Builds the site served at the apex.
@@ -43,5 +43,7 @@ for (const locale of ["ja", "en"] as const) {
   mkdirSync(localeDirectory, { recursive: true });
   await Bun.write(join(localeDirectory, "index.html"), landingHtml({ ...commonOptions, locale }));
 }
+
+await Bun.write(join(outDir, "404.html"), notFoundHtml());
 
 process.stdout.write(`site built into ${outDir}\n`);
