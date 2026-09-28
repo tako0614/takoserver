@@ -1,6 +1,7 @@
 import { canonicalJson, isSha256Digest } from "../json.ts";
 import type { ObjectStore, Sql } from "../ports.ts";
 import { isPublicHostIdentity, type PublicHostIdentityRpc } from "../public-host-identity.ts";
+import type { PublicFormImplementationConfiguration } from "../public-worker-implementation.ts";
 import {
   deriveRuntimeImplementationCatalog,
   parseFormAuthorityCapabilityManifest,
@@ -137,6 +138,55 @@ export async function createFormAuthorityComposition(input: {
   return createComposition(input);
 }
 
+/**
+ * Source-only Actor qualification. This is intentionally a separate factory:
+ * neither the released closure nor the ordinary Host authority can select an
+ * unpublished Form, and a fixture result can never be production eligible.
+ */
+export async function createIntegrationActorFormAuthorityComposition(input: {
+  readonly configuration: FormAuthorityEndpointConfiguration;
+  readonly bindings: FormAuthorityEndpointBindings;
+  readonly verifier: FormAuthorityEvidenceVerifier;
+  readonly packages: FormAuthorityPackageSource;
+  readonly packageSet: readonly FormAuthorityPackageIdentity[];
+  readonly expectedEvidence: FormAuthorityVerificationEvidence;
+  readonly actorProvider: NonNullable<PublicFormImplementationConfiguration["actorProvider"]>;
+  readonly activationPolicy?: FormAuthorityActivationPolicy;
+}): Promise<FormAuthorityComposition> {
+  if (
+    input.configuration.environment !== "integration" ||
+    !input.verifier.readiness.available ||
+    input.verifier.readiness.released
+  ) {
+    throw new HostAdmissionCoordinatorError(
+      "production_not_ready",
+      "unpublished Actor authority requires an available integration-only verifier",
+    );
+  }
+  const catalog = await deriveRuntimeImplementationCatalog({
+    implementationPayloadDigest: input.configuration.implementationPayloadDigest,
+    capabilities: input.configuration.capabilities,
+    candidate: "actor-forward",
+    actorProvider: input.actorProvider,
+  });
+  const actor = catalog.entries.filter((entry) => entry.formRef.kind === "ActorNamespace");
+  if (
+    actor.length !== 1 ||
+    !actor[0]?.operations.includes("create") ||
+    !input.packageSet.some(
+      (entry) =>
+        canonicalJson(entry.formRef) === canonicalJson(actor[0]?.formRef) &&
+        entry.packageDigest === actor[0]?.packageDigest,
+    )
+  ) {
+    throw new HostAdmissionCoordinatorError(
+      "invalid_request",
+      "exact executable Actor Form package is unavailable",
+    );
+  }
+  return createComposition({ ...input, catalog });
+}
+
 export function createExactFormPackageSource(
   packages: readonly FormPackageInput[],
 ): FormAuthorityPackageSource {
@@ -168,11 +218,14 @@ async function createComposition(input: {
   readonly packageSet?: readonly FormAuthorityPackageIdentity[];
   readonly expectedEvidence?: FormAuthorityVerificationEvidence;
   readonly activationPolicy?: FormAuthorityActivationPolicy;
+  readonly catalog?: TakoformImplementationCatalog;
 }): Promise<FormAuthorityComposition> {
-  const catalog = await deriveRuntimeImplementationCatalog({
-    implementationPayloadDigest: input.configuration.implementationPayloadDigest,
-    capabilities: input.configuration.capabilities,
-  });
+  const catalog =
+    input.catalog ??
+    (await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: input.configuration.implementationPayloadDigest,
+      capabilities: input.configuration.capabilities,
+    }));
   if (catalog.implementationDigest !== input.configuration.implementationDigest) {
     throw new HostAdmissionCoordinatorError(
       "identity_mismatch",

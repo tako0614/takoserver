@@ -8,6 +8,7 @@
     ".": "./src/index.ts",
     "./provider-extension": "./src/provider-extension.ts",
     "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",
+    "./form-authority-integration-actor": "./src/takoform/integration-actor-form-authority.ts",
     "./takoform-worker-store": "./src/takoform/worker-store.ts",
     "./workflow-runtime": "./src/workflow-runtime.ts",
     "./workflow-runtime/workerd": "./src/workflow-runtime-workerd.ts",
