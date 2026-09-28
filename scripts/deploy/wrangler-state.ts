@@ -47,6 +47,11 @@ const WRANGLER_FAILURE_NETWORK_MARKERS = [
     pattern: /(?:^|[^A-Za-z0-9_])fetch failed(?:$|[^A-Za-z0-9_])/iu,
   },
 ] as const;
+const WRANGLER_CONTAINER_MISCONFIGURATION_PATTERN =
+  /^(?:✘ \[ERROR\] )?Error (?:creating application|modifying application [^\r\n]{1,128}|rolling out application [^\r\n]{1,128}) due to a misconfiguration(?::|\r?$)/mu;
+const WRANGLER_CONTAINER_INTERNAL_ERROR_PATTERN =
+  /^(?:✘ \[ERROR\] )?Error (?:creating application|modifying application [^\r\n]{1,128}|rolling out application [^\r\n]{1,128}) due to an internal error \(request id: [^\r\n)]{1,128}\):/mu;
+const MAX_WRANGLER_CONTAINER_ERROR_BODY_CHARS = 16_384;
 
 export type WranglerProcess = (
   command: readonly string[],
@@ -1041,6 +1046,8 @@ async function runPublicationCommand(
  */
 function safeWranglerFailureDetail(result: CommandResult): string {
   const sources = [result.stdout, result.stderr];
+  const containerMisconfiguration = WRANGLER_CONTAINER_MISCONFIGURATION_PATTERN.test(result.stderr);
+  const containerInternalError = WRANGLER_CONTAINER_INTERNAL_ERROR_PATTERN.test(result.stderr);
   const codes: string[] = [];
   for (const source of sources) {
     for (const match of source.matchAll(WRANGLER_FAILURE_CODE_PATTERN)) {
@@ -1051,6 +1058,41 @@ function safeWranglerFailureDetail(result: CommandResult): string {
     }
     if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
   }
+  if (containerMisconfiguration || containerInternalError) {
+    for (const source of [result.stderr]) {
+      for (const line of source.split(/\r?\n/u)) {
+        const body = line.trim();
+        if (
+          body.length > MAX_WRANGLER_CONTAINER_ERROR_BODY_CHARS ||
+          !body.startsWith("{") ||
+          !body.endsWith("}")
+        )
+          continue;
+        let value: unknown;
+        try {
+          value = JSON.parse(body);
+        } catch {
+          continue;
+        }
+        if (!isRecord(value) || !Array.isArray(value.errors)) continue;
+        for (const error of value.errors) {
+          if (!isRecord(error) || typeof error.code !== "number") continue;
+          if (
+            !Number.isSafeInteger(error.code) ||
+            error.code < 0 ||
+            error.code > 10 ** MAX_WRANGLER_FAILURE_CODE_DIGITS - 1
+          )
+            continue;
+          const code = String(error.code);
+          if (codes.includes(code)) continue;
+          codes.push(code);
+          if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
+        }
+        if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
+      }
+      if (codes.length >= MAX_WRANGLER_FAILURE_CODES) break;
+    }
+  }
 
   const network: string[] = [];
   for (const marker of WRANGLER_FAILURE_NETWORK_MARKERS) {
@@ -1058,6 +1100,8 @@ function safeWranglerFailureDetail(result: CommandResult): string {
   }
 
   const detail = [`exit=${result.exitCode}`];
+  if (containerMisconfiguration) detail.push("container-http=400");
+  else if (containerInternalError) detail.push("container=internal-error");
   if (codes.length > 0) {
     detail.push(`codes=${codes.map((code) => `[code: ${code}]`).join(",")}`);
   }

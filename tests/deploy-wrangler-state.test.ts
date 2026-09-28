@@ -221,6 +221,76 @@ describe("Wrangler version publication output", () => {
     }
   });
 
+  test("keeps only the status and numeric code from pinned Wrangler Container API errors", async () => {
+    const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-container-failure-${crypto.randomUUID()}`;
+    const syntheticBearer = "synthetic-container-bearer";
+    const syntheticAccount = "synthetic-account-id";
+    const syntheticRequestId = "synthetic-request-id";
+    // Wrangler 4.123.0 Container apply handles ApiError.status === 400 by
+    // printing this category and formatError6(err). For a body without
+    // `error`, formatError6 returns JSON.stringify(err.body), including the
+    // provider's numeric errors[].code fields.
+    const pinnedContainerFailure = [
+      "Error creating application due to a misconfiguration",
+      JSON.stringify({
+        errors: [
+          {
+            code: 10061,
+            message: `Authorization: Bearer ${syntheticBearer} account=${syntheticAccount}`,
+          },
+          { code: 10062, message: "untrusted diagnostic two" },
+          { code: 10063, message: "untrusted diagnostic three" },
+          { code: 10064, message: "untrusted diagnostic four" },
+          { code: 1234567, message: "untrusted diagnostic five" },
+          { code: "10065", message: "not a numeric provider code" },
+        ],
+        request_id: syntheticRequestId,
+        status: 503,
+        success: false,
+      }),
+    ].join("\n");
+    const lease = {
+      accountId: target.accountId,
+      workerName: target.workerName,
+      release: async () => {},
+    };
+    try {
+      const failure = await deployWranglerLifecycleChange({
+        root,
+        bundlePath: `${root}/bundle.js`,
+        configPath: `${root}/wrangler.jsonc`,
+        accountId: target.accountId,
+        workerName: target.workerName,
+        message: "safe-message",
+        lease,
+        assertCurrentStillExpected: async () => {},
+        run: async () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: `✘ [ERROR] ${pinnedContainerFailure}`,
+        }),
+      }).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      const detail = (failure as DeployError).detail ?? "";
+      expect(detail).toContain("exit=1");
+      expect(detail).toContain("container-http=400");
+      expect(detail).toContain("[code: 10061]");
+      expect(detail).toContain("[code: 10062]");
+      expect(detail).toContain("[code: 10063]");
+      expect(detail).not.toContain("10064");
+      expect(detail).not.toContain("1234567");
+      expect(detail).not.toContain("10065");
+      expect(detail).not.toContain("503");
+      expect(detail).not.toContain(syntheticBearer);
+      expect(detail).not.toContain(syntheticAccount);
+      expect(detail).not.toContain(syntheticRequestId);
+      expect(detail).not.toContain("Authorization");
+      expect(detail).not.toContain("message");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("falls back to the exit code when no allowlisted failure detail exists", async () => {
     const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-lifecycle-failure-empty-${crypto.randomUUID()}`;
     const lease = {
@@ -241,7 +311,11 @@ describe("Wrangler version publication output", () => {
         run: async () => ({
           exitCode: 7,
           stdout: "plain Wrangler failure text",
-          stderr: "nothing allowlisted here",
+          stderr: JSON.stringify({
+            errors: [
+              { code: 10061, message: "Error creating application due to a misconfiguration" },
+            ],
+          }),
         }),
       }).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
