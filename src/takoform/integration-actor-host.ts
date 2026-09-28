@@ -31,6 +31,10 @@ export {
   createResourceDeploymentStore,
   type ResourceDeploymentStore,
 } from "../resource-deployments.ts";
+export {
+  createWorkerEndpointOriginReservations,
+  type WorkerEndpointOriginReservations,
+} from "../worker-endpoint-origin-reservations.ts";
 export { type CreateTakoformHostOptions, createTakoformHost } from "./host.ts";
 export {
   type CreateTakoformHostAuthorityOptions,

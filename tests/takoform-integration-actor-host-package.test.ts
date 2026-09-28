@@ -18,6 +18,7 @@ import {
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createTakoformHost } from "../src/takoform/host.ts";
 import { createTakoformHostAuthority } from "../src/takoform/host-authority.ts";
+import { createWorkerEndpointOriginReservations } from "../src/worker-endpoint-origin-reservations.ts";
 
 test("integration Host subpath exposes only the selected composition constructors", () => {
   expect(Object.keys(integrationHost).sort()).toEqual([
@@ -33,6 +34,7 @@ test("integration Host subpath exposes only the selected composition constructor
     "createResourceDeploymentStore",
     "createTakoformHost",
     "createTakoformHostAuthority",
+    "createWorkerEndpointOriginReservations",
     "derivePublicFormImplementationIdentity",
     "grants",
     "publicFormCapabilityManifest",
@@ -51,6 +53,9 @@ test("integration Host subpath exposes only the selected composition constructor
   expect(integrationHost.createResourceDeploymentStore).toBe(createResourceDeploymentStore);
   expect(integrationHost.createTakoformHost).toBe(createTakoformHost);
   expect(integrationHost.createTakoformHostAuthority).toBe(createTakoformHostAuthority);
+  expect(integrationHost.createWorkerEndpointOriginReservations).toBe(
+    createWorkerEndpointOriginReservations,
+  );
   expect(integrationHost.derivePublicFormImplementationIdentity).toBe(
     derivePublicFormImplementationIdentity,
   );
