@@ -47,18 +47,24 @@ this descriptor locally, while the selected private backend owns native
 observation and lifecycle execution. This is a software extension contract,
 not a new Host API route or a change to the published Actor Form.
 
-Technical routing does not advertise Actor support or create an Offering.
-`ActorNamespace` remains an identity Form, not a relation that inherits a
-Worker's commercial Offering. The hosted edge supply parser has no Actor
-resource-class, metering or price-plan contract, and continues to reject Actor
-supply configuration. The shipped Host composition still refuses class-holder admission;
-native owner allocation alone is not evidence that every weighted active
-Worker version exports the required class or that the Actor Form is Ready.
-Normal hosted admission therefore remains unavailable until provider-qualified
-class readiness, the backend lifecycle and the separately owned commercial
-supply composition are implemented and qualified.
+With the explicit `actor-forward` public source candidate, the Cloudflare proxy
+can expose a technical `ProviderOffering` for the exact Actor Form when its
+package/class ABI is registered and the executor provides class inspection.
+That proxy capability is not a sellable catalog `Offering` and does not itself
+admit Actor identity creates through the normal Host lane. Normal identity
+creation still requires an independently reviewed sellable catalog Offering.
+The hosted edge supply parser continues to reject Actor supply configuration;
+it has no Actor resource-class, metering, or price-plan contract. `ActorNamespace`
+remains an identity Form, not a relation that inherits a Worker's commercial
+Offering.
 
-The dormant `Provider.workerClassRuntime` software port separates identity
+This opt-in is source qualification, not publication or production admission.
+Native owner allocation or a technical proxy route alone does not prove that
+every weighted active Worker version exports the required class or that the
+Actor Form is Ready. Provider-qualified readiness, the backend lifecycle, and
+the separately owned commercial supply composition remain distinct work.
+
+The `Provider.workerClassRuntime` software port separates identity
 allocation from runtime readiness. An adapter must register an exact FormRef,
 package digest and explicit runtime InterfaceRef; the historical inferred
 Actor adapter has no such ABI registration. The same capability is checked by
@@ -75,7 +81,9 @@ both the Resource graph and native Deployment facts are re-read after
 inspection. Missing graphs, mismatches and unavailable inspection never yield
 Ready. The inspector must not construct the class or receive live Actor state
 or sensitive environment values. Wrapper identity and declared-handler checks
-alone are insufficient. No shipped adapter registers this capability yet.
+alone are insufficient. The public Cloudflare proxy registers the exact
+candidate ABI only for the explicit `actor-forward` composition when its class
+inspection RPC is available; the default released-Form composition does not.
 
 Exact idempotency replay still returns its historical mutation response. It
 does not re-evaluate current readiness or grant traffic admission; current
