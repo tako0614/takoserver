@@ -51,6 +51,32 @@ const placement = {
   providerInstallationRef: "probe-provider.dev",
   offeringId: offering.id,
 };
+const soldOffering: Offering = {
+  id: offering.id,
+  providerPackRef: placement.providerPackRef,
+  providerInstallationRef: placement.providerInstallationRef,
+  supplyContractRef: "probe.supply",
+  pricePlanRef: "probe.price",
+  resourceClass: "probe",
+  deliveryMode: "managed-endpoint",
+  supportPolicyRef: "probe.support",
+  abusePolicyRef: "probe.abuse",
+  kind: offering.kind,
+  displayName: offering.displayName,
+  form: formRef,
+  pricePlan: {
+    id: "probe.price",
+    currency: "USD",
+    provisioning: { meter: "probe.create", amountMinor: 100 },
+    meters: [],
+  },
+  providedInterfaces: [],
+  bindingRefs: [],
+  regions: [],
+  portability: { api: "portable", exportFormats: [], importFormats: [], migrationModes: [] },
+  isolation: "dedicated-resource",
+  available: true,
+};
 
 function setup(
   resolve?: NonNullable<CreateProviderDriverOptions["noncommercialPlacement"]>["resolve"],
@@ -215,42 +241,16 @@ test("noncommercial authority is exact and cannot replace a sold selection", asy
 });
 
 test("an existing sold Offering keeps commercial selection and never consults the hook", async () => {
-  const sold: Offering = {
-    id: offering.id,
-    providerPackRef: placement.providerPackRef,
-    providerInstallationRef: placement.providerInstallationRef,
-    supplyContractRef: "probe.supply",
-    pricePlanRef: "probe.price",
-    resourceClass: "probe",
-    deliveryMode: "managed-endpoint",
-    supportPolicyRef: "probe.support",
-    abusePolicyRef: "probe.abuse",
-    kind: offering.kind,
-    displayName: offering.displayName,
-    form: formRef,
-    pricePlan: {
-      id: "probe.price",
-      currency: "USD",
-      provisioning: { meter: "probe.create", amountMinor: 100 },
-      meters: [],
-    },
-    providedInterfaces: [],
-    bindingRefs: [],
-    regions: [],
-    portability: { api: "portable", exportFormats: [], importFormats: [], migrationModes: [] },
-    isolation: "dedicated-resource",
-    available: true,
-  };
   let consulted = false;
   const fixture = setup(async () => {
     consulted = true;
     return placement;
-  }, sold);
+  }, soldOffering);
   try {
     const selected = await fixture.driver.selectApply(selectionInput());
     expect(selected).toMatchObject({
       kind: "provider",
-      sold: { offeringId: sold.id, pricePlan: sold.pricePlan },
+      sold: { offeringId: soldOffering.id, pricePlan: soldOffering.pricePlan },
     });
     expect(consulted).toBe(false);
     await expect(
@@ -267,6 +267,24 @@ test("an existing sold Offering keeps commercial selection and never consults th
     expect(consulted).toBe(false);
   } finally {
     fixture.database.close();
+  }
+});
+
+test("an unavailable commercial Offering ID cannot be repurposed as noncommercial supply", async () => {
+  for (const withdrawn of [
+    { ...soldOffering, available: false },
+    { ...soldOffering, retired: true },
+  ]) {
+    const fixture = setup(async () => placement, withdrawn);
+    try {
+      await expect(fixture.driver.selectApply(selectionInput())).rejects.toMatchObject({
+        code: "unsupported_capability",
+        status: 422,
+      });
+      expect(fixture.calls).toEqual([]);
+    } finally {
+      fixture.database.close();
+    }
   }
 });
 

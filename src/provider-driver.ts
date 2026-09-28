@@ -438,7 +438,7 @@ export function createProviderDriver(
       placement.space !== input.space ||
       canonicalJson(placement.form) !== canonicalJson(input.form.identity) ||
       !placement.providerInstallationRef ||
-      catalog.findOffering(placement.offeringId) !== undefined ||
+      catalog.hasOfferingId(placement.offeringId) ||
       !provider ||
       provider.installedProviderInstallationRef !== placement.providerInstallationRef ||
       offerings?.length !== 1 ||

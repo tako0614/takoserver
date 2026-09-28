@@ -135,6 +135,8 @@ export interface Offering {
 export interface Catalog {
   list(): readonly Offering[];
   findOffering(offeringId: string): Offering | undefined;
+  /** Identity membership, including unavailable and retired configured Offerings. */
+  hasOfferingId(offeringId: string): boolean;
   offeringsFor(form: TakoformV1Alpha3FormRef): readonly Offering[];
   /**
    * Pins the commercial terms a caller was quoted. A grant carries this digest
@@ -160,6 +162,10 @@ export function createCatalog(offerings: readonly Offering[]): Catalog {
     findOffering(offeringId): Offering | undefined {
       const offering = byId.get(offeringId);
       return offering?.available ? offering : undefined;
+    },
+
+    hasOfferingId(offeringId): boolean {
+      return byId.has(offeringId);
     },
 
     offeringsFor(form): readonly Offering[] {
