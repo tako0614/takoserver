@@ -167,6 +167,8 @@ export class CloudflareProviderProxy implements Provider {
     if (executionContext !== undefined) {
       if (
         input.previous !== undefined ||
+        input.identity.incarnationId !== undefined ||
+        input.identity.generation !== undefined ||
         input.operationMode !== "initial" ||
         prospectiveDeploymentId !== `dep_${input.operationId}`
       )
@@ -209,6 +211,8 @@ export class CloudflareProviderProxy implements Provider {
     if (executionContext !== undefined) {
       if (
         input.previous !== undefined ||
+        input.identity.incarnationId !== undefined ||
+        input.identity.generation !== undefined ||
         input.operationMode === "initial" ||
         prospectiveDeploymentId !== `dep_${input.operationId}`
       )

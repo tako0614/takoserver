@@ -79,6 +79,22 @@ test("old CPE cannot silently discard a fresh-create context", async () => {
   expect(legacyCalls).toBe(0);
 });
 
+test("context cannot turn a caller-selected incarnation into create custody", async () => {
+  let calls = 0;
+  const provider = proxy({
+    applyWithExecutionContextV1: async () => {
+      calls++;
+      return failed;
+    },
+  });
+  const ticket = await provider.apply(
+    { ...input, identity: { ...input.identity, incarnationId: "dep_caller" } },
+    { prospectiveDeploymentId: "dep_op-context-1" },
+  );
+  expect(ticket).toMatchObject({ phase: "failed", failure: { code: "unavailable" } });
+  expect(calls).toBe(0);
+});
+
 test("recovery forwards the same versioned context and never upgrades missing mode to initial", async () => {
   const calls: unknown[] = [];
   const provider = proxy({
