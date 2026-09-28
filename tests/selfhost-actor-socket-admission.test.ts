@@ -204,7 +204,8 @@ if (childMode) {
       new Response(child.stderr).text(),
       child.exited,
     ]);
-    expect(exitCode).toBe(0, `${stdout}\n${stderr}`);
+    expect(exitCode).toBe(0);
+    if (exitCode !== 0) throw new Error(`${stdout}\n${stderr}`);
 
     const { createActorAlarmAttemptRegistry } = await import(
       "../src/selfhost-actor-native-process.ts"
