@@ -48,6 +48,27 @@ jobs:
           } | tee "${report}"
 
           expected_package_version='1:20.1.8-2ubuntu8'
+          if ! sudo apt-get update; then
+            echo "prerequisite_failure: Ubuntu package index refresh failed" | tee -a "${report}"
+            exit 1
+          fi
+          llvm_dev_packages=(
+            "libc++-20-dev=${expected_package_version}"
+            "libc++abi-20-dev=${expected_package_version}"
+            "libunwind-20-dev=${expected_package_version}"
+          )
+          if ! sudo apt-get install --no-upgrade --no-remove --no-install-recommends --yes "${llvm_dev_packages[@]}"; then
+            echo "prerequisite_failure: pinned LLVM development package installation failed" | tee -a "${report}"
+            exit 1
+          fi
+          for package in libc++-20-dev libc++abi-20-dev libunwind-20-dev; do
+            actual_dev_version="$(dpkg-query -W -f='${Version}' "${package}" 2>/dev/null || true)"
+            echo "${package}_version=${actual_dev_version}" | tee -a "${report}"
+            if [[ "${actual_dev_version}" != "${expected_package_version}" ]]; then
+              echo "prerequisite_failure: ${package} expected ${expected_package_version}, got ${actual_dev_version}" | tee -a "${report}"
+              exit 1
+            fi
+          done
           actual_package_version="$(dpkg-query -W -f='${Version}' clang-20 2>/dev/null || true)"
           expected_clang_line='Ubuntu clang version 20.1.8 (2ubuntu8)'
           actual_clang_line="$(/usr/bin/clang-20 --version 2>/dev/null | head -n 1 || true)"

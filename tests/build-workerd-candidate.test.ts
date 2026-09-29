@@ -30,6 +30,12 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     expect(workflow).toMatch(/^\s*workflow_dispatch:\s*$/mu);
     expect(workflow).not.toMatch(/^\s*(?:push|pull_request):/mu);
     expect(workflow).toContain("runs-on: ubuntu-26.04");
+    expect(workflow).toContain("--no-upgrade --no-remove --no-install-recommends");
+    for (const packageName of ["libc++-20-dev", "libc++abi-20-dev", "libunwind-20-dev"]) {
+      expect(workflow).toContain(packageName + "=${expected_package_version}");
+    }
+    expect(workflow).toContain('${package}_version=${actual_dev_version}');
+    expect(workflow).toContain('"${actual_dev_version}" != "${expected_package_version}"');
     expect(workflow).toContain("timeout-minutes: 45");
     expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 40m");
     expect(workflow).toContain("--candidate workflow-loader");
