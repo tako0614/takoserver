@@ -1,10 +1,11 @@
 import type { FormRef, ResourceSummary } from "../api.ts";
+import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
-import { linkProps, navigate } from "../router.ts";
-import { api } from "../state.ts";
+import { linkProps, navigate, route } from "../router.ts";
+import { api, currentOrganization } from "../state.ts";
 import {
   badge,
   card,
@@ -33,13 +34,34 @@ export function resourceDetailPage(
   address: { space: string; kind: string; name: string },
 ): Child {
   const tab = signal<"overview" | "spec" | "observed" | "identity">("overview");
+  const routeSegments = ["resources", address.space, address.kind, address.name];
+  const isCurrent = (): boolean =>
+    currentOrganization()?.id === organizationId &&
+    routeSegments.every((segment, index) => route().segments[index] === segment);
   const page = resource(async () => {
-    const { resources } = await api.resources(organizationId, { space: address.space });
-    return (
-      resources.find(
-        (entry) => entry.kind === address.kind && entry.metadata.name === address.name,
-      ) ?? null
-    );
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    while (isCurrent()) {
+      const result = await api.resources(organizationId, {
+        space: address.space,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+      if (!isCurrent()) return null;
+      const found = result.resources.find(
+        (entry) =>
+          entry.metadata.space === address.space &&
+          entry.kind === address.kind &&
+          entry.metadata.name === address.name,
+      );
+      if (found) return found;
+      if (!result.cursor) return null;
+      if (seenCursors.has(result.cursor)) {
+        throw new ApiError("invalid_response", 200, "/v1/organizations/resources");
+      }
+      seenCursors.add(result.cursor);
+      cursor = result.cursor;
+    }
+    return null;
   });
 
   return h(
