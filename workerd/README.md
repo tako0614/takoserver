@@ -94,10 +94,13 @@ identity, Bazelisk/Bazel digests, clang version/platform, and both patch digests
 A full candidate build requires a clean Takoserver worktree and writes the
 binary plus `provenance.json` only beneath
 `artifacts/candidates/<identity>/`; the output SHA-256 names the exact candidate
-binary. Candidate mode uses Bazel `--jobs` and `--local_resources` scheduling
-budgets (default 2 jobs / 8192 MiB). These are Bazel scheduling limits, not an
-OS-enforced memory ceiling. The candidate publisher refuses an existing
-identity directory rather than replacing its bytes or record.
+binary. Candidate mode defaults to Bazel scheduling budgets of 2 jobs / 8192
+MiB for local use and accepts at most 4 jobs / 12288 MiB. Before building or
+running native tests, it measures effective CPU quota/cpuset and memory limits
+and refuses a requested budget the machine cannot provide. These are Bazel
+scheduling limits, not an OS-enforced memory ceiling. The candidate publisher
+refuses an existing identity directory rather than replacing its bytes or
+record.
 
 ```sh
 BAZELISK=/absolute/path/to/bazelisk \
@@ -117,17 +120,24 @@ non-compile way to verify archive retrieval and combined-patch application.
 
 The manual GitHub Actions workflow
 [`workerd-workflow-loader-candidate.yml`](../.github/workflows/workerd-workflow-loader-candidate.yml)
-tries this build on the standard `ubuntu-26.04` hosted runner. It records
-available disk and total memory before the build plus available disk after it,
-verifies the exact Ubuntu clang package/version and required LLVM paths, and
-uses a 40-minute build limit within a 45-minute job. A missing toolchain
-prerequisite, capacity failure, or timeout is a failed run, never a successful
-probe. No Bazel cache is shared between runs. A successful run uploads only the
-candidate binary and its provenance for seven days; the separate runner report
-is also retained for seven days. This manual workflow builds only: native
-tests, WorkerLoader qualification, runtime wiring, publication, and deployment
-are not performed. The uploaded binary remains an unqualified CI candidate and
-must not be configured as `TAKOSERVER_WORKERD_BINARY`.
+uses only the standard `ubuntu-26.04` hosted runner. It records effective CPU
+quota/cpuset, memory limit, available disk, and installed memory before the
+build; refuses to start the requested 4-job / 12288-MiB budget unless preflight
+confirms it; and verifies the exact Ubuntu clang package/version and required
+LLVM paths. Its bounded build/test estimates are 180 minutes and 60 minutes
+inside a 260-minute outer job timeout; those limits are not runtime promises.
+A missing toolchain prerequisite, unsupported capacity, build/test failure, or
+timeout is a failed run, never a successful probe. The exact candidate binary
+and its build-time unqualified provenance are uploaded immediately after the
+build, before the native tests run. The six reviewed targets above plus
+`//src/workerd/api/tests:worker-loader-test` (seven targets total) then run in
+the same job, source tree, Bazel output root, repository cache, compiler
+toolchain, and shared resource/flag construction as the build. A distinct
+native-test report is retained separately; it does not rewrite artifact
+provenance or promote the candidate. No large Bazel cache is uploaded or
+restored, so a later failed job still starts cold. The uploaded binary remains
+an unqualified CI candidate and must not be configured as
+`TAKOSERVER_WORKERD_BINARY`.
 
 The accepted build remains the default when `--candidate workflow-loader` is
 absent. The candidate output is explicitly marked

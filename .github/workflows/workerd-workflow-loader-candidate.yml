@@ -17,7 +17,7 @@ jobs:
   candidate-build:
     name: build unqualified WorkerLoader candidate
     runs-on: ubuntu-26.04
-    timeout-minutes: 65
+    timeout-minutes: 260
     steps:
       - name: Check out selected candidate commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
@@ -40,6 +40,10 @@ jobs:
             echo "runner_image=ubuntu-26.04"
             echo "runner_name=${RUNNER_NAME}"
             echo "architecture=$(uname -m)"
+            echo "cpu_online=$(getconf _NPROCESSORS_ONLN)"
+            echo "cpu_quota=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unavailable)"
+            echo "cpu_set=$(cat /sys/fs/cgroup/cpuset.cpus.effective 2>/dev/null || echo unavailable)"
+            echo "memory_limit_bytes=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)"
             echo "available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')"
             echo "memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
             df -h "${RUNNER_TEMP}"
@@ -92,6 +96,11 @@ jobs:
             exit 1
           fi
           echo "compiler_prerequisites=verified" | tee -a "${report}"
+          bun run build:workerd -- \
+            --candidate workflow-loader \
+            --preflight-only \
+            --jobs 4 \
+            --memory-mib 12288 | tee -a "${report}"
 
       - name: Download and verify pinned Bazelisk
         shell: bash
@@ -115,13 +124,13 @@ jobs:
           report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
           echo "build_start_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
           set +e
-          timeout --signal=TERM --kill-after=30s 60m \
+          timeout --signal=TERM --kill-after=30s 180m \
             env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
             bun run build:workerd -- \
               --candidate workflow-loader \
               --state-root "${state_root}" \
-              --jobs 2 \
-              --memory-mib 8192 2>&1 | tee "${build_log}"
+              --jobs 4 \
+              --memory-mib 12288 2>&1 | tee "${build_log}"
           pipeline_statuses=("${PIPESTATUS[@]}")
           build_status=${pipeline_statuses[0]:-1}
           tee_status=${pipeline_statuses[1]:-1}
@@ -176,5 +185,43 @@ jobs:
         with:
           name: workerd-workflow-loader-runner-report-${{ github.sha }}-${{ github.run_id }}
           path: ${{ runner.temp }}/workerd-candidate-runner-report.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Run native WorkerLoader candidate qualification targets
+        id: native-tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          report="${RUNNER_TEMP}/workerd-candidate-native-qualification-report.txt"
+          state_root="${RUNNER_TEMP}/workerd-workflow-loader-state"
+          echo "candidate_commit=${GITHUB_SHA}" | tee "${report}"
+          set +e
+          timeout --signal=TERM --kill-after=30s 60m \
+            env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
+            bun run build:workerd -- \
+              --candidate workflow-loader \
+              --native-qualification-only \
+              --state-root "${state_root}" \
+              --jobs 4 \
+              --memory-mib 12288 2>&1 | tee -a "${report}"
+          statuses=("${PIPESTATUS[@]}")
+          test_status=${statuses[0]:-1}
+          capture_status=${statuses[1]:-1}
+          set -e
+          echo "native_qualification_exit_code=${test_status}" | tee -a "${report}"
+          echo "native_qualification_capture_exit_code=${capture_status}" | tee -a "${report}"
+          if [[ "${capture_status}" -ne 0 ]]; then
+            echo "capture_failure: native qualification report was not fully preserved" | tee -a "${report}"
+            exit "${capture_status}"
+          fi
+          exit "${test_status}"
+
+      - name: Upload separate native qualification report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned: v7.0.1
+        with:
+          name: workerd-workflow-loader-native-qualification-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/workerd-candidate-native-qualification-report.txt
           if-no-files-found: warn
           retention-days: 7

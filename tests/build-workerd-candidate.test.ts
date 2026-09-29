@@ -6,8 +6,11 @@ import { join } from "node:path";
 import {
   applyWorkerdOverlays,
   createWorkflowLoaderCandidateProvenance,
+  preflightWorkflowLoaderCandidateResources,
   publishWorkflowLoaderCandidate,
+  WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
   type WorkerdOverlay,
+  workflowLoaderCandidateBazelArguments,
   workflowLoaderCandidateOverlays,
   workflowLoaderCandidateResourceArguments,
 } from "../scripts/build-workerd.ts";
@@ -32,19 +35,28 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     expect(workflow).toContain("runs-on: ubuntu-26.04");
     expect(workflow).toContain("--no-upgrade --no-remove --no-install-recommends");
     for (const packageName of ["libc++-20-dev", "libc++abi-20-dev", "libunwind-20-dev"]) {
-      expect(workflow).toContain(packageName + "=${expected_package_version}");
+      expect(workflow).toContain(`${packageName}=\${expected_package_version}`);
     }
-    expect(workflow).toContain("${package}_version=${actual_dev_version}");
-    expect(workflow).toContain('"${actual_dev_version}" != "${expected_package_version}"');
-    expect(workflow).toContain("timeout-minutes: 65");
+    expect(workflow).toContain(`\${package}_version=\${actual_dev_version}`);
+    expect(workflow).toContain(`"\${actual_dev_version}" != "\${expected_package_version}"`);
+    expect(workflow).toContain("timeout-minutes: 260");
+    expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 180m");
     expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 60m");
+    expect(workflow).toContain("cpu.max");
+    expect(workflow).toContain("cpuset.cpus.effective");
+    expect(workflow).toContain("--preflight-only");
     expect(workflow).toContain("--candidate workflow-loader");
-    expect(workflow).toContain("--jobs 2");
-    expect(workflow).toContain("--memory-mib 8192");
+    expect(workflow).toContain("--jobs 4");
+    expect(workflow).toContain("--memory-mib 12288");
     expect(workflow).toContain(`pipeline_statuses=("\${PIPESTATUS[@]}")`);
     expect(workflow).toContain(`tee_status=\${pipeline_statuses[1]:-1}`);
     expect(workflow).toContain("capture_failure:");
     expect(workflow).toContain("native-tests-not-run");
+    expect(workflow).toContain("--native-qualification-only");
+    expect(workflow.indexOf("Upload unqualified candidate binary and provenance")).toBeLessThan(
+      workflow.indexOf("Run native WorkerLoader candidate qualification targets"),
+    );
+    expect(workflow).toContain("Upload separate native qualification report");
     expect(workflow).toContain("retention-days: 7");
     expect(workflow).not.toMatch(/\b(?:bun test|bun run test|bazel test)\b/u);
     expect(workflow).not.toContain("TAKOSERVER_WORKERD_BINARY");
@@ -56,6 +68,100 @@ describe("workerd WorkerLoader candidate build inputs", () => {
       "--jobs=2",
       "--local_resources=cpu=2",
       "--local_resources=memory=8192",
+    ]);
+    expect(workflowLoaderCandidateResourceArguments({ jobs: 4, memoryMiB: 12288 })).toEqual([
+      "--jobs=4",
+      "--local_resources=cpu=4",
+      "--local_resources=memory=12288",
+    ]);
+    expect(() => workflowLoaderCandidateResourceArguments({ jobs: 5, memoryMiB: 8192 })).toThrow(
+      "limited to 4 Bazel jobs",
+    );
+    expect(() => workflowLoaderCandidateResourceArguments({ jobs: 2, memoryMiB: 12289 })).toThrow(
+      "limited to 12288 MiB",
+    );
+  });
+
+  test("preflight reports effective limits and refuses unsupported requested budgets", async () => {
+    await expect(
+      preflightWorkflowLoaderCandidateResources({
+        jobs: 4,
+        memoryMiB: 12288,
+        cpuQuota: "400000 100000",
+        cpuset: "0-3",
+        memoryLimit: String(16 * 1024 * 1024 * 1024),
+        physicalMemoryKiB: 16 * 1024 * 1024,
+      }),
+    ).resolves.toMatchObject({
+      requestedJobs: 4,
+      requestedMemoryMiB: 12288,
+      effectiveCpuCount: 4,
+      effectiveMemoryMiB: 16384,
+    });
+    await expect(
+      preflightWorkflowLoaderCandidateResources({
+        jobs: 4,
+        memoryMiB: 8192,
+        cpuQuota: "200000 100000",
+        cpuset: "0-3",
+        memoryLimit: "max",
+        physicalMemoryKiB: 16 * 1024 * 1024,
+      }),
+    ).rejects.toThrow("requested 4 Bazel jobs but runner exposes 2 CPU(s)");
+    await expect(
+      preflightWorkflowLoaderCandidateResources({
+        jobs: 2,
+        memoryMiB: 12288,
+        cpuQuota: "400000 100000",
+        cpuset: "0-3",
+        memoryLimit: String(8 * 1024 * 1024 * 1024),
+        physicalMemoryKiB: 16 * 1024 * 1024,
+      }),
+    ).rejects.toThrow("requested 12288 MiB Bazel memory but runner exposes 8192 MiB");
+  });
+
+  test("native build and test commands share the exact resource, cache, and toolchain flags", () => {
+    const common = {
+      stateRoot: "/tmp/workerd-candidate",
+      llvm: "/usr/lib/llvm-20",
+      tmp: "/tmp/workerd-candidate/tmp",
+      libraryPath: "/usr/lib/x86_64-linux-gnu:/usr/lib/llvm-20/lib",
+      jobs: 4,
+      memoryMiB: 12288,
+    };
+    const build = workflowLoaderCandidateBazelArguments({
+      ...common,
+      command: "build",
+      targets: ["//src/workerd/server:workerd"],
+    });
+    const tests = workflowLoaderCandidateBazelArguments({
+      ...common,
+      command: "test",
+      targets: ["//src/workerd/api/tests:worker-loader-test"],
+    });
+    expect(build).toContain("--output_user_root=/tmp/workerd-candidate/bazel-output");
+    expect(tests).toContain("--output_user_root=/tmp/workerd-candidate/bazel-output");
+    expect(build).toContain("--repository_cache=/tmp/workerd-candidate/repository-cache");
+    expect(tests).toContain("--repository_cache=/tmp/workerd-candidate/repository-cache");
+    expect(build).toContain("--jobs=4");
+    expect(tests).toContain("--jobs=4");
+    expect(build).toContain("--local_resources=memory=12288");
+    expect(tests).toContain("--local_resources=memory=12288");
+    expect(tests).toContain("--strategy=CppCompile=local");
+    expect(tests).toContain("--cxxopt=-isystem/usr/lib/llvm-20/include/c++/v1");
+    const withoutAction = (args: readonly string[]) =>
+      args.filter(
+        (argument) => argument !== "build" && argument !== "test" && !argument.startsWith("//"),
+      );
+    expect(withoutAction(build)).toEqual(withoutAction(tests));
+    expect(WORKFLOW_LOADER_NATIVE_TEST_TARGETS).toEqual([
+      "//src/workerd/tests:closed-module-graph-test",
+      "//src/workerd/tests:module-imports-test",
+      "//src/workerd/api/tests:new-module-registry-test",
+      "//src/workerd/api/tests:new-module-registry-startup-eval-test",
+      "//src/workerd/jsg:modules-new-test",
+      "//src/workerd/jsg:resource-test",
+      "//src/workerd/api/tests:worker-loader-test",
     ]);
   });
 

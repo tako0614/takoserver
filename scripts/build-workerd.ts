@@ -11,6 +11,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
@@ -32,9 +33,21 @@ interface BuildArguments {
   readonly archive?: string;
   readonly prepareOnly: boolean;
   readonly candidateWorkflowLoader: boolean;
+  readonly preflightOnly: boolean;
+  readonly nativeQualificationOnly: boolean;
   readonly jobs?: number;
   readonly memoryMiB?: number;
 }
+
+export const WORKFLOW_LOADER_NATIVE_TEST_TARGETS = [
+  "//src/workerd/tests:closed-module-graph-test",
+  "//src/workerd/tests:module-imports-test",
+  "//src/workerd/api/tests:new-module-registry-test",
+  "//src/workerd/api/tests:new-module-registry-startup-eval-test",
+  "//src/workerd/jsg:modules-new-test",
+  "//src/workerd/jsg:resource-test",
+  "//src/workerd/api/tests:worker-loader-test",
+] as const;
 
 export interface WorkerdOverlay {
   readonly name: string;
@@ -64,6 +77,17 @@ export interface WorkflowLoaderCandidateProvenance {
 async function main(): Promise<void> {
   const input = parseArguments(process.argv.slice(2));
   requireLinuxX64();
+  if (input.preflightOnly) {
+    console.log(
+      JSON.stringify(
+        await preflightWorkflowLoaderCandidateResources({
+          jobs: input.jobs ?? 2,
+          memoryMiB: input.memoryMiB ?? 8192,
+        }),
+      ),
+    );
+    return;
+  }
   await requireDigest(OVERLAY, WORKERD_CLOSED_GRAPH_ARTIFACT.overlayPatchSha256, "overlay patch");
 
   const candidateProvenance = input.candidateWorkflowLoader
@@ -91,6 +115,18 @@ async function main(): Promise<void> {
   for (const directory of [stateRoot, downloads, sourceParent, tmp, tools, artifacts]) {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
+  }
+
+  if (input.nativeQualificationOnly) {
+    if (candidateProvenance === null)
+      throw new Error("native qualification requires candidate mode");
+    await runWorkflowLoaderCandidateNativeTests({
+      stateRoot,
+      provenance: candidateProvenance,
+      jobs: input.jobs ?? 2,
+      memoryMiB: input.memoryMiB ?? 8192,
+    });
+    return;
   }
 
   const archive = join(downloads, `workerd-${WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit}.tar.gz`);
@@ -209,34 +245,27 @@ async function main(): Promise<void> {
     LD_LIBRARY_PATH: libraryPath,
     TMPDIR: tmp,
   };
-  await run(
-    [
-      bazelisk,
-      `--output_user_root=${join(stateRoot, "bazel-output")}`,
-      "build",
-      ...(candidateProvenance === null
-        ? []
-        : workflowLoaderCandidateResourceArguments({
-            jobs: input.jobs ?? 2,
-            memoryMiB: input.memoryMiB ?? 8192,
-          })),
-      WORKERD_TARGET,
-      `--repository_cache=${join(stateRoot, "repository-cache")}`,
-      `--action_env=LD_LIBRARY_PATH=${libraryPath}`,
-      `--host_action_env=LD_LIBRARY_PATH=${libraryPath}`,
-      `--action_env=TMPDIR=${tmp}`,
-      `--host_action_env=TMPDIR=${tmp}`,
-      `--copt=-resource-dir=${join(llvm, "lib/clang/20")}`,
-      `--host_copt=-resource-dir=${join(llvm, "lib/clang/20")}`,
-      `--cxxopt=-isystem${join(llvm, "include/c++/v1")}`,
-      `--host_cxxopt=-isystem${join(llvm, "include/c++/v1")}`,
-      `--linkopt=-L${join(llvm, "lib")}`,
-      `--host_linkopt=-L${join(llvm, "lib")}`,
-      "--strategy=CppCompile=local",
-    ],
-    source,
-    environment,
-  );
+  const bazelArguments = {
+    stateRoot,
+    llvm,
+    tmp,
+    libraryPath,
+    jobs: input.jobs ?? 2,
+    memoryMiB: input.memoryMiB ?? 8192,
+  };
+  if (candidateProvenance !== null) {
+    const capacity = await preflightWorkflowLoaderCandidateResources(bazelArguments);
+    console.log(`candidate_runner_capacity=${JSON.stringify(capacity)}`);
+  }
+  const commandArguments =
+    candidateProvenance === null
+      ? workerdBazelArguments({ ...bazelArguments, command: "build", targets: [WORKERD_TARGET] })
+      : workflowLoaderCandidateBazelArguments({
+          ...bazelArguments,
+          command: "build",
+          targets: [WORKERD_TARGET],
+        });
+  await run([bazelisk, ...commandArguments], source, environment);
 
   await requireDigest(
     join(
@@ -292,11 +321,279 @@ export function workflowLoaderCandidateResourceArguments(input: {
   readonly jobs: number;
   readonly memoryMiB: number;
 }): readonly string[] {
+  validateWorkflowLoaderCandidateBudget(input);
   return [
     `--jobs=${input.jobs}`,
     `--local_resources=cpu=${input.jobs}`,
     `--local_resources=memory=${input.memoryMiB}`,
   ];
+}
+
+export async function preflightWorkflowLoaderCandidateResources(input: {
+  readonly jobs: number;
+  readonly memoryMiB: number;
+  readonly cpuQuota?: string;
+  readonly cpuset?: string;
+  readonly memoryLimit?: string;
+  readonly physicalMemoryKiB?: number;
+}): Promise<{
+  readonly requestedJobs: number;
+  readonly requestedMemoryMiB: number;
+  readonly effectiveCpuCount: number;
+  readonly effectiveMemoryMiB: number;
+}> {
+  validateWorkflowLoaderCandidateBudget(input);
+  const [cpuQuota, cpuset, memoryLimit, memoryInfo] = await Promise.all([
+    input.cpuQuota === undefined
+      ? readOptionalFile("/sys/fs/cgroup/cpu.max")
+      : Promise.resolve(input.cpuQuota),
+    input.cpuset === undefined
+      ? readOptionalFile("/sys/fs/cgroup/cpuset.cpus.effective")
+      : Promise.resolve(input.cpuset),
+    input.memoryLimit === undefined
+      ? readOptionalFile("/sys/fs/cgroup/memory.max")
+      : Promise.resolve(input.memoryLimit),
+    input.physicalMemoryKiB === undefined
+      ? readOptionalFile("/proc/meminfo")
+      : Promise.resolve(String(input.physicalMemoryKiB)),
+  ]);
+  const effectiveCpuCount = effectiveCpuCapacity(cpuQuota, cpuset, availableParallelism());
+  const effectiveMemoryMiB = effectiveMemoryCapacity(memoryLimit, memoryInfo);
+  if (effectiveCpuCount < input.jobs) {
+    throw new Error(
+      "candidate resource preflight refused: requested " +
+        input.jobs +
+        " Bazel jobs but runner exposes " +
+        effectiveCpuCount +
+        " CPU(s)",
+    );
+  }
+  if (effectiveMemoryMiB < input.memoryMiB) {
+    throw new Error(
+      "candidate resource preflight refused: requested " +
+        input.memoryMiB +
+        " MiB Bazel memory but runner exposes " +
+        effectiveMemoryMiB +
+        " MiB",
+    );
+  }
+  return {
+    requestedJobs: input.jobs,
+    requestedMemoryMiB: input.memoryMiB,
+    effectiveCpuCount,
+    effectiveMemoryMiB,
+  };
+}
+
+function validateWorkflowLoaderCandidateBudget(input: {
+  readonly jobs: number;
+  readonly memoryMiB: number;
+}): void {
+  if (!Number.isSafeInteger(input.jobs) || input.jobs < 1 || input.jobs > 4) {
+    throw new Error("candidate builds are limited to 4 Bazel jobs");
+  }
+  if (!Number.isSafeInteger(input.memoryMiB) || input.memoryMiB < 1 || input.memoryMiB > 12288) {
+    throw new Error("candidate memory scheduling budget is limited to 12288 MiB");
+  }
+}
+
+function workerdBazelArguments(input: {
+  readonly stateRoot: string;
+  readonly llvm: string;
+  readonly tmp: string;
+  readonly libraryPath: string;
+  readonly command: "build" | "test";
+  readonly targets: readonly string[];
+}): readonly string[] {
+  return [
+    `--output_user_root=${join(input.stateRoot, "bazel-output")}`,
+    input.command,
+    ...input.targets,
+    `--repository_cache=${join(input.stateRoot, "repository-cache")}`,
+    `--action_env=LD_LIBRARY_PATH=${input.libraryPath}`,
+    `--host_action_env=LD_LIBRARY_PATH=${input.libraryPath}`,
+    `--action_env=TMPDIR=${input.tmp}`,
+    `--host_action_env=TMPDIR=${input.tmp}`,
+    `--copt=-resource-dir=${join(input.llvm, "lib/clang/20")}`,
+    `--host_copt=-resource-dir=${join(input.llvm, "lib/clang/20")}`,
+    `--cxxopt=-isystem${join(input.llvm, "include/c++/v1")}`,
+    `--host_cxxopt=-isystem${join(input.llvm, "include/c++/v1")}`,
+    `--linkopt=-L${join(input.llvm, "lib")}`,
+    `--host_linkopt=-L${join(input.llvm, "lib")}`,
+    "--strategy=CppCompile=local",
+  ];
+}
+
+export function workflowLoaderCandidateBazelArguments(input: {
+  readonly stateRoot: string;
+  readonly llvm: string;
+  readonly tmp: string;
+  readonly libraryPath: string;
+  readonly jobs: number;
+  readonly memoryMiB: number;
+  readonly command: "build" | "test";
+  readonly targets: readonly string[];
+}): readonly string[] {
+  validateWorkflowLoaderCandidateBudget(input);
+  const common = workerdBazelArguments(input);
+  return [
+    common[0] ?? "",
+    common[1] ?? "",
+    ...workflowLoaderCandidateResourceArguments({ jobs: input.jobs, memoryMiB: input.memoryMiB }),
+    ...common.slice(2),
+  ];
+}
+
+async function runWorkflowLoaderCandidateNativeTests(input: {
+  readonly stateRoot: string;
+  readonly provenance: WorkflowLoaderCandidateProvenance;
+  readonly jobs: number;
+  readonly memoryMiB: number;
+}): Promise<void> {
+  const capacity = await preflightWorkflowLoaderCandidateResources(input);
+  console.log(`candidate_runner_capacity=${JSON.stringify(capacity)}`);
+  const identityDirectory = join(
+    input.stateRoot,
+    "artifacts/candidates",
+    input.provenance.identity.slice(7),
+  );
+  const record = JSON.parse(await Bun.file(join(identityDirectory, "provenance.json")).text()) as {
+    readonly identity?: string;
+    readonly binaryPath?: string;
+    readonly binarySha256?: string;
+    readonly qualification?: string;
+    readonly nativeQualification?: string;
+  };
+  if (
+    record.identity !== input.provenance.identity ||
+    record.qualification !== "unqualified-native-tests-not-run" ||
+    record.nativeQualification !== "not-run" ||
+    record.binaryPath === undefined ||
+    record.binarySha256 === undefined
+  ) {
+    throw new Error(
+      "native qualification requires the exact previously published unqualified candidate provenance",
+    );
+  }
+  await requireDigest(
+    record.binaryPath,
+    record.binarySha256,
+    "candidate binary before native qualification",
+  );
+
+  const sourceName =
+    "workerd-" +
+    WORKERD_CLOSED_GRAPH_ARTIFACT.upstreamCommit +
+    "-candidate-" +
+    input.provenance.identity.slice(7, 23);
+  const source = join(input.stateRoot, "source", sourceName);
+  const stateRoot = input.stateRoot;
+  const tmp = join(stateRoot, "tmp");
+  const llvmRoot = requiredAbsoluteEnvironmentPath("WORKERD_LLVM_ROOT");
+  const llvm = join(llvmRoot, "usr/lib/llvm-20");
+  const platformLibraries = join(llvmRoot, "usr/lib/x86_64-linux-gnu");
+  const libraryPath = `${platformLibraries}:${join(llvm, "lib")}`;
+  const bazelisk = requiredAbsoluteEnvironmentPath("BAZELISK");
+  await requireDigest(
+    bazelisk,
+    WORKERD_CLOSED_GRAPH_ARTIFACT.bazeliskSha256,
+    "Bazelisk executable",
+  );
+  const environment = {
+    HOME: stateRoot,
+    XDG_CACHE_HOME: join(stateRoot, "cache/xdg"),
+    XDG_CONFIG_HOME: join(stateRoot, "config"),
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    PATH: `${join(stateRoot, "tools")}:/usr/bin:/bin`,
+    BAZELISK_HOME: join(stateRoot, "cache/bazelisk"),
+    BAZELISK_SKIP_WRAPPER: "true",
+    BAZEL_COMPILER: "clang",
+    CC: join(stateRoot, "tools/clang"),
+    CXX: join(stateRoot, "tools/clang++"),
+    LD_LIBRARY_PATH: libraryPath,
+    TMPDIR: tmp,
+  };
+  const args = workflowLoaderCandidateBazelArguments({
+    stateRoot,
+    llvm,
+    tmp,
+    libraryPath,
+    jobs: input.jobs,
+    memoryMiB: input.memoryMiB,
+    command: "test",
+    targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+  });
+  await run([bazelisk, ...args], source, environment);
+  console.log(
+    JSON.stringify({
+      candidateIdentity: input.provenance.identity,
+      binarySha256: record.binarySha256,
+      nativeTestTargets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+      nativeTests: "passed; artifact provenance unchanged",
+      promotion: "not-performed; candidate remains unqualified",
+    }),
+  );
+}
+
+async function readOptionalFile(path: string): Promise<string | undefined> {
+  return await Bun.file(path)
+    .text()
+    .catch(() => undefined);
+}
+
+function effectiveCpuCapacity(
+  cpuQuota: string | undefined,
+  cpuset: string | undefined,
+  fallback: number,
+): number {
+  const capacities = [fallback];
+  if (cpuQuota !== undefined) {
+    const [quotaText, periodText] = cpuQuota.trim().split(/\s+/u);
+    if (quotaText !== undefined && quotaText !== "max" && periodText !== undefined) {
+      const quota = Number(quotaText);
+      const period = Number(periodText);
+      if (Number.isFinite(quota) && Number.isFinite(period) && quota > 0 && period > 0)
+        capacities.push(Math.floor(quota / period));
+    }
+  }
+  if (cpuset !== undefined) {
+    const count = parseCpuSetCount(cpuset.trim());
+    if (count !== undefined) capacities.push(count);
+  }
+  return Math.max(0, Math.min(...capacities));
+}
+
+function parseCpuSetCount(value: string): number | undefined {
+  if (value === "") return undefined;
+  let count = 0;
+  for (const part of value.split(",")) {
+    const match = /^(\d+)(?:-(\d+))?$/u.exec(part);
+    if (match === null) return undefined;
+    const first = Number(match[1]);
+    const last = Number(match[2] ?? match[1]);
+    if (last < first) return undefined;
+    count += last - first + 1;
+  }
+  return count;
+}
+
+function effectiveMemoryCapacity(
+  memoryLimit: string | undefined,
+  memoryInfo: string | undefined,
+): number {
+  const limits: number[] = [];
+  if (memoryLimit !== undefined && memoryLimit.trim() !== "max") {
+    const bytes = Number(memoryLimit.trim());
+    if (Number.isFinite(bytes) && bytes > 0) limits.push(Math.floor(bytes / 1024 / 1024));
+  }
+  if (memoryInfo !== undefined) {
+    const match = /^MemTotal:\s+(\d+)\s+kB$/mu.exec(memoryInfo);
+    const physicalKiB = Number(match?.[1] ?? memoryInfo);
+    if (Number.isFinite(physicalKiB) && physicalKiB > 0)
+      limits.push(Math.floor(physicalKiB / 1024));
+  }
+  return limits.length === 0 ? 0 : Math.min(...limits);
 }
 
 export async function createWorkflowLoaderCandidateProvenance(input: {
@@ -417,6 +714,8 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
   let stateRoot: string | undefined;
   let archive: string | undefined;
   let prepareOnly = false;
+  let preflightOnly = false;
+  let nativeQualificationOnly = false;
   let candidateWorkflowLoader = false;
   let jobs: number | undefined;
   let memoryMiB: number | undefined;
@@ -424,6 +723,14 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
     const argument = arguments_[index];
     if (argument === "--prepare-only") {
       prepareOnly = true;
+      continue;
+    }
+    if (argument === "--preflight-only") {
+      preflightOnly = true;
+      continue;
+    }
+    if (argument === "--native-qualification-only") {
+      nativeQualificationOnly = true;
       continue;
     }
     if (argument === "--candidate") {
@@ -449,11 +756,11 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
           throw new Error(`${argument} requires a positive integer`);
         }
         if (argument === "--jobs") {
-          if (parsed > 2) throw new Error("candidate builds are limited to 2 Bazel jobs");
+          if (parsed > 4) throw new Error("candidate builds are limited to 4 Bazel jobs");
           jobs = parsed;
         } else {
-          if (parsed > 32768)
-            throw new Error("candidate memory scheduling budget is limited to 32768 MiB");
+          if (parsed > 12288)
+            throw new Error("candidate memory scheduling budget is limited to 12288 MiB");
           memoryMiB = parsed;
         }
         index += 1;
@@ -469,7 +776,7 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
     }
     throw new Error(`unknown argument: ${argument ?? ""}`);
   }
-  if (stateRoot === undefined) {
+  if (stateRoot === undefined && !preflightOnly) {
     throw new Error(
       "usage: bun run build:workerd -- --state-root /absolute/private/path [--archive /absolute/workerd.tar.gz] [--prepare-only] [--candidate workflow-loader [--jobs 2] [--memory-mib 8192]]",
     );
@@ -477,11 +784,21 @@ function parseArguments(arguments_: readonly string[]): BuildArguments {
   if (!candidateWorkflowLoader && (jobs !== undefined || memoryMiB !== undefined)) {
     throw new Error("--jobs and --memory-mib are candidate-only build controls");
   }
+  if (preflightOnly && !candidateWorkflowLoader)
+    throw new Error("--preflight-only requires --candidate workflow-loader");
+  if (nativeQualificationOnly && (!candidateWorkflowLoader || stateRoot === undefined))
+    throw new Error("--native-qualification-only requires candidate mode and --state-root");
+  if (preflightOnly && (prepareOnly || nativeQualificationOnly || archive !== undefined))
+    throw new Error("--preflight-only cannot be combined with build options");
+  if (nativeQualificationOnly && (prepareOnly || archive !== undefined))
+    throw new Error("native qualification cannot be combined with archive preparation");
   return {
-    stateRoot,
+    stateRoot: stateRoot ?? "",
     ...(archive === undefined ? {} : { archive }),
     prepareOnly,
     candidateWorkflowLoader,
+    preflightOnly,
+    nativeQualificationOnly,
     ...(jobs === undefined ? {} : { jobs }),
     ...(memoryMiB === undefined ? {} : { memoryMiB }),
   };
