@@ -34,7 +34,7 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     for (const packageName of ["libc++-20-dev", "libc++abi-20-dev", "libunwind-20-dev"]) {
       expect(workflow).toContain(packageName + "=${expected_package_version}");
     }
-    expect(workflow).toContain('${package}_version=${actual_dev_version}');
+    expect(workflow).toContain("${package}_version=${actual_dev_version}");
     expect(workflow).toContain('"${actual_dev_version}" != "${expected_package_version}"');
     expect(workflow).toContain("timeout-minutes: 45");
     expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 40m");
