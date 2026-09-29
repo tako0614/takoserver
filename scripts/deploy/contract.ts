@@ -1076,6 +1076,66 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-production-d1-fresh-init",
+      target: "cloudflare-d1:new-production-database-fully-migrated-to-current-head",
+      covers: [
+        "migrations",
+        "scripts/deploy.ts",
+        "scripts/deploy/contract.ts",
+        "scripts/deploy/production-d1-fresh-init.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+        "scripts/deploy/d1-migration-import.ts",
+        "scripts/deploy/application-schema-shape.ts",
+        "scripts/deploy/schema.ts",
+        "scripts/deploy/migrations.ts",
+        "scripts/deploy/d1.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/qualification.ts",
+        "tests/deploy-production-d1-fresh-init.test.ts",
+        "docs/deploy.md",
+      ],
+      requiresScripts: ["check:migrations"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance:
+          `${exactSource} Production only. One explicit --generation=<32-lowercase-hex> derives ` +
+          "the fresh name as takoserver-p-<generation>; TAKOSERVER_DEPLOY_TARGET_PRODUCTION must " +
+          "name the incumbent production target, whose D1 identity is printed and never read by a " +
+          "provider operation. The scoped migration gate runs once; the fixed audited 0001-0066 " +
+          "names and bytes are sealed before creation. A separately digested import file preserves " +
+          "every migration byte and adds only Wranglers migration-ledger DDL and inserts.",
+        "pre-mutation-proof":
+          "The fresh name must be absent at inspection and again at the creation fence; an existing " +
+          "database is never adopted, reset or re-migrated. The new D1 UUID/name and exact empty " +
+          "canonical shape are checked before migration, and the exact 0001-0066 lineage, canonical " +
+          "schema digest and application-schema match are checked after. The incumbent database and " +
+          "object bucket are outside this surface provider capability.",
+        "independent-review": review,
+        "post-conditions":
+          "One new D1 is created, proved empty, migrated through one Wrangler file import and read " +
+          "back as the exact 0001-0066 lineage with a matching application schema. The result prints " +
+          "the exact d1.databaseName/d1.databaseId a successor target descriptor needs and reports " +
+          "targetBinding not-written. No Worker, route, namespace, secret, R2 object state or " +
+          "current target is changed.",
+        reversal:
+          "The incumbent database and bucket are untouched, so the deliberate reversal is to " +
+          "discard the fresh database and keep serving the incumbent; archiving the incumbent is a " +
+          "separate operator decision. There is no down migration, reset, adoption or automatic " +
+          "deletion of either database.",
+        "failure-handling":
+          `${highRiskFailure} Both actions require an explicit CLOUDFLARE_API_TOKEN and apply also ` +
+          "requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or integration fallback and no " +
+          "--dry-run beyond the side-effect-free --status probe." +
+          inputContract(applyReviewInput),
+      },
+    },
+    {
       surface: "takoserver-integration-storage-disposal",
       target: "cloudflare-d1-and-r2:exact-selected-integration-target-only",
       covers: [

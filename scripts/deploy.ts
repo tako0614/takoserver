@@ -22,6 +22,10 @@ import { runIntegrationStorageGeneration } from "./deploy/integration-storage-ge
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import { requireEnvironment } from "./deploy/process.ts";
+import {
+  type ProductionD1FreshInitInvocation,
+  runProductionD1FreshInit,
+} from "./deploy/production-d1-fresh-init.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
 import {
   type RehearsalD1CreateDeclaration,
@@ -84,6 +88,10 @@ const USAGE = `takoserver deploy
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
+  takoserver-production-d1-fresh-init creates one new empty production D1 and applies the complete
+    audited 0001-0066 lineage to it in one reviewed command. It is production-only, requires the
+    explicit --generation=<32-lowercase-hex> and TAKOSERVER_DEPLOY_TARGET_PRODUCTION, and never
+    reads, adopts, resets, archives or deletes the incumbent production database or its bucket.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -125,6 +133,7 @@ type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
 type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
+type ProductionD1FreshInitSurface = "takoserver-production-d1-fresh-init";
 type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
   Surface,
@@ -134,6 +143,7 @@ type StandardSurface = Exclude<
   | StorageDisposalSurface
   | HostRetirementSurface
   | RehearsalD1CreateSurface
+  | ProductionD1FreshInitSurface
   | D1SnapshotRestoreSurface
 >;
 
@@ -167,6 +177,11 @@ type Invocation =
     })
   | (InvocationBase & {
       readonly surface: StorageGenerationSurface;
+      readonly action: "status" | "apply";
+      readonly generation: string;
+    })
+  | (InvocationBase & {
+      readonly surface: ProductionD1FreshInitSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
     })
@@ -566,7 +581,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
-  if ((generation !== null) !== storageGeneration) return null;
+  const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
+  if ((generation !== null) !== (storageGeneration || productionFreshInit)) return null;
   if (
     storageGeneration &&
     (environment !== "integration" ||
@@ -574,6 +590,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       (action !== "status" && action !== "apply"))
   ) {
     return null;
+  }
+  if (productionFreshInit) {
+    return environment === "production" &&
+      (action === "status" || action === "apply") &&
+      generation !== null &&
+      args.length === 5
+      ? { surface: surfaceValue, action, environment, commit, generation }
+      : null;
   }
   const closureDeltaNames = [
     ...retireVars,
@@ -1044,6 +1068,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runD1Schema0058Rehearsal(invocation, target);
     case "takoserver-integration-storage-generation":
       return await runIntegrationStorageGeneration(invocation, target);
+    case "takoserver-production-d1-fresh-init":
+      return await runProductionD1FreshInit(
+        {
+          action: invocation.action,
+          environment: invocation.environment,
+          commit: invocation.commit,
+          generation: invocation.generation,
+        } satisfies ProductionD1FreshInitInvocation,
+        target,
+      );
     case "takoserver-integration-storage-disposal":
       return await runIntegrationStorageDisposal(invocation, target);
     case "takoserver-integration-host-retirement":

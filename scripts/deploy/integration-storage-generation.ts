@@ -163,7 +163,7 @@ export interface IntegrationStorageGenerationTargetVerificationOptions {
   readonly wranglerCommand?: IntegrationStorageGenerationOptions["wranglerCommand"];
 }
 
-type IntegrationStorageGeneratedStateOptions = Pick<
+export type IntegrationStorageGeneratedStateOptions = Pick<
   IntegrationStorageGenerationOptions,
   "readD1State" | "reader" | "wranglerCommand"
 > & { readonly wranglerPath?: string };
@@ -712,27 +712,29 @@ async function applyStorageGeneration(
   return result;
 }
 
-async function checkedMigrationGate(run: IntegrationStorageGenerationProcess): Promise<void> {
+export async function checkedMigrationGate(
+  run: IntegrationStorageGenerationProcess,
+): Promise<void> {
   const result = await run(["bun", "run", "check:migrations"]);
   if (result.exitCode !== 0) {
     throw preflightError("scoped migration gate `bun run check:migrations` failed");
   }
 }
 
-interface GeneratedD1Target {
+export interface GeneratedD1Target {
   readonly accountId: string;
   readonly databaseName: string;
   readonly databaseId: string;
 }
 
-async function applySealedMigrations(
+export async function applySealedMigrations(
   configPath: string,
   databaseName: string,
   importPath: string,
   target: GeneratedD1Target,
   environment: Readonly<Record<string, string>>,
   run: IntegrationStorageGenerationProcess,
-  options: IntegrationStorageGenerationOptions,
+  options: IntegrationStorageGeneratedStateOptions,
   sealed: ReturnType<typeof sealDirectory>,
   expectedMigrations: readonly string[],
 ): Promise<{ readonly state: D1SchemaState }> {
@@ -800,7 +802,7 @@ async function applySealedMigrations(
   return { state };
 }
 
-async function readGeneratedState(
+export async function readGeneratedState(
   phase: DeployPhase,
   configPath: string,
   target: GeneratedD1Target,
@@ -836,7 +838,7 @@ function generatedStateWranglerCommand(
   return wranglerPath === undefined ? wranglerCommand : (args) => [wranglerPath, ...args];
 }
 
-function assertEmptyDatabase(state: D1SchemaState, databaseId: string): void {
+export function assertEmptyDatabase(state: D1SchemaState, databaseId: string): void {
   let applicationShape: string;
   try {
     applicationShape = canonicalApplicationShape(state);
@@ -864,7 +866,7 @@ function assertEmptyDatabase(state: D1SchemaState, databaseId: string): void {
   }
 }
 
-function assertCompleteDatabase(
+export function assertCompleteDatabase(
   state: D1SchemaState,
   expectedMigrations: readonly string[],
   migrationDigest: string,

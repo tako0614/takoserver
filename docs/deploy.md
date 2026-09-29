@@ -159,6 +159,43 @@ Successful output is only a candidate storage projection. It does not publish
 a Host or WfP Worker, register signing keys, change a route or switch the
 current target. Those steps retain their separate owning deploy surfaces.
 
+### Fresh production storage (deliberate replacement)
+
+A production database that cannot be moved forward wave by wave has one
+explicit replacement surface. It is production only and never touches the
+incumbent storage:
+
+```sh
+bun run deploy -- takoserver-production-d1-fresh-init --status --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex>
+bun run deploy -- takoserver-production-d1-fresh-init --apply --environment=production --commit=<40-hex-sha> --generation=<32-lowercase-hex>
+```
+
+The fresh name is `takoserver-p-<generation>`, and a name that equals either the
+incumbent database or the incumbent object bucket is refused before any
+provider call. The selected `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor
+supplies the account and the incumbent identity; this surface never writes that
+descriptor. `--status` is the side-effect-free probe: it lists the fresh name,
+prints the planned identity, the audited lineage digest, the migration count and
+the expected canonical application-schema digest, and reports the incumbent as
+untouched. `--apply` additionally requires an explicit
+`CLOUDFLARE_API_TOKEN` and `TAKOSERVER_INDEPENDENT_REVIEW`, qualifies one clean
+production commit, runs the migration gate once, seals the fixed audited
+0001–0066 names and bytes, proves the fresh name absent twice, creates one D1,
+proves the empty canonical shape, applies the lineage through one sealed
+`wrangler d1 execute --file` import, and verifies the exact lineage and
+application schema afterwards.
+
+An existing database, even an empty one, is never adopted, reset or re-migrated.
+The whole provider capability this surface holds is D1 inventory, create and
+read: it has no delete, update, binding, Worker, route, namespace or R2
+operation, so the incumbent database and bucket cannot be archived, deleted,
+rebound or replaced here and no new bucket is created. Apply output is a
+candidate identity (`d1.databaseName`/`d1.databaseId`) with
+`targetBinding: not-written`; pointing the target at it and archiving the
+replaced database are separate operator decisions and separate surfaces. A
+failure after the create boundary is indeterminate and is never retried or
+adopted.
+
 ### Retire a replaced integration Host
 
 After a disposable rebuild, the public Host has its own retirement operation.
@@ -789,6 +826,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-integration-host-retirement` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The current target selects the successor; exact `--retired-target`, `--retired-deployment`, and `--retired-version` select the replaced Host. No force or storage deletion. |
 | `takoserver-rehearsal-d1-create` | `--status`, `--apply` | rehearsal only | Absolute owned 0600 `TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH` and explicit `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`. No ordinary target descriptor, OAuth or production fallback. |
 | `takoserver-d1-snapshot-restore` | `--status`, `--apply` | rehearsal only | Absolute owned 0600 `TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH` and explicit `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`. The declaration pins the D1 UUID/name and the snapshot path with its sha256; the snapshot must be an owned single-link 0600 file. No ordinary target descriptor, OAuth or production fallback. |
+| `takoserver-production-d1-fresh-init` | `--status`, `--apply` | production only | Explicit `CLOUDFLARE_API_TOKEN` for both and `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`; exact `--generation=<32-lowercase-hex>` and the selected `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor, whose incumbent D1/R2 identity is printed and never mutated. Creates and fully migrates one new `takoserver-p-<generation>` D1 only; it does not write the target, create a bucket, or adopt, archive or delete existing storage. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
 | `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. No production rehearsal receipt is read or written. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
