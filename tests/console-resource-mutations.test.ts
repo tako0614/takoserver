@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { Offering } from "../console/src/api.ts";
+import type { Offering, Organization, ResourceSummary } from "../console/src/api.ts";
 
 // The console uses a small DOM surface. Exercise its real event handlers and
 // reactive rendering without replacing application modules or adding a browser
@@ -152,6 +152,27 @@ const offering = {
   pricePlan: { currency: "USD", provisioning: { amountMinor: 0 }, meters: [] },
 } as unknown as Offering;
 
+const organization = (id: string): Organization => ({
+  id,
+  name: id,
+  ownerPrincipalId: "owner",
+  createdAt: "2026-01-01T00:00:00Z",
+});
+
+const summary = (name: string): ResourceSummary => ({
+  apiVersion: form.apiVersion,
+  kind: form.kind,
+  metadata: {
+    space: "default",
+    name,
+    uid: name,
+    generation: "1",
+    revision: "1",
+    updatedAt: "2026-01-01T00:00:00Z",
+  },
+  form: { formRef: form },
+});
+
 describe("console accepted resource mutations", () => {
   test.each(["create", "delete", "failure"] as const)(
     "shows accepted %s and checks status without replaying the mutation",
@@ -162,11 +183,15 @@ describe("console accepted resource mutations", () => {
       );
       const { resourcesPage } = await import("../console/src/pages/resources.ts");
       const { consoleLocale } = await import("../console/src/i18n.ts");
-      const { setApiOrigin } = await import("../console/src/state.ts");
+      const { organizations, selectOrganization, setApiOrigin } = await import(
+        "../console/src/state.ts"
+      );
       const { route } = await import("../console/src/router.ts");
       const { mountToasts } = await import("../console/src/ui.ts");
       consoleLocale.set("en");
       setApiOrigin("https://api.example.test");
+      organizations.set([organization("org-console")]);
+      selectOrganization("org-console");
       route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
       body.append(mountToasts() as unknown as TestNode);
 
@@ -257,4 +282,147 @@ describe("console accepted resource mutations", () => {
       }
     },
   );
+});
+
+describe("console resource pagination", () => {
+  test("appends cursor pages, ignores duplicate clicks, and stops at the terminal page", async () => {
+    const body = installDom();
+    const { resourcesPage } = await import("../console/src/pages/resources.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { organizations, selectOrganization, setApiOrigin } = await import(
+      "../console/src/state.ts"
+    );
+    const { route } = await import("../console/src/router.ts");
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization("org-pagination")]);
+    selectOrganization("org-pagination");
+    route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
+
+    let resolveSecond!: (response: Response) => void;
+    const secondPage = new Promise<Response>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const requests: Request[] = [];
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        requests.push(request);
+        const url = new URL(request.url);
+        const cursor = url.searchParams.get("cursor");
+        if (!cursor) return Response.json({ resources: [summary("first")], cursor: "next-1" });
+        if (cursor === "next-1") return secondPage;
+        if (cursor === "next-2") return Response.json({ resources: [summary("third")] });
+        throw new Error(`unexpected cursor: ${cursor}`);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    body.append(resourcesPage("org-pagination") as unknown as TestNode);
+    await settle();
+    expect(body.textContent).toContain("first");
+    expect(body.textContent).toContain("Filters match loaded resources only");
+    const load = button(body, "Load more");
+    load.click();
+    load.click();
+    const resourceRequests = () =>
+      requests.filter((request) => new URL(request.url).pathname.endsWith("/resources"));
+    expect(resourceRequests()).toHaveLength(2);
+    await settle();
+    expect(button(body, "Loading…").attributes.has("disabled")).toBe(true);
+    resolveSecond(Response.json({ resources: [summary("second")], cursor: "next-2" }));
+    await settle();
+    expect(body.textContent).toContain("first");
+    expect(body.textContent).toContain("second");
+    button(body, "Load more").click();
+    await settle();
+    expect(body.textContent).toContain("third");
+    expect(
+      body.all().some((node) => node.tag === "button" && node.textContent === "Load more"),
+    ).toBe(false);
+    expect(
+      resourceRequests().map((request) => new URL(request.url).searchParams.get("cursor")),
+    ).toEqual([null, "next-1", "next-2"]);
+  });
+
+  test("retains loaded rows after a failed page and retries that cursor in Japanese", async () => {
+    const body = installDom();
+    const { resourcesPage } = await import("../console/src/pages/resources.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { organizations, selectOrganization, setApiOrigin } = await import(
+      "../console/src/state.ts"
+    );
+    const { route } = await import("../console/src/router.ts");
+    consoleLocale.set("ja");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization("org-pagination-retry")]);
+    selectOrganization("org-pagination-retry");
+    route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
+    let continuationRequests = 0;
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const cursor = new URL(request.url).searchParams.get("cursor");
+        if (!cursor) return Response.json({ resources: [summary("kept")], cursor: "retry-me" });
+        continuationRequests += 1;
+        if (continuationRequests === 1) throw new Error("temporary failure");
+        return Response.json({ resources: [summary("added")] });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    body.append(resourcesPage("org-pagination-retry") as unknown as TestNode);
+    await settle();
+    expect(body.textContent).toContain("続きも読み込む");
+    expect(body.textContent).toContain("絞り込み対象は読み込み済みのリソースです。");
+    button(body, "さらに読み込む").click();
+    await settle();
+    expect(body.textContent).toContain("kept");
+    expect(
+      body.all().some((node) => node.tag === "button" && node.textContent === "もう一度試す"),
+    ).toBe(true);
+    button(body, "もう一度試す").click();
+    await settle();
+    expect(body.textContent).toContain("kept");
+    expect(body.textContent).toContain("added");
+    expect(body.textContent).not.toContain("さらに読み込む");
+    expect(continuationRequests).toBe(2);
+  });
+
+  test("does not append a pending page after the current organization changes", async () => {
+    const body = installDom();
+    const { resourcesPage } = await import("../console/src/pages/resources.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { organizations, selectOrganization, setApiOrigin } = await import(
+      "../console/src/state.ts"
+    );
+    const { route } = await import("../console/src/router.ts");
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization("org-a"), organization("org-b")]);
+    selectOrganization("org-a");
+    route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
+    let resolveNext!: (response: Response) => void;
+    const nextPage = new Promise<Response>((resolve) => {
+      resolveNext = resolve;
+    });
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (new URL(request.url).searchParams.has("cursor")) return nextPage;
+        return Response.json({ resources: [summary("org-a-first")], cursor: "org-a-next" });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    body.append(resourcesPage("org-a") as unknown as TestNode);
+    await settle();
+    button(body, "Load more").click();
+    selectOrganization("org-b");
+    await settle();
+    expect(body.textContent).not.toContain("org-a-first");
+    resolveNext(Response.json({ resources: [summary("org-a-stale")] }));
+    await settle();
+    expect(body.textContent).not.toContain("org-a-stale");
+  });
 });

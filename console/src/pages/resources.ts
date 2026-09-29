@@ -4,7 +4,7 @@ import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
-import { api } from "../state.ts";
+import { api, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, ICON, icon, shortDigest, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
@@ -19,7 +19,20 @@ import { createResource } from "./create-resource.ts";
 export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
   const spaceFilter = signal("");
+  const additional = signal<readonly ResourceSummary[]>([]);
+  const continuation = signal<{ readonly cursor?: string } | null>(null);
+  const loadingMore = signal(false);
+  const moreError = signal<Error | null>(null);
   const page = resource(() => api.resources(organizationId));
+  let pagingGeneration = 0;
+  const reloadResources = (): void => {
+    pagingGeneration += 1;
+    additional.set([]);
+    continuation.set(null);
+    loadingMore.set(false);
+    moreError.set(null);
+    page.reload();
+  };
   const operationId = route().query.get("operation");
   // Keep the accepted handle in the URL across refreshes. Checking status is
   // explicit: it never resubmits create/delete or claims acceptance is done.
@@ -28,14 +41,55 @@ export function resourcesPage(organizationId: string): Child {
         try {
           return await api.resourceOperation(organizationId, operationId);
         } finally {
-          page.reload();
+          reloadResources();
         }
       })
     : null;
   const reload = (): void => {
     if (operation) operation.reload();
-    else page.reload();
+    else reloadResources();
   };
+  const loadMore = async (cursor: string): Promise<void> => {
+    if (loadingMore() || currentOrganization()?.id !== organizationId) return;
+    const mine = ++pagingGeneration;
+    loadingMore.set(true);
+    moreError.set(null);
+    try {
+      const next = await api.resources(organizationId, { cursor });
+      if (mine !== pagingGeneration || currentOrganization()?.id !== organizationId) return;
+      additional.update((loaded) => [...loaded, ...next.resources]);
+      continuation.set(next.cursor ? { cursor: next.cursor } : {});
+    } catch (error) {
+      if (mine === pagingGeneration && currentOrganization()?.id === organizationId) {
+        moreError.set(error instanceof Error ? error : new Error(String(error)));
+      }
+    } finally {
+      if (mine === pagingGeneration && currentOrganization()?.id === organizationId) {
+        loadingMore.set(false);
+      }
+    }
+  };
+  const moreButton = (cursor: string): Child =>
+    h(
+      "div",
+      { class: "toolbar", style: { justifyContent: "center" } },
+      h(
+        "button",
+        {
+          class: "btn",
+          type: "button",
+          ...(loadingMore() ? { disabled: true, "aria-busy": "true" } : {}),
+          onClick: () => void loadMore(cursor),
+        },
+        text(
+          loadingMore()
+            ? tr("読み込み中…", "Loading…")
+            : moreError()
+              ? tr("もう一度試す", "Try again")
+              : tr("さらに読み込む", "Load more"),
+        ),
+      ),
+    );
   // Loaded alongside, because the button that creates a resource must offer
   // exactly what this organization may provision — not a list written here.
   const catalog = resource(() => api.catalog(organizationId));
@@ -136,41 +190,56 @@ export function resourcesPage(organizationId: string): Child {
       whenReady(
         page.get(),
         ({ resources, cursor }) => {
-          if (resources.length === 0) {
+          if (currentOrganization()?.id !== organizationId) return null;
+          const allResources = [...resources, ...additional()];
+          const nextCursor = continuation() === null ? cursor : continuation()?.cursor;
+          if (allResources.length === 0) {
             return card(
               null,
-              empty(
-                tr("リソースがありません", "Nothing declared yet"),
-                tr(
-                  "ここで作成するか、Takoform providerまたはCLIから適用してください。ホストで作成が完了すると表示されます。",
-                  "Declare one here, or apply it with the Takoform provider or the CLI. It appears once the Host completes creation.",
+              h(
+                "div",
+                { style: { display: "grid", gap: "12px" } },
+                empty(
+                  tr("リソースがありません", "Nothing declared yet"),
+                  tr(
+                    "ここで作成するか、Takoform providerまたはCLIから適用してください。ホストで作成が完了すると表示されます。",
+                    "Declare one here, or apply it with the Takoform provider or the CLI. It appears once the Host completes creation.",
+                  ),
                 ),
+                moreError()
+                  ? h("div", { class: "notice notice--bad" }, moreError()?.message)
+                  : null,
+                nextCursor ? moreButton(nextCursor) : null,
               ),
             );
           }
-          const spaces = [...new Set(resources.map((entry) => entry.metadata.space))].sort();
+          const spaces = [...new Set(allResources.map((entry) => entry.metadata.space))].sort();
           return h(
             "div",
             { style: { display: "grid", gap: "14px" } },
             toolbar(filter, spaceFilter, spaces),
+            nextCursor
+              ? h(
+                  "div",
+                  { class: "dim", style: { fontSize: "12.5px" } },
+                  tr(
+                    "絞り込み対象は読み込み済みのリソースです。続きも読み込むと検索範囲が広がります。",
+                    "Filters match loaded resources only. Load more to search the rest.",
+                  ),
+                )
+              : null,
             card(
               null,
               h(
                 "div",
                 { class: "table-scroll" },
-                table(visible(resources, filter(), spaceFilter())),
+                table(visible(allResources, filter(), spaceFilter())),
               ),
             ),
-            cursor
-              ? h(
-                  "div",
-                  { class: "dim", style: { fontSize: "12.5px" } },
-                  tr(
-                    `先頭の${resources.length}件を表示しています。続きがあります。`,
-                    `Showing the first ${resources.length}. More pages exist.`,
-                  ),
-                )
+            moreError()
+              ? h("div", { class: "notice notice--bad" }, text(moreError()?.message ?? ""))
               : null,
+            nextCursor ? moreButton(nextCursor) : null,
           );
         },
         { retry: page.reload },
