@@ -28,11 +28,13 @@ const invocation: RehearsalD1CreateInvocation = {
   commit: COMMIT,
 };
 
-function qualifiedSource(): RehearsalD1CreateOptions["run"] {
+function qualifiedSource(): NonNullable<RehearsalD1CreateOptions["run"]> {
   return async (command) => {
     if (command.join(" ") === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (command.join(" ") === "git branch --show-current") return ok("rehearsal\n");
     if (command.join(" ") === "git status --porcelain=v1 -z --untracked-files=all") return ok();
+    if (command.join(" ") === "git fetch --quiet --all --prune") return ok();
+    if (command.join(" ") === `git branch -r --contains ${COMMIT}`) return ok("  origin/main\n");
     throw new Error(`unexpected qualification command: ${command.join(" ")}`);
   };
 }

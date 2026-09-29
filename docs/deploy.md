@@ -787,6 +787,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-console` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback). |
 | `takoserver-integration-storage-disposal` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Exact target-selected storage names only; complete current regular + dispatch Worker binding inventory required. |
 | `takoserver-integration-host-retirement` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The current target selects the successor; exact `--retired-target`, `--retired-deployment`, and `--retired-version` select the replaced Host. No force or storage deletion. |
+| `takoserver-rehearsal-d1-create` | `--status`, `--apply` | rehearsal only | Absolute owned 0600 `TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH` and explicit `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`. No ordinary target descriptor, OAuth or production fallback. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
 | `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. No production rehearsal receipt is read or written. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
@@ -1215,6 +1216,39 @@ copy size/runtime against platform limits, and compare rows, BLOBs, triggers and
 foreign keys after migration. Large targets require a separate bounded
 maintenance/shadow transition. Do not use an integration reset as production
 recovery or bypass the protected selector.
+
+For an isolated rehearsal target that does not yet exist, the separate
+`takoserver-rehearsal-d1-create` surface can allocate exactly one empty D1.
+It does not provision R2, import migrations, update a target descriptor or
+Worker binding, or select production. Both actions use an absolute,
+operator-owned 0600 JSON file at
+`TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH`:
+
+```json
+{
+  "kind": "takoserver.rehearsal-d1-create@v1",
+  "environment": "rehearsal",
+  "accountId": "<reviewed rehearsal account, 32 lowercase hex>",
+  "name": "takoserver-r-<fresh 32 lowercase hex generation>"
+}
+```
+
+```bash
+bun run deploy -- takoserver-rehearsal-d1-create --status --environment=rehearsal --commit=<40-hex-sha>
+bun run deploy -- takoserver-rehearsal-d1-create --apply --environment=rehearsal --commit=<40-hex-sha>
+```
+
+Both require explicit `CLOUDFLARE_API_TOKEN`; apply additionally requires an
+independent reviewer and clean, remote-reachable source. The operator must
+review the credential's actual account/D1 scope: the environment label and
+declaration do not prove the token cannot mutate production. The command
+checks exact name absence twice before one create, then reads back UUID/name
+and empty schema. An uncertain acknowledgement is never retried; inspect
+`--status` and quarantine the resource for separate disposition. A returned
+UUID is an input to a separately reviewed rehearsal target declaration, not
+authority to run a schema wave. The fixed empty-to-0022 baseline and later
+protected rehearsal waves remain separate; this surface does not advance the
+new D1 to 0057 or qualify 0058.
 
 The dedicated `takoserver-d1-schema-0058-rehearsal` surface is a bounded
 synthetic D1 experiment, **not** a protected-wave selector or production

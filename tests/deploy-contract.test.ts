@@ -67,6 +67,7 @@ const SURFACES = [
   ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
   ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
   ["takoserver-integration-host-retirement", ["irreversible", "authority"]],
+  ["takoserver-rehearsal-d1-create", ["irreversible", "authority"]],
   ["takoserver-d1-schema-0058-rehearsal", ["irreversible"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
@@ -702,6 +703,33 @@ describe("Takoserver split deploy entrypoint", () => {
 
   describe("parses only the fixed rehearsal baseline and approved schema wave boundaries", () => {
     const sha = "a".repeat(40);
+
+    test("routes rehearsal D1 creation without an ordinary target descriptor", async () => {
+      const accepted = await deploy([
+        "takoserver-rehearsal-d1-create",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH");
+      expect(accepted.stderr).not.toContain("deploy target descriptor");
+      for (const tail of [
+        ["--environment=production"],
+        ["--environment=integration"],
+        ["--environment=rehearsal", "--through-migration=0057"],
+      ]) {
+        const refused = await deploy([
+          "takoserver-rehearsal-d1-create",
+          "--status",
+          ...tail,
+          `--commit=${sha}`,
+        ]);
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stderr).toContain("no target was touched");
+        expect(refused.stderr).not.toContain("deploy target descriptor");
+      }
+    });
 
     test("accepts the fixed rehearsal baseline selector", async () => {
       const baseline = await deploy([

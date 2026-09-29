@@ -1168,6 +1168,33 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-rehearsal-d1-create",
+      target: "cloudflare-d1:one-explicit-new-rehearsal-database",
+      covers: [
+        "scripts/deploy/rehearsal-d1-create.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH",
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH selects one rehearsal account and a fresh generation-named D1. No ordinary target descriptor, Worker binding, R2 resource or schema import is read or changed.`,
+        "post-conditions":
+          "Cloudflare readback proves the returned UUID/name identifies the one newly created D1 and its non-internal schema-object count is zero. The UUID may be used in a separately reviewed rehearsal target declaration; it is not automatically adopted.",
+        reversal:
+          "No reset, delete or automatic cleanup is offered. An uncertain or unexpected creation is quarantined for separate operator decision.",
+        "failure-handling": `${highRiskFailure} Both actions require explicit CLOUDFLARE_API_TOKEN and the owned 0600 declaration selected by TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH; apply additionally requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or production fallback.`,
+        "pre-mutation-proof":
+          "Before the sole create, exact named-D1 absence is read and fenced again. The reviewer and clean, remote-reachable source commit are checked; the operator must separately review that the token is scoped to the intended rehearsal account.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-d1-schema-0058-rehearsal",
       target: "cloudflare-d1:explicit-isolated-0058-synthetic-rehearsal",
       covers: [

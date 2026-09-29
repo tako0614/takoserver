@@ -114,6 +114,7 @@ export async function runRehearsalD1Create(
   const source = await qualifySource({
     environment: "rehearsal",
     commit: invocation.commit,
+    policy: "clean-remote",
     ...(options.run === undefined ? {} : { run: options.run }),
   });
 

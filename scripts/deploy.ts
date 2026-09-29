@@ -1,3 +1,4 @@
+import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
 import { runConsole } from "./deploy/console.ts";
@@ -16,7 +17,12 @@ import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disp
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
+import { requireEnvironment } from "./deploy/process.ts";
 import type { DeployEnvironment } from "./deploy/qualification.ts";
+import {
+  type RehearsalD1CreateDeclaration,
+  runRehearsalD1Create,
+} from "./deploy/rehearsal-d1-create.ts";
 import { runRetirement } from "./deploy/retirement.ts";
 import {
   runD1Schema,
@@ -69,6 +75,8 @@ const USAGE = `takoserver deploy
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
   takoserver-d1-schema-0058-rehearsal is an isolated synthetic 0057 -> 0058 D1 qualification,
     rehearsal-only, no selector or production receipt; see docs/deploy.md.
+  takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
+    no target descriptor, schema import, binding change, or production mode is accepted.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -109,6 +117,7 @@ type OrgApiKeySurface = "takoserver-org-api-key";
 type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
+type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
 type StandardSurface = Exclude<
   Surface,
   | CredentialSurface
@@ -116,6 +125,7 @@ type StandardSurface = Exclude<
   | StorageGenerationSurface
   | StorageDisposalSurface
   | HostRetirementSurface
+  | RehearsalD1CreateSurface
 >;
 
 interface InvocationBase {
@@ -136,6 +146,11 @@ interface InvocationBase {
 }
 
 type Invocation =
+  | (InvocationBase & {
+      readonly surface: RehearsalD1CreateSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "rehearsal";
+    })
   | (InvocationBase & {
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
@@ -652,6 +667,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     } as Invocation;
   }
   if (action === "mint") return null;
+  if (surfaceValue === "takoserver-rehearsal-d1-create") {
+    return environment === "rehearsal" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
   const budget = 6 + (adoptLivePath === null ? 0 : 1) + (bootstrapVerifierBridge ? 1 : 0);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
@@ -885,7 +907,48 @@ function isSurface(value: string | undefined): value is Surface {
   return DEPLOY_CONTRACT.surfaces.some(({ surface }) => surface === value);
 }
 
+function loadRehearsalD1CreateDeclaration(): RehearsalD1CreateDeclaration {
+  const path = requireEnvironment("TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH");
+  if (!isAbsolute(path) || /[\0\r\n]/u.test(path)) {
+    throw new DeployError("preflight", "rehearsal D1 declaration path must be absolute");
+  }
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    throw new DeployError("preflight", "rehearsal D1 declaration could not be opened");
+  }
+  try {
+    const status = fstatSync(fd);
+    if (
+      !status.isFile() ||
+      status.nlink !== 1 ||
+      status.uid !== process.getuid?.() ||
+      (status.mode & 0o077) !== 0 ||
+      status.size > 4096
+    ) {
+      throw new DeployError(
+        "preflight",
+        "rehearsal D1 declaration must be owned 0600 regular file",
+      );
+    }
+    const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      throw new DeployError("preflight", "rehearsal D1 declaration must be a JSON object");
+    }
+    return parsed as RehearsalD1CreateDeclaration;
+  } catch (error) {
+    if (error instanceof DeployError) throw error;
+    throw new DeployError("preflight", "rehearsal D1 declaration is invalid JSON");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-rehearsal-d1-create") {
+    return await runRehearsalD1Create(loadRehearsalD1CreateDeclaration(), invocation);
+  }
   const target = loadTarget(targetPath(invocation.environment), invocation.environment);
   const scopeTransition =
     invocation.formAuthorityScopeTransitionPath === undefined
