@@ -5,7 +5,18 @@ import { resource, signal } from "../reactive.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
-import { ago, badge, card, copyable, empty, ICON, icon, shortDigest, whenReady } from "../ui.ts";
+import {
+  ago,
+  badge,
+  card,
+  copyable,
+  empty,
+  explain,
+  ICON,
+  icon,
+  shortDigest,
+  whenReady,
+} from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /**
@@ -90,6 +101,10 @@ export function resourcesPage(organizationId: string): Child {
         ),
       ),
     );
+  const pagingError = (): Child => {
+    const error = moreError();
+    return error ? h("div", { class: "notice notice--bad" }, text(explain(error))) : null;
+  };
   // Loaded alongside, because the button that creates a resource must offer
   // exactly what this organization may provision — not a list written here.
   const catalog = resource(() => api.catalog(organizationId));
@@ -206,9 +221,7 @@ export function resourcesPage(organizationId: string): Child {
                     "Declare one here, or apply it with the Takoform provider or the CLI. It appears once the Host completes creation.",
                   ),
                 ),
-                moreError()
-                  ? h("div", { class: "notice notice--bad" }, moreError()?.message)
-                  : null,
+                pagingError(),
                 nextCursor ? moreButton(nextCursor) : null,
               ),
             );
@@ -236,9 +249,7 @@ export function resourcesPage(organizationId: string): Child {
                 table(visible(allResources, filter(), spaceFilter())),
               ),
             ),
-            moreError()
-              ? h("div", { class: "notice notice--bad" }, text(moreError()?.message ?? ""))
-              : null,
+            pagingError(),
             nextCursor ? moreButton(nextCursor) : null,
           );
         },

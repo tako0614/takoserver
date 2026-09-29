@@ -345,49 +345,62 @@ describe("console resource pagination", () => {
     ).toEqual([null, "next-1", "next-2"]);
   });
 
-  test("retains loaded rows after a failed page and retries that cursor in Japanese", async () => {
-    const body = installDom();
-    const { resourcesPage } = await import("../console/src/pages/resources.ts");
-    const { consoleLocale } = await import("../console/src/i18n.ts");
-    const { organizations, selectOrganization, setApiOrigin } = await import(
-      "../console/src/state.ts"
-    );
-    const { route } = await import("../console/src/router.ts");
-    consoleLocale.set("ja");
-    setApiOrigin("https://api.example.test");
-    organizations.set([organization("org-pagination-retry")]);
-    selectOrganization("org-pagination-retry");
-    route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
-    let continuationRequests = 0;
-    globalThis.fetch = Object.assign(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(input, init);
-        const cursor = new URL(request.url).searchParams.get("cursor");
-        if (!cursor) return Response.json({ resources: [summary("kept")], cursor: "retry-me" });
-        continuationRequests += 1;
-        if (continuationRequests === 1) throw new Error("temporary failure");
-        return Response.json({ resources: [summary("added")] });
-      },
-      { preconnect: globalThis.fetch.preconnect },
-    );
+  test.each(["ja", "en"] as const)(
+    "localizes API paging failures in %s and retries the same cursor with or without loaded rows",
+    async (locale) => {
+      for (const hasInitialResources of [false, true]) {
+        const body = installDom();
+        const { resourcesPage } = await import("../console/src/pages/resources.ts");
+        const { consoleLocale } = await import("../console/src/i18n.ts");
+        const { organizations, selectOrganization, setApiOrigin } = await import(
+          "../console/src/state.ts"
+        );
+        const { route } = await import("../console/src/router.ts");
+        const orgId = `org-pagination-retry-${locale}-${hasInitialResources}`;
+        consoleLocale.set(locale);
+        setApiOrigin("https://api.example.test");
+        organizations.set([organization(orgId)]);
+        selectOrganization(orgId);
+        route.set({ path: "/resources", segments: ["resources"], query: new URLSearchParams() });
+        let continuationRequests = 0;
+        globalThis.fetch = Object.assign(
+          async (input: RequestInfo | URL, init?: RequestInit) => {
+            const request = new Request(input, init);
+            const cursor = new URL(request.url).searchParams.get("cursor");
+            if (!cursor) {
+              return Response.json({
+                resources: hasInitialResources ? [summary("kept")] : [],
+                cursor: "retry-me",
+              });
+            }
+            continuationRequests += 1;
+            if (continuationRequests === 1) {
+              return Response.json({ error: { code: "permission_denied" } }, { status: 403 });
+            }
+            return Response.json({ resources: [summary("added")] });
+          },
+          { preconnect: globalThis.fetch.preconnect },
+        );
 
-    body.append(resourcesPage("org-pagination-retry") as unknown as TestNode);
-    await settle();
-    expect(body.textContent).toContain("続きも読み込む");
-    expect(body.textContent).toContain("絞り込み対象は読み込み済みのリソースです。");
-    button(body, "さらに読み込む").click();
-    await settle();
-    expect(body.textContent).toContain("kept");
-    expect(
-      body.all().some((node) => node.tag === "button" && node.textContent === "もう一度試す"),
-    ).toBe(true);
-    button(body, "もう一度試す").click();
-    await settle();
-    expect(body.textContent).toContain("kept");
-    expect(body.textContent).toContain("added");
-    expect(body.textContent).not.toContain("さらに読み込む");
-    expect(continuationRequests).toBe(2);
-  });
+        body.append(resourcesPage(orgId) as unknown as TestNode);
+        await settle();
+        if (hasInitialResources) expect(body.textContent).toContain("kept");
+        button(body, locale === "ja" ? "さらに読み込む" : "Load more").click();
+        await settle();
+        expect(body.textContent).toContain(
+          locale === "ja"
+            ? "このアカウントには操作する権限がありません。"
+            : "This account is not allowed to do that.",
+        );
+        expect(body.textContent).not.toContain("permission_denied");
+        if (hasInitialResources) expect(body.textContent).toContain("kept");
+        button(body, locale === "ja" ? "もう一度試す" : "Try again").click();
+        await settle();
+        expect(body.textContent).toContain("added");
+        expect(continuationRequests).toBe(2);
+      }
+    },
+  );
 
   test("does not append a pending page after the current organization changes", async () => {
     const body = installDom();
