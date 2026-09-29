@@ -451,8 +451,8 @@ Host capability manifest, and handled by the runtime.
 
 As observed on 2026-09-29, no composed provider backend claims
 `DurableWorkflow`. The current selected contract and composition do not provide
-the execution-stop acknowledgement identified in
-[ADR 0010](adr/0010-durable-workflow-has-no-provider-owner.md); this observation
+qualified support for the selected execution contract, as described in
+[ADR 0010](adr/0010-durable-workflow-has-no-provider-owner.md). This observation
 does not rule out another implementation or composition.
 
 `ObjectBucket` left that list in

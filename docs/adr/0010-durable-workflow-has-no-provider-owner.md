@@ -5,8 +5,9 @@
 This record captures the implementation and composition inspected on
 2026-09-29. It is not a permanent decision that no backend or execution
 primitive can support the published Form, and it does not reinterpret or amend
-that Form's published contract. The current product contract remains owned by
-the published Takoform specification.
+the published contract. The Form publisher owns Form semantics, Takoform's
+frozen specification owns the Host API, and Takoserver's product docs own its
+control-plane surface.
 
 ## Observation
 
@@ -27,10 +28,10 @@ The source evidence inspected on that date was:
 | Internal workflow execution components existed but were documented as inactive and not composed into a serving entrypoint | `src/workflow-execution.ts`, `src/workflow-runtime.ts`, and `docs/workflow-runtime.md` |
 | The control catalogue projected optional availability fields from the resolver when present | `src/control.ts` and `src/app.ts` |
 
-The available source also identified a contract question around a host
-acknowledging that one identified execution has stopped. That is evidence
-about the inspected implementation's qualification gap; it does not establish
-that no existing or future primitive can provide the behavior.
+The inspected composition was not qualified for the selected workflow
+execution contract. This is an implementation qualification gap, not a claim
+that the published contract lacks termination semantics or that no primitive
+can provide them.
 
 ## Follow-up contract surface
 
