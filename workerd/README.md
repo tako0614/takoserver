@@ -70,9 +70,8 @@ The native acceptance run covers these real V8 targets:
 workerd's `kj_test` and `wd_test` macros declare no plain `//package:name`
 label: they rename the test rule to the test variant, so `name@` is the label
 that runs the test and a plain label resolves to nothing. Building or testing
-these targets therefore needs the declared variants. Bazel also reports only
-the first undeclared label of a target set, so a stale label fails before any
-native test starts and does not name the rest of the damage.
+these targets therefore needs the declared variants. Correcting the target
+labels is not evidence that native compilation or acceptance has passed.
 
 The Takoserver owner gate does not rebuild workerd. It validates the runtime
 adapter and fixtures portably; tests given `TAKOSERVER_WORKERD_BINARY` also run
