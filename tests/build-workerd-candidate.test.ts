@@ -36,8 +36,8 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     }
     expect(workflow).toContain("${package}_version=${actual_dev_version}");
     expect(workflow).toContain('"${actual_dev_version}" != "${expected_package_version}"');
-    expect(workflow).toContain("timeout-minutes: 45");
-    expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 40m");
+    expect(workflow).toContain("timeout-minutes: 65");
+    expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 60m");
     expect(workflow).toContain("--candidate workflow-loader");
     expect(workflow).toContain("--jobs 2");
     expect(workflow).toContain("--memory-mib 8192");

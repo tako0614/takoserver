@@ -17,7 +17,7 @@ jobs:
   candidate-build:
     name: build unqualified WorkerLoader candidate
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 65
     steps:
       - name: Check out selected candidate commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
@@ -115,7 +115,7 @@ jobs:
           report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
           echo "build_start_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
           set +e
-          timeout --signal=TERM --kill-after=30s 40m \
+          timeout --signal=TERM --kill-after=30s 60m \
             env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
             bun run build:workerd -- \
               --candidate workflow-loader \
