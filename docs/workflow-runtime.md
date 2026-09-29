@@ -17,7 +17,7 @@ That published closure does not fully define the JavaScript step callback,
 class environment, retry normalization or incomplete cross-kind replay. A
 separate, unregistered forward candidate now supplies those clauses in
 `takoform-forms`, at commit `59606f11d6d50e781383332f7c597de20a096e83`
-(`docs/proposals/workflow-execution-contract.md`). It defines an ordinary
+(`docs/proposals/workflow-execution-contract.md` in that checkout). It defines an ordinary
 `new Export(env)` / `instance.run(event, step)` class surface without a vendor
 base class. The candidate is authored and checked, not published, selected or
 activated. This implementation does not fill the old contract's gaps by
