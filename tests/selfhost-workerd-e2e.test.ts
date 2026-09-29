@@ -616,6 +616,12 @@ test.skipIf(WORKERD === null)(
     );
     expect(await (await ask(origin, "/")).text()).toBe("tenant prelude spelling");
 
+    const unclaimedHost = await fetch(`${origin}/`, {
+      headers: { host: "unclaimed.localhost" },
+    });
+    expect(unclaimedHost.status).toBe(404);
+    expect(await unclaimedHost.text()).toBe("no worker is published for unclaimed.localhost\n");
+
     workerd?.kill();
     await workerd?.exited;
     workerd = Bun.spawn([WORKERD as string, "serve", join(root, "workers", "workerd.capnp")], {
