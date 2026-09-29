@@ -85,13 +85,22 @@ function writeCustody(directory: string): string {
   return path;
 }
 
-function processFixture(database: Database, interruptedImport = false, interruptedSeed = false) {
+function processFixture(
+  database: Database,
+  interruptedImport = false,
+  interruptedSeed = false,
+  driftAfterSeed = false,
+  advanceBeforeSeed = false,
+) {
   const calls: string[][] = [];
   const readQueries: string[] = [];
   const fileImports: string[] = [];
   let interruptNextImport = interruptedImport;
   let interruptNextSeed = interruptedSeed;
   let readsAtSeed = -1;
+  let lineageReads = 0;
+  let fixtureSeeded = false;
+  let postSeedReceiptReads = 0;
   const run = async (command: readonly string[]): Promise<CommandResult> => {
     calls.push([...command]);
     const key = command.join(" ");
@@ -106,6 +115,37 @@ function processFixture(database: Database, interruptedImport = false, interrupt
     if (commandIndex >= 0) {
       const sql = command[commandIndex + 1];
       if (!sql) throw new Error("D1 query omitted its SQL");
+      if (sql.includes("FROM d1_migrations ORDER BY id")) {
+        lineageReads += 1;
+        if (advanceBeforeSeed && lineageReads === 2) {
+          const migration = readMigrationArtifact(migrationDirectory).files[57];
+          if (!migration) throw new Error("audited 0058 migration is missing");
+          database.exec(buildD1MigrationImport([migration], { freshLedger: false }).sql);
+        }
+      }
+      if (
+        fixtureSeeded &&
+        sql.includes(
+          "SELECT * FROM cloudflare_managed_worker_receipts ORDER BY provider_id, resource_uid",
+        )
+      ) {
+        postSeedReceiptReads += 1;
+        if (driftAfterSeed && postSeedReceiptReads === 2) {
+          database
+            .query(`INSERT INTO cloudflare_managed_worker_receipts
+              (provider_id, resource_uid, native_id, kind, logical_worker_id, operation_id,
+               generation, descriptor_digest, state, observed_json)
+              VALUES (?, ?, ?, 'version', ?, ?, 1, ?, 'pending', '{}')`)
+            .run(
+              "synthetic-0058-drift",
+              "synthetic-0058-drift-resource",
+              "version:synthetic-0058-drift",
+              "synthetic-worker",
+              "synthetic-0058-drift-operation",
+              `sha256:${"e".repeat(64)}`,
+            );
+        }
+      }
       readQueries.push(sql);
       const results = database.query(sql).all() as Record<string, unknown>[];
       return ok(`${JSON.stringify([{ success: true, results }])}\n`);
@@ -118,6 +158,7 @@ function processFixture(database: Database, interruptedImport = false, interrupt
       fileImports.push(path);
       if (path.endsWith("fixture.sql")) readsAtSeed = readQueries.length;
       database.exec(readFileSync(path, "utf8"));
+      if (path.endsWith("fixture.sql")) fixtureSeeded = true;
       if (interruptNextSeed && path.endsWith("fixture.sql")) {
         interruptNextSeed = false;
         return { exitCode: 1, stdout: "", stderr: "seed transport interrupted after apply" };
@@ -152,12 +193,26 @@ function makeOptions(
   database: Database,
   interruptedImport = false,
   interruptedSeed = false,
-  providerIdentity = {
+  providerIdentity:
+    | { readonly uuid: string; readonly name: string }
+    | readonly { readonly uuid: string; readonly name: string }[] = {
     uuid: ISOLATED_DATABASE_ID,
     name: ISOLATED_DATABASE_NAME,
   },
+  driftAfterSeed = false,
+  advanceBeforeSeed = false,
 ) {
-  const fixture = processFixture(database, interruptedImport, interruptedSeed);
+  const fixture = processFixture(
+    database,
+    interruptedImport,
+    interruptedSeed,
+    driftAfterSeed,
+    advanceBeforeSeed,
+  );
+  const providerIdentities = Array.isArray(providerIdentity)
+    ? providerIdentity
+    : [providerIdentity];
+  let providerRead = 0;
   return {
     fixture,
     options: {
@@ -166,11 +221,14 @@ function makeOptions(
       custodyPath: writeCustody(directory),
       migrationDirectory,
       outputDirectory: join(directory, "output"),
-      fetcher: async () =>
-        new Response(JSON.stringify({ success: true, result: providerIdentity }), {
+      fetcher: async () => {
+        const identity =
+          providerIdentities[Math.min(providerRead++, providerIdentities.length - 1)];
+        return new Response(JSON.stringify({ success: true, result: identity }), {
           status: 200,
           headers: { "content-type": "application/json" },
-        }),
+        });
+      },
     },
   };
 }
@@ -181,6 +239,7 @@ function snapshotShape(snapshot: Fixture0058Snapshot) {
     states: snapshot.states,
     digest: snapshot.digest,
     blobBytes: snapshot.blobBytes,
+    exactSyntheticBlobs: snapshot.exactSyntheticBlobs,
     foreignKeyViolations: snapshot.foreignKeyViolations,
     foreignKeysEnabled: snapshot.foreignKeysEnabled,
   };
@@ -211,6 +270,7 @@ describe("0058 isolated D1 rehearsal", () => {
       });
       expect(before.states).toEqual({ pending: 1, committed: 1, deleting: 1, deleted: 1 });
       expect(before.blobBytes).toBeGreaterThanOrEqual(174);
+      expect(before.exactSyntheticBlobs).toBe(true);
       expect(before.foreignKeyViolations).toBe(0);
       expect(before.foreignKeysEnabled).toBe(true);
 
@@ -392,6 +452,38 @@ describe("0058 isolated D1 rehearsal", () => {
     }
   });
 
+  test("a 0058 change at the immediate predecessor fence refuses before fixture seed", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("advanced-predecessor-fence");
+      const { fixture, options } = makeOptions(
+        directory,
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        false,
+        true,
+      );
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "apply", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          options,
+        ),
+      ).rejects.toThrow("exact canonical 0057 predecessor");
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(database.query("SELECT name FROM d1_migrations ORDER BY id").all()).toHaveLength(58);
+      expect(database.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
   test("an interrupted import is read back authoritatively and is never replayed", async () => {
     const database = databaseThrough(57);
     const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
@@ -473,6 +565,93 @@ describe("0058 isolated D1 rehearsal", () => {
       expect(seeded.states).toEqual({ pending: 1, committed: 1, deleting: 1, deleted: 1 });
       expect(seeded.foreignKeyViolations).toBe(0);
       expect(database.query("SELECT name FROM d1_migrations ORDER BY id").all()).toHaveLength(57);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("post-seed row drift is classified as changed-target failure and status remains available", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("post-seed-row-drift");
+      const { fixture, options } = makeOptions(
+        directory,
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        true,
+      );
+      const failure = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        options,
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(["mutation", "verification"]).toContain((failure as DeployError).phase);
+      expect(fixture.fileImports.filter((path) => path.endsWith("fixture.sql"))).toHaveLength(1);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(0);
+
+      const statusDirectory = caseDirectory("post-seed-row-drift-status");
+      const { options: statusOptions } = makeOptions(statusDirectory, database);
+      const status = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        statusOptions,
+      );
+      expect(status).toMatchObject({
+        appliedMigration: MIGRATIONS[56]?.name,
+        fixtureTableCounts: { cloudflare_managed_worker_receipts: 5 },
+        readyForApply: false,
+      });
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("post-seed provider UUID/name drift is classified as changed-target failure", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("post-seed-provider-drift");
+      const { fixture, options } = makeOptions(directory, database, false, false, [
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        { uuid: "22222222-2222-4222-8222-222222222222", name: ISOLATED_DATABASE_NAME },
+      ]);
+      const failure = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        options,
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(["mutation", "verification"]).toContain((failure as DeployError).phase);
+      expect(fixture.fileImports.filter((path) => path.endsWith("fixture.sql"))).toHaveLength(1);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(0);
+
+      const statusDirectory = caseDirectory("post-seed-provider-drift-status");
+      const { options: statusOptions } = makeOptions(statusDirectory, database);
+      const status = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        statusOptions,
+      );
+      expect(status).toMatchObject({
+        appliedMigration: MIGRATIONS[56]?.name,
+        fixtureTableCounts: { cloudflare_managed_worker_receipts: 4 },
+        readyForApply: false,
+      });
     } finally {
       database.close();
       if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;

@@ -17,7 +17,13 @@ import {
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
-import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
+import {
+  DeployError,
+  type DeployPhase,
+  mutationError,
+  preflightError,
+  verificationError,
+} from "./errors.ts";
 import { type D1SchemaState, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
 import {
   type CommandResult,
@@ -80,6 +86,7 @@ export interface Fixture0058Snapshot {
   readonly states: Readonly<Record<(typeof STATES)[number], number>>;
   readonly digest: `sha256:${string}`;
   readonly blobBytes: number;
+  readonly exactSyntheticBlobs: boolean;
   readonly foreignKeyViolations: number;
   readonly foreignKeysEnabled: boolean;
 }
@@ -277,11 +284,29 @@ export async function read0058FixtureSnapshot(
       blobBytes += (row.nonce.length + row.ciphertext.length) / 2;
     }
   }
+  const expectedBlobRows = (name: string) =>
+    STATES.slice(0, 3)
+      .map((state, index) => ({
+        provider_id: PROVIDER,
+        resource_uid: `synthetic-0058-${state}`,
+        name,
+        nonce: Buffer.alloc(12, index + 1)
+          .toString("hex")
+          .toUpperCase(),
+        ciphertext: Buffer.alloc(17 + index, index + 11)
+          .toString("hex")
+          .toUpperCase(),
+      }))
+      .sort((left, right) => left.resource_uid.localeCompare(right.resource_uid));
+  const exactSyntheticBlobs =
+    JSON.stringify(rows[2]) === JSON.stringify(expectedBlobRows("API_KEY")) &&
+    JSON.stringify(rows[3]) === JSON.stringify(expectedBlobRows("object:MEDIA:runtime-proof"));
   return {
     counts,
     states,
     digest: digest(JSON.stringify(rows)),
     blobBytes,
+    exactSyntheticBlobs,
     foreignKeyViolations: violations.length,
     foreignKeysEnabled: foreignKeys.length === 1 && foreignKeys[0]?.foreign_keys === 1,
   };
@@ -295,6 +320,7 @@ function assertFixture(snapshot: Fixture0058Snapshot): void {
     snapshot.counts[TABLES[3]] !== 3 ||
     STATES.some((state) => snapshot.states[state] !== 1) ||
     snapshot.blobBytes < 174 ||
+    !snapshot.exactSyntheticBlobs ||
     snapshot.foreignKeyViolations !== 0 ||
     !snapshot.foreignKeysEnabled
   ) {
@@ -466,6 +492,7 @@ export async function runD1Schema0058Rehearsal(
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-d1-0058-rehearsal-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
+  let targetMayHaveChanged = false;
   try {
     const inspection = config(
       join(root, "inspect-wrangler.jsonc"),
@@ -585,6 +612,7 @@ export async function runD1Schema0058Rehearsal(
         path,
       ]);
     let seed: CommandResult | null = null;
+    targetMayHaveChanged = true;
     try {
       seed = await run(fileCommand(fixturePath), { env: environment });
     } catch {
@@ -614,9 +642,24 @@ export async function runD1Schema0058Rehearsal(
       JSON.stringify(seededState.applied) !== JSON.stringify(initial.applied)
     )
       throw verificationError("0058 fixture seed changed schema or lineage");
-    const fenced = await read0058FixtureSnapshot(db, "preflight");
+    // The fixture seed already touched D1. Every final-fence failure is a
+    // verification failure, even when a reused reader labels it preflight.
+    const immediate = await readD1SchemaState(db, "verification");
+    if (
+      JSON.stringify(immediate.applied) !== JSON.stringify(source.names.slice(0, 57)) ||
+      immediate.shapeDigest !== initial.shapeDigest ||
+      !applicationSchemaMatches(
+        immediate,
+        deriveExpectedApplicationShape(source.files.slice(0, 57)),
+      )
+    ) {
+      throw verificationError(
+        "0058 exact 0057 lineage or canonical shape changed at migration fence",
+      );
+    }
+    const fenced = await read0058FixtureSnapshot(db, "verification");
     if (fenced.digest !== seeded.digest)
-      throw preflightError("0058 fixture rows changed at migration fence");
+      throw verificationError("0058 fixture rows changed at migration fence");
     await assertProviderIdentity("at migration fence");
     sealed.assertUnchanged();
     const started = performance.now();
@@ -684,8 +727,21 @@ export async function runD1Schema0058Rehearsal(
       recovery:
         "quarantine this exact isolated D1 on uncertainty; never reset or replay it automatically",
     };
+  } catch (error) {
+    if (!targetMayHaveChanged) throw error;
+    if (error instanceof DeployError && error.phase !== "preflight") throw error;
+    throw mutationError(
+      "0058 isolated D1 may have changed; inspect authoritative status and do not replay",
+      error instanceof Error ? error.message : String(error),
+    );
   } finally {
     unsealDirectory(root);
-    if (temporary) rmSync(root, { recursive: true, force: true });
+    if (temporary) {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {
+        // Local temporary cleanup must not replace the D1 mutation outcome.
+      }
+    }
   }
 }
