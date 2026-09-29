@@ -597,6 +597,7 @@ export function buildApp(ports: AppPorts): App {
     attachments,
     migrations,
     forms: ports.forms,
+    ...(availability?.catalogue ? { formAvailability: availability } : {}),
     identityProviders: ports.identityProviders ?? [],
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ledger,

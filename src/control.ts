@@ -34,6 +34,7 @@ import { isSpaceId } from "./takoform/space-id.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
 import type {
   InstalledTakoformForm,
+  TakoformFormAvailabilityResolver,
   TakoformNativeAbsenceEvidence,
   TakoformRuntimeInputPolicy,
 } from "./takoform/types.ts";
@@ -134,6 +135,13 @@ export interface CreateControlRoutesOptions {
   readonly migrations: ResourceMigrationService;
   /** Every Form definition this Host will accept. */
   readonly forms: readonly InstalledTakoformForm[];
+  /**
+   * The same authority the apply path refuses from. When it can answer for a
+   * platform-level read, the catalogue states which of those definitions this
+   * Host can actually execute; without it the catalogue publishes none of the
+   * three facts rather than guessing them.
+   */
+  readonly formAvailability?: TakoformFormAvailabilityResolver | undefined;
   /** How a caller may sign in to this deployment. */
   readonly identityProviders: readonly IdentityProviderDescriptor[];
   readonly ledger: Ledger;
@@ -181,6 +189,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     attachments,
     migrations,
     forms,
+    formAvailability,
     identityProviders,
     ledger,
     catalog,
@@ -406,12 +415,26 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     // are not authenticated for asking a public question.
     if (request.method === "GET" && url.pathname === "/v1/forms") {
       return Response.json({
-        profiles: forms.map((form) =>
-          formSupportProfile(
-            form,
-            "support.takoform.com/v1alpha1",
-            runtimeInputPolicy?.guaranteedMaximum(form) ?? 0,
-          ),
+        profiles: await Promise.all(
+          forms.map(async (form) => {
+            const availability = formAvailability?.catalogue
+              ? await formAvailability.catalogue({ form })
+              : undefined;
+            return {
+              ...formSupportProfile(
+                form,
+                "support.takoform.com/v1alpha1",
+                runtimeInputPolicy?.guaranteedMaximum(form) ?? 0,
+              ),
+              ...(availability === undefined
+                ? {}
+                : {
+                    executable: availability.executable,
+                    activated: availability.activated,
+                    availableToPrincipal: availability.availableToPrincipal,
+                  }),
+            };
+          }),
         ),
       });
     }
