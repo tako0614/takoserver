@@ -535,6 +535,12 @@ export function createArtifactRecovery(options: CreateArtifactRecoveryOptions): 
         throw new ArtifactRecoveryError("invalid_request", 400);
       }
       const current = await inspect(input.request);
+      if (!(await requestOwnsDurableAuthorization(options.sql, current.canonical.requestDigest))) {
+        // A competing descriptor's authorization is never this request's
+        // success: refuse before the plan check so that neither a stale sibling
+        // plan nor a fresh read of the consumed state is acknowledged.
+        throw new ArtifactRecoveryError("state_conflict", 409);
+      }
       if (current.status.planDigest !== input.planDigest) {
         // Once this exact singleton exists, a duplicate delivery can observe
         // the already-advanced state after its sibling committed. Treat that
@@ -599,6 +605,21 @@ export function createArtifactRecovery(options: CreateArtifactRecoveryOptions): 
       return (await inspect(input.request)).status;
     },
   };
+}
+
+/**
+ * `apply` may only advance or acknowledge the durable authorization its own
+ * request took. The singleton request digest is immutable once written, so this
+ * read decides the action that follows for every delivery, including a stale
+ * duplicate that raced the request that won.
+ */
+async function requestOwnsDurableAuthorization(sql: Sql, requestDigest: Digest): Promise<boolean> {
+  const rows = await sql.query(
+    "SELECT request_digest FROM tf_artifact_recovery_once WHERE singleton = 1",
+  );
+  if (rows.length === 0) return true;
+  if (rows.length !== 1) return false;
+  return rows[0]?.request_digest === requestDigest;
 }
 
 export async function canonicalArtifactRecoveryRequest(

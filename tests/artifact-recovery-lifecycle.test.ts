@@ -438,6 +438,61 @@ describe("exact artifact recovery lifecycle", () => {
     expect(await count(fixture.sql, "tf_artifact_recovery_details")).toBe(1);
   });
 
+  test("a competing descriptor's plan is refused, never acknowledged as the winner", async () => {
+    const fixture = await recoveryFixture();
+    const otherRequest: ArtifactRecoveryRequest = {
+      ...fixture.request,
+      settlementEvidence: {
+        ...fixture.request.settlementEvidence,
+        digest: `sha256:${"9".repeat(64)}`,
+      },
+    };
+    const otherCanonical = await canonicalArtifactRecoveryRequest(otherRequest);
+    const other = fixture.recoveryFor({
+      ...fixture.execution,
+      pinnedRequestDigest: otherCanonical.requestDigest,
+      workerVersionId: SECOND_VERSION,
+    });
+    const [first, second] = await Promise.all([
+      fixture.recovery.status(fixture.request),
+      other.status(otherRequest),
+    ]);
+    if (first.planDigest === second.planDigest) {
+      throw new Error("distinct descriptors must inspect distinct plans");
+    }
+    expect(first).toMatchObject({ phase: "eligible", action: "prepare" });
+    expect(second).toMatchObject({ phase: "eligible", action: "prepare" });
+
+    // The first descriptor takes the durable authorization deterministically.
+    expect(
+      await fixture.recovery.apply({
+        request: fixture.request,
+        planDigest: first.planDigest,
+      }),
+    ).toMatchObject({ phase: "prepared", action: "wait" });
+    const consumed = await other.status(otherRequest);
+    expect(consumed).toMatchObject({
+      phase: "blocked",
+      action: "none",
+      blocker: "authorization_consumed_by_other_request",
+    });
+
+    // Neither the plan the loser inspected before the winner committed ...
+    await expect(
+      other.apply({ request: otherRequest, planDigest: second.planDigest }),
+    ).rejects.toEqual(new ArtifactRecoveryError("state_conflict", 409));
+    // ... nor a fresh read of the consumed state may be reported as success.
+    await expect(
+      other.apply({ request: otherRequest, planDigest: consumed.planDigest }),
+    ).rejects.toEqual(new ArtifactRecoveryError("state_conflict", 409));
+
+    expect(await count(fixture.sql, "tf_artifact_recovery_once")).toBe(1);
+    expect(await count(fixture.sql, "tf_artifact_recovery_details")).toBe(1);
+    expect(await fixture.sql.query("SELECT request_digest FROM tf_artifact_recovery_once")).toEqual(
+      [{ request_digest: fixture.canonical.requestDigest }],
+    );
+  });
+
   test("active recovery rejects uncertainty, roots, holds and blob writers", async () => {
     const fixture = await recoveryFixture();
     const status = await fixture.recovery.status(fixture.request);
