@@ -788,6 +788,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-integration-storage-disposal` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Exact target-selected storage names only; complete current regular + dispatch Worker binding inventory required. |
 | `takoserver-integration-host-retirement` | `--status`, `--apply` | integration only | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The current target selects the successor; exact `--retired-target`, `--retired-deployment`, and `--retired-version` select the replaced Host. No force or storage deletion. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
+| `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. No production rehearsal receipt is read or written. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -1214,6 +1215,68 @@ copy size/runtime against platform limits, and compare rows, BLOBs, triggers and
 foreign keys after migration. Large targets require a separate bounded
 maintenance/shadow transition. Do not use an integration reset as production
 recovery or bypass the protected selector.
+
+The dedicated `takoserver-d1-schema-0058-rehearsal` surface is a bounded
+synthetic D1 experiment, **not** a protected-wave selector or production
+permission. It can only run with `--environment=rehearsal` and no
+`--through-migration`. It selects an operator-owned 0600 JSON file named by
+`TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` (absolute path). Invoke it as:
+
+```bash
+bun run deploy -- takoserver-d1-schema-0058-rehearsal --status --environment=rehearsal --commit=<40-hex-sha>
+bun run deploy -- takoserver-d1-schema-0058-rehearsal --apply --environment=rehearsal --commit=<40-hex-sha>
+```
+
+The selected target declaration has exactly these fields:
+
+```json
+{
+  "kind": "takoserver.d1-0058-isolated-rehearsal-target@v1",
+  "accountId": "<same reviewed rehearsal account>",
+  "databaseId": "<distinct isolated D1 UUID>",
+  "databaseName": "<distinct isolated D1 name>",
+  "disposableFixtureCustody": true,
+  "writersQuiesced": true,
+  "credentialScopeReviewed": true
+}
+```
+
+Those booleans are operator declarations, not proof that the token lacks
+production scope. The operator must independently verify that the D1 is
+isolated, contains no durable customer/operator data, has no active writers or
+private executor, and that the explicit token can address only the intended
+rehearsal account/target. If that token also has D1 write authority over
+production in the same account, the operator cannot make this scope claim and
+must stop; the declaration alone does not enforce token scope. The surface
+refuses the ordinary rehearsal D1 ID/name
+and verifies the selected D1 UUID/name against Cloudflare before inspection,
+fixture seed, and migration import. It never reads a production descriptor,
+OAuth credential, receipt path, or
+customer dataset. `--status` only inspects the exact selected D1; `--apply`
+requires a clean remote-reachable source commit, independent reviewer and
+`check:migrations` before mutation.
+
+Apply requires the exact audited 0001–0057 lineage and canonical predecessor
+shape and zero rows in the four affected receipt/material/sealed-value tables.
+It inserts deterministic synthetic pending, committed, deleting and deleted
+Version receipts; the first three retain sealed material, nonce and ciphertext
+BLOBs, while the deleted state exercises the expected cascade. It then sends
+the unchanged 0058 SQL plus its Wrangler ledger insertion as one sealed
+whole-file `d1 execute --file` import. Authoritative readback compares the
+ordered lineage, canonical schema, trigger SQL, all fixture row and BLOB bytes,
+foreign keys, and reports migration/fixture bytes and elapsed time without
+printing values. A failed or unknown acknowledgement is not replayed. Inspect
+the exact isolated D1, quarantine it on uncertainty, and decide forward repair
+separately; the command never drops or resets it. The result explicitly says
+`non-authoritative`, emits no production-accepted rehearsal receipt, and does
+not qualify existing production data volume or writer quiescence. Protected
+`--through-migration=0058` remains unavailable pending actual D1 evidence and
+a separately reviewed production transition. The current protected wave lane
+uses `d1 migrations apply` except its 0047 file-import special case. This
+0058 experiment uses the explicit whole-file import instead; its result can
+support a future protected 0058 transition only if that transition commits to
+the same exact transport and passes its own nonempty D1 rehearsal. It does not
+prove that the current protected lane's transport would be atomic for 0058.
 
 ### 0059/0060: additive existing-data integration cutover
 

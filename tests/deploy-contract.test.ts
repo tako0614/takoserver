@@ -67,6 +67,7 @@ const SURFACES = [
   ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
   ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
   ["takoserver-integration-host-retirement", ["irreversible", "authority"]],
+  ["takoserver-d1-schema-0058-rehearsal", ["irreversible"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
   ["takoserver-d1-schema", ["irreversible"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
@@ -712,6 +713,32 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(baseline.exitCode).toBe(2);
       expect(baseline.stderr).toContain("deploy target descriptor not found");
       expect(baseline.stderr).not.toContain("no target was touched");
+    });
+
+    test("accepts only the isolated 0058 rehearsal surface without a selector", async () => {
+      const accepted = await deploy([
+        "takoserver-d1-schema-0058-rehearsal",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+      ]);
+      expect(accepted.exitCode).toBe(2);
+      expect(accepted.stderr).toContain("deploy target descriptor not found");
+      for (const tail of [
+        ["--environment=production"],
+        ["--environment=integration"],
+        ["--environment=rehearsal", "--through-migration=0057"],
+      ]) {
+        const refused = await deploy([
+          "takoserver-d1-schema-0058-rehearsal",
+          "--status",
+          ...tail,
+          `--commit=${sha}`,
+        ]);
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stderr).toContain("no target was touched");
+        expect(refused.stderr).not.toContain("deploy target descriptor");
+      }
     });
 
     for (const through of [

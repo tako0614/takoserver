@@ -24,6 +24,7 @@ import {
   SCHEMA_WAVE_BOUNDARIES,
   type SchemaWaveBoundary,
 } from "./deploy/schema.ts";
+import { runD1Schema0058Rehearsal } from "./deploy/schema-0058-rehearsal.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -66,6 +67,8 @@ const USAGE = `takoserver deploy
   Pending 0043 additionally requires the staged pre-0043-quiesced Worker target and the absolute
   operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH documented in docs/deploy.md.
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
+  takoserver-d1-schema-0058-rehearsal is an isolated synthetic 0057 -> 0058 D1 qualification,
+    rehearsal-only, no selector or production receipt; see docs/deploy.md.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -680,6 +683,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
+    surfaceValue === "takoserver-d1-schema-0058-rehearsal" &&
+    (environment !== "rehearsal" || throughMigration !== null)
+  ) {
+    return null;
+  }
+  if (
     surfaceValue === "takoserver-d1-schema" &&
     environment !== "integration" &&
     throughMigration === null
@@ -689,6 +698,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   if (
     surfaceValue !== "takoserver-d1-schema" &&
     surfaceValue !== "takoserver-d1-schema-rehearsal-baseline" &&
+    surfaceValue !== "takoserver-d1-schema-0058-rehearsal" &&
     throughMigration !== null
   ) {
     return null;
@@ -927,6 +937,8 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runConsole(invocation, target);
     case "takoserver-d1-schema-rehearsal-baseline":
       return await runD1SchemaRehearsalBaseline(invocation, target);
+    case "takoserver-d1-schema-0058-rehearsal":
+      return await runD1Schema0058Rehearsal(invocation, target);
     case "takoserver-integration-storage-generation":
       return await runIntegrationStorageGeneration(invocation, target);
     case "takoserver-integration-storage-disposal":

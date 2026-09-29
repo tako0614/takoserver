@@ -1168,6 +1168,39 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-d1-schema-0058-rehearsal",
+      target: "cloudflare-d1:explicit-isolated-0058-synthetic-rehearsal",
+      covers: [
+        "migrations/0058_cloudflare_managed_worker_domain_receipts.sql",
+        "scripts/deploy/schema-0058-rehearsal.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/application-schema-shape.ts",
+        "scripts/deploy/d1-migration-import.ts",
+        "scripts/deploy/d1.ts",
+      ],
+      requiresScripts: ["check:migrations"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible"],
+      obligations: {
+        provenance: `${exactSource} Only the audited unchanged 0058 SQL and Wrangler ledger INSERT are assembled in a sealed whole-file import. The exact isolated target declaration must name a different D1 from the ordinary rehearsal target. This surface never changes the protected selector.`,
+        "post-conditions":
+          "Authoritative D1 readback compares exact 0058 lineage, canonical schema, trigger definitions, all four synthetic receipt states, row/BLOB digests and foreign keys. The value-free result reports bytes and elapsed time, not a production-accepted receipt.",
+        reversal:
+          "No automatic reset, replay, down migration, or restore. Quarantine the exact isolated D1 after uncertainty; forward repair is an operator decision. Production is untouched.",
+        "failure-handling":
+          highRiskFailure +
+          " Both actions require explicit CLOUDFLARE_API_TOKEN and an owned 0600 declaration selected by TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH, affirming disposable fixture custody, writer quiescence and credential-scope review. Apply additionally requires independent review. No OAuth or production-target fallback exists.",
+        "pre-mutation-proof":
+          "The declared isolated D1 UUID/name is read from Cloudflare before inspection and at both mutation fences. Exact canonical 0057 lineage and schema plus zero rows in all four affected tables are checked before fixture seed and fenced again. Only bounded synthetic fixture rows are admitted before 0058.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-d1-schema-rehearsal-baseline",
       target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
