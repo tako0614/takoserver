@@ -59,13 +59,19 @@ Configure that absolute path as `TAKOSERVER_WORKERD_BINARY`.
 The native acceptance run covers these real V8 targets:
 
 ```text
-//src/workerd/tests:closed-module-graph-test
-//src/workerd/tests:module-imports-test
-//src/workerd/api/tests:new-module-registry-test
-//src/workerd/api/tests:new-module-registry-startup-eval-test
-//src/workerd/jsg:modules-new-test
-//src/workerd/jsg:resource-test
+//src/workerd/tests:closed-module-graph-test@
+//src/workerd/tests:module-imports-test@
+//src/workerd/api/tests:new-module-registry-test@
+//src/workerd/api/tests:new-module-registry-startup-eval-test@
+//src/workerd/jsg:modules-new-test@
+//src/workerd/jsg:resource-test@
 ```
+
+workerd's `kj_test` and `wd_test` macros declare no plain `//package:name`
+label: they rename the test rule to the test variant, so `name@` is the label
+that runs the test and a plain label resolves to nothing. Building or testing
+these targets therefore needs the declared variants. Correcting the target
+labels is not evidence that native compilation or acceptance has passed.
 
 The Takoserver owner gate does not rebuild workerd. It validates the runtime
 adapter and fixtures portably; tests given `TAKOSERVER_WORKERD_BINARY` also run
