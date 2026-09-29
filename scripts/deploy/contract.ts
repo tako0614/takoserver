@@ -1168,6 +1168,95 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-rehearsal-d1-create",
+      target: "cloudflare-d1:one-explicit-new-rehearsal-database",
+      covers: [
+        "scripts/deploy/rehearsal-d1-create.ts",
+        "scripts/deploy/integration-storage-generation.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun"],
+      requiresEnv: [
+        "TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH",
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH selects one rehearsal account and a fresh generation-named D1. No ordinary target descriptor, Worker binding, R2 resource or schema import is read or changed.`,
+        "post-conditions":
+          "Cloudflare readback proves the returned UUID/name identifies the one newly created D1 and its non-internal schema-object count is zero. The UUID may be used in a separately reviewed rehearsal target declaration; it is not automatically adopted.",
+        reversal:
+          "No reset, delete or automatic cleanup is offered. An uncertain or unexpected creation is quarantined for separate operator decision.",
+        "failure-handling": `${highRiskFailure} Both actions require explicit CLOUDFLARE_API_TOKEN and the owned 0600 declaration selected by TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH; apply additionally requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or production fallback.`,
+        "pre-mutation-proof":
+          "Before the sole create, exact named-D1 absence is read and fenced again. The reviewer and clean, remote-reachable source commit are checked; the operator must separately review that the token is scoped to the intended rehearsal account.",
+        "independent-review": review,
+      },
+    },
+    {
+      surface: "takoserver-d1-snapshot-restore",
+      target: "cloudflare-d1:one-explicit-empty-rehearsal-database-restored-from-one-pinned-dump",
+      covers: [
+        "scripts/deploy/d1-snapshot-restore.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/d1.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH",
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH selects one rehearsal-generation D1 by exact UUID and name, one absolute operator-owned 0600 snapshot path, and the sha256 its bytes must carry. No ordinary target descriptor, Worker binding, R2 resource, production mode or OAuth credential is read or changed.`,
+        "post-conditions":
+          "Rewriting every in-literal NUL byte as '||char(0)||' and applying the dump must reproduce the dump's own expectations: every created application table, every per-table row count, the index/trigger/view counts, the exact d1_migrations lineage and zero foreign-key violations, with Wrangler's reported statement count equal to the dump's statement count whenever it is reported at all.",
+        reversal:
+          "The restored D1 is left intact for explicit forward repair. No reset, delete, import-over or automatic cleanup is offered.",
+        "failure-handling": `${highRiskFailure} An import whose readback differs from the dump's expectations is a verification failure that prints every mismatch; a partial application is never reported as success, and an interrupted or unreadable acknowledgement is indeterminate rather than retryable. Both actions require explicit CLOUDFLARE_API_TOKEN and the owned 0600 declaration selected by TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH; apply additionally requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or production fallback.`,
+        "pre-mutation-proof":
+          "The provider identity of the declared D1 is read back, the target must carry no application table and no d1_migrations row, that fence is re-read after the normalized import bytes are sealed, and the clean remote-reachable commit is qualified once. A dump whose bytes do not match the declared sha256, whose NUL bytes are not all inside single-quoted literals, or whose INSERT statements cannot be counted exactly is refused before any provider mutation.",
+        "independent-review": review,
+      },
+    },
+
+    {
+      surface: "takoserver-d1-schema-0058-rehearsal",
+      target: "cloudflare-d1:explicit-isolated-0058-synthetic-rehearsal",
+      covers: [
+        "migrations/0058_cloudflare_managed_worker_domain_receipts.sql",
+        "scripts/deploy/schema-0058-rehearsal.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/application-schema-shape.ts",
+        "scripts/deploy/d1-migration-import.ts",
+        "scripts/deploy/d1.ts",
+      ],
+      requiresScripts: ["check:migrations"],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible"],
+      obligations: {
+        provenance: `${exactSource} Only the audited unchanged 0058 SQL and Wrangler ledger INSERT are assembled in a sealed whole-file import. The exact isolated target declaration must name a different D1 from the ordinary rehearsal target. This surface never changes the protected selector.`,
+        "post-conditions":
+          "Authoritative D1 readback compares exact 0058 lineage, canonical schema, trigger definitions, all four synthetic receipt states, row/BLOB digests and foreign keys. The value-free result reports bytes and elapsed time, not a production-accepted receipt.",
+        reversal:
+          "No automatic reset, replay, down migration, or restore. Quarantine the exact isolated D1 after uncertainty; forward repair is an operator decision. Production is untouched.",
+        "failure-handling":
+          highRiskFailure +
+          " Both actions require explicit CLOUDFLARE_API_TOKEN and an owned 0600 declaration selected by TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH, affirming disposable fixture custody, writer quiescence and credential-scope review. Apply additionally requires independent review. No OAuth or production-target fallback exists.",
+        "pre-mutation-proof":
+          "The declared isolated D1 UUID/name is read from Cloudflare before inspection and at both mutation fences. Exact canonical 0057 lineage and schema plus zero rows in all four affected tables are checked before fixture seed and fenced again. Only bounded synthetic fixture rows are admitted before 0058.",
+        "independent-review": review,
+      },
+    },
+    {
       surface: "takoserver-d1-schema-rehearsal-baseline",
       target: "cloudflare-d1:environment-selected-takoserver-rehearsal-baseline",
       covers: ["migrations", "scripts/deploy/schema.ts", "scripts/deploy/d1.ts"],
