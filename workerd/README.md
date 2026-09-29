@@ -59,13 +59,19 @@ Configure that absolute path as `TAKOSERVER_WORKERD_BINARY`.
 The native acceptance run covers these real V8 targets:
 
 ```text
-//src/workerd/tests:closed-module-graph-test
-//src/workerd/tests:module-imports-test
-//src/workerd/api/tests:new-module-registry-test
-//src/workerd/api/tests:new-module-registry-startup-eval-test
-//src/workerd/jsg:modules-new-test
-//src/workerd/jsg:resource-test
+//src/workerd/tests:closed-module-graph-test@
+//src/workerd/tests:module-imports-test@
+//src/workerd/api/tests:new-module-registry-test@
+//src/workerd/api/tests:new-module-registry-startup-eval-test@
+//src/workerd/jsg:modules-new-test@
+//src/workerd/jsg:resource-test@
 ```
+
+workerd's `kj_test` and `wd_test` macros declare no plain `//package:name`
+label: they rename the rule to the test variant, so `name@` is the label that
+runs the test and a plain label resolves to nothing. The build script resolves
+every declared label against the prepared source before Bazel compiles or tests
+it, and a stale label fails the run with each undeclared target named.
 
 The Takoserver owner gate does not rebuild workerd. It validates the runtime
 adapter and fixtures portably; tests given `TAKOSERVER_WORKERD_BINARY` also run
@@ -130,9 +136,11 @@ A missing toolchain prerequisite, unsupported capacity, build/test failure, or
 timeout is a failed run, never a successful probe. The exact candidate binary
 and its build-time unqualified provenance are uploaded immediately after the
 build, before the native tests run. The six reviewed targets above plus
-`//src/workerd/api/tests:worker-loader-test` (seven targets total) then run in
-the same job, source tree, Bazel output root, repository cache, compiler
-toolchain, and shared resource/flag construction as the build. A distinct
+`//src/workerd/api/tests:worker-loader-test@` (seven targets total) are resolved
+with a Bazel query, then run in the same job, source tree, Bazel output root,
+repository cache, compiler toolchain, and shared resource/flag construction as
+the build; the candidate build resolves the same labels before it compiles, so a
+stale target list fails in minutes rather than after the build. A distinct
 native-test report is retained separately; it does not rewrite artifact
 provenance or promote the candidate. No large Bazel cache is uploaded or
 restored, so a later failed job still starts cold. The uploaded binary remains

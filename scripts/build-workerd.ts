@@ -39,14 +39,23 @@ interface BuildArguments {
   readonly memoryMiB?: number;
 }
 
+/**
+ * Native qualification targets declared by the pinned upstream commit plus both
+ * overlays. workerd's `kj_test` and `wd_test` macros declare no plain
+ * `//package:name` label: they append the test variants to the rule name, so the
+ * default `name@` variant is the label that runs the test itself. The
+ * `name@all-autogates`, `name@eslint`, and `name_binary` helpers are extra
+ * variants, and a plain label resolves to nothing at all. Every label below is
+ * resolved against the prepared source before Bazel builds or tests it.
+ */
 export const WORKFLOW_LOADER_NATIVE_TEST_TARGETS = [
-  "//src/workerd/tests:closed-module-graph-test",
-  "//src/workerd/tests:module-imports-test",
-  "//src/workerd/api/tests:new-module-registry-test",
-  "//src/workerd/api/tests:new-module-registry-startup-eval-test",
-  "//src/workerd/jsg:modules-new-test",
-  "//src/workerd/jsg:resource-test",
-  "//src/workerd/api/tests:worker-loader-test",
+  "//src/workerd/tests:closed-module-graph-test@",
+  "//src/workerd/tests:module-imports-test@",
+  "//src/workerd/api/tests:new-module-registry-test@",
+  "//src/workerd/api/tests:new-module-registry-startup-eval-test@",
+  "//src/workerd/jsg:modules-new-test@",
+  "//src/workerd/jsg:resource-test@",
+  "//src/workerd/api/tests:worker-loader-test@",
 ] as const;
 
 export interface WorkerdOverlay {
@@ -256,6 +265,16 @@ async function main(): Promise<void> {
   if (candidateProvenance !== null) {
     const capacity = await preflightWorkflowLoaderCandidateResources(bazelArguments);
     console.log(`candidate_runner_capacity=${JSON.stringify(capacity)}`);
+    // Resolve the native qualification labels before spending hours on a build
+    // whose later test step would reject them.
+    const nativeTargets = await requireWorkflowLoaderCandidateNativeTargets({
+      bazelisk,
+      source,
+      environment,
+      stateRoot,
+      targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+    });
+    console.log(`candidate_native_targets=${JSON.stringify(nativeTargets)}`);
   }
   const commandArguments =
     candidateProvenance === null
@@ -326,6 +345,24 @@ export function workflowLoaderCandidateResourceArguments(input: {
     `--jobs=${input.jobs}`,
     `--local_resources=cpu=${input.jobs}`,
     `--local_resources=memory=${input.memoryMiB}`,
+  ];
+}
+
+/**
+ * Label resolution uses the same Bazel output root and repository cache as the
+ * build and test invocations, but no compile flags: Bazel rejects the build
+ * option set on a query.
+ */
+export function workflowLoaderCandidateQueryArguments(input: {
+  readonly stateRoot: string;
+  readonly expression: string;
+}): readonly string[] {
+  return [
+    `--output_user_root=${join(input.stateRoot, "bazel-output")}`,
+    "query",
+    `--repository_cache=${join(input.stateRoot, "repository-cache")}`,
+    "--output=label",
+    input.expression,
   ];
 }
 
@@ -444,6 +481,77 @@ export function workflowLoaderCandidateBazelArguments(input: {
   ];
 }
 
+/**
+ * Resolves every declared native qualification label before Bazel starts work.
+ *
+ * Bazel reports only the first unresolvable label of a failed target-pattern
+ * set, so one `bazel test` invocation cannot show an operator the whole damage of
+ * a stale list; the same applies to a build that takes hours before the test
+ * step even starts. The union query below therefore succeeds only when every
+ * label exists, and when it fails each label is queried alone so the thrown
+ * error names every target that the pinned source does not declare.
+ */
+export async function requireWorkflowLoaderCandidateNativeTargets(input: {
+  readonly bazelisk: string;
+  readonly source: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly stateRoot: string;
+  readonly targets: readonly string[];
+  readonly captureCommand?: (
+    command: readonly string[],
+    cwd: string,
+    env: Readonly<Record<string, string>>,
+  ) => Promise<CapturedCommand>;
+}): Promise<readonly string[]> {
+  const captureCommand = input.captureCommand ?? capture;
+  const query = async (expression: string): Promise<CapturedCommand> =>
+    await captureCommand(
+      [
+        input.bazelisk,
+        ...workflowLoaderCandidateQueryArguments({
+          stateRoot: input.stateRoot,
+          expression,
+        }),
+      ],
+      input.source,
+      input.environment,
+    );
+
+  const union = await query(input.targets.join(" + "));
+  const resolved = union.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  if (union.exitCode === 0) {
+    if (resolved.length !== input.targets.length) {
+      throw new Error(
+        `native qualification resolved ${resolved.length} label(s) for ${input.targets.length} declared target(s)`,
+      );
+    }
+    return resolved;
+  }
+
+  const failures: string[] = [];
+  for (const target of input.targets) {
+    const single = await query(target);
+    if (single.exitCode !== 0) failures.push(targetDiagnostic(target, single));
+  }
+  throw new Error(
+    `native qualification target list is not declared in the pinned workerd source: ${failures.join("; ")}`,
+  );
+}
+
+/** Keeps the first Bazel diagnostic so a failure names the offending label. */
+function targetDiagnostic(target: string, result: CapturedCommand): string {
+  const diagnostic = result.stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("ERROR:"));
+  if (diagnostic !== undefined) return `${target}: ${diagnostic}`;
+  const trimmed = result.stderr.trim();
+  return `${target}: ${trimmed === "" ? "bazel query failed without diagnostics" : trimmed}`;
+}
+
 async function runWorkflowLoaderCandidateNativeTests(input: {
   readonly stateRoot: string;
   readonly provenance: WorkflowLoaderCandidateProvenance;
@@ -524,12 +632,20 @@ async function runWorkflowLoaderCandidateNativeTests(input: {
     command: "test",
     targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
   });
+  const resolvedTargets = await requireWorkflowLoaderCandidateNativeTargets({
+    bazelisk,
+    source,
+    environment,
+    stateRoot,
+    targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+  });
   await run([bazelisk, ...args], source, environment);
   console.log(
     JSON.stringify({
       candidateIdentity: input.provenance.identity,
       binarySha256: record.binarySha256,
       nativeTestTargets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+      resolvedNativeTestTargets: resolvedTargets,
       nativeTests: "passed; artifact provenance unchanged",
       promotion: "not-performed; candidate remains unqualified",
     }),
@@ -853,14 +969,39 @@ async function output(
   command: readonly string[],
   env: Readonly<Record<string, string>>,
 ): Promise<string> {
-  const child = Bun.spawn({ cmd: [...command], env: { ...env }, stdout: "pipe", stderr: "pipe" });
+  const result = await capture(command, REPOSITORY_ROOT, env);
+  if (result.exitCode !== 0) {
+    throw new Error(`${command[0] ?? "command"} failed: ${result.stderr.trim()}`);
+  }
+  return result.stdout;
+}
+
+export interface CapturedCommand {
+  readonly exitCode: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+/** Captures a command whose non-zero exit is a result the caller inspects. */
+async function capture(
+  command: readonly string[],
+  cwd: string,
+  env: Readonly<Record<string, string>>,
+): Promise<CapturedCommand> {
+  const child = Bun.spawn({
+    cmd: [...command],
+    cwd,
+    env: { ...env },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
-  if (exitCode !== 0) throw new Error(`${command[0] ?? "command"} failed: ${stderr.trim()}`);
-  return stdout;
+  return { exitCode, stdout, stderr };
 }
 
 async function run(

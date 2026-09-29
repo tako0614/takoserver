@@ -8,10 +8,12 @@ import {
   createWorkflowLoaderCandidateProvenance,
   preflightWorkflowLoaderCandidateResources,
   publishWorkflowLoaderCandidate,
+  requireWorkflowLoaderCandidateNativeTargets,
   WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
   type WorkerdOverlay,
   workflowLoaderCandidateBazelArguments,
   workflowLoaderCandidateOverlays,
+  workflowLoaderCandidateQueryArguments,
   workflowLoaderCandidateResourceArguments,
 } from "../scripts/build-workerd.ts";
 
@@ -137,7 +139,7 @@ describe("workerd WorkerLoader candidate build inputs", () => {
     const tests = workflowLoaderCandidateBazelArguments({
       ...common,
       command: "test",
-      targets: ["//src/workerd/api/tests:worker-loader-test"],
+      targets: ["//src/workerd/api/tests:worker-loader-test@"],
     });
     expect(build).toContain("--output_user_root=/tmp/workerd-candidate/bazel-output");
     expect(tests).toContain("--output_user_root=/tmp/workerd-candidate/bazel-output");
@@ -155,13 +157,95 @@ describe("workerd WorkerLoader candidate build inputs", () => {
       );
     expect(withoutAction(build)).toEqual(withoutAction(tests));
     expect(WORKFLOW_LOADER_NATIVE_TEST_TARGETS).toEqual([
-      "//src/workerd/tests:closed-module-graph-test",
-      "//src/workerd/tests:module-imports-test",
-      "//src/workerd/api/tests:new-module-registry-test",
-      "//src/workerd/api/tests:new-module-registry-startup-eval-test",
-      "//src/workerd/jsg:modules-new-test",
-      "//src/workerd/jsg:resource-test",
-      "//src/workerd/api/tests:worker-loader-test",
+      "//src/workerd/tests:closed-module-graph-test@",
+      "//src/workerd/tests:module-imports-test@",
+      "//src/workerd/api/tests:new-module-registry-test@",
+      "//src/workerd/api/tests:new-module-registry-startup-eval-test@",
+      "//src/workerd/jsg:modules-new-test@",
+      "//src/workerd/jsg:resource-test@",
+      "//src/workerd/api/tests:worker-loader-test@",
+    ]);
+  });
+
+  test("resolves every declared native qualification label before Bazel runs tests", async () => {
+    const stateRoot = "/tmp/workerd-candidate";
+    expect(
+      workflowLoaderCandidateQueryArguments({
+        stateRoot,
+        expression: "//src/workerd/jsg:resource-test@",
+      }),
+    ).toEqual([
+      "--output_user_root=/tmp/workerd-candidate/bazel-output",
+      "query",
+      "--repository_cache=/tmp/workerd-candidate/repository-cache",
+      "--output=label",
+      "//src/workerd/jsg:resource-test@",
+    ]);
+
+    const commands: string[][] = [];
+    const resolved = await requireWorkflowLoaderCandidateNativeTargets({
+      bazelisk: "/tmp/bazelisk",
+      source: "/tmp/workerd-candidate/source/workerd",
+      environment: { HOME: stateRoot },
+      stateRoot,
+      targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+      captureCommand: async (command) => {
+        commands.push([...command]);
+        return {
+          exitCode: 0,
+          stdout: `${WORKFLOW_LOADER_NATIVE_TEST_TARGETS.join("\n")}\n`,
+          stderr: "",
+        };
+      },
+    });
+
+    expect(resolved).toEqual([...WORKFLOW_LOADER_NATIVE_TEST_TARGETS]);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]?.slice(0, 2)).toEqual([
+      "/tmp/bazelisk",
+      "--output_user_root=/tmp/workerd-candidate/bazel-output",
+    ]);
+    expect(commands[0]?.at(-1)).toBe(WORKFLOW_LOADER_NATIVE_TEST_TARGETS.join(" + "));
+  });
+
+  test("names every undeclared native qualification label instead of only the first", async () => {
+    const stateRoot = "/tmp/workerd-candidate";
+    const undeclared = ["//src/workerd/jsg:modules-new-test@", "//src/workerd/jsg:resource-test@"];
+    expect(
+      undeclared.every((target) =>
+        (WORKFLOW_LOADER_NATIVE_TEST_TARGETS as readonly string[]).includes(target),
+      ),
+    );
+    const queries: string[] = [];
+    const rejection = await requireWorkflowLoaderCandidateNativeTargets({
+      bazelisk: "/tmp/bazelisk",
+      source: "/tmp/workerd-candidate/source/workerd",
+      environment: { HOME: stateRoot },
+      stateRoot,
+      targets: WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
+      captureCommand: async (command) => {
+        const expression = command.at(-1) ?? "";
+        queries.push(expression);
+        const missing = undeclared.filter((target) => expression.split(" + ").includes(target));
+        if (missing.length === 0) return { exitCode: 0, stdout: `${expression}\n`, stderr: "" };
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Loading: 0 packages loaded\nERROR: no such target '${missing[0]}': target not declared in package\n`,
+        };
+      },
+    }).catch((reason: unknown) => reason);
+
+    expect(rejection).toBeInstanceOf(Error);
+    const message = rejection instanceof Error ? rejection.message : "";
+    for (const target of undeclared) {
+      expect(message).toContain(`${target}: ERROR: no such target '${target}'`);
+    }
+    expect(message).toContain("native qualification target list is not declared");
+    // One union query, then one query per declared label to name every failure.
+    expect(queries).toEqual([
+      WORKFLOW_LOADER_NATIVE_TEST_TARGETS.join(" + "),
+      ...WORKFLOW_LOADER_NATIVE_TEST_TARGETS,
     ]);
   });
 
