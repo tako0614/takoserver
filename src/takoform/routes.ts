@@ -397,7 +397,27 @@ export function createTakoformRoutes(options: CreateTakoformRoutesOptions): Tako
           form.identity.formRef.definitionVersion === definitionVersion,
       );
       const candidate = candidates.length === 1 ? candidates[0] : undefined;
-      if (!candidate) return failure("form_unknown", 404);
+      if (!candidate) {
+        // The refusal stands: this exact FormRef is not carried, and nothing
+        // here widens the profile to accept it. The detail is the half of the
+        // answer the refused caller cannot compute on its own: a Host that
+        // carries WorkerVersion@0.3.0 and is asked for the superseded
+        // WorkerVersion@0.2.0 is a different client-visible fact from a Host
+        // that carries no WorkerVersion at all. The first means the caller's
+        // pin is behind the Host; the second means the resource comes out of
+        // the configuration. `form_unknown` alone cannot tell them apart.
+        //
+        // `details` is free-form in the released provider's strict envelope
+        // decoder (it is a named member, so it is not an unknown field), which
+        // makes this the one added member no pinned provider release can turn
+        // into a protocol-invalid refusal, and none acts on it.
+        return failure("form_unknown", 404, {
+          group: apiVersion,
+          kind,
+          requestedDefinitionVersion: definitionVersion,
+          declaredDefinitionVersions: declaredDefinitionVersions(forms, apiVersion, kind),
+        });
+      }
       return Response.json(
         formSupportProfile(
           candidate,
@@ -1162,6 +1182,33 @@ function joinedGroup(
   const safeGroup = safeSegment(group);
   if (strictStableLane && !isFormGroup(safeGroup)) throw new TakoformHostError();
   return version === undefined ? safeGroup : `${safeGroup}/${safeSegment(version)}`;
+}
+
+/**
+ * The definitionVersions this Host build declares for one group and kind, in
+ * order, for the refusal detail above.
+ *
+ * It reads the compiled Form set the lane serves, not the targeted authority
+ * projection the refusal itself came from. A targeted lookup answers for the
+ * one exact FormRef it was asked about and reports nothing for the rest of the
+ * kind, so reading it here would answer the one refusal that needs the answer
+ * with an empty set.
+ *
+ * Declaration is not support: durable authority, the caller's Space, and the
+ * provider's own availability can each still narrow a declared Form away, and
+ * this member never turns any of those answers into support.
+ */
+function declaredDefinitionVersions(
+  declared: FormRegistry,
+  apiVersion: string,
+  kind: string,
+): readonly string[] {
+  const versions = new Set<string>();
+  for (const form of declared.values()) {
+    const ref = form.identity.formRef;
+    if (ref.apiVersion === apiVersion && ref.kind === kind) versions.add(ref.definitionVersion);
+  }
+  return [...versions].sort();
 }
 
 function validateFormsFilters(url: URL): void {
