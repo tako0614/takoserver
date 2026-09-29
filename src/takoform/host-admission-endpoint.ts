@@ -103,6 +103,8 @@ export class HostAdmissionEndpoint {
 export async function createProductionFormAuthorityComposition(input: {
   readonly configuration: FormAuthorityEndpointConfiguration;
   readonly bindings: FormAuthorityEndpointBindings;
+  /** Non-Worker Host composition may provide its realized provider surface. */
+  readonly handlerSurface?: Readonly<Record<string, unknown>>;
   /** Optional operator-pinned positive activation scope. */
   readonly activationPolicy?: FormAuthorityActivationPolicy;
 }): Promise<FormAuthorityComposition> {
@@ -122,6 +124,7 @@ export async function createProductionFormAuthorityComposition(input: {
     packages: closure.packages,
     packageSet: closure.packageSet,
     expectedEvidence: closure.evidence,
+    ...(input.handlerSurface ? { handlerSurface: input.handlerSurface } : {}),
   });
 }
 
@@ -219,6 +222,7 @@ async function createComposition(
     readonly packageSet?: readonly FormAuthorityPackageIdentity[];
     readonly expectedEvidence?: FormAuthorityVerificationEvidence;
     readonly activationPolicy?: FormAuthorityActivationPolicy;
+    readonly handlerSurface?: Readonly<Record<string, unknown>>;
   },
   selectedCatalog?: TakoformImplementationCatalog,
 ): Promise<FormAuthorityComposition> {
@@ -227,6 +231,7 @@ async function createComposition(
     (await deriveRuntimeImplementationCatalog({
       implementationPayloadDigest: input.configuration.implementationPayloadDigest,
       capabilities: input.configuration.capabilities,
+      ...(input.handlerSurface ? { handlerSurface: input.handlerSurface } : {}),
     }));
   if (catalog.implementationDigest !== input.configuration.implementationDigest) {
     throw new HostAdmissionCoordinatorError(

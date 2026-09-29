@@ -655,6 +655,18 @@ export function createSelfhostDataPlaneAccess(dataRoot: string): SelfhostDataPla
   };
 }
 
+/**
+ * The handler names used when deriving self-host Form support. This descriptor
+ * is consumed only for presence checks; the provider's concrete implementation
+ * is exercised against it by selfhost-provider-handler-surface.test.ts.
+ */
+export const SELFHOST_PROVIDER_HANDLER_SURFACE = Object.freeze({
+  apply() {},
+  delete() {},
+  adopt() {},
+  observe() {},
+});
+
 /** Whether a ticket says "try again", as opposed to "this cannot be served". */
 function retryableTicket(ticket: ProviderTicket): boolean {
   return ticket.phase === "failed" && ticket.failure.retryable === true;

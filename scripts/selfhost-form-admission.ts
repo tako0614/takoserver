@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { ObjectStore, Sql } from "../src/ports.ts";
+import { SELFHOST_PROVIDER_HANDLER_SURFACE } from "../src/providers/selfhost.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -110,6 +111,7 @@ export async function runSelfhostFormAdmission(
   const semantic = await derivePublicFormImplementationIdentity({
     implementationPayloadDigest,
     capabilities,
+    handlerSurface: SELFHOST_PROVIDER_HANDLER_SURFACE,
   });
   const configuration: FormAuthorityEndpointConfiguration = {
     environment: "production",
@@ -133,6 +135,7 @@ export async function runSelfhostFormAdmission(
   };
   const composition = await createProductionFormAuthorityComposition({
     configuration,
+    handlerSurface: SELFHOST_PROVIDER_HANDLER_SURFACE,
     bindings: {
       sql: options.sql,
       objects: options.objects,
