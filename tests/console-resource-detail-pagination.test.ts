@@ -117,7 +117,7 @@ function summary(name: string, endpoint?: string, space = "default"): ResourceSu
       revision: "1",
       updatedAt: "2026-01-01T00:00:00Z",
     },
-    status: endpoint ? { outputs: { endpoint } } : undefined,
+    ...(endpoint ? { status: { outputs: { endpoint } } } : {}),
   };
 }
 
