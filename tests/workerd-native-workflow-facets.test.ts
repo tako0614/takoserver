@@ -3,12 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // Qualification probe, not a Workflow adapter. Held-I/O abort does not prove
 // that the supervisor can stop synchronous application code. The outer test
 // process bounds this deliberately non-yielding fixture; killing that process
 // on failure is cleanup, never evidence of a successful per-execution stop.
-const CONFIGURED_WORKERD = process.env.TAKOSERVER_WORKERD_BINARY;
+const CONFIGURED_WORKERD = nativeEvidenceBinary("workerd-artifact");
 const CPU_ENTERED = "workflow-native-cpu-entered";
 
 const application = `

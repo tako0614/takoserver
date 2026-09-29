@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createActorNativeOwner } from "../src/actor-native-owner-worker.ts";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "../src/generated/actor-native-bootstrap.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const headers = {
   "x-takoserver-private-actor-id": "same-id",
@@ -120,7 +121,7 @@ test("already completed response is not retroactively failed by its producer dea
   await Promise.all(f.retained);
 });
 
-const candidate = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const candidate = nativeEvidenceBinary("actor-qualification");
 const candidateDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 test.skipIf(candidate === undefined)(

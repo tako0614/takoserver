@@ -15,6 +15,7 @@ import {
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 /**
  * A self-host survives its own restart.
@@ -34,7 +35,7 @@ import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
 
 // A restart must prove the binary Takoserver is allowed to serve with, not the
 // legacy package runtime that the production selector deliberately rejects.
-const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
+const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 const HOSTNAME = "restart.localhost";
 const MODULE = `export default {
   async fetch(request, env) {

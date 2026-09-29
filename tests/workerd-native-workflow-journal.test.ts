@@ -6,9 +6,13 @@ import { join } from "node:path";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdExecutionGuard } from "../src/workerd-execution-guard.ts";
 import { createWorkflowTransportJournal } from "../src/workflow-transport-journal.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
-const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+const workerd = nativeEvidenceBinary("workerd-artifact");
+const guardBinary = nativeEvidenceBinary(
+  "workerd-artifact",
+  "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+);
 
 async function until(probe: () => Promise<boolean>): Promise<void> {
   const deadline = Date.now() + 2_000;

@@ -24,12 +24,13 @@ import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts
 import type { TakoformV1Alpha3FormRef as FormRef } from "../src/takoform/types.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 // Native-only: run in an isolated network namespace with loopback enabled and
 // port 443 free. WorkerEndpoint@0.1.0 promises HTTPS without a non-default port.
 // The executor must verify the configured closed-graph binary's owner digest.
-const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
+const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 const HOST_ORIGIN = "https://api.takoserver.test";
 const SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";

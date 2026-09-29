@@ -10,11 +10,12 @@ import {
   createWorkerdWorkerModuleInspector,
   WORKERD_INSPECTION_ENTRYPOINT_MODULE,
 } from "../src/workerd-worker-module-inspector.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // The inspector's policy is implemented by the pinned native runtime. The npm
 // binary predates it and is not a substitute for this executable test.
 const repositoryRoot = resolve(import.meta.dir, "..");
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
+const workerd = nativeEvidenceBinary("workerd-artifact") ?? null;
 const encoder = new TextEncoder();
 
 function module(

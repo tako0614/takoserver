@@ -20,6 +20,7 @@ import { createSelfhostObjectStore } from "../src/selfhost-object-store.ts";
 import { createSelfhostQueuePump } from "../src/selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "../src/selfhost-scheduler.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 /**
  * The whole self-hosted lane, end to end, with nothing simulated.
@@ -60,7 +61,7 @@ const MODULE_WORKER_SERVICE_BINDING_REF = {
 } as const;
 // This suite is serving evidence only for the pinned native runtime. Falling
 // back to the npm workerd would exercise the known-open resolver instead.
-const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
+const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 
 const TENANT_MODULE = `export default {
   async fetch(request, env) {

@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // This evidence is deliberately opt-in. It runs one upstream native
 // WorkerLoader/Facet fixture against the exact Host-selected workerd bytes.
@@ -10,7 +11,7 @@ import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 // dynamic WorkerCode has no capnp modulePolicy/role fields, so its import
 // observations below are reported as a confinement gap rather than as proof
 // of the closed application graph.
-const CONFIGURED_WORKERD = process.env.TAKOSERVER_WORKERD_BINARY;
+const CONFIGURED_WORKERD = nativeEvidenceBinary("workerd-artifact");
 const LOADER_GRAPH_LIMITATION =
   "dynamic WorkerLoader has no modulePolicy/roles; import observations are not closed-graph conformance";
 

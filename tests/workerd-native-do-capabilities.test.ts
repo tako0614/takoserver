@@ -3,13 +3,14 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // This evidence is deliberately opt-in. The package workerd is not the pinned
 // artifact that production serving is allowed to execute.
 // It probes the upstream native ABI, not Takoform Actor conformance. The same-socket
 // idle reconstruction check proves one hibernation path, not code-update continuity
 // or multi-instance coordination.
-const CONFIGURED_WORKERD = process.env.TAKOSERVER_WORKERD_BINARY;
+const CONFIGURED_WORKERD = nativeEvidenceBinary("workerd-artifact");
 
 const NATIVE_PROBE_MODULE = `export class NativeProbe {
   constructor(state, env) {

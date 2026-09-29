@@ -5,9 +5,13 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdExecutionGuard } from "../src/workerd-execution-guard.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
-const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+const workerd = nativeEvidenceBinary("workerd-artifact");
+const guardBinary = nativeEvidenceBinary(
+  "workerd-artifact",
+  "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+);
 
 const application = `export default { fetch(request) {
   if (new URL(request.url).pathname === "/cpu") { for (;;) {} }
