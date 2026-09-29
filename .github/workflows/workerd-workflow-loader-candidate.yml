@@ -1,0 +1,159 @@
+name: workerd WorkerLoader candidate build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workerd-workflow-loader-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  candidate-build:
+    name: build unqualified WorkerLoader candidate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out selected candidate commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # pinned: v2.0.2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Record runner capacity and verify exact compiler prerequisites
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+          {
+            echo "candidate_commit=${GITHUB_SHA}"
+            echo "runner_image=ubuntu-26.04"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "architecture=$(uname -m)"
+            echo "available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')"
+            echo "memory_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+            df -h "${RUNNER_TEMP}"
+            echo "clang_package_version=$(dpkg-query -W -f='${Version}' clang-20 2>/dev/null || echo missing)"
+            /usr/bin/clang-20 --version 2>&1 | head -n 1 || true
+          } | tee "${report}"
+
+          expected_package_version='1:20.1.8-2ubuntu8'
+          actual_package_version="$(dpkg-query -W -f='${Version}' clang-20 2>/dev/null || true)"
+          expected_clang_line='Ubuntu clang version 20.1.8 (2ubuntu8)'
+          actual_clang_line="$(/usr/bin/clang-20 --version 2>/dev/null | head -n 1 || true)"
+          if [[ "${actual_package_version}" != "${expected_package_version}" || "${actual_clang_line}" != "${expected_clang_line}" ]]; then
+            echo "prerequisite_failure: expected clang-20 ${expected_package_version} (${expected_clang_line}); got package='${actual_package_version}', compiler='${actual_clang_line}'" | tee -a "${report}"
+            exit 1
+          fi
+          for path in \
+            /usr/bin/clang-20 \
+            /usr/bin/clang++-20 \
+            /usr/bin/ld.lld-20 \
+            /usr/lib/llvm-20/lib/clang/20 \
+            /usr/lib/llvm-20/include/c++/v1; do
+            if [[ ! -e "${path}" ]]; then
+              echo "prerequisite_failure: required pinned toolchain path missing: ${path}" | tee -a "${report}"
+              exit 1
+            fi
+          done
+          if [[ "$(uname -m)" != x86_64 ]]; then
+            echo "prerequisite_failure: candidate build requires linux/x64, got $(uname -m)" | tee -a "${report}"
+            exit 1
+          fi
+          echo "compiler_prerequisites=verified" | tee -a "${report}"
+
+      - name: Download and verify pinned Bazelisk
+        shell: bash
+        run: |
+          set -euo pipefail
+          bazelisk="${RUNNER_TEMP}/bazelisk-1.29.0"
+          curl --fail --silent --show-error --location \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64 \
+            --output "${bazelisk}"
+          echo '5a408715e932c0250d28bd84555f12edbf70117de42f9181691c736eacc4a992  '"${bazelisk}" | sha256sum --check
+          chmod 0755 "${bazelisk}"
+          echo "bazelisk_sha256=$(sha256sum "${bazelisk}" | cut -d ' ' -f 1)" >> "${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+
+      - name: Build isolated WorkerLoader candidate (no native tests)
+        id: build
+        shell: bash
+        run: |
+          set -uo pipefail
+          state_root="${RUNNER_TEMP}/workerd-workflow-loader-state"
+          build_log="${RUNNER_TEMP}/workerd-workflow-loader-build.log"
+          report="${RUNNER_TEMP}/workerd-candidate-runner-report.txt"
+          echo "build_start_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
+          set +e
+          timeout --signal=TERM --kill-after=30s 40m \
+            env BAZELISK="${RUNNER_TEMP}/bazelisk-1.29.0" WORKERD_LLVM_ROOT=/ \
+            bun run build:workerd -- \
+              --candidate workflow-loader \
+              --state-root "${state_root}" \
+              --jobs 2 \
+              --memory-mib 8192 2>&1 | tee "${build_log}"
+          pipeline_statuses=("${PIPESTATUS[@]}")
+          build_status=${pipeline_statuses[0]:-1}
+          tee_status=${pipeline_statuses[1]:-1}
+          set -e
+          echo "build_exit_code=${build_status}" | tee -a "${report}"
+          echo "build_log_capture_exit_code=${tee_status}" | tee -a "${report}"
+          echo "build_end_available_disk_kib=$(df -Pk "${RUNNER_TEMP}" | awk 'NR == 2 { print $4 }')" | tee -a "${report}"
+          if [[ "${tee_status}" -ne 0 ]]; then
+            echo "capture_failure: tee failed to preserve the complete build log (exit ${tee_status}); candidate output cannot be accepted" | tee -a "${report}"
+          fi
+          if [[ "${build_status}" -ne 0 ]]; then
+            if [[ "${build_status}" -eq 124 || "${build_status}" -eq 137 ]] || \
+              grep -Eiq 'no space left on device|disk quota exceeded|ENOSPC|out of memory|resource exhausted|cannot allocate memory|killed' "${build_log}"; then
+              echo "capacity_failure: native candidate build stopped under runner disk, memory, or time limits (exit ${build_status}); this is not a successful build" | tee -a "${report}"
+            else
+              echo "candidate_build_failure: build failed before producing an unqualified candidate (exit ${build_status})" | tee -a "${report}"
+            fi
+            exit "${build_status}"
+          fi
+          if [[ "${tee_status}" -ne 0 ]]; then
+            exit "${tee_status}"
+          fi
+          tail -n 1 "${build_log}" > "${RUNNER_TEMP}/workerd-candidate-result.json"
+          jq -e '
+            .qualification == "unqualified-native-tests-not-run" and
+            (.artifact | type == "string") and
+            (.provenance | type == "string")
+          ' "${RUNNER_TEMP}/workerd-candidate-result.json" > /dev/null
+          provenance="$(jq -r '.provenance' "${RUNNER_TEMP}/workerd-candidate-result.json")"
+          binary="$(jq -r '.artifact' "${RUNNER_TEMP}/workerd-candidate-result.json")"
+          test -f "${binary}"
+          test -f "${provenance}"
+          jq -e '.nativeQualification == "not-run" and .qualification == "unqualified-native-tests-not-run"' "${provenance}" > /dev/null
+          echo "candidate_binary=${binary}" >> "${GITHUB_OUTPUT}"
+          echo "candidate_provenance=${provenance}" >> "${GITHUB_OUTPUT}"
+          echo "build_result=unqualified-native-tests-not-run" | tee -a "${report}"
+
+      - name: Upload unqualified candidate binary and provenance
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned: v7.0.1
+        with:
+          name: workerd-workflow-loader-candidate-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            ${{ steps.build.outputs.candidate_binary }}
+            ${{ steps.build.outputs.candidate_provenance }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload runner capacity report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pinned: v7.0.1
+        with:
+          name: workerd-workflow-loader-runner-report-${{ github.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/workerd-candidate-runner-report.txt
+          if-no-files-found: warn
+          retention-days: 7
