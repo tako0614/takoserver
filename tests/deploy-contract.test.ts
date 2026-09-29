@@ -65,6 +65,7 @@ const SURFACES = [
   ["takoserver-site", []],
   ["takoserver-console", []],
   ["takoserver-integration-storage-generation", ["irreversible", "authority"]],
+  ["takoserver-production-d1-fresh-init", ["irreversible", "authority"]],
   ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
   ["takoserver-integration-host-retirement", ["irreversible", "authority"]],
   ["takoserver-rehearsal-d1-create", ["irreversible", "authority"]],
