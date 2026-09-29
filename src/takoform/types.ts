@@ -163,6 +163,17 @@ export interface TakoformFormAvailabilityResolver {
     readonly principalId: string;
     readonly form: InstalledTakoformForm;
   }): Promise<TakoformFormAvailability>;
+  /**
+   * The same answer for a catalogue read, which has no tenant or principal.
+   *
+   * A discovery response that lists a Form without saying whether this Host can
+   * execute it tells an integrator to plan a resource the apply will refuse, so
+   * the surface that answers "which Forms exist" must be able to ask the same
+   * authority that answers "may I apply this". Absent means this resolver has no
+   * platform-level answer and the catalogue publishes no executability at all,
+   * rather than one derived from something else.
+   */
+  catalogue?(input: { readonly form: InstalledTakoformForm }): Promise<TakoformFormAvailability>;
 }
 
 export interface TakoformCommercialAuthority {

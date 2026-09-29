@@ -60,6 +60,7 @@ import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
   TakoformDriverRelation,
+  TakoformFormAvailability,
   TakoformFormAvailabilityResolver,
   TakoformNativeAbsenceEvidence,
   TakoformResourceDriver,
@@ -3206,17 +3207,21 @@ export function createProviderFormAvailability(
   const backed = providers.flatMap((provider) =>
     provider.offerings.map((offering) => offering.form),
   );
+  const answer = (form: InstalledTakoformForm): TakoformFormAvailability => {
+    const executable =
+      (form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+        INTRINSIC_FORMS.has(form.identity.formRef.kind)) ||
+      backed.some((candidate) => sameForm(candidate, form.identity.formRef));
+    return { executable, activated: executable, availableToPrincipal: executable };
+  };
   return {
     async resolve({ form }) {
-      const executable =
-        (form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
-          INTRINSIC_FORMS.has(form.identity.formRef.kind)) ||
-        backed.some((candidate) => sameForm(candidate, form.identity.formRef));
-      return {
-        executable,
-        activated: executable,
-        availableToPrincipal: executable,
-      };
+      return answer(form);
+    },
+    // One composition owns both answers. A catalogue that asked a second
+    // question would be able to advertise an apply this Host would refuse.
+    async catalogue({ form }) {
+      return answer(form);
     },
   };
 }
