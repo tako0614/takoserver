@@ -1,7 +1,9 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
+  EMPTY_SCHEMA_QUERY,
   type RehearsalD1CreateDeclaration,
   type RehearsalD1CreateInvocation,
   type RehearsalD1CreateOptions,
@@ -239,5 +241,52 @@ describe("rehearsal D1 create", () => {
     );
     expect(error.phase).toBe("preflight");
     expect(error.message).toContain("explicit CLOUDFLARE_API_TOKEN");
+  });
+});
+
+/**
+ * The empty-schema fence runs against a real D1, where Cloudflare provisions
+ * its own internal `_cf_KV` table. These tests execute the exact production SQL
+ * against a D1-shaped SQLite schema so the fence's counting rule is pinned to
+ * observed provider state rather than to the stub provider's return value.
+ */
+describe("rehearsal D1 empty-schema fence query", () => {
+  function objectCount(database: Database): number {
+    const row = database.query(EMPTY_SCHEMA_QUERY).get() as { object_count?: unknown } | null;
+    if (row === null || typeof row.object_count !== "number") {
+      throw new Error("empty-schema query returned an invalid object count");
+    }
+    return row.object_count;
+  }
+
+  test("counts nothing on a freshly created D1 that only carries the internal _cf_KV", () => {
+    const database = new Database(":memory:");
+    try {
+      database.exec("CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB);");
+      expect(objectCount(database)).toBe(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    ["application table", "CREATE TABLE users (id TEXT PRIMARY KEY);"],
+    [
+      "application index",
+      "CREATE TABLE users (id TEXT PRIMARY KEY); CREATE INDEX users_by_id ON users (id);",
+    ],
+    [
+      "platform migration ledger",
+      "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP);",
+    ],
+  ])("still refuses any non-internal object: %s", (_label, ddl) => {
+    const database = new Database(":memory:");
+    try {
+      database.exec("CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB);");
+      database.exec(ddl);
+      expect(objectCount(database)).toBeGreaterThan(0);
+    } finally {
+      database.close();
+    }
   });
 });

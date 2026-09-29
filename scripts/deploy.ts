@@ -3,6 +3,10 @@ import { isAbsolute } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
+import {
+  type D1SnapshotRestoreDeclaration,
+  runD1SnapshotRestore,
+} from "./deploy/d1-snapshot-restore.ts";
 import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "./deploy/errors.ts";
 import { runExistingSpaceOperator } from "./deploy/existing-space-operator.ts";
 import { runFormAuthority } from "./deploy/form-authority.ts";
@@ -77,6 +81,9 @@ const USAGE = `takoserver deploy
     rehearsal-only, no selector or production receipt; see docs/deploy.md.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
     no target descriptor, schema import, binding change, or production mode is accepted.
+  takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
+    rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
+    application is never reported as success.
   The authority cutover may add --legacy-predecessor-version=<uuid> for integration bootstrap.
   Hosted-edge authority transition requires the named
   --legacy-host-runtime-predecessor-version=<uuid> selector in integration or production.
@@ -118,6 +125,7 @@ type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
 type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
+type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
   Surface,
   | CredentialSurface
@@ -126,6 +134,7 @@ type StandardSurface = Exclude<
   | StorageDisposalSurface
   | HostRetirementSurface
   | RehearsalD1CreateSurface
+  | D1SnapshotRestoreSurface
 >;
 
 interface InvocationBase {
@@ -148,6 +157,11 @@ interface InvocationBase {
 type Invocation =
   | (InvocationBase & {
       readonly surface: RehearsalD1CreateSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "rehearsal";
+    })
+  | (InvocationBase & {
+      readonly surface: D1SnapshotRestoreSurface;
       readonly action: "status" | "apply";
       readonly environment: "rehearsal";
     })
@@ -674,6 +688,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? { surface: surfaceValue, action, environment, commit }
       : null;
   }
+  if (surfaceValue === "takoserver-d1-snapshot-restore") {
+    return environment === "rehearsal" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
   const budget = 6 + (adoptLivePath === null ? 0 : 1) + (bootstrapVerifierBridge ? 1 : 0);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
@@ -908,15 +929,27 @@ function isSurface(value: string | undefined): value is Surface {
 }
 
 function loadRehearsalD1CreateDeclaration(): RehearsalD1CreateDeclaration {
-  const path = requireEnvironment("TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH");
+  return loadOwnedDeclaration<RehearsalD1CreateDeclaration>(
+    "TAKOSERVER_REHEARSAL_D1_CREATE_DECLARATION_PATH",
+    "rehearsal D1 declaration",
+  );
+}
+
+/**
+ * Reads one operator-owned declaration. Both surfaces that own a D1 identity by
+ * declaration (rehearsal creation and snapshot restore) share these exact file
+ * rules: absolute link-free single-link 0600, current owner, bounded size.
+ */
+function loadOwnedDeclaration<T>(environmentVariable: string, label: string): T {
+  const path = requireEnvironment(environmentVariable);
   if (!isAbsolute(path) || /[\0\r\n]/u.test(path)) {
-    throw new DeployError("preflight", "rehearsal D1 declaration path must be absolute");
+    throw new DeployError("preflight", `${label} path must be absolute`);
   }
   let fd: number;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch {
-    throw new DeployError("preflight", "rehearsal D1 declaration could not be opened");
+    throw new DeployError("preflight", `${label} could not be opened`);
   }
   try {
     const status = fstatSync(fd);
@@ -927,27 +960,34 @@ function loadRehearsalD1CreateDeclaration(): RehearsalD1CreateDeclaration {
       (status.mode & 0o077) !== 0 ||
       status.size > 4096
     ) {
-      throw new DeployError(
-        "preflight",
-        "rehearsal D1 declaration must be owned 0600 regular file",
-      );
+      throw new DeployError("preflight", `${label} must be owned 0600 regular file`);
     }
     const parsed: unknown = JSON.parse(readFileSync(fd, "utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new DeployError("preflight", "rehearsal D1 declaration must be a JSON object");
+      throw new DeployError("preflight", `${label} must be a JSON object`);
     }
-    return parsed as RehearsalD1CreateDeclaration;
+    return parsed as T;
   } catch (error) {
     if (error instanceof DeployError) throw error;
-    throw new DeployError("preflight", "rehearsal D1 declaration is invalid JSON");
+    throw new DeployError("preflight", `${label} is invalid JSON`);
   } finally {
     closeSync(fd);
   }
 }
 
+function loadD1SnapshotRestoreDeclaration(): D1SnapshotRestoreDeclaration {
+  return loadOwnedDeclaration<D1SnapshotRestoreDeclaration>(
+    "TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH",
+    "snapshot restore declaration",
+  );
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
   if (invocation.surface === "takoserver-rehearsal-d1-create") {
     return await runRehearsalD1Create(loadRehearsalD1CreateDeclaration(), invocation);
+  }
+  if (invocation.surface === "takoserver-d1-snapshot-restore") {
+    return await runD1SnapshotRestore(loadD1SnapshotRestoreDeclaration(), invocation);
   }
   const target = loadTarget(targetPath(invocation.environment), invocation.environment);
   const scopeTransition =

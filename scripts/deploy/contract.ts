@@ -1195,6 +1195,35 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-d1-snapshot-restore",
+      target: "cloudflare-d1:one-explicit-empty-rehearsal-database-restored-from-one-pinned-dump",
+      covers: [
+        "scripts/deploy/d1-snapshot-restore.ts",
+        "scripts/deploy/cloudflare-state.ts",
+        "scripts/deploy/d1.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: [
+        "TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH",
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+      ],
+      triggers: ["irreversible", "authority"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH selects one rehearsal-generation D1 by exact UUID and name, one absolute operator-owned 0600 snapshot path, and the sha256 its bytes must carry. No ordinary target descriptor, Worker binding, R2 resource, production mode or OAuth credential is read or changed.`,
+        "post-conditions":
+          "Rewriting every in-literal NUL byte as '||char(0)||' and applying the dump must reproduce the dump's own expectations: every created application table, every per-table row count, the index/trigger/view counts, the exact d1_migrations lineage and zero foreign-key violations, with Wrangler's reported statement count equal to the dump's statement count whenever it is reported at all.",
+        reversal:
+          "The restored D1 is left intact for explicit forward repair. No reset, delete, import-over or automatic cleanup is offered.",
+        "failure-handling": `${highRiskFailure} An import whose readback differs from the dump's expectations is a verification failure that prints every mismatch; a partial application is never reported as success, and an interrupted or unreadable acknowledgement is indeterminate rather than retryable. Both actions require explicit CLOUDFLARE_API_TOKEN and the owned 0600 declaration selected by TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH; apply additionally requires TAKOSERVER_INDEPENDENT_REVIEW. There is no OAuth or production fallback.`,
+        "pre-mutation-proof":
+          "The provider identity of the declared D1 is read back, the target must carry no application table and no d1_migrations row, that fence is re-read after the normalized import bytes are sealed, and the clean remote-reachable commit is qualified once. A dump whose bytes do not match the declared sha256, whose NUL bytes are not all inside single-quoted literals, or whose INSERT statements cannot be counted exactly is refused before any provider mutation.",
+        "independent-review": review,
+      },
+    },
+
+    {
       surface: "takoserver-d1-schema-0058-rehearsal",
       target: "cloudflare-d1:explicit-isolated-0058-synthetic-rehearsal",
       covers: [

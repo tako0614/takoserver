@@ -15,8 +15,18 @@ const COMMIT = /^[0-9a-f]{40}$/u;
 const NAME = /^takoserver-r-([0-9a-f]{32})$/u;
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
 const MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024;
-const EMPTY_SCHEMA_QUERY =
-  "SELECT COUNT(*) AS object_count FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'";
+/**
+ * Counts application schema objects only. Cloudflare provisions its own
+ * internal `_cf_KV` table in every new D1, so a newly created database is never
+ * literally empty. The platform's own readers already exclude it
+ * (`application-schema-shape.ts` and `integration-worker-bootstrap.ts` both drop
+ * `_cf_KV`), and it is provider-owned rather than a user object, so excluding it
+ * keeps the fence honest: any application table, index, trigger or provider
+ * migration ledger still refuses the create.
+ */
+export const EMPTY_SCHEMA_QUERY =
+  "SELECT COUNT(*) AS object_count FROM sqlite_schema " +
+  "WHERE name NOT LIKE 'sqlite_%' AND name <> '_cf_KV'";
 
 export interface RehearsalD1CreateDeclaration {
   readonly kind: "takoserver.rehearsal-d1-create@v1";
