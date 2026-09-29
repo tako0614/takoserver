@@ -17,9 +17,13 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
-const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+const workerd = nativeEvidenceBinary("workerd-artifact");
+const guardBinary = nativeEvidenceBinary(
+  "workerd-artifact",
+  "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+);
 const scope = { tenantId: "tenant", workflowResourceUid: "workflow" };
 
 const poisonNonPromiseIntrinsicsSource = `

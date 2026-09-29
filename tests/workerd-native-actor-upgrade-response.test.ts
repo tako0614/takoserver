@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // Opt-in candidate-runtime evidence only. This does not change the serving pin or
 // claim that a native WebSocket response satisfies the Actor socket contract.
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const expectedDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 const PROBE_MODULE = `export default {

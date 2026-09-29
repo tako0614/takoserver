@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createActorAddressing } from "../src/actor-addressing.ts";
 import { renderActorAddressingModuleSource } from "../src/actor-addressing-source.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const expectedDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 test.skipIf(binary === undefined)(

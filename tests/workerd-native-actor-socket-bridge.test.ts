@@ -13,9 +13,10 @@ import { openSelfhostActorForwardBrokers } from "../src/selfhost-actor-forward-b
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import { createWorkerdRuntime, type WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../src/workerd-version-graph.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // An explicit local candidate, never the accepted serving pin or release gate.
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const expectedDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 const encoder = new TextEncoder();
 

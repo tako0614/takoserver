@@ -4,9 +4,10 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // Explicit LOCAL qualifier. This does not alter the production selector/pin.
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const expectedDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 test.skipIf(binary === undefined)(

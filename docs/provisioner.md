@@ -619,6 +619,38 @@ code-update socket continuity, storage-format upgrades or machine power-loss
 recovery. Actor/Workflow support remains unavailable until the relevant exact
 contracts and provider execution are implemented and verified.
 
+### What the portable gate does with the opt-in evidence
+
+`bun run check` runs `check:native-evidence` immediately before the test phase.
+It names every capability that gates a test, validates a configured artifact, and
+counts what the run did not prove. That report is the authority for what a gate
+run executed; a green `bun run check` does not cover the native evidence below.
+
+| state | CI (`Takoserver quality`) | local `bun run check` |
+| --- | --- | --- |
+| `TAKOSERVER_WORKERD_BINARY` | not configured | not configured unless the operator sets it |
+| the tests it gates | skipped, reported as unproven | skipped, reported as unproven |
+| `TAKOSERVER_ACTOR_QUALIFICATION_BINARY` | not configured | not configured unless the operator sets it |
+| the tests it gates | skipped, reported as unproven | skipped, reported as unproven |
+
+At this revision the report prints 65 gated tests in 15 files for the workerd
+artifact and 8 gated tests in 8 files for the Actor qualification candidate.
+Neither workflow supplies a native artifact, and it cannot: the pinned workerd
+build is not in the dependency tree and `selectClosedGraphWorkerd` refuses to
+substitute the package runtime for the pinned bytes. The gate therefore states
+the gap rather than reporting a pass count it did not earn.
+
+An *unconfigured* capability is not a gate failure, because the portable gate has
+to stay green on a machine without the artifact. A *configured* capability that
+does not hold is a failure: a relative path, a missing or non-executable file, a
+host platform that does not match the pin, bytes whose sha256 is not the pinned
+digest, or an Actor candidate without its declared digest all stop the gate
+before the tests run. A configured artifact never degrades back into skips.
+
+Each gated test file also prints one line per capability per process when the
+capability is not configured, so
+`bun test tests/workerd-native-facets.test.ts` explains its own `(skip)`.
+
 The unadmitted self-host Actor execution path also has a development-only
 alarm slice. Its native per-ID owner stores a pending time separately from an
 unsettled delivery, uses a native Durable Object alarm as a wake/watchdog, and

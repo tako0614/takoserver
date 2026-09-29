@@ -10,8 +10,9 @@ import {
 import { selfhostWorkerEntrypointSource } from "../src/providers/selfhost-worker-wrapper.ts";
 import { openWorkerdActorNamespace } from "../src/selfhost-actor-native-process.ts";
 import type { WorkerdActiveActorGraph } from "../src/workerd-runtime.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const digest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 const encoder = new TextEncoder();
 

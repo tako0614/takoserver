@@ -10,6 +10,7 @@ import {
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 /**
  * The scheme the Host publishes and the scheme the socket serves are the same
@@ -26,7 +27,7 @@ import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 
 // Native coverage is exact-artifact coverage. The npm dependency is the old,
 // open resolver and must never make this test look like serving evidence.
-const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY ?? null;
+const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 const HOSTNAME = "tls-probe.localhost";
 
 let root: string;

@@ -14,9 +14,13 @@ import { createSelfhostWorkflowPreparation } from "../src/selfhost-workflow-prep
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/workerd-runtime.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
-const workerd = process.env.TAKOSERVER_WORKERD_BINARY;
-const guardBinary = process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY;
+const workerd = nativeEvidenceBinary("workerd-artifact");
+const guardBinary = nativeEvidenceBinary(
+  "workerd-artifact",
+  "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
+);
 const scope = { tenantId: "tenant", workflowResourceUid: "workflow" };
 
 const SCRIPT = "workflow";

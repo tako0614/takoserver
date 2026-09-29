@@ -10,6 +10,7 @@ import {
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createWorkerdSupervisor } from "../src/workerd-supervisor.ts";
 import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 test("does not select an implicit package runtime", async () => {
   const root = await mkdtemp(join(tmpdir(), "takoserver-workerd-artifact-"));
@@ -35,10 +36,10 @@ test("rejects a runnable binary whose immutable digest is not the owner pin", as
   }
 });
 
-test.skipIf(process.env.TAKOSERVER_WORKERD_BINARY === undefined)(
+test.skipIf(nativeEvidenceBinary("workerd-artifact") === undefined)(
   "selects the pinned artifact only after its real closed-graph capability executes",
   async () => {
-    const binary = process.env.TAKOSERVER_WORKERD_BINARY as string;
+    const binary = nativeEvidenceBinary("workerd-artifact") as string;
     const root = await mkdtemp(join(tmpdir(), "takoserver-workerd-artifact-"));
     try {
       const selected = await selectClosedGraphWorkerd({
@@ -60,7 +61,7 @@ test.skipIf(process.env.TAKOSERVER_WORKERD_BINARY === undefined)(
   },
 );
 
-test.skipIf(process.env.TAKOSERVER_WORKERD_BINARY === undefined)(
+test.skipIf(nativeEvidenceBinary("workerd-artifact") === undefined)(
   "later inspection executes the selected byte identity after the configured path is replaced",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "takoserver-workerd-artifact-replacement-"));
@@ -69,7 +70,7 @@ test.skipIf(process.env.TAKOSERVER_WORKERD_BINARY === undefined)(
     let running: ReturnType<typeof Bun.spawn> | undefined;
     let supervisor: ReturnType<typeof createWorkerdSupervisor> | undefined;
     try {
-      await copyFile(process.env.TAKOSERVER_WORKERD_BINARY as string, configured);
+      await copyFile(nativeEvidenceBinary("workerd-artifact") as string, configured);
       await chmod(configured, 0o700);
       const selected = await selectClosedGraphWorkerd({
         binary: configured,

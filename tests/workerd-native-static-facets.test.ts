@@ -3,12 +3,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // This is an opt-in native feasibility fixture. It runs the exact Host-selected
 // workerd bytes and exercises static facet classes; it is not a portable Actor
 // ABI or a production Host wrapper. The host-private module is deliberately the
 // only class entrypoint and constructs a fixture-only application context.
-const CONFIGURED_WORKERD = process.env.TAKOSERVER_WORKERD_BINARY;
+const CONFIGURED_WORKERD = nativeEvidenceBinary("workerd-artifact");
 const STATIC_VERSION_A = "A" as const;
 const STATIC_VERSION_B = "B" as const;
 type StaticVersion = typeof STATIC_VERSION_A | typeof STATIC_VERSION_B;

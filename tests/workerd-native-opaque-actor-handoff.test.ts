@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 // Two real, separate workerd processes. This is a candidate transport probe,
 // not an Actor contract implementation or a serving-artifact qualification.
-const binary = process.env.TAKOSERVER_ACTOR_QUALIFICATION_BINARY;
+const binary = nativeEvidenceBinary("actor-qualification");
 const expectedDigest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 
 const CHILD = `export class ActorChild {
