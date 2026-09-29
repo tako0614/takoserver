@@ -115,6 +115,20 @@ enough private disk for the pinned source archive, dependency downloads, and
 native outputs before a full candidate build. `--prepare-only` is the
 non-compile way to verify archive retrieval and combined-patch application.
 
+The manual GitHub Actions workflow
+[`workerd-workflow-loader-candidate.yml`](../.github/workflows/workerd-workflow-loader-candidate.yml)
+tries this build on the standard `ubuntu-26.04` hosted runner. It records
+available disk and total memory before the build plus available disk after it,
+verifies the exact Ubuntu clang package/version and required LLVM paths, and
+uses a 40-minute build limit within a 45-minute job. A missing toolchain
+prerequisite, capacity failure, or timeout is a failed run, never a successful
+probe. No Bazel cache is shared between runs. A successful run uploads only the
+candidate binary and its provenance for seven days; the separate runner report
+is also retained for seven days. This manual workflow builds only: native
+tests, WorkerLoader qualification, runtime wiring, publication, and deployment
+are not performed. The uploaded binary remains an unqualified CI candidate and
+must not be configured as `TAKOSERVER_WORKERD_BINARY`.
+
 The accepted build remains the default when `--candidate workflow-loader` is
 absent. The candidate output is explicitly marked
 `unqualified-native-tests-not-run`; native compilation, exact-binary probing,

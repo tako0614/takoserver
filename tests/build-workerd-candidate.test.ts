@@ -21,6 +21,30 @@ afterEach(async () => {
 });
 
 describe("workerd WorkerLoader candidate build inputs", () => {
+  test("manual hosted workflow builds only an isolated, explicitly unqualified candidate", async () => {
+    const workflow = await readFile(
+      new URL("../.github/workflows/workerd-workflow-loader-candidate.yml", import.meta.url),
+      "utf8",
+    );
+
+    expect(workflow).toMatch(/^\s*workflow_dispatch:\s*$/mu);
+    expect(workflow).not.toMatch(/^\s*(?:push|pull_request):/mu);
+    expect(workflow).toContain("runs-on: ubuntu-26.04");
+    expect(workflow).toContain("timeout-minutes: 45");
+    expect(workflow).toContain("timeout --signal=TERM --kill-after=30s 40m");
+    expect(workflow).toContain("--candidate workflow-loader");
+    expect(workflow).toContain("--jobs 2");
+    expect(workflow).toContain("--memory-mib 8192");
+    expect(workflow).toContain(`pipeline_statuses=("\${PIPESTATUS[@]}")`);
+    expect(workflow).toContain(`tee_status=\${pipeline_statuses[1]:-1}`);
+    expect(workflow).toContain("capture_failure:");
+    expect(workflow).toContain("native-tests-not-run");
+    expect(workflow).toContain("retention-days: 7");
+    expect(workflow).not.toMatch(/\b(?:bun test|bun run test|bazel test)\b/u);
+    expect(workflow).not.toContain("TAKOSERVER_WORKERD_BINARY");
+    expect(workflow).not.toMatch(/\b(?:wrangler deploy|bun run deploy)\b/u);
+  });
+
   test("emits separate Bazel local-resource assignments", () => {
     expect(workflowLoaderCandidateResourceArguments({ jobs: 2, memoryMiB: 8192 })).toEqual([
       "--jobs=2",
