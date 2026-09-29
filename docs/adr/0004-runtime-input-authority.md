@@ -42,12 +42,13 @@ machine credential for these routes:
 - `PUT|DELETE /v1/worker-endpoint-origin-reservations/{reservationId}/activation`
 - `GET|PUT|DELETE /v1/organizations/{organizationId}/worker-runtime-input-preparations/{operationId}`
 
-The reservation format is
-`takoserver.worker-endpoint-origin-reservation.v1`. Its public projection
-contains only the reservation ID, canonical origin, revision, expiry, logical
-target (`space`, `workerName`, `endpointName`), status, and the exact worker or
-endpoint UIDs once known. Provider placement is deliberately retained in the
-ledger but not exposed as portable identity.
+The current reservation format is
+`takoserver.worker-endpoint-origin-reservation.v2`. Its public projection
+contains only the reservation ID, the requested subdomain, canonical origin,
+revision, expiry, status, and the exact bound worker or endpoint identity once
+known; `…reservation.v1` rows written by the retired writer stay readable as
+history. Provider placement is deliberately retained in the ledger but not
+exposed as portable identity.
 
 Reservation PUT may omit `offeringId` only when the same sold-placement
 authority used by ordinary Host mutation finds exactly one eligible
@@ -70,7 +71,8 @@ prepared|bound --release with absence fences--> terminal
 
 There is one live reservation per organization, space, and logical worker, and
 one global owner per canonical origin. A PUT replay succeeds only when its
-target, TTL, selected placement, Offering digest, and derived origin are exact.
+requested subdomain, TTL, selected placement, Offering digest, and derived
+origin are exact.
 
 Binding records the exact Ready/current-generation ModuleWorker UID and
 revision and its matching active provider deployment. Activation accepts an

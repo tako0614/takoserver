@@ -1,6 +1,15 @@
 # ADR 0007 — ObjectBucket joins the implementation catalog
 
-**Status:** accepted, 2026-09-02; amended 2026-09-03 and 2026-09-11
+**Status:** accepted, 2026-09-02; amended 2026-09-03, 2026-09-11 and 2026-09-20
+
+> **2026-09-20 amendment:** the public Host's code-owned capability manifest
+> declares `WorkerCustomDomain`'s five published operations (`create`,
+> `read`, `delete`, `import`, `observe`), so its catalog derives a supporting
+> entry for that kind. The sentence below that grouped `WorkerCustomDomain`
+> with the packages this Host does not support was written before that and no
+> longer describes the public Host; `ActorNamespace` and `DurableWorkflow`
+> still derive no entry, and `WorkerCustomDomain` stays outside
+> `YURUCOMMU_IDENTITY_CAPABILITY_KINDS` with no identity supply of its own.
 
 > **2026-09-11 amendment:** StaticAssetBundle now joins the executable
 > capability set as an intrinsic artifact resource. Earlier exclusion and
@@ -53,10 +62,14 @@ the identity Forms that composition did offer. The
 [second rotation](#second-rotation-the-self-host-realizes-the-supply) closed
 that gap; the rule that produced both answers is the same one.
 
-The three other installed-but-unsupported packages — `ActorNamespace`,
-`DurableWorkflow`, and `WorkerCustomDomain` — are unchanged. They stay
-installed, unsupported, and without an activation head. `StaticAssetBundle` was
-admitted as an intrinsic executable resource by the 2026-09-11 amendment below.
+The three packages outside this identity-supply set — `ActorNamespace`,
+`DurableWorkflow`, and `WorkerCustomDomain` — are unchanged as packages.
+`ActorNamespace` and `DurableWorkflow` stay installed, unsupported, and without
+an activation head; `WorkerCustomDomain` is declared supported by the public
+Host from the 2026-09-20 amendment at the top of this document, which is where
+`publicFormCapabilityManifest()` names its five published operations.
+`StaticAssetBundle` was admitted as an intrinsic executable resource by the
+2026-09-11 amendment below.
 
 ## What each runtime hands the Worker
 
@@ -598,11 +611,12 @@ asset-serving path. That backend still explicitly refuses asset-bearing
 WorkerVersions pending upload and authoritative readback support. Bundle
 storage, backend attachment, and live serving are separate claims.
 
-This does not enable WorkerCustomDomain. That handler requires an exact
-tenant/hostname zone grant, which is independent of artifact storage. A Host
-without custom-domain grants remains a valid composition; no global zone
-requirement is introduced. ActorNamespace and DurableWorkflow still have no
-runtime lifecycle handler.
+This admission did not enable WorkerCustomDomain; the capability declaration
+that later moved it is recorded in the 2026-09-20 amendment at the top of this
+document. That handler requires an exact tenant/hostname zone grant, which is
+independent of artifact storage. A Host without custom-domain grants remains a
+valid composition; no global zone requirement is introduced. ActorNamespace
+and DurableWorkflow still have no runtime lifecycle handler.
 
 The new intrinsic capability changes both Hosts' code-derived capability and
 implementation digests. The ObjectBucket-era digest tables above remain

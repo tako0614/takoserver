@@ -165,10 +165,13 @@ answer really is still the answer.
 ### Why a marker and not a new code
 
 A new code would have been the tidier list. It is not available. The portable
-taxonomy is closed and released: `stableErrorHTTPStatusByCode` in the provider's
-`internal/clientv3/errors.go` — mirrored here as `STABLE_ERROR_HTTP_STATUS` —
-is the complete set `parseAPIError` will classify, and a code outside it is read
-as an opaque rejection carrying no portable semantics at all. Minting
+taxonomy is closed and released: the provider's `stableErrorHTTPStatusByCode`
+table, projected here from the vendored
+`vendor/takoform/host-api-v1/operations-v1.json` into
+`src/generated/takoform-stable-error-taxonomy.ts` as
+`STABLE_ERROR_HTTP_STATUS`, is the complete set `parseAPIError` will classify,
+and a code outside it is read as an opaque rejection carrying no portable
+semantics at all. Minting
 `precondition_unmet` would answer outside the taxonomy every released provider
 speaks, to fix a defect that lives entirely on this side of the wire.
 

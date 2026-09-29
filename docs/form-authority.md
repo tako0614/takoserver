@@ -78,7 +78,7 @@ bootstrap, rehearsal, and production do not select this path.
 
 Ordinary integration code-only applies to the probe, route-less authority, and
 operator gateway also have a bounded Form-local gate instead of repeating the
-complete repository check. It runs the repository typecheck, all four Form
+complete repository check. It runs the repository typecheck, all five Form
 Worker typechecks and generated-type checks, import/corpus/package checks, the
 selected surface's runtime and deploy-boundary tests, and four Docker-free
 Worker bundle/closure builds with Container rollout disabled. The caller must

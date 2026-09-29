@@ -104,7 +104,7 @@ refused. `tests/selfhost-actor-upgrade-broker.test.ts` drives the actual broker
 over Unix sockets, including its commit control request; this is carrier-parser
 evidence, not a native workerd WebSocket qualification.
 
-The pinned Hono 4.12.31 test exercises its actual CORS/context reconstruction and
+The pinned Hono 4.13.10 test exercises its actual CORS/context reconstruction and
 post-handler header mutation, without a Hono-specific branch. On baseline
 `639112e`, the empty opaque object reconstructs into a status-200 Response and
 loses its reservation; the test expecting 101 fails. This differs from the older
@@ -126,6 +126,6 @@ protocol, and verifies that the decision retains only the validated snapshot.
 Focused checks: `bun test tests/actor-upgrade-handoff.test.ts
 tests/actor-native-class-execution.test.ts tests/actor-class-execution.test.ts
 tests/actor-namespace-facade.test.ts tests/actor-native-owner-worker.test.ts
-tests/selfhost-actor-forward-worker-wrapper.test.ts`, TypeScript, and the four
+tests/selfhost-actor-forward-worker-wrapper.test.ts`, TypeScript, and the five
 Actor source-projection checks. These are not complete owner-gate, native
 transport, production or publication evidence.

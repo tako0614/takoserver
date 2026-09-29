@@ -38,7 +38,7 @@ describe("Takoserver public site", () => {
     });
     expect(html).toContain('<html lang="ja">');
     expect(html).toContain("インフラを宣言。Hostが価格を決め、プロビジョニングし、計測します。");
-    expect(html).toContain("正確なForm identity");
+    expect(html).toContain("厳密なForm同一性");
     expect(html).toContain("日本語");
   });
 

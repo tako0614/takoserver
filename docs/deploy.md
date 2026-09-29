@@ -93,7 +93,7 @@ pre-shape and data digest before the first migration can run.
 
 ### Fresh integration storage
 
-A disposable staging rebuild uses a separate integration-only surface. It does
+A disposable integration rebuild uses a separate integration-only surface. It does
 not reset an existing database or relax its migration requirements:
 
 ```sh
@@ -435,7 +435,8 @@ The routine surfaces stay strict too and never accept such a predecessor.
 
 The public storage rebind is a separate, narrow delta available only in
 `integration` on `takoserver-worker-authority-cutover`,
-`takoserver-form-authority-worker` (the staging Form authority Worker), and
+`takoserver-form-authority-worker` (the environment-selected route-less Form
+authority Worker), and
 `takoserver-integration-form-authority-worker`. It requires the pinned closure
 predecessor plus both flags:
 
@@ -536,7 +537,7 @@ yourself; nothing writes it for you.
 
 **2. Advance the route-less integration Form authority Worker.** Its live
 Version `e2c68d9a-3ea3-4155-80e5-6d4da5648b7a` was published from `b10479d2`
-and carries the twelve-kind manifest; `main` derives thirteen:
+and carries the twelve-kind manifest; `main` derives fourteen:
 
 ```sh
 bun run deploy -- takoserver-integration-form-authority-worker --status \
@@ -961,8 +962,10 @@ managed customer runtime.
   authority mutation and is not smuggled through this public Worker deploy.
 - `takoserver-form-authority-identity-probe`: one reviewed minimal read-only
   Worker upload in every Form-authority environment. Its permanent target-owned
-  workers.dev endpoint exposes only `GET /v1/public-host-identity`, backed by a
-  named service binding to the public Worker's identity RPC. It has no storage,
+  workers.dev endpoint exposes only `GET /v1/public-host-identity` and
+  `GET /v1/core-verifier-identity` — the latter answering only while its
+  `FORM_AUTHORITY` binding exists — each backed by a named service binding to
+  the public Worker's identity RPC or to the released-Core authority's. It has no storage,
   secret, mutation RPC, custom domain, preview, or zone route. For an initial
   integration target with both native Workers absent, the existing surface
   internally selects `integration-host-only` and realizes only the Host id and
@@ -1295,12 +1298,14 @@ new D1 to 0057 or qualify 0058.
 ### Restoring an exported dump into an empty rehearsal D1
 
 `wrangler d1 export` output is not re-importable as-is, and the failure is
-silent. The measured production dump carries 1616 raw NUL bytes inside `TEXT`
-literals (composite `tf_replays.replay_key` values), D1's text parser stops at
-the first of them, and `wrangler d1 execute --file` **exits 0 while applying
-only 45 of the dump's 4226 statements** — 6 of 44 tables, with no error and no
-warning. The `takoserver-d1-snapshot-restore` surface exists so that no restore
-depends on that exit code:
+silent. The production dump the operator measured carries 1616 raw NUL bytes
+inside `TEXT` literals (composite `tf_replays.replay_key` values), D1's text
+parser stops at the first of them, and `wrangler d1 execute --file` **exits 0
+while applying only 45 of the dump's 4226 statements** — 6 of 44 tables, with
+no error and no warning. The byte and table counts are that measurement; what
+this checkout attests is the loss, the 4181 of 4226 statements recorded in
+`scripts/deploy/d1-snapshot-restore.ts`. The `takoserver-d1-snapshot-restore`
+surface exists so that no restore depends on that exit code:
 
 - it normalizes the dump in memory before anything runs: every NUL inside a
   single-quoted literal becomes `'||char(0)||'` (semantics-preserving), a NUL
@@ -1733,10 +1738,12 @@ For the retained pair, use the existing retirement owners to complete the exit:
 
 1. Settle the selected schema lineage and qualify the declared CPE dependencies
    before removing maintenance mode.
-2. With the normal target, `takoserver-public-parent-token-retirement` first
-   publishes the normal Host with its CPE binding while carrying both legacy
-   keys, then deletes only the Cloudflare key. It does not copy or rotate secret
-   values.
+2. With the normal target, the private composition's
+   `takoserver-public-parent-token-retirement` — exported through
+   `@takoserver/core/deploy-extension`, and not a surface of this checkout's
+   contract — first publishes the normal Host with its CPE binding while
+   carrying both legacy keys, then deletes only the Cloudflare key. It does not
+   copy or rotate secret values.
 3. If route and materializer removal already predate this schema transition,
    `takoserver-sponsorship-public-route-retirement` settles that current fact in
    D1 using a fresh cutover proof and repeated exact readback. Its predecessor
