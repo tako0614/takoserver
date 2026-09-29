@@ -449,6 +449,12 @@ a catalog that removes their capability. No operation is advertised unless it
 is declared by the package, present in the
 Host capability manifest, and handled by the runtime.
 
+As observed on 2026-09-29, no composed provider backend claims
+`DurableWorkflow`. The current selected contract and composition do not provide
+the execution-stop acknowledgement identified in
+[ADR 0010](adr/0010-durable-workflow-has-no-provider-owner.md); this observation
+does not rule out another implementation or composition.
+
 `ObjectBucket` left that list in
 [ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md). The exact
 current package at definition version `0.1.0` is now supported and activated
