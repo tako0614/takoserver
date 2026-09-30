@@ -531,14 +531,25 @@ of historical unresolved operations.
 
 ### Runtime-specific support
 
-Vector has an explicit development-only self-host integration. It requires a
-matching VectorIndex Offering, the exact candidate Interface and Binding, and
-an injected `vectorIndexStore` for both provisioning and the data plane. The
-ordinary Bun entry does not activate it or admit its unpublished Forms. An
-application binding exposes only `upsert`, `get`, `delete`, and `query`; its
-tenant and Resource UID come from the Host-resolved relation, never from the
-application's operation input. A missing store or deleted index is unavailable,
-not permission to create an index implicitly. Managed WfP support is separate.
+AI gateway availability is composition-dependent, not a promise that this
+Bun process provides a model service. The ordinary Bun entry can expose
+`/v1/ai` only when an operator configures an OpenAI-compatible upstream URL,
+model mapping, and token source; the gateway forwards requests to that upstream.
+The Cloudflare Worker composition instead uses its native Workers AI binding
+when model mappings are configured. The account-level Cloudflare REST adapter
+is not part of either active composition. Neither path provisions models or
+grants a customer Cloudflare account credential.
+
+Vector has a fixture-backed, development-only self-host integration. It
+requires a matching VectorIndex Offering, the exact candidate Interface and
+Binding, and an injected `vectorIndexStore` for both provisioning and the data
+plane. The ordinary Bun entry does not compose that store, activate the
+candidate, or admit its unpublished Forms; the released Form catalog therefore
+does not advertise VectorIndex. An application binding exposes only `upsert`,
+`get`, `delete`, and `query`; its tenant and Resource UID come from the
+Host-resolved relation, never from the application's operation input. A
+missing store or deleted index is unavailable, not permission to create an
+index implicitly. Managed WfP support is separate.
 
 A Version with Vector bindings retains their exact tenant/Resource scope in
 the internal v6 binding record. Versions without Vector keep v4/v5 writes, and

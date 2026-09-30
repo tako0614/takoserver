@@ -45,6 +45,8 @@ const CURRENT_PUBLISHER_FORM_KINDS = new Set(
 export interface PublicFormImplementationConfiguration {
   readonly implementationPayloadDigest: `sha256:${string}`;
   readonly capabilities: TakoformLifecycleCapabilityManifest;
+  /** Concrete provider handler surface for non-Worker compositions. */
+  readonly handlerSurface?: Readonly<Record<string, unknown>>;
   /** Explicit source composition, never publication, admission or activation. */
   readonly candidate?: "actor-forward";
   /** Real composed technical supply and runtime. Source selection alone is
@@ -105,7 +107,8 @@ export async function deriveRuntimeImplementationCatalog(
   const selection = selectTakoformCandidates(configuration.candidate);
   const forms = exactPublisherFormCandidates([...selection.forms, ...selection.retainedForms]);
   const providerOperations = providerResourceOperationHandlers(
-    CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>,
+    configuration.handlerSurface ??
+      (CloudflareProvider.prototype as unknown as Readonly<Record<string, unknown>>),
   );
   const intrinsicKinds = new Set<string>(TAKOSERVER_INTRINSIC_HANDLER_KINDS);
   const cloudflareKinds = new Set<string>(CLOUDFLARE_TAKOFORM_HANDLER_KINDS);

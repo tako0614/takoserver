@@ -1,16 +1,22 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
+import type { Provider } from "../src/provider-port.ts";
 import { deriveRuntimeImplementationCatalog } from "../src/public-worker-implementation.ts";
 import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
+import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
+import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 const SELFHOST_CAPABILITIES = yurucommuLifecycleCapabilityManifest(
@@ -27,11 +33,90 @@ const SELFHOST_CATALOG = await deriveRuntimeImplementationCatalog({
 const PACKAGE_COUNT = 17;
 const IMPLEMENTED = SELFHOST_CATALOG.entries.length;
 
+describe("self-host Form admission CLI", () => {
+  test("refuses recovery-only mode before opening admission state", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tsa-cli-"));
+    try {
+      const result = await runAdmissionCli(root, {
+        TAKOSERVER_RETIRED_PROVIDER_MODE: "cloudflare-object-bucket-drain",
+        CLOUDFLARE_ACCOUNT_ID: "fixture-account",
+        CLOUDFLARE_API_TOKEN: "fixture-token",
+        TAKOSERVER_PROVISIONER_TOKEN: "fixture-provisioner",
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("self-host Form admission requires stable-selfhost");
+      expect(existsSync(join(root, "control.sqlite"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the running Host's configured database without opening the default", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tsa-cli-"));
+    const databasePath = join(root, "custom.sqlite");
+    const database = new Database(databasePath);
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    database.close();
+    try {
+      // The unreachable verifier keeps this a pre-admission probe. The CLI
+      // must select the exact Host database before reaching that boundary.
+      const result = await runAdmissionCli(root, { TAKOSERVER_DB: databasePath });
+      expect(result.exitCode).not.toBe(0);
+      expect(existsSync(databasePath)).toBe(true);
+      expect(existsSync(join(root, "control.sqlite"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an ephemeral Host database before opening admission state", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tsa-cli-"));
+    try {
+      const result = await runAdmissionCli(root, { TAKOSERVER_DB: ":memory:" });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("self-host Form admission requires durable local state");
+      expect(existsSync(join(root, "control.sqlite"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+async function runAdmissionCli(root: string, environment: Readonly<Record<string, string>>) {
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "--no-env-file",
+      "scripts/selfhost-form-admission.ts",
+      "org_cli",
+      "default",
+      "--data-root",
+      root,
+      "--core-verifier",
+      "http://127.0.0.1:1",
+      "--apply",
+    ],
+    {
+      cwd: join(import.meta.dir, ".."),
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, ...environment },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  const [exitCode, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stderr).text(),
+    new Response(child.stdout).text(),
+  ]);
+  return { exitCode, stderr };
+}
+
 describe("self-host Form admission", () => {
   test("plans the exact publisher set as a dry run and records nothing", async () => {
     const fixture = dataRoot();
     try {
       const verifier = createSyntheticPublisherSetVerifier();
+      const provider = await fixture.provider();
       const result = await runSelfhostFormAdmission({
         organizationId: "org_selfhost",
         space: "default",
@@ -40,6 +125,7 @@ describe("self-host Form admission", () => {
         apply: false,
         sql: fixture.sql,
         objects: fixture.objects,
+        provider,
         fetch: verifier.fetch,
       });
       expect(result.applied).toBeNull();
@@ -58,6 +144,7 @@ describe("self-host Form admission", () => {
     const fixture = dataRoot();
     try {
       const verifier = createSyntheticPublisherSetVerifier();
+      const provider = await fixture.provider();
       const result = await runSelfhostFormAdmission({
         organizationId: "org_selfhost",
         space: "default",
@@ -66,6 +153,7 @@ describe("self-host Form admission", () => {
         apply: true,
         sql: fixture.sql,
         objects: fixture.objects,
+        provider,
         fetch: verifier.fetch,
       });
       const applied = result.applied;
@@ -117,6 +205,7 @@ describe("self-host Form admission", () => {
         apply: true,
         sql: fixture.sql,
         objects: fixture.objects,
+        provider,
         fetch: verifier.fetch,
       });
       expect(again.plan.commands).toEqual([]);
@@ -134,6 +223,7 @@ describe("self-host Form admission", () => {
       const verifier = createSyntheticPublisherSetVerifier({
         artifactDigest: `sha256:${"b".repeat(64)}`,
       });
+      const provider = await fixture.provider();
       await expect(
         runSelfhostFormAdmission({
           organizationId: "org_selfhost",
@@ -143,6 +233,7 @@ describe("self-host Form admission", () => {
           apply: true,
           sql: fixture.sql,
           objects: fixture.objects,
+          provider,
           fetch: verifier.fetch,
         }),
       ).rejects.toMatchObject({ code: "artifact_mismatch" });
@@ -151,18 +242,78 @@ describe("self-host Form admission", () => {
       fixture.close();
     }
   });
+
+  test("derives admission import support from the supplied Provider handler", async () => {
+    const fixture = dataRoot();
+    try {
+      const verifier = createSyntheticPublisherSetVerifier();
+      const provider = await fixture.provider();
+      // This alters only one lifecycle handler on a real composed Provider;
+      // admission identity must track that method surface rather than any
+      // separately declared runtime/native availability.
+      const withoutAdopt: Provider = Object.assign(Object.create(provider) as Provider, {
+        adopt: undefined,
+      });
+      const result = await runSelfhostFormAdmission({
+        organizationId: "org_selfhost",
+        space: "default",
+        hostId: "http://localhost:8787",
+        coreVerifierUrl: "http://127.0.0.1:1",
+        apply: false,
+        sql: fixture.sql,
+        objects: fixture.objects,
+        provider: withoutAdopt,
+        fetch: verifier.fetch,
+      });
+      const edgeKv = result.plan.packages.find((entry) => entry.formRef.kind === "EdgeKVNamespace");
+      expect(edgeKv?.operations).toEqual(["create", "read", "delete", "observe"]);
+    } finally {
+      fixture.close();
+    }
+  });
 });
 
 function dataRoot() {
   const root = mkdtempSync(join(tmpdir(), "takoserver-selfhost-admission-"));
+  const objects = createFileObjectStore({ root });
   // These cases receive an SQL handle and never reopen a database file. Keep
   // the full SQLite schema and constraints without per-migration disk flushes;
   // the assertions cover admission authority/state, not filesystem durability.
   const database = new Database(":memory:");
   for (const migration of MIGRATIONS) database.exec(migration.sql);
   return {
+    root,
     sql: createSqliteSql(database),
-    objects: createFileObjectStore({ root }),
+    objects,
+    async provider() {
+      const artifacts = createTakoformArtifacts({
+        sql: createSqliteSql(database),
+        objects,
+        clock: () => new Date(),
+        randomId: () => crypto.randomUUID(),
+      });
+      const composition = createStandaloneProviderComposition({
+        mode: "stable-selfhost",
+        stableForms: currentTakoformCandidates().forms,
+        edge: await buildEdgeForms(),
+        dataRoot: root,
+        runtime: createWorkerdRuntime({ root, binary: null }),
+        // These admission tests inspect the concrete Provider method surface,
+        // not native workerd qualification or runtime service availability.
+        workerRuntimeAvailable: false,
+        artifacts: {
+          manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
+          async blob(digest) {
+            const object = await objects.get(`art/${digest.slice("sha256:".length)}`);
+            return object ? new Uint8Array(await new Response(object.body).arrayBuffer()) : null;
+          },
+        },
+        now: new Date(),
+      });
+      const provider = composition.providers[0];
+      if (!provider) throw new Error("self-host provider composition is empty");
+      return provider;
+    },
     close() {
       database.close();
       rmSync(root, { recursive: true, force: true });
