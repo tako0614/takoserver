@@ -694,6 +694,18 @@ function asBytes(value: unknown): Uint8Array | null {
   if (ArrayBuffer.isView(value)) {
     return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
   }
+  if (Array.isArray(value)) {
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) return null;
+      const byte: unknown = value[index];
+      if (typeof byte !== "number" || !Number.isInteger(byte) || byte < 0 || byte > 255) {
+        return null;
+      }
+      bytes[index] = byte;
+    }
+    return bytes;
+  }
   return null;
 }
 
