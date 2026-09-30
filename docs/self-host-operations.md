@@ -3,8 +3,9 @@
 This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator
 snapshot/restore command, no restore mode that suppresses startup work, and no
-full live-operator restore drill. The test below proves only that selected
-local readers can reopen a copied fixture.
+full live-operator restore drill. The tests below cover local readers and an
+optional isolated native Host restore; neither replaces an operator recovery
+drill.
 
 ## What belongs to one installation
 
@@ -84,9 +85,43 @@ installation, not as a no-write restore check. If source fencing, ownership of
 the public identity, or the fate of pending operations is uncertain, leave the
 restored copy stopped and resolve that uncertainty before activation.
 
-The automated test `tests/self-host-backup-restore.test.ts` copies a disposable
+## Automated proof and its limits
+
+The portable test `tests/self-host-backup-restore.test.ts` copies a disposable
 fixture after closing its SQLite connection, then reopens the copied database,
 object store, and published Worker files through their current readers. It does
 not boot the entrypoint, prove a complete installation restore, exercise
 external credentials or services, test a real filesystem snapshot, or replace
 an operator recovery drill.
+
+The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
+starts the real Bun entrypoint and the accepted workerd artifact. It creates
+resources through the Host HTTP API, uploads and publishes a Worker, and checks
+its Endpoint over certificate-validated HTTPS. After the Host and its workerd
+descendants have exited and both listeners have closed, it copies the complete
+data root, an external control database directory (including any sidecars), and
+external TLS material in the same stopped window. A new Host starts from the
+copy. The test checks the old HTTPS URL before reading the Resource graph, then
+checks that UIDs, revisions, exposed outputs, and the Endpoint URL are retained.
+The client does not republish resources during recovery.
+
+This native case requires Linux `/proc`, Bun, OpenSSL, `unshare`, `ip`, an exact
+accepted workerd artifact, and permission to create a network namespace and
+bind port 443 there. Run it from the repository root in a separate loopback-only
+network namespace; do not borrow the ports or data root of an existing Host:
+
+```sh
+env -i PATH="$PATH" TMPDIR=/tmp \
+  TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
+  unshare --net --mount-proc sh -c \
+  'ip link set lo up && bun --no-env-file test --timeout 120000 tests/selfhost-host-cold-restore-native.test.ts'
+```
+
+An unset artifact explicitly skips this native case; a portable check therefore
+does not prove native restore. A configured but unaccepted artifact fails rather
+than substituting a different binary. The fixture uses a synthetic Core verifier
+and disposable credentials, keys, and TLS material. It does not prove real
+Core/Sigstore verification, production source fencing, external credential or
+service recovery, pending event delivery, monitoring, or an operator disaster-
+recovery drill. Startup remains active as described above; there is no read-only
+restore mode.
