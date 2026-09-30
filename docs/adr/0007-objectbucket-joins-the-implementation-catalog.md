@@ -606,10 +606,15 @@ the existing package/capability/handler intersection and narrowing-only
 operator policy still determine the executable set. Asset attachment and
 serving policy remain in WorkerVersion.
 
-This admission correction does not complete the managed Workers-for-Platforms
-asset-serving path. That backend still explicitly refuses asset-bearing
-WorkerVersions pending upload and authoritative readback support. Bundle
-storage, backend attachment, and live serving are separate claims.
+This admission correction did not, by itself, complete the managed
+Workers-for-Platforms asset-serving path. At the time this paragraph was
+written, that backend refused asset-bearing WorkerVersions pending upload and
+authoritative readback support. The current source implements managed WfP asset
+upload and provider-only attachment/readback; see
+[Form authority](../form-authority.md#takoform-form-authority). Hosted/native
+qualification remains open, and this source update does not claim live
+Cloudflare serving. Bundle storage, backend attachment, and live serving remain
+separate claims.
 
 This admission did not enable WorkerCustomDomain; the capability declaration
 that later moved it is recorded in the 2026-09-20 amendment at the top of this
