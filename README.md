@@ -152,7 +152,10 @@ the part that owns accounts, money, and the machines.
 
 ## Self-hosting
 
-Everything lives under one directory, `.takoserver` by default.
+By default, the self-host data root is `.takoserver`; set
+`TAKOSERVER_DATA_ROOT` to relocate it. `TAKOSERVER_DB` can put the control
+database outside that root, and configured service dependencies may use
+protected files outside it.
 
 | Variable | What it does |
 |---|---|
@@ -304,8 +307,15 @@ records the publisher-set admission chain with
 `bun scripts/selfhost-form-admission.ts <organizationId> <space> --apply`; see
 [docs/form-authority.md](docs/form-authority.md#self-host-admission).
 
-Everything durable is under that one directory, so backing up a deployment is
-copying it and moving one is moving it:
+By default, durable state is rooted under `.takoserver`, but that directory is
+not always the complete backup set. Stop Takoserver, its child `workerd`, and
+every other configured writer before copying the complete root. Include an
+external `TAKOSERVER_DB` and any existing SQLite `-wal`, `-shm`, or
+rollback-journal sidecars from the same quiescent window. Preserve protected
+external configuration and key material needed to restore the same identity
+separately; do not store secrets in this repository. See the
+[self-host backup and restore preparation](docs/self-host-operations.md) for
+the procedure and its limits.
 
 ```
 .takoserver/
