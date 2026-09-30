@@ -31,7 +31,7 @@
     "typecheck:sponsorship-authority-worker": "tsc --noEmit -p tsconfig.sponsorship-authority-worker.json",
     "typecheck:form-authority-worker": "tsc --noEmit -p tsconfig.form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-operator-worker.json && tsc --noEmit -p tsconfig.form-authority-identity-probe.json && tsc --noEmit -p tsconfig.existing-space-operator-worker.json",
     "typecheck:exact-artifact-recovery-worker": "tsc --noEmit -p tsconfig.exact-artifact-recovery-worker.json",
-    "test": "bun test --timeout 60000",
+    "test": "bun test --parallel --timeout 60000",
     "qualify:actor-cold-alarm": "bun --no-env-file scripts/qualify-actor-cold-alarm.ts",
     "test:selfhost-opentofu": "bun --no-env-file scripts/selfhost-opentofu-e2e.ts",
     "check:provider": "cd provider && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
