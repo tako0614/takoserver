@@ -1171,16 +1171,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  for (const refusedBoundary of [
-    "0058",
-    "0059",
-    "0060",
-    "0061",
-    "0062",
-    "0063",
-    "0064",
-    "0065",
-  ] as const) {
+  for (const refusedBoundary of ["0059", "0060", "0061", "0062", "0063", "0064", "0065"] as const) {
     test(`${refusedBoundary} remains unavailable as a rehearsal or production fixed-wave boundary`, async () => {
       for (const environment of ["rehearsal", "production"] as const) {
         const root = mkdtempSync(
@@ -1618,7 +1609,8 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error) => error);
       expect(first).toMatchObject({ phase: "mutation" });
-      expect(first).toMatchObject({ detail: expect.stringContaining("provider connection lost") });
+      expect(JSON.stringify(first)).not.toContain("provider connection lost");
+      expect(String(first)).toContain("0037 runtime-input monotonic quiescence trigger failed");
       expect(firstProcess.migrationApplyCalls()).toBe(0);
       expect(existsSync(`${receiptPath}.attempt`)).toBe(true);
       expect(

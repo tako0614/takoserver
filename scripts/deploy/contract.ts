@@ -1351,6 +1351,7 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
+        "scripts/deploy/schema-0058-proof.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
@@ -1368,15 +1369,15 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
-          "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056 or 0057. The exact predecessor lineage, selected through-prefix and wave " +
+          "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current source inventory is exactly 0001-0066; unreviewed 0067+ tails are refused before qualification or provider mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the full audited lineage. Protected wave selectors still end at 0057. " +
+          "forward-only apply. The current source inventory is exactly 0001-0066; unreviewed 0067+ tails are refused before qualification or provider mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the full audited lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
           "catch-up and never permits arbitrary migration-prefix adoption. The selected 0047 wave " +
           "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
-          "its migration-ledger insert; other selected waves keep their existing transport.",
+          "its migration-ledger insert; future qualified 0058 is wired for the same sealed one-file /import transport, never /query. Other selected waves keep their existing transport.",
         "post-conditions":
           "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
           "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
@@ -1396,6 +1397,7 @@ export const DEPLOY_CONTRACT = {
           "The 0055 boundary adds durable value-free Queue custody dead-letter transfer notices after 0054; terminal transfer, notice coalescing and source removal remain one guarded atomic batch, while notice acknowledgement stays an exact source-generation/target/token CAS for a private destination wake. " +
           "The 0056 boundary adds Host-owned bounded VectorIndex SQL storage after 0055: immutable cosine index configuration, per-Resource record quotas, binary32 vector records, and type-sensitive equality filter terms; it changes no published identity, binding or provider catalog. " +
           "The 0057 boundary adds receipt-coupled, provider-private execution-material tables for immutable managed Worker Versions after 0056; it stores only bounded execution descriptors and sealed values, and does not publish a Worker, activate custody, or apply any schema automatically. " +
+          "The 0058 status selector requires canonical 0057 schema and reads bounded digests of all four affected tables including sealed BLOBs, counts, bytes and foreign-key integrity. It reports missing production-shaped volume/import qualification and public Host plus private CPE writer drain. Apply refuses before mutation while those owner producers are absent; neither the synthetic isolated fixture nor operator booleans count as proof. " +
           "The standalone integration-only 0062 to 0063 transition adds the immutable managed Queue retirement marker, helper phases and tripwire after 0062; it creates only new tables, indexes and triggers, performs no backfill, and changes no published API or protected selector. " +
           "The separate integration-only 0063 to 0064 transition adds an Actor owner claim table without rewriting the Worker receipt table or admitting Actors; it performs no backfill and changes no protected selector. " +
           "The separate integration-only 0064 to 0065 transition adds a value-free runtime-input lease generation and backfills prepared/claimed rows from their live seal nonce; historical dispatched and terminal rows with no nonce remain NULL and fail closed on ambiguous acknowledgement. It changes no protected selector. " +

@@ -26,7 +26,7 @@ production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057>
+bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058>
 bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057>
 ```
 
@@ -1237,12 +1237,20 @@ managed customer runtime.
   normal Host closure retires the quiescence mode only after the selected schema
   lineage is settled, with no rehearsal receipt chain created for integration.
 
-### 0058 domain receipt schema: protected wave unavailable
+### 0058 domain receipt schema: protected status only
 
 The current source includes audited 0058–0066 for fresh, explicitly
-disposable integration storage. Protected wave selectors still stop at 0057:
-neither rehearsal nor production accepts `--through-migration=0058`,
-`--through-migration=0059`, `--through-migration=0060`,
+disposable integration storage. The protected `--through-migration=0058`
+selector can inspect only an exact canonical 0057 predecessor. It reports a
+bounded digest, row counts, approximate value bytes, maximum BLOB size and
+foreign-key integrity for the four tables 0058 replaces, without printing
+rows or sealed BLOBs. `--apply` refuses before mutation: the public Host and
+private CPE have no owner-backed, target/version/source/expiry-bound all-writer
+drain producer, and protected production-shaped volume/import qualification
+is unavailable. The existing rehearsal receipt and attempt bytes remain
+unchanged. Rehearsal and production data digests need not equal each other;
+each target must preserve its own pre/post digest when a qualified apply exists.
+The parser still refuses `--through-migration=0059`, `--through-migration=0060`,
 `--through-migration=0061`, `--through-migration=0062`,
 `--through-migration=0063`, `--through-migration=0064`,
 `--through-migration=0065`, or `--through-migration=0066`.
@@ -1418,7 +1426,7 @@ the exact isolated D1, quarantine it on uncertainty, and decide forward repair
 separately; the command never drops or resets it. The result explicitly says
 `non-authoritative`, emits no production-accepted rehearsal receipt, and does
 not qualify existing production data volume or writer quiescence. Protected
-`--through-migration=0058` remains unavailable pending actual isolated D1
+0058 apply remains unavailable pending actual isolated D1
 rollback/success evidence on both transports, bounded nonempty-data volume qualification,
 all-writer quiescence (including the private executor), and a separately
 reviewed protected transition. The current protected wave lane uses
