@@ -1393,23 +1393,43 @@ Apply requires the exact audited 0001–0057 lineage and canonical predecessor
 shape and zero rows in the four affected receipt/material/sealed-value tables.
 It inserts deterministic synthetic pending, committed, deleting and deleted
 Version receipts; the first three retain sealed material, nonce and ciphertext
-BLOBs, while the deleted state exercises the expected cascade. It then sends
-the unchanged 0058 SQL plus its Wrangler ledger insertion as one sealed
-whole-file `d1 execute --file` import. Authoritative readback compares the
-ordered lineage, canonical schema, trigger SQL, all fixture row and BLOB bytes,
+BLOBs, while the deleted state exercises the expected cascade. Before the real
+0058 import, it runs two failure probes on that same populated isolated D1.
+First, a sealed 0058 file contains the exact audited SQL plus one ledger
+insertion; pinned Wrangler `d1 migrations apply` appends its own second ledger
+insertion and sends the built query over D1 `/query`. Second, it sends the exact
+audited 0058 SQL and ledger insertion followed by a duplicate ledger insertion
+in one `d1 execute --file` import probe over D1 `/import`. Each intentionally
+failing probe has a two-minute child-process timeout; a timeout is an unknown
+outcome and quarantines the selected D1 even when immediate readback still
+looks unchanged, because provider ingestion may still be settling. Each probe must
+return a typed migration-name uniqueness failure, and after each probe
+authoritative readback must find the exact 0057 lineage, schema, fixture rows,
+BLOBs, enabled foreign keys, and zero foreign-key violations. A partial commit,
+unknown acknowledgement, different error, or unreadable state quarantines
+the isolated D1 and prevents the real import; the surface never drops or
+resets it. On a proved rollback it then sends the unchanged 0058 SQL plus its
+Wrangler ledger insertion as one sealed whole-file `d1 execute --file` import.
+Authoritative readback compares the ordered lineage, canonical schema,
+trigger SQL, all fixture row and BLOB bytes,
 foreign keys, and reports migration/fixture bytes and elapsed time without
 printing values. A failed or unknown acknowledgement is not replayed. Inspect
 the exact isolated D1, quarantine it on uncertainty, and decide forward repair
 separately; the command never drops or resets it. The result explicitly says
 `non-authoritative`, emits no production-accepted rehearsal receipt, and does
 not qualify existing production data volume or writer quiescence. Protected
-`--through-migration=0058` remains unavailable pending actual D1 evidence and
-a separately reviewed production transition. The current protected wave lane
-uses `d1 migrations apply` except its 0047 file-import special case. This
-0058 experiment uses the explicit whole-file import instead; its result can
-support a future protected 0058 transition only if that transition commits to
-the same exact transport and passes its own nonempty D1 rehearsal. It does not
-prove that the current protected lane's transport would be atomic for 0058.
+`--through-migration=0058` remains unavailable pending actual isolated D1
+rollback/success evidence on both transports, bounded nonempty-data volume qualification,
+all-writer quiescence (including the private executor), and a separately
+reviewed protected transition. The current protected wave lane uses
+`d1 migrations apply` except its 0047 file-import special case. The 0058
+experiment probes rollback on both commands but uses `/import` for the final
+successful transition. The `/query` failure probe alone does not establish a
+successful `/query` 0058 upgrade, nor does an isolated fixture establish live
+production capacity or writer quiescence. A later protected 0058 implementation
+must use an exactly qualified transport and prove its own nonempty rehearsal,
+receipt chain and deployment compatibility. The local mock/SQLite tests are
+not actual D1 evidence.
 
 ### 0059/0060: additive existing-data integration cutover
 

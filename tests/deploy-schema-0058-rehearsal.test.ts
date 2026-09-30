@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
@@ -91,6 +91,10 @@ function processFixture(
   interruptedSeed = false,
   driftAfterSeed = false,
   advanceBeforeSeed = false,
+  partialFailureProbe = false,
+  partialQueryProbe = false,
+  timeoutQueryProbe = false,
+  timeoutImportProbe = false,
 ) {
   const calls: string[][] = [];
   const readQueries: string[] = [];
@@ -103,6 +107,10 @@ function processFixture(
   let postSeedReceiptReads = 0;
   const run = async (command: readonly string[]): Promise<CommandResult> => {
     calls.push([...command]);
+    if (command[0] === "timeout" && command[1] !== "--version") {
+      expect(command.slice(0, 4)).toEqual(["timeout", "--signal=TERM", "--kill-after=5s", "120s"]);
+      command = command.slice(4);
+    }
     const key = command.join(" ");
     if (key === "git rev-parse HEAD") return ok(`${COMMIT}\n`);
     if (key === "git branch --show-current") return ok("release/schema\n");
@@ -110,6 +118,41 @@ function processFixture(
     if (key === "git fetch --quiet --all --prune") return ok("");
     if (key === `git branch -r --contains ${COMMIT}`) return ok("  origin/release-schema\n");
     if (key === "bun run check:migrations") return ok("green\n");
+    if (key === "timeout --version") return ok("GNU coreutils timeout\n");
+
+    if (command.includes("migrations") && command.includes("apply")) {
+      const configPath = command[command.indexOf("--config") + 1];
+      const migrationName = MIGRATIONS[57]?.name;
+      if (!configPath || !migrationName)
+        throw new Error("0058 query probe lacks config or migration");
+      const sql = readFileSync(
+        join(dirname(configPath), "query-probe-migrations", migrationName),
+        "utf8",
+      );
+      const audited = readMigrationArtifact(migrationDirectory).files[57];
+      if (!audited || sql !== buildD1MigrationImport([audited], { freshLedger: false }).sql)
+        throw new Error("0058 query probe lacks exact audited migration and first ledger insert");
+      if (timeoutQueryProbe)
+        return {
+          exitCode: 124,
+          stdout: "",
+          stderr: "UNIQUE constraint failed: d1_migrations.name",
+        };
+      try {
+        if (partialQueryProbe) {
+          database.exec(sql);
+          database.query("INSERT INTO d1_migrations (name) VALUES (?)").run(migrationName);
+        } else
+          database.transaction(() => {
+            database.exec(sql);
+            database.query("INSERT INTO d1_migrations (name) VALUES (?)").run(migrationName);
+          })();
+      } catch (error) {
+        if (!String(error).includes("UNIQUE constraint failed: d1_migrations.name")) throw error;
+        return { exitCode: 1, stdout: "", stderr: "UNIQUE constraint failed: d1_migrations.name" };
+      }
+      throw new Error("0058 query probe unexpectedly succeeded");
+    }
 
     const commandIndex = command.indexOf("--command");
     if (commandIndex >= 0) {
@@ -157,6 +200,41 @@ function processFixture(
       if (!path) throw new Error("D1 file import omitted its path");
       fileImports.push(path);
       if (path.endsWith("fixture.sql")) readsAtSeed = readQueries.length;
+      if (path.endsWith("rollback-probe.sql")) {
+        if (timeoutImportProbe)
+          return {
+            exitCode: 124,
+            stdout: "",
+            stderr: "UNIQUE constraint failed: d1_migrations.name",
+          };
+        const sql = readFileSync(path, "utf8");
+        const migrationName = MIGRATIONS[57]?.name;
+        if (
+          !migrationName ||
+          !sql.endsWith(`INSERT INTO "d1_migrations" (name) VALUES ('${migrationName}');\n`)
+        )
+          throw new Error("rollback probe lacks the exact duplicate ledger tail");
+        try {
+          if (partialFailureProbe) database.exec(sql);
+          else {
+            const transactional = database.transaction(() => {
+              database.exec(sql);
+              // bun:sqlite may execute the final conflicting statement as a
+              // separate prepare; force the same UNIQUE failure in this mock.
+              database.query("INSERT INTO d1_migrations (name) VALUES (?)").run(migrationName);
+            });
+            transactional();
+          }
+        } catch (error) {
+          if (!String(error).includes("UNIQUE constraint failed: d1_migrations.name")) throw error;
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "UNIQUE constraint failed: d1_migrations.name",
+          };
+        }
+        throw new Error("rollback probe unexpectedly succeeded");
+      }
       database.exec(readFileSync(path, "utf8"));
       if (path.endsWith("fixture.sql")) fixtureSeeded = true;
       if (interruptNextSeed && path.endsWith("fixture.sql")) {
@@ -201,6 +279,10 @@ function makeOptions(
   },
   driftAfterSeed = false,
   advanceBeforeSeed = false,
+  partialFailureProbe = false,
+  partialQueryProbe = false,
+  timeoutQueryProbe = false,
+  timeoutImportProbe = false,
 ) {
   const fixture = processFixture(
     database,
@@ -208,6 +290,10 @@ function makeOptions(
     interruptedSeed,
     driftAfterSeed,
     advanceBeforeSeed,
+    partialFailureProbe,
+    partialQueryProbe,
+    timeoutQueryProbe,
+    timeoutImportProbe,
   );
   const providerIdentities = Array.isArray(providerIdentity)
     ? providerIdentity
@@ -257,6 +343,163 @@ function schemaShape(database: Database): string {
 }
 
 describe("0058 isolated D1 rehearsal", () => {
+  test("requires a failed exact-import rollback probe before the real import", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const { fixture, options } = makeOptions(caseDirectory("probe-success"), database);
+      const result = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        options,
+      );
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual([
+        "fixture.sql",
+        "rollback-probe.sql",
+        "migration-import.sql",
+      ]);
+      expect(
+        fixture.calls.filter(
+          (command) => command.includes("migrations") && command.includes("apply"),
+        ),
+      ).toHaveLength(1);
+      expect(result).toMatchObject({ rollbackProbe: "failed-and-exact-0057-restored" });
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("partial failed D1 import quarantines target and never attempts the real 0058 import", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const { fixture, options } = makeOptions(
+        caseDirectory("probe-partial"),
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        false,
+        false,
+        true,
+      );
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "apply", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          options,
+        ),
+      ).rejects.toThrow("rollback probe");
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual([
+        "fixture.sql",
+        "rollback-probe.sql",
+      ]);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+  test("partial query-transport migration quarantines before either file import probe", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const { fixture, options } = makeOptions(
+        caseDirectory("query-probe-partial"),
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        false,
+        false,
+        false,
+        true,
+      );
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "apply", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          options,
+        ),
+      ).rejects.toThrow("query rollback probe");
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual(["fixture.sql"]);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+  test("timed-out query probe quarantines even when readback is unchanged", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const { fixture, options } = makeOptions(
+        caseDirectory("query-probe-timeout"),
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        false,
+        false,
+        false,
+        false,
+        true,
+      );
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "apply", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          options,
+        ),
+      ).rejects.toThrow("query rollback probe");
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual(["fixture.sql"]);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+  test("timed-out import probe with UNIQUE output still quarantines and skips real import", async () => {
+    const database = databaseThrough(57);
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const { fixture, options } = makeOptions(
+        caseDirectory("import-probe-timeout"),
+        database,
+        false,
+        false,
+        { uuid: ISOLATED_DATABASE_ID, name: ISOLATED_DATABASE_NAME },
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+      );
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "apply", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          options,
+        ),
+      ).rejects.toThrow("rollback probe");
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual([
+        "fixture.sql",
+        "rollback-probe.sql",
+      ]);
+    } finally {
+      database.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
   test("the exact 0058 migration preserves all four synthetic lifecycle states and sealed BLOBs", async () => {
     const database = databaseThrough(57);
     try {

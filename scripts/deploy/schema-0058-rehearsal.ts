@@ -47,6 +47,7 @@ const MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const PROVIDER = "takoserver.synthetic.0058.rehearsal";
 const FORMAT = "takoserver.managed-worker-version-execution-material@v1";
 const PROTOCOL = "takoserver.managed-worker-release@v4";
+const ROLLBACK_PROBE_TIMEOUT_SECONDS = 120;
 const TABLES = [
   "cloudflare_managed_worker_receipts",
   "cloudflare_managed_worker_version_execution_material",
@@ -579,6 +580,30 @@ export async function runD1Schema0058Rehearsal(
     const migrationImport = buildD1MigrationImport([sealed0058], { freshLedger: false });
     const importPath = join(release, "migration-import.sql");
     writeFileSync(importPath, migrationImport.sql, { flag: "wx", mode: 0o600 });
+    // Exercise the exact transport and migration/ledger prefix before the real
+    // import. The last statement MUST fail on the duplicate migration name.
+    // A provider that committed any preceding DDL/rows fails the readback and
+    // this isolated target is quarantined; nothing is undone automatically.
+    const rollbackProbeSql = `${migrationImport.sql}\nINSERT INTO "d1_migrations" (name) VALUES ('${MIGRATION}');\n`;
+    const rollbackProbePath = join(release, "rollback-probe.sql");
+    writeFileSync(rollbackProbePath, rollbackProbeSql, { flag: "wx", mode: 0o600 });
+    // Wrangler migrations apply sends one built migration over D1 /query,
+    // unlike execute --file which uses /import. Give it the audited 0058 SQL
+    // plus one ledger insert; Wrangler appends the second ledger insert and
+    // must roll the entire built query back on that UNIQUE failure.
+    const queryProbeRoot = join(release, "query-probe-migrations");
+    mkdirSync(queryProbeRoot, { recursive: true, mode: 0o700 });
+    for (const migration of source.files.slice(0, 57))
+      copyFileSync(migration.path, join(queryProbeRoot, migration.name));
+    writeFileSync(join(queryProbeRoot, MIGRATION), migrationImport.sql, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    const queryProbeConfigPath = config(
+      join(release, "query-probe-wrangler.jsonc"),
+      selected,
+      "query-probe-migrations",
+    );
     const fixtureSql = build0058SyntheticFixtureSql();
     const fixturePath = join(release, "fixture.sql");
     writeFileSync(fixturePath, fixtureSql, { flag: "wx", mode: 0o600 });
@@ -586,8 +611,11 @@ export async function runD1Schema0058Rehearsal(
     const sealed = sealDirectory(release, [
       "wrangler.jsonc",
       "migration-import.sql",
+      "rollback-probe.sql",
+      "query-probe-wrangler.jsonc",
       "fixture.sql",
       ...source.names.slice(0, 58).map((name) => `migrations/${name}`),
+      ...source.names.slice(0, 58).map((name) => `query-probe-migrations/${name}`),
     ]);
     const db = new RemoteD1(configPath, { environment, run });
     const reread = await readD1SchemaState(db);
@@ -611,6 +639,20 @@ export async function runD1Schema0058Rehearsal(
         "--file",
         path,
       ]);
+    const boundedProbeCommand = (command: readonly string[]) => [
+      "timeout",
+      "--signal=TERM",
+      "--kill-after=5s",
+      `${ROLLBACK_PROBE_TIMEOUT_SECONDS}s`,
+      ...command,
+    ];
+    let timeoutReady = false;
+    try {
+      timeoutReady = (await run(["timeout", "--version"])).exitCode === 0;
+    } catch {
+      // Missing timeout must fail before this surface seeds the selected D1.
+    }
+    if (!timeoutReady) throw preflightError("0058 rollback probes require GNU timeout");
     let seed: CommandResult | null = null;
     targetMayHaveChanged = true;
     try {
@@ -661,6 +703,119 @@ export async function runD1Schema0058Rehearsal(
     if (fenced.digest !== seeded.digest)
       throw verificationError("0058 fixture rows changed at migration fence");
     await assertProviderIdentity("at migration fence");
+    sealed.assertUnchanged();
+    let queryProbe: CommandResult | null = null;
+    try {
+      queryProbe = await run(
+        boundedProbeCommand(
+          wranglerCommand([
+            "d1",
+            "migrations",
+            "apply",
+            selected.databaseName,
+            "--remote",
+            "--config",
+            queryProbeConfigPath,
+          ]),
+        ),
+        { env: environment },
+      );
+    } catch {
+      // A lost acknowledgement is not evidence of a rolled-back /query.
+    }
+    let queryProbeState: D1SchemaState;
+    let queryProbeRows: Fixture0058Snapshot;
+    try {
+      queryProbeState = await readD1SchemaState(db, "verification");
+      queryProbeRows = await read0058FixtureSnapshot(db, "verification");
+    } catch {
+      throw mutationError(
+        "0058 query rollback probe readback indeterminate; quarantine isolated D1",
+      );
+    }
+    if (
+      queryProbe?.exitCode !== 1 ||
+      !/UNIQUE constraint failed: (?:main\.)?d1_migrations\.name/iu.test(
+        `${queryProbe.stdout}${queryProbe.stderr}`,
+      ) ||
+      JSON.stringify(queryProbeState.applied) !== JSON.stringify(source.names.slice(0, 57)) ||
+      queryProbeState.shapeDigest !== initial.shapeDigest ||
+      !applicationSchemaMatches(
+        queryProbeState,
+        deriveExpectedApplicationShape(source.files.slice(0, 57)),
+      ) ||
+      queryProbeRows.digest !== seeded.digest ||
+      queryProbeRows.foreignKeyViolations !== 0 ||
+      !queryProbeRows.foreignKeysEnabled
+    ) {
+      throw mutationError(
+        "0058 query rollback probe did not prove exact 0057 restoration; quarantine isolated D1",
+        JSON.stringify({
+          providerExitClass:
+            queryProbe === null
+              ? "transport_unknown"
+              : queryProbe.exitCode === 0
+                ? "unexpected_success"
+                : queryProbe.exitCode === 1
+                  ? "expected_exit_but_unqualified"
+                  : "timeout_or_unexpected_exit",
+          appliedMigrationCount: queryProbeState.applied.length,
+          schemaRestored: queryProbeState.shapeDigest === initial.shapeDigest,
+          rowsRestored: queryProbeRows.digest === seeded.digest,
+        }),
+      );
+    }
+    await assertProviderIdentity("after query rollback probe");
+    sealed.assertUnchanged();
+    let rollbackProbe: CommandResult | null = null;
+    try {
+      rollbackProbe = await run(boundedProbeCommand(fileCommand(rollbackProbePath)), {
+        env: environment,
+      });
+    } catch {
+      // A transport exception may follow either rollback or partial commit.
+    }
+    let probeState: D1SchemaState;
+    let probeRows: Fixture0058Snapshot;
+    try {
+      probeState = await readD1SchemaState(db, "verification");
+      probeRows = await read0058FixtureSnapshot(db, "verification");
+    } catch {
+      throw mutationError("0058 rollback probe readback indeterminate; quarantine isolated D1");
+    }
+    if (
+      rollbackProbe?.exitCode !== 1 ||
+      !/UNIQUE constraint failed: (?:main\.)?d1_migrations\.name/iu.test(
+        `${rollbackProbe.stdout}${rollbackProbe.stderr}`,
+      ) ||
+      JSON.stringify(probeState.applied) !== JSON.stringify(source.names.slice(0, 57)) ||
+      probeState.shapeDigest !== initial.shapeDigest ||
+      !applicationSchemaMatches(
+        probeState,
+        deriveExpectedApplicationShape(source.files.slice(0, 57)),
+      ) ||
+      probeRows.digest !== seeded.digest ||
+      probeRows.foreignKeyViolations !== 0 ||
+      !probeRows.foreignKeysEnabled
+    ) {
+      throw mutationError(
+        "0058 rollback probe did not prove exact 0057 restoration; quarantine isolated D1",
+        JSON.stringify({
+          providerExitClass:
+            rollbackProbe === null
+              ? "transport_unknown"
+              : rollbackProbe.exitCode === 0
+                ? "unexpected_success"
+                : rollbackProbe.exitCode === 1
+                  ? "expected_exit_but_unqualified"
+                  : "timeout_or_unexpected_exit",
+          appliedMigrationCount: probeState.applied.length,
+          schemaRestored: probeState.shapeDigest === initial.shapeDigest,
+          rowsRestored: probeRows.digest === seeded.digest,
+        }),
+      );
+    }
+    await assertProviderIdentity("after rollback probe");
     sealed.assertUnchanged();
     const started = performance.now();
     let applied: CommandResult | null = null;
@@ -715,6 +870,11 @@ export async function runD1Schema0058Rehearsal(
       migrationDigest: file.digest,
       importDigest: migrationImport.digest,
       importBytes: migrationImport.bytes,
+      queryRollbackProbe: "failed-and-exact-0057-restored",
+      queryRollbackProbeDigest: digest(migrationImport.sql),
+      rollbackProbe: "failed-and-exact-0057-restored",
+      rollbackProbeDigest: digest(rollbackProbeSql),
+      rollbackProbeBytes: Buffer.byteLength(rollbackProbeSql),
       fixtureBytes: Buffer.byteLength(fixtureSql),
       fixtureDigest: seeded.digest,
       fixtureCounts: seeded.counts,
