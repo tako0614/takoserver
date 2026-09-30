@@ -133,7 +133,11 @@ export interface CreateControlRoutesOptions {
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
   readonly attachments: AttachmentService;
   readonly migrations: ResourceMigrationService;
-  /** Every Form definition this Host will accept. */
+  /**
+   * Every published Form definition this Host answers for. Being listed is
+   * discovery, not acceptance: a published identity this Host has no provider
+   * backend for is still here, and the profiles say so.
+   */
   readonly forms: readonly InstalledTakoformForm[];
   /**
    * The same authority the apply path refuses from. When it can answer for a
