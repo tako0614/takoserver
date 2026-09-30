@@ -1,6 +1,17 @@
 # ADR 0007 — ObjectBucket joins the implementation catalog
 
-**Status:** accepted, 2026-09-02; amended 2026-09-03, 2026-09-11 and 2026-09-20
+**Status:** accepted, 2026-09-02; amended 2026-09-03, 2026-09-11, 2026-09-20 and 2026-09-30
+
+> **2026-09-30 correction:** the public Cloudflare Host capability manifest
+> excludes fresh `WorkerCustomDomain` import: its native domain identifier
+> cannot be derived from a new Resource, and the provider refuses adoption
+> without retained Host-owned custody. The four declared operations are now
+> `create`, `read`, `delete`, and `observe`. This narrows the implementation,
+> not the released Form or its five declared operations. The 2026-09-20
+> statement below records the earlier source declaration, not current live
+> support. The shared integration-only Actor candidate's implementation
+> identity also changes; support/activation require explicit reconvergence.
+> See [Form authority](../form-authority.md) for current qualification boundaries.
 
 > **2026-09-20 amendment:** the public Host's code-owned capability manifest
 > declares `WorkerCustomDomain`'s five published operations (`create`,

@@ -437,11 +437,20 @@ published Form or artifact transport. It also bounds self-host materialization
 and workerd readback. The public Cloudflare adapter sends the same committed
 files to Workers Static Assets; the Host's 20 MiB aggregate bound keeps each
 file below Cloudflare's [25 MiB per-file limit](https://developers.cloudflare.com/workers/platform/limits/).
-`WorkerCustomDomain` is in the implementation catalog with its declared
-`create`, `read`, `delete`, `import`, and `observe` operations. Its provider
-handler requires an exact tenant/hostname zone grant; integration qualification
-is allowed when that grant is realized, but this document does not establish
-production or full-lifecycle qualification. `ActorNamespace` and
+`WorkerCustomDomain` remains the same released Form identity, but the public
+Cloudflare capability declaration is limited to `create`, `read`, `delete`,
+and `observe`. Fresh `import` is not implemented: Cloudflare assigns the native
+domain identifier, which cannot be derived from a new Resource identity, so an
+import must not trust a caller-supplied identifier. Recovery of a Host-owned
+domain from its retained native receipt is a separate path, not fresh adoption.
+This source correction neither changes the released package nor establishes
+current live support or activation, and existing support or activation heads
+do not change automatically. Operator-driven support or reconvergence requires
+the exact new implementation identity, a realized Host-owned zone grant, and
+qualified backend behavior; fresh import remains unavailable. The integration-only
+`actor-forward` candidate uses this same public manifest, so its capability and
+implementation identities also rotate. Existing Actor DEV heads and operator
+descriptors must not be reused as proof for the new identity. `ActorNamespace` and
 `DurableWorkflow` have no handlers, so they remain installed and discoverable only
 (`supported: false`). Neither may have an active activation head; retained inactive
 history is not discarded. Deactivate any existing active heads before deploying
@@ -666,10 +675,11 @@ released-Core-verified public publisher set:
   `WorkerCustomDomain` at definition version `0.1.0`.
 
 The executable implementation catalog is a separate, derived support subset:
-it currently has 15 entries. `WorkerCustomDomain` support is conditional on an
-exact tenant/hostname zone grant; integration qualification is allowed with
-that grant, while production and full-lifecycle qualification remain
-unestablished. The two actor/workflow identities have no concrete handlers.
+it currently has 15 entries. `WorkerCustomDomain`'s public source capability
+is conditional on an exact tenant/hostname zone grant and excludes fresh
+`import`; this source catalog is not evidence of current live support or
+activation. Retained native-receipt recovery is separate from fresh import.
+The two actor/workflow identities have no concrete handlers.
 StaticAssetBundle is
 intrinsic and exposes its declared lifecycle operations, as described above.
 The owning current-catalog importer derives package, schema, and payload digests directly
