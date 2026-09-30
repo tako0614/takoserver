@@ -78,7 +78,7 @@ bootstrap, rehearsal, and production do not select this path.
 
 Ordinary integration code-only applies to the probe, route-less authority, and
 operator gateway also have a bounded Form-local gate instead of repeating the
-complete repository check. It runs the repository typecheck, all four Form
+complete repository check. It runs the repository typecheck, all five Form
 Worker typechecks and generated-type checks, import/corpus/package checks, the
 selected surface's runtime and deploy-boundary tests, and four Docker-free
 Worker bundle/closure builds with Container rollout disabled. The caller must
@@ -448,6 +448,12 @@ history is not discarded. Deactivate any existing active heads before deploying
 a catalog that removes their capability. No operation is advertised unless it
 is declared by the package, present in the
 Host capability manifest, and handled by the runtime.
+
+As observed on 2026-09-29, no composed provider backend claims
+`DurableWorkflow`. The current selected contract and composition do not provide
+qualified support for the selected execution contract, as described in
+[ADR 0010](adr/0010-durable-workflow-has-no-provider-owner.md). This observation
+does not rule out another implementation or composition.
 
 `ObjectBucket` left that list in
 [ADR 0007](adr/0007-objectbucket-joins-the-implementation-catalog.md). The exact

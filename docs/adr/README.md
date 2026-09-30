@@ -15,3 +15,4 @@ decision dates in each document.
 | [0007](0007-objectbucket-joins-the-implementation-catalog.md) | ObjectBucket joins the implementation catalog | accepted |
 | [0008](0008-a-settled-refusal-about-the-host-is-re-attempted.md) | A settled refusal about the Host is re-attempted | accepted |
 | [0009](0009-a-self-host-publishes-the-scheme-its-socket-serves.md) | A self-host publishes the scheme its socket serves | accepted |
+| [0010](0010-durable-workflow-has-no-provider-owner.md) | DurableWorkflow provider ownership: implementation observation | dated implementation observation, 2026-09-29 |

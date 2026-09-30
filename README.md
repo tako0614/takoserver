@@ -351,7 +351,8 @@ provider adapters may remain installed to observe and delete recorded
 Deployments, but their beta Forms are not republished as a sale catalog.
 `bun run deploy -- --contract` prints the
 side-effect-free split deploy contract. Every operation then names one surface,
-one `--status` or `--apply` action, an exact environment, and an exact 40-hex
+one action (`--status` or `--apply`, and on the credential surfaces their own
+`--issue`, `--mint` and `--revoke`), an exact environment, and an exact 40-hex
 commit; there is no mixed controller, plan, ledger, journal, or target override.
 See [`docs/deploy.md`](docs/deploy.md) for the surface list, dependency order,
 the clean-checkout integration target realization path, private inputs, and
@@ -361,13 +362,16 @@ target joins the Cloudflare supplies, executor, gateway, and receipt-authority
 identities atomically. The landing-page details are in
 [`docs/deploy-site.md`](docs/deploy-site.md).
 
-The one-time public parent-credential handoff is owned by the fixed
-`takoserver-public-parent-token-retirement` surface. It qualifies the exact
-route-less executor and public Worker closure, releases the exact service
-binding if needed, then removes only the public `CLOUDFLARE_API_TOKEN`; its
-value-free status is the sole lost-acknowledgement/adoption path. It does not
-read or alter the executor's owner-private credential file. Run integration
-first; rehearsal and production remain separate target/source-qualified lanes.
+The one-time public parent-credential handoff is owned by the private
+composition's `takoserver-public-parent-token-retirement` surface, exported
+through `@takoserver/core/deploy-extension`; it is deliberately absent from the
+public contract above, so this checkout's `bun run deploy` refuses it. It
+qualifies the exact route-less executor and public Worker closure, releases the
+exact service binding if needed, then removes only the public
+`CLOUDFLARE_API_TOKEN`; its value-free status is the sole
+lost-acknowledgement/adoption path. It does not read or alter the executor's
+owner-private credential file. Run integration first; rehearsal and production
+remain separate target/source-qualified lanes.
 
 Wasabi has no equivalent private executor. Every Wasabi supply or recovery
 offering therefore fails target parsing/public composition closed; its access

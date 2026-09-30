@@ -1,5 +1,7 @@
 # Separate resource meaning from supply and deployment
 
+**Status:** foundational, 2026-08-18
+
 Takoserver keeps provider identity and commercial terms out of Takoform Forms: a Form
 defines resource meaning, while an Offering names sellable supply and a Deployment
 records one provider realization of a logical Resource. This permits several

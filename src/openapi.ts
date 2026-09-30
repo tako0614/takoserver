@@ -396,8 +396,9 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       },
     ],
   }),
-  listHostForms: described("List every Form definition this Host will accept", {
+  listHostForms: described("List the published Form definitions and this Host's answer for each", {
     security: [],
+    responses: { "200": hostFormCatalogueResponse() },
   }),
   createOrganization: described("Create an Organization"),
   createApiKey: described("Create a scoped API key"),
@@ -683,17 +684,28 @@ function artifactConsumerResolutionReceiptResponse() {
   } as const;
 }
 
+/** The response schema for the control-plane Form catalogue. */
+function hostFormCatalogueResponse() {
+  return {
+    description: "The published Form definitions and this Host's answer for each",
+    content: {
+      "application/json": { schema: { $ref: "#/components/schemas/HostFormCatalogue" } },
+    },
+  } as const;
+}
+
 /** One published operation description, addressed by its operation name. */
 function described(
   summary: string,
   extra: {
     readonly security?: readonly unknown[];
     readonly parameters?: readonly unknown[];
+    readonly responses?: Record<string, unknown>;
   } = {},
 ): Record<string, unknown> {
   return {
     summary,
-    responses: { "200": { description: "Success" } },
+    responses: extra.responses ?? { "200": { description: "Success" } },
     ...(extra.security ? { security: extra.security } : {}),
     ...(extra.parameters ? { parameters: extra.parameters } : {}),
   };
@@ -792,6 +804,64 @@ export const openApiDocument = {
                 description: "Lane-specific, value-free detail. Never derived from a secret.",
               },
             },
+          },
+        },
+      },
+      HostFormProfile: {
+        type: "object",
+        description:
+          "One published Form definition and this Host's answer for it. `operations` lists the package-declared lifecycle; the optional availability fields report separate Host facts.",
+        required: ["apiVersion", "kind", "formRef", "operations"],
+        additionalProperties: false,
+        properties: {
+          apiVersion: { const: "support.takoform.com/v1alpha1" },
+          kind: { const: "FormSupport" },
+          formRef: {
+            type: "object",
+            required: ["apiVersion", "kind", "definitionVersion", "schemaDigest"],
+            additionalProperties: false,
+            properties: {
+              apiVersion: { type: "string", minLength: 1, maxLength: 320 },
+              kind: { type: "string", minLength: 1, maxLength: 128 },
+              definitionVersion: { type: "string", minLength: 1, maxLength: 128 },
+              schemaDigest: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+            },
+          },
+          operations: {
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 64 },
+          },
+          executable: {
+            description:
+              "Whether this Host's composed execution support covers this exact Form. This does not guarantee activation, principal authorization, or operation success.",
+            type: "boolean",
+          },
+          activated: {
+            description:
+              "Whether this exact Form is activated by this Host. This does not report principal authorization or guarantee operation success.",
+            type: "boolean",
+          },
+          availableToPrincipal: {
+            description:
+              "Whether this Form is available to the principal for this request. This does not guarantee operation success.",
+            type: "boolean",
+          },
+          supportedEnums: {
+            type: "object",
+            additionalProperties: { type: "array", items: { type: "string" } },
+          },
+          supportedBindings: { type: "array", items: { type: "string" } },
+          limits: { type: "object", additionalProperties: { type: "number" } },
+        },
+      },
+      HostFormCatalogue: {
+        type: "object",
+        required: ["profiles"],
+        additionalProperties: false,
+        properties: {
+          profiles: {
+            type: "array",
+            items: { $ref: "#/components/schemas/HostFormProfile" },
           },
         },
       },

@@ -75,7 +75,7 @@ sending everything down it.
 ## What the gates check now
 
 `scripts/check-imports.ts` proves the public Worker cannot reach the real
-Cloudflare provider, its parent REST backends, or Wasabi credential paths. The
+Cloudflare provider, its parent REST backends, or Wasabi credential paths.
 The public entry is `src/entry-worker.ts`, which imports only the credential-free
 `CloudflareProviderExecutorRpc` contract from
 `src/providers/cloudflare-provider-executor-port.ts`. The credential-bearing
