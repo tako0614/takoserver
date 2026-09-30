@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { AiGateway } from "../src/ai-port.ts";
+import { buildApp } from "../src/app.ts";
 import { createAccounts, type ExternalIdentityVerifier } from "../src/auth.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createDataAiRoutes } from "../src/data-ai.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMetering } from "../src/metering.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { createWorkerDataServices } from "../src/worker-data-services.ts";
 
 const identity: ExternalIdentityVerifier = {
   async verify({ assertion }) {
@@ -110,6 +114,95 @@ async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOver
   return { call, calls, scoped, unscoped, ledger, organization, sql };
 }
 
+const WORKER_AI_MODELS = JSON.stringify([
+  {
+    id: "takoserver-text",
+    upstreamId: "@cf/meta/llama-3.1-8b-instruct-fp8",
+    created: 1_787_054_400,
+    ownedBy: "takoserver",
+    maxInputTokens: 100,
+    maxOutputTokens: 10,
+    inputMinorPerMillionTokens: 1_000_000,
+    outputMinorPerMillionTokens: 1_000_000,
+  },
+]);
+
+async function workerCompositionFixture(nativeOutput: unknown) {
+  const sql = createEphemeralSql();
+  const clock = () => new Date("2026-08-18T12:00:00.000Z");
+  let identityCounter = 0;
+  const accounts = createAccounts({
+    sql,
+    identity,
+    clock,
+    randomId: () => `worker-fixed${++identityCounter}`,
+  });
+  const ledger = createLedger(sql, clock);
+  const signedIn = await accounts.signIn({ provider: "google", assertion: "owner" });
+  const owner = await accounts.authenticate(`Bearer ${signedIn.sessionToken}`);
+  if (!owner) throw new Error("owner did not authenticate");
+  const organization = await accounts.createOrganization({ actor: owner, name: "Acme" });
+  await ledger.fund({ organizationId: organization.id, fundingRef: "seed", amountMinor: 1_000 });
+  const scoped = await accounts.createApiKey({
+    actor: owner,
+    organizationId: organization.id,
+    name: "ai-client",
+    scopes: ["ai:invoke"],
+    expiresInSeconds: 3_600,
+  });
+
+  const calls: unknown[][] = [];
+  const services = createWorkerDataServices({
+    AI: {
+      async run(...input) {
+        calls.push(input);
+        return nativeOutput;
+      },
+    },
+    TAKOSERVER_AI_MODELS: WORKER_AI_MODELS,
+  });
+  const app = buildApp({
+    sql,
+    objects: createMemoryObjectStore(),
+    identity,
+    settlement: {
+      async verify() {
+        throw new Error("settlement is not used by this fixture");
+      },
+    },
+    ...(services.ai ? { ai: services.ai } : {}),
+    publicOrigin: "https://api.example.test",
+    forms: [],
+    hostForms: [],
+    offerings: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    clock,
+    randomId: () => "worker_ai_request",
+  });
+  const call = (init: RequestInit = {}) =>
+    app.fetch(
+      new Request("https://api.example.test/v1/ai/chat/completions", {
+        method: "POST",
+        ...init,
+        headers: {
+          authorization: `Bearer ${scoped.secret}`,
+          "content-type": "application/json",
+          "idempotency-key": "worker-composition-chat",
+          ...((init.headers as Record<string, string>) ?? {}),
+        },
+        body:
+          init.body ??
+          JSON.stringify({
+            model: "takoserver-text",
+            messages: [{ role: "user", content: "hello" }],
+            max_tokens: 10,
+          }),
+      }),
+    );
+
+  return { call, calls, ledger, organization, sql };
+}
+
 describe("OpenAI-compatible AI data plane", () => {
   test("lists only configured models to an ai-scoped organization key", async () => {
     const { call, scoped, unscoped } = await fixture();
@@ -181,6 +274,66 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(await sql.query("SELECT meter, quantity, amount_micros FROM usage_events")).toEqual([
       { meter: "ai.tokens.takoserver-text", quantity: 5, amount_micros: 0 },
     ]);
+  });
+
+  test("composes the native Workers AI binding through HTTP, accounting, and idempotent replay", async () => {
+    const { call, calls, ledger, organization, sql } = await workerCompositionFixture({
+      response: "hello",
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    });
+
+    const response = await call();
+    const body = await response.json();
+    const replay = await call();
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-takoserver-billed-minor")).toBe("5");
+    expect(body).toMatchObject({
+      object: "chat.completion",
+      model: "takoserver-text",
+      choices: [{ message: { role: "assistant", content: "hello" } }],
+      usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    });
+    expect(await replay.json()).toEqual(body);
+    expect(replay.headers.get("x-takoserver-billed-minor")).toBe("5");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject([
+      "@cf/meta/llama-3.1-8b-instruct-fp8",
+      {
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 10,
+        stream: false,
+      },
+      {
+        gateway: {
+          id: "default",
+          metadata: { takoserver_request_id: "ai_worker_ai_request" },
+        },
+      },
+    ]);
+    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect(await sql.query("SELECT meter, quantity FROM usage_events")).toEqual([
+      { meter: "ai.tokens.takoserver-text", quantity: 5 },
+    ]);
+  });
+
+  test("refuses native completions without usage instead of inferring a zero-cost success", async () => {
+    const { call, calls, ledger, organization, sql } = await workerCompositionFixture({
+      response: "generated without native usage",
+    });
+
+    const response = await call();
+    const body = await response.json();
+    const replay = await call();
+
+    expect(response.status).toBe(502);
+    expect(response.headers.get("x-takoserver-billed-minor")).toBe("0");
+    expect(body).toMatchObject({ error: { code: "upstream_unavailable" } });
+    expect(await replay.json()).toEqual(body);
+    expect(replay.status).toBe(502);
+    expect(calls).toHaveLength(1);
+    expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
+    expect(await sql.query("SELECT request_id FROM usage_events")).toEqual([]);
   });
 
   test("rejects malformed upstream choices before billing and replays the same refusal", async () => {
