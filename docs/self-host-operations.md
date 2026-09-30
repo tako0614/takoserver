@@ -113,7 +113,7 @@ network namespace; do not borrow the ports or data root of an existing Host:
 ```sh
 env -i PATH="$PATH" TMPDIR=/tmp \
   TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
-  unshare --net --mount-proc sh -c \
+  unshare --net sh -c \
   'ip link set lo up && bun --no-env-file test --timeout 120000 tests/selfhost-host-cold-restore-native.test.ts'
 ```
 
