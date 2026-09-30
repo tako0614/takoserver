@@ -3,10 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalDigest } from "../src/json.ts";
-import {
-  createSelfhostProvider,
-  SELFHOST_PROVIDER_HANDLER_SURFACE,
-} from "../src/providers/selfhost.ts";
+import { createSelfhostProvider } from "../src/providers/selfhost.ts";
 import {
   deriveRuntimeImplementationCatalog,
   providerResourceOperationHandlers,
@@ -72,7 +69,6 @@ describe("self-host provider handler surface", () => {
       composeProvider() as unknown as Readonly<Record<string, unknown>>,
     );
     expect(forced).toEqual([...COMPLETE_LIFECYCLE]);
-    expect(providerResourceOperationHandlers(SELFHOST_PROVIDER_HANDLER_SURFACE)).toEqual(forced);
   });
 
   test("derives handler evidence from the surface it is given, not another Host's adapter", async () => {

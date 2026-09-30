@@ -1,12 +1,24 @@
 import { Database } from "bun:sqlite";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { ObjectStore, Sql } from "../src/ports.ts";
-import { SELFHOST_PROVIDER_HANDLER_SURFACE } from "../src/providers/selfhost.ts";
+import type { Provider } from "../src/provider-port.ts";
 import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
-import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
+import {
+  SELFHOST_IDENTITY_CAPABILITY_KINDS,
+  SELFHOST_TLS_ENVIRONMENT,
+  selfhostWorkerEndpointScheme,
+} from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  createStandaloneProviderComposition,
+  resolveStandaloneProviderMode,
+} from "../src/standalone-provider-composition.ts";
+import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import {
   readReleasedCoreVerifierIdentity,
   type TakoformCoreVerifierContainerNamespace,
@@ -23,6 +35,8 @@ import {
 } from "../src/takoform/host-admission-endpoint.ts";
 import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
+import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
+import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { takoformCoreVerifierArtifactDigest } from "./deploy/form-authority.ts";
 
 /**
@@ -56,6 +70,12 @@ export interface SelfhostFormAdmissionOptions {
   readonly apply: boolean;
   readonly sql: Sql;
   readonly objects: ObjectStore;
+  /**
+   * The exact provider instance used by the self-host execution composition.
+   * Its lifecycle methods are handler-presence evidence only, not native or
+   * service availability qualification.
+   */
+  readonly provider: Provider;
   readonly fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 }
 
@@ -108,10 +128,11 @@ export async function runSelfhostFormAdmission(
     kind: "takoserver.selfhost-form-implementation@v1",
     capabilities,
   });
+  const handlerSurface = options.provider as unknown as Readonly<Record<string, unknown>>;
   const semantic = await derivePublicFormImplementationIdentity({
     implementationPayloadDigest,
     capabilities,
-    handlerSurface: SELFHOST_PROVIDER_HANDLER_SURFACE,
+    handlerSurface,
   });
   const configuration: FormAuthorityEndpointConfiguration = {
     environment: "production",
@@ -123,7 +144,7 @@ export async function runSelfhostFormAdmission(
     capabilities,
     coreVerifierArtifactDigest: artifactDigest,
   };
-  const identity = await deriveFormAuthorityIdentity(configuration);
+  const identity = await deriveFormAuthorityIdentity(configuration, handlerSurface);
   const live = {
     kind: "takoserver.public-host-identity@v2" as const,
     hostId: identity.hostId,
@@ -135,7 +156,7 @@ export async function runSelfhostFormAdmission(
   };
   const composition = await createProductionFormAuthorityComposition({
     configuration,
-    handlerSurface: SELFHOST_PROVIDER_HANDLER_SURFACE,
+    handlerSurface,
     bindings: {
       sql: options.sql,
       objects: options.objects,
@@ -174,7 +195,10 @@ function requireIdentifier(value: string, name: string): void {
 }
 
 if (import.meta.main) {
-  const args = process.argv.slice(2);
+  await runSelfhostFormAdmissionCli(process.argv.slice(2));
+}
+
+export async function runSelfhostFormAdmissionCli(args: readonly string[]): Promise<void> {
   const positional = args.filter((argument) => !argument.startsWith("--"));
   const flag = (name: string): string | undefined => {
     const index = args.indexOf(`--${name}`);
@@ -187,17 +211,132 @@ if (import.meta.main) {
     );
     process.exit(2);
   }
-  const dataRoot = resolve(flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver");
-  const database = new Database(`${dataRoot}/control.sqlite`);
+  const requestedDataRoot = flag("data-root") ?? process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+  const dataRoot = resolve(requestedDataRoot);
+  const mode = resolveStandaloneProviderMode({
+    retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
+    cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+    cloudflareCredentialConfigured: Boolean(
+      process.env.CLOUDFLARE_API_TOKEN?.trim() || process.env.TAKOSERVER_CF_TOKEN_FILE?.trim(),
+    ),
+    provisionerCredentialConfigured: Boolean(process.env.TAKOSERVER_PROVISIONER_TOKEN?.trim()),
+    cloudflareZones: process.env.TAKOSERVER_ZONES,
+    legacyEdgeForms: process.env.TAKOSERVER_EDGE_FORMS,
+    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+    suffixes: process.env.TAKOSERVER_SUFFIXES,
+    workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
+  });
+  if (mode !== "stable-selfhost") {
+    throw new Error("self-host Form admission requires stable-selfhost, not recovery-only mode");
+  }
+  const databasePath = process.env.TAKOSERVER_DB ?? `${dataRoot}/control.sqlite`;
+  if (requestedDataRoot === ":memory:" || databasePath === ":memory:") {
+    throw new Error("self-host Form admission requires durable local state");
+  }
+  const database = new Database(databasePath);
   try {
+    const sql = createSqliteSql(database);
+    const objects = createFileObjectStore({ root: dataRoot });
+    const workerdSelection = await selectClosedGraphWorkerd({
+      binary: process.env.TAKOSERVER_WORKERD_BINARY,
+      privateRoot: resolve(dataRoot, "runtime-probes"),
+    });
+    if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
+    const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
+      ? Number(process.env.TAKOSERVER_WORKERD_PORT)
+      : 8788;
+    const tlsText = (name: string): string | undefined => {
+      const value = process.env[name]?.trim();
+      return value || undefined;
+    };
+    const tlsFile = (name: string): string | undefined => {
+      const path = tlsText(name);
+      if (!path) return undefined;
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        throw new Error(`${name} could not be read: ${path}`);
+      }
+    };
+    const certificate =
+      tlsFile(SELFHOST_TLS_ENVIRONMENT.certificateFile) ??
+      tlsText(SELFHOST_TLS_ENVIRONMENT.certificate);
+    const privateKey =
+      tlsFile(SELFHOST_TLS_ENVIRONMENT.privateKeyFile) ??
+      tlsText(SELFHOST_TLS_ENVIRONMENT.privateKey);
+    if (Boolean(certificate) !== Boolean(privateKey)) {
+      throw new Error(
+        `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
+          ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
+          ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
+      );
+    }
+    const tls =
+      certificate && privateKey ? { certificateChain: certificate, privateKey } : undefined;
+    const endpoint = selfhostWorkerEndpointScheme({
+      workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+      tlsConfigured: tls !== undefined,
+    });
+    const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
+      ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
+      : workerdPort;
+    if (
+      !Number.isSafeInteger(workerEndpointPort) ||
+      workerEndpointPort < 1 ||
+      workerEndpointPort > 65_535
+    ) {
+      throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
+    }
+    const runtime = createWorkerdRuntime({
+      root: dataRoot,
+      binary: workerdSelection.binary,
+      port: workerdPort,
+      ...(tls ? { tls } : {}),
+    });
+    const clock = () => new Date();
+    const artifactStore = createTakoformArtifacts({
+      sql,
+      objects,
+      clock,
+      randomId: () => crypto.randomUUID(),
+    });
+    const providerArtifacts = {
+      manifest: (tenantRef: string, digest: string) =>
+        artifactStore.resolveManifest(tenantRef, digest),
+      async blob(digest: string) {
+        const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+        return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+      },
+    };
+    const providerComposition = createStandaloneProviderComposition({
+      mode,
+      stableForms: currentTakoformCandidates().forms,
+      edge: await buildEdgeForms(),
+      dataRoot,
+      runtime,
+      workerRuntimeAvailable: workerdSelection.binary !== null,
+      artifacts: providerArtifacts,
+      ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
+        ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
+        : {}),
+      workerEndpointScheme: endpoint.scheme,
+      workerEndpointPort,
+      ...(process.env.TAKOSERVER_SUFFIXES
+        ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+        : {}),
+      now: clock(),
+    });
+    const provider = providerComposition.providers[0];
+    if (!provider) throw new Error("self-host provider composition is empty");
     const result = await runSelfhostFormAdmission({
       organizationId,
       space,
       hostId: flag("host-id") ?? process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787",
       coreVerifierUrl: flag("core-verifier") ?? "http://127.0.0.1:8080",
       apply: args.includes("--apply"),
-      sql: createSqliteSql(database),
-      objects: createFileObjectStore({ root: dataRoot }),
+      sql,
+      objects,
+      provider,
     });
     const { plan, applied } = result;
     process.stdout.write(

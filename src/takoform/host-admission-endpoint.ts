@@ -305,10 +305,12 @@ async function createComposition(
 /** Derives the exact identity sealed into operator requests without touching D1/R2. */
 export async function deriveFormAuthorityIdentity(
   configuration: FormAuthorityEndpointConfiguration,
+  handlerSurface?: Readonly<Record<string, unknown>>,
 ): Promise<FormAuthorityIdentity> {
   const catalog = await deriveRuntimeImplementationCatalog({
     implementationPayloadDigest: configuration.implementationPayloadDigest,
     capabilities: configuration.capabilities,
+    ...(handlerSurface ? { handlerSurface } : {}),
   });
   if (catalog.implementationDigest !== configuration.implementationDigest) {
     throw new HostAdmissionCoordinatorError(

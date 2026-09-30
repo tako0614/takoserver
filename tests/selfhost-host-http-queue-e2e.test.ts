@@ -238,6 +238,8 @@ test.skipIf(WORKERD === null)(
         { name: "Queue journey" },
       );
       auth["takoform-organization"] = organization.id;
+      const admissionProvider = composition.providers[0];
+      if (!admissionProvider) throw new Error("self-host provider composition is empty");
       // This seeds normal durable authority using real published package bytes.
       // The external verifier response and identity assertion are synthetic:
       // neither real Core/Sigstore nor Accounts/OIDC are qualified by this test.
@@ -249,6 +251,7 @@ test.skipIf(WORKERD === null)(
         apply: true,
         sql,
         objects,
+        provider: admissionProvider,
         fetch: createSyntheticPublisherSetVerifier().fetch,
       });
       expect(seeded.applied?.status).toBe("converged");
