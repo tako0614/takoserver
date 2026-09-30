@@ -97,7 +97,13 @@ an operator recovery drill.
 The optional native test `tests/selfhost-host-cold-restore-native.test.ts`
 starts the real Bun entrypoint and the accepted workerd artifact. It creates
 resources through the Host HTTP API, uploads and publishes a Worker, and checks
-its Endpoint over certificate-validated HTTPS. After the Host and its workerd
+its Endpoint over certificate-validated HTTPS. It then kills only the exact
+accepted workerd child and requires a distinct replacement under the same Bun
+Host process. Within 15 seconds, that replacement must serve the same HTTPS
+marker at the old URL without a Resource read, client republish, manual child
+spawn, or Host restart. The test checks process identity throughout; TLS
+validation failures, an unexpected HTTP status, or a different marker fail
+immediately rather than being retried. After the Host and its workerd
 descendants have exited and both listeners have closed, it copies the complete
 data root, an external control database directory (including any sidecars), and
 external TLS material in the same stopped window. A new Host starts from the
@@ -125,3 +131,12 @@ Core/Sigstore verification, production source fencing, external credential or
 service recovery, pending event delivery, monitoring, or an operator disaster-
 recovery drill. Startup remains active as described above; there is no read-only
 restore mode.
+
+The serving supervisor writes bounded child-exit, automatic-restart attempt and
+delay, and recovery-success diagnostics through its existing log callback (the
+Bun entry forwards these to stdout). New recovery messages contain no config
+path or arbitrary child error text; deliberate stops and stale children are
+not reported as crashes. A failure to write these diagnostics does not stop
+runtime recovery. Operators still need to collect logs and configure their own
+alerts: these messages are not a health API, monitoring service, or proof of
+operator recovery.

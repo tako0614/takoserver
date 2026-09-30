@@ -93,6 +93,14 @@ export function createWorkerdSupervisor(options: {
   let nextEpoch = 0;
   let nextRestartId = 0;
 
+  const logRecoveryDiagnostic = (message: string): void => {
+    try {
+      options.log?.(message);
+    } catch {
+      // Diagnostics must not change the runtime lifecycle.
+    }
+  };
+
   const isDesiredEpoch = (epoch: number): boolean =>
     desired?.epoch === epoch && nextEpoch === epoch;
 
@@ -174,22 +182,29 @@ export function createWorkerdSupervisor(options: {
     if (!fired && isDesiredEpoch(epoch) && !running && !pendingRestart) {
       pendingRestart = { id, cancel };
     }
+    logRecoveryDiagnostic(
+      `workerd runtime automatic restart scheduled (attempt=${attempt} delayMs=${delayMs})`,
+    );
   };
 
-  const handleExit = (entry: RuntimeEntry): void => {
+  const handleExit = (entry: RuntimeEntry, code: number | null): void => {
     if (running !== entry) return;
+    const shouldRecover = entry.ready && isDesiredEpoch(entry.epoch);
     running = null;
-    if (entry.ready && isDesiredEpoch(entry.epoch)) {
-      schedule(entry.epoch, entry.configPath);
-    }
+    if (!shouldRecover) return;
+
+    const safeCode =
+      code !== null && Number.isInteger(code) && code >= 0 && code <= 255 ? code : "unknown";
+    logRecoveryDiagnostic(`workerd runtime child exited (code=${safeCode})`);
+    schedule(entry.epoch, entry.configPath);
   };
 
   const observeExit = (entry: RuntimeEntry): void => {
     const exited = entry.process.exited;
     if (!exited) return;
     void exited.then(
-      () => handleExit(entry),
-      () => handleExit(entry),
+      (code) => handleExit(entry, code),
+      () => handleExit(entry, null),
     );
   };
 
@@ -251,7 +266,11 @@ export function createWorkerdSupervisor(options: {
       if (!desired) {
         desired = { configPath, epoch, restartAttempt: 0 };
       }
-      options.log?.(`workerd started against ${configPath}`);
+      if (recovery) {
+        logRecoveryDiagnostic("workerd runtime recovered after automatic restart");
+      } else {
+        options.log?.(`workerd started against ${configPath}`);
+      }
     } catch (error) {
       if (entry) {
         kill(entry);

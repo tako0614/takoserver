@@ -28,7 +28,8 @@ const API_PORT = 8787;
 const WORKER_SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
 const SPACE = "default";
-const MODULE = `export default { async fetch() { return new Response("cold-restore-marker-v1"); } };`;
+const WORKER_MARKER = "cold-restore-marker-v1";
+const MODULE = `export default { async fetch() { return new Response("${WORKER_MARKER}"); } };`;
 const RESOURCE_NAMES = [
   ["ModuleWorker", "cold-restore-worker"],
   ["WorkerBundle", "cold-restore-bundle"],
@@ -47,7 +48,7 @@ type ProcessIdentity = {
 const observedHostDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>();
 
 test.skipIf(WORKERD === null)(
-  "a stopped self-host cold copy restores its published Worker at the same public endpoint",
+  "a self-host recovers a crashed workerd child and restores its Worker at the same endpoint",
   async () => {
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-selfhost-cold-restore-"));
     chmodSync(fixture, 0o700);
@@ -175,9 +176,13 @@ test.skipIf(WORKERD === null)(
         );
         const completedAdmission = admission;
         const admissionDescendants = new Map<string, ProcessIdentity>();
+        const admissionDeadline = Date.now() + 30_000;
         rememberDescendants(completedAdmission.pid, admissionDescendants);
         let exitCode: number | null = null;
         while (completedAdmission.exitCode === null) {
+          if (Date.now() >= admissionDeadline) {
+            throw new Error("selfhost_form_admission_cli_timeout");
+          }
           rememberDescendants(completedAdmission.pid, admissionDescendants);
           await Bun.sleep(25);
         }
@@ -314,6 +319,39 @@ test.skipIf(WORKERD === null)(
       rememberHostDescendants(host);
       const graphBefore = await readResourceGraph(auth, forms);
 
+      // Kill only the exact accepted runtime child. Recovery must happen inside
+      // this same Host process before any Resource read or client republish.
+      const sourceHostIdentity = processIdentity(host.pid);
+      const acceptedWorkerd = acceptedWorkerdSnapshot(sourceRoot);
+      const crashedWorkerd = uniqueLiveWorkerd(host, acceptedWorkerd);
+      const currentWorkerd = processIdentity(crashedWorkerd.pid);
+      if (
+        !sameIdentity(currentWorkerd, crashedWorkerd) ||
+        currentWorkerd.executable !== acceptedWorkerd
+      ) {
+        throw new Error("selfhost_workerd_identity_changed_before_kill");
+      }
+      process.kill(crashedWorkerd.pid, "SIGKILL");
+      await waitForProcessIdentitiesGone([crashedWorkerd]);
+      assertHostStillSameProcess(host, sourceHostIdentity);
+      const replacementWorkerd = await waitForWorkerdReplacement(
+        host,
+        sourceHostIdentity,
+        acceptedWorkerd,
+        crashedWorkerd,
+      );
+      if (sameIdentity(replacementWorkerd, crashedWorkerd)) {
+        throw new Error("selfhost_workerd_replacement_identity_not_distinct");
+      }
+      const recoveredMarker = await waitForRecoveredWorkerMarker(
+        host,
+        sourceHostIdentity,
+        replacementWorkerd,
+        hostname,
+        join(sourceTls, "worker-cert.pem"),
+      );
+      expect(recoveredMarker).toBe(WORKER_MARKER);
+
       // The source is quiescent before copying the entire installation root and
       // the complete external control-DB directory (including any SQLite sidecars).
       await stopHost(host, { requireWorker: true, dataRoot: sourceRoot });
@@ -425,12 +463,7 @@ async function stopHost(
   if (host.exitCode !== null) throw new Error("selfhost_unexpected_host_exit_before_stop");
   if (options.requireWorker) {
     if (!options.dataRoot) throw new Error("selfhost_workerd_snapshot_root_missing");
-    const expectedBinary = join(
-      options.dataRoot,
-      "runtime-probes",
-      "artifacts",
-      `workerd-${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
-    );
+    const expectedBinary = acceptedWorkerdSnapshot(options.dataRoot);
     if (![...observed.values()].some((identity) => identity.executable === expectedBinary)) {
       throw new Error("selfhost_workerd_child_not_observed_before_stop");
     }
@@ -486,6 +519,71 @@ function hostDescendants(host: Host): Map<string, ProcessIdentity> {
 
 function rememberHostDescendants(host: Host): void {
   rememberDescendants(host.pid, hostDescendants(host));
+}
+
+function acceptedWorkerdSnapshot(dataRoot: string): string {
+  return join(
+    dataRoot,
+    "runtime-probes",
+    "artifacts",
+    `workerd-${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
+  );
+}
+
+function processIdentity(pid: number): ProcessIdentity {
+  const stat = processStat(pid);
+  const executable = processExecutable(pid);
+  if (stat === null || executable === null) throw new Error("selfhost_process_identity_not_live");
+  return { pid, startTicks: stat.startTicks, executable };
+}
+
+function sameIdentity(left: ProcessIdentity, right: ProcessIdentity): boolean {
+  return left.pid === right.pid && left.startTicks === right.startTicks;
+}
+
+function identityIsLive(identity: ProcessIdentity): boolean {
+  const stat = processStat(identity.pid);
+  return (
+    stat?.startTicks === identity.startTicks &&
+    processExecutable(identity.pid) === identity.executable
+  );
+}
+
+function uniqueLiveWorkerd(host: Host, expectedExecutable: string): ProcessIdentity {
+  rememberHostDescendants(host);
+  const matches = [...hostDescendants(host).values()].filter(
+    (identity) => identity.executable === expectedExecutable && identityIsLive(identity),
+  );
+  if (matches.length !== 1) throw new Error("selfhost_expected_one_live_workerd_child");
+  return matches[0] as ProcessIdentity;
+}
+
+function assertHostStillSameProcess(host: Host, expected: ProcessIdentity): void {
+  if (host.exitCode !== null || !identityIsLive(expected)) {
+    throw new Error("selfhost_host_process_changed_after_workerd_crash");
+  }
+}
+
+async function waitForWorkerdReplacement(
+  host: Host,
+  hostIdentity: ProcessIdentity,
+  expectedExecutable: string,
+  crashed: ProcessIdentity,
+): Promise<ProcessIdentity> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    assertHostStillSameProcess(host, hostIdentity);
+    const replacement = [...hostDescendants(host).values()].find(
+      (identity) =>
+        identity.executable === expectedExecutable &&
+        !sameIdentity(identity, crashed) &&
+        identityIsLive(identity),
+    );
+    if (replacement) return replacement;
+    rememberHostDescendants(host);
+    await Bun.sleep(25);
+  }
+  throw new Error("selfhost_workerd_replacement_timeout");
 }
 
 function rememberDescendants(rootPid: number, output: Map<string, ProcessIdentity>): void {
@@ -743,9 +841,50 @@ async function createTls(directory: string): Promise<{ certificate: string; priv
   return { certificate, privateKey };
 }
 
+type WorkerHttpsTransportFailureKind =
+  | "connection_refused"
+  | "connection_reset"
+  | "timeout"
+  | "tls_validation"
+  | "other";
+
+const RETRYABLE_WORKER_HTTPS_FAILURES = new Set<WorkerHttpsTransportFailureKind>([
+  "connection_refused",
+  "connection_reset",
+  "timeout",
+]);
+
+class WorkerHttpsTransportFailure extends Error {
+  constructor(readonly kind: WorkerHttpsTransportFailureKind) {
+    super("worker_https_transport_failure");
+  }
+}
+
 function workerRequest(hostname: string, certificatePath: string, path: string): Promise<string> {
+  return workerRequestAttempt(hostname, certificatePath, path, 5_000).catch((error: unknown) => {
+    if (error instanceof WorkerHttpsTransportFailure) {
+      throw new Error("worker_https_transport_error");
+    }
+    throw error;
+  });
+}
+
+function workerRequestAttempt(
+  hostname: string,
+  certificatePath: string,
+  path: string,
+  timeoutMs: number,
+): Promise<string> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("worker_https_timeout_budget_invalid");
+  }
   const certificate = readFileSync(certificatePath, "utf8");
   return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const clearDeadline = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = undefined;
+    };
     const request = httpsRequest(
       {
         hostname: "127.0.0.1",
@@ -757,20 +896,95 @@ function workerRequest(hostname: string, certificatePath: string, path: string):
         ca: certificate,
       },
       (response) => {
+        if (response.statusCode !== 200) {
+          clearDeadline();
+          const status = response.statusCode ?? 0;
+          response.destroy();
+          reject(new Error(`worker_https_status_${status}`));
+          return;
+        }
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
-        response.on("error", () => reject(new Error("worker_https_response_error")));
+        response.on("error", () => {
+          clearDeadline();
+          reject(new Error("worker_https_response_error"));
+        });
         response.on("end", () => {
-          if (response.statusCode !== 200) {
-            reject(new Error(`worker_https_status_${response.statusCode ?? 0}`));
-            return;
-          }
+          clearDeadline();
           resolve(Buffer.concat(chunks).toString("utf8"));
         });
       },
     );
-    request.setTimeout(5_000, () => request.destroy(new Error("worker_https_timeout")));
-    request.on("error", () => reject(new Error("worker_https_transport_error")));
+    timeout = setTimeout(
+      () => request.destroy(new WorkerHttpsTransportFailure("timeout")),
+      timeoutMs,
+    );
+    request.on("error", (error: unknown) => {
+      clearDeadline();
+      reject(new WorkerHttpsTransportFailure(workerHttpsTransportFailureKind(error)));
+    });
     request.end();
   });
+}
+
+function workerHttpsTransportFailureKind(error: unknown): WorkerHttpsTransportFailureKind {
+  if (error instanceof WorkerHttpsTransportFailure) return error.kind;
+  if (typeof error !== "object" || error === null || !("code" in error)) return "other";
+  const code = (error as { readonly code?: unknown }).code;
+  if (code === "ECONNREFUSED") return "connection_refused";
+  if (code === "ECONNRESET") return "connection_reset";
+  if (code === "ETIMEDOUT") return "timeout";
+  if (
+    code === "CERT_HAS_EXPIRED" ||
+    code === "CERT_NOT_YET_VALID" ||
+    code === "ERR_TLS_CERT_ALTNAME_INVALID" ||
+    code === "DEPTH_ZERO_SELF_SIGNED_CERT" ||
+    code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+  ) {
+    return "tls_validation";
+  }
+  return "other";
+}
+
+async function waitForRecoveredWorkerMarker(
+  host: Host,
+  hostIdentity: ProcessIdentity,
+  replacementWorkerd: ProcessIdentity,
+  hostname: string,
+  certificatePath: string,
+): Promise<string> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    assertHostStillSameProcess(host, hostIdentity);
+    if (!identityIsLive(replacementWorkerd)) {
+      throw new Error("selfhost_replacement_workerd_changed_during_readiness");
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error("selfhost_worker_endpoint_readiness_timeout");
+    try {
+      const marker = await workerRequestAttempt(
+        hostname,
+        certificatePath,
+        "/",
+        Math.min(5_000, remainingMs),
+      );
+      assertHostStillSameProcess(host, hostIdentity);
+      if (!identityIsLive(replacementWorkerd)) {
+        throw new Error("selfhost_replacement_workerd_changed_during_readiness");
+      }
+      if (marker !== WORKER_MARKER) throw new Error("selfhost_worker_marker_unexpected");
+      return marker;
+    } catch (error) {
+      if (
+        !(error instanceof WorkerHttpsTransportFailure) ||
+        !RETRYABLE_WORKER_HTTPS_FAILURES.has(error.kind)
+      ) {
+        throw error;
+      }
+      const retryDelayMs = Math.min(50, deadline - Date.now());
+      if (retryDelayMs <= 0) throw new Error("selfhost_worker_endpoint_readiness_timeout");
+      await Bun.sleep(retryDelayMs);
+    }
+  }
 }

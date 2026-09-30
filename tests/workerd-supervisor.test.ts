@@ -79,6 +79,7 @@ describe("keeping workerd running", () => {
 
   test("recovers a ready runtime after its child exits", async () => {
     const children: TestChild[] = [];
+    const said: string[] = [];
     const restarts: Array<{ readonly delay: number; readonly run: () => void }> = [];
     const supervisor = createWorkerdSupervisor({
       binary: "/usr/bin/workerd",
@@ -88,6 +89,7 @@ describe("keeping workerd running", () => {
         return child.process;
       },
       readiness: async () => true,
+      log: (message) => said.push(message),
       scheduleRestart: (run, delay) => {
         restarts.push({ delay, run });
         return () => undefined;
@@ -102,11 +104,124 @@ describe("keeping workerd running", () => {
     expect(supervisor.isReady()).toBe(false);
     expect(restarts).toHaveLength(1);
     expect(restarts[0]?.delay).toBeGreaterThan(0);
+    expect(said).toContain("workerd runtime child exited (code=1)");
+    expect(said).toContain("workerd runtime automatic restart scheduled (attempt=1 delayMs=100)");
 
     restarts[0]?.run();
     await settle();
     expect(children).toHaveLength(2);
     expect(supervisor.isReady()).toBe(true);
+    expect(said).toContain("workerd runtime recovered after automatic restart");
+  });
+
+  test("does not report an expected exit after deliberate stop", async () => {
+    const children: TestChild[] = [];
+    const said: string[] = [];
+    let scheduled = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+      log: (message) => said.push(message),
+      scheduleRestart: () => {
+        scheduled += 1;
+        return () => undefined;
+      },
+    });
+
+    await supervisor.ensure("/data/workerd.capnp");
+    supervisor.stop();
+    children[0]?.exit(0);
+    await settle();
+
+    expect(scheduled).toBe(0);
+    const unexpectedExitLogs = said.filter(
+      (message) => message.includes("child exited") || message.includes("restart scheduled"),
+    );
+    expect(unexpectedExitLogs).toEqual([]);
+  });
+
+  test("reports rejected child exit as unknown without exposing its reason", async () => {
+    const exited = deferred<number>();
+    const said: string[] = [];
+    const restarts: Array<{ readonly delay: number; readonly run: () => void }> = [];
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => ({ kill() {}, exited: exited.promise }),
+      readiness: async () => true,
+      log: (message) => said.push(message),
+      scheduleRestart: (run, delay) => {
+        restarts.push({ delay, run });
+        return () => undefined;
+      },
+    });
+
+    await supervisor.ensure("/data/workerd.capnp");
+    exited.reject(new Error("untrusted child reason /private/config/path"));
+    await settle();
+
+    expect(said).toContain("workerd runtime child exited (code=unknown)");
+    expect(said.join("\n")).not.toContain("untrusted child reason /private/config/path");
+    expect(said).toContain("workerd runtime automatic restart scheduled (attempt=1 delayMs=100)");
+    expect(restarts.map(({ delay }) => delay)).toEqual([100]);
+  });
+
+  test("diagnostic logger failures do not interrupt automatic recovery", async () => {
+    const children: TestChild[] = [];
+    const restarts: Array<{ readonly run: () => void }> = [];
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => true,
+      log: (message) => {
+        if (message.startsWith("workerd runtime")) throw new Error("diagnostic sink unavailable");
+      },
+      scheduleRestart: (run) => {
+        restarts.push({ run });
+        return () => undefined;
+      },
+    });
+
+    await supervisor.ensure("/data/workerd.capnp");
+    children[0]?.exit(9);
+    await settle();
+    expect(restarts).toHaveLength(1);
+
+    restarts[0]?.run();
+    await settle();
+    expect(children).toHaveLength(2);
+    expect(supervisor.isReady()).toBe(true);
+  });
+
+  test("does not report a child exit before first readiness as a runtime crash", async () => {
+    const exited = deferred<number>();
+    const readiness = deferred<boolean>();
+    const said: string[] = [];
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => ({ kill() {}, exited: exited.promise }),
+      readiness: async () => await readiness.promise,
+      log: (message) => said.push(message),
+      scheduleRestart: () => {
+        throw new Error("a first-start failure must not schedule recovery");
+      },
+    });
+
+    const starting = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    exited.reject(new Error("child exited before readiness"));
+    await expect(starting).rejects.toThrow("exited before its serving readiness check");
+    await settle();
+
+    expect(said.filter((message) => message.includes("child exited"))).toEqual([]);
   });
 
   test("caps repeated recovery backoff without bouncing a healthy child", async () => {
@@ -183,6 +298,7 @@ describe("keeping workerd running", () => {
   test("does not let stale readiness revive a stopped child or replace a later ensure", async () => {
     const children: TestChild[] = [];
     const probes: Array<Deferred<boolean>> = [];
+    const said: string[] = [];
     const supervisor = createWorkerdSupervisor({
       binary: "/usr/bin/workerd",
       spawn: () => {
@@ -190,6 +306,7 @@ describe("keeping workerd running", () => {
         children.push(child);
         return child.process;
       },
+      log: (message) => said.push(message),
       readiness: async () => {
         const probe = deferred<boolean>();
         probes.push(probe);
@@ -220,6 +337,10 @@ describe("keeping workerd running", () => {
     children[0]?.exit();
     await settle();
     expect(supervisor.isReady()).toBe(true);
+    const staleExitLogs = said.filter(
+      (message) => message.includes("child exited") || message.includes("restart scheduled"),
+    );
+    expect(staleExitLogs).toEqual([]);
   });
 
   test("kills a child when its readiness probe throws", async () => {
