@@ -28,12 +28,16 @@ const API_PORT = 8787;
 const WORKER_SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
 const SPACE = "default";
-const WORKER_MARKER = "cold-restore-marker-v1";
-const MODULE = `export default { async fetch() { return new Response("${WORKER_MARKER}"); } };`;
+const WORKER_MARKER_V1 = "cold-restore-marker-v1";
+const WORKER_MARKER_V2 = "cold-restore-marker-v2";
+const MODULE_V1 = `export default { async fetch() { return new Response("${WORKER_MARKER_V1}"); } };`;
+const MODULE_V2 = `export default { async fetch() { return new Response("${WORKER_MARKER_V2}"); } };`;
 const RESOURCE_NAMES = [
   ["ModuleWorker", "cold-restore-worker"],
   ["WorkerBundle", "cold-restore-bundle"],
   ["WorkerVersion", "cold-restore-version"],
+  ["WorkerBundle", "cold-restore-bundle-v2"],
+  ["WorkerVersion", "cold-restore-version-v2"],
   ["WorkerDeployment", "cold-restore-deployment"],
   ["WorkerEndpoint", "cold-restore-endpoint"],
 ] as const;
@@ -48,7 +52,7 @@ type ProcessIdentity = {
 const observedHostDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>();
 
 test.skipIf(WORKERD === null)(
-  "a self-host recovers a crashed workerd child and restores its Worker at the same endpoint",
+  "a self-host updates, recovers, and restores its Worker at the same endpoint",
   async () => {
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-selfhost-cold-restore-"));
     chmodSync(fixture, 0o700);
@@ -138,6 +142,47 @@ test.skipIf(WORKERD === null)(
         authorization: `Bearer ${apiToken}`,
         "takoform-organization": organizationId,
       };
+      async function publishModuleArtifact(moduleSource: string, key: string): Promise<string> {
+        const moduleBytes = new TextEncoder().encode(moduleSource);
+        const moduleDigest = await bytesDigest(moduleBytes);
+        const upload = await api<Json>(
+          "POST",
+          `${LANE}/artifacts/uploads`,
+          201,
+          {
+            manifest: {
+              apiVersion: "artifacts.takoform.com/v1alpha1",
+              kind: "WorkerBundle",
+              mainModule: "index.js",
+              modules: [
+                {
+                  name: "index.js",
+                  mediaType: "application/javascript+module",
+                  size: moduleBytes.byteLength,
+                  digest: moduleDigest,
+                },
+              ],
+            },
+          },
+          { ...auth, "idempotency-key": `${key}-upload` },
+        );
+        const uploadId = stringAt(upload, "uploadId");
+        expect(upload.missingBlobs).toContain(moduleDigest);
+        const uploaded = await fetch(
+          `${HOST_ORIGIN}${LANE}/artifacts/uploads/${uploadId}/blobs/${moduleDigest}`,
+          { method: "PUT", headers: auth, body: moduleBytes },
+        );
+        expect(uploaded.status).toBe(201);
+        await uploaded.arrayBuffer();
+        const artifact = await api<Json>(
+          "POST",
+          `${LANE}/artifacts/uploads/${uploadId}/commit`,
+          201,
+          undefined,
+          { ...auth, "idempotency-key": `${key}-commit` },
+        );
+        return stringAt(artifact, "manifestDigest");
+      }
 
       // Self-host Forms are durably admitted before Worker resources are created.
       // This fixture synthesizes verifier responses; it is not Core/Sigstore proof.
@@ -217,55 +262,22 @@ test.skipIf(WORKERD === null)(
           return [stringAt(objectAt(identity, "formRef"), "kind"), objectAt(identity, "formRef")];
         }),
       );
-      const moduleBytes = new TextEncoder().encode(MODULE);
-      const moduleDigest = await bytesDigest(moduleBytes);
-      const upload = await api<Json>(
-        "POST",
-        `${LANE}/artifacts/uploads`,
-        201,
-        {
-          manifest: {
-            apiVersion: "artifacts.takoform.com/v1alpha1",
-            kind: "WorkerBundle",
-            mainModule: "index.js",
-            modules: [
-              {
-                name: "index.js",
-                mediaType: "application/javascript+module",
-                size: moduleBytes.byteLength,
-                digest: moduleDigest,
-              },
-            ],
-          },
-        },
-        { ...auth, "idempotency-key": "cold-restore-upload" },
-      );
-      const uploadId = stringAt(upload, "uploadId");
-      expect(upload.missingBlobs).toContain(moduleDigest);
-      const uploaded = await fetch(
-        `${HOST_ORIGIN}${LANE}/artifacts/uploads/${uploadId}/blobs/${moduleDigest}`,
-        {
-          method: "PUT",
-          headers: auth,
-          body: moduleBytes,
-        },
-      );
-      expect(uploaded.status).toBe(201);
-      await uploaded.arrayBuffer();
-      const artifact = await api<Json>(
-        "POST",
-        `${LANE}/artifacts/uploads/${uploadId}/commit`,
-        201,
-        undefined,
-        { ...auth, "idempotency-key": "cold-restore-upload-commit" },
-      );
+      const manifestDigestV1 = await publishModuleArtifact(MODULE_V1, "cold-restore-v1");
 
       const reference = (kind: string, name: string) => ({
         apiVersion: "edge.forms.takoform.com",
         kind,
         name,
       });
-      async function apply(kind: string, name: string, spec: Json): Promise<Json> {
+      async function apply(
+        kind: string,
+        name: string,
+        spec: Json,
+        options: {
+          readonly expectedGeneration?: string;
+          readonly ifMatchRevision?: string;
+        } = {},
+      ): Promise<Json> {
         const formRef = forms.get(kind);
         if (!formRef) throw new Error(`selfhost_form_missing_${kind}`);
         const desired = {
@@ -275,7 +287,16 @@ test.skipIf(WORKERD === null)(
           metadata: { name, space: SPACE },
           spec,
         };
-        const prepared = await api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, auth);
+        const updating = options.ifMatchRevision !== undefined;
+        if (updating !== (options.expectedGeneration !== undefined)) {
+          throw new Error("selfhost_update_generation_and_revision_fence_required");
+        }
+        const prepared = await api<Json>("POST", `${LANE}/resources/prepare`, 200, desired, {
+          ...auth,
+          ...(updating
+            ? { "takoform-expected-generation": options.expectedGeneration as string }
+            : {}),
+        });
         const review = objectAt(prepared, "review");
         const query = new URLSearchParams({
           space: SPACE,
@@ -285,15 +306,24 @@ test.skipIf(WORKERD === null)(
         return api<Json>(
           "PUT",
           `${LANE}/resources/${formRef.apiVersion}/${kind}/${name}?${query}`,
-          201,
+          updating ? 200 : 201,
           { ...desired, review },
-          { ...auth, "idempotency-key": `${kind}-${name}-create`, "if-none-match": "*" },
+          {
+            ...auth,
+            "idempotency-key": `${kind}-${name}-${updating ? "update" : "create"}`,
+            ...(updating
+              ? {
+                  "if-match": `"${options.ifMatchRevision}"`,
+                  "takoform-expected-generation": options.expectedGeneration as string,
+                }
+              : { "if-none-match": "*" }),
+          },
         );
       }
 
-      await apply("ModuleWorker", "cold-restore-worker", {});
+      const moduleWorkerV1 = await apply("ModuleWorker", "cold-restore-worker", {});
       await apply("WorkerBundle", "cold-restore-bundle", {
-        manifestDigest: stringAt(artifact, "manifestDigest"),
+        manifestDigest: manifestDigestV1,
       });
       await apply("WorkerVersion", "cold-restore-version", {
         worker: reference("ModuleWorker", "cold-restore-worker"),
@@ -301,7 +331,7 @@ test.skipIf(WORKERD === null)(
         handlers: ["fetch"],
         requiredSensitiveVars: [],
       });
-      await apply("WorkerDeployment", "cold-restore-deployment", {
+      const deploymentV1 = await apply("WorkerDeployment", "cold-restore-deployment", {
         worker: reference("ModuleWorker", "cold-restore-worker"),
         versions: [
           { workerVersion: reference("WorkerVersion", "cold-restore-version"), weight: 10_000 },
@@ -315,9 +345,82 @@ test.skipIf(WORKERD === null)(
       expect(new URL(endpointBefore).port).toBe("");
       const hostname = new URL(endpointBefore).hostname;
       const markerBefore = await workerRequest(hostname, join(sourceTls, "worker-cert.pem"), "/");
-      expect(markerBefore).toBe("cold-restore-marker-v1");
+      expect(markerBefore).toBe(WORKER_MARKER_V1);
+
+      // Publish V2 through the same public artifact and Form endpoints, then
+      // update the existing Deployment behind its current revision fence.
+      const manifestDigestV2 = await publishModuleArtifact(MODULE_V2, "cold-restore-v2");
+      await apply("WorkerBundle", "cold-restore-bundle-v2", {
+        manifestDigest: manifestDigestV2,
+      });
+      await apply("WorkerVersion", "cold-restore-version-v2", {
+        worker: reference("ModuleWorker", "cold-restore-worker"),
+        bundle: reference("WorkerBundle", "cold-restore-bundle-v2"),
+        handlers: ["fetch"],
+        requiredSensitiveVars: [],
+      });
+      const deploymentV2 = await apply(
+        "WorkerDeployment",
+        "cold-restore-deployment",
+        {
+          worker: reference("ModuleWorker", "cold-restore-worker"),
+          versions: [
+            {
+              workerVersion: reference("WorkerVersion", "cold-restore-version-v2"),
+              weight: 10_000,
+            },
+          ],
+        },
+        {
+          expectedGeneration: stringAt(objectAt(deploymentV1, "metadata"), "generation"),
+          ifMatchRevision: stringAt(objectAt(deploymentV1, "metadata"), "revision"),
+        },
+      );
+      expect(stringAt(objectAt(deploymentV2, "metadata"), "uid")).toBe(
+        stringAt(objectAt(deploymentV1, "metadata"), "uid"),
+      );
+      expect(stringAt(objectAt(deploymentV2, "metadata"), "revision")).not.toBe(
+        stringAt(objectAt(deploymentV1, "metadata"), "revision"),
+      );
+      expect(await workerRequest(hostname, join(sourceTls, "worker-cert.pem"), "/")).toBe(
+        WORKER_MARKER_V2,
+      );
       rememberHostDescendants(host);
       const graphBefore = await readResourceGraph(auth, forms);
+      expect(
+        stringAt(resourceGraphItem(graphBefore, "ModuleWorker", "cold-restore-worker"), "uid"),
+      ).toBe(stringAt(objectAt(moduleWorkerV1, "metadata"), "uid"));
+      expect(
+        stringAt(resourceGraphItem(graphBefore, "WorkerEndpoint", "cold-restore-endpoint"), "uid"),
+      ).toBe(stringAt(objectAt(endpointResource, "metadata"), "uid"));
+      expect(
+        stringAt(
+          objectAt(
+            resourceGraphItem(graphBefore, "WorkerEndpoint", "cold-restore-endpoint"),
+            "outputs",
+          ),
+          "url",
+        ),
+      ).toBe(endpointBefore);
+      expect(
+        stringAt(
+          resourceGraphItem(graphBefore, "WorkerDeployment", "cold-restore-deployment"),
+          "uid",
+        ),
+      ).toBe(stringAt(objectAt(deploymentV2, "metadata"), "uid"));
+      const activeDeploymentSpec = objectAt(
+        resourceGraphItem(graphBefore, "WorkerDeployment", "cold-restore-deployment"),
+        "spec",
+      );
+      if (
+        !Array.isArray(activeDeploymentSpec.versions) ||
+        activeDeploymentSpec.versions.length !== 1
+      ) {
+        throw new Error("selfhost_updated_deployment_version_graph_invalid");
+      }
+      expect(
+        stringAt(objectAt(activeDeploymentSpec.versions[0] as Json, "workerVersion"), "name"),
+      ).toBe("cold-restore-version-v2");
 
       // Kill only the exact accepted runtime child. Recovery must happen inside
       // this same Host process before any Resource read or client republish.
@@ -349,8 +452,9 @@ test.skipIf(WORKERD === null)(
         replacementWorkerd,
         hostname,
         join(sourceTls, "worker-cert.pem"),
+        WORKER_MARKER_V2,
       );
-      expect(recoveredMarker).toBe(WORKER_MARKER);
+      expect(recoveredMarker).toBe(WORKER_MARKER_V2);
 
       // The source is quiescent before copying the entire installation root and
       // the complete external control-DB directory (including any SQLite sidecars).
@@ -383,12 +487,15 @@ test.skipIf(WORKERD === null)(
       host = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
       expect(await workerRequest(hostname, join(restoredTls, "worker-cert.pem"), "/")).toBe(
-        "cold-restore-marker-v1",
+        WORKER_MARKER_V2,
       );
       const graphAfter = await readResourceGraph(auth, forms);
       expect(graphAfter).toEqual(graphBefore);
       const endpointAfter = stringAt(
-        objectAt(graphAfter.find((item) => item.kind === "WorkerEndpoint") ?? {}, "outputs"),
+        objectAt(
+          resourceGraphItem(graphAfter, "WorkerEndpoint", "cold-restore-endpoint"),
+          "outputs",
+        ),
         "url",
       );
       expect(endpointAfter).toBe(endpointBefore);
@@ -781,10 +888,17 @@ async function readResourceGraph(
       name,
       uid: stringAt(metadata, "uid"),
       revision: stringAt(metadata, "revision"),
+      spec: objectAt(resource, "spec"),
       ...(status.outputs === undefined ? {} : { outputs: objectValue(status.outputs, "outputs") }),
     });
   }
   return resources;
+}
+
+function resourceGraphItem(graph: readonly Json[], kind: string, name: string): Json {
+  const found = graph.find((item) => item.kind === kind && item.name === name);
+  if (!found) throw new Error(`selfhost_resource_missing_${kind}`);
+  return found;
 }
 
 function output(resource: Json, name: string): string {
@@ -953,6 +1067,7 @@ async function waitForRecoveredWorkerMarker(
   replacementWorkerd: ProcessIdentity,
   hostname: string,
   certificatePath: string,
+  expectedMarker: string,
 ): Promise<string> {
   const deadline = Date.now() + 15_000;
   for (;;) {
@@ -973,7 +1088,7 @@ async function waitForRecoveredWorkerMarker(
       if (!identityIsLive(replacementWorkerd)) {
         throw new Error("selfhost_replacement_workerd_changed_during_readiness");
       }
-      if (marker !== WORKER_MARKER) throw new Error("selfhost_worker_marker_unexpected");
+      if (marker !== expectedMarker) throw new Error("selfhost_worker_marker_unexpected");
       return marker;
     } catch (error) {
       if (
