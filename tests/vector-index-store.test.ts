@@ -80,6 +80,27 @@ function tracedSql(
   return { sql, queryParams, runParams, batches };
 }
 
+function mappedBlobSql(inner: Sql, map: (value: unknown) => unknown): Sql {
+  return {
+    async query(statement, params) {
+      const rows = await inner.query(statement, params);
+      return rows.map((row) =>
+        Object.hasOwn(row, "values_blob") ? { ...row, values_blob: map(row.values_blob) } : row,
+      );
+    },
+    run: (statement, params) => inner.run(statement, params),
+    batch: (statements) => inner.batch(statements),
+  };
+}
+
+function blobBytes(value: unknown): Uint8Array {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  throw new Error("expected a binary vector BLOB");
+}
+
 async function expectCode(action: () => Promise<unknown>, code: string): Promise<void> {
   try {
     await action();
@@ -312,6 +333,75 @@ describe("bounded VectorIndex SQL records and quotas", () => {
 });
 
 describe("bounded VectorIndex SQL reads and exact query", () => {
+  test("decodes dense D1 byte arrays and byte views without losing their offsets", async () => {
+    const value = await configured();
+    await value.store.upsert(SCOPE, {
+      vectors: [record("array", [0.25, -0.5, 0.75]), record("view", [-0.25, 0.5, -0.75])],
+    });
+
+    const d1Sql = mappedBlobSql(value.sql, (blob) => Array.from(blobBytes(blob)));
+    const d1Store = createVectorIndexStore(d1Sql);
+    expect((await d1Store.get(SCOPE, { ids: ["array"] })).vectors).toEqual([
+      { id: "array", values: [0.25, -0.5, 0.75], metadata: {} },
+    ]);
+    expect(
+      (
+        await d1Store.query(SCOPE, {
+          values: [-0.25, 0.5, -0.75],
+          topK: 1,
+          returnValues: true,
+        })
+      ).matches[0]?.values,
+    ).toEqual([-0.25, 0.5, -0.75]);
+
+    const offsetStore = createVectorIndexStore(
+      mappedBlobSql(value.sql, (blob) => {
+        const bytes = blobBytes(blob);
+        const backing = new Uint8Array(bytes.length + 4);
+        backing.set(bytes, 2);
+        return new DataView(backing.buffer, 2, bytes.length);
+      }),
+    );
+    expect((await offsetStore.get(SCOPE, { ids: ["view"] })).vectors).toEqual([
+      { id: "view", values: [-0.25, 0.5, -0.75], metadata: {} },
+    ]);
+  });
+
+  test("refuses malformed D1 byte arrays and corrupt BLOB dimensions or floats", async () => {
+    const cases: readonly { readonly map: (bytes: Uint8Array) => unknown }[] = [
+      {
+        map: (bytes) => {
+          const sparse = new Array<number>(bytes.length);
+          for (let index = 0; index < bytes.length; index += 1) {
+            if (index !== 2) sparse[index] = bytes[index] as number;
+          }
+          return sparse;
+        },
+      },
+      { map: (bytes) => [bytes[0], 1.5, ...bytes.slice(2)] },
+      { map: (bytes) => [bytes[0], 256, ...bytes.slice(2)] },
+      { map: (bytes) => bytes.slice(1) },
+      {
+        map: (bytes) => {
+          const corrupt = bytes.slice();
+          new DataView(corrupt.buffer).setFloat32(0, Number.POSITIVE_INFINITY, true);
+          return corrupt;
+        },
+      },
+    ];
+
+    for (const testCase of cases) {
+      const value = await configured();
+      await value.store.upsert(SCOPE, { vectors: [record("corrupt")] });
+      const store = createVectorIndexStore(
+        mappedBlobSql(value.sql, (blob) => testCase.map(blobBytes(blob))),
+      );
+      await expectCode(() => store.get(SCOPE, { ids: ["corrupt"] }), "unavailable");
+      await expectCode(() => store.query(SCOPE, { values: [1, 0, 0], topK: 1 }), "unavailable");
+      value.database.close();
+    }
+  });
+
   test("returns get results in request order, omits unknowns, and deletes idempotently", async () => {
     const value = await configured();
     await value.store.upsert(SCOPE, {
