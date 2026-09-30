@@ -41,6 +41,15 @@ const RESOURCE_NAMES = [
   ["WorkerDeployment", "cold-restore-deployment"],
   ["WorkerEndpoint", "cold-restore-endpoint"],
 ] as const;
+const RESOURCE_DELETE_ORDER = [
+  ["WorkerEndpoint", "cold-restore-endpoint"],
+  ["WorkerDeployment", "cold-restore-deployment"],
+  ["WorkerVersion", "cold-restore-version-v2"],
+  ["WorkerBundle", "cold-restore-bundle-v2"],
+  ["WorkerVersion", "cold-restore-version"],
+  ["WorkerBundle", "cold-restore-bundle"],
+  ["ModuleWorker", "cold-restore-worker"],
+] as const;
 
 type Json = Record<string, unknown>;
 type Host = ReturnType<typeof startHost>;
@@ -486,6 +495,7 @@ test.skipIf(WORKERD === null)(
       // There is no client resource publication after this point.
       host = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+      const restoredHostIdentity = processIdentity(host.pid);
       expect(await workerRequest(hostname, join(restoredTls, "worker-cert.pem"), "/")).toBe(
         WORKER_MARKER_V2,
       );
@@ -499,6 +509,25 @@ test.skipIf(WORKERD === null)(
         "url",
       );
       expect(endpointAfter).toBe(endpointBefore);
+
+      // Delete through the public Host API in reverse dependency order. Each
+      // delete uses generation/revision read from the same public resource GET.
+      for (const [kind, name] of RESOURCE_DELETE_ORDER) {
+        await deleteResource(
+          auth,
+          forms,
+          kind,
+          name,
+          stringAt(resourceGraphItem(graphAfter, kind, name), "uid"),
+        );
+      }
+      await waitForWorkerEndpointRemoval(
+        host,
+        restoredHostIdentity,
+        hostname,
+        join(restoredTls, "worker-cert.pem"),
+        WORKER_MARKER_V2,
+      );
     } catch (error) {
       primaryFailure = error;
       hasPrimaryFailure = true;
@@ -823,7 +852,7 @@ function tcpPortIsClosed(port: number): Promise<boolean> {
   });
 }
 
-async function api<T extends Json>(
+async function api<T = Json>(
   method: string,
   path: string,
   expectedStatus: number,
@@ -858,7 +887,36 @@ async function api<T extends Json>(
       `selfhost_api_${method.toLowerCase()}_${response.status}_expected_${expectedStatus}_${code}`,
     );
   }
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+async function deleteResource(
+  auth: Record<string, string>,
+  forms: Map<string, Json>,
+  kind: string,
+  name: string,
+  expectedUid: string,
+): Promise<void> {
+  const formRef = forms.get(kind);
+  if (!formRef) throw new Error(`selfhost_form_missing_${kind}`);
+  const query = new URLSearchParams({
+    space: SPACE,
+    definitionVersion: stringAt(formRef, "definitionVersion"),
+    schemaDigest: stringAt(formRef, "schemaDigest"),
+  });
+  const path = `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`;
+  const current = await api<Json>("GET", path, 200, undefined, auth);
+  const metadata = objectAt(current, "metadata");
+  expect(stringAt(metadata, "uid")).toBe(expectedUid);
+  await api<undefined>("DELETE", path, 204, undefined, {
+    ...auth,
+    "idempotency-key": `delete-${kind}-${name}`,
+    "takoform-expected-generation": stringAt(metadata, "generation"),
+    "if-match": `"${stringAt(metadata, "revision")}"`,
+  });
+  const missing = await api<Json>("GET", path, 404, undefined, auth);
+  expect(stringAt(objectAt(missing, "error"), "code")).toBe("resource_not_found");
 }
 
 async function readResourceGraph(
@@ -1026,6 +1084,105 @@ function workerRequestAttempt(
         response.on("end", () => {
           clearDeadline();
           resolve(Buffer.concat(chunks).toString("utf8"));
+        });
+      },
+    );
+    timeout = setTimeout(
+      () => request.destroy(new WorkerHttpsTransportFailure("timeout")),
+      timeoutMs,
+    );
+    request.on("error", (error: unknown) => {
+      clearDeadline();
+      reject(new WorkerHttpsTransportFailure(workerHttpsTransportFailureKind(error)));
+    });
+    request.end();
+  });
+}
+
+async function waitForWorkerEndpointRemoval(
+  host: Host,
+  hostIdentity: ProcessIdentity,
+  hostname: string,
+  certificatePath: string,
+  expectedMarker: string,
+): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    assertHostStillSameProcess(host, hostIdentity);
+    rememberHostDescendants(host);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new Error("selfhost_worker_endpoint_removal_timeout");
+    try {
+      const response = await workerResponseAttempt(
+        hostname,
+        certificatePath,
+        "/",
+        Math.min(5_000, remainingMs),
+      );
+      assertHostStillSameProcess(host, hostIdentity);
+      rememberHostDescendants(host);
+      if (response.status === 404) {
+        if (response.body !== `no worker is published for ${hostname}\n`) {
+          throw new Error("selfhost_worker_endpoint_removal_response_unexpected");
+        }
+        return;
+      }
+      if (response.status !== 200 || response.body !== expectedMarker) {
+        throw new Error(`selfhost_worker_endpoint_removal_status_${response.status}`);
+      }
+    } catch (error) {
+      if (
+        !(error instanceof WorkerHttpsTransportFailure) ||
+        !RETRYABLE_WORKER_HTTPS_FAILURES.has(error.kind)
+      ) {
+        throw error;
+      }
+    }
+    const retryDelayMs = Math.min(50, deadline - Date.now());
+    if (retryDelayMs <= 0) throw new Error("selfhost_worker_endpoint_removal_timeout");
+    await Bun.sleep(retryDelayMs);
+  }
+}
+
+function workerResponseAttempt(
+  hostname: string,
+  certificatePath: string,
+  path: string,
+  timeoutMs: number,
+): Promise<{ readonly status: number; readonly body: string }> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("worker_https_timeout_budget_invalid");
+  }
+  const certificate = readFileSync(certificatePath, "utf8");
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const clearDeadline = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = undefined;
+    };
+    const request = httpsRequest(
+      {
+        hostname: "127.0.0.1",
+        port: 443,
+        servername: hostname,
+        path,
+        method: "GET",
+        headers: { host: hostname },
+        ca: certificate,
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer | string) => chunks.push(Buffer.from(chunk)));
+        response.on("error", () => {
+          clearDeadline();
+          reject(new Error("worker_https_response_error"));
+        });
+        response.on("end", () => {
+          clearDeadline();
+          resolve({
+            status: response.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
         });
       },
     );
