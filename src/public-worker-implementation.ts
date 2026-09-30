@@ -73,7 +73,7 @@ export function publicFormCapabilityManifest(
     ...yurucommu,
     forms: {
       ...yurucommu.forms,
-      WorkerCustomDomain: ["create", "read", "delete", "import", "observe"],
+      WorkerCustomDomain: ["create", "read", "delete", "observe"],
       ...(candidate === "actor-forward" ? { ActorNamespace: RESOURCE_OPERATION_ORDER } : {}),
     },
   };

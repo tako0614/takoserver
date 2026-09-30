@@ -240,7 +240,6 @@ describe("Form authority implementation catalog", () => {
       "create",
       "read",
       "delete",
-      "import",
       "observe",
     ]);
     expect(capabilities.forms.StaticAssetBundle).toEqual([

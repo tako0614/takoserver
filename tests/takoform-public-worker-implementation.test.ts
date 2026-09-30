@@ -23,16 +23,48 @@ const WORKER_CUSTOM_DOMAIN_IDENTITY = {
 } as const;
 
 describe("public Worker semantic implementation identity", () => {
-  test("admits the exact published WorkerCustomDomain operations without update", async () => {
+  test("admits WorkerCustomDomain operations without fresh import or update", async () => {
+    const capabilities = publicFormCapabilityManifest();
+    expect(capabilities.forms.WorkerCustomDomain).toEqual(["create", "read", "delete", "observe"]);
     const catalog = await deriveRuntimeImplementationCatalog({
       implementationPayloadDigest: artifact("1"),
-      capabilities: publicFormCapabilityManifest(),
+      capabilities,
     });
 
     expect(catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")).toEqual({
       ...WORKER_CUSTOM_DOMAIN_IDENTITY,
-      operations: ["create", "read", "delete", "import", "observe"],
+      operations: ["create", "read", "delete", "observe"],
     });
+  });
+
+  test("changes capability and implementation digests without changing Form package identity", async () => {
+    const capabilities = publicFormCapabilityManifest();
+    const catalog = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities,
+    });
+    const priorCapability = await deriveRuntimeImplementationCatalog({
+      implementationPayloadDigest: artifact("1"),
+      capabilities: {
+        ...capabilities,
+        forms: {
+          ...capabilities.forms,
+          WorkerCustomDomain: ["create", "read", "delete", "import", "observe"],
+        },
+      },
+    });
+
+    expect(catalog.capabilityDigest).not.toBe(priorCapability.capabilityDigest);
+    expect(catalog.implementationDigest).not.toBe(priorCapability.implementationDigest);
+    expect(
+      catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.packageDigest,
+    ).toBe(
+      priorCapability.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")
+        ?.packageDigest,
+    );
+    expect(catalog.entries.filter((entry) => entry.formRef.kind !== "WorkerCustomDomain")).toEqual(
+      priorCapability.entries.filter((entry) => entry.formRef.kind !== "WorkerCustomDomain"),
+    );
   });
 
   test("derives support only from declared capabilities and concrete handlers", async () => {
@@ -52,7 +84,7 @@ describe("public Worker semantic implementation identity", () => {
     ).toEqual(["create", "read", "delete", "import", "observe"]);
     expect(
       catalog.entries.find((entry) => entry.formRef.kind === "WorkerCustomDomain")?.operations,
-    ).toEqual(["create", "read", "delete", "import", "observe"]);
+    ).toEqual(["create", "read", "delete", "observe"]);
   });
 
   test("keeps intrinsic asset support independent of identity supply and domain configuration", async () => {
