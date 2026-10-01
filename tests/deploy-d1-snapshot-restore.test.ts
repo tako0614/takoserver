@@ -102,6 +102,7 @@ function harness(
     readonly truncateAt?: number;
     readonly exitCode?: number;
     readonly reportedQueries?: number;
+    readonly beforeRemoteReachability?: () => void;
   } = {},
 ): { readonly run: RestoreRun; readonly calls: string[][]; readonly fileImports: string[] } {
   const calls: string[][] = [];
@@ -113,7 +114,10 @@ function harness(
     if (key === "git branch --show-current") return ok("feature/rehearsal-d1-snapshot-restore\n");
     if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok("");
     if (key === "git fetch --quiet --all --prune") return ok("");
-    if (key === `git branch -r --contains ${COMMIT}`) return ok("  origin/feature/rehearsal\n");
+    if (key === `git branch -r --contains ${COMMIT}`) {
+      options.beforeRemoteReachability?.();
+      return ok("  origin/feature/rehearsal\n");
+    }
     const fileIndex = command.indexOf("--file");
     if (fileIndex >= 0) {
       const path = command[fileIndex + 1] ?? "";
@@ -322,6 +326,10 @@ describe("snapshot restore surface", () => {
     const directory = caseDirectory("restore");
     const database = emptyDatabase();
     try {
+      database.exec(
+        'CREATE TABLE "_cf_KV" (key TEXT PRIMARY KEY, value BLOB);' +
+          'CREATE TABLE "d1_migrations"(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP);',
+      );
       const snapshotPath = writeSnapshot(directory);
       const fixture = harness(database);
       const result = await runD1SnapshotRestore(
@@ -401,6 +409,71 @@ describe("snapshot restore surface", () => {
       expect(error.phase).toBe("preflight");
       expect(error.message).toContain("never resets or overwrites a D1");
       expect(fixture.fileImports).toHaveLength(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("refuses a target that carries a standalone schema object before importing", async () => {
+    const directory = caseDirectory("occupied-view");
+    const database = emptyDatabase();
+    try {
+      database.exec('CREATE VIEW "sqliteXresidue" AS SELECT 1 AS value;');
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database);
+      const status = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+      expect(status).toMatchObject({ readyForApply: false, targetTables: 0, targetViews: 1 });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("apply"),
+          restoreOptions(directory, fixture.run, {
+            outputDirectory: join(directory, "apply-output"),
+          }),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("never resets or overwrites a D1");
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(
+        database.query("SELECT type, name FROM sqlite_schema WHERE name = 'sqliteXresidue'").all(),
+      ).toEqual([{ type: "view", name: "sqliteXresidue" }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rechecks schema-object emptiness at the import fence", async () => {
+    const directory = caseDirectory("refence-view");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database, {
+        beforeRemoteReachability: () => {
+          database.exec('CREATE VIEW "sqliteXlate_residue" AS SELECT 1 AS value;');
+        },
+      });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("apply"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("changed before the import");
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(
+        database
+          .query("SELECT type, name FROM sqlite_schema WHERE name = 'sqliteXlate_residue'")
+          .all(),
+      ).toEqual([{ type: "view", name: "sqliteXlate_residue" }]);
     } finally {
       database.close();
     }

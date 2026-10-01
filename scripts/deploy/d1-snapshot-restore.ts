@@ -52,14 +52,16 @@ const UNVERIFIABLE_TABLE_WRITE =
 const MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024;
 const MAX_MISMATCHES = 12;
 const USER_TABLES_SQL =
-  "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' " +
+  "SELECT name FROM sqlite_schema WHERE type = 'table' AND lower(name) NOT GLOB 'sqlite_*' " +
   "AND name <> '_cf_KV' AND name <> 'd1_migrations' ORDER BY name";
 const LEDGER_TABLE_SQL = "SELECT COUNT(*) AS n FROM sqlite_schema WHERE name = 'd1_migrations'";
 const LEDGER_ROWS_SQL = "SELECT COUNT(*) AS n FROM d1_migrations";
 const LEDGER_LINEAGE_SQL = "SELECT name FROM d1_migrations ORDER BY id";
 const SCHEMA_OBJECT_COUNTS_SQL =
   "SELECT type AS kind, COUNT(*) AS n FROM sqlite_schema " +
-  "WHERE type IN ('index', 'trigger', 'view') AND name NOT LIKE 'sqlite_%' GROUP BY type";
+  "WHERE type IN ('index', 'trigger', 'view') AND lower(name) NOT GLOB 'sqlite_*' " +
+  "AND name <> '_cf_KV' AND tbl_name <> '_cf_KV' " +
+  "AND name <> 'd1_migrations' AND tbl_name <> 'd1_migrations' GROUP BY type";
 const FOREIGN_KEY_CHECK_SQL = "PRAGMA foreign_key_check";
 
 export interface D1SnapshotRestoreDeclaration {
@@ -630,6 +632,9 @@ interface TargetState {
   readonly userTables: readonly string[];
   readonly migrationRows: number;
   readonly migrationLineage: readonly string[];
+  readonly indexes: number;
+  readonly triggers: number;
+  readonly views: number;
 }
 
 async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<TargetState> {
@@ -639,6 +644,24 @@ async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<
     USER_TABLES_SQL,
     "name",
   );
+  const schemaObjects = await database.query(
+    phase,
+    "snapshot restore target schema objects",
+    SCHEMA_OBJECT_COUNTS_SQL,
+  );
+  const schemaObjectCount = (kind: string): number => {
+    const row = schemaObjects.find((entry) => entry.kind === kind);
+    if (row === undefined) return 0;
+    const count = row.n;
+    if (!Number.isSafeInteger(count) || Number(count) < 0) {
+      const error = "snapshot restore target schema-object count is malformed";
+      throw phase === "preflight" ? preflightError(error) : verificationError(error);
+    }
+    return Number(count);
+  };
+  const indexes = schemaObjectCount("index");
+  const triggers = schemaObjectCount("trigger");
+  const views = schemaObjectCount("view");
   const ledger = await database.query(
     phase,
     "snapshot restore target migration ledger",
@@ -665,7 +688,7 @@ async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<
       "name",
     );
   }
-  return { userTables, migrationRows, migrationLineage };
+  return { userTables, migrationRows, migrationLineage, indexes, triggers, views };
 }
 
 async function readRestoreReadback(
@@ -680,20 +703,6 @@ async function readRestoreReadback(
     USER_TABLES_SQL,
     "name",
   );
-  const objectCounts = await database.query(
-    phase,
-    "snapshot restore readback schema objects",
-    SCHEMA_OBJECT_COUNTS_SQL,
-  );
-  const objectCount = (kind: string): number => {
-    const row = objectCounts.find((entry) => entry.kind === kind);
-    if (row === undefined) return 0;
-    const count = row.n;
-    if (!Number.isSafeInteger(count) || Number(count) < 0) {
-      throw verificationError("snapshot restore readback schema-object count is malformed");
-    }
-    return Number(count);
-  };
   const present = expected.tables.filter((table) => tables.includes(table));
   const rowCounts: Record<string, number> = {};
   if (present.length > 0) {
@@ -718,9 +727,9 @@ async function readRestoreReadback(
   );
   return {
     tables,
-    indexes: objectCount("index"),
-    triggers: objectCount("trigger"),
-    views: objectCount("view"),
+    indexes: target.indexes,
+    triggers: target.triggers,
+    views: target.views,
     rowCounts,
     migrationLineage: target.migrationLineage,
     foreignKeyViolations: violations.length,
@@ -882,7 +891,7 @@ export async function runD1SnapshotRestore(
     const sealed = sealDirectory(root, ["snapshot-normalized.sql", "wrangler.jsonc"]);
     const database = new RemoteD1(configPath, { environment, run });
     const target = await readTargetState(database, "preflight");
-    const empty = target.userTables.length === 0 && target.migrationRows === 0;
+    const empty = isEmptyTarget(target);
 
     if (invocation.action === "status") {
       return {
@@ -904,6 +913,9 @@ export async function runD1SnapshotRestore(
         expectedMigrationLineage: expected.migrationLineage.length,
         targetTables: target.userTables.length,
         targetMigrationRows: target.migrationRows,
+        targetIndexes: target.indexes,
+        targetTriggers: target.triggers,
+        targetViews: target.views,
         readyForApply: empty,
       };
     }
@@ -911,7 +923,7 @@ export async function runD1SnapshotRestore(
     if (!empty) {
       throw preflightError(
         "snapshot restore target already carries tables or a migration ledger; this surface never resets or overwrites a D1",
-        `tables=${target.userTables.join(",")} migrationRows=${target.migrationRows}`,
+        targetStateDiagnostic(target),
       );
     }
     const reviewer = exactReviewer(
@@ -924,7 +936,7 @@ export async function runD1SnapshotRestore(
       ...(options.run === undefined ? {} : { run: options.run }),
     });
     const refence = await readTargetState(database, "preflight");
-    if (refence.userTables.length !== 0 || refence.migrationRows !== 0) {
+    if (!isEmptyTarget(refence)) {
       throw preflightError("snapshot restore target changed before the import; refusing to import");
     }
     await assertProviderIdentity("at restore fence");
@@ -1021,6 +1033,26 @@ export async function runD1SnapshotRestore(
       }
     }
   }
+}
+
+function isEmptyTarget(target: TargetState): boolean {
+  return (
+    target.userTables.length === 0 &&
+    target.migrationRows === 0 &&
+    target.indexes === 0 &&
+    target.triggers === 0 &&
+    target.views === 0
+  );
+}
+
+function targetStateDiagnostic(target: TargetState): string {
+  return [
+    `tables=${target.userTables.join(",")}`,
+    `migrationRows=${target.migrationRows}`,
+    `indexes=${target.indexes}`,
+    `triggers=${target.triggers}`,
+    `views=${target.views}`,
+  ].join(" ");
 }
 
 function validateDeclaration(value: D1SnapshotRestoreDeclaration): void {
