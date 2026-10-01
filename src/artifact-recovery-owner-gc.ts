@@ -315,15 +315,15 @@ function purgeGuard(input: {
                  WHERE request_digest = ? AND purge_after = ? AND (
                    (kind = 'blob' AND state = 'deleted') OR
                    (kind = 'manifest' AND state = 'metadata_deleted')
-                 )) = 29
+                 )) = ?
             AND (SELECT COUNT(*) FROM tf_artifact_gc_candidates AS candidate
                  JOIN tf_artifact_recovery_candidates AS detail
                    ON detail.kind = candidate.kind AND detail.digest = candidate.digest
-                 WHERE detail.request_digest = ? AND candidate.state = 'deleted') = 29
+                 WHERE detail.request_digest = ? AND candidate.state = 'deleted') = ?
             AND (SELECT COUNT(*) FROM tf_artifact_owner_closure_receipts
                  WHERE receipt_kind = 'exact_failed_run_recovery'
                    AND recovery_request_digest = ? AND state = 'recovery_complete'
-                   AND purge_after = ?) = 5
+                   AND purge_after = ?) = ?
             AND (SELECT COUNT(*) FROM tf_artifact_blob_io_results
                  WHERE receipt_kind = 'exact_failed_run_recovery'
                    AND recovery_request_digest = ?) = ?
@@ -373,9 +373,12 @@ function purgeGuard(input: {
       input.purgeAfter,
       input.requestDigest,
       input.purgeAfter,
+      EXACT_ARTIFACT_RECOVERY_CANDIDATE_COUNT,
       input.requestDigest,
+      EXACT_ARTIFACT_RECOVERY_CANDIDATE_COUNT,
       input.requestDigest,
       input.purgeAfter,
+      EXACT_ARTIFACT_RECOVERY_UPLOAD_COUNT,
       input.requestDigest,
       input.recoveryIoCount,
       input.requestDigest,
