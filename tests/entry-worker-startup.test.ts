@@ -212,6 +212,57 @@ describe("Worker startup diagnostics", () => {
     ).resolves.toBeUndefined();
   });
 
+  test("the pre-0058 schema maintenance mode blocks every route and scheduled work before composition", async () => {
+    const env = {
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-0058-quiesced",
+      get STATE_DB(): never {
+        throw new Error("maintenance read storage");
+      },
+      get PUBLIC_ORIGIN(): never {
+        throw new Error("maintenance read origin");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    for (const [method, path] of [
+      ["GET", "/healthz"],
+      ["GET", "/.well-known/takoserver"],
+      ["POST", "/v1/resources"],
+      ["PUT", "/anything"],
+      ["DELETE", "/anything"],
+    ] as const) {
+      const response = await worker.fetch(new Request(`${ORIGIN}${path}`, { method }), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("retry-after")).toBe("60");
+      const body = await envelope(response);
+      expect(body.error.code).toBe("backend_unavailable");
+      expect(body.error.details?.reason).toBe("runtime-configuration");
+      expect(body.error.message).toContain("0058");
+    }
+    await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
+  });
+
+  test("invalid or conflicting maintenance selectors refuse before composition", async () => {
+    for (const selected of ["", "pre-0058", "PRE-0058-QUIESCED", null, 7]) {
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({ TAKOSERVER_SCHEMA_MAINTENANCE_MODE: selected }),
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+      await expect(
+        worker.scheduled({}, workerEnv({ TAKOSERVER_SCHEMA_MAINTENANCE_MODE: selected })),
+      ).rejects.toThrow();
+    }
+    const both = workerEnv({
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-0058-quiesced",
+      TAKOSERVER_ARTIFACT_BLOB_IO_MODE: "pre-0043-quiesced",
+    });
+    const response = await worker.fetch(new Request(`${ORIGIN}/healthz`), both);
+    expect(response.status).toBe(503);
+    expect((await envelope(response)).error.message).toContain("conflict");
+    await expect(worker.scheduled({}, both)).rejects.toThrow();
+  });
+
   test("an unknown artifact blob I/O mode fails closed as runtime configuration", async () => {
     const response = await worker.fetch(
       new Request(`${ORIGIN}/healthz`),

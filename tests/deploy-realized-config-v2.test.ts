@@ -73,6 +73,21 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("projects only the selected pre-0058 schema maintenance mode", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-schema-maintenance-"));
+    try {
+      const path = writeWorkerConfig(
+        { ...target, schemaMaintenanceMode: "pre-0058-quiesced" },
+        { path: join(root, "wrangler.jsonc"), main: "worker.js", commit: "a".repeat(40) },
+      );
+      const config = JSON.parse(readFileSync(path, "utf8")) as { vars: Record<string, string> };
+      expect(config.vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE).toBe("pre-0058-quiesced");
+      expect(config.vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("omits only the executor service while retaining the maintenance target inputs", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-executor-"));
     const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();

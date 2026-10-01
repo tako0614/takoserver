@@ -1239,6 +1239,41 @@ managed customer runtime.
 
 ### 0058 domain receipt schema: protected status only
 
+The public Host has a source-only, optional deploy-target profile
+`"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret
+`TAKOSERVER_SCHEMA_MAINTENANCE_MODE=pre-0058-quiesced` into the selected Worker
+Version. That Version returns the existing `backend_unavailable` 503 envelope
+with `no-store` and `retry-after: 60` on every fetch route, and does no scheduled
+work, before Host composition or storage access. The value is distinct from
+`artifactBlobIoMode: pre-0043-quiesced`; both together, an empty value, and an
+unknown value are refused. Neither selector is a general-purpose readiness or
+drain claim.
+
+Worker publication and closure transition can qualify this profile only when
+the selected source catalog and target readback have the exact canonical
+0001–0057 applied prefix and **0058 as the next unapplied migration**. Later
+0059–0066 files in the source catalog remain unapplied and confer no apply
+authority. The current and successor Version's source annotation, target
+bindings (including the exact maintenance var and native D1/R2 identities),
+secrets, routing, and the owner-injected private executor qualification still
+must pass their existing checks. The status/readback names `maintenance` and
+keeps `ready: false`; a 503 smoke verifies the maintenance response, not normal
+Host health. The closure transition's pinned predecessor and resulting
+immediate rollback Version must each be checked against their own exact
+maintenance setting before any eventual schema mutation. An older serving
+rollback Version is not a safe post-0058 rollback by virtue of being a valid
+Worker Version.
+
+This source profile does **not** produce an all-writer drain: the public Host
+has no owner-backed target/Version/source/expiry-bound evidence for older
+in-flight invocations, and the private executor must separately prove its own
+quiescence. It does not add an invocation-drain RPC, protected 0058 apply
+selector, operation automation, rehearsal receipt, or production readiness.
+Protected `--through-migration=0058 --apply` remains unconditionally refused
+until the separate rehearsal, capacity, writer-drain and reviewed transition
+requirements below are met. No operator-private target is selected by this
+documentation or by the source default.
+
 The current source includes audited 0058–0066 for fresh, explicitly
 disposable integration storage. The protected `--through-migration=0058`
 selector can inspect only an exact canonical 0057 predecessor. It reports a

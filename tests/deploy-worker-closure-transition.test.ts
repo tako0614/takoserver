@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -55,6 +56,7 @@ const ADDED_SECRET = "TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING";
 const ROTATED_SECRET = "TAKOSERVER_SIGNING_KEY";
 const CARRIED_STORE_SECRET = "STRIPE_SECRET_KEY";
 const ARTIFACT_MODE_VAR = "TAKOSERVER_ARTIFACT_BLOB_IO_MODE";
+const SCHEMA_MODE_VAR = "TAKOSERVER_SCHEMA_MAINTENANCE_MODE";
 const UNKNOWN_SECRET = "TAKOSERVER_UNKNOWN_SECRET";
 const LEGACY_SECRET_PAIR = [LEGACY_PUBLIC_PARENT_SECRET, LEGACY_HOSTED_SPONSORSHIP_SECRET] as const;
 const SEAL_KEYRING_VALUE = "seal-keyring-input-value";
@@ -101,6 +103,13 @@ const compatibilityRollbackTarget = {
   ...rollbackTarget,
   artifactBlobIoMode: "pre-0043-quiesced" as const,
 } satisfies DeployTarget;
+
+const schemaMaintenanceTarget = {
+  ...target,
+  schemaMaintenanceMode: "pre-0058-quiesced" as const,
+} satisfies DeployTarget;
+const schemaMigrations = readMigrationArtifact().names;
+const schemaPredecessor = schemaMigrations.slice(0, 57);
 
 const storageRebindTarget = {
   ...target,
@@ -572,6 +581,96 @@ describe("reviewed Worker closure transition", () => {
         probe: { status: 503, traffic: "quiesced" },
       });
       expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test("stages the distinct 0058 maintenance successor with exact target closure and non-ready status", async () => {
+    await withRoot("takoserver-closure-0058-maintenance-", async (root) => {
+      const parts = fixture(root, {
+        selected: schemaMaintenanceTarget,
+        local: schemaMigrations,
+        applied: schemaPredecessor,
+        predecessor: { dropVar: SCHEMA_MODE_VAR },
+      });
+      const delta = {
+        ...INTEGRATION_DELTA,
+        addedVars: [...INTEGRATION_DELTA.addedVars, SCHEMA_MODE_VAR],
+      };
+      const result = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta,
+        },
+        schemaMaintenanceTarget,
+        {
+          run: parts.run,
+          state: parts.state,
+          migrations: parts.migrations,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+          fetcher: async () =>
+            Response.json(
+              {
+                error: {
+                  code: "backend_unavailable",
+                  message: "Host is quiesced for the 0058 schema maintenance transition",
+                  details: { reason: "runtime-configuration" },
+                },
+              },
+              { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+            ),
+        },
+      );
+      expect(result).toMatchObject({
+        maintenance: "pre-0058-quiesced",
+        previousVersionId: PREDECESSOR,
+        versionId: SUCCESSOR,
+        pendingMigrations: schemaMigrations.slice(57),
+        probe: { status: 503, traffic: "maintenance" },
+      });
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test("0058 closure refuses wrong predecessor lineage before upload", async () => {
+    await withRoot("takoserver-closure-0058-wrong-prefix-", async (root) => {
+      const parts = fixture(root, {
+        selected: schemaMaintenanceTarget,
+        local: schemaMigrations,
+        applied: schemaPredecessor.slice(0, -1),
+        predecessor: { dropVar: SCHEMA_MODE_VAR },
+      });
+      const refusal = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            ...INTEGRATION_DELTA,
+            addedVars: [...INTEGRATION_DELTA.addedVars, SCHEMA_MODE_VAR],
+          },
+        },
+        schemaMaintenanceTarget,
+        {
+          run: parts.run,
+          state: parts.state,
+          migrations: parts.migrations,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+        },
+      ).catch((error) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
     });
   });
 

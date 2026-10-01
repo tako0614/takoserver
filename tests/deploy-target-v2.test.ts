@@ -158,6 +158,34 @@ describe("environment-exact deploy target", () => {
     expect(isArtifactBlobIoQuiescedTarget(ordinaryTarget)).toBe(false);
   });
 
+  test("accepts only the distinct pre-0058 schema maintenance selector and rejects both selectors", () => {
+    const selected = parseDeployTarget(
+      descriptor({ schemaMaintenanceMode: "pre-0058-quiesced" }),
+      "0058 target",
+      "rehearsal",
+    );
+    expect(selected.schemaMaintenanceMode).toBe("pre-0058-quiesced");
+    for (const invalid of ["", "pre-0058", null, true]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({ schemaMaintenanceMode: invalid }),
+          "invalid 0058 target",
+          "rehearsal",
+        ),
+      ).toThrow("schemaMaintenanceMode");
+    }
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          schemaMaintenanceMode: "pre-0058-quiesced",
+          artifactBlobIoMode: "pre-0043-quiesced",
+        }),
+        "conflicting target",
+        "rehearsal",
+      ),
+    ).toThrow("conflict");
+  });
+
   test("refuses the retired cross-product runtime topology", () => {
     withTarget(
       descriptor({
