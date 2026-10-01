@@ -49,12 +49,13 @@ async function compose(
   runtimeInputs?: ProviderRuntimeInputLeasePort,
   workerRuntimeAvailable?: boolean,
   stableForms = stableProductionTakoformCatalog().forms,
+  runtimeOverride?: WorkerdRuntime,
 ) {
   return createSelfhostComposition({
     edge: await buildEdgeForms(),
     stableForms,
     dataRoot: "/tmp/unused",
-    runtime,
+    runtime: runtimeOverride ?? runtime,
     artifacts: {
       async manifest() {
         return null;
@@ -265,7 +266,21 @@ describe("the self-host catalog", () => {
   });
 
   test("lets the driver invoke a technical relation readback through its authority", async () => {
-    const composition = await compose(true);
+    const servingGraph = new Map([["worker", new Set(["v2"])]]);
+    const publicationReadbacks: {
+      name: string;
+      subject: Parameters<NonNullable<WorkerdRuntime["observePublication"]>>[1];
+    }[] = [];
+    const readbackRuntime: WorkerdRuntime = {
+      ...runtime,
+      async observePublication(name, subject) {
+        publicationReadbacks.push({ name, subject });
+        const versions = servingGraph.get(name);
+        if (!versions || subject?.kind !== "version") return "unknown";
+        return versions.has(subject.versionId) ? "present" : "absent";
+      },
+    };
+    const composition = await compose(true, undefined, undefined, undefined, readbackRuntime);
     const version = composition.provider.offerings.find(
       (offering) => offering.id === "selfhost.edge.stable-v1.workerversion",
     );
@@ -359,6 +374,9 @@ describe("the self-host catalog", () => {
       name: "version-v1",
     });
     expect(readbacks).toBe(1);
+    expect(publicationReadbacks).toEqual([
+      { name: "worker", subject: { kind: "version", versionId: "v1" } },
+    ]);
     expect(evidence).toMatchObject({
       status: "absent",
       source: "provider",

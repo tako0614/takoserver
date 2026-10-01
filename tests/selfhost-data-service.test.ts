@@ -1,4 +1,6 @@
+import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,13 +14,19 @@ import {
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_ORIGIN,
   SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_SQL_PATH,
   SELFHOST_DATA_PLANE_VECTOR_PATH,
   SELFHOST_WORKER_DATA_TOKEN_BINDING,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 let root: string | undefined;
+let controlDatabase: Database | undefined;
 
 afterEach(async () => {
+  controlDatabase?.close();
+  controlDatabase = undefined;
   if (root) await rm(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -132,4 +140,92 @@ test("the generated data service rejects an oversized Vector body before forward
     error: { code: "backend_unavailable" },
   });
   expect(forwarded).toBe(false);
+});
+
+test("the generated SQL binding recovers after a failed batch on an existing SQLite file", async () => {
+  root = await mkdtemp(join(tmpdir(), "takoserver-selfhost-data-service-sql-"));
+  const databaseRoot = join(root, "databases");
+  mkdirSync(databaseRoot);
+  const databasePath = join(databaseRoot, "tenant-db.sqlite");
+  const persisted = new Database(databasePath);
+  persisted.exec("CREATE TABLE attempts (id INTEGER PRIMARY KEY)");
+  persisted.exec("INSERT INTO attempts VALUES (41)");
+  persisted.close();
+
+  await Bun.write(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE), selfhostDataServiceSource());
+  const loaded = (await import(
+    `${pathToFileURL(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE)).href}?test=${crypto.randomUUID()}`
+  )) as {
+    readonly default: {
+      fetch(request: Request, env: Record<string, unknown>): Promise<Response>;
+    };
+  };
+  controlDatabase = new Database(":memory:");
+  const planes = serveSelfhostDataPlanes({
+    sql: createSqliteSql(controlDatabase),
+    grant: async (script, versionId) =>
+      script === "worker" && versionId === "v1"
+        ? {
+            secret: "selfhost-plane-secret-1234",
+            kv: {},
+            sql: { DB: "tenant-db" },
+            queue: {},
+            objects: {},
+          }
+        : null,
+    databasePath: (name) => join(databaseRoot, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+  });
+  const env = {
+    [SELFHOST_WORKER_DATA_TOKEN_BINDING]: "worker.v1.selfhost-plane-secret-1234",
+    [SELFHOST_WORKER_DATA_PLANE_BINDING]: {
+      async fetch(url: string, init: RequestInit): Promise<Response> {
+        const path = new URL(url).pathname;
+        return await fetch(`http://127.0.0.1:${planes.port}${path}`, init);
+      },
+    },
+  };
+  const sqlRequest = (body: Record<string, unknown>) =>
+    loaded.default.fetch(
+      new Request(`${SELFHOST_DATA_PLANE_ORIGIN}${SELFHOST_DATA_PLANE_SQL_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ protocol: SELFHOST_DATA_PLANE_PROTOCOL, binding: "DB", ...body }),
+      }),
+      env,
+    );
+
+  try {
+    const failed = await sqlRequest({
+      op: "transaction",
+      statements: [
+        { sql: "INSERT INTO attempts VALUES (42)" },
+        { sql: "INSERT INTO attempts VALUES (41)" },
+      ],
+    });
+    expect(failed.status).toBe(200);
+    expect(await failed.json()).toEqual({ ok: false, error: { code: "sql_error" } });
+
+    const recovered = await sqlRequest({
+      op: "transaction",
+      statements: [{ sql: "INSERT INTO attempts VALUES (43)" }],
+    });
+    expect(recovered.status).toBe(200);
+    expect(await recovered.json()).toEqual({
+      ok: true,
+      value: { results: [{ rows: [], rowsWritten: 1 }] },
+    });
+
+    const persistedRows = await sqlRequest({
+      op: "query",
+      statement: { sql: "SELECT id FROM attempts ORDER BY id" },
+    });
+    expect(await persistedRows.json()).toEqual({
+      ok: true,
+      value: { rows: [{ id: 41 }, { id: 43 }], rowsWritten: 0 },
+    });
+  } finally {
+    planes.maintenance.deleteDatabase("tenant-db");
+    planes.stop(true);
+  }
 });

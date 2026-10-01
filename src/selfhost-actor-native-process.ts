@@ -30,6 +30,20 @@ export interface WorkerdActorNamespaceOptions {
   readonly completeSocket: (leaseId: string) => void;
   /** Native negative-test seam only; production uses owner defaults. */
   readonly ownerDeadlines?: { readonly handlerMs: number; readonly producerMs: number };
+  /** Native process lifecycle test seam only; production uses Bun and Unix readiness. */
+  readonly processAdapter?: WorkerdActorNativeProcessAdapter;
+}
+
+type WorkerdActorNativeChild = Pick<ReturnType<typeof Bun.spawn>, "exitCode" | "exited" | "kill">;
+
+/** Kept injectable so process startup/abort cleanup can be proven without workerd. */
+export interface WorkerdActorNativeProcessAdapter {
+  spawn(binary: string, config: string): WorkerdActorNativeChild;
+  probeReadiness(input: {
+    readonly socketPath: string;
+    readonly token: string;
+    readonly signal: AbortSignal;
+  }): Promise<Response>;
 }
 
 export interface WorkerdActorNamespace {
@@ -391,7 +405,31 @@ export default {
   );
   const root = await mkdtemp(join(tmpdir(), "tactor-"));
   await chmod(root, 0o700);
-  let child: ReturnType<typeof Bun.spawn> | undefined;
+  const processAdapter =
+    options.processAdapter ??
+    ({
+      spawn: (selectedBinary: string, selectedConfig: string) =>
+        Bun.spawn([selectedBinary, "serve", selectedConfig, "--experimental"], {
+          env: {},
+          stdout: "ignore",
+          stderr: "ignore",
+        }),
+      probeReadiness: ({
+        socketPath,
+        token: readinessToken,
+        signal,
+      }: {
+        readonly socketPath: string;
+        readonly token: string;
+        readonly signal: AbortSignal;
+      }) =>
+        fetch("http://actor.invalid/", {
+          unix: socketPath,
+          headers: { "x-takoserver-private-actor-token": readinessToken },
+          signal,
+        }),
+    } satisfies WorkerdActorNativeProcessAdapter);
+  let child: WorkerdActorNativeChild | undefined;
   let closing: Promise<void> | undefined;
   let verified = false;
   const attempts = createActorAlarmAttemptRegistry(options.completeAlarm);
@@ -527,23 +565,24 @@ export default {
       },
     });
     options.signal.throwIfAborted();
-    child = Bun.spawn([binary, "serve", config, "--experimental"], {
-      env: {},
-      stdout: "ignore",
-      stderr: "ignore",
-    });
+    const startingChild = processAdapter.spawn(binary, config);
+    child = startingChild;
     let ready = false;
     let lastReadinessStatus: number | undefined;
     const startupDeadlineAt = Date.now() + 20_000;
     for (let attempt = 0; attempt < 200 && Date.now() < startupDeadlineAt; attempt += 1) {
       options.signal.throwIfAborted();
-      if (child.exitCode !== null) throw new Error("Actor native child exited during startup");
+      if (startingChild.exitCode !== null)
+        throw new Error("Actor native child exited during startup");
       let response: Response;
       try {
-        response = await fetch("http://actor.invalid/", {
-          unix: socket,
-          headers: { "x-takoserver-private-actor-token": token },
-          signal: AbortSignal.timeout(Math.max(1, Math.min(5_000, startupDeadlineAt - Date.now()))),
+        response = await processAdapter.probeReadiness({
+          socketPath: socket,
+          token,
+          signal: AbortSignal.any([
+            options.signal,
+            AbortSignal.timeout(Math.max(1, Math.min(5_000, startupDeadlineAt - Date.now()))),
+          ]),
         });
         lastReadinessStatus = response.status;
       } catch {
@@ -564,7 +603,7 @@ export default {
         `Actor native child readiness unavailable${lastReadinessStatus === undefined ? "" : ` (${lastReadinessStatus})`}`,
       );
     options.signal.throwIfAborted();
-    const runningChild = child;
+    const runningChild = startingChild;
     return {
       exited: runningChild.exited.then(() => {
         verified = false;

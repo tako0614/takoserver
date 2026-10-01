@@ -1418,9 +1418,23 @@ bun run deploy -- takoserver-d1-snapshot-restore --status --environment=rehearsa
 bun run deploy -- takoserver-d1-snapshot-restore --apply --environment=rehearsal --commit=<40-hex-sha>
 ```
 
-`--status` is read-only: it reports the normalized size, the rewritten NUL
-count, the expected statements/tables/rows/lineage and the target's current
-tables and ledger rows, and answers `readyForApply`. `--apply` additionally
+`--status` is read-only: it reports the normalized size and rewritten NUL
+count, expected table names and per-table row counts, index/trigger/view counts,
+and the exact migration-name lineage. For a nonempty target it reuses the
+readback verifier and reports `currentSnapshotExpectationMatch` plus a bounded
+`currentSnapshotExpectationMismatches` list; current tables, per-table counts,
+schema-object counts, migration names, and foreign-key violation count are
+included. If that readback is unavailable or malformed, status fails with a
+read-only preflight error rather than inferring a match or readiness. An empty
+target remains unclassified (`currentSnapshotExpectationMatch: null`) and can
+retain `readyForApply: true`.
+
+This is only a structural/count/foreign-key comparison to the declared snapshot
+expectation. A match does not prove original import acknowledgement, per-row
+content hashes, full restoration success, or that this surface is the sole
+writer, and grants no retry or replay authority. `readyForApply` keeps its old
+meaning: the target is empty immediately before an apply; a nonempty matching
+target is still not ready and is never imported over. `--apply` additionally
 requires the clean remote-reachable source and `TAKOSERVER_INDEPENDENT_REVIEW`,
 requires the target to be empty (no application table and no `d1_migrations`
 row) immediately before the single import, and never adopts, resets or

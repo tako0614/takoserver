@@ -316,6 +316,16 @@ export interface WorkerdRuntime {
   /** Whether the requested generation is actually activated, for `observe`. */
   has(name: string, generation?: string): Promise<boolean>;
   /**
+   * Read-only observation of this incarnation's exact served publication.
+   * Unlike has(), a missing readiness marker is never evidence of absence.
+   */
+  observePublication?(
+    name: string,
+    subject?:
+      | { readonly kind: "version"; readonly versionId: string }
+      | { readonly kind: "hostname"; readonly hostname: string },
+  ): Promise<"present" | "absent" | "unknown">;
+  /**
    * Asks one published script a question over the router this runtime serves.
    *
    * `null` means the runtime did not answer at all — it is not running, or it
@@ -807,38 +817,42 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
   const activated = (published: readonly PublishedDeployment[]) =>
     Object.fromEntries(published.map((entry) => [entry.name, entry.generation ?? null]));
 
-  const proveRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
-    // A composition with no process hook intentionally stages files only. It
-    // cannot prove serving truth, but `has()` will still fail closed unless its
-    // composition supplies a live `isReady` probe.
-    if (options.onReload === undefined) return;
+  const renderedConfirmed = async (published: readonly PublishedDeployment[]): Promise<boolean> => {
     const expected = publishedGraphIdentity(
       published,
       privateServiceGraph(published),
       actorForwardSockets,
     );
+    let confirmed = false;
+    try {
+      const response = await fetch(
+        `${options.tls ? "https" : "http"}://127.0.0.1:${port}${CONFIG_PROBE_PATH}`,
+        {
+          method: "POST",
+          headers: {
+            host: CONFIG_PROBE_HOSTNAME,
+            [CONFIG_PROBE_HEADER]: configProbeToken,
+          },
+          ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
+          signal: AbortSignal.timeout(1_000),
+        },
+      );
+      confirmed =
+        response.status === 204 && response.headers.get(CONFIG_IDENTITY_HEADER) === expected;
+    } catch {
+      // The watcher may still be crossing to the atomically replaced file.
+    }
+    return confirmed && (await capturePrivateSockets());
+  };
+
+  const proveRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
+    // A composition with no process hook intentionally stages files only. It
+    // cannot prove serving truth, but `has()` will still fail closed unless its
+    // composition supplies a live `isReady` probe.
+    if (options.onReload === undefined) return;
     const deadline = Date.now() + 5_000;
     for (;;) {
-      let confirmed = false;
-      try {
-        const response = await fetch(
-          `${options.tls ? "https" : "http"}://127.0.0.1:${port}${CONFIG_PROBE_PATH}`,
-          {
-            method: "POST",
-            headers: {
-              host: CONFIG_PROBE_HOSTNAME,
-              [CONFIG_PROBE_HEADER]: configProbeToken,
-            },
-            ...(options.tls ? { tls: { rejectUnauthorized: false } } : {}),
-            signal: AbortSignal.timeout(1_000),
-          },
-        );
-        confirmed =
-          response.status === 204 && response.headers.get(CONFIG_IDENTITY_HEADER) === expected;
-      } catch {
-        // The watcher may still be crossing to the atomically replaced file.
-      }
-      if (confirmed && (await capturePrivateSockets())) return;
+      if (await renderedConfirmed(published)) return;
       if (Date.now() >= deadline) {
         throw new Error("worker runtime did not confirm the rendered configuration");
       }
@@ -1440,6 +1454,62 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           return false;
         }
         return true;
+      });
+    },
+
+    async observePublication(name, subject) {
+      return await exclusiveActivation(async () => {
+        scriptDirectory(name);
+        if (
+          privateSocketUncertain ||
+          options.onReload === undefined ||
+          options.isReady === undefined ||
+          !options.isReady()
+        ) {
+          return "unknown";
+        }
+        try {
+          // The private probe token is unique to this runtime incarnation.
+          // A stale activation marker, a previous Host process, and a graph
+          // still serving after a failed reload cannot answer for it.
+          const published = await readPublished(scriptsRoot, assetsRoot);
+          if (!(await renderedConfirmed(published))) return "unknown";
+          if (privateSocketUncertain || !options.isReady()) return "unknown";
+          const entry = published.find((candidate) => candidate.name === name);
+          if (!entry) return "absent";
+          if (subject?.kind === "hostname") {
+            return entry.hostnames.includes(subject.hostname) ? "present" : "absent";
+          }
+          if (subject?.kind === "version") {
+            if (entry.weighted) {
+              return entry.variants.some((variant) => variant.versionId === subject.versionId)
+                ? "present"
+                : "absent";
+            }
+            // Retained scalar publications have no weighted Version list.
+            // Their generated, graph-bound generation records activeVersion;
+            // older opaque generations cannot identify a Version safely.
+            let scalar: unknown;
+            try {
+              scalar = JSON.parse(entry.generation ?? "");
+            } catch {
+              return "unknown";
+            }
+            if (
+              typeof scalar !== "object" ||
+              scalar === null ||
+              Array.isArray(scalar) ||
+              !("activeVersion" in scalar) ||
+              (scalar.activeVersion !== null && typeof scalar.activeVersion !== "string")
+            ) {
+              return "unknown";
+            }
+            return scalar.activeVersion === subject.versionId ? "present" : "absent";
+          }
+          return "present";
+        } catch {
+          return "unknown";
+        }
       });
     },
 

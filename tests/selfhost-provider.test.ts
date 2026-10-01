@@ -1473,7 +1473,8 @@ describe("publishing a Worker through the Edge Family", () => {
   });
 
   test("the endpoint attachment assigns a stable HTTPS address and routes it", async () => {
-    const local = provider();
+    const probed = probedMaterializingRuntime();
+    const local = provider({ runtime: probed.runtime });
     const script = await publish(local);
 
     const endpoint = await local.apply({
@@ -4547,8 +4548,17 @@ describe("the current ObjectBucket Form on a self-host", () => {
 
 describe("read-only native absence verification", () => {
   test("reads worker Version state, then proves it absent after parent deletion", async () => {
-    const runtime = flakyRuntime();
-    const local = provider({ runtime: runtime.runtime });
+    const probed = probedMaterializingRuntime();
+    let writes = 0;
+    const local = provider({
+      runtime: {
+        ...probed.runtime,
+        async write(...args) {
+          writes += 1;
+          await probed.runtime.write(...args);
+        },
+      },
+    });
     const worker = await local.apply({
       operationId: "op_readback_worker",
       offering: offering("ModuleWorker"),
@@ -4579,8 +4589,8 @@ describe("read-only native absence verification", () => {
       nativeId: version.result.nativeId,
       identity: identity("hello-v1"),
     });
-    const writes = runtime.state.writes;
-    const reloads = runtime.state.reloads;
+    const writesBeforeReadback = writes;
+    const reloads = probed.reloads();
     const present = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
       descriptor,
@@ -4590,8 +4600,8 @@ describe("read-only native absence verification", () => {
       outcome: "present",
       evidence: { provider: "local", kind: "WorkerVersion", state: "present" },
     });
-    expect(runtime.state.writes).toBe(writes);
-    expect(runtime.state.reloads).toBe(reloads);
+    expect(writes).toBe(writesBeforeReadback);
+    expect(probed.reloads()).toBe(reloads);
 
     const deleted = await local.delete({
       operationId: "op_readback_parent_delete",
@@ -4600,8 +4610,8 @@ describe("read-only native absence verification", () => {
       identity: identity("hello"),
     });
     expect(deleted.phase).toBe("succeeded");
-    const writesAfterDelete = runtime.state.writes;
-    const reloadsAfterDelete = runtime.state.reloads;
+    const writesAfterDelete = writes;
+    const reloadsAfterDelete = probed.reloads();
     const absent = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
       descriptor,
@@ -4612,8 +4622,8 @@ describe("read-only native absence verification", () => {
       evidence: { provider: "local", kind: "WorkerVersion", state: "absent" },
     });
     expect(JSON.stringify(absent)).not.toContain(script);
-    expect(runtime.state.writes).toBe(writesAfterDelete);
-    expect(runtime.state.reloads).toBe(reloadsAfterDelete);
+    expect(writes).toBe(writesAfterDelete);
+    expect(probed.reloads()).toBe(reloadsAfterDelete);
 
     const malformed = await local.verifyNativeAbsence({
       offering: offering("WorkerVersion"),
