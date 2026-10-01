@@ -83,6 +83,9 @@ const USAGE = `takoserver deploy
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
   takoserver-d1-schema-0058-rehearsal is an isolated synthetic 0057 -> 0058 D1 qualification,
     rehearsal-only, no selector or production receipt; see docs/deploy.md.
+    --protected-reference=<integration|production> explicitly reads that environment's
+    operator-private deploy target with a separate TAKOSERVER_D1_0058_REFERENCE_API_TOKEN;
+    only the selected isolated rehearsal D1 is mutated, and the receipt grants no apply authority.
   The protected 0058 selector is status-only until owner-backed public Host and private CPE
     writer-drain plus target-bound volume/import qualification are implemented; apply refuses.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
@@ -163,6 +166,7 @@ interface InvocationBase {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
+  readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly reverse?: boolean;
 }
 
@@ -231,6 +235,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
+  readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
   readonly scopes?: readonly ApiKeyScope[];
@@ -319,6 +324,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let bootstrapVerifierBridge = false;
   let bootstrapProbePredecessorVersionId: string | null = null;
   let throughMigration: SchemaWaveBoundary | null = null;
+  let protectedReferenceEnvironment: "integration" | "production" | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
   const scopes: ApiKeyScope[] = [];
@@ -398,6 +404,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
         return null;
       }
       environment = value;
+      continue;
+    }
+    if (flag.startsWith("--protected-reference=")) {
+      if (protectedReferenceEnvironment !== null) return null;
+      const value = flag.slice("--protected-reference=".length);
+      if (value !== "integration" && value !== "production") return null;
+      protectedReferenceEnvironment = value;
       continue;
     }
     if (flag.startsWith("--commit=")) {
@@ -758,6 +771,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
+    protectedReferenceEnvironment !== null &&
+    (surfaceValue !== "takoserver-d1-schema-0058-rehearsal" || args.length !== 5)
+  ) {
+    return null;
+  }
+  if (
     surfaceValue === "takoserver-d1-schema" &&
     environment !== "integration" &&
     throughMigration === null
@@ -918,6 +937,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(throughMigration === null ? {} : { throughMigration }),
+    ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
     ...(generation === null ? {} : { generation }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
@@ -1067,7 +1087,28 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-d1-schema-rehearsal-baseline":
       return await runD1SchemaRehearsalBaseline(invocation, target);
     case "takoserver-d1-schema-0058-rehearsal":
-      return await runD1Schema0058Rehearsal(invocation, target);
+      if (invocation.protectedReferenceEnvironment === undefined)
+        return await runD1Schema0058Rehearsal(invocation, target);
+      {
+        const referenceEnvironment = invocation.protectedReferenceEnvironment;
+        const referencePath = requireEnvironment(
+          `TAKOSERVER_DEPLOY_TARGET_${referenceEnvironment.toUpperCase()}`,
+        );
+        if (!isAbsolute(referencePath))
+          throw new DeployError(
+            "preflight",
+            "0058 protected reference target path must be absolute",
+          );
+        const referenceTarget = loadTarget(referencePath, referenceEnvironment);
+        const referenceToken = requireEnvironment("TAKOSERVER_D1_0058_REFERENCE_API_TOKEN");
+        return await runD1Schema0058Rehearsal(invocation, target, {
+          protectedReference: {
+            environment: referenceEnvironment,
+            target: referenceTarget,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: referenceToken },
+          },
+        });
+      }
     case "takoserver-integration-storage-generation":
       return await runIntegrationStorageGeneration(invocation, target);
     case "takoserver-production-d1-fresh-init":

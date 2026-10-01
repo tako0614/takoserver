@@ -829,7 +829,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-d1-snapshot-restore` | `--status`, `--apply` | rehearsal only | Absolute owned 0600 `TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH` and explicit `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`. The declaration pins the D1 UUID/name and the snapshot path with its sha256; the snapshot must be an owned single-link 0600 file. No ordinary target descriptor, OAuth or production fallback. |
 | `takoserver-production-d1-fresh-init` | `--status`, `--apply` | production only | Explicit `CLOUDFLARE_API_TOKEN` for both and `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`; exact `--generation=<32-lowercase-hex>` and the selected `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor, whose incumbent D1/R2 identity is printed and never mutated. Creates and fully migrates one new `takoserver-p-<generation>` D1 only; it does not write the target, create a bucket, or adopt, archive or delete existing storage. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Reads/writes only local no-overwrite attempt markers beside the isolated target declaration; no production rehearsal receipt is read or written. |
+| `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No migration selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Optional `--protected-reference=integration\|production` additionally requires that environment's explicit deploy target path and distinct `TAKOSERVER_D1_0058_REFERENCE_API_TOKEN`, and reads that reference only. Local no-overwrite attempt markers remain beside the isolated declaration; no production rehearsal receipt is read or written. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -1448,9 +1448,31 @@ the option nor its receipt proves production volume, old-writer drain, or
 permission to enable the protected 0058 migration. Unknown import ACKs remain
 dispatched-only and cannot become qualified by a later status read or replay.
 
+An optional, explicit `--protected-reference=integration|production` profile
+instead selects that environment's existing operator-private
+`TAKOSERVER_DEPLOY_TARGET_INTEGRATION` or `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`
+declaration (absolute path) as a **read-only execution reference**. The
+rehearsal surface and its isolated mutation target do not change. Supply a
+separate `TAKOSERVER_D1_0058_REFERENCE_API_TOKEN`; it must differ from the
+isolated target's `CLOUDFLARE_API_TOKEN`. The reference credential is used only
+for reference identity and canonical D1 reads; the isolated credential is used
+only for isolated rehearsal commands. Query fencing prevents this surface from
+issuing reference DML, but does **not** establish that the Cloudflare token
+itself has read-only permission. The operator must independently review the
+token's actual scope. No reference value or credential is printed or persisted.
+The distinct `0058-protected-reference-volume` local receipt binds the exact
+reference environment/account/D1, source/import digests, shape and bounded
+row/BLOB digests, timing and expiry. It is a non-authoritative candidate, not
+the older selected-rehearsal receipt and not old-writer drain, native D1
+atomicity, or protected-apply authority. After an unknown import ACK only the
+dispatched marker remains; fresh status/apply reads without reimport or
+promoting it. This profile makes no production mutation.
+
 ```bash
 bun run deploy -- takoserver-d1-schema-0058-rehearsal --status --environment=rehearsal --commit=<40-hex-sha>
 bun run deploy -- takoserver-d1-schema-0058-rehearsal --apply --environment=rehearsal --commit=<40-hex-sha>
+bun run deploy -- takoserver-d1-schema-0058-rehearsal --status --environment=rehearsal --commit=<40-hex-sha> --protected-reference=production
+bun run deploy -- takoserver-d1-schema-0058-rehearsal --apply --environment=rehearsal --commit=<40-hex-sha> --protected-reference=production
 ```
 
 The selected target declaration has exactly these fields:
@@ -1476,9 +1498,11 @@ production in the same account, the operator cannot make this scope claim and
 must stop; the declaration alone does not enforce token scope. The surface
 refuses the ordinary rehearsal D1 ID/name
 and verifies the selected D1 UUID/name against Cloudflare before inspection,
-fixture seed, and migration import. It never reads a production descriptor,
-OAuth credential, production receipt path, or
-customer dataset. `--status` inspects the exact selected D1 and its local
+fixture seed, and migration import. Without the explicit protected-reference
+option it never reads a production descriptor, OAuth credential, production
+receipt path, or customer dataset. With that option it reads only the selected
+reference identity and bounded affected-table state; it never writes the
+reference. `--status` inspects the exact selected D1 and its local
 attempt markers; `--apply`
 requires a clean remote-reachable source commit, independent reviewer and
 `check:migrations` before mutation.

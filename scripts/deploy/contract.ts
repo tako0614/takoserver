@@ -1289,6 +1289,7 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "migrations/0058_cloudflare_managed_worker_domain_receipts.sql",
         "scripts/deploy/schema-0058-rehearsal.ts",
+        "scripts/deploy/schema-0058-volume-receipt.ts",
         "scripts/deploy/cloudflare-state.ts",
         "scripts/deploy/application-schema-shape.ts",
         "scripts/deploy/d1-migration-import.ts",
@@ -1300,6 +1301,9 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH",
         "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_D1_0058_REFERENCE_API_TOKEN",
       ],
       triggers: ["irreversible"],
       obligations: {
@@ -1310,7 +1314,7 @@ export const DEPLOY_CONTRACT = {
           "No automatic reset, replay, down migration, or restore. Quarantine the exact isolated D1 after uncertainty; forward repair is an operator decision. Production is untouched.",
         "failure-handling":
           highRiskFailure +
-          " Both actions require explicit CLOUDFLARE_API_TOKEN and an owned 0600 declaration selected by TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH, affirming disposable fixture custody, writer quiescence and credential-scope review. Apply additionally requires independent review. No OAuth or production-target fallback exists.",
+          " Both actions require explicit CLOUDFLARE_API_TOKEN and an owned 0600 declaration selected by TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH, affirming disposable fixture custody, writer quiescence and credential-scope review. Apply additionally requires independent review. The optional --protected-reference=integration|production profile requires an explicit TAKOSERVER_DEPLOY_TARGET_INTEGRATION or TAKOSERVER_DEPLOY_TARGET_PRODUCTION path and a distinct TAKOSERVER_D1_0058_REFERENCE_API_TOKEN; that target is queried only, while the isolated rehearsal D1 alone receives writes. Its separate receipt is non-authoritative and never enables protected apply or proves writer drain. No OAuth or production-target fallback exists.",
         "pre-mutation-proof":
           "The declared isolated D1 UUID/name is read from Cloudflare before inspection and at both mutation fences. Exact canonical 0057 lineage and schema plus zero rows in all four affected tables are checked before fixture seed and fenced again. Only bounded synthetic fixture rows are admitted before 0058.",
         "independent-review": review,

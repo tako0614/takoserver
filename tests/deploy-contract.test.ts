@@ -166,6 +166,17 @@ describe("Takoserver split deploy entrypoint", () => {
       ({ surface }) => surface === "takoserver-d1-schema-rehearsal-baseline",
     );
     const schema = contract.surfaces.find(({ surface }) => surface === "takoserver-d1-schema");
+    const rehearsal0058 = contract.surfaces.find(
+      ({ surface }) => surface === "takoserver-d1-schema-0058-rehearsal",
+    );
+    expect(rehearsal0058?.requiresEnv).toEqual([
+      "CLOUDFLARE_API_TOKEN",
+      "TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+      "TAKOSERVER_DEPLOY_TARGET_INTEGRATION",
+      "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+      "TAKOSERVER_D1_0058_REFERENCE_API_TOKEN",
+    ]);
     for (const owner of ["takoserver-d1-schema", "takoserver-integration-storage-generation"]) {
       expect(contract.surfaces.find(({ surface }) => surface === owner)?.covers).toContain(
         "scripts/deploy/application-schema-shape.ts",
@@ -781,6 +792,25 @@ describe("Takoserver split deploy entrypoint", () => {
       ]);
       expect(accepted.exitCode).toBe(2);
       expect(accepted.stderr).toContain("deploy target descriptor not found");
+      const protectedReference = await deploy([
+        "takoserver-d1-schema-0058-rehearsal",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        "--protected-reference=production",
+      ]);
+      expect(protectedReference.exitCode).toBe(2);
+      expect(protectedReference.stderr).toContain("deploy target descriptor not found");
+      expect(protectedReference.stderr).not.toContain("no target was touched");
+      const integrationReference = await deploy([
+        "takoserver-d1-schema-0058-rehearsal",
+        "--status",
+        "--environment=rehearsal",
+        `--commit=${sha}`,
+        "--protected-reference=integration",
+      ]);
+      expect(integrationReference.stderr).toContain("deploy target descriptor not found");
+      expect(integrationReference.stderr).not.toContain("no target was touched");
       for (const tail of [
         ["--environment=production"],
         ["--environment=integration"],
@@ -795,6 +825,19 @@ describe("Takoserver split deploy entrypoint", () => {
         expect(refused.exitCode).toBe(2);
         expect(refused.stderr).toContain("no target was touched");
         expect(refused.stderr).not.toContain("deploy target descriptor");
+      }
+      for (const tail of [
+        ["--protected-reference=rehearsal"],
+        ["--protected-reference=production", "--protected-reference=production"],
+      ]) {
+        const refused = await deploy([
+          "takoserver-d1-schema-0058-rehearsal",
+          "--status",
+          "--environment=rehearsal",
+          `--commit=${sha}`,
+          ...tail,
+        ]);
+        expect(refused.stderr).toContain("no target was touched");
       }
     });
 
