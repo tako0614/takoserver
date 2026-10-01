@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -566,6 +566,143 @@ test("the sole schema writer reopens a completed dispatched 0058 attempt read-on
       ),
     ).rejects.toMatchObject({ phase: "mutation" });
     expect(dispatched).toBe(0);
+  } finally {
+    item.db.close();
+  }
+});
+
+test("a bound 0058 target reopens its dispatched attempt despite changed caller paths", async () => {
+  const item = fixture();
+  const previousReceiptEnvironment = process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH;
+  try {
+    const identity = lstatSync(item.root, { bigint: true });
+    const target = {
+      kind: "takoserver.deploy-target@v2" as const,
+      environment: "rehearsal" as const,
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-rehearsal",
+      d1: { databaseName: "fixture-0058", databaseId: "00000000-0000-4000-8000-000000000058" },
+      r2: { bucketName: "fixture-objects" },
+      publicOrigin: "https://rehearsal.example.test",
+      signing: { currentKeyId: "key-current" },
+      protected0058Custody: {
+        root: item.root,
+        rootIdentity: { device: String(identity.dev), inode: String(identity.ino) },
+      },
+    };
+    const before = await item.readState();
+    const custodyPath = join(
+      item.root,
+      `d1-0058-${createHash("sha256")
+        .update(`${target.accountId}\0${target.d1.databaseId}`)
+        .digest("hex")}`,
+    );
+    await runProtected0058Transition({
+      custodyPath,
+      binding: {
+        environment: "rehearsal",
+        target: {
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+        },
+        source: {
+          commit: "b".repeat(40),
+          prefix: item.source.map(({ name, digest }) => ({ name, digest })),
+          importDigest: item.imported.digest,
+          importBytes: item.imported.bytes,
+        },
+        before: {
+          lineage: before.applied,
+          shapeDigest: before.shapeDigest,
+          snapshot: await item.readSnapshot(),
+        },
+      },
+      importArtifact: item.imported,
+      expectedPostShape: deriveExpectedApplicationShape(item.source),
+      readState: item.readState,
+      readSnapshot: item.readSnapshot,
+      importOnce: () => item.importOnce("acknowledged"),
+    });
+    let cloudflareCalls = 0;
+    process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH = join(item.root, "changed-env-receipt");
+    const result = await runD1Schema(
+      {
+        action: "apply",
+        environment: "rehearsal",
+        commit: "b".repeat(40),
+        throughMigration: "0058",
+      },
+      target,
+      {
+        receiptPath: join(item.root, "caller-selected-other-receipt"),
+        leaseRoot: join(item.root, "caller-selected-other-lease"),
+        outputDirectory: join(item.root, "caller-selected-output"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        reader: { read: item.readState, protected0058Snapshot: item.readSnapshot },
+        run: async () => {
+          cloudflareCalls += 1;
+          throw new Error("unexpected native dispatch");
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      kind: "takoserver.d1-schema-0058-readonly-reconciliation@v1",
+      providerAcknowledgement: "reconciled-complete-without-second-apply",
+    });
+    expect(cloudflareCalls).toBe(0);
+  } finally {
+    if (previousReceiptEnvironment === undefined) {
+      delete process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH;
+    } else {
+      process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH = previousReceiptEnvironment;
+    }
+    item.db.close();
+  }
+});
+
+test("a bound root alone never admits a new unqualified protected 0058 import", async () => {
+  const item = fixture();
+  try {
+    const identity = lstatSync(item.root, { bigint: true });
+    const target = {
+      kind: "takoserver.deploy-target@v2" as const,
+      environment: "integration" as const,
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "fixture-0058", databaseId: "00000000-0000-4000-8000-000000000058" },
+      r2: { bucketName: "fixture-objects" },
+      publicOrigin: "https://integration.example.test",
+      signing: { currentKeyId: "key-current" },
+      protected0058Custody: {
+        root: item.root,
+        rootIdentity: { device: String(identity.dev), inode: String(identity.ino) },
+      },
+    };
+    let nativeCalls = 0;
+    await expect(
+      runD1Schema(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: "b".repeat(40),
+          throughMigration: "0058",
+        },
+        target,
+        {
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          reader: { read: item.readState, protected0058Snapshot: item.readSnapshot },
+          run: async () => {
+            nativeCalls += 1;
+            throw new Error("unexpected native dispatch");
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      phase: "preflight",
+      message: expect.stringContaining("public Host and private CPE writer-drain"),
+    });
+    expect(nativeCalls).toBe(0);
   } finally {
     item.db.close();
   }

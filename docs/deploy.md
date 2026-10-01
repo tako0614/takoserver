@@ -1295,6 +1295,32 @@ original four-table/sealed-BLOB snapshot, issues no second import, and reports
 is not permission to replay the import. This local source behavior is not
 production volume, native import atomicity, or old-writer drain evidence;
 the isolated rehearsal receipt and its contract are unchanged.
+
+For a future single-coordinator-host protected attempt, the operator-private
+`takoserver.deploy-target@v2` descriptor may explicitly include
+`"protected0058Custody": {"root": "/absolute/private/persistent/root", "rootIdentity":
+{"device": "<decimal st_dev>", "inode": "<decimal st_ino>"}}`. The operator must
+preprovision and independently pin an owned `0700` root outside every checkout;
+the path must be canonical with no symlinked ancestor. The deploy command
+neither initializes nor recreates it. The source verifies that pinned
+filesystem identity before lease acquisition, after acquisition,
+and before a future native import. It derives both the flat attempt prefix and
+same-host kernel-lease root from the account and D1 database IDs, never from
+the Worker name, output directory, caller receipt path, or rehearsal receipt
+environment variable. The binding is private deploy metadata, not a Worker
+runtime variable or a published target projection. This attempt custody is
+separate from the existing v3 rehearsal/production receipt chain; selecting a
+root does not rewrite that chain or supply its qualification evidence. Missing,
+replaced, symlinked, or non-private roots hold with unknown prior-dispatch
+history; a new empty directory is not recovery. A descriptor without this new binding
+keeps the existing read-only reconciliation of a legacy dispatched attempt at
+its original receipt path, but cannot start a new protected import. Selecting
+the new binding does not silently adopt such historical arbitrary-path
+custody: recover it through the legacy read-only route and resolve any
+enrollment explicitly before a qualified apply. Device/inode pinning does not
+fence another host, malicious/destructive operator rewriting or rebinding,
+receipt deletion, or inode reuse. Root selection, continuity, and coordination
+remain operator authority, not source proof of live safety or writer drain.
 The parser still refuses `--through-migration=0059`, `--through-migration=0060`,
 `--through-migration=0061`, `--through-migration=0062`,
 `--through-migration=0063`, `--through-migration=0064`,
