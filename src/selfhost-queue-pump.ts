@@ -708,33 +708,47 @@ export function createSelfhostQueuePump(options: SelfhostQueuePumpOptions): Self
     return settled;
   };
 
-  return {
-    async tick() {
-      const listed = await options.targets.list();
-      // From a rotating start, so a target near the end of the list is not the
-      // one that never gets its turn when a pass runs out of room.
-      const offset = listed.length === 0 ? 0 : rotation % listed.length;
-      rotation = (rotation + 1) % Math.max(1, listed.length);
-      const targets = [...listed.slice(offset), ...listed.slice(0, offset)];
-      let settled = 0;
-      let next = 0;
-      const worker = async (): Promise<void> => {
-        for (;;) {
-          const target = targets[next];
-          next += 1;
-          if (!target) return;
-          try {
-            settled += await drainTarget(target);
-          } catch {
-            // Same discipline one level up: a target that throws is one
-            // target, and every other tenant's queue still gets this pass.
-          }
+  let tickInFlight: Promise<number> | undefined;
+  const runTick = async (): Promise<number> => {
+    const listed = await options.targets.list();
+    // From a rotating start, so a target near the end of the list is not the
+    // one that never gets its turn when a pass runs out of room.
+    const offset = listed.length === 0 ? 0 : rotation % listed.length;
+    rotation = (rotation + 1) % Math.max(1, listed.length);
+    const targets = [...listed.slice(offset), ...listed.slice(0, offset)];
+    let settled = 0;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const target = targets[next];
+        next += 1;
+        if (!target) return;
+        try {
+          settled += await drainTarget(target);
+        } catch {
+          // Same discipline one level up: a target that throws is one
+          // target, and every other tenant's queue still gets this pass.
         }
-      };
-      await Promise.all(
-        Array.from({ length: Math.min(MAX_CONCURRENT_TARGETS, targets.length) }, worker),
-      );
-      return settled;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(MAX_CONCURRENT_TARGETS, targets.length) }, worker),
+    );
+    return settled;
+  };
+
+  return {
+    tick() {
+      if (tickInFlight) return tickInFlight;
+      // Schedule the body after publishing its shared promise. This also makes
+      // a re-entrant caller from a targets adapter join the same pass.
+      const inFlight = Promise.resolve()
+        .then(runTick)
+        .finally(() => {
+          if (tickInFlight === inFlight) tickInFlight = undefined;
+        });
+      tickInFlight = inFlight;
+      return inFlight;
     },
 
     async sweep(limit = SWEEP_LIMIT) {
