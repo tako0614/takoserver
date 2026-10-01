@@ -1,6 +1,6 @@
+import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
-import { describe, expect, test } from "bun:test";
 import type {
   D1SchemaState,
   MigrationArtifact,
