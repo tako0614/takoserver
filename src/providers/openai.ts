@@ -131,7 +131,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
         await response.body?.cancel().catch(() => undefined);
         throw new AiGatewayError("invalid_response");
       }
-      const bytes = new Uint8Array(await response.arrayBuffer());
+      const bytes = await readResponseBody(response);
       if (bytes.byteLength > MAX_RESPONSE_BYTES) throw new AiGatewayError("invalid_response");
 
       let parsed: unknown;
@@ -146,6 +146,36 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
       return { ...parsed, model: publicModel };
     },
   };
+}
+
+async function readResponseBody(response: Response): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array();
+
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      byteLength += part.value.byteLength;
+      if (byteLength > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new AiGatewayError("invalid_response");
+      }
+      chunks.push(part.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
 }
 
 function apiBase(value: string): string {
