@@ -829,7 +829,7 @@ The conservative `requiresEnv` union remains unchanged.
 | `takoserver-d1-snapshot-restore` | `--status`, `--apply` | rehearsal only | Absolute owned 0600 `TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH` and explicit `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`. The declaration pins the D1 UUID/name and the snapshot path with its sha256; the snapshot must be an owned single-link 0600 file. No ordinary target descriptor, OAuth or production fallback. |
 | `takoserver-production-d1-fresh-init` | `--status`, `--apply` | production only | Explicit `CLOUDFLARE_API_TOKEN` for both and `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply`; exact `--generation=<32-lowercase-hex>` and the selected `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor, whose incumbent D1/R2 identity is printed and never mutated. Creates and fully migrates one new `takoserver-p-<generation>` D1 only; it does not write the target, create a bucket, or adopt, archive or delete existing storage. |
 | `takoserver-d1-schema-rehearsal-baseline` | `--status`, `--apply` | rehearsal only | No selector is accepted. `CLOUDFLARE_API_TOKEN` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. The receipt-path input is never read. |
-| `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. No production rehearsal receipt is read or written. |
+| `takoserver-d1-schema-0058-rehearsal` | `--status`, `--apply` | rehearsal only | No selector is accepted. Explicit `CLOUDFLARE_API_TOKEN` and absolute `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` for both; `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only. Reads/writes only local no-overwrite attempt markers beside the isolated target declaration; no production rehearsal receipt is read or written. |
 | `takoserver-d1-schema` | `--status`, `--apply` | integration, rehearsal, production | Rehearsal and production require `--through-migration=0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057`; integration may omit the selector for its disposable suffix or select one audited boundary, in which case it applies only that wave and reports `integration-protected-wave` evidence without entering the rehearsal receipt chain. Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` for `--apply` only; one distinct `TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH` per wave for `--apply` in rehearsal or production only. The one-time 0016→0022 receipt is standalone; ordinary chained rehearsal waves after 0028 require the immediately preceding `TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH`. A pending 0043 additionally requires `TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH` and the staged compatibility protocol below. |
 | `takoserver-signing-key-register` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PUBLIC_JWK_PATH` for `--apply` only. |
 | `takoserver-signing-repair` | `--status`, `--apply` | integration, rehearsal, production | Resolved Cloudflare credential for both (explicit token, or integration-only OAuth fallback); `TAKOSERVER_INDEPENDENT_REVIEW` and `TAKOSERVER_SIGNING_PRIVATE_JWK_PATH` for `--apply` only. |
@@ -1427,10 +1427,28 @@ must stop; the declaration alone does not enforce token scope. The surface
 refuses the ordinary rehearsal D1 ID/name
 and verifies the selected D1 UUID/name against Cloudflare before inspection,
 fixture seed, and migration import. It never reads a production descriptor,
-OAuth credential, receipt path, or
-customer dataset. `--status` only inspects the exact selected D1; `--apply`
+OAuth credential, production receipt path, or
+customer dataset. `--status` inspects the exact selected D1 and its local
+attempt markers; `--apply`
 requires a clean remote-reachable source commit, independent reviewer and
 `check:migrations` before mutation.
+
+The target declaration's parent directory must be owner-owned mode `0700`;
+the declaration remains a single-link `0600` file. Immediately before the
+single final import, `--apply` writes no-overwrite sibling files named
+`<target-path>.0058-prepared.json` and `<target-path>.0058-dispatched.json`,
+each owner-owned mode `0600`. They contain only target/source bindings,
+lineage and schema digests, and bounded value-free fixture counts/digests.
+After an interrupted or unknown import acknowledgement, run `--status` against
+the same declaration and source. It compares the current native lineage,
+schema and fixture snapshot with that marker without changing the D1 or marker
+files and without retrying. Observed 0058 plus preserved fixture is reported as
+`observed-complete-no-provider-ack-claimed`; exact unchanged 0057 is reported
+as no-retry, and any partial or drifted state requires forward repair. A
+repeated `--apply` only performs this reconciliation; it never replays the
+import. These local attempt markers are not provider acknowledgements,
+production rehearsal receipts, writer-drain evidence, or permission to enable
+the protected 0058 apply.
 
 Apply requires the exact audited 0001–0057 lineage and canonical predecessor
 shape and zero rows in the four affected receipt/material/sealed-value tables.
