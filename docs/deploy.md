@@ -1398,6 +1398,20 @@ permission. It can only run with `--environment=rehearsal` and no
 `--through-migration`. It selects an operator-owned 0600 JSON file named by
 `TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH` (absolute path). Invoke it as:
 
+An internal, source-only `runD1Schema0058Rehearsal` option can additionally
+measure the selected ordinary **rehearsal** D1's canonical 0057 affected-table
+counts, serialized bytes, and largest sealed BLOB, then seed the already
+selected isolated D1 with bounded synthetic rows meeting those measured upper
+bounds. It uses the same one-import attempt custody, both rollback probes, and
+native readbacks, but writes distinct value-free volume receipts beside the
+target declaration. These receipts identify the reference and isolated D1s,
+source/import digests, bounds, command wall-clock timing, and expiry; an injected
+test runner is labeled as such. This option is not exposed by the deploy CLI or
+contract. Its reference is **not the protected production D1**, and neither
+the option nor its receipt proves production volume, old-writer drain, or
+permission to enable the protected 0058 migration. Unknown import ACKs remain
+dispatched-only and cannot become qualified by a later status read or replay.
+
 ```bash
 bun run deploy -- takoserver-d1-schema-0058-rehearsal --status --environment=rehearsal --commit=<40-hex-sha>
 bun run deploy -- takoserver-d1-schema-0058-rehearsal --apply --environment=rehearsal --commit=<40-hex-sha>
