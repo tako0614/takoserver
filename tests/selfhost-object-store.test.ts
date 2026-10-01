@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
-import { mkdir, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
@@ -340,6 +340,9 @@ describe("the self-host object store", () => {
     const part = await store.uploadPart(BUCKET_A, "durable", created.uploadId, 1, bytes("kept"), {
       contentLength: 4,
     });
+    const directory = join(root, BUCKET_A, "u", created.uploadId);
+    await rename(join(directory, `1-${part.etag}`), join(directory, "1"));
+    // A prior release stored the acknowledged part at the numeric path.
     // A second store over the same database and root is the restart: nothing
     // about the upload lived in the first one's memory.
     const restarted = createSelfhostObjectStore({ sql, root });
@@ -351,6 +354,181 @@ describe("the self-host object store", () => {
     );
     expect(completed.size).toBe(4);
     expect(await text((await restarted.get(BUCKET_A, "durable"))?.body as never)).toBe("kept");
+  });
+
+  test("a failed part replacement preserves the previously acknowledged part", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "replace-part", {});
+    const original = await store.uploadPart(
+      BUCKET_A,
+      "replace-part",
+      created.uploadId,
+      1,
+      bytes("kept"),
+      { contentLength: 4 },
+    );
+    const failedSql: Sql = {
+      query: (statement, params) => sql.query(statement, params),
+      run: async (statement, params) => {
+        if (statement.includes("INSERT INTO selfhost_object_upload_parts")) {
+          throw new Error("injected receipt write failure");
+        }
+        return await sql.run(statement, params);
+      },
+      batch: (statements) => sql.batch(statements),
+    };
+    const replacementStore = createSelfhostObjectStore({ sql: failedSql, root });
+    expect(
+      await failure(
+        replacementStore.uploadPart(BUCKET_A, "replace-part", created.uploadId, 1, bytes("lost"), {
+          contentLength: 4,
+        }),
+      ),
+    ).toBe("upload_not_found");
+    await store.completeMultipartUpload(BUCKET_A, "replace-part", created.uploadId, [
+      { etag: original.etag, partNumber: 1 },
+    ]);
+    expect(await text((await store.get(BUCKET_A, "replace-part"))?.body as never)).toBe("kept");
+  });
+
+  test("same-etag retries do not add retained part files", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "repeat", {});
+    const first = await store.uploadPart(BUCKET_A, "repeat", created.uploadId, 1, bytes("same"), {
+      contentLength: 4,
+    });
+    const directory = join(root, BUCKET_A, "u", created.uploadId);
+    const secondStore = createSelfhostObjectStore({ sql, root });
+    for (let i = 0; i < 3; i += 1) {
+      const retry = await secondStore.uploadPart(
+        BUCKET_A,
+        "repeat",
+        created.uploadId,
+        1,
+        bytes("same"),
+        { contentLength: 4 },
+      );
+      expect(retry.etag).toBe(first.etag);
+      expect(await readdir(directory)).toHaveLength(1);
+    }
+    await secondStore.completeMultipartUpload(BUCKET_A, "repeat", created.uploadId, [
+      { etag: first.etag, partNumber: 1 },
+    ]);
+    expect(await text((await secondStore.get(BUCKET_A, "repeat"))?.body as never)).toBe("same");
+  });
+
+  test("a failed first receipt write leaves no published part", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "first-failure", {});
+    const failedSql: Sql = {
+      query: (statement, params) => sql.query(statement, params),
+      run: async (statement, params) => {
+        if (statement.includes("INSERT INTO selfhost_object_upload_parts")) {
+          throw new Error("receipt rejected before commit");
+        }
+        return await sql.run(statement, params);
+      },
+      batch: (statements) => sql.batch(statements),
+    };
+    const failing = createSelfhostObjectStore({ sql: failedSql, root });
+    expect(
+      await failure(
+        failing.uploadPart(BUCKET_A, "first-failure", created.uploadId, 1, bytes("lost"), {
+          contentLength: 4,
+        }),
+      ),
+    ).toBe("upload_not_found");
+    expect(await readdir(join(root, BUCKET_A, "u", created.uploadId))).toEqual([]);
+  });
+
+  test("a committed receipt with a lost SQL acknowledgement retains its bytes", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "lost-ack", {});
+    const first = await store.uploadPart(BUCKET_A, "lost-ack", created.uploadId, 1, bytes("old"), {
+      contentLength: 3,
+    });
+    const committedThenRejected: Sql = {
+      query: (statement, params) => sql.query(statement, params),
+      run: async (statement, params) => {
+        const result = await sql.run(statement, params);
+        if (statement.includes("INSERT INTO selfhost_object_upload_parts")) {
+          throw new Error("lost write acknowledgement after commit");
+        }
+        return result;
+      },
+      batch: (statements) => sql.batch(statements),
+    };
+    const retrying = createSelfhostObjectStore({ sql: committedThenRejected, root });
+    const replaced = await retrying.uploadPart(
+      BUCKET_A,
+      "lost-ack",
+      created.uploadId,
+      1,
+      bytes("new"),
+      { contentLength: 3 },
+    );
+    expect(replaced.etag).not.toBe(first.etag);
+    expect(await readdir(join(root, BUCKET_A, "u", created.uploadId))).toHaveLength(1);
+    await store.completeMultipartUpload(BUCKET_A, "lost-ack", created.uploadId, [
+      { etag: replaced.etag, partNumber: 1 },
+    ]);
+    expect(await text((await store.get(BUCKET_A, "lost-ack"))?.body as never)).toBe("new");
+  });
+
+  test("an unknown SQL acknowledgement keeps possibly committed bytes", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "unknown-ack", {});
+    let lostReadback = false;
+    const sqlWithUnknownAck: Sql = {
+      query: async (statement, params) => {
+        if (lostReadback && statement.includes("selfhost_object_upload_parts")) {
+          throw new Error("readback unavailable");
+        }
+        return await sql.query(statement, params);
+      },
+      run: async (statement, params) => {
+        const result = await sql.run(statement, params);
+        if (statement.includes("INSERT INTO selfhost_object_upload_parts")) {
+          lostReadback = true;
+          throw new Error("lost write acknowledgement after commit");
+        }
+        return result;
+      },
+      batch: (statements) => sql.batch(statements),
+    };
+    const uncertain = createSelfhostObjectStore({ sql: sqlWithUnknownAck, root });
+    expect(
+      await failure(
+        uncertain.uploadPart(BUCKET_A, "unknown-ack", created.uploadId, 1, bytes("held"), {
+          contentLength: 4,
+        }),
+      ),
+    ).toBe("backend_unavailable");
+    expect(await readdir(join(root, BUCKET_A, "u", created.uploadId))).toHaveLength(1);
+    const receipt = await sql.query(
+      "SELECT etag FROM selfhost_object_upload_parts WHERE bucket_id = ? AND upload_id = ? AND part_number = ?",
+      [BUCKET_A, created.uploadId, 1],
+    );
+    await store.completeMultipartUpload(BUCKET_A, "unknown-ack", created.uploadId, [
+      { etag: String(receipt[0]?.etag), partNumber: 1 },
+    ]);
+    expect(await text((await store.get(BUCKET_A, "unknown-ack"))?.body as never)).toBe("held");
+  });
+
+  test("two store instances survive a same-etag ABA replay without orphaning parts", async () => {
+    const created = await store.createMultipartUpload(BUCKET_A, "aba", {});
+    const other = createSelfhostObjectStore({ sql, root });
+    const initial = await store.uploadPart(BUCKET_A, "aba", created.uploadId, 1, bytes("A"), {
+      contentLength: 1,
+    });
+    await Promise.all([
+      other.uploadPart(BUCKET_A, "aba", created.uploadId, 1, bytes("B"), { contentLength: 1 }),
+      store.uploadPart(BUCKET_A, "aba", created.uploadId, 1, bytes("A"), { contentLength: 1 }),
+    ]);
+    const replay = await other.uploadPart(BUCKET_A, "aba", created.uploadId, 1, bytes("A"), {
+      contentLength: 1,
+    });
+    expect(replay.etag).toBe(initial.etag);
+    expect(await readdir(join(root, BUCKET_A, "u", created.uploadId))).toHaveLength(1);
+    await store.completeMultipartUpload(BUCKET_A, "aba", created.uploadId, [
+      { etag: replay.etag, partNumber: 1 },
+    ]);
+    expect(await text((await store.get(BUCKET_A, "aba"))?.body as never)).toBe("A");
   });
 
   test("aborts an upload and forgets its parts and its files", async () => {
@@ -565,11 +743,10 @@ describe("the self-host object store", () => {
     const two = await store.uploadPart(BUCKET_A, "swapped", created.uploadId, 2, bytes("tail"), {
       contentLength: 4,
     });
-    // The interleaving a lock on the row would not catch: uploadPart renames a
-    // new file over the deterministic part path, so a same-size replacement
-    // passes both the recorded size and the assembled total. The bytes are
-    // what the receipt is checked against.
-    await writeFile(join(root, BUCKET_A, "u", created.uploadId, "2"), "TAIL", { mode: 0o600 });
+    // A same-size on-disk mutation still fails the durable digest check.
+    await writeFile(join(root, BUCKET_A, "u", created.uploadId, `2-${two.etag}`), "TAIL", {
+      mode: 0o600,
+    });
     expect(
       await failure(
         store.completeMultipartUpload(BUCKET_A, "swapped", created.uploadId, [
