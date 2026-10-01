@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
@@ -19,6 +19,7 @@ import {
   read0058FixtureSnapshot,
   runD1Schema0058Rehearsal,
 } from "../scripts/deploy/schema-0058-rehearsal.ts";
+import { read0058VolumeReceipt } from "../scripts/deploy/schema-0058-volume-receipt.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
@@ -1658,28 +1659,104 @@ describe("0058 selected-reference volume producer", () => {
     }
   });
 
-  test("FIFO custody is refused without blocking the status seam", () => {
-    const child = spawnSync(
-      "timeout",
-      [
-        "3s",
-        process.execPath,
-        "test",
-        import.meta.path,
-        "--test-name-pattern",
-        "FIFO child status",
-      ],
-      {
-        env: { ...process.env, TAKOSERVER_0058_FIFO_CHILD: "1" },
+  test("3s watchdog distinguishes a blocking FIFO reader from the canonical bounded reader", () => {
+    const directory = caseDirectory("volume-fifo-watchdog");
+    const custodyPath = join(directory, "custody");
+    const dispatchedPath = `${custodyPath}.0058-volume-dispatched.json`;
+    expect(spawnSync("mkfifo", [dispatchedPath]).status).toBe(0);
+    const childEnvironment = {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+      ...(process.env.TMPDIR === undefined ? {} : { TMPDIR: process.env.TMPDIR }),
+      TAKOSERVER_0058_FIFO_PATH: custodyPath,
+    };
+    const runWatched = (script: string) =>
+      spawnSync("timeout", ["3s", process.execPath, "-e", script], {
+        env: childEnvironment,
         encoding: "utf8",
         timeout: 4_000,
+      });
+    // Deliberately blocking test double: no writer exists, so GNU timeout
+    // must stop it. It neither calls nor weakens the production reader.
+    const blocked = runWatched(
+      'import { openSync, constants } from "node:fs"; openSync(process.env.TAKOSERVER_0058_FIFO_PATH + ".0058-volume-dispatched.json", constants.O_RDONLY);',
+    );
+    expect(blocked.status).toBe(124);
+    const readerModule = new URL(
+      "../scripts/deploy/schema-0058-volume-receipt.ts",
+      import.meta.url,
+    );
+    const errorModule = new URL("../scripts/deploy/errors.ts", import.meta.url);
+    const readScript = `
+      import { read0058VolumeReceipt } from ${JSON.stringify(readerModule.href)};
+      import { DeployError } from ${JSON.stringify(errorModule.href)};
+      try {
+        read0058VolumeReceipt(process.env.TAKOSERVER_0058_FIFO_PATH, "dispatched");
+        process.exit(2);
+      } catch (error) {
+        if (!(error instanceof DeployError) || error.phase !== "preflight") process.exit(3);
+        process.stdout.write("receipt-refused:preflight\\n");
+      }
+    `;
+    const fifo = runWatched(readScript);
+    expect({ status: fifo.status, phase: fifo.stdout.trim() }).toEqual({
+      status: 0,
+      phase: "receipt-refused:preflight",
+    });
+    rmSync(dispatchedPath);
+    writeFileSync(dispatchedPath, Buffer.alloc(16 * 1024 + 1, 0x41), { mode: 0o600 });
+    const oversized = runWatched(readScript);
+    expect({ status: oversized.status, phase: oversized.stdout.trim() }).toEqual({
+      status: 0,
+      phase: "receipt-refused:preflight",
+    });
+    // The direct reader is also the one used by the full status seam below.
+    expect(() => read0058VolumeReceipt(custodyPath, "dispatched")).toThrow(DeployError);
+    rmSync(dispatchedPath);
+    const regularPath = join(directory, "regular-marker.json");
+    writeFileSync(regularPath, "{}\n", { mode: 0o600 });
+    symlinkSync(regularPath, dispatchedPath);
+    expect(() => read0058VolumeReceipt(custodyPath, "dispatched")).toThrow(
+      "could not be opened safely",
+    );
+  });
+
+  test("FIFO and oversize custody are refused by the full status seam", () => {
+    const child = spawnSync(
+      process.execPath,
+      ["test", import.meta.path, "--test-name-pattern", "FIFO child status"],
+      {
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          ...(process.env.TMPDIR === undefined ? {} : { TMPDIR: process.env.TMPDIR }),
+          TAKOSERVER_0058_FIFO_CHILD: "1",
+        },
+        encoding: "utf8",
+        // This bounds the full fixture/rehearsal setup, not the FIFO read.
+        // The independent 3s watchdog above owns the nonblocking guarantee.
+        timeout: 15_000,
       },
     );
-    expect(child.status).toBe(0);
+    const phases = child.stdout.match(/0058-fifo-phase:[a-z-]+/gu) ?? [];
+    expect({
+      status: child.status,
+      timeout: (child.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+      phases,
+    }).toEqual({
+      status: 0,
+      timeout: null,
+      phases: [
+        "0058-fifo-phase:setup",
+        "0058-fifo-phase:status-fifo",
+        "0058-fifo-phase:status-oversize",
+      ],
+    });
   });
 
   test("FIFO child status", async () => {
     if (process.env.TAKOSERVER_0058_FIFO_CHILD !== "1") return;
+    process.stdout.write("0058-fifo-phase:setup\n");
     const isolated = databaseThrough(57);
     const reference = databaseThrough(57);
     reference.exec(build0058SyntheticFixtureSql());
@@ -1713,6 +1790,7 @@ describe("0058 selected-reference volume producer", () => {
       const dispatchedPath = `${options.custodyPath}.0058-volume-dispatched.json`;
       rmSync(dispatchedPath);
       expect(spawnSync("mkfifo", [dispatchedPath]).status).toBe(0);
+      process.stdout.write("0058-fifo-phase:status-fifo\n");
       const failure = await runD1Schema0058Rehearsal(
         { action: "status", environment: "rehearsal", commit: COMMIT },
         ordinaryTarget,
@@ -1721,6 +1799,7 @@ describe("0058 selected-reference volume producer", () => {
       expect(failure).toBeInstanceOf(DeployError);
       rmSync(dispatchedPath);
       writeFileSync(dispatchedPath, Buffer.alloc(16 * 1024 + 1, 0x41), { mode: 0o600 });
+      process.stdout.write("0058-fifo-phase:status-oversize\n");
       const oversized = await runD1Schema0058Rehearsal(
         { action: "status", environment: "rehearsal", commit: COMMIT },
         ordinaryTarget,
