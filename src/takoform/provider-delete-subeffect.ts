@@ -1,5 +1,5 @@
 import { canonicalJson } from "../json.ts";
-import type { Sql, SqlParam, SqlStatement } from "../ports.ts";
+import type { Sql, SqlParam, SqlStatement, SqlWrite } from "../ports.ts";
 
 const SAGAS = "tf_provider_mutation_sagas_selection_v1";
 const ATTESTATIONS = "tf_resource_deletion_attestations";
@@ -45,6 +45,9 @@ export interface TakoformDeleteSubeffectIssueInput extends TakoformDeleteSubeffe
 export type TakoformDeleteSubeffectRead = "absent" | "issued" | "succeeded" | "conflict";
 export type TakoformDeleteSubeffectIssue = "claimed" | "already-issued" | "succeeded" | "conflict";
 export type TakoformDeleteSubeffectConclusion = "recorded" | "existing" | "conflict";
+type GuardedLedgerBatchResult =
+  | { readonly state: "acknowledged"; readonly writes: readonly SqlWrite[] }
+  | { readonly state: "unconfirmed" };
 
 /**
  * Host-owned first-issuer custody for one provider Delete subeffect. The
@@ -207,7 +210,84 @@ export function createTakoformDeleteSubeffectStore(sql: Sql, now: () => number =
     }
   };
 
-  return { readExact, issue, concludeExact };
+  // Internal ledger composition only: this batch never issues a native-effect ticket.
+  const runGuardedLedgerBatch = async (
+    input: TakoformDeleteSubeffectInput,
+    privateStatements: readonly SqlStatement[],
+  ): Promise<GuardedLedgerBatchResult> => {
+    try {
+      if (!normalize(input)) return { state: "unconfirmed" };
+      const statements = copyPrivateStatements(privateStatements);
+      if (!statements) return { state: "unconfirmed" };
+      const timestamp = now();
+      const firstGuard = guardToken();
+      const finalGuard = guardToken();
+      const results = await sql.batch([
+        authorityGuard(input, timestamp, firstGuard),
+        ...statements,
+        authorityGuard(input, timestamp, finalGuard),
+        { sql: `DELETE FROM ${GUARDS} WHERE token IN (?, ?)`, params: [firstGuard, finalGuard] },
+      ]);
+      if (
+        !isSqlWrites(results) ||
+        results.length !== statements.length + 3 ||
+        results[0]?.changes !== 1 ||
+        results[statements.length + 1]?.changes !== 1 ||
+        results[statements.length + 2]?.changes !== 2
+      )
+        return { state: "unconfirmed" };
+      return {
+        state: "acknowledged",
+        writes: results.slice(1, statements.length + 1),
+      };
+    } catch {
+      // A thrown batch acknowledgement is unknown: the batch may have committed.
+      return { state: "unconfirmed" };
+    }
+  };
+
+  return { readExact, issue, concludeExact, runGuardedLedgerBatch };
+}
+
+function copyPrivateStatements(statements: readonly SqlStatement[]): SqlStatement[] | null {
+  if (!Array.isArray(statements) || statements.length < 1) return null;
+  const copied: SqlStatement[] = [];
+  for (const statement of statements) {
+    if (
+      !statement ||
+      typeof statement.sql !== "string" ||
+      statement.sql.trim().length === 0 ||
+      !Array.isArray(statement.params) ||
+      statement.params.length < 1
+    )
+      return null;
+    const params: SqlParam[] = [];
+    for (const value of statement.params) {
+      if (typeof value === "string") params.push(value);
+      else if (typeof value === "number" && Number.isFinite(value)) params.push(value);
+      else if (value === null) params.push(value);
+      else if (value instanceof ArrayBuffer) params.push(value.slice(0));
+      else return null;
+    }
+    copied.push({ sql: statement.sql, params });
+  }
+  return copied;
+}
+
+function isSqlWrites(value: unknown): value is readonly SqlWrite[] {
+  return Array.isArray(value) && value.every(isSqlWrite);
+}
+
+function isSqlWrite(value: unknown): value is SqlWrite {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const write = value as Record<string, unknown>;
+  return (
+    Array.isArray(write.rows) &&
+    Number.isSafeInteger(write.changes) &&
+    typeof write.changes === "number" &&
+    write.changes >= 0 &&
+    write.rows.every((row: unknown) => !!row && typeof row === "object" && !Array.isArray(row))
+  );
 }
 
 type Expected = { readonly effectId: string; readonly targetJson: string };

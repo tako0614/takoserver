@@ -493,6 +493,217 @@ test("real D1 rolls back row and JSON mirror together and never reissues after a
   }
 }, 30_000);
 
+test("one guarded ledger batch acknowledges private marker writes under the accepted lease", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const sql = createSqliteSql(database);
+    const now = await seedAcceptedDelete(sql);
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
+    const marker = `native-delete-pending-${"x".repeat(9_000)}`;
+    const result = await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [
+      markerStatement(marker, now + 2),
+    ]);
+
+    expect(result).toMatchObject({ state: "acknowledged" });
+    if (result.state !== "acknowledged") return;
+    expect(result.writes).toHaveLength(1);
+    expect(result.writes[0]?.changes).toBe(1);
+    expect(
+      await sql.query(
+        "SELECT operation_id, marker FROM private_queue_delete_markers WHERE operation_id = ?",
+        [OPERATION],
+      ),
+    ).toEqual([{ operation_id: OPERATION, marker }]);
+    expect(await rows(sql)).toEqual([]);
+    expect(await sql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("guarded ledger batch rejects an already-expired database lease without a marker", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const baseSql = createSqliteSql(database);
+    const createdAt = Date.now() - 120_000;
+    await seedAcceptedDelete(baseSql, createdAt, createdAt + 60_000);
+    let batches = 0;
+    const sql: Sql = {
+      query: baseSql.query.bind(baseSql),
+      run: baseSql.run.bind(baseSql),
+      batch: async (statements) => {
+        batches += 1;
+        return await baseSql.batch(statements);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(sql, () => createdAt + 2);
+
+    expect(
+      await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [markerStatement()]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(batches).toBe(1);
+    expect(await markerRows(baseSql)).toEqual([]);
+    expect(await baseSql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+    expect(await rows(baseSql)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("guarded ledger batch rolls back private writes when authority changes before its final guard", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const sql = createSqliteSql(database);
+    const now = await seedAcceptedDelete(sql);
+    database.exec(`CREATE TRIGGER cancel_delete_after_private_marker
+      AFTER INSERT ON private_queue_delete_markers
+      BEGIN
+        UPDATE tf_resource_deletion_attestations
+        SET state = 'cancelled'
+        WHERE tenant_id = '${TENANT}' AND resource_uid = '${UID}';
+      END`);
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
+
+    expect(
+      await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [markerStatement()]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(await markerRows(sql)).toEqual([]);
+    expect(
+      await sql.query(
+        "SELECT state FROM tf_resource_deletion_attestations WHERE tenant_id = ? AND resource_uid = ?",
+        [TENANT, UID],
+      ),
+    ).toEqual([{ state: "pending" }]);
+    expect(await sql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+    expect(await rows(sql)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("guarded ledger batch treats a committed but lost acknowledgement as unconfirmed", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const baseSql = createSqliteSql(database);
+    const now = await seedAcceptedDelete(baseSql);
+    const sql: Sql = {
+      query: baseSql.query.bind(baseSql),
+      run: baseSql.run.bind(baseSql),
+      batch: async (statements) => {
+        await baseSql.batch(statements);
+        throw new Error("transport acknowledgement lost after commit");
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
+
+    expect(
+      await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [markerStatement()]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(await markerRows(baseSql)).toEqual([
+      { operation_id: OPERATION, marker: "native-delete-pending" },
+    ]);
+    expect(await rows(baseSql)).toEqual([]);
+    expect(await baseSql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("guarded ledger batch treats a truncated committed acknowledgement as unconfirmed", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const baseSql = createSqliteSql(database);
+    const now = await seedAcceptedDelete(baseSql);
+    const sql: Sql = {
+      query: baseSql.query.bind(baseSql),
+      run: baseSql.run.bind(baseSql),
+      batch: async (statements) => {
+        const committed = await baseSql.batch(statements);
+        return committed.slice(0, -1);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
+
+    expect(
+      await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [markerStatement()]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(await markerRows(baseSql)).toEqual([
+      { operation_id: OPERATION, marker: "native-delete-pending" },
+    ]);
+    expect(await rows(baseSql)).toEqual([]);
+    expect(await baseSql.query("SELECT token FROM tf_operation_commit_guards")).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+test("guarded ledger batch rejects malformed private statements before the batch", async () => {
+  const database = new Database(":memory:");
+  try {
+    migrateSqlite(database);
+    createPrivateMarkerTable(database);
+    const baseSql = createSqliteSql(database);
+    const now = await seedAcceptedDelete(baseSql);
+    let batches = 0;
+    const sql: Sql = {
+      query: baseSql.query.bind(baseSql),
+      run: baseSql.run.bind(baseSql),
+      batch: async (statements) => {
+        batches += 1;
+        return await baseSql.batch(statements);
+      },
+    };
+    const store = createTakoformDeleteSubeffectStore(sql, () => now + 2);
+
+    expect(
+      await store.runGuardedLedgerBatch({ ...ticket("actor-tombstone"), leaseToken: "x" }, [
+        markerStatement(),
+      ]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(
+      await store.runGuardedLedgerBatch(ticket("actor-tombstone"), [
+        { sql: "INSERT INTO private_queue_delete_markers VALUES ('literal', 'marker', 1)" },
+      ]),
+    ).toEqual({ state: "unconfirmed" });
+    expect(batches).toBe(0);
+    expect(await markerRows(baseSql)).toEqual([]);
+  } finally {
+    database.close();
+  }
+});
+
+function createPrivateMarkerTable(database: Database): void {
+  database.exec(`CREATE TABLE private_queue_delete_markers (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    marker TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`);
+}
+
+function markerStatement(marker = "native-delete-pending", createdAt = Date.now()) {
+  return {
+    sql: `INSERT INTO private_queue_delete_markers (operation_id, marker, created_at)
+          VALUES (?, ?, ?)`,
+    params: [OPERATION, marker, createdAt],
+  } as const;
+}
+
+async function markerRows(sql: Sql) {
+  return await sql.query(
+    "SELECT operation_id, marker FROM private_queue_delete_markers ORDER BY operation_id",
+  );
+}
+
 function splitMigration(source: string): readonly string[] {
   const statements: string[] = [];
   let rest = source.replace(/^\s*--.*$/gmu, "").trim();
