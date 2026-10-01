@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -7,6 +8,7 @@ import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { read0058Receipt } from "../scripts/deploy/schema-0058-apply-receipt.ts";
 import {
   build0058SyntheticFixtureSql,
   type Fixture0058Snapshot,
@@ -727,7 +729,7 @@ describe("0058 isolated D1 rehearsal", () => {
     }
   });
 
-  test("an interrupted import is read back authoritatively and is never replayed", async () => {
+  test("an interrupted import reconciles from its durable receipt on fresh status without replay", async () => {
     const database = databaseThrough(57);
     const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
     process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
@@ -761,6 +763,113 @@ describe("0058 isolated D1 rehearsal", () => {
         cloudflare_managed_worker_version_execution_provider_proofs: 3,
       });
       expect(after.foreignKeyViolations).toBe(0);
+      const importsBeforeStatus = fixture.fileImports.filter((path) =>
+        path.endsWith("migration-import.sql"),
+      ).length;
+      const statusOptions = makeOptions(caseDirectory("interrupted-import-status"), database);
+      statusOptions.options.custodyPath = options.custodyPath;
+      const status = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        statusOptions.options,
+      );
+      expect(status).toMatchObject({
+        attemptState: "dispatched",
+        reconciliation: "observed-complete-no-provider-ack-claimed",
+        providerAcknowledgement: "not-claimed",
+        readyForApply: false,
+        qualification: "not-production-evidence",
+      });
+      expect(status).toHaveProperty("observedAppliedMigration", MIGRATIONS[57]?.name);
+      const duplicateStatusOptions = makeOptions(
+        caseDirectory("interrupted-import-duplicate-status"),
+        database,
+      );
+      duplicateStatusOptions.options.custodyPath = options.custodyPath;
+      const duplicateStatus = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        duplicateStatusOptions.options,
+      );
+      expect(duplicateStatus).toEqual(status);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(importsBeforeStatus);
+      const duplicateApplyOptions = makeOptions(
+        caseDirectory("interrupted-import-duplicate-apply"),
+        database,
+      );
+      duplicateApplyOptions.options.custodyPath = options.custodyPath;
+      const duplicateApply = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        duplicateApplyOptions.options,
+      );
+      expect(duplicateApply).toMatchObject({
+        reconciliation: "observed-complete-no-provider-ack-claimed",
+        recovery: "status-only reconciliation; a dispatched 0058 import is never replayed",
+      });
+      expect(duplicateApplyOptions.fixture.fileImports).toHaveLength(0);
+      const mismatchedSourceOptions = makeOptions(
+        caseDirectory("interrupted-import-source-mismatch"),
+        database,
+      );
+      mismatchedSourceOptions.options.custodyPath = options.custodyPath;
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "status", environment: "rehearsal", commit: "b".repeat(40) },
+          ordinaryTarget,
+          mismatchedSourceOptions.options,
+        ),
+      ).rejects.toThrow("attempt receipt does not match");
+      expect(mismatchedSourceOptions.fixture.fileImports).toHaveLength(0);
+      const dispatchedPath = `${options.custodyPath}.0058-dispatched.json`;
+      const corruptedReceipt = JSON.parse(readFileSync(dispatchedPath, "utf8")) as {
+        digest: string;
+      };
+      corruptedReceipt.digest = `sha256:${"0".repeat(64)}`;
+      writeFileSync(dispatchedPath, `${JSON.stringify(corruptedReceipt)}\n`);
+      const corruptedReceiptOptions = makeOptions(
+        caseDirectory("interrupted-import-receipt-tamper"),
+        database,
+      );
+      corruptedReceiptOptions.options.custodyPath = options.custodyPath;
+      await expect(
+        runD1Schema0058Rehearsal(
+          { action: "status", environment: "rehearsal", commit: COMMIT },
+          ordinaryTarget,
+          corruptedReceiptOptions.options,
+        ),
+      ).rejects.toThrow("attempt receipt integrity check");
+      expect(corruptedReceiptOptions.fixture.fileImports).toHaveLength(0);
+      const custodyPath = options.custodyPath;
+      if (custodyPath === undefined) throw new Error("test target custody path was not selected");
+      const preparedPath = `${custodyPath}.0058-prepared.json`;
+      const prepared = JSON.parse(readFileSync(preparedPath, "utf8")) as Record<string, unknown>;
+      const { digest: _preparedDigest, ...preparedBody } = prepared;
+      const mismatchedBody = {
+        kind: preparedBody.kind,
+        state: "dispatched",
+        preparedDigest: `sha256:${"1".repeat(64)}`,
+        environment: preparedBody.environment,
+        target: preparedBody.target,
+        source: preparedBody.source,
+        before: preparedBody.before,
+      };
+      writeFileSync(
+        preparedPath,
+        `${JSON.stringify({
+          ...mismatchedBody,
+          digest: `sha256:${createHash("sha256").update(JSON.stringify(mismatchedBody)).digest("hex")}`,
+        })}\n`,
+      );
+      expect(() => read0058Receipt(custodyPath, "prepared")).toThrow(
+        "state does not match receipt filename",
+      );
+      writeFileSync(dispatchedPath, Buffer.alloc(128 * 1024 + 1, 0x20));
+      expect(() => read0058Receipt(custodyPath, "dispatched")).toThrow(
+        "receipt custody is invalid",
+      );
     } finally {
       database.close();
       if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
@@ -901,4 +1010,9 @@ describe("0058 isolated D1 rehearsal", () => {
       else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
     }
   });
+});
+
+test("receipt lookup treats only ENOENT as an absent marker", () => {
+  const custodyPath = join(caseDirectory("receipt-non-enoent"), "x".repeat(245));
+  expect(() => read0058Receipt(custodyPath, "dispatched")).toThrow("could not be opened safely");
 });

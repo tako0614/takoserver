@@ -40,6 +40,13 @@ import {
   unsealDirectory,
 } from "./qualification.ts";
 import { readAuditedMigrationArtifact, type SchemaWaveBoundary } from "./schema.ts";
+import {
+  type ApplyReceipt,
+  type ApplyReceiptBinding,
+  persistDispatched0058Receipt,
+  persistPrepared0058Receipt,
+  read0058DispatchedReceipt,
+} from "./schema-0058-apply-receipt.ts";
 import type { DeployTarget } from "./target.ts";
 
 const SURFACE = "takoserver-d1-schema-0058-rehearsal";
@@ -90,6 +97,78 @@ export interface Fixture0058Snapshot {
   readonly exactSyntheticBlobs: boolean;
   readonly foreignKeyViolations: number;
   readonly foreignKeysEnabled: boolean;
+}
+
+function attemptBindingMatches(receipt: ApplyReceipt, binding: ApplyReceiptBinding): boolean {
+  return (
+    receipt.environment === binding.environment &&
+    JSON.stringify(receipt.target) === JSON.stringify(binding.target) &&
+    JSON.stringify(receipt.source) === JSON.stringify(binding.source) &&
+    JSON.stringify(receipt.before.lineage) === JSON.stringify(binding.before.lineage)
+  );
+}
+
+function attemptStatus(
+  receipt: ApplyReceipt,
+  binding: ApplyReceiptBinding,
+  input: {
+    readonly initial: D1SchemaState;
+    readonly snapshot: Fixture0058Snapshot | null;
+    readonly is0057: boolean;
+    readonly is0058: boolean;
+    readonly source: ReturnType<typeof readAuditedMigrationArtifact>;
+  },
+): Record<string, unknown> {
+  if (!attemptBindingMatches(receipt, binding))
+    throw preflightError(
+      "0058 attempt receipt does not match the selected target and audited source",
+    );
+  const preserved =
+    input.snapshot !== null &&
+    JSON.stringify(input.snapshot) === JSON.stringify(receipt.before.snapshot) &&
+    input.snapshot.foreignKeyViolations === 0 &&
+    input.snapshot.foreignKeysEnabled;
+  const sameTriggers = triggerDigest(input.initial) === receipt.before.triggerDigest;
+  let reconciliation: string;
+  if (receipt.state === "prepared") {
+    reconciliation =
+      input.is0057 && input.initial.shapeDigest === receipt.before.shapeDigest && preserved
+        ? "prepared-not-dispatched-no-retry"
+        : "indeterminate-forward-repair-required";
+  } else if (
+    input.is0058 &&
+    applicationSchemaMatches(
+      input.initial,
+      deriveExpectedApplicationShape(input.source.files.slice(0, 58)),
+    ) &&
+    preserved &&
+    sameTriggers
+  ) {
+    reconciliation = "observed-complete-no-provider-ack-claimed";
+  } else if (
+    input.is0057 &&
+    input.initial.shapeDigest === receipt.before.shapeDigest &&
+    preserved
+  ) {
+    reconciliation = "observed-unchanged-no-retry";
+  } else {
+    reconciliation = "indeterminate-forward-repair-required";
+  }
+  return {
+    kind: "takoserver.d1-0058-rehearsal-attempt-status@v1",
+    environment: "rehearsal",
+    accountId: receipt.target.accountId,
+    databaseId: receipt.target.databaseId,
+    databaseName: receipt.target.databaseName,
+    attemptState: receipt.state,
+    reconciliation,
+    observedAppliedMigration: input.initial.applied.at(-1),
+    observedSchemaShapeDigest: input.initial.shapeDigest,
+    observedFixtureDigest: input.snapshot?.digest ?? null,
+    providerAcknowledgement: "not-claimed",
+    readyForApply: false,
+    qualification: "not-production-evidence",
+  };
 }
 
 type FixtureCounts = Fixture0058Snapshot["counts"];
@@ -489,6 +568,9 @@ export async function runD1Schema0058Rehearsal(
   );
   const file = source.files[57];
   if (file?.name !== MIGRATION) throw preflightError("0058 audited file is missing");
+  if (!/^[0-9a-f]{40}$/u.test(invocation.commit))
+    throw preflightError("0058 receipt source commit is invalid");
+  const auditedImport = buildD1MigrationImport([file], { freshLedger: false });
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-d1-0058-rehearsal-"));
@@ -517,6 +599,40 @@ export async function runD1Schema0058Rehearsal(
       (isExactFixtureSize(initialCounts) && (await onlySyntheticRows(initialDb, "preflight")))
         ? await read0058FixtureSnapshot(initialDb, "preflight")
         : null;
+    const receiptBinding: ApplyReceiptBinding = {
+      environment: "rehearsal",
+      target: selected,
+      source: {
+        commit: invocation.commit,
+        prefix: source.files.slice(0, 58).map(({ name, digest }) => ({ name, digest })),
+        importDigest: auditedImport.digest,
+        importBytes: auditedImport.bytes,
+      },
+      before: {
+        lineage: source.names.slice(0, 57),
+        shapeDigest: initial.shapeDigest,
+        triggerDigest: triggerDigest(initial),
+        snapshot: statusSnapshot,
+      },
+    };
+    const receiptPath =
+      options.custodyPath ?? requireEnvironment("TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH");
+    const existingAttempt = read0058DispatchedReceipt(receiptPath);
+    if (existingAttempt !== null) {
+      const reconciled = attemptStatus(existingAttempt, receiptBinding, {
+        initial,
+        snapshot: statusSnapshot,
+        is0057,
+        is0058,
+        source,
+      });
+      return invocation.action === "status"
+        ? reconciled
+        : {
+            ...reconciled,
+            recovery: "status-only reconciliation; a dispatched 0058 import is never replayed",
+          };
+    }
     if (invocation.action === "status")
       return {
         kind: "takoserver.d1-0058-rehearsal-status@v1",
@@ -578,6 +694,12 @@ export async function runD1Schema0058Rehearsal(
     if (sealed0058?.name !== MIGRATION)
       throw preflightError("0058 sealed migration file is missing");
     const migrationImport = buildD1MigrationImport([sealed0058], { freshLedger: false });
+    if (
+      migrationImport.digest !== auditedImport.digest ||
+      migrationImport.bytes !== auditedImport.bytes
+    ) {
+      throw preflightError("0058 sealed whole-file import differs from the audited source");
+    }
     const importPath = join(release, "migration-import.sql");
     writeFileSync(importPath, migrationImport.sql, { flag: "wx", mode: 0o600 });
     // Exercise the exact transport and migration/ledger prefix before the real
@@ -817,6 +939,12 @@ export async function runD1Schema0058Rehearsal(
     }
     await assertProviderIdentity("after rollback probe");
     sealed.assertUnchanged();
+    const finalReceiptBinding: ApplyReceiptBinding = {
+      ...receiptBinding,
+      before: { ...receiptBinding.before, snapshot: seeded },
+    };
+    const preparedReceipt = persistPrepared0058Receipt(receiptPath, finalReceiptBinding);
+    persistDispatched0058Receipt(receiptPath, finalReceiptBinding, preparedReceipt);
     const started = performance.now();
     let applied: CommandResult | null = null;
     try {
