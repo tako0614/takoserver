@@ -122,8 +122,8 @@ function publication(name: string, options: PublicationOptions = {}): WorkerdDep
   };
 }
 
-function newTemporaryRoot(prefix = "tss-exec-"): string {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+function newTemporaryRoot(prefix = "tss-exec-", base = tmpdir()): string {
+  const root = mkdtempSync(join(base, prefix));
   temporaryRoots.push(root);
   return root;
 }
@@ -384,7 +384,7 @@ test("validates private socket directory shape before rendering", async () => {
     createWorkerdRuntime({ root: runtimeRoot, serviceBindingSocketDirectory: tooLong }),
   ).toThrow("unusable private service socket directory");
 
-  const shortRoot = newTemporaryRoot("r-");
+  const shortRoot = newTemporaryRoot("r-", "/tmp");
   expect(() =>
     createWorkerdRuntime({
       root: shortRoot,
@@ -392,7 +392,7 @@ test("validates private socket directory shape before rendering", async () => {
     }),
   ).toThrow("outside the runtime root");
 
-  const missing = join(newTemporaryRoot("m-"), "missing");
+  const missing = join(newTemporaryRoot("m-", "/tmp"), "missing");
   const missingRuntime = createWorkerdRuntime({
     root: runtimeRoot,
     serviceBindingSocketDirectory: missing,
@@ -406,7 +406,7 @@ test("validates private socket directory shape before rendering", async () => {
   });
   await expect(modeRuntime.reload()).rejects.toThrow();
 
-  const linked = join(newTemporaryRoot("ln-"), "l");
+  const linked = join(newTemporaryRoot("ln-", "/tmp"), "l");
   symlinkSync(socketDirectory, linked);
   const linkedRuntime = createWorkerdRuntime({
     root: runtimeRoot,
