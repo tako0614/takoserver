@@ -1285,6 +1285,16 @@ drain producer, and protected production-shaped volume/import qualification
 is unavailable. The existing rehearsal receipt and attempt bytes remain
 unchanged. Rehearsal and production data digests need not equal each other;
 each target must preserve its own pre/post digest when a qualified apply exists.
+The source also contains a sole-writer, forward-only one-import/reconciliation
+seam for a future qualified 0058 apply. New protected imports still refuse
+unconditionally. If the same target/source has an exact durable dispatched
+attempt and already reads back the complete 0058 lineage, an apply invocation
+can only reconcile that attempt read-only: it checks the canonical schema and
+original four-table/sealed-BLOB snapshot, issues no second import, and reports
+`readyForApply: false`. A missing, conflicting, partial, or damaged attempt
+is not permission to replay the import. This local source behavior is not
+production volume, native import atomicity, or old-writer drain evidence;
+the isolated rehearsal receipt and its contract are unchanged.
 The parser still refuses `--through-migration=0059`, `--through-migration=0060`,
 `--through-migration=0061`, `--through-migration=0062`,
 `--through-migration=0063`, `--through-migration=0064`,
