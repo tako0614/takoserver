@@ -52,11 +52,16 @@ import {
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
+import { readProtected0058Attempt } from "./schema-0058-apply-receipt.ts";
 import {
   assertProtected0058Preserved,
   type Protected0058Snapshot,
   readProtected0058Snapshot,
 } from "./schema-0058-proof.ts";
+import {
+  reconcileDispatchedProtected0058Transition,
+  runProtected0058Transition,
+} from "./schema-0058-transition.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
@@ -822,14 +827,115 @@ export async function runD1Schema(
       target,
       options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
     );
-    const initial = await readState(
-      "preflight",
-      inspectionConfig,
-      environment,
-      run,
-      options.reader,
-    );
-    const wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
+    const possible0058Custody =
+      invocation.action === "apply" && invocation.throughMigration === "0058"
+        ? (options.receiptPath ??
+          (invocation.environment === "integration"
+            ? undefined
+            : process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH))
+        : undefined;
+    let dispatched0058Custody: string | null = null;
+    if (possible0058Custody !== undefined) {
+      let markerPresent = false;
+      try {
+        markerPresent =
+          lstatSync(`${possible0058Custody}.0058-protected-dispatched.json`, {
+            throwIfNoEntry: false,
+          }) !== undefined;
+      } catch {
+        throw mutationError("0058 dispatched attempt marker presence is indeterminate");
+      }
+      if (markerPresent) {
+        try {
+          dispatched0058Custody = exactReceiptPath(possible0058Custody);
+        } catch {
+          throw mutationError("0058 dispatched attempt custody path is invalid; retain custody");
+        }
+      }
+    }
+    if (dispatched0058Custody !== null) {
+      // Recognize custody before a failed or malformed D1 readback can be
+      // mislabeled as a pre-mutation failure on a restarted invocation.
+      if (readProtected0058Attempt(dispatched0058Custody)?.state !== "dispatched") {
+        throw mutationError("0058 dispatched attempt custody changed before readback");
+      }
+    }
+    let initial: D1SchemaState;
+    try {
+      initial = await readState("preflight", inspectionConfig, environment, run, options.reader);
+    } catch (error) {
+      if (dispatched0058Custody !== null) {
+        throw mutationError(
+          "0058 dispatched attempt initial D1 readback is unavailable; retain custody",
+        );
+      }
+      throw error;
+    }
+    let wave: SelectedSchemaWave;
+    try {
+      wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
+    } catch (error) {
+      if (dispatched0058Custody !== null) {
+        throw mutationError(
+          "0058 dispatched attempt lineage is malformed or divergent; retain custody",
+        );
+      }
+      throw error;
+    }
+    // Reopening a durable dispatched 0058 attempt is read-only, including when
+    // an interrupted import left the lineage unchanged or the schema partial.
+    if (invocation.action === "apply" && wave.selector === "0058") {
+      const possibleCustodyPath = dispatched0058Custody;
+      if (possibleCustodyPath !== null) {
+        const custodyPath = possibleCustodyPath;
+        if (readProtected0058Attempt(custodyPath)?.state === "dispatched") {
+          const importFile = sourceMigrations.files[57];
+          if (importFile?.name !== "0058_cloudflare_managed_worker_domain_receipts.sql") {
+            throw preflightError("0058 audited import file is unavailable");
+          }
+          const importArtifact = buildD1MigrationImport([importFile], { freshLedger: false });
+          const result = await reconcileDispatchedProtected0058Transition({
+            custodyPath,
+            expectedScope: {
+              environment: invocation.environment,
+              target: {
+                accountId: target.accountId,
+                databaseId: target.d1.databaseId,
+                databaseName: target.d1.databaseName,
+              },
+              source: {
+                commit: invocation.commit,
+                prefix: sourceMigrations.files.slice(0, 58).map(({ name, digest }) => ({
+                  name,
+                  digest,
+                })),
+                importDigest: importArtifact.digest,
+                importBytes: importArtifact.bytes,
+              },
+            },
+            importArtifact,
+            expectedPostShape: deriveExpectedApplicationShape(sourceMigrations.files.slice(0, 58)),
+            readState: () =>
+              readState("mutation", inspectionConfig, environment, run, options.reader),
+            readSnapshot: () =>
+              readProtected0058Current({
+                phase: "verification",
+                configPath: inspectionConfig,
+                environment,
+                run,
+                injected: options.reader,
+              }),
+          });
+          return {
+            kind: "takoserver.d1-schema-0058-readonly-reconciliation@v1",
+            appliedMigrations: result.post.applied,
+            schemaShapeDigest: result.post.shapeDigest,
+            providerAcknowledgement: result.providerAcknowledgement,
+            readyForApply: false,
+          };
+        }
+      }
+    }
     const protected0058 =
       wave.selector === "0058" &&
       wave.pending.includes("0058_cloudflare_managed_worker_domain_receipts.sql")
@@ -1605,19 +1711,58 @@ export async function runD1Schema(
           }),
         );
       }
-      const apply = await run(
-        wranglerCommand(
-          migrationImportPath === null
-            ? [
-                "d1",
-                "migrations",
-                "apply",
-                target.d1.databaseName,
-                "--remote",
-                "--config",
-                configPath,
-              ]
-            : [
+      if (protected0058 !== null) {
+        if (
+          migrationImport === null ||
+          migrationImportPath === null ||
+          additiveCutoverPostShape === null
+        ) {
+          throw preflightError("0058 exact whole-file import artifact is unavailable");
+        }
+        const custodyPath =
+          receiptPath ??
+          (options.receiptPath === undefined ? null : exactReceiptPath(options.receiptPath));
+        if (custodyPath === null) {
+          throw preflightError("0058 protected apply requires durable local attempt custody");
+        }
+        const transition = await runProtected0058Transition({
+          custodyPath,
+          binding: {
+            environment: invocation.environment,
+            target: {
+              accountId: target.accountId,
+              databaseId: target.d1.databaseId,
+              databaseName: target.d1.databaseName,
+            },
+            source: {
+              commit: source.commit,
+              prefix: sealedMigrationArtifact.files.slice(0, 58).map(({ name, digest }) => ({
+                name,
+                digest,
+              })),
+              importDigest: migrationImport.digest,
+              importBytes: migrationImport.bytes,
+            },
+            before: {
+              lineage: fenced.applied,
+              shapeDigest: fenced.shapeDigest,
+              snapshot: protected0058,
+            },
+          },
+          importArtifact: migrationImport,
+          expectedPostShape: additiveCutoverPostShape,
+          readState: () => readState("mutation", configPath, environment, run, options.reader),
+          readSnapshot: () =>
+            readProtected0058Current({
+              phase: "verification",
+              configPath,
+              environment,
+              run,
+              injected: options.reader,
+            }),
+          importOnce: async () => {
+            const result = await run(
+              wranglerCommand([
                 "d1",
                 "execute",
                 target.d1.databaseName,
@@ -1627,63 +1772,95 @@ export async function runD1Schema(
                 configPath,
                 "--file",
                 migrationImportPath,
-              ],
-        ),
-        { env: environment },
-      );
-      providerAcknowledgement = "acknowledged";
-      if (apply.exitCode !== 0) {
-        let readback: D1SchemaState;
-        try {
-          readback = await readState("mutation", configPath, environment, run, options.reader);
-        } catch (error) {
-          throw mutationError(
-            "D1 migration apply failed and authoritative readback also failed; do not retry blindly",
-            JSON.stringify({
-              fromMigration: wave.fromMigration,
-              throughMigration: wave.throughMigration,
-              providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
-              readbackError:
-                error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-            }),
-          );
-        }
-        let remaining: readonly string[];
-        try {
-          remaining = pendingMigrations(wave.throughPrefixNames, readback.applied);
-        } catch (error) {
-          throw mutationError(
-            "D1 migration apply failed and authoritative lineage is outside the selected wave",
-            JSON.stringify({
-              fromMigration: wave.fromMigration,
-              throughMigration: wave.throughMigration,
-              lastAppliedMigration: last(readback.applied),
-              appliedMigrations: readback.applied,
-              schemaShapeDigest: readback.shapeDigest,
-              providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
-              lineageError:
-                error instanceof Error ? `${error.name}: ${error.message}` : String(error),
-            }),
-          );
-        }
-        if (remaining.length > 0) {
-          throw mutationError(
-            "D1 migration wave partially applied; status and a retry must retain this exact selected wave and evidence",
-            JSON.stringify({
-              fromMigration: wave.fromMigration,
-              throughMigration: wave.throughMigration,
-              lastAppliedMigration: last(readback.applied),
-              nextPendingMigration: remaining[0] ?? null,
-              appliedMigrations: readback.applied,
-              schemaShapeDigest: readback.shapeDigest,
-              providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
-            }),
-          );
-        }
-        providerAcknowledgement = "provider-error-recovered-by-authoritative-readback";
-        post = readback;
+              ]),
+              { env: environment },
+            );
+            return result.exitCode === 0 ? "acknowledged" : "unknown";
+          },
+        });
+        post = transition.post;
+        providerAcknowledgement = transition.providerAcknowledgement;
       } else {
-        post = await readState("verification", configPath, environment, run, options.reader);
+        const apply = await run(
+          wranglerCommand(
+            migrationImportPath === null
+              ? [
+                  "d1",
+                  "migrations",
+                  "apply",
+                  target.d1.databaseName,
+                  "--remote",
+                  "--config",
+                  configPath,
+                ]
+              : [
+                  "d1",
+                  "execute",
+                  target.d1.databaseName,
+                  "--remote",
+                  "--yes",
+                  "--config",
+                  configPath,
+                  "--file",
+                  migrationImportPath,
+                ],
+          ),
+          { env: environment },
+        );
+        providerAcknowledgement = "acknowledged";
+        if (apply.exitCode !== 0) {
+          let readback: D1SchemaState;
+          try {
+            readback = await readState("mutation", configPath, environment, run, options.reader);
+          } catch (error) {
+            throw mutationError(
+              "D1 migration apply failed and authoritative readback also failed; do not retry blindly",
+              JSON.stringify({
+                fromMigration: wave.fromMigration,
+                throughMigration: wave.throughMigration,
+                providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
+                readbackError:
+                  error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              }),
+            );
+          }
+          let remaining: readonly string[];
+          try {
+            remaining = pendingMigrations(wave.throughPrefixNames, readback.applied);
+          } catch (error) {
+            throw mutationError(
+              "D1 migration apply failed and authoritative lineage is outside the selected wave",
+              JSON.stringify({
+                fromMigration: wave.fromMigration,
+                throughMigration: wave.throughMigration,
+                lastAppliedMigration: last(readback.applied),
+                appliedMigrations: readback.applied,
+                schemaShapeDigest: readback.shapeDigest,
+                providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
+                lineageError:
+                  error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              }),
+            );
+          }
+          if (remaining.length > 0) {
+            throw mutationError(
+              "D1 migration wave partially applied; status and a retry must retain this exact selected wave and evidence",
+              JSON.stringify({
+                fromMigration: wave.fromMigration,
+                throughMigration: wave.throughMigration,
+                lastAppliedMigration: last(readback.applied),
+                nextPendingMigration: remaining[0] ?? null,
+                appliedMigrations: readback.applied,
+                schemaShapeDigest: readback.shapeDigest,
+                providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
+              }),
+            );
+          }
+          providerAcknowledgement = "provider-error-recovered-by-authoritative-readback";
+          post = readback;
+        } else {
+          post = await readState("verification", configPath, environment, run, options.reader);
+        }
       }
     }
     const postLegacyCatchupIntegrity = await inspectLegacyProductionCatchupDataIntegrity({
@@ -1705,18 +1882,8 @@ export async function runD1Schema(
         `expected=${JSON.stringify(wave.throughPrefixNames)} actual=${JSON.stringify(post.applied)}`,
       );
     }
-    if (protected0058 !== null) {
-      assertProtected0058Preserved(
-        protected0058,
-        await readProtected0058Current({
-          phase: "verification",
-          configPath,
-          environment,
-          run,
-          injected: options.reader,
-        }),
-      );
-    }
+    // The 0058 transition performed its strict post-import comparison while
+    // classifying any failure as target-may-have-changed, with durable custody.
     if (
       fencedReceiptEvidence &&
       postLegacyCatchupIntegrity.dataIntegrityDigest !==
