@@ -114,23 +114,42 @@ The client does not republish resources during recovery.
 This native case requires Linux `/proc`, Bun, OpenSSL, `unshare`, `ip`, an exact
 accepted workerd artifact, and permission to create a network namespace and
 bind port 443 there. Run it from the repository root in a separate loopback-only
-network namespace; do not borrow the ports or data root of an existing Host:
+network namespace; do not borrow the ports or data root of an existing Host.
+The test also builds `services/takoform-core-verifier` from this checkout into
+its mode-0700 temporary fixture using the locally installed Go toolchain and
+pre-existing Go module/build caches. It disables module-network access; a
+missing tool or cache fails the test instead of substituting a prebuilt binary.
+The Go build is bounded to two concurrent package builds and two active Go
+processors; this does not change the native Host or recovery time assertions.
+The verifier reports the current checkout's source-derived artifact digest and
+pins released Core v1.1.0. Before durable Form admission, the test submits the
+exact current 17-package publisher closure over its real loopback HTTP API,
+requires acceptance, then requires refusal of changed package bytes and a
+valid-but-wrong publisher ref at that same verification endpoint. The actual
+self-host admission CLI then applies the unchanged closure through its existing
+`--core-verifier` interface.
+
+For example, provide Bun 1.4.0, Go, and the existing local Go caches in `PATH`
+and the two cache variables; no module download or network fallback is used:
 
 ```sh
 env -i PATH="$PATH" TMPDIR=/tmp \
+  TAKOSERVER_NATIVE_GO_CACHE=/path/to/existing/go-build-cache \
+  TAKOSERVER_NATIVE_GO_MODULES=/path/to/existing/go-module-cache \
   TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
   unshare --net sh -c \
   'ip link set lo up && bun --no-env-file test --timeout 120000 tests/selfhost-host-cold-restore-native.test.ts'
 ```
 
 An unset artifact explicitly skips this native case; a portable check therefore
-does not prove native restore. A configured but unaccepted artifact fails rather
-than substituting a different binary. The fixture uses a synthetic Core verifier
-and disposable credentials, keys, and TLS material. It does not prove real
-Core/Sigstore verification, production source fencing, external credential or
-service recovery, pending event delivery, monitoring, or an operator disaster-
-recovery drill. Startup remains active as described above; there is no read-only
-restore mode.
+does not prove native restore or Core publisher authenticity. A configured but
+unaccepted workerd artifact fails rather than substituting a different binary.
+The Go verifier and 17-package signatures are real current-source/Core proof;
+the operator assertion, operator key, and self-signed endpoint TLS certificate
+remain disposable local fixture identities. This test does not prove production
+deployment provenance, external credential or service recovery, pending event
+delivery, monitoring, or an operator disaster-recovery drill. Startup remains
+active as described above; there is no read-only restore mode.
 
 The serving supervisor writes bounded child-exit, automatic-restart attempt and
 delay, and recovery-success diagnostics through its existing log callback (the
