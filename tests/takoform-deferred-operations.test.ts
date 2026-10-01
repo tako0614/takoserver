@@ -796,6 +796,85 @@ describe("durable deferred Takoform operations", () => {
     opened.close();
   });
 
+  test("background repair publishes a saved provider receipt after process restart without redispatch", async () => {
+    let now = Date.parse("2026-09-01T00:00:00.000Z");
+    const memory = new InMemoryTakoformResourceDriver();
+    let providerCalls = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: async (input) => {
+        providerCalls += 1;
+        return await memory.apply(input);
+      },
+      observe: (input) => memory.observe(input),
+      delete: (input) => memory.delete(input),
+    };
+    const harness = persistentHarness(() => new Date(now), driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    });
+    const firstProcess = harness.open();
+    const desired = desiredResource("restart-saved-receipt", "created-once");
+    const review = await prepareReview(firstProcess.host, desired);
+    const path = `${lane}/resources/example.forms.invalid/DeferredThing/restart-saved-receipt`;
+    const apply = (host: TakoformHost) =>
+      host.handle(
+        request(path, "primary", {
+          method: "PUT",
+          headers: {
+            "idempotency-key": "restart-saved-receipt-0001",
+            "if-none-match": "*",
+          },
+          body: JSON.stringify({ ...desired, review }),
+        }),
+      );
+
+    const releaseFinalCommit = failNextProviderSagaCommit(firstProcess.database);
+    const accepted = await apply(firstProcess.host);
+    expect(accepted?.status).toBe(202);
+    if (!accepted) throw new Error("saved receipt attempt returned no response");
+    const operationId = ((await accepted.json()) as { operation: { id: string } }).operation.id;
+    expect(providerCalls).toBe(1);
+    expect(
+      firstProcess.database
+        .query(
+          "SELECT phase, receipt_json FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+        )
+        .get(operationId),
+    ).toMatchObject({ phase: "executed", receipt_json: expect.any(String) });
+    releaseFinalCommit();
+    firstProcess.close();
+
+    // A saved provider effect remains repairable beyond the ordinary replay TTL.
+    now += 8 * 24 * 60 * 60_000;
+    const restarted = harness.open();
+    expect(await restarted.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 1,
+      pending: 0,
+    });
+    const terminal = await restarted.host.handle(
+      request(`${lane}/operations/${operationId}`, "primary"),
+    );
+    expect(await terminal?.json()).toMatchObject({
+      id: operationId,
+      done: true,
+      result: { resource: { metadata: { name: "restart-saved-receipt" } } },
+    });
+    expect((await apply(restarted.host))?.status).toBe(201);
+    expect(providerCalls).toBe(1);
+    expect(await restarted.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 0,
+      acquired: 0,
+      settled: 0,
+      pending: 0,
+    });
+    restarted.close();
+  });
+
   test("retains recovery provenance when a cached import receipt follows a lost Host commit", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     const operationModes: Array<"initial" | "recovery" | undefined> = [];
@@ -2730,6 +2809,13 @@ describe("durable deferred Takoform operations", () => {
     ]);
     expect(opened.database.query("SELECT state FROM tf_operations").all()).toEqual([]);
     expect(opened.database.query("SELECT * FROM tf_resource_deployments").all()).toEqual([]);
+    expect(await opened.host.maintenance?.drainProviderRepairs(8)).toEqual({
+      candidates: 1,
+      acquired: 1,
+      settled: 0,
+      pending: 1,
+    });
+    expect(appliedResourceUids).toEqual([executed.resource_uid]);
 
     // Changing what a fresh provider call would publish cannot authorize one:
     // the exact executed receipt remains the only repair authority.
