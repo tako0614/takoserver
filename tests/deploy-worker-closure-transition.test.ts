@@ -467,7 +467,7 @@ describe("reviewed Worker closure transition", () => {
             ? [{ name: "d1_migrations" }]
             : query?.startsWith("SELECT name FROM d1_migrations") === true
               ? [{ name: "0001_first.sql" }, { name: "0002_second.sql" }]
-              : query?.includes("WHERE name NOT LIKE 'sqlite_%'") === true
+              : query?.includes("WHERE name NOT GLOB 'sqlite_*'") === true
                 ? []
                 : undefined;
         if (results === undefined) throw new Error(`unexpected remote D1 query: ${query}`);

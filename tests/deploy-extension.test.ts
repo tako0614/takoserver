@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
@@ -72,52 +73,64 @@ describe("curated deploy extension schema readback", () => {
       false,
     );
 
-    const wireRows = [
-      {
-        type: "table",
-        name: "d1_migrations",
-        tbl_name: "d1_migrations",
-        sql: "CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-      },
-      ...expectedApplicationRows.map(({ type, name, table, sql }) => ({
-        type,
-        name,
-        tbl_name: table,
-        sql,
-      })),
-    ].sort((left, right) =>
-      `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
-    );
-    const statements: string[] = [];
-    const database = new deployExtension.RemoteD1("/unused/wrangler.jsonc", {
-      environment: {},
-      run: async (command) => {
-        const commandIndex = command.indexOf("--command");
-        const sql = commandIndex < 0 ? "" : command[commandIndex + 1];
-        if (sql === undefined) throw new Error("D1 process omitted its SQL command");
-        statements.push(sql);
-        const results = sql.includes("SELECT name FROM sqlite_schema")
-          ? [{ name: "d1_migrations" }]
-          : sql.includes("SELECT name FROM d1_migrations")
-            ? [{ name: artifact.names[56] }]
-            : wireRows;
-        return {
-          exitCode: 0,
-          stdout: JSON.stringify([{ success: true, results }]),
-          stderr: "",
-        };
-      },
-    });
+    const sqlite = new Database(":memory:");
+    try {
+      sqlite.exec("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+      for (const file of artifact.files.slice(0, 57)) {
+        sqlite.exec(await Bun.file(file.path).text());
+      }
+      sqlite.exec(
+        "INSERT INTO d1_migrations (id, name) VALUES (57, '0057_cloudflare_managed_worker_version_execution_material.sql')",
+      );
+      const internalIndexNames = sqlite
+        .query("SELECT name FROM sqlite_schema WHERE name GLOB 'sqlite_autoindex_*'")
+        .all() as { readonly name: string }[];
+      expect(internalIndexNames.length).toBeGreaterThan(0);
 
-    const state: D1SchemaState = await deployExtension.readD1SchemaState(database);
-    expect(state.applied).toEqual([
-      "0057_cloudflare_managed_worker_version_execution_material.sql",
-    ]);
-    expect(state.shapeDigest).toBe(
-      `sha256:${createHash("sha256").update(state.shape).digest("hex")}`,
-    );
-    expect(deployExtension.applicationSchemaMatches(state, expectedApplicationShape)).toBe(true);
-    expect(statements).toHaveLength(3);
-    expect(statements.every((statement) => /^SELECT\b/u.test(statement))).toBe(true);
+      const statements: string[] = [];
+      const database = new deployExtension.RemoteD1("/unused/wrangler.jsonc", {
+        environment: {},
+        run: async (command) => {
+          const commandIndex = command.indexOf("--command");
+          const sql = commandIndex < 0 ? "" : command[commandIndex + 1];
+          if (sql === undefined) throw new Error("D1 process omitted its SQL command");
+          statements.push(sql);
+          const results = sqlite.query(sql).all() as Record<string, unknown>[];
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify([{ success: true, results }]),
+            stderr: "",
+          };
+        },
+      });
+
+      const baseline: D1SchemaState = await deployExtension.readD1SchemaState(database);
+      expect(baseline.applied).toEqual([
+        "0057_cloudflare_managed_worker_version_execution_material.sql",
+      ]);
+      const baselineRows = JSON.parse(baseline.shape) as { readonly name: string }[];
+      expect(baselineRows.some(({ name }) => name === "sqliteXrogue")).toBe(false);
+      expect(baselineRows.some(({ name }) => name.startsWith("sqlite_autoindex_"))).toBe(false);
+      expect(deployExtension.applicationSchemaMatches(baseline, expectedApplicationShape)).toBe(
+        true,
+      );
+
+      sqlite.exec("CREATE TABLE sqliteXrogue (value TEXT)");
+      const state: D1SchemaState = await deployExtension.readD1SchemaState(database);
+      expect(state.applied).toEqual([
+        "0057_cloudflare_managed_worker_version_execution_material.sql",
+      ]);
+      expect(state.shapeDigest).toBe(
+        `sha256:${createHash("sha256").update(state.shape).digest("hex")}`,
+      );
+      const actualRows = JSON.parse(state.shape) as { readonly name: string }[];
+      expect(actualRows.some(({ name }) => name === "sqliteXrogue")).toBe(true);
+      expect(actualRows.some(({ name }) => name.startsWith("sqlite_autoindex_"))).toBe(false);
+      expect(deployExtension.applicationSchemaMatches(state, expectedApplicationShape)).toBe(false);
+      expect(statements.length).toBeGreaterThan(3);
+      expect(statements.every((statement) => /^SELECT\b/u.test(statement))).toBe(true);
+    } finally {
+      sqlite.close();
+    }
   });
 });

@@ -86,7 +86,7 @@ function fixture(
     commands.push(key);
     if (command.includes("--command")) {
       const sql = command[command.indexOf("--command") + 1] as string;
-      if (sql.includes("FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")) {
+      if (sql.includes("FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")) {
         shapeReads++;
         if (shapeReads === options.driftAtShapeRead) {
           db.exec("CREATE TABLE rogue_immediate_fence(value TEXT)");

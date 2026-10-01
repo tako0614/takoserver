@@ -120,7 +120,7 @@ export async function readD1SchemaState(
     phase,
     "D1 canonical schema shape",
     "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
-      "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+      "FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
   );
   const shape = canonicalSchemaShape(rows);
   return { applied, shape, shapeDigest: sha256(shape) };
