@@ -10,6 +10,43 @@ import { createWorkerdRuntime, type WorkerdDeploymentPublication } from "../src/
 const EDGE_API = "edge.forms.takoform.com/v1beta1" as const;
 const SCRIPT = "site";
 const FORM_DIGEST = `sha256:${"a".repeat(64)}` as const;
+const configProbes = new Set<ReturnType<typeof Bun.serve>>();
+
+function configProbe() {
+  let serving: { readonly identity: string; readonly token: string } | null = null;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url);
+      if (
+        serving === null ||
+        request.method !== "POST" ||
+        request.headers.get("host") !== "runtime.selfhost-config.invalid" ||
+        url.pathname !== "/.well-known/takoserver/selfhost-runtime-config/v1" ||
+        request.headers.get("x-takoserver-selfhost-runtime-config") !== serving.token
+      ) {
+        return new Response(null, { status: 404 });
+      }
+      return new Response(null, {
+        status: 204,
+        headers: { "x-takoserver-selfhost-config-identity": serving.identity },
+      });
+    },
+  });
+  configProbes.add(server);
+  if (server.port === undefined) throw new Error("config probe did not bind");
+  return {
+    port: server.port,
+    async onReload(path: string) {
+      const config = await readFile(path, "utf8");
+      const identity = /\(name = "CONFIG_IDENTITY", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+      const token = /\(name = "CONFIG_PROBE_TOKEN", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
+      if (!identity || !token) throw new Error("invalid config probe declaration");
+      serving = { identity, token };
+    },
+  };
+}
 
 function offering(kind: string): ProviderOffering {
   return {
@@ -111,6 +148,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const server of configProbes) server.stop(true);
+  configProbes.clear();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -133,7 +172,13 @@ async function publishScalar(runtime: ReturnType<typeof createWorkerdRuntime>) {
 
 describe("self-host native absence after runtime unpublish", () => {
   test("proves ModuleWorker, Deployment, and Endpoint absent after weighted publish deletion", async () => {
-    const runtime = createWorkerdRuntime({ root, isReady: () => true });
+    const probe = configProbe();
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
     if (!runtime.publish) throw new Error("weighted publication is unavailable");
     await runtime.publish(SCRIPT, weightedPublication());
     await runtime.publish(SCRIPT, null);
@@ -156,7 +201,11 @@ describe("self-host native absence after runtime unpublish", () => {
     const [moduleOffering, module, deploymentOffering, deployment, endpointOffering, endpoint] =
       readbackDescriptors(local);
     const actual = await Promise.all([
-      local.verifyNativeAbsence({ offering: moduleOffering, descriptor: module, target: target() }),
+      local.verifyNativeAbsence({
+        offering: moduleOffering,
+        descriptor: module,
+        target: target(),
+      }),
       local.verifyNativeAbsence({
         offering: deploymentOffering,
         descriptor: deployment,

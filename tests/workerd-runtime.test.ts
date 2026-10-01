@@ -128,6 +128,8 @@ function rawRequest(url: string, method = "GET"): Request {
 function createConfigProbe(): {
   readonly port: number;
   readonly onReload: (path: string) => Promise<void>;
+  readonly activeIdentity: () => string | null;
+  retainPriorGraphOnFailure: boolean;
   behavior: ((config: string, invocation: number) => void | Promise<void>) | undefined;
   stop(): void;
 } {
@@ -135,6 +137,8 @@ function createConfigProbe(): {
   let invocation = 0;
   const result = {
     port: 0,
+    retainPriorGraphOnFailure: false,
+    activeIdentity: () => serving?.identity ?? null,
     behavior: undefined as
       | ((config: string, invocation: number) => void | Promise<void>)
       | undefined,
@@ -143,9 +147,15 @@ function createConfigProbe(): {
       const identity = /\(name = "CONFIG_IDENTITY", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
       const token = /\(name = "CONFIG_PROBE_TOKEN", text = "([0-9a-f]{64})"\)/u.exec(config)?.[1];
       if (!identity || !token) throw new Error("invalid config probe declaration");
+      const previous = serving;
       serving = { identity, token };
       invocation += 1;
-      await result.behavior?.(config, invocation);
+      try {
+        await result.behavior?.(config, invocation);
+      } catch (error) {
+        if (result.retainPriorGraphOnFailure) serving = previous;
+        throw error;
+      }
     },
     stop() {
       server.stop(true);
@@ -1735,6 +1745,134 @@ test("clears activation truth when neither the forward nor rollback graph is pro
     ).toEqual({});
     expect(await runtime.has("site", "generation-1")).toBe(false);
     expect(await runtime.has("site", "generation-2")).toBe(false);
+  } finally {
+    probe.stop();
+  }
+});
+
+test("cannot turn an uncertain private socket activation into absence", async () => {
+  const probe = createConfigProbe();
+  const socketDirectory = mkdtempSync(join(tmpdir(), "ws-"));
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      serviceBindingSocketDirectory: socketDirectory,
+    });
+    if (!runtime.publish || !runtime.observePublication)
+      throw new Error("runtime contract missing");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    const oldIdentity = probe.activeIdentity();
+    expect(await runtime.observePublication("site")).toBe("present");
+
+    probe.retainPriorGraphOnFailure = true;
+    probe.behavior = (_config, invocation) => {
+      if (invocation === 2) throw new Error("reload acknowledgement failed");
+    };
+    await expect(
+      runtime.publish("site", weightedPublication("site", "generation-2", [9_999, 1])),
+    ).rejects.toThrow("reload acknowledgement failed");
+
+    // The private serving graph is still old, but the failed process boundary
+    // deliberately cleared the positive activation marker.
+    expect(probe.activeIdentity()).toBe(oldIdentity);
+    expect(await runtime.has("site")).toBe(false);
+    expect(await runtime.observePublication("site")).toBe("unknown");
+    await expect(runtime.publish("site", null)).rejects.toThrow(
+      "private service runtime requires a fresh supervised incarnation",
+    );
+    const restarted = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+      serviceBindingSocketDirectory: socketDirectory,
+    });
+    expect(await restarted.observePublication?.("site")).toBe("unknown");
+  } finally {
+    probe.stop();
+    rmSync(socketDirectory, { recursive: true, force: true });
+  }
+});
+
+test("does not infer absence from a missing marker and a fake ready signal", async () => {
+  const runtime = createWorkerdRuntime({ root, isReady: () => true });
+  if (!runtime.publish || !runtime.observePublication) throw new Error("runtime contract missing");
+  await runtime.publish("site", weightedPublication("site", "generation-1"));
+  await runtime.publish("site", null);
+  expect(await runtime.has("site")).toBe(false);
+  expect(await runtime.observePublication("site")).toBe("unknown");
+});
+
+test("proves one non-active Version and one removed route absent in another live graph", async () => {
+  const probe = createConfigProbe();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.publish || !runtime.observePublication)
+      throw new Error("runtime contract missing");
+    await runtime.publish("site", weightedPublication("site", "generation-1"));
+    expect(
+      await runtime.observePublication("site", { kind: "version", versionId: "site-v-a" }),
+    ).toBe("present");
+    expect(
+      await runtime.observePublication("site", { kind: "version", versionId: "old-version" }),
+    ).toBe("absent");
+    expect(
+      await runtime.observePublication("site", { kind: "hostname", hostname: "site.localhost" }),
+    ).toBe("present");
+    expect(
+      await runtime.observePublication("site", { kind: "hostname", hostname: "old.localhost" }),
+    ).toBe("absent");
+  } finally {
+    probe.stop();
+  }
+});
+
+test("matches a retained scalar Version only through its graph-bound generation", async () => {
+  const probe = createConfigProbe();
+  try {
+    const runtime = createWorkerdRuntime({
+      root,
+      port: probe.port,
+      isReady: () => true,
+      onReload: probe.onReload,
+    });
+    if (!runtime.observePublication) throw new Error("runtime observation is unavailable");
+    await runtime.write(
+      "site",
+      {
+        directory: "site",
+        mainModule: "index.js",
+        hostEntrypoint: HOST_ENTRYPOINT,
+        hostnames: ["site.localhost"],
+        generation: JSON.stringify({
+          activeVersion: "site-v1",
+          endpointHostname: null,
+          domains: [],
+        }),
+        workerResourceUid: "uid-ModuleWorker-site",
+        fetchHandler: true,
+      },
+      MODULES,
+      undefined,
+      new Map([
+        [HOST_ENTRYPOINT, new TextEncoder().encode('export { default } from "./index.js";')],
+      ]),
+    );
+    await runtime.reload();
+    expect(
+      await runtime.observePublication("site", { kind: "version", versionId: "site-v1" }),
+    ).toBe("present");
+    expect(await runtime.observePublication("site", { kind: "version", versionId: "old-v1" })).toBe(
+      "absent",
+    );
   } finally {
     probe.stop();
   }

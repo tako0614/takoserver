@@ -3660,7 +3660,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     /**
      * Read only local durable/runtime descriptors. This method deliberately
      * avoids `scriptStates.read` and `runtime.has`: both may clean stale
-     * activation files, while an absence proof must have no write/reload path.
+     * activation files. Worker absence additionally requires a read-only
+     * challenge of this incarnation's exact serving graph.
      */
     async verifyNativeAbsence(input: {
       offering: ProviderOffering;
@@ -3670,6 +3671,18 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       const kind = vectorIndexKind(input.offering);
       const parsed = validateSelfhostReadbackDescriptor(id, kind, input.descriptor);
       if (!parsed) return selfhostUnknown("malformed", false);
+      const confirmWorkerAbsence = async (
+        script: string,
+        local: ProviderNativeAbsence,
+        subject?: Parameters<NonNullable<WorkerdRuntime["observePublication"]>>[1],
+      ): Promise<ProviderNativeAbsence> => {
+        if (local.outcome !== "absent") return local;
+        const observePublication = runtime.observePublication;
+        if (!observePublication) return selfhostUnknown("transport", true);
+        const observed = await observePublication(script, subject);
+        if (observed === "unknown") return selfhostUnknown("transport", true);
+        return selfhostAbsence(observed, input.descriptor, kind, id, parsed.data);
+      };
       try {
         switch (kind) {
           case "VectorIndex": {
@@ -3703,40 +3716,63 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           }
           case "ModuleWorker":
             if (!parsed.script) return selfhostUnknown("malformed", false);
-            return await verifySelfhostWorkerAbsence(
-              dataRoot,
-              scriptsRoot,
-              versionsRoot,
+            return await confirmWorkerAbsence(
               parsed.script,
-              input.descriptor,
-              kind,
+              await verifySelfhostWorkerAbsence(
+                dataRoot,
+                scriptsRoot,
+                versionsRoot,
+                parsed.script,
+                input.descriptor,
+                kind,
+              ),
             );
           case "WorkerVersion":
             if (!parsed.script || !parsed.versionId) return selfhostUnknown("malformed", false);
-            return await verifySelfhostVersionAbsence(
-              versionMaterializer,
+            {
+              const state = await readSelfhostState(scriptsRoot, parsed.script);
+              if (
+                state.activeVersion === parsed.versionId ||
+                state.deployment?.versions.some((version) => version.versionId === parsed.versionId)
+              ) {
+                return selfhostAbsence("present", input.descriptor, kind, id, parsed.data);
+              }
+            }
+            return await confirmWorkerAbsence(
               parsed.script,
-              parsed.versionId,
-              input.descriptor,
-              kind,
+              await verifySelfhostVersionAbsence(
+                versionMaterializer,
+                parsed.script,
+                parsed.versionId,
+                input.descriptor,
+                kind,
+              ),
+              { kind: "version", versionId: parsed.versionId },
             );
           case "WorkerDeployment":
             if (!parsed.script) return selfhostUnknown("malformed", false);
-            return await verifySelfhostDeploymentAbsence(
-              dataRoot,
+            return await confirmWorkerAbsence(
               parsed.script,
-              input.descriptor,
-              kind,
+              await verifySelfhostDeploymentAbsence(
+                dataRoot,
+                parsed.script,
+                input.descriptor,
+                kind,
+              ),
             );
           case "WorkerEndpoint":
           case "WorkerCustomDomain":
             if (!parsed.script) return selfhostUnknown("malformed", false);
-            return await verifySelfhostRouteAbsence(
-              dataRoot,
+            return await confirmWorkerAbsence(
               parsed.script,
-              parsed.hostname,
-              input.descriptor,
-              kind,
+              await verifySelfhostRouteAbsence(
+                dataRoot,
+                parsed.script,
+                parsed.hostname,
+                input.descriptor,
+                kind,
+              ),
+              parsed.hostname ? { kind: "hostname", hostname: parsed.hostname } : undefined,
             );
           // An attachment is durable state now rather than a bare declaration,
           // so its absence is something this Host can read rather than assert.
@@ -4454,6 +4490,15 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           "the local delete outcome is not proven; operator repair is required",
           true,
         );
+      const publicationAbsent = async (
+        script: string,
+        subject?: Parameters<NonNullable<WorkerdRuntime["observePublication"]>>[1],
+      ): Promise<boolean> => {
+        const observePublication = runtime.observePublication;
+        return observePublication
+          ? (await runtimeOperation(() => observePublication(script, subject))) === "absent"
+          : false;
+      };
       try {
         if (isConfiguredVectorIndexOffering(input.offering))
           return await vectorRecoverDelete(input);
@@ -4476,11 +4521,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               space: input.identity.space,
               name: input.identity.name,
             });
+            const parsed = parseSelfhostNativeId("ModuleWorker", input.nativeId, input.spec);
+            if (parsed?.script !== script) {
+              return failed("not_found", "the Worker identity is malformed");
+            }
             const current = await readScriptState(script);
-            const serving = await runtimeOperation(async () =>
-              runtime.has(script, await runtimeGeneration(script, current.state)),
-            );
-            return current.revision === null && !serving ? done() : uncertain();
+            return current.revision === null && (await publicationAbsent(script))
+              ? done()
+              : uncertain();
           }
           case "WorkerVersion": {
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
@@ -4496,9 +4544,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             // durable active generation. A different active generation may
             // still serve, which is fine for this non-active Version.
             const materialized = existsSync(join(versionsRoot, script, versionId));
-            return !materialized &&
-              current.state.activeVersion !== versionId &&
-              !current.state.deployment?.versions.some((version) => version.versionId === versionId)
+            if (
+              materialized ||
+              current.state.activeVersion === versionId ||
+              current.state.deployment?.versions.some((version) => version.versionId === versionId)
+            ) {
+              return uncertain();
+            }
+            // Durable removal is not serving absence even when a different
+            // Deployment is now desired: its publication may have failed and
+            // the removed Version may still be in the old live graph.
+            return (await publicationAbsent(script, { kind: "version", versionId }))
               ? done()
               : uncertain();
           }
@@ -4506,13 +4562,19 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (!worker) return failed("not_found", "the Worker Deployment has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-            const current = await readScriptState(script);
-            const serving = await runtimeOperation(async () =>
-              runtime.has(script, await runtimeGeneration(script, current.state)),
+            const parsed = parseSelfhostNativeId(
+              "WorkerDeployment",
+              input.nativeId,
+              input.spec,
+              input.relations,
             );
+            if (parsed?.script !== script) {
+              return failed("not_found", "the Worker Deployment identity is malformed");
+            }
+            const current = await readScriptState(script);
             return current.state.activeVersion === undefined &&
               current.state.deployment === undefined &&
-              !serving
+              (await publicationAbsent(script))
               ? done()
               : uncertain();
           }
@@ -4530,9 +4592,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               return failed("not_found", "the Worker Endpoint identity is malformed");
             }
             const current = await readScriptState(script);
-            const manifest = await readSelfhostRuntimeManifest(dataRoot, script);
             return current.state.endpointHostname !== parsed.hostname &&
-              manifest?.hostnames.includes(parsed.hostname) !== true
+              (await publicationAbsent(script, { kind: "hostname", hostname: parsed.hostname }))
               ? done()
               : uncertain();
           }
@@ -4540,14 +4601,20 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
             const worker = relationResource(input.relations, "/worker", "ModuleWorker");
             if (!worker) return failed("not_found", "the Worker route has no worker relation");
             const script = await scriptOf(input.identity.tenantRef, worker.metadata);
-            const current = await readScriptState(script);
-            const serving = await runtimeOperation(async () =>
-              runtime.has(script, await runtimeGeneration(script, current.state)),
+            const parsed = parseSelfhostNativeId(
+              "WorkerCustomDomain",
+              input.nativeId,
+              { ...input.spec, scriptName: script },
+              input.relations,
             );
-            // Workerd's boolean seam reports script activation, not a
-            // per-host route. When another route still serves the script we
-            // cannot prove this route's absence, so fail closed.
-            return !serving && current.state.domains.length === 0 ? done() : uncertain();
+            if (!parsed?.hostname || parsed.script !== script) {
+              return failed("not_found", "the Worker CustomDomain identity is malformed");
+            }
+            const current = await readScriptState(script);
+            return !current.state.domains.includes(parsed.hostname) &&
+              (await publicationAbsent(script, { kind: "hostname", hostname: parsed.hostname }))
+              ? done()
+              : uncertain();
           }
           case "SQLiteDatabase":
           case "sql_database": {
@@ -4566,6 +4633,171 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       } catch (error) {
         if (error instanceof SelfhostFailure) return error.ticket;
         throw error;
+      }
+    },
+
+    /** Maintenance-lane convergence for a removed Worker publication or route. */
+    async convergeDelete(input): Promise<ProviderTicket> {
+      const recoverDelete = this.recoverDelete;
+      if (!recoverDelete) throw new Error("self-host delete recovery is unavailable");
+      if (input.providerHandle) {
+        return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
+      }
+      const kind = dispatchKind(input.offering);
+      if (
+        kind === "ModuleWorker" ||
+        kind === "WorkerDeployment" ||
+        kind === "WorkerEndpoint" ||
+        kind === "WorkerCustomDomain"
+      ) {
+        let release: (() => void) | undefined;
+        try {
+          release = await acquireWorkerMutation(input);
+          const worker =
+            kind === "ModuleWorker"
+              ? input.identity
+              : relationResource(input.relations, "/worker", "ModuleWorker")?.metadata;
+          if (!worker) return failed("not_found", "the Worker route has no worker relation");
+          const script = await scriptOf(input.identity.tenantRef, worker);
+          const parsed = parseSelfhostNativeId(
+            kind,
+            input.nativeId,
+            kind === "WorkerCustomDomain" ? { ...input.spec, scriptName: script } : input.spec,
+            input.relations,
+          );
+          if (parsed?.script !== script) {
+            return failed("not_found", "the Worker delete identity is malformed");
+          }
+          const hostname =
+            kind === "WorkerEndpoint" || kind === "WorkerCustomDomain"
+              ? parsed.hostname
+              : undefined;
+          if ((kind === "WorkerEndpoint" || kind === "WorkerCustomDomain") && !hostname) {
+            return failed("not_found", "the Worker route identity is malformed");
+          }
+          const desiredGone = (current: Awaited<ReturnType<typeof readScriptState>>): boolean => {
+            switch (kind) {
+              case "ModuleWorker":
+                return current.revision === null;
+              case "WorkerDeployment":
+                return (
+                  current.state.activeVersion === undefined &&
+                  current.state.deployment === undefined
+                );
+              case "WorkerEndpoint":
+                return current.state.endpointHostname !== hostname;
+              case "WorkerCustomDomain":
+                return !current.state.domains.includes(hostname as string);
+              default:
+                return false;
+            }
+          };
+          const current = await readScriptState(script);
+          if (!desiredGone(current)) return await recoverDelete(input);
+
+          const observePublication = runtime.observePublication;
+          if (!observePublication) return await recoverDelete(input);
+          const subject = hostname ? ({ kind: "hostname", hostname } as const) : undefined;
+          const publication = await runtimeOperation(() => observePublication(script, subject));
+          if (publication === "absent") return await recoverDelete(input);
+
+          // Recovery may only republish the current desired graph. A delayed
+          // runtime observation must not authorize replacing a new declaration.
+          const latest = await readScriptState(script);
+          if (latest.revision !== current.revision || !desiredGone(latest)) {
+            return failed(
+              "unavailable",
+              "the Worker runtime changed while delete convergence was being prepared",
+              true,
+            );
+          }
+          await publishScript(script);
+          const after = await runtimeOperation(() => observePublication(script, subject));
+          if (after !== "absent") {
+            return failed("unavailable", "the Worker runtime did not prove the route absent", true);
+          }
+          return await recoverDelete(input);
+        } catch (error) {
+          if (error instanceof SelfhostFailure) return error.ticket;
+          throw error;
+        } finally {
+          release?.();
+        }
+      }
+      if (kind !== "WorkerVersion") {
+        return await recoverDelete(input);
+      }
+      const worker = relationResource(input.relations, "/worker", "ModuleWorker");
+      if (!worker) return failed("not_found", "the Worker Version has no worker relation");
+
+      let release: (() => void) | undefined;
+      try {
+        release = await acquireWorkerMutation(input);
+        const script = await scriptOf(input.identity.tenantRef, worker.metadata);
+        const versionId = await versionIdOf(input.identity.tenantRef, {
+          space: input.identity.space,
+          name: input.identity.name,
+        });
+        const current = await readScriptState(script);
+        const currentVersionMaterialized = existsSync(join(versionsRoot, script, versionId));
+        const currentVersionDesired =
+          current.state.activeVersion === versionId ||
+          current.state.deployment?.versions.some((version) => version.versionId === versionId) ===
+            true;
+        if (currentVersionMaterialized || currentVersionDesired) {
+          return await recoverDelete(input);
+        }
+        // A different desired Version is not the stale deployment this repair
+        // is allowed to stop. Ordinary read-only recovery still settles a
+        // genuinely non-active Version deletion without touching that runtime.
+        if (current.state.activeVersion !== undefined || current.state.deployment !== undefined) {
+          return await recoverDelete(input);
+        }
+
+        const observePublication = runtime.observePublication;
+        const publication = observePublication
+          ? await runtimeOperation(() => observePublication(script))
+          : "unknown";
+        if (publication === "absent") return await recoverDelete(input);
+
+        // Fence the empty publication against a replacement written while the
+        // serving readback was in flight. The mutation path itself re-reads
+        // durable state, but this exact revision check keeps it from stopping a
+        // newly desired generation in the ordinary same-process race.
+        const latest = await readScriptState(script);
+        if (
+          latest.revision !== current.revision ||
+          existsSync(join(versionsRoot, script, versionId)) ||
+          latest.state.activeVersion !== undefined ||
+          latest.state.deployment !== undefined
+        ) {
+          return failed(
+            "unavailable",
+            "the Worker runtime changed while delete convergence was being prepared",
+            true,
+          );
+        }
+
+        // Reuse the canonical state-to-runtime publication path. With no
+        // desired Worker generation it sends only the empty publication; no
+        // removed Version body is reconstructed or replayed.
+        await publishScript(script);
+        const after = observePublication
+          ? await runtimeOperation(() => observePublication(script))
+          : "unknown";
+        if (after !== "absent") {
+          return failed(
+            "unavailable",
+            "the Worker runtime did not prove the deleted Version absent",
+            true,
+          );
+        }
+        return await recoverDelete(input);
+      } catch (error) {
+        if (error instanceof SelfhostFailure) return error.ticket;
+        throw error;
+      } finally {
+        release?.();
       }
     },
 
