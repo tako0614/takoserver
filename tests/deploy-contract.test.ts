@@ -818,6 +818,7 @@ describe("Takoserver split deploy entrypoint", () => {
       "0055",
       "0056",
       "0057",
+      "0058",
     ] as const) {
       for (const environment of ["integration", "rehearsal", "production"] as const) {
         test(`accepts schema wave ${through} in ${environment}`, async () => {

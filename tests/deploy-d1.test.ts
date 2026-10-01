@@ -11,6 +11,37 @@ function processReturning(value: unknown): D1Process {
 }
 
 describe("strict Wrangler D1 readback", () => {
+  test("never echoes a sealed BLOB from malformed rows or provider diagnostics", async () => {
+    const secret = "DEADBEEFSEALEDPRIVATEBYTES";
+    for (const result of [
+      { exitCode: 1, stdout: secret, stderr: `failed ${secret}` },
+      {
+        exitCode: 0,
+        stdout: JSON.stringify([{ success: true, results: [{ value: secret }, null] }]),
+        stderr: "",
+      },
+      {
+        exitCode: 0,
+        stdout: JSON.stringify([{ success: true, results: [{ value: secret }] }]),
+        stderr: "",
+      },
+    ]) {
+      const database = new RemoteD1("/tmp/wrangler.jsonc", {
+        environment: {},
+        run: async () => result,
+      });
+      let failure: unknown;
+      try {
+        await database.column("preflight", "secret readback", "SELECT hex(ciphertext)", "missing");
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeDefined();
+      expect(JSON.stringify(failure)).not.toContain(secret);
+      expect(String(failure)).not.toContain(secret);
+    }
+  });
+
   test("accepts exactly one successful structured result", async () => {
     const database = new RemoteD1("/tmp/wrangler.jsonc", {
       environment: { CLOUDFLARE_API_TOKEN: "explicit" },

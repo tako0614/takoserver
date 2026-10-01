@@ -59,7 +59,6 @@ export class RemoteD1 {
         throw new DeployError(
           phase,
           `${description} returned a row without a string \`${name}\` column`,
-          JSON.stringify(row),
         );
       }
       return value;
@@ -100,11 +99,9 @@ export class RemoteD1 {
       { env: this.#environment },
     );
     if (result.exitCode !== 0) {
-      throw new DeployError(
-        phase,
-        `${description} failed (exit ${result.exitCode})`,
-        `${result.stdout}${result.stderr}`.trim(),
-      );
+      // Provider diagnostics can echo SQL result values. This transport is
+      // shared by sealed-BLOB integrity reads, so never attach raw output.
+      throw new DeployError(phase, `${description} failed (exit ${result.exitCode})`);
     }
     return result.stdout;
   }
@@ -126,14 +123,14 @@ function parseResults(
     throw new DeployError(phase, `${description} returned unparsable JSON`);
   }
   if (!Array.isArray(parsed) || parsed.length !== 1) {
-    throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
+    throw new DeployError(phase, `${description} returned an unexpected shape`);
   }
   const first = parsed[0];
   if (!isRecord(first) || first.success !== true || !Array.isArray(first.results)) {
-    throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
+    throw new DeployError(phase, `${description} returned an unexpected shape`);
   }
   if (!first.results.every(isRecord)) {
-    throw new DeployError(phase, `${description} returned an unexpected shape`, raw);
+    throw new DeployError(phase, `${description} returned an unexpected shape`);
   }
   const rows = first.results;
   for (const row of rows) {
@@ -141,7 +138,6 @@ function parseResults(
       throw new DeployError(
         phase,
         `${description} received an execution summary instead of the selected rows`,
-        JSON.stringify(row),
       );
     }
   }

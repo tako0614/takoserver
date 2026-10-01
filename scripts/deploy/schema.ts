@@ -52,6 +52,11 @@ import {
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
+import {
+  assertProtected0058Preserved,
+  type Protected0058Snapshot,
+  readProtected0058Snapshot,
+} from "./schema-0058-proof.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
@@ -293,6 +298,7 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0055",
   "0056",
   "0057",
+  "0058",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -420,6 +426,12 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 57,
     throughMigration: "0057_cloudflare_managed_worker_version_execution_material.sql",
   },
+  "0058": {
+    fromCount: 57,
+    fromMigration: "0057_cloudflare_managed_worker_version_execution_material.sql",
+    throughCount: 58,
+    throughMigration: "0058_cloudflare_managed_worker_domain_receipts.sql",
+  },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
   (boundary): boundary is Exclude<SchemaWaveBoundary, "0022"> =>
@@ -459,6 +471,8 @@ export type SchemaProcess = (
 
 export interface SchemaReader {
   read(phase: DeployPhase): Promise<D1SchemaState>;
+  /** Value-free test boundary for the fixed 0058 four-table/BLOB scan. */
+  protected0058Snapshot?(phase: DeployPhase): Promise<Protected0058Snapshot>;
   /** Open effects need their retained resource identity; unresolved work itself is allowed. */
   orphanOpenProviderEffectCount?(phase: DeployPhase): Promise<number>;
   /** Old import preparation may have effects; 0062 must fence every planned import. */
@@ -816,6 +830,19 @@ export async function runD1Schema(
       options.reader,
     );
     const wave = selectSchemaWave(sourceMigrations, initial.applied, invocation);
+    const protected0058 =
+      wave.selector === "0058" &&
+      wave.pending.includes("0058_cloudflare_managed_worker_domain_receipts.sql")
+        ? await inspectProtected0058Predecessor({
+            state: initial,
+            files: sourceMigrations.files.slice(0, 57),
+            phase: "preflight",
+            configPath: inspectionConfig,
+            environment,
+            run,
+            injected: options.reader,
+          })
+        : null;
     const inspectSelectionCutover = (
       state: D1SchemaState,
       selected: SelectedSchemaWave,
@@ -938,8 +965,18 @@ export async function runD1Schema(
         managedActorOwnerCutover,
         runtimeInputLeaseGenerationCutover,
         actorKvCapabilityCutover,
+        protected0058:
+          wave.selector === "0058"
+            ? {
+                affectedData: protected0058,
+                qualification: "production-shaped-bounded-volume-proof-required",
+                writerDrain: "public-Host-and-private-CPE-owner-proof-required",
+                ready: false,
+              }
+            : null,
         readyForApply:
           wave.pending.length > 0 &&
+          wave.selector !== "0058" &&
           dataPreflights.status === "ready" &&
           (wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY ||
             (legacyCatchupIntegrity.status === "ready" &&
@@ -959,6 +996,9 @@ export async function runD1Schema(
           (actorKvCapabilityCutover.status === "not_pending" ||
             actorKvCapabilityCutover.status === "ready"),
       };
+    }
+    if (wave.selector === "0058") {
+      requireProtected0058OwnerQualification();
     }
     assertDataPreflightsReady(dataPreflights, "before qualification");
     assertLegacyProductionCatchupReady(
@@ -1061,6 +1101,7 @@ export async function runD1Schema(
       throw preflightError("sealed migration prefix differs from the qualified source bytes");
     }
     const additiveCutoverPostShape =
+      wave.selector === "0058" ||
       applyProviderSelectionCutover.status === "ready" ||
       managedQueueRetirementCutover.status === "ready" ||
       managedActorOwnerCutover.status === "ready" ||
@@ -1069,7 +1110,7 @@ export async function runD1Schema(
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
-      wave.selector === "0047"
+      wave.selector === "0047" || wave.selector === "0058"
         ? buildD1MigrationImport(
             sealedMigrationArtifact.files.slice(
               wave.fromPrefixNames.length,
@@ -1092,6 +1133,20 @@ export async function runD1Schema(
 
     const requalified = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(initial, requalified);
+    if (protected0058 !== null) {
+      assertProtected0058Preserved(
+        protected0058,
+        await inspectProtected0058Predecessor({
+          state: requalified,
+          files: sealedMigrationArtifact.files.slice(0, 57),
+          phase: "preflight",
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        }),
+      );
+    }
     const requalifiedWave = selectSchemaWave(sourceMigrations, requalified.applied, invocation);
     if (JSON.stringify(requalifiedWave.pending) !== JSON.stringify(wave.pending)) {
       throw preflightError("D1 selected wave suffix changed during qualification");
@@ -1198,6 +1253,20 @@ export async function runD1Schema(
     artifact.assertUnchanged();
     const fenced = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(requalified, fenced);
+    if (protected0058 !== null) {
+      assertProtected0058Preserved(
+        protected0058,
+        await inspectProtected0058Predecessor({
+          state: fenced,
+          files: sealedMigrationArtifact.files.slice(0, 57),
+          phase: "preflight",
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        }),
+      );
+    }
     const fencedWave = selectSchemaWave(sourceMigrations, fenced.applied, invocation);
     assertApplyProviderSelectionCutoverReady(
       await inspectSelectionCutover(fenced, fencedWave, "preflight", configPath),
@@ -1432,6 +1501,22 @@ export async function runD1Schema(
       assertApplyProviderSelectionCutoverReady(
         await inspectSelectionCutover(fenced, fencedWave, "mutation", configPath),
       );
+      if (protected0058 !== null) {
+        const immediate = await readState("mutation", configPath, environment, run, options.reader);
+        assertSamePreState(fenced, immediate, "at the immediate 0058 migration fence");
+        assertProtected0058Preserved(
+          protected0058,
+          await inspectProtected0058Predecessor({
+            state: immediate,
+            files: sealedMigrationArtifact.files.slice(0, 57),
+            phase: "mutation",
+            configPath,
+            environment,
+            run,
+            injected: options.reader,
+          }),
+        );
+      }
       if (fencedWave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)) {
         const immediateManagedQueueRetirementState = await readState(
           "mutation",
@@ -1620,6 +1705,18 @@ export async function runD1Schema(
         `expected=${JSON.stringify(wave.throughPrefixNames)} actual=${JSON.stringify(post.applied)}`,
       );
     }
+    if (protected0058 !== null) {
+      assertProtected0058Preserved(
+        protected0058,
+        await readProtected0058Current({
+          phase: "verification",
+          configPath,
+          environment,
+          run,
+          injected: options.reader,
+        }),
+      );
+    }
     if (
       fencedReceiptEvidence &&
       postLegacyCatchupIntegrity.dataIntegrityDigest !==
@@ -1637,17 +1734,19 @@ export async function runD1Schema(
     if (additiveCutoverPostShape !== null) {
       const cutoverName = wave.pending.includes(ACTOR_KV_CAPABILITY_MIGRATION)
         ? "Actor KV capability claim"
-        : wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)
-          ? "runtime-input lease generation"
-          : wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
-            ? "Actor owner claim"
-            : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
-              ? "managed Queue retirement"
-              : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
-                ? "import-selection"
-                : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
-                  ? "accepted-authority"
-                  : "operation-generation";
+        : wave.selector === "0058"
+          ? "managed Worker domain receipt"
+          : wave.pending.includes(RUNTIME_INPUT_LEASE_GENERATION_MIGRATION)
+            ? "runtime-input lease generation"
+            : wave.pending.includes(MANAGED_ACTOR_OWNER_CLAIM_MIGRATION)
+              ? "Actor owner claim"
+              : wave.pending.includes(MANAGED_QUEUE_RETIREMENT_MIGRATION)
+                ? "managed Queue retirement"
+                : wave.pending.includes(IMPORT_PROVIDER_SELECTION_MIGRATION)
+                  ? "import-selection"
+                  : wave.pending.includes(ACCEPTED_AUTHORITY_MIGRATION)
+                    ? "accepted-authority"
+                    : "operation-generation";
       const cutoverBoundary = wave.throughMigration.slice(0, 4);
       if (!applicationSchemaMatches(post, additiveCutoverPostShape)) {
         throw verificationError(
@@ -1809,6 +1908,12 @@ export async function runD1Schema(
       await lease?.release();
     }
   }
+}
+
+function requireProtected0058OwnerQualification(): void {
+  throw preflightError(
+    "0058 protected apply requires owner-backed public Host and private CPE writer-drain evidence plus a target/version/source/expiry-bound production-shaped volume and /import qualification; neither input has an owner proof producer yet",
+  );
 }
 
 type MigrationArtifact = ReturnType<typeof readMigrationArtifact>;
@@ -3402,6 +3507,40 @@ async function readState(
   if (injected) return await injected.read(phase);
   return withoutRuntimeInputQuiescenceTrigger(
     await readD1SchemaState(new RemoteD1(configPath, { environment, run }), phase),
+  );
+}
+
+async function inspectProtected0058Predecessor(input: {
+  readonly state: D1SchemaState;
+  readonly files: readonly MigrationArtifactFile[];
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<Protected0058Snapshot> {
+  if (!applicationSchemaMatches(input.state, deriveExpectedApplicationShape(input.files))) {
+    throw preflightError("0058 requires the exact canonical 0057 application schema");
+  }
+  return await readProtected0058Current(input);
+}
+
+async function readProtected0058Current(input: {
+  readonly phase: DeployPhase;
+  readonly configPath: string;
+  readonly environment: Readonly<Record<string, string>>;
+  readonly run: SchemaProcess;
+  readonly injected: SchemaReader | undefined;
+}): Promise<Protected0058Snapshot> {
+  if (input.injected) {
+    if (!input.injected.protected0058Snapshot) {
+      throw preflightError("0058 bounded affected-table/BLOB integrity reader is unavailable");
+    }
+    return await input.injected.protected0058Snapshot(input.phase);
+  }
+  return await readProtected0058Snapshot(
+    new RemoteD1(input.configPath, { environment: input.environment, run: input.run }),
+    input.phase,
   );
 }
 

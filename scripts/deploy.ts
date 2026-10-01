@@ -74,7 +74,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   D1 schema status/apply may select one fixed next-wave boundary:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058>
   Integration without a selector keeps its disposable suffix path; selected integration applies
   only the audited wave and emits integration-protected-wave evidence, never a rehearsal receipt.
   Rehearsal and production still require the selector and their receipt chain.
@@ -83,6 +83,8 @@ const USAGE = `takoserver deploy
   takoserver-d1-schema-rehearsal-baseline is fixed empty -> 0022, rehearsal-only, and accepts no selector.
   takoserver-d1-schema-0058-rehearsal is an isolated synthetic 0057 -> 0058 D1 qualification,
     rehearsal-only, no selector or production receipt; see docs/deploy.md.
+  The protected 0058 selector is status-only until owner-backed public Host and private CPE
+    writer-drain plus target-bound volume/import qualification are implemented; apply refuses.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
     no target descriptor, schema import, binding change, or production mode is accepted.
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
