@@ -447,7 +447,7 @@ test("coalesces concurrent ticks and keeps the per-consumer concurrency ceiling"
       if (active === 2) markConcurrentProbeStarted?.();
       try {
         await probesReleased;
-        return await base.runtime.probe?.(name, path, init);
+        return (await base.runtime.probe?.(name, path, init)) ?? null;
       } finally {
         active -= 1;
       }
