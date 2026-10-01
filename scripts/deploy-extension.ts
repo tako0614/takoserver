@@ -6,6 +6,10 @@
  * backend implementations, credentials or private configuration writers.
  */
 
+export {
+  applicationSchemaMatches,
+  deriveExpectedApplicationShape,
+} from "./deploy/application-schema-shape.ts";
 export { CloudflareState } from "./deploy/cloudflare-state.ts";
 export { GENERIC_WORKER_DEPLOY_CONTRACT_SURFACES } from "./deploy/contract.ts";
 export type { D1Process } from "./deploy/d1.ts";
@@ -38,6 +42,8 @@ export type {
 } from "./deploy/integration-storage-generation.ts";
 export { verifyIntegrationStorageGenerationTarget } from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
+export type { D1SchemaState, MigrationArtifact, MigrationFile } from "./deploy/migrations.ts";
+export { readD1SchemaState } from "./deploy/migrations.ts";
 export type {
   CloudflareCredential,
   CloudflareDeployEnvironment,
@@ -71,6 +77,7 @@ export {
   sealDirectory,
   unsealDirectory,
 } from "./deploy/qualification.ts";
+export { readAuditedMigrationArtifact } from "./deploy/schema.ts";
 export type {
   DeployTarget,
   ManagedWorkerDispatchNamespaceTarget,
