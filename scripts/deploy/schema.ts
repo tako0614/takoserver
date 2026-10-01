@@ -53,6 +53,7 @@ import {
   unsealDirectory,
 } from "./qualification.ts";
 import { readProtected0058Attempt } from "./schema-0058-apply-receipt.ts";
+import { resolveProtected0058Custody } from "./schema-0058-custody.ts";
 import {
   assertProtected0058Preserved,
   type Protected0058Snapshot,
@@ -805,23 +806,39 @@ export async function runD1Schema(
   const sourceMigrations = readMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
+  const protected0058Custody =
+    invocation.action === "apply" &&
+    invocation.throughMigration === "0058" &&
+    target.protected0058Custody
+      ? resolveProtected0058Custody(target)
+      : null;
   const temporary = options.outputDirectory === undefined;
   const root = options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-schema-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   let lease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null = null;
   try {
-    lease =
-      invocation.action === "apply"
-        ? await acquireWranglerVersionPublicationLease({
-            accountId: target.accountId,
-            // Reuse the repository's owned kernel-lease primitive, but key this
-            // lane by the durable D1 identity rather than the adjacent Worker.
-            // Two descriptors that name the same database therefore cannot
-            // bypass each other's attempt/mutation/finalization lease.
-            workerName: `d1-${target.d1.databaseId}`,
-            ...(options.leaseRoot === undefined ? {} : { root: options.leaseRoot }),
-          })
-        : null;
+    try {
+      lease =
+        invocation.action === "apply"
+          ? await acquireWranglerVersionPublicationLease({
+              accountId: target.accountId,
+              // Reuse the repository's owned kernel-lease primitive, but key this
+              // lane by the durable D1 identity rather than the adjacent Worker.
+              // Two descriptors that name the same database therefore cannot
+              // bypass each other's attempt/mutation/finalization lease.
+              workerName: `d1-${target.d1.databaseId}`,
+              ...(protected0058Custody
+                ? { root: protected0058Custody.leaseRoot, createRoot: false }
+                : options.leaseRoot === undefined
+                  ? {}
+                  : { root: options.leaseRoot }),
+            })
+          : null;
+    } catch (error) {
+      protected0058Custody?.assertContinuity();
+      throw error;
+    }
+    protected0058Custody?.assertContinuity();
     const inspectionConfig = writeD1Config(
       join(root, "inspect-wrangler.jsonc"),
       target,
@@ -829,7 +846,8 @@ export async function runD1Schema(
     );
     const possible0058Custody =
       invocation.action === "apply" && invocation.throughMigration === "0058"
-        ? (options.receiptPath ??
+        ? (protected0058Custody?.attemptPrefix ??
+          options.receiptPath ??
           (invocation.environment === "integration"
             ? undefined
             : process.env.TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH))
@@ -854,6 +872,7 @@ export async function runD1Schema(
       }
     }
     if (dispatched0058Custody !== null) {
+      protected0058Custody?.assertContinuity();
       // Recognize custody before a failed or malformed D1 readback can be
       // mislabeled as a pre-mutation failure on a restarted invocation.
       if (readProtected0058Attempt(dispatched0058Custody)?.state !== "dispatched") {
@@ -889,6 +908,7 @@ export async function runD1Schema(
       if (possibleCustodyPath !== null) {
         const custodyPath = possibleCustodyPath;
         if (readProtected0058Attempt(custodyPath)?.state === "dispatched") {
+          protected0058Custody?.assertContinuity();
           const importFile = sourceMigrations.files[57];
           if (importFile?.name !== "0058_cloudflare_managed_worker_domain_receipts.sql") {
             throw preflightError("0058 audited import file is unavailable");
@@ -926,6 +946,7 @@ export async function runD1Schema(
                 injected: options.reader,
               }),
           });
+          protected0058Custody?.assertContinuity();
           return {
             kind: "takoserver.d1-schema-0058-readonly-reconciliation@v1",
             appliedMigrations: result.post.applied,
@@ -1128,6 +1149,8 @@ export async function runD1Schema(
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
     );
+    // The v3 rehearsal/production receipt chain is distinct from the protected
+    // 0058 attempt marker. This unchanged chain is not new dispatch authority.
     const receiptPath =
       invocation.environment === "integration"
         ? null
@@ -1712,6 +1735,11 @@ export async function runD1Schema(
         );
       }
       if (protected0058 !== null) {
+        if (protected0058Custody === null) {
+          throw mutationError(
+            "0058 protected attempt has no stable custody binding; prior dispatch cannot be ruled out",
+          );
+        }
         if (
           migrationImport === null ||
           migrationImportPath === null ||
@@ -1719,12 +1747,8 @@ export async function runD1Schema(
         ) {
           throw preflightError("0058 exact whole-file import artifact is unavailable");
         }
-        const custodyPath =
-          receiptPath ??
-          (options.receiptPath === undefined ? null : exactReceiptPath(options.receiptPath));
-        if (custodyPath === null) {
-          throw preflightError("0058 protected apply requires durable local attempt custody");
-        }
+        const custodyPath = protected0058Custody.attemptPrefix;
+        protected0058Custody.assertContinuity();
         const transition = await runProtected0058Transition({
           custodyPath,
           binding: {
@@ -1761,6 +1785,7 @@ export async function runD1Schema(
               injected: options.reader,
             }),
           importOnce: async () => {
+            protected0058Custody.assertContinuity();
             const result = await run(
               wranglerCommand([
                 "d1",
@@ -1778,6 +1803,7 @@ export async function runD1Schema(
             return result.exitCode === 0 ? "acknowledged" : "unknown";
           },
         });
+        protected0058Custody.assertContinuity();
         post = transition.post;
         providerAcknowledgement = transition.providerAcknowledgement;
       } else {

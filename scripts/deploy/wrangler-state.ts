@@ -322,12 +322,14 @@ export async function acquireWranglerVersionPublicationLease(input: {
   readonly accountId: string;
   readonly workerName: string;
   readonly root?: string;
+  /** Protected custody roots must already exist; never recreate a lost root. */
+  readonly createRoot?: boolean;
 }): Promise<WranglerVersionPublicationLease> {
   if (!ACCOUNT_ID.test(input.accountId) || !WORKER_NAME.test(input.workerName)) {
     throw preflightError("Worker Version publication lease requires one exact target");
   }
   const paths = publicationLeasePaths(input);
-  ensurePrivateLeaseRoot(paths.root);
+  ensurePrivateLeaseRoot(paths.root, input.createRoot ?? true);
   ensurePrivateLeaseFile(paths.lockPath);
   const holder = Bun.spawn(
     [

@@ -39,6 +39,12 @@ export interface DeployTarget {
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for the pending 0058 transition. */
   readonly schemaMaintenanceMode?: "pre-0058-quiesced";
+  /** Operator-selected, preprovisioned single-host custody for protected 0058 attempts. */
+  readonly protected0058Custody?: {
+    readonly root: string;
+    /** Pinned independently of the current filesystem entry; never inferred on load. */
+    readonly rootIdentity: { readonly device: string; readonly inode: string };
+  };
   /**
    * Other hostnames this deployment also answers on.
    *
@@ -414,6 +420,7 @@ export function parseDeployTarget(
       "integrationE2eCredentialAuthority",
       "artifactBlobIoMode",
       "schemaMaintenanceMode",
+      "protected0058Custody",
     ],
   );
 
@@ -449,6 +456,9 @@ export function parseDeployTarget(
     publicOrigin: httpsOrigin(value.publicOrigin),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
+    ...(value.protected0058Custody === undefined
+      ? {}
+      : { protected0058Custody: protected0058Custody(value.protected0058Custody) }),
     ...(value.aliases === undefined ? {} : { aliases: hostnames(value.aliases) }),
     ...(value.consoleOrigin === undefined
       ? {}
@@ -1215,6 +1225,42 @@ function edgeSupplyList(value: unknown): HostedEdgeSupplies {
   } catch {
     throw preflightError("deploy target `edgeSupplies` is invalid");
   }
+}
+
+function protected0058Custody(value: unknown): NonNullable<DeployTarget["protected0058Custody"]> {
+  if (!isRecord(value)) {
+    throw preflightError("deploy target `protected0058Custody` must be an object");
+  }
+  assertExactKeys(value, ["root", "rootIdentity"]);
+  if (
+    typeof value.root !== "string" ||
+    !isAbsolute(value.root) ||
+    resolve(value.root) !== value.root
+  ) {
+    throw preflightError(
+      "deploy target `protected0058Custody.root` must be a normalized absolute path",
+    );
+  }
+  if (!isRecord(value.rootIdentity)) {
+    throw preflightError("deploy target `protected0058Custody.rootIdentity` must be an object");
+  }
+  assertExactKeys(value.rootIdentity, ["device", "inode"]);
+  const positiveDecimal = /^[1-9][0-9]*$/u;
+  return {
+    root: value.root,
+    rootIdentity: {
+      device: pattern(
+        value.rootIdentity.device,
+        positiveDecimal,
+        "protected0058Custody.rootIdentity.device",
+      ),
+      inode: pattern(
+        value.rootIdentity.inode,
+        positiveDecimal,
+        "protected0058Custody.rootIdentity.inode",
+      ),
+    },
+  };
 }
 
 function assertExactKeys(
