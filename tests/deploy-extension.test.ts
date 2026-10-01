@@ -120,4 +120,88 @@ describe("curated deploy extension schema readback", () => {
     expect(statements).toHaveLength(3);
     expect(statements.every((statement) => /^SELECT\b/u.test(statement))).toBe(true);
   });
+
+  test("classifies schema-shape failures in the requested D1 read phase", async () => {
+    const validRows = [
+      { type: "table", name: "items", tbl_name: "items", sql: "CREATE TABLE items" },
+      { type: "table", name: "other", tbl_name: "other", sql: "CREATE TABLE other" },
+    ];
+    const malformedRows = [{ type: "table", name: "items" }];
+    const cases = [
+      {
+        name: "malformed schema row",
+        rows: malformedRows,
+        message: "D1 schema shape row has no string tbl_name",
+        detail: '{"keys":["name","type"]}',
+      },
+      {
+        name: "non-canonical schema ordering",
+        rows: [...validRows].reverse(),
+        message: "D1 schema shape readback is not canonically ordered",
+      },
+    ] as const;
+
+    for (const phase of ["preflight", "verification", "mutation", undefined] as const) {
+      for (const scenario of cases) {
+        const database = new deployExtension.RemoteD1("/unused/wrangler.jsonc", {
+          environment: {},
+          run: async (command) => {
+            const commandIndex = command.indexOf("--command");
+            const sql = commandIndex < 0 ? "" : command[commandIndex + 1];
+            if (sql === undefined) throw new Error("D1 process omitted its SQL command");
+            const results = sql.includes("SELECT name FROM sqlite_schema")
+              ? [{ name: "items" }]
+              : sql.includes("SELECT name FROM d1_migrations")
+                ? []
+                : scenario.rows;
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([{ success: true, results }]),
+              stderr: "",
+            };
+          },
+        });
+
+        const expectedPhase = phase ?? "preflight";
+        const state =
+          phase === undefined
+            ? deployExtension.readD1SchemaState(database)
+            : deployExtension.readD1SchemaState(database, phase);
+        await expect(state).rejects.toMatchObject({
+          name: "DeployError",
+          phase: expectedPhase,
+          message: scenario.message,
+          ...("detail" in scenario ? { detail: scenario.detail } : {}),
+        });
+      }
+    }
+  });
+
+  test("keeps D1 transport failures in the phase assigned by the database port", async () => {
+    for (const phase of ["verification", "mutation"] as const) {
+      const database = new deployExtension.RemoteD1("/unused/wrangler.jsonc", {
+        environment: {},
+        run: async (command) => {
+          const commandIndex = command.indexOf("--command");
+          const sql = commandIndex < 0 ? "" : command[commandIndex + 1];
+          if (sql === undefined) throw new Error("D1 process omitted its SQL command");
+          if (sql.includes("SELECT type, name, tbl_name")) {
+            return { exitCode: 9, stdout: "", stderr: "redacted provider output" };
+          }
+          const results = sql.includes("SELECT name FROM sqlite_schema") ? [{ name: "items" }] : [];
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify([{ success: true, results }]),
+            stderr: "",
+          };
+        },
+      });
+
+      await expect(deployExtension.readD1SchemaState(database, phase)).rejects.toMatchObject({
+        name: "DeployError",
+        phase,
+        message: "D1 canonical schema shape failed (exit 9)",
+      });
+    }
+  });
 });
