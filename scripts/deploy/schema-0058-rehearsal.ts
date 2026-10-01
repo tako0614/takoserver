@@ -47,6 +47,12 @@ import {
   persistPrepared0058Receipt,
   read0058DispatchedReceipt,
 } from "./schema-0058-apply-receipt.ts";
+import { type Protected0058Snapshot, readProtected0058Snapshot } from "./schema-0058-proof.ts";
+import {
+  persist0058VolumeReceipt,
+  read0058VolumeChain,
+  type VolumeReceipt,
+} from "./schema-0058-volume-receipt.ts";
 import type { DeployTarget } from "./target.ts";
 
 const SURFACE = "takoserver-d1-schema-0058-rehearsal";
@@ -81,6 +87,8 @@ export interface Rehearsal0058Options {
   readonly migrationDirectory?: string;
   readonly outputDirectory?: string;
   readonly fetcher?: (request: Request) => Promise<Response>;
+  /** Internal source-only selector; it is not a protected-wave approval. */
+  readonly volumeQualification?: { readonly kind: "selected-target-upper-bound" };
 }
 
 interface IsolatedTarget {
@@ -302,6 +310,31 @@ export function build0058SyntheticFixtureSql(): string {
   return `${lines.join("\n")}\n`;
 }
 
+function build0058VolumeFixtureSql(reference: Protected0058Snapshot): string {
+  // A deliberately small, code-owned fixture envelope. Larger references need
+  // a separately reviewed rehearsal; this is not a provider capacity claim.
+  const groups = Math.max(
+    1,
+    Math.ceil(reference.counts[TABLES[0]] / 4),
+    ...TABLES.slice(1).map((table) => Math.ceil(reference.counts[table] / 3)),
+    Math.ceil(reference.bytes / 1000),
+  );
+  if (groups > 32 || reference.maxBlobBytes > 65_552)
+    throw preflightError("0058 selected reference exceeds the bounded volume fixture envelope");
+  const base = build0058SyntheticFixtureSql();
+  const lines = Array.from({ length: groups }, (_, index) =>
+    base.replaceAll("synthetic-0058-", `synthetic-0058-volume-${index}-`),
+  );
+  const blob = Buffer.alloc(Math.max(reference.maxBlobBytes, 17), 0x5a).toString("hex");
+  lines.push(
+    `UPDATE ${TABLES[3]} SET ciphertext = X'${blob}' WHERE provider_id = ${sqlLiteral(PROVIDER)} AND resource_uid = 'synthetic-0058-volume-0-pending' AND name = 'object:MEDIA:runtime-proof';`,
+  );
+  const sql = `${lines.join("\n")}\n`;
+  if (Buffer.byteLength(sql) > 1024 * 1024)
+    throw preflightError("0058 selected reference exceeds the bounded volume fixture SQL");
+  return sql;
+}
+
 /** Value-free digest still binds every receipt column and exact sealed BLOB bytes. */
 export async function read0058FixtureSnapshot(
   database: Pick<RemoteD1, "query">,
@@ -521,6 +554,10 @@ export async function runD1Schema0058Rehearsal(
   ordinary: DeployTarget,
   options: Rehearsal0058Options = {},
 ): Promise<Record<string, unknown>> {
+  const volume = options.volumeQualification !== undefined;
+  const injectedTransport = options.run !== undefined || options.fetcher !== undefined;
+  if (volume && options.volumeQualification?.kind !== "selected-target-upper-bound")
+    throw preflightError("0058 volume selector is unsupported");
   if (
     invocation.environment !== "rehearsal" ||
     ordinary.environment !== "rehearsal" ||
@@ -562,7 +599,22 @@ export async function runD1Schema0058Rehearsal(
       );
     }
   };
+  const assertReferenceIdentity = async (stage: string): Promise<void> => {
+    const result = await provider.read(
+      `/d1/database/${encodeURIComponent(ordinary.d1.databaseId)}`,
+      `0058 selected reference D1 identity ${stage}`,
+    );
+    if (
+      typeof result !== "object" ||
+      result === null ||
+      Array.isArray(result) ||
+      (result as { uuid?: unknown }).uuid !== ordinary.d1.databaseId ||
+      (result as { name?: unknown }).name !== ordinary.d1.databaseName
+    )
+      throw preflightError("0058 selected reference D1 provider identity changed");
+  };
   await assertProviderIdentity("before inspection");
+  if (volume) await assertReferenceIdentity("before inspection");
   const source = readAuditedMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
@@ -584,6 +636,39 @@ export async function runD1Schema0058Rehearsal(
     );
     const initialDb = new RemoteD1(inspection, { environment, run });
     const initial = await readD1SchemaState(initialDb);
+    const referenceDb = volume
+      ? new RemoteD1(
+          config(
+            join(root, "reference-wrangler.jsonc"),
+            {
+              accountId: ordinary.accountId,
+              databaseId: ordinary.d1.databaseId,
+              databaseName: ordinary.d1.databaseName,
+            },
+            options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+          ),
+          { environment, run },
+        )
+      : null;
+    const referenceState = referenceDb === null ? null : await readD1SchemaState(referenceDb);
+    if (referenceState !== null) assertPredecessor(referenceState, source.names, source.files);
+    const referenceSnapshot =
+      referenceDb === null ? null : await readProtected0058Snapshot(referenceDb, "preflight");
+    const assertReferenceUnchanged = async (stage: string): Promise<void> => {
+      if (referenceDb === null || referenceState === null || referenceSnapshot === null) return;
+      await assertReferenceIdentity(stage);
+      const currentState = await readD1SchemaState(referenceDb, "verification");
+      const current = await readProtected0058Snapshot(referenceDb, "verification");
+      if (
+        JSON.stringify(currentState.applied) !== JSON.stringify(referenceState.applied) ||
+        currentState.shapeDigest !== referenceState.shapeDigest ||
+        current.digest !== referenceSnapshot.digest ||
+        current.bytes !== referenceSnapshot.bytes ||
+        current.maxBlobBytes !== referenceSnapshot.maxBlobBytes ||
+        JSON.stringify(current.counts) !== JSON.stringify(referenceSnapshot.counts)
+      )
+        throw verificationError("0058 selected reference D1 drifted during volume qualification");
+    };
     const is0057 = JSON.stringify(initial.applied) === JSON.stringify(source.names.slice(0, 57));
     const is0058 = JSON.stringify(initial.applied) === JSON.stringify(source.names.slice(0, 58));
     if (!is0057 && !is0058)
@@ -594,9 +679,10 @@ export async function runD1Schema0058Rehearsal(
       deriveExpectedApplicationShape(source.files.slice(0, is0057 ? 57 : 58)),
     );
     const empty = TABLES.every((table) => initialCounts[table] === 0);
-    const statusSnapshot =
-      empty ||
-      (isExactFixtureSize(initialCounts) && (await onlySyntheticRows(initialDb, "preflight")))
+    const statusSnapshot = volume
+      ? await readProtected0058Snapshot(initialDb, "preflight")
+      : empty ||
+          (isExactFixtureSize(initialCounts) && (await onlySyntheticRows(initialDb, "preflight")))
         ? await read0058FixtureSnapshot(initialDb, "preflight")
         : null;
     const receiptBinding: ApplyReceiptBinding = {
@@ -617,11 +703,48 @@ export async function runD1Schema0058Rehearsal(
     };
     const receiptPath =
       options.custodyPath ?? requireEnvironment("TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH");
-    const existingAttempt = read0058DispatchedReceipt(receiptPath);
+    if (volume) {
+      const chain = read0058VolumeChain(receiptPath);
+      const existingVolume = chain.dispatched ?? chain.prepared;
+      if (existingVolume !== null) {
+        const binding = existingVolume.binding;
+        if (
+          binding.referenceTargetD1.databaseId !== ordinary.d1.databaseId ||
+          binding.isolatedTargetD1.databaseId !== selected.databaseId ||
+          binding.commit !== invocation.commit ||
+          binding.importDigest !== auditedImport.digest ||
+          binding.referenceDigest !== referenceSnapshot?.digest ||
+          binding.referenceShapeDigest !== referenceState?.shapeDigest ||
+          binding.prefixDigest !==
+            digest(
+              JSON.stringify(
+                source.files.slice(0, 58).map(({ name, digest }) => ({ name, digest })),
+              ),
+            ) ||
+          (is0057 && binding.isolatedBeforeShapeDigest !== initial.shapeDigest)
+        )
+          throw preflightError("0058 volume attempt does not match selected source and targets");
+        const qualifiedVolume = chain.qualified;
+        return {
+          kind: "takoserver.d1-0058-selected-reference-volume-status@v1",
+          attemptState: chain.dispatched === null ? "prepared" : "dispatched",
+          reconciliation:
+            is0058 && qualifiedVolume !== null
+              ? "qualified-receipt-present-recheck-required"
+              : chain.dispatched === null
+                ? "prepared-not-dispatched-no-retry"
+                : "status-only-no-replay",
+          observedAppliedMigration: initial.applied.at(-1),
+          providerAcknowledgement: "not-claimed-by-status",
+          readyForProtectedApply: false,
+        };
+      }
+    }
+    const existingAttempt = volume ? null : read0058DispatchedReceipt(receiptPath);
     if (existingAttempt !== null) {
       const reconciled = attemptStatus(existingAttempt, receiptBinding, {
         initial,
-        snapshot: statusSnapshot,
+        snapshot: statusSnapshot as Fixture0058Snapshot | null,
         is0057,
         is0058,
         source,
@@ -653,7 +776,7 @@ export async function runD1Schema0058Rehearsal(
           empty &&
           canonicalShape &&
           statusSnapshot?.foreignKeyViolations === 0 &&
-          statusSnapshot.foreignKeysEnabled,
+          (volume || (statusSnapshot as Fixture0058Snapshot).foreignKeysEnabled),
         qualification: "not-production-evidence",
       };
     assertPredecessor(initial, source.names, source.files);
@@ -662,8 +785,23 @@ export async function runD1Schema0058Rehearsal(
         "0058 fixture custody requires four exact empty affected tables and enabled clean foreign keys",
       );
     const initialSnapshot = statusSnapshot;
-    if (initialSnapshot?.foreignKeyViolations !== 0 || initialSnapshot?.foreignKeysEnabled !== true)
+    if (
+      initialSnapshot?.foreignKeyViolations !== 0 ||
+      (!volume && (initialSnapshot as Fixture0058Snapshot).foreignKeysEnabled !== true)
+    )
       throw preflightError("0058 fixture custody requires enabled, clean foreign keys");
+    const readTargetSnapshot = (db: RemoteD1, phase: DeployPhase) =>
+      volume ? readProtected0058Snapshot(db, phase) : read0058FixtureSnapshot(db, phase);
+    const assertVolumeFixture = (snapshot: Protected0058Snapshot): void => {
+      if (
+        referenceSnapshot === null ||
+        TABLES.some((table) => snapshot.counts[table] < referenceSnapshot.counts[table]) ||
+        snapshot.bytes < referenceSnapshot.bytes ||
+        snapshot.maxBlobBytes < referenceSnapshot.maxBlobBytes ||
+        snapshot.foreignKeyViolations !== 0
+      )
+        throw verificationError("0058 volume fixture did not cover the selected reference bounds");
+    };
     const reviewer = requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW");
     if (!/^[A-Za-z0-9][A-Za-z0-9._@ -]{1,127}$/u.test(reviewer))
       throw preflightError("0058 independent reviewer is invalid");
@@ -673,6 +811,8 @@ export async function runD1Schema0058Rehearsal(
       policy: "clean-remote",
       run,
     });
+    if (volume && qualified.remoteRef === null)
+      throw preflightError("0058 selected reference volume requires a reviewed remote source ref");
     const gate = await run(["bun", "run", "check:migrations"]);
     if (gate.exitCode !== 0)
       throw preflightError(
@@ -726,7 +866,9 @@ export async function runD1Schema0058Rehearsal(
       selected,
       "query-probe-migrations",
     );
-    const fixtureSql = build0058SyntheticFixtureSql();
+    const fixtureSql = volume
+      ? build0058VolumeFixtureSql(referenceSnapshot as Protected0058Snapshot)
+      : build0058SyntheticFixtureSql();
     const fixturePath = join(release, "fixture.sql");
     writeFileSync(fixturePath, fixtureSql, { flag: "wx", mode: 0o600 });
     const configPath = config(join(release, "wrangler.jsonc"), selected, "migrations");
@@ -744,10 +886,11 @@ export async function runD1Schema0058Rehearsal(
     assertPredecessor(reread, source.names, source.files);
     if (reread.shapeDigest !== initial.shapeDigest)
       throw preflightError("0058 schema changed before fixture seed");
-    const beforeSeed = await read0058FixtureSnapshot(db, "preflight");
+    const beforeSeed = await readTargetSnapshot(db, "preflight");
     if (beforeSeed.digest !== initialSnapshot.digest)
       throw preflightError("0058 fixture tables changed before seed");
     await assertProviderIdentity("at fixture seed fence");
+    await assertReferenceUnchanged("at fixture seed fence");
     sealed.assertUnchanged();
     const fileCommand = (path: string) =>
       wranglerCommand([
@@ -782,11 +925,11 @@ export async function runD1Schema0058Rehearsal(
     } catch {
       // A transport exception is an unknown acknowledgement, not a retry signal.
     }
-    let seeded: Fixture0058Snapshot;
+    let seeded: Fixture0058Snapshot | Protected0058Snapshot;
     let seededState: D1SchemaState;
     try {
       seededState = await readD1SchemaState(db, "verification");
-      seeded = await read0058FixtureSnapshot(db, "verification");
+      seeded = await readTargetSnapshot(db, "verification");
     } catch {
       throw mutationError(
         "0058 fixture seed acknowledgement/readback indeterminate; do not replay",
@@ -800,7 +943,8 @@ export async function runD1Schema0058Rehearsal(
           fixtureCounts: seeded.counts,
         }),
       );
-    assertFixture(seeded);
+    if (volume) assertVolumeFixture(seeded as Protected0058Snapshot);
+    else assertFixture(seeded as Fixture0058Snapshot);
     if (
       seededState.shapeDigest !== initial.shapeDigest ||
       JSON.stringify(seededState.applied) !== JSON.stringify(initial.applied)
@@ -821,10 +965,11 @@ export async function runD1Schema0058Rehearsal(
         "0058 exact 0057 lineage or canonical shape changed at migration fence",
       );
     }
-    const fenced = await read0058FixtureSnapshot(db, "verification");
+    const fenced = await readTargetSnapshot(db, "verification");
     if (fenced.digest !== seeded.digest)
       throw verificationError("0058 fixture rows changed at migration fence");
     await assertProviderIdentity("at migration fence");
+    await assertReferenceUnchanged("at migration fence");
     sealed.assertUnchanged();
     let queryProbe: CommandResult | null = null;
     try {
@@ -846,10 +991,10 @@ export async function runD1Schema0058Rehearsal(
       // A lost acknowledgement is not evidence of a rolled-back /query.
     }
     let queryProbeState: D1SchemaState;
-    let queryProbeRows: Fixture0058Snapshot;
+    let queryProbeRows: Fixture0058Snapshot | Protected0058Snapshot;
     try {
       queryProbeState = await readD1SchemaState(db, "verification");
-      queryProbeRows = await read0058FixtureSnapshot(db, "verification");
+      queryProbeRows = await readTargetSnapshot(db, "verification");
     } catch {
       throw mutationError(
         "0058 query rollback probe readback indeterminate; quarantine isolated D1",
@@ -868,7 +1013,7 @@ export async function runD1Schema0058Rehearsal(
       ) ||
       queryProbeRows.digest !== seeded.digest ||
       queryProbeRows.foreignKeyViolations !== 0 ||
-      !queryProbeRows.foreignKeysEnabled
+      (!volume && !(queryProbeRows as Fixture0058Snapshot).foreignKeysEnabled)
     ) {
       throw mutationError(
         "0058 query rollback probe did not prove exact 0057 restoration; quarantine isolated D1",
@@ -898,10 +1043,10 @@ export async function runD1Schema0058Rehearsal(
       // A transport exception may follow either rollback or partial commit.
     }
     let probeState: D1SchemaState;
-    let probeRows: Fixture0058Snapshot;
+    let probeRows: Fixture0058Snapshot | Protected0058Snapshot;
     try {
       probeState = await readD1SchemaState(db, "verification");
-      probeRows = await read0058FixtureSnapshot(db, "verification");
+      probeRows = await readTargetSnapshot(db, "verification");
     } catch {
       throw mutationError("0058 rollback probe readback indeterminate; quarantine isolated D1");
     }
@@ -918,7 +1063,7 @@ export async function runD1Schema0058Rehearsal(
       ) ||
       probeRows.digest !== seeded.digest ||
       probeRows.foreignKeyViolations !== 0 ||
-      !probeRows.foreignKeysEnabled
+      (!volume && !(probeRows as Fixture0058Snapshot).foreignKeysEnabled)
     ) {
       throw mutationError(
         "0058 rollback probe did not prove exact 0057 restoration; quarantine isolated D1",
@@ -938,13 +1083,62 @@ export async function runD1Schema0058Rehearsal(
       );
     }
     await assertProviderIdentity("after rollback probe");
+    await assertReferenceUnchanged("after rollback probe");
     sealed.assertUnchanged();
-    const finalReceiptBinding: ApplyReceiptBinding = {
-      ...receiptBinding,
-      before: { ...receiptBinding.before, snapshot: seeded },
-    };
-    const preparedReceipt = persistPrepared0058Receipt(receiptPath, finalReceiptBinding);
-    persistDispatched0058Receipt(receiptPath, finalReceiptBinding, preparedReceipt);
+    let volumeBinding: VolumeReceipt["binding"] | null = null;
+    let volumeDispatched: VolumeReceipt | null = null;
+    if (volume) {
+      const reference = referenceSnapshot as Protected0058Snapshot;
+      const fixture = seeded as Protected0058Snapshot;
+      const binding: VolumeReceipt["binding"] = {
+        referenceTargetD1: {
+          accountId: ordinary.accountId,
+          databaseId: ordinary.d1.databaseId,
+          databaseName: ordinary.d1.databaseName,
+        },
+        isolatedTargetD1: selected,
+        commit: qualified.commit,
+        remoteRef: qualified.remoteRef as string,
+        prefixDigest: digest(
+          JSON.stringify(sealedSource.files.map(({ name, digest }) => ({ name, digest }))),
+        ),
+        referenceShapeDigest: (referenceState as D1SchemaState).shapeDigest,
+        isolatedBeforeShapeDigest: initial.shapeDigest,
+        isolatedTriggerDigest: triggerDigest(initial),
+        importDigest: migrationImport.digest,
+        importBytes: migrationImport.bytes,
+        fixtureSqlDigest: digest(fixtureSql),
+        queryRollbackProbeDigest: digest(migrationImport.sql),
+        importRollbackProbeDigest: digest(rollbackProbeSql),
+        referenceDigest: reference.digest,
+        referenceCounts: reference.counts,
+        referenceBytes: reference.bytes,
+        referenceMaxBlobBytes: reference.maxBlobBytes,
+        fixtureDigest: fixture.digest,
+        fixtureCounts: fixture.counts,
+        fixtureBytes: fixture.bytes,
+        fixtureMaxBlobBytes: fixture.maxBlobBytes,
+      };
+      volumeBinding = binding;
+      const prepared = persist0058VolumeReceipt(receiptPath, {
+        kind: "takoserver.d1-0058-selected-reference-volume@v1",
+        state: "prepared",
+        binding,
+      });
+      volumeDispatched = persist0058VolumeReceipt(receiptPath, {
+        kind: "takoserver.d1-0058-selected-reference-volume@v1",
+        state: "dispatched",
+        binding,
+        preparedDigest: prepared.digest,
+      });
+    } else {
+      const finalReceiptBinding: ApplyReceiptBinding = {
+        ...receiptBinding,
+        before: { ...receiptBinding.before, snapshot: seeded },
+      };
+      const preparedReceipt = persistPrepared0058Receipt(receiptPath, finalReceiptBinding);
+      persistDispatched0058Receipt(receiptPath, finalReceiptBinding, preparedReceipt);
+    }
     const started = performance.now();
     let applied: CommandResult | null = null;
     try {
@@ -955,10 +1149,10 @@ export async function runD1Schema0058Rehearsal(
     const elapsedMs = Math.round(performance.now() - started);
     // Even a nonzero exit may have committed: authoritative readback is mandatory and no replay follows.
     let post: D1SchemaState;
-    let after: Fixture0058Snapshot;
+    let after: Fixture0058Snapshot | Protected0058Snapshot;
     try {
       post = await readD1SchemaState(db, "verification");
-      after = await read0058FixtureSnapshot(db, "verification");
+      after = await readTargetSnapshot(db, "verification");
     } catch {
       throw mutationError("0058 import acknowledgement/readback indeterminate; do not replay");
     }
@@ -977,11 +1171,49 @@ export async function runD1Schema0058Rehearsal(
       triggerDigest(post) !== triggerDigest(initial) ||
       after.digest !== seeded.digest ||
       after.foreignKeyViolations !== 0 ||
-      !after.foreignKeysEnabled
+      (!volume && !(after as Fixture0058Snapshot).foreignKeysEnabled)
     ) {
       throw verificationError(
         "0058 D1 post-readback differs in lineage, schema, triggers, rows, BLOBs or foreign keys",
       );
+    }
+    if (volume) {
+      await assertProviderIdentity("after volume import");
+      await assertReferenceUnchanged("after volume import");
+      sealed.assertUnchanged();
+      const now = Date.now();
+      const qualifiedVolume = persist0058VolumeReceipt(receiptPath, {
+        kind: "takoserver.d1-0058-selected-reference-volume@v1",
+        state: "qualified",
+        binding: volumeBinding as VolumeReceipt["binding"],
+        dispatchedDigest: (volumeDispatched as VolumeReceipt).digest,
+        elapsedMs,
+        timingSource: injectedTransport
+          ? "injected-runner-local-test"
+          : "wrangler-remote-command-wall-clock",
+        postShapeDigest: post.shapeDigest,
+        providerAcknowledgement: injectedTransport
+          ? "injected-runner-simulated"
+          : "wrangler-command-ack-observed",
+        rollbackProbes: "both-failed-and-exact-0057-restored",
+        observedAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+        qualification: injectedTransport
+          ? "injected-runner-local-test-only"
+          : "selected-rehearsal-reference-only",
+      });
+      return {
+        ...qualifiedVolume,
+        referenceTargetD1: ordinary.d1,
+        measuredUpperBounds: {
+          counts: (seeded as Protected0058Snapshot).counts,
+          bytes: (seeded as Protected0058Snapshot).bytes,
+          maxBlobBytes: (seeded as Protected0058Snapshot).maxBlobBytes,
+        },
+        providerIdentityVerified: true,
+        readyForProtectedApply: false,
+        recovery: "one dispatched import; no replay on any uncertainty",
+      };
     }
     return {
       kind: "takoserver.d1-0058-isolated-qualification@v1",
@@ -1006,7 +1238,7 @@ export async function runD1Schema0058Rehearsal(
       fixtureBytes: Buffer.byteLength(fixtureSql),
       fixtureDigest: seeded.digest,
       fixtureCounts: seeded.counts,
-      blobBytes: seeded.blobBytes,
+      blobBytes: (seeded as Fixture0058Snapshot).blobBytes,
       elapsedMs,
       preShapeDigest: initial.shapeDigest,
       postShapeDigest: post.shapeDigest,
