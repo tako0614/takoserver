@@ -51,6 +51,10 @@ function dumpBytes(): Buffer {
   return Buffer.from(DUMP, "utf8");
 }
 
+function dumpBytesWithEmptyTable(): Buffer {
+  return Buffer.from(`${DUMP}\nCREATE TABLE "empty" (id INTEGER PRIMARY KEY);`, "utf8");
+}
+
 function digestBytes(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 }
@@ -101,7 +105,14 @@ function harness(
   options: {
     readonly truncateAt?: number;
     readonly exitCode?: number;
+    readonly throwImport?: boolean;
     readonly reportedQueries?: number;
+    readonly failQuery?: string;
+    readonly queryOverride?: {
+      readonly includes: string;
+      readonly afterImport?: boolean;
+      readonly results: readonly Record<string, unknown>[];
+    };
     readonly beforeRemoteReachability?: () => void;
   } = {},
 ): { readonly run: RestoreRun; readonly calls: string[][]; readonly fileImports: string[] } {
@@ -129,6 +140,7 @@ function harness(
       } catch {
         // The platform truncates mid-statement without failing the command.
       }
+      if (options.throwImport === true) throw new Error("import acknowledgement was lost");
       if (options.exitCode !== undefined && options.exitCode !== 0) {
         return { exitCode: options.exitCode, stdout: "", stderr: "transport interrupted" };
       }
@@ -141,6 +153,16 @@ function harness(
     const commandIndex = command.indexOf("--command");
     if (commandIndex >= 0) {
       const sql = command[commandIndex + 1] ?? "";
+      if (options.failQuery === sql) {
+        return { exitCode: 1, stdout: "", stderr: "readback unavailable" };
+      }
+      if (
+        options.queryOverride !== undefined &&
+        sql.includes(options.queryOverride.includes) &&
+        (!options.queryOverride.afterImport || fileImports.length > 0)
+      ) {
+        return ok(JSON.stringify([{ success: true, results: options.queryOverride.results }]));
+      }
       const results = database.query(sql).all() as Record<string, unknown>[];
       return ok(JSON.stringify([{ success: true, results }]));
     }
@@ -318,6 +340,22 @@ describe("snapshot restore verification", () => {
     );
     expect(comparison.ok).toBe(false);
     expect(comparison.mismatches).toContain("unexpected table delta");
+  });
+
+  test("bounds mismatch details while indicating omitted differences", () => {
+    const tables = Array.from({ length: 20 }, (_value, index) => `missing_${index}`);
+    const expectations = fixtureExpectations();
+    const comparison = verifySnapshotRestore(
+      {
+        ...expectations,
+        tables,
+        rowCounts: Object.fromEntries(tables.map((table) => [table, 0])),
+      },
+      readbackFixture({ tables: [] }),
+    );
+
+    expect(comparison.mismatches).toHaveLength(13);
+    expect(comparison.mismatches.at(-1)).toBe("... and 8 more mismatches");
   });
 });
 
@@ -520,8 +558,640 @@ describe("snapshot restore surface", () => {
         nulBytesRewritten: 1,
         targetTables: 0,
         targetMigrationRows: 0,
+        currentSnapshotExpectationMatch: null,
+        currentSnapshotExpectationMismatches: [],
         readyForApply: true,
       });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status compares a nonempty target with the pinned snapshot structure", async () => {
+    const directory = caseDirectory("status-match");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(normalizeSnapshotDump(dumpBytes()).sql);
+      const fixture = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(result).toMatchObject({
+        expectedTableNames: ["alpha", "beta"],
+        expectedRowsByTable: { alpha: 2, beta: 2 },
+        expectedIndexes: 1,
+        expectedTriggers: 0,
+        expectedViews: 1,
+        expectedMigrationLineageNames: ["0001_alpha.sql", "0002_beta.sql"],
+        currentTables: ["alpha", "beta"],
+        currentRowsByTable: { alpha: 2, beta: 2 },
+        currentIndexes: 1,
+        currentTriggers: 0,
+        currentViews: 1,
+        currentMigrationLineageNames: ["0001_alpha.sql", "0002_beta.sql"],
+        currentForeignKeyViolations: 0,
+        currentSnapshotExpectationMatch: true,
+        currentSnapshotExpectationMismatches: [],
+        readyForApply: false,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status reports partial target state as bounded expectation mismatches", async () => {
+    const directory = caseDirectory("status-partial");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(
+        'CREATE TABLE "alpha" (id INTEGER PRIMARY KEY, name TEXT, note TEXT);' +
+          "INSERT INTO \"alpha\" VALUES (1, 'one', NULL);",
+      );
+      const fixture = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(result).toMatchObject({
+        currentSnapshotExpectationMatch: false,
+        currentSnapshotExpectationMismatches: expect.arrayContaining([
+          "table alpha: expected 2 rows, read back 1",
+          "missing table beta",
+          "index count: expected 1, read back 0",
+        ]),
+        readyForApply: false,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status detects same-count tables and migration lineage with different names", async () => {
+    const directory = caseDirectory("status-same-count-wrong-names");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(
+        'CREATE TABLE "d1_migrations" (id INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);' +
+          "INSERT INTO d1_migrations VALUES (1, '0001_other.sql', 'now'), (2, '0002_other.sql', 'now');" +
+          'CREATE TABLE "alpha_renamed" (id INTEGER PRIMARY KEY, name TEXT, note TEXT);' +
+          'CREATE TABLE "beta_renamed" (id INTEGER PRIMARY KEY, payload TEXT);' +
+          "INSERT INTO \"alpha_renamed\" VALUES (1, 'one', NULL), (2, 'two', NULL);" +
+          "INSERT INTO \"beta_renamed\" VALUES (1, 'x'), (2, 'y');" +
+          'CREATE UNIQUE INDEX "renamed_alpha_by_name" ON "alpha_renamed" (name);' +
+          'CREATE VIEW "renamed_gamma" AS SELECT id FROM "alpha_renamed";',
+      );
+      const fixture = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(fixture.fileImports).toHaveLength(0);
+      expect(result).toMatchObject({
+        targetTables: 2,
+        targetMigrationRows: 2,
+        targetIndexes: 1,
+        targetViews: 1,
+        currentSnapshotExpectationMatch: false,
+        currentSnapshotExpectationMismatches: expect.arrayContaining([
+          "missing table alpha",
+          "missing table beta",
+          "unexpected table alpha_renamed",
+          "unexpected table beta_renamed",
+          "d1_migrations lineage entries differ",
+        ]),
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status fails closed with a read-only typed error when structural readback is unreadable", async () => {
+    const directory = caseDirectory("status-unreadable");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(normalizeSnapshotDump(dumpBytes()).sql);
+      const rowCountsQuery =
+        'SELECT (SELECT COUNT(*) FROM "alpha") AS "alpha", (SELECT COUNT(*) FROM "beta") AS "beta"';
+      const fixture = harness(database, { failQuery: rowCountsQuery });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("status"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("snapshot restore readback row counts failed");
+      expect(error.message).not.toContain("SELECT");
+      expect(error.detail).toBeUndefined();
+      expect(fixture.fileImports).toHaveLength(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status accepts a readable zero count for a snapshot table with no rows", async () => {
+    const directory = caseDirectory("status-zero-row-table");
+    const database = emptyDatabase();
+    try {
+      const bytes = dumpBytesWithEmptyTable();
+      const snapshotPath = writeSnapshot(directory, bytes);
+      database.exec(normalizeSnapshotDump(bytes).sql);
+      const fixture = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath, bytes),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(result).toMatchObject({
+        expectedRowsByTable: { alpha: 2, beta: 2, empty: 0 },
+        currentRowsByTable: { alpha: 2, beta: 2, empty: 0 },
+        currentSnapshotExpectationMatch: true,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    ["missing zero count", [{ alpha: 2, beta: 2 }]],
+    ["unexpected count alias", [{ alpha: 2, beta: 2, empty: 0, extra: 0 }]],
+    ["negative zero-table count", [{ alpha: 2, beta: 2, empty: -1 }]],
+    ["noninteger zero-table count", [{ alpha: 2, beta: 2, empty: 0.5 }]],
+    ["non-numeric zero-table count", [{ alpha: 2, beta: 2, empty: "0" }]],
+    [
+      "multiple count rows",
+      [
+        { alpha: 2, beta: 2, empty: 0 },
+        { alpha: 2, beta: 2, empty: 0 },
+      ],
+    ],
+  ] as const)(
+    "status refuses %s instead of classifying unknown count state",
+    async (_label, rows) => {
+      const directory = caseDirectory("status-malformed-count");
+      const database = emptyDatabase();
+      try {
+        const bytes = dumpBytesWithEmptyTable();
+        const snapshotPath = writeSnapshot(directory, bytes);
+        database.exec(normalizeSnapshotDump(bytes).sql);
+        const fixture = harness(database, {
+          queryOverride: {
+            includes: 'SELECT (SELECT COUNT(*) FROM "alpha")',
+            results: rows,
+          },
+        });
+        const error = await rejected(
+          runD1SnapshotRestore(
+            declaration(snapshotPath, bytes),
+            invocation("status"),
+            restoreOptions(directory, fixture.run),
+          ),
+        );
+
+        expect(error.phase).toBe("preflight");
+        expect(error.message).toContain("snapshot restore readback row counts");
+        expect(error.detail).toBeUndefined();
+        expect(fixture.fileImports).toHaveLength(0);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test("apply classifies a malformed successful count readback as verification failure without replay", async () => {
+    const directory = caseDirectory("apply-malformed-row-count");
+    const database = emptyDatabase();
+    try {
+      const bytes = dumpBytesWithEmptyTable();
+      const snapshotPath = writeSnapshot(directory, bytes);
+      const fixture = harness(database, {
+        queryOverride: {
+          includes: 'SELECT (SELECT COUNT(*) FROM "alpha")',
+          results: [{ alpha: 2, beta: 2, empty: "0" }],
+        },
+      });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath, bytes),
+          invocation("apply"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("verification");
+      expect(error.message).toContain(
+        "snapshot restore readback row counts returned a malformed count",
+      );
+      expect(fixture.fileImports).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    ["unknown kind", [{ kind: "unknown", n: 1 }]],
+    ["missing kind", [{ n: 1 }]],
+    ["zero group count", [{ kind: "index", n: 0 }]],
+  ] as const)(
+    "status refuses schema-object readback with %s instead of treating the target as empty",
+    async (_label, results) => {
+      const directory = caseDirectory("status-unknown-schema-object-kind");
+      const database = emptyDatabase();
+      try {
+        const snapshotPath = writeSnapshot(directory);
+        const fixture = harness(database, {
+          queryOverride: {
+            includes: "SELECT type AS kind, COUNT(*) AS n FROM sqlite_schema",
+            results,
+          },
+        });
+        const error = await rejected(
+          runD1SnapshotRestore(
+            declaration(snapshotPath),
+            invocation("status"),
+            restoreOptions(directory, fixture.run),
+          ),
+        );
+
+        expect(error.phase).toBe("preflight");
+        expect(error.message).toContain("snapshot restore target schema-object readback");
+        expect(error.detail).toBeUndefined();
+        expect(fixture.fileImports).toHaveLength(0);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test.each([
+    ["missing row", []],
+    ["multiple rows", [{ n: 0 }, { n: 0 }]],
+    ["unexpected alias", [{ n: 0, extra: 0 }]],
+    ["out-of-domain count", [{ n: 2 }]],
+    ["non-numeric count", [{ n: "0" }]],
+  ] as const)(
+    "status rejects migration-ledger presence readback with %s",
+    async (_label, results) => {
+      const directory = caseDirectory("status-malformed-ledger-presence");
+      const database = emptyDatabase();
+      try {
+        const snapshotPath = writeSnapshot(directory);
+        const fixture = harness(database, {
+          queryOverride: {
+            includes: "SELECT COUNT(*) AS n FROM sqlite_schema WHERE name = 'd1_migrations'",
+            results,
+          },
+        });
+        const error = await rejected(
+          runD1SnapshotRestore(
+            declaration(snapshotPath),
+            invocation("status"),
+            restoreOptions(directory, fixture.run),
+          ),
+        );
+
+        expect(error.phase).toBe("preflight");
+        expect(error.message).toContain("snapshot restore target migration ledger");
+        expect(error.detail).toBeUndefined();
+        expect(fixture.fileImports).toHaveLength(0);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test("status preserves valid absent and empty migration ledgers as empty targets", async () => {
+    const directory = caseDirectory("status-empty-ledger");
+    const database = emptyDatabase();
+    try {
+      database.exec(
+        'CREATE TABLE "d1_migrations" (id INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);',
+      );
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(result).toMatchObject({
+        targetTables: 0,
+        targetMigrationRows: 0,
+        currentSnapshotExpectationMatch: null,
+        readyForApply: true,
+      });
+      expect(fixture.fileImports).toHaveLength(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    ["missing row", []],
+    ["multiple rows", [{ n: 0 }, { n: 0 }]],
+    ["unexpected alias", [{ n: 0, extra: 0 }]],
+    ["negative count", [{ n: -1 }]],
+    ["noninteger count", [{ n: 0.5 }]],
+    ["non-numeric count", [{ n: "0" }]],
+  ] as const)("status rejects migration-row count readback with %s", async (_label, results) => {
+    const directory = caseDirectory("status-malformed-ledger-rows");
+    const database = emptyDatabase();
+    try {
+      database.exec(
+        'CREATE TABLE "d1_migrations" (id INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);',
+      );
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database, {
+        queryOverride: {
+          includes: "SELECT COUNT(*) AS n FROM d1_migrations",
+          results,
+        },
+      });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("status"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("snapshot restore target migration rows");
+      expect(error.detail).toBeUndefined();
+      expect(fixture.fileImports).toHaveLength(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("status rejects migration lineage rows that do not agree with the exact ledger count", async () => {
+    const directory = caseDirectory("status-malformed-ledger-lineage");
+    const database = emptyDatabase();
+    try {
+      database.exec(
+        'CREATE TABLE "d1_migrations" (id INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);' +
+          "INSERT INTO d1_migrations VALUES (1, '0001_alpha.sql', 'now');",
+      );
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database, {
+        queryOverride: {
+          includes: "SELECT name FROM d1_migrations ORDER BY id",
+          results: [],
+        },
+      });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("status"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("migration lineage count does not match");
+      expect(error.detail).toBeUndefined();
+      expect(fixture.fileImports).toHaveLength(0);
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    ["extra user-table field", [{ name: "alpha", extra: "value" }]],
+    ["duplicate user-table name", [{ name: "alpha" }, { name: "alpha" }]],
+  ] as const)(
+    "status rejects %s instead of accepting malformed target tables",
+    async (_label, results) => {
+      const directory = caseDirectory("status-malformed-user-tables");
+      const database = emptyDatabase();
+      try {
+        const snapshotPath = writeSnapshot(directory);
+        const fixture = harness(database, {
+          queryOverride: {
+            includes: "SELECT name FROM sqlite_schema WHERE type = 'table'",
+            results,
+          },
+        });
+        const error = await rejected(
+          runD1SnapshotRestore(
+            declaration(snapshotPath),
+            invocation("status"),
+            restoreOptions(directory, fixture.run),
+          ),
+        );
+
+        expect(error.phase).toBe("preflight");
+        expect(error.message).toContain("snapshot restore target tables");
+        expect(error.detail).toBeUndefined();
+        expect(fixture.fileImports).toHaveLength(0);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test("status treats every foreign-key result row as a violation without returning row details", async () => {
+    const directory = caseDirectory("status-foreign-key-row");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(normalizeSnapshotDump(dumpBytes()).sql);
+      const fixture = harness(database, {
+        queryOverride: {
+          includes: "PRAGMA foreign_key_check",
+          results: [{ privateRowDetail: "never returned" }],
+        },
+      });
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        invocation("status"),
+        restoreOptions(directory, fixture.run),
+      );
+
+      expect(result).toMatchObject({
+        currentSnapshotExpectationMatch: false,
+        currentSnapshotExpectationMismatches: ["foreign key violations: 1"],
+      });
+      expect(JSON.stringify(result)).not.toContain("privateRowDetail");
+      expect(JSON.stringify(result)).not.toContain("never returned");
+    } finally {
+      database.close();
+    }
+  });
+
+  test.each([
+    [
+      "COUNT",
+      "throw",
+      'SELECT (SELECT COUNT(*) FROM "alpha")',
+      [{ alpha: 2, beta: 2, empty: "0" }],
+    ],
+    [
+      "COUNT",
+      "nonzero",
+      'SELECT (SELECT COUNT(*) FROM "alpha")',
+      [{ alpha: 2, beta: 2, empty: "0" }],
+    ],
+    [
+      "schema",
+      "throw",
+      "SELECT type AS kind, COUNT(*) AS n FROM sqlite_schema",
+      [{ kind: "other", n: 1 }],
+    ],
+    [
+      "schema",
+      "nonzero",
+      "SELECT type AS kind, COUNT(*) AS n FROM sqlite_schema",
+      [{ kind: "other", n: 1 }],
+    ],
+    [
+      "ledger",
+      "throw",
+      "SELECT COUNT(*) AS n FROM sqlite_schema WHERE name = 'd1_migrations'",
+      [{ n: 2 }],
+    ],
+    [
+      "ledger",
+      "nonzero",
+      "SELECT COUNT(*) AS n FROM sqlite_schema WHERE name = 'd1_migrations'",
+      [{ n: 2 }],
+    ],
+  ] as const)(
+    "unknown or nonzero import acknowledgement dominates malformed %s readback",
+    async (_shape, acknowledgement, includes, results) => {
+      const directory = caseDirectory("apply-unknown-ack-malformed-readback");
+      const database = emptyDatabase();
+      try {
+        const bytes = dumpBytesWithEmptyTable();
+        const snapshotPath = writeSnapshot(directory, bytes);
+        const fixture = harness(database, {
+          ...(acknowledgement === "throw" ? { throwImport: true } : { exitCode: 1 }),
+          queryOverride: { includes, results, afterImport: true },
+        });
+        const error = await rejected(
+          runD1SnapshotRestore(
+            declaration(snapshotPath, bytes),
+            invocation("apply"),
+            restoreOptions(directory, fixture.run),
+          ),
+        );
+
+        expect(error.phase).toBe("mutation");
+        expect(error.message).toContain("acknowledgement/readback is indeterminate");
+        expect(fixture.fileImports).toHaveLength(1);
+        expect(fixture.calls.filter((command) => command.includes("--file"))).toHaveLength(1);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test("apply preserves verification failure for a malformed ledger after successful acknowledgement", async () => {
+    const directory = caseDirectory("apply-malformed-ledger-readback");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      const fixture = harness(database, {
+        queryOverride: {
+          includes: "SELECT COUNT(*) AS n FROM d1_migrations",
+          results: [{ n: "2" }],
+          afterImport: true,
+        },
+      });
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("apply"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("verification");
+      expect(error.message).toContain("snapshot restore target migration rows");
+      expect(fixture.fileImports).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("fresh status compares an import after its accepted acknowledgement lost readback without replay", async () => {
+    const directory = caseDirectory("status-after-lost-readback");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      const failedApplyReadback = harness(database, {
+        failQuery:
+          'SELECT (SELECT COUNT(*) FROM "alpha") AS "alpha", (SELECT COUNT(*) FROM "beta") AS "beta"',
+      });
+      const applyError = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("apply"),
+          restoreOptions(directory, failedApplyReadback.run),
+        ),
+      );
+
+      expect(applyError.phase).toBe("mutation");
+      expect(applyError.message).toContain("acknowledgement/readback is indeterminate");
+      expect(failedApplyReadback.fileImports).toHaveLength(1);
+
+      const freshStatusInvocation = invocation("status");
+      const statusRun = harness(database);
+      const result = await runD1SnapshotRestore(
+        declaration(snapshotPath),
+        freshStatusInvocation,
+        restoreOptions(directory, statusRun.run, {
+          outputDirectory: join(directory, "status-output"),
+        }),
+      );
+
+      expect(result).toMatchObject({
+        currentSnapshotExpectationMatch: true,
+        currentSnapshotExpectationMismatches: [],
+        readyForApply: false,
+      });
+      expect(statusRun.fileImports).toHaveLength(0);
+      expect(failedApplyReadback.fileImports).toHaveLength(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("apply still refuses a nonempty target even when its structure matches the snapshot", async () => {
+    const directory = caseDirectory("apply-matching-target");
+    const database = emptyDatabase();
+    try {
+      const snapshotPath = writeSnapshot(directory);
+      database.exec(normalizeSnapshotDump(dumpBytes()).sql);
+      const fixture = harness(database);
+      const error = await rejected(
+        runD1SnapshotRestore(
+          declaration(snapshotPath),
+          invocation("apply"),
+          restoreOptions(directory, fixture.run),
+        ),
+      );
+
+      expect(error.phase).toBe("preflight");
+      expect(error.message).toContain("never resets or overwrites a D1");
+      expect(fixture.fileImports).toHaveLength(0);
     } finally {
       database.close();
     }

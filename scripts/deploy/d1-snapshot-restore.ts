@@ -121,6 +121,15 @@ export interface SnapshotRestoreComparison {
   readonly mismatches: readonly string[];
 }
 
+class SnapshotReadbackShapeError extends DeployError {}
+
+function readbackPhaseError(phase: DeployPhase, message: string): SnapshotReadbackShapeError {
+  return new SnapshotReadbackShapeError(
+    phase === "preflight" ? "preflight" : "verification",
+    message,
+  );
+}
+
 /**
  * Rewrites every raw NUL byte that a `wrangler d1 export` dump carries inside a
  * TEXT literal as `'||char(0)||'`.
@@ -281,16 +290,18 @@ export function verifySnapshotRestore(
       mismatches.push(`table ${table}: expected ${expectedRows} rows, read back ${actualRows}`);
     }
   }
-  const lineageDiffers =
-    actual.migrationLineage.length !== expected.migrationLineage.length ||
-    actual.migrationLineage.some((name, index) => name !== expected.migrationLineage[index]);
-  if (lineageDiffers) {
+  const lineageNamesDiffer = actual.migrationLineage.some(
+    (name, index) => name !== expected.migrationLineage[index],
+  );
+  if (actual.migrationLineage.length !== expected.migrationLineage.length) {
     mismatches.push(
       "d1_migrations lineage: expected " +
         expected.migrationLineage.length +
         " entries, read back " +
         actual.migrationLineage.length,
     );
+  } else if (lineageNamesDiffer) {
+    mismatches.push("d1_migrations lineage entries differ");
   }
   if (actual.foreignKeyViolations !== 0) {
     mismatches.push(`foreign key violations: ${actual.foreignKeyViolations}`);
@@ -637,27 +648,87 @@ interface TargetState {
   readonly views: number;
 }
 
+async function readExactStringRows(
+  database: RemoteD1,
+  phase: DeployPhase,
+  description: string,
+  sql: string,
+  column: string,
+): Promise<readonly string[]> {
+  const rows = await database.query(phase, description, sql);
+  const values: string[] = [];
+  for (const row of rows) {
+    if (Object.keys(row).length !== 1 || typeof row[column] !== "string") {
+      throw readbackPhaseError(phase, `${description} returned a malformed row`);
+    }
+    values.push(row[column] as string);
+  }
+  return values;
+}
+
+function readExactCountResult(
+  rows: readonly Record<string, unknown>[],
+  phase: DeployPhase,
+  description: string,
+  maximum?: number,
+): number {
+  if (rows.length !== 1) {
+    throw readbackPhaseError(phase, `${description} returned an unexpected row`);
+  }
+  const row = rows[0] ?? {};
+  const count = row.n;
+  if (
+    Object.keys(row).length !== 1 ||
+    typeof count !== "number" ||
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    (maximum !== undefined && count > maximum)
+  ) {
+    throw readbackPhaseError(phase, `${description} returned a malformed count`);
+  }
+  return count;
+}
+
 async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<TargetState> {
-  const userTables = await database.column(
+  const userTables = await readExactStringRows(
+    database,
     phase,
     "snapshot restore target tables",
     USER_TABLES_SQL,
     "name",
   );
+  if (new Set(userTables).size !== userTables.length) {
+    throw readbackPhaseError(phase, "snapshot restore target tables returned duplicate names");
+  }
   const schemaObjects = await database.query(
     phase,
     "snapshot restore target schema objects",
     SCHEMA_OBJECT_COUNTS_SQL,
   );
+  const schemaObjectKinds = new Set(["index", "trigger", "view"]);
+  const observedSchemaObjectKinds = new Set<string>();
+  for (const row of schemaObjects) {
+    const kind = row.kind;
+    const count = row.n;
+    if (
+      Object.keys(row).length !== 2 ||
+      typeof kind !== "string" ||
+      !schemaObjectKinds.has(kind) ||
+      observedSchemaObjectKinds.has(kind) ||
+      !Number.isSafeInteger(count) ||
+      Number(count) < 1
+    ) {
+      throw readbackPhaseError(
+        phase,
+        "snapshot restore target schema-object readback is malformed",
+      );
+    }
+    observedSchemaObjectKinds.add(kind);
+  }
   const schemaObjectCount = (kind: string): number => {
     const row = schemaObjects.find((entry) => entry.kind === kind);
     if (row === undefined) return 0;
-    const count = row.n;
-    if (!Number.isSafeInteger(count) || Number(count) < 0) {
-      const error = "snapshot restore target schema-object count is malformed";
-      throw phase === "preflight" ? preflightError(error) : verificationError(error);
-    }
-    return Number(count);
+    return Number(row.n);
   };
   const indexes = schemaObjectCount("index");
   const triggers = schemaObjectCount("trigger");
@@ -667,7 +738,13 @@ async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<
     "snapshot restore target migration ledger",
     LEDGER_TABLE_SQL,
   );
-  const ledgerPresent = ledger.length === 1 && ledger[0]?.n === 1;
+  const ledgerCount = readExactCountResult(
+    ledger,
+    phase,
+    "snapshot restore target migration ledger",
+    1,
+  );
+  const ledgerPresent = ledgerCount === 1;
   let migrationRows = 0;
   let migrationLineage: readonly string[] = [];
   if (ledgerPresent) {
@@ -676,17 +753,20 @@ async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<
       "snapshot restore target migration rows",
       LEDGER_ROWS_SQL,
     );
-    const count = rows.length === 1 ? rows[0]?.n : undefined;
-    if (!Number.isSafeInteger(count) || Number(count) < 0) {
-      throw preflightError("snapshot restore target migration ledger readback is malformed");
-    }
-    migrationRows = Number(count);
-    migrationLineage = await database.column(
+    migrationRows = readExactCountResult(rows, phase, "snapshot restore target migration rows");
+    migrationLineage = await readExactStringRows(
+      database,
       phase,
       "snapshot restore target migration lineage",
       LEDGER_LINEAGE_SQL,
       "name",
     );
+    if (migrationLineage.length !== migrationRows) {
+      throw readbackPhaseError(
+        phase,
+        "snapshot restore target migration lineage count does not match its ledger count",
+      );
+    }
   }
   return { userTables, migrationRows, migrationLineage, indexes, triggers, views };
 }
@@ -697,12 +777,16 @@ async function readRestoreReadback(
   phase: DeployPhase,
   reportedQueries: number | null,
 ): Promise<SnapshotRestoreReadback> {
-  const tables = await database.column(
+  const tables = await readExactStringRows(
+    database,
     phase,
     "snapshot restore readback tables",
     USER_TABLES_SQL,
     "name",
   );
+  if (new Set(tables).size !== tables.length) {
+    throw readbackPhaseError(phase, "snapshot restore readback tables returned duplicate names");
+  }
   const present = expected.tables.filter((table) => tables.includes(table));
   const rowCounts: Record<string, number> = {};
   if (present.length > 0) {
@@ -711,12 +795,31 @@ async function readRestoreReadback(
       present.map((table) => `(SELECT COUNT(*) FROM "${table}") AS "${table}"`).join(", ");
     const rows = await database.query(phase, "snapshot restore readback row counts", sql);
     if (rows.length !== 1) {
-      throw verificationError("snapshot restore readback row counts returned an unexpected row");
+      throw readbackPhaseError(
+        phase,
+        "snapshot restore readback row counts returned an unexpected row",
+      );
     }
     const row = rows[0] ?? {};
+    const expectedAliases = new Set(present);
+    if (
+      Object.keys(row).length !== expectedAliases.size ||
+      Object.keys(row).some((alias) => !expectedAliases.has(alias))
+    ) {
+      throw readbackPhaseError(
+        phase,
+        "snapshot restore readback row counts returned a malformed row",
+      );
+    }
     for (const table of present) {
       const value = row[table];
-      if (Number.isSafeInteger(value) && Number(value) >= 0) rowCounts[table] = Number(value);
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw readbackPhaseError(
+          phase,
+          "snapshot restore readback row counts returned a malformed count",
+        );
+      }
+      rowCounts[table] = value;
     }
   }
   const target = await readTargetState(database, phase);
@@ -894,6 +997,11 @@ export async function runD1SnapshotRestore(
     const empty = isEmptyTarget(target);
 
     if (invocation.action === "status") {
+      const currentReadback = empty
+        ? null
+        : await readRestoreReadback(database, expected, "preflight", null);
+      const currentComparison =
+        currentReadback === null ? null : verifySnapshotRestore(expected, currentReadback);
       return {
         kind: "takoserver.d1-snapshot-restore-status@v1",
         surface: SURFACE,
@@ -909,13 +1017,28 @@ export async function runD1SnapshotRestore(
         nulBytesRewritten: normalized.nulBytes,
         expectedStatements: expected.statements,
         expectedTables: expected.tables.length,
+        expectedTableNames: expected.tables,
         expectedRows,
+        expectedRowsByTable: expected.rowCounts,
+        expectedIndexes: expected.indexes,
+        expectedTriggers: expected.triggers,
+        expectedViews: expected.views,
         expectedMigrationLineage: expected.migrationLineage.length,
+        expectedMigrationLineageNames: expected.migrationLineage,
         targetTables: target.userTables.length,
         targetMigrationRows: target.migrationRows,
         targetIndexes: target.indexes,
         targetTriggers: target.triggers,
         targetViews: target.views,
+        currentTables: currentReadback?.tables ?? null,
+        currentRowsByTable: currentReadback?.rowCounts ?? null,
+        currentIndexes: currentReadback?.indexes ?? null,
+        currentTriggers: currentReadback?.triggers ?? null,
+        currentViews: currentReadback?.views ?? null,
+        currentMigrationLineageNames: currentReadback?.migrationLineage ?? null,
+        currentForeignKeyViolations: currentReadback?.foreignKeyViolations ?? null,
+        currentSnapshotExpectationMatch: currentComparison?.ok ?? null,
+        currentSnapshotExpectationMismatches: currentComparison?.mismatches ?? [],
         readyForApply: empty,
       };
     }
@@ -967,7 +1090,15 @@ export async function runD1SnapshotRestore(
     let readback: SnapshotRestoreReadback;
     try {
       readback = await readRestoreReadback(database, expected, "verification", reportedQueries);
-    } catch {
+    } catch (error) {
+      if (
+        imported !== null &&
+        imported.exitCode === 0 &&
+        error instanceof SnapshotReadbackShapeError &&
+        error.phase === "verification"
+      ) {
+        throw error;
+      }
       throw mutationError(
         "snapshot restore import acknowledgement/readback is indeterminate; inspect the target and do not replay",
       );
