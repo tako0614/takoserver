@@ -123,6 +123,8 @@ export type SelfhostDataPlaneRoutes = (request: Request, url: URL) => Promise<Re
 export interface SelfhostDataPlanes {
   readonly routes: SelfhostDataPlaneRoutes;
   readonly maintenance: SelfhostDataPlaneMaintenance;
+  /** Fences routed SQL work and closes every cached SQLite handle owned here. */
+  close(): Promise<void>;
 }
 
 const MAX_REQUEST_BYTES = 40 * 1024 * 1024;
@@ -199,6 +201,8 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   // records, but use one absolute Host-owned path for filesystem operations.
   // The Bun entry's default `.takoserver` root is relative.
   const databasePath = (name: string): string => resolve(options.databasePath(name));
+  let closeRequested = false;
+  let closePromise: Promise<void> | undefined;
 
   /**
    * One handle per database file, kept open.
@@ -212,6 +216,10 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
    * including SQLite's sidecar files; it never sweeps a directory.
    */
   const database = (name: string): Database => {
+    // SQLite statements below run synchronously on this event loop. Once close
+    // sets this fence, a request still awaiting authorization/body can no longer
+    // allocate a handle that outlives the shutdown.
+    if (closeRequested) throw new PlaneError("backend_unavailable");
     const existing = databases.get(name);
     if (existing) return existing;
     const path = databasePath(name);
@@ -243,6 +251,7 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
   };
 
   const routes: SelfhostDataPlaneRoutes = async (request, url) => {
+    if (closeRequested) return refusal("backend_unavailable", 503);
     if (url.pathname === SELFHOST_DATA_PLANE_VECTOR_PATH) {
       const rejectVector = (code: "invalid_spec" | "quota" | "unavailable", status: number) =>
         Response.json({ ok: false, error: { code } }, { status });
@@ -374,6 +383,24 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
     }
   };
 
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closeRequested = true;
+    // SQL use below is synchronous on this event loop. Requests still awaiting
+    // authorization/body hit the fence before they can open or use a handle;
+    // an executing statement finishes before this queued close can run.
+    closePromise = Promise.resolve().then(() => {
+      for (const [name, opened] of databases) {
+        opened.close();
+        databases.delete(name);
+      }
+    });
+    void closePromise.catch(() => {
+      closePromise = undefined;
+    });
+    return closePromise;
+  };
+
   const maintenance: SelfhostDataPlaneMaintenance = {
     async deleteKvNamespace(namespaceId) {
       // A namespace id is derived from the Resource's own uid, so this can
@@ -453,7 +480,7 @@ export function createSelfhostDataPlanes(options: SelfhostDataPlaneOptions): Sel
     },
   };
 
-  return { routes, maintenance };
+  return { routes, maintenance, close };
 }
 
 /**
@@ -471,7 +498,7 @@ export function serveSelfhostDataPlanes(
   readonly address: string;
   readonly port: number;
   readonly maintenance: SelfhostDataPlaneMaintenance;
-  stop(closeActive?: boolean): void;
+  stop(closeActive?: boolean): Promise<void>;
 } {
   const planes = createSelfhostDataPlanes(options);
   const server = Bun.serve({
@@ -485,11 +512,24 @@ export function serveSelfhostDataPlanes(
       );
     },
   });
+  let stopPromise: Promise<void> | undefined;
   return {
     address: `127.0.0.1:${server.port}`,
     port: Number(server.port),
     maintenance: planes.maintenance,
-    stop: (closeActive) => server.stop(closeActive),
+    stop: (closeActive) => {
+      if (stopPromise) return stopPromise;
+      const stopping = (async () => {
+        const listenerStopping = server.stop(closeActive);
+        const planesClosing = planes.close();
+        await Promise.all([listenerStopping, planesClosing]);
+      })();
+      stopPromise = stopping;
+      void stopping.catch(() => {
+        stopPromise = undefined;
+      });
+      return stopping;
+    },
   };
 }
 
