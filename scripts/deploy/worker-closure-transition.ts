@@ -1,10 +1,7 @@
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import {
-  artifactBlobIoSchemaAllowsPending,
-  probeArtifactBlobIoQuiescence,
-} from "./artifact-blob-io-compatibility.ts";
+import { probeArtifactBlobIoQuiescence } from "./artifact-blob-io-compatibility.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
@@ -28,10 +25,12 @@ import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   probeProduct,
+  probeSchemaMaintenance,
   providerExecutorQualificationReader,
   type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
   withProviderExecutorQualification,
+  workerSchemaAllowsPending,
 } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { assertTargetComposes } from "./worker-composition.ts";
@@ -143,6 +142,9 @@ export async function runWorkerClosureTransition(
   if (target.environment !== invocation.environment) {
     throw preflightError("Worker invocation and target environments differ");
   }
+  if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
+    throw preflightError("Worker maintenance selectors conflict");
+  }
   if (invocation.surface !== "takoserver-worker-authority-cutover") {
     throw preflightError("closure transition requires takoserver-worker-authority-cutover");
   }
@@ -245,7 +247,14 @@ export async function runWorkerClosureTransition(
 
     if (invocation.action === "status" && history.versionId !== selector) {
       return withProviderExecutorQualification(
-        await appliedClosureTransitionStatus(invocation, target, state, migrations, history),
+        await appliedClosureTransitionStatus(
+          invocation,
+          target,
+          state,
+          migrations,
+          history,
+          sourceRepositoryRoot,
+        ),
         providerExecutorBefore,
       );
     }
@@ -265,6 +274,12 @@ export async function runWorkerClosureTransition(
     );
     const migrationState = await migrations.read();
     const pending = pendingMigrations(migrationState.local, migrationState.applied);
+    if (
+      target.schemaMaintenanceMode !== undefined &&
+      !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)
+    ) {
+      throw preflightError("0058 Worker maintenance requires exact applied 0057 and 0058 next");
+    }
 
     if (invocation.action === "status") {
       return withProviderExecutorQualification(
@@ -286,16 +301,20 @@ export async function runWorkerClosureTransition(
           secretInputsRequired: [...delta.addedSecrets, ...delta.rotatedSecrets].sort(),
           appliedMigrations: migrationState.applied,
           pendingMigrations: pending,
+          ...(target.schemaMaintenanceMode === undefined
+            ? {}
+            : { maintenance: target.schemaMaintenanceMode }),
           mutationApplied: false,
           ready:
-            artifactBlobIoSchemaAllowsPending(target, pending) &&
+            target.schemaMaintenanceMode === undefined &&
+            workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot) &&
             (providerExecutorBefore === null || providerExecutorBefore.ready),
         },
         providerExecutorBefore,
       );
     }
 
-    if (!artifactBlobIoSchemaAllowsPending(target, pending)) {
+    if (!workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)) {
       throw preflightError(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
@@ -425,7 +444,7 @@ export async function runWorkerClosureTransition(
     }
     const finalMigrationState = await migrations.read();
     const finalPending = pendingMigrations(finalMigrationState.local, finalMigrationState.applied);
-    if (!artifactBlobIoSchemaAllowsPending(target, finalPending)) {
+    if (!workerSchemaAllowsPending(target, finalMigrationState, sourceRepositoryRoot)) {
       throw preflightError(
         "closure transition refuses changed pending D1 migrations before upload; apply takoserver-d1-schema first",
         JSON.stringify(finalPending),
@@ -503,7 +522,7 @@ export async function runWorkerClosureTransition(
     }
     const afterMigrations = await migrations.read();
     const afterPending = pendingMigrations(afterMigrations.local, afterMigrations.applied);
-    if (!artifactBlobIoSchemaAllowsPending(target, afterPending)) {
+    if (!workerSchemaAllowsPending(target, afterMigrations, sourceRepositoryRoot)) {
       throw verificationError("closure transition left pending D1 migrations");
     }
     const providerExecutorAfter =
@@ -518,15 +537,20 @@ export async function runWorkerClosureTransition(
       );
     }
     const probe =
-      target.artifactBlobIoMode === "pre-0043-quiesced"
-        ? await probeArtifactBlobIoQuiescence(
+      target.schemaMaintenanceMode === "pre-0058-quiesced"
+        ? await probeSchemaMaintenance(
             target.publicOrigin,
             options.fetcher ?? ((input, init) => fetch(input, init)),
           )
-        : await probeProduct(
-            target.publicOrigin,
-            options.fetcher ?? ((input, init) => fetch(input, init)),
-          );
+        : target.artifactBlobIoMode === "pre-0043-quiesced"
+          ? await probeArtifactBlobIoQuiescence(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            )
+          : await probeProduct(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            );
     const rollbackVersionId = after.history.previousVersionId;
     if (rollbackVersionId === null) {
       throw verificationError(
@@ -556,6 +580,9 @@ export async function runWorkerClosureTransition(
         deploymentId: after.history.deploymentId,
         versionId: after.history.versionId,
         pendingMigrations: afterPending,
+        ...(target.schemaMaintenanceMode === undefined
+          ? {}
+          : { maintenance: target.schemaMaintenanceMode }),
         probe,
         mutationApplied: true,
         rollback:
@@ -581,6 +608,7 @@ async function appliedClosureTransitionStatus(
   state: WorkerState,
   migrations: WorkerMigrationReader,
   history: WorkerDeploymentHistory,
+  sourceRepositoryRoot: string,
 ): Promise<Record<string, unknown>> {
   const selector = invocation.closurePredecessorVersionId;
   if (history.previousVersionId !== selector) {
@@ -613,6 +641,12 @@ async function appliedClosureTransitionStatus(
   });
   const migrationState = await migrations.read();
   const pending = pendingMigrations(migrationState.local, migrationState.applied);
+  if (
+    target.schemaMaintenanceMode !== undefined &&
+    !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)
+  ) {
+    throw preflightError("0058 Worker maintenance requires exact applied 0057 and 0058 next");
+  }
   return {
     kind: "takoserver.worker-closure-transition-status@v1",
     surface: invocation.surface,
@@ -628,9 +662,14 @@ async function appliedClosureTransitionStatus(
     delta: { ...normalizedWorkerClosureDelta(invocation.delta) },
     appliedMigrations: migrationState.applied,
     pendingMigrations: pending,
+    ...(target.schemaMaintenanceMode === undefined
+      ? {}
+      : { maintenance: target.schemaMaintenanceMode }),
     mutationApplied: false,
     ready:
-      artifactBlobIoSchemaAllowsPending(target, pending) && successor.commit === invocation.commit,
+      target.schemaMaintenanceMode === undefined &&
+      workerSchemaAllowsPending(target, migrationState) &&
+      successor.commit === invocation.commit,
   };
 }
 

@@ -141,6 +141,73 @@ interface WorkerInspection {
   readonly integrationE2eCredentialAuthorityConfigured: boolean;
 }
 
+const SCHEMA_0058_NAME = "0058_cloudflare_managed_worker_domain_receipts.sql";
+
+/** One non-serving source profile, not authority to apply 0058 or its later catalog tail. */
+export function workerSchemaAllowsPending(
+  target: DeployTarget,
+  migrations: { readonly local: readonly string[]; readonly applied: readonly string[] },
+  sourceRepositoryRoot = REPOSITORY,
+): boolean {
+  if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
+    return artifactBlobIoSchemaAllowsPending(
+      target,
+      pendingMigrations(migrations.local, migrations.applied),
+    );
+  }
+  if (target.artifactBlobIoMode !== undefined) return false;
+  const source = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
+  if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+  if (migrations.applied.length !== 57 || source.names[57] !== SCHEMA_0058_NAME) return false;
+  return migrations.applied.every((name, index) => name === source.names[index]);
+}
+
+export async function probeSchemaMaintenance(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<{ readonly url: string; readonly status: 503; readonly traffic: "maintenance" }> {
+  const url = `${origin}/healthz`;
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      method: "GET",
+      headers: { "cache-control": "no-cache" },
+      redirect: "error",
+    });
+  } catch (error) {
+    throw verificationError(
+      "0058 schema maintenance Worker probe failed",
+      error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    );
+  }
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (
+    response.status !== 503 ||
+    response.headers.get("cache-control") !== "no-store" ||
+    response.headers.get("retry-after") !== "60" ||
+    typeof body !== "object" ||
+    body === null ||
+    !("error" in body) ||
+    typeof body.error !== "object" ||
+    body.error === null ||
+    !("code" in body.error) ||
+    body.error.code !== "backend_unavailable" ||
+    !("message" in body.error) ||
+    body.error.message !== "Host is quiesced for the 0058 schema maintenance transition" ||
+    !("details" in body.error) ||
+    typeof body.error.details !== "object" ||
+    body.error.details === null ||
+    !("reason" in body.error.details) ||
+    body.error.details.reason !== "runtime-configuration"
+  ) {
+    throw verificationError(
+      "0058 schema maintenance Worker did not prove maintenance refusal",
+      `status=${response.status}`,
+    );
+  }
+  return { url, status: 503, traffic: "maintenance" };
+}
+
 export { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
 
 /** Routine or explicitly reviewed authority-sensitive Worker code publication. */
@@ -151,6 +218,9 @@ export async function runWorker(
 ): Promise<Record<string, unknown>> {
   if (target.environment !== invocation.environment) {
     throw preflightError("Worker invocation and target environments differ");
+  }
+  if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
+    throw preflightError("Worker maintenance selectors conflict");
   }
   if (invocation.legacyPredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
@@ -284,6 +354,13 @@ export async function runWorker(
     const versionPublication =
       invocation.surface === "takoserver-worker" && invocation.environment !== "production";
 
+    if (
+      target.schemaMaintenanceMode !== undefined &&
+      !workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot)
+    ) {
+      throw preflightError("0058 Worker maintenance requires exact applied 0057 and 0058 next");
+    }
+
     if (invocation.action === "status") {
       const advancedFromSelector =
         invocation.legacyPredecessorVersionId !== undefined &&
@@ -302,6 +379,9 @@ export async function runWorker(
         artifactDigest: before.bundleDigestHex === null ? null : `sha256:${before.bundleDigestHex}`,
         appliedMigrations: before.migrations.applied,
         pendingMigrations: before.pending,
+        ...(target.schemaMaintenanceMode === undefined
+          ? {}
+          : { maintenance: target.schemaMaintenanceMode }),
         integrationE2eCredentialAuthorityConfigured:
           before.integrationE2eCredentialAuthorityConfigured,
         ...providerExecutorStatus(providerExecutorBefore),
@@ -317,7 +397,8 @@ export async function runWorker(
             }
           : {}),
         ready:
-          artifactBlobIoSchemaAllowsPending(target, before.pending) &&
+          target.schemaMaintenanceMode === undefined &&
+          workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
           !legacyProfileCurrent &&
           (target.integrationE2eCredentialAuthority === undefined ||
             before.integrationE2eCredentialAuthorityConfigured) &&
@@ -352,7 +433,7 @@ export async function runWorker(
       commit: invocation.commit,
       run,
     });
-    if (!artifactBlobIoSchemaAllowsPending(target, before.pending)) {
+    if (!workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot)) {
       throw preflightError(
         "routine Worker publication refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(before.pending),
@@ -573,7 +654,7 @@ export async function runWorker(
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
-    if (!artifactBlobIoSchemaAllowsPending(target, after.pending)) {
+    if (!workerSchemaAllowsPending(target, after.migrations, sourceRepositoryRoot)) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
     const providerExecutorAfter =
@@ -588,15 +669,20 @@ export async function runWorker(
       );
     }
     const probe =
-      target.artifactBlobIoMode === "pre-0043-quiesced"
-        ? await probeArtifactBlobIoQuiescence(
+      target.schemaMaintenanceMode === "pre-0058-quiesced"
+        ? await probeSchemaMaintenance(
             target.publicOrigin,
             options.fetcher ?? ((input, init) => fetch(input, init)),
           )
-        : await probeProduct(
-            target.publicOrigin,
-            options.fetcher ?? ((input, init) => fetch(input, init)),
-          );
+        : target.artifactBlobIoMode === "pre-0043-quiesced"
+          ? await probeArtifactBlobIoQuiescence(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            )
+          : await probeProduct(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            );
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,
@@ -617,6 +703,9 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      ...(target.schemaMaintenanceMode === undefined
+        ? {}
+        : { maintenance: target.schemaMaintenanceMode }),
       ...providerExecutorStatus(providerExecutorAfter),
       ...(publication === null
         ? {}

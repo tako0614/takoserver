@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
@@ -13,6 +14,7 @@ import {
   type WorkerMigrationReader,
   type WorkerProcess,
   type WorkerState,
+  workerSchemaAllowsPending,
 } from "../scripts/deploy/worker.ts";
 import {
   authorityImplementationClosure,
@@ -54,6 +56,14 @@ const target = {
   publicOrigin: "https://api.integration.example.test",
   signing: { currentKeyId: "key-current" },
 } satisfies DeployTarget;
+
+const schemaMaintenanceTarget = {
+  ...target,
+  schemaMaintenanceMode: "pre-0058-quiesced",
+} satisfies DeployTarget;
+
+const canonicalMigrations = readMigrationArtifact().names;
+const exact0057 = canonicalMigrations.slice(0, 57);
 
 const executorTarget = {
   ...target,
@@ -634,6 +644,185 @@ describe("split Takoserver Worker surfaces", () => {
       expect(failure.message).toContain("pending D1 migrations");
       expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
       expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("0058 maintenance admits only exact source 0057 predecessor with 0058 next, never readiness", async () => {
+    const canonical = { local: canonicalMigrations, applied: exact0057 };
+    expect(workerSchemaAllowsPending(schemaMaintenanceTarget, canonical)).toBe(true);
+    expect(workerSchemaAllowsPending(target, canonical)).toBe(false);
+    for (const invalid of [
+      { local: canonicalMigrations, applied: exact0057.slice(0, -1) },
+      { local: canonicalMigrations, applied: canonicalMigrations.slice(0, 58) },
+      { local: canonicalMigrations, applied: [...exact0057.slice(0, -1), "0057_foreign.sql"] },
+      { local: [...canonicalMigrations.slice(0, 57), "0058_foreign.sql"], applied: exact0057 },
+    ])
+      expect(workerSchemaAllowsPending(schemaMaintenanceTarget, invalid)).toBe(false);
+    const current = fixture({
+      selectedTarget: schemaMaintenanceTarget,
+      local: canonicalMigrations,
+      applied: exact0057,
+    });
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      schemaMaintenanceTarget,
+      { ...current, cloudflareEnvironment: {} },
+    );
+    expect(status).toMatchObject({
+      maintenance: "pre-0058-quiesced",
+      ready: false,
+      pendingMigrations: canonicalMigrations.slice(57),
+    });
+  });
+
+  test("0058 maintenance does not bypass a declared private executor qualifier", async () => {
+    const selected = { ...executorTarget, schemaMaintenanceMode: "pre-0058-quiesced" as const };
+    const current = fixture({
+      selectedTarget: selected,
+      local: canonicalMigrations,
+      applied: exact0057,
+    });
+    const failure = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      selected,
+      { ...current, cloudflareEnvironment: {} },
+    ).catch((error) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as Error).message).toContain("owner-injected live qualification");
+    expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+  });
+
+  test("wrong 0058 predecessor refuses before owner gate or Worker upload", async () => {
+    const current = fixture({
+      selectedTarget: schemaMaintenanceTarget,
+      local: canonicalMigrations,
+      applied: exact0057.slice(0, -1),
+    });
+    const failure = await runWorker(
+      { surface: "takoserver-worker", action: "apply", environment: "integration", commit: COMMIT },
+      schemaMaintenanceTarget,
+      { ...current, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" } },
+    ).catch((error) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+    expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      schemaMaintenanceTarget,
+      { ...current, cloudflareEnvironment: {} },
+    ).catch((error) => error);
+    expect(status).toBeInstanceOf(DeployError);
+  });
+
+  test("0058 maintenance current Version readback refuses wrong mode, storage binding and source annotation", async () => {
+    for (const defect of ["mode", "storage", "source"] as const) {
+      const current = fixture({
+        selectedTarget: schemaMaintenanceTarget,
+        current: "after",
+        afterMessage: `takoserver-worker:${COMMIT}:${"c".repeat(64)}`,
+        local: canonicalMigrations,
+        applied: exact0057,
+      });
+      const state: WorkerState = {
+        ...current.state,
+        async workerVersion(workerName, versionId) {
+          const version = await current.state.workerVersion(workerName, versionId);
+          if (versionId !== VERSION_AFTER) return version;
+          const actual = version as ReturnType<typeof versionForTarget>;
+          if (defect === "source")
+            return {
+              ...actual,
+              annotations: { ...actual.annotations, "workers/message": "not-a-source-annotation" },
+            };
+          return {
+            ...actual,
+            resources: {
+              bindings: actual.resources.bindings.map((binding) => {
+                if (defect === "mode" && binding.name === "TAKOSERVER_SCHEMA_MAINTENANCE_MODE")
+                  return { ...binding, text: "wrong" };
+                if (defect === "storage" && binding.name === "STATE_DB")
+                  return { ...binding, id: "other-database" };
+                return binding;
+              }),
+            },
+          };
+        },
+      };
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        schemaMaintenanceTarget,
+        { ...current, state, cloudflareEnvironment: {} },
+      ).catch((error) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    }
+  });
+
+  test("publishes a second exact 0058 maintenance Version without claiming runtime readiness", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-0058-maintenance-"));
+    try {
+      const current = fixture({
+        selectedTarget: schemaMaintenanceTarget,
+        local: canonicalMigrations,
+        applied: exact0057,
+        beforeMessage: `takoserver-worker:${COMMIT}:${"c".repeat(64)}`,
+        diff: "",
+      });
+      const result = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        schemaMaintenanceTarget,
+        {
+          ...current,
+          review: "reviewer@example.test",
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          fetcher: async () =>
+            Response.json(
+              {
+                error: {
+                  code: "backend_unavailable",
+                  message: "Host is quiesced for the 0058 schema maintenance transition",
+                  details: { reason: "runtime-configuration" },
+                },
+              },
+              { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+            ),
+        },
+      );
+      expect(result).toMatchObject({
+        maintenance: "pre-0058-quiesced",
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+        probe: { status: 503, traffic: "maintenance" },
+      });
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

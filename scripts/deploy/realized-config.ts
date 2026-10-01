@@ -207,6 +207,9 @@ export function deploymentVariables(
   if (target.artifactBlobIoMode !== undefined) {
     vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE = target.artifactBlobIoMode;
   }
+  if (target.schemaMaintenanceMode !== undefined) {
+    vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE = target.schemaMaintenanceMode;
+  }
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {

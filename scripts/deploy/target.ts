@@ -37,6 +37,8 @@ export interface DeployTarget {
   readonly publicOrigin: string;
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
+  /** Optional whole-Host source-only maintenance profile for the pending 0058 transition. */
+  readonly schemaMaintenanceMode?: "pre-0058-quiesced";
   /**
    * Other hostnames this deployment also answers on.
    *
@@ -411,6 +413,7 @@ export function parseDeployTarget(
       "operatorIdentity",
       "integrationE2eCredentialAuthority",
       "artifactBlobIoMode",
+      "schemaMaintenanceMode",
     ],
   );
 
@@ -421,6 +424,9 @@ export function parseDeployTarget(
     throw preflightError(
       `deploy target environment ${JSON.stringify(value.environment)} does not match selected ${environment}`,
     );
+  }
+  if (value.artifactBlobIoMode !== undefined && value.schemaMaintenanceMode !== undefined) {
+    throw preflightError("deploy target maintenance selectors conflict");
   }
 
   const d1 = value.d1;
@@ -442,6 +448,7 @@ export function parseDeployTarget(
     r2: { bucketName: pattern(r2.bucketName, BUCKET_NAME, "r2.bucketName") },
     publicOrigin: httpsOrigin(value.publicOrigin),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
+    ...schemaMaintenanceMode(value.schemaMaintenanceMode),
     ...(value.aliases === undefined ? {} : { aliases: hostnames(value.aliases) }),
     ...(value.consoleOrigin === undefined
       ? {}
@@ -1247,6 +1254,18 @@ function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pr
     throw preflightError("deploy target `artifactBlobIoMode` must be pre-0043-quiesced when set");
   }
   return { artifactBlobIoMode: value };
+}
+
+function schemaMaintenanceMode(value: unknown): {
+  readonly schemaMaintenanceMode?: "pre-0058-quiesced";
+} {
+  if (value === undefined) return {};
+  if (value !== "pre-0058-quiesced") {
+    throw preflightError(
+      "deploy target `schemaMaintenanceMode` must be pre-0058-quiesced when set",
+    );
+  }
+  return { schemaMaintenanceMode: value };
 }
 
 function httpsOrigin(value: unknown): string {
