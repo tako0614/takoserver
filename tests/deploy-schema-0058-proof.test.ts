@@ -151,6 +151,49 @@ describe("protected 0058 bounded integrity", () => {
     }
   });
 
+  test("detects changes between distinct valid SQLite integers beyond JSON number precision", async () => {
+    const { db, reader: sqliteReader } = fixture();
+    const reader = {
+      async query(phase: string, description: string, sql: string) {
+        const rows = await sqliteReader.query(phase, description, sql);
+        return JSON.parse(JSON.stringify(rows)) as Record<string, unknown>[];
+      },
+    };
+    try {
+      db.exec(
+        "ALTER TABLE cloudflare_managed_worker_receipts ADD COLUMN generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0)",
+      );
+      db.exec("ALTER TABLE cloudflare_managed_worker_receipts ADD COLUMN optional_text TEXT");
+      db.exec(
+        "INSERT INTO cloudflare_managed_worker_receipts (provider_id, resource_uid, state, generation, optional_text) VALUES ('provider', 'uid-unsafe-int', 'pending', 9007199254740992, NULL)",
+      );
+      const before = await readProtected0058Snapshot(reader, "preflight");
+      const unchanged = await readProtected0058Snapshot(reader, "verification");
+      const storedBefore = db
+        .query(
+          "SELECT CAST(generation AS TEXT) AS generation FROM cloudflare_managed_worker_receipts WHERE resource_uid = 'uid-unsafe-int'",
+        )
+        .get() as { generation: string };
+
+      db.exec(
+        "UPDATE cloudflare_managed_worker_receipts SET generation = 9007199254740993 WHERE resource_uid = 'uid-unsafe-int'",
+      );
+      const storedAfter = db
+        .query(
+          "SELECT CAST(generation AS TEXT) AS generation FROM cloudflare_managed_worker_receipts WHERE resource_uid = 'uid-unsafe-int'",
+        )
+        .get() as { generation: string };
+      const after = await readProtected0058Snapshot(reader, "verification");
+
+      expect(storedBefore.generation).toBe("9007199254740992");
+      expect(storedAfter.generation).toBe("9007199254740993");
+      expect(() => assertProtected0058Preserved(before, unchanged)).not.toThrow();
+      expect(() => assertProtected0058Preserved(before, after)).toThrow("changed");
+    } finally {
+      db.close();
+    }
+  });
+
   test("turns raw remote failures into value-free diagnostics", async () => {
     const reader = {
       async query() {
