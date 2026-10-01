@@ -53,12 +53,20 @@ Cloudflare Workers belongs to the Worker entry, not to an ambient account
 credential in the Bun entry.
 
 ```
-bun install
+bun install --frozen-lockfile
 bun src/entry-bun.ts
 ```
 
-That is the whole first run. It creates its schema, generates the keys it signs
-with, prints a sign-in you can paste into its console, and starts serving.
+This starts the local Host; it does not by itself make a fresh Host ready to
+provision Takoform Resources. Startup creates the local schema, generates the
+operator key when no identity provider is configured, prints a 10-minute
+sign-in assertion, and starts serving. Sign in at the printed `/console` URL,
+create or select the organization that will own resources, and choose its
+stable Space identifier. Then perform the explicit publisher-set admission
+while the Bun process is stopped, restart it, and verify the published Forms
+before creating a Resource. The complete operator sequence, including exact
+Core-verifier identity, is in [Self-host operations](docs/self-host-operations.md).
+
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
 supply, but it is neither provider-selection nor resale authority and does not
@@ -303,9 +311,12 @@ the operator vouching in a form the server can check and nobody else can forge
 is configured.
 
 The Takoform Host of a fresh self-host serves no Form until the operator
-records the publisher-set admission chain with
-`bun scripts/selfhost-form-admission.ts <organizationId> <space> --apply`; see
-[docs/form-authority.md](docs/form-authority.md#self-host-admission).
+records the publisher-set admission chain. This is an explicit local operator
+action, separate from startup; it verifies the exact embedded publisher
+closure with the released Takoform Core verifier and activates this build's
+implemented subset for one organization and Space. It does not create the
+organization or Space. See [Self-host admission](docs/form-authority.md#self-host-admission)
+and the [end-to-end self-host operations guide](docs/self-host-operations.md).
 
 By default, durable state is rooted under `.takoserver`, but that directory is
 not always the complete backup set. Stop Takoserver, its child `workerd`, and
