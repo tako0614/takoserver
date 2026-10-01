@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -97,6 +98,8 @@ function processFixture(
   partialQueryProbe = false,
   timeoutQueryProbe = false,
   timeoutImportProbe = false,
+  referenceDatabase?: Database,
+  referenceDriftAfterSeed = false,
 ) {
   const calls: string[][] = [];
   const readQueries: string[] = [];
@@ -107,6 +110,7 @@ function processFixture(
   let lineageReads = 0;
   let fixtureSeeded = false;
   let postSeedReceiptReads = 0;
+  let referenceDrifted = false;
   const run = async (command: readonly string[]): Promise<CommandResult> => {
     calls.push([...command]);
     if (command[0] === "timeout" && command[1] !== "--version") {
@@ -160,6 +164,27 @@ function processFixture(
     if (commandIndex >= 0) {
       const sql = command[commandIndex + 1];
       if (!sql) throw new Error("D1 query omitted its SQL");
+      const configPath = command[command.indexOf("--config") + 1];
+      const targetDatabase =
+        configPath &&
+        referenceDatabase &&
+        JSON.parse(readFileSync(configPath, "utf8")).d1_databases[0].database_id ===
+          ordinaryTarget.d1.databaseId
+          ? referenceDatabase
+          : database;
+      if (
+        targetDatabase === referenceDatabase &&
+        fixtureSeeded &&
+        referenceDriftAfterSeed &&
+        !referenceDrifted
+      ) {
+        referenceDrifted = true;
+        referenceDatabase.exec(`INSERT INTO cloudflare_managed_worker_receipts
+          (provider_id, resource_uid, native_id, kind, logical_worker_id, operation_id,
+           generation, descriptor_digest, state, observed_json)
+          VALUES ('reference-drift', 'reference-drift', 'version:reference-drift', 'version',
+           'reference-worker', 'reference-drift', 1, 'sha256:${"e".repeat(64)}', 'pending', '{}')`);
+      }
       if (sql.includes("FROM d1_migrations ORDER BY id")) {
         lineageReads += 1;
         if (advanceBeforeSeed && lineageReads === 2) {
@@ -192,7 +217,7 @@ function processFixture(
         }
       }
       readQueries.push(sql);
-      const results = database.query(sql).all() as Record<string, unknown>[];
+      const results = targetDatabase.query(sql).all() as Record<string, unknown>[];
       return ok(`${JSON.stringify([{ success: true, results }])}\n`);
     }
 
@@ -285,6 +310,8 @@ function makeOptions(
   partialQueryProbe = false,
   timeoutQueryProbe = false,
   timeoutImportProbe = false,
+  referenceDatabase?: Database,
+  referenceDriftAfterSeed = false,
 ) {
   const fixture = processFixture(
     database,
@@ -296,6 +323,8 @@ function makeOptions(
     partialQueryProbe,
     timeoutQueryProbe,
     timeoutImportProbe,
+    referenceDatabase,
+    referenceDriftAfterSeed,
   );
   const providerIdentities = Array.isArray(providerIdentity)
     ? providerIdentity
@@ -309,9 +338,10 @@ function makeOptions(
       custodyPath: writeCustody(directory),
       migrationDirectory,
       outputDirectory: join(directory, "output"),
-      fetcher: async () => {
-        const identity =
-          providerIdentities[Math.min(providerRead++, providerIdentities.length - 1)];
+      fetcher: async (request: Request) => {
+        const identity = request.url.includes(ordinaryTarget.d1.databaseId)
+          ? { uuid: ordinaryTarget.d1.databaseId, name: ordinaryTarget.d1.databaseName }
+          : providerIdentities[Math.min(providerRead++, providerIdentities.length - 1)];
         return new Response(JSON.stringify({ success: true, result: identity }), {
           status: 200,
           headers: { "content-type": "application/json" },
@@ -1015,4 +1045,328 @@ describe("0058 isolated D1 rehearsal", () => {
 test("receipt lookup treats only ENOENT as an absent marker", () => {
   const custodyPath = join(caseDirectory("receipt-non-enoent"), "x".repeat(245));
   expect(() => read0058Receipt(custodyPath, "dispatched")).toThrow("could not be opened safely");
+});
+
+describe("0058 selected-reference volume producer", () => {
+  test("measures an ordinary 0057 reference and persists a distinct upper-bound receipt only after an acknowledged import", async () => {
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    reference.exec(build0058SyntheticFixtureSql().replaceAll("synthetic-0058-", "reference-0058-"));
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("volume-success");
+      const { fixture, options } = makeOptions(
+        directory,
+        isolated,
+        false,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+      );
+      const result = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        { ...options, volumeQualification: { kind: "selected-target-upper-bound" } },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.d1-0058-selected-reference-volume@v1",
+        referenceTargetD1: ordinaryTarget.d1,
+        qualification: "injected-runner-local-test-only",
+        readyForProtectedApply: false,
+      });
+      expect(
+        (result.measuredUpperBounds as { counts: Record<string, number> }).counts
+          .cloudflare_managed_worker_receipts,
+      ).toBeGreaterThanOrEqual(8);
+      expect(fixture.fileImports.map((path) => path.split("/").at(-1))).toEqual([
+        "fixture.sql",
+        "rollback-probe.sql",
+        "migration-import.sql",
+      ]);
+      const qualified = JSON.parse(
+        readFileSync(`${options.custodyPath}.0058-volume-qualified.json`, "utf8"),
+      );
+      expect(qualified).toMatchObject({
+        state: "qualified",
+        qualification: "injected-runner-local-test-only",
+        providerAcknowledgement: "injected-runner-simulated",
+        timingSource: "injected-runner-local-test",
+        rollbackProbes: "both-failed-and-exact-0057-restored",
+        binding: {
+          referenceTargetD1: {
+            databaseId: ordinaryTarget.d1.databaseId,
+          },
+          isolatedTargetD1: { databaseId: ISOLATED_DATABASE_ID },
+          commit: COMMIT,
+          referenceCounts: { cloudflare_managed_worker_receipts: 8 },
+        },
+      });
+      expect(Date.parse(qualified.expiresAt)).toBeGreaterThan(Date.parse(qualified.observedAt));
+      const status = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        {
+          ...options,
+          volumeQualification: { kind: "selected-target-upper-bound" },
+          outputDirectory: join(directory, "status-output"),
+        },
+      );
+      expect(status).toMatchObject({
+        reconciliation: "qualified-receipt-present-recheck-required",
+        readyForProtectedApply: false,
+      });
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("reference drift after seed holds before dispatch and emits no qualified receipt", async () => {
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("volume-reference-drift");
+      const { fixture, options } = makeOptions(
+        directory,
+        isolated,
+        false,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+        true,
+      );
+      const failure = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        { ...options, volumeQualification: { kind: "selected-target-upper-bound" } },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(0);
+      expect(() =>
+        readFileSync(`${options.custodyPath}.0058-volume-qualified.json`, "utf8"),
+      ).toThrow();
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("unknown import ACK leaves a dispatched receipt and cannot replay", async () => {
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("volume-unknown-ack");
+      const { fixture, options } = makeOptions(
+        directory,
+        isolated,
+        true,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+      );
+      const request = { action: "apply", environment: "rehearsal", commit: COMMIT } as const;
+      const selected = {
+        ...options,
+        volumeQualification: { kind: "selected-target-upper-bound" },
+      } as const;
+      const failure = await runD1Schema0058Rehearsal(request, ordinaryTarget, selected).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(readFileSync(`${options.custodyPath}.0058-volume-dispatched.json`, "utf8")).toContain(
+        '"state":"dispatched"',
+      );
+      expect(() =>
+        readFileSync(`${options.custodyPath}.0058-volume-qualified.json`, "utf8"),
+      ).toThrow();
+      const replay = await runD1Schema0058Rehearsal(request, ordinaryTarget, {
+        ...selected,
+        outputDirectory: join(directory, "replay-output"),
+      });
+      expect(replay).toMatchObject({
+        reconciliation: "status-only-no-replay",
+        readyForProtectedApply: false,
+      });
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(1);
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("missing prepared or changed dispatched custody after import cannot mint a qualified receipt", async () => {
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      for (const fault of ["missing-prepared", "changed-dispatched"] as const) {
+        const isolated = databaseThrough(57);
+        const reference = databaseThrough(57);
+        reference.exec(build0058SyntheticFixtureSql());
+        try {
+          const directory = caseDirectory(`volume-${fault}`);
+          const { fixture, options } = makeOptions(
+            directory,
+            isolated,
+            false,
+            false,
+            undefined,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            reference,
+          );
+          const run = async (command: readonly string[]) => {
+            const result = await fixture.run(command);
+            if (command.some((part) => part.endsWith("migration-import.sql"))) {
+              if (fault === "missing-prepared")
+                rmSync(`${options.custodyPath}.0058-volume-prepared.json`);
+              else writeFileSync(`${options.custodyPath}.0058-volume-dispatched.json`, "{}\n");
+            }
+            return result;
+          };
+          const failure = await runD1Schema0058Rehearsal(
+            { action: "apply", environment: "rehearsal", commit: COMMIT },
+            ordinaryTarget,
+            { ...options, run, volumeQualification: { kind: "selected-target-upper-bound" } },
+          ).catch((error: unknown) => error);
+          expect(failure).toBeInstanceOf(DeployError);
+          expect(() =>
+            readFileSync(`${options.custodyPath}.0058-volume-qualified.json`, "utf8"),
+          ).toThrow();
+          const statusFailure = await runD1Schema0058Rehearsal(
+            { action: "status", environment: "rehearsal", commit: COMMIT },
+            ordinaryTarget,
+            {
+              ...options,
+              volumeQualification: { kind: "selected-target-upper-bound" },
+              outputDirectory: join(directory, "status-output"),
+            },
+          ).catch((error: unknown) => error);
+          expect(statusFailure).toBeInstanceOf(DeployError);
+        } finally {
+          isolated.close();
+          reference.close();
+        }
+      }
+    } finally {
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("FIFO custody is refused without blocking the status seam", () => {
+    const child = spawnSync(
+      "timeout",
+      [
+        "3s",
+        process.execPath,
+        "test",
+        import.meta.path,
+        "--test-name-pattern",
+        "FIFO child status",
+      ],
+      {
+        env: { ...process.env, TAKOSERVER_0058_FIFO_CHILD: "1" },
+        encoding: "utf8",
+        timeout: 4_000,
+      },
+    );
+    expect(child.status).toBe(0);
+  });
+
+  test("FIFO child status", async () => {
+    if (process.env.TAKOSERVER_0058_FIFO_CHILD !== "1") return;
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("volume-fifo");
+      const { options } = makeOptions(
+        directory,
+        isolated,
+        false,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+      );
+      const selected = {
+        ...options,
+        volumeQualification: { kind: "selected-target-upper-bound" },
+      } as const;
+      await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        selected,
+      );
+      const dispatchedPath = `${options.custodyPath}.0058-volume-dispatched.json`;
+      rmSync(dispatchedPath);
+      expect(spawnSync("mkfifo", [dispatchedPath]).status).toBe(0);
+      const failure = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        { ...selected, outputDirectory: join(directory, "status-output") },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      rmSync(dispatchedPath);
+      writeFileSync(dispatchedPath, Buffer.alloc(16 * 1024 + 1, 0x41), { mode: 0o600 });
+      const oversized = await runD1Schema0058Rehearsal(
+        { action: "status", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        { ...selected, outputDirectory: join(directory, "oversized-output") },
+      ).catch((error: unknown) => error);
+      expect(oversized).toBeInstanceOf(DeployError);
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
 });
