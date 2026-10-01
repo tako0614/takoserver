@@ -1006,7 +1006,7 @@ describe("split Takoserver Worker surfaces", () => {
       if (sql.includes("SELECT name FROM sqlite_schema WHERE type = 'table'")) {
         return ok(JSON.stringify([{ success: true, results: [] }]));
       }
-      if (sql.includes("FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")) {
+      if (sql.includes("FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'")) {
         return ok(JSON.stringify([{ success: true, results: [] }]));
       }
       throw new Error(`unexpected D1 query: ${sql}`);
