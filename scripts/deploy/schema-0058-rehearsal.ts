@@ -49,7 +49,10 @@ import {
 } from "./schema-0058-apply-receipt.ts";
 import { type Protected0058Snapshot, readProtected0058Snapshot } from "./schema-0058-proof.ts";
 import {
+  type ProtectedReferenceVolumeReceipt,
+  persist0058ProtectedReferenceVolumeReceipt,
   persist0058VolumeReceipt,
+  read0058ProtectedReferenceVolumeChain,
   read0058VolumeChain,
   type VolumeReceipt,
 } from "./schema-0058-volume-receipt.ts";
@@ -73,6 +76,19 @@ type Run = (
   options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
 
+/** Runtime query fence for the separately credentialed protected reference. */
+export class ReadOnlyReferenceD1 extends RemoteD1 {
+  override async query(phase: DeployPhase, description: string, sql: string) {
+    if ((sql !== "PRAGMA foreign_keys" && !/^\s*SELECT\b/iu.test(sql)) || sql.includes(";"))
+      throw preflightError("0058 protected reference accepts only a single read query");
+    return await super.query(phase, description, sql);
+  }
+
+  override async statement(_phase: DeployPhase, _description: string, _sql: string): Promise<void> {
+    throw preflightError("0058 protected reference cannot execute a statement");
+  }
+}
+
 export interface Rehearsal0058Invocation {
   readonly action: "status" | "apply";
   readonly environment: DeployEnvironment;
@@ -89,6 +105,12 @@ export interface Rehearsal0058Options {
   readonly fetcher?: (request: Request) => Promise<Response>;
   /** Internal source-only selector; it is not a protected-wave approval. */
   readonly volumeQualification?: { readonly kind: "selected-target-upper-bound" };
+  /** Explicit protected reference is read only; only the selected rehearsal D1 is mutated. */
+  readonly protectedReference?: {
+    readonly environment: "integration" | "production";
+    readonly target: DeployTarget;
+    readonly cloudflareEnvironment: Readonly<Record<string, string>>;
+  };
 }
 
 interface IsolatedTarget {
@@ -554,10 +576,15 @@ export async function runD1Schema0058Rehearsal(
   ordinary: DeployTarget,
   options: Rehearsal0058Options = {},
 ): Promise<Record<string, unknown>> {
-  const volume = options.volumeQualification !== undefined;
+  const protectedReference = options.protectedReference;
+  const volume = options.volumeQualification !== undefined || protectedReference !== undefined;
   const injectedTransport = options.run !== undefined || options.fetcher !== undefined;
-  if (volume && options.volumeQualification?.kind !== "selected-target-upper-bound")
-    throw preflightError("0058 volume selector is unsupported");
+  if (
+    (options.volumeQualification !== undefined &&
+      options.volumeQualification.kind !== "selected-target-upper-bound") ||
+    (options.volumeQualification !== undefined && protectedReference !== undefined)
+  )
+    throw preflightError("0058 volume selector is unsupported or conflicting");
   if (
     invocation.environment !== "rehearsal" ||
     ordinary.environment !== "rehearsal" ||
@@ -577,11 +604,39 @@ export async function runD1Schema0058Rehearsal(
   if (credential?.source !== "api-token")
     throw preflightError("0058 rehearsal requires explicit API token");
   const environment = credential.childEnvironment;
+  if (
+    protectedReference !== undefined &&
+    (protectedReference.target.environment !== protectedReference.environment ||
+      (protectedReference.target.accountId === selected.accountId &&
+        protectedReference.target.d1.databaseId === selected.databaseId))
+  )
+    throw preflightError("0058 protected reference scope or identity is invalid");
+  const referenceCredential =
+    protectedReference === undefined
+      ? credential
+      : await resolveCloudflareCredential(protectedReference.environment, {
+          cloudflareEnvironment: protectedReference.cloudflareEnvironment,
+          run,
+        });
+  if (
+    protectedReference !== undefined &&
+    (referenceCredential.source !== "api-token" || referenceCredential.token === credential.token)
+  )
+    throw preflightError("0058 protected reference requires a distinct explicit API token");
+  const referenceTarget = protectedReference?.target ?? ordinary;
   const provider = new CloudflareState({
     accountId: selected.accountId,
     token: credential.token,
     ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
   });
+  const referenceProvider =
+    protectedReference === undefined
+      ? provider
+      : new CloudflareState({
+          accountId: referenceTarget.accountId,
+          token: referenceCredential.token,
+          ...(options.fetcher === undefined ? {} : { fetcher: options.fetcher }),
+        });
   const assertProviderIdentity = async (stage: string): Promise<void> => {
     const result = await provider.read(
       `/d1/database/${encodeURIComponent(selected.databaseId)}`,
@@ -600,16 +655,16 @@ export async function runD1Schema0058Rehearsal(
     }
   };
   const assertReferenceIdentity = async (stage: string): Promise<void> => {
-    const result = await provider.read(
-      `/d1/database/${encodeURIComponent(ordinary.d1.databaseId)}`,
+    const result = await referenceProvider.read(
+      `/d1/database/${encodeURIComponent(referenceTarget.d1.databaseId)}`,
       `0058 selected reference D1 identity ${stage}`,
     );
     if (
       typeof result !== "object" ||
       result === null ||
       Array.isArray(result) ||
-      (result as { uuid?: unknown }).uuid !== ordinary.d1.databaseId ||
-      (result as { name?: unknown }).name !== ordinary.d1.databaseName
+      (result as { uuid?: unknown }).uuid !== referenceTarget.d1.databaseId ||
+      (result as { name?: unknown }).name !== referenceTarget.d1.databaseName
     )
       throw preflightError("0058 selected reference D1 provider identity changed");
   };
@@ -636,20 +691,29 @@ export async function runD1Schema0058Rehearsal(
     );
     const initialDb = new RemoteD1(inspection, { environment, run });
     const initial = await readD1SchemaState(initialDb);
-    const referenceDb = volume
-      ? new RemoteD1(
-          config(
-            join(root, "reference-wrangler.jsonc"),
-            {
-              accountId: ordinary.accountId,
-              databaseId: ordinary.d1.databaseId,
-              databaseName: ordinary.d1.databaseName,
-            },
-            options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-          ),
-          { environment, run },
+    const referenceConfig = volume
+      ? config(
+          join(root, "reference-wrangler.jsonc"),
+          {
+            accountId: referenceTarget.accountId,
+            databaseId: referenceTarget.d1.databaseId,
+            databaseName: referenceTarget.d1.databaseName,
+          },
+          options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
         )
       : null;
+    const referenceDb =
+      referenceConfig === null
+        ? null
+        : protectedReference === undefined
+          ? new RemoteD1(referenceConfig, {
+              environment: referenceCredential.childEnvironment,
+              run,
+            })
+          : new ReadOnlyReferenceD1(referenceConfig, {
+              environment: referenceCredential.childEnvironment,
+              run,
+            });
     const referenceState = referenceDb === null ? null : await readD1SchemaState(referenceDb);
     if (referenceState !== null) assertPredecessor(referenceState, source.names, source.files);
     const referenceSnapshot =
@@ -704,13 +768,36 @@ export async function runD1Schema0058Rehearsal(
     const receiptPath =
       options.custodyPath ?? requireEnvironment("TAKOSERVER_D1_0058_ISOLATED_TARGET_PATH");
     if (volume) {
-      const chain = read0058VolumeChain(receiptPath);
+      // The two profiles are intentionally disjoint receipts, not separate
+      // permission to seed or import the same isolated D1 a second time.
+      const otherChain =
+        protectedReference === undefined
+          ? read0058ProtectedReferenceVolumeChain(receiptPath)
+          : read0058VolumeChain(receiptPath);
+      if (
+        otherChain.prepared !== null ||
+        otherChain.dispatched !== null ||
+        otherChain.qualified !== null
+      )
+        throw preflightError("0058 isolated D1 already has another volume attempt");
+      const chain =
+        protectedReference === undefined
+          ? read0058VolumeChain(receiptPath)
+          : read0058ProtectedReferenceVolumeChain(receiptPath);
       const existingVolume = chain.dispatched ?? chain.prepared;
       if (existingVolume !== null) {
         const binding = existingVolume.binding;
         if (
-          binding.referenceTargetD1.databaseId !== ordinary.d1.databaseId ||
+          binding.referenceTargetD1.accountId !== referenceTarget.accountId ||
+          binding.referenceTargetD1.databaseId !== referenceTarget.d1.databaseId ||
+          binding.referenceTargetD1.databaseName !== referenceTarget.d1.databaseName ||
+          (protectedReference !== undefined &&
+            ("referenceEnvironment" in binding
+              ? binding.referenceEnvironment !== protectedReference.environment
+              : true)) ||
+          binding.isolatedTargetD1.accountId !== selected.accountId ||
           binding.isolatedTargetD1.databaseId !== selected.databaseId ||
+          binding.isolatedTargetD1.databaseName !== selected.databaseName ||
           binding.commit !== invocation.commit ||
           binding.importDigest !== auditedImport.digest ||
           binding.referenceDigest !== referenceSnapshot?.digest ||
@@ -1085,16 +1172,19 @@ export async function runD1Schema0058Rehearsal(
     await assertProviderIdentity("after rollback probe");
     await assertReferenceUnchanged("after rollback probe");
     sealed.assertUnchanged();
-    let volumeBinding: VolumeReceipt["binding"] | null = null;
-    let volumeDispatched: VolumeReceipt | null = null;
+    let volumeBinding:
+      | VolumeReceipt["binding"]
+      | ProtectedReferenceVolumeReceipt["binding"]
+      | null = null;
+    let volumeDispatched: VolumeReceipt | ProtectedReferenceVolumeReceipt | null = null;
     if (volume) {
       const reference = referenceSnapshot as Protected0058Snapshot;
       const fixture = seeded as Protected0058Snapshot;
       const binding: VolumeReceipt["binding"] = {
         referenceTargetD1: {
-          accountId: ordinary.accountId,
-          databaseId: ordinary.d1.databaseId,
-          databaseName: ordinary.d1.databaseName,
+          accountId: referenceTarget.accountId,
+          databaseId: referenceTarget.d1.databaseId,
+          databaseName: referenceTarget.d1.databaseName,
         },
         isolatedTargetD1: selected,
         commit: qualified.commit,
@@ -1119,18 +1209,37 @@ export async function runD1Schema0058Rehearsal(
         fixtureBytes: fixture.bytes,
         fixtureMaxBlobBytes: fixture.maxBlobBytes,
       };
-      volumeBinding = binding;
-      const prepared = persist0058VolumeReceipt(receiptPath, {
-        kind: "takoserver.d1-0058-selected-reference-volume@v1",
-        state: "prepared",
-        binding,
-      });
-      volumeDispatched = persist0058VolumeReceipt(receiptPath, {
-        kind: "takoserver.d1-0058-selected-reference-volume@v1",
-        state: "dispatched",
-        binding,
-        preparedDigest: prepared.digest,
-      });
+      if (protectedReference === undefined) {
+        volumeBinding = binding;
+        const prepared = persist0058VolumeReceipt(receiptPath, {
+          kind: "takoserver.d1-0058-selected-reference-volume@v1",
+          state: "prepared",
+          binding,
+        });
+        volumeDispatched = persist0058VolumeReceipt(receiptPath, {
+          kind: "takoserver.d1-0058-selected-reference-volume@v1",
+          state: "dispatched",
+          binding,
+          preparedDigest: prepared.digest,
+        });
+      } else {
+        const protectedBinding: ProtectedReferenceVolumeReceipt["binding"] = {
+          ...binding,
+          referenceEnvironment: protectedReference.environment,
+        };
+        volumeBinding = protectedBinding;
+        const prepared = persist0058ProtectedReferenceVolumeReceipt(receiptPath, {
+          kind: "takoserver.d1-0058-protected-reference-volume@v1",
+          state: "prepared",
+          binding: protectedBinding,
+        });
+        volumeDispatched = persist0058ProtectedReferenceVolumeReceipt(receiptPath, {
+          kind: "takoserver.d1-0058-protected-reference-volume@v1",
+          state: "dispatched",
+          binding: protectedBinding,
+          preparedDigest: prepared.digest,
+        });
+      }
     } else {
       const finalReceiptBinding: ApplyReceiptBinding = {
         ...receiptBinding,
@@ -1182,11 +1291,10 @@ export async function runD1Schema0058Rehearsal(
       await assertReferenceUnchanged("after volume import");
       sealed.assertUnchanged();
       const now = Date.now();
-      const qualifiedVolume = persist0058VolumeReceipt(receiptPath, {
-        kind: "takoserver.d1-0058-selected-reference-volume@v1",
+      const qualifiedPayload = {
         state: "qualified",
-        binding: volumeBinding as VolumeReceipt["binding"],
-        dispatchedDigest: (volumeDispatched as VolumeReceipt).digest,
+        dispatchedDigest: (volumeDispatched as VolumeReceipt | ProtectedReferenceVolumeReceipt)
+          .digest,
         elapsedMs,
         timingSource: injectedTransport
           ? "injected-runner-local-test"
@@ -1198,13 +1306,28 @@ export async function runD1Schema0058Rehearsal(
         rollbackProbes: "both-failed-and-exact-0057-restored",
         observedAt: new Date(now).toISOString(),
         expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
-        qualification: injectedTransport
-          ? "injected-runner-local-test-only"
-          : "selected-rehearsal-reference-only",
-      });
+      } as const;
+      const qualifiedVolume =
+        protectedReference === undefined
+          ? persist0058VolumeReceipt(receiptPath, {
+              kind: "takoserver.d1-0058-selected-reference-volume@v1",
+              binding: volumeBinding as VolumeReceipt["binding"],
+              ...qualifiedPayload,
+              qualification: injectedTransport
+                ? "injected-runner-local-test-only"
+                : "selected-rehearsal-reference-only",
+            })
+          : persist0058ProtectedReferenceVolumeReceipt(receiptPath, {
+              kind: "takoserver.d1-0058-protected-reference-volume@v1",
+              binding: volumeBinding as ProtectedReferenceVolumeReceipt["binding"],
+              ...qualifiedPayload,
+              qualification: injectedTransport
+                ? "injected-runner-local-test-only"
+                : "protected-reference-candidate-only",
+            });
       return {
         ...qualifiedVolume,
-        referenceTargetD1: ordinary.d1,
+        referenceTargetD1: referenceTarget.d1,
         measuredUpperBounds: {
           counts: (seeded as Protected0058Snapshot).counts,
           bytes: (seeded as Protected0058Snapshot).bytes,

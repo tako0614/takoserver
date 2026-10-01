@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
@@ -10,13 +10,16 @@ import { DeployError } from "../scripts/deploy/errors.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { read0058Receipt } from "../scripts/deploy/schema-0058-apply-receipt.ts";
+import { readProtected0058Snapshot } from "../scripts/deploy/schema-0058-proof.ts";
 import {
   build0058SyntheticFixtureSql,
   type Fixture0058Snapshot,
+  ReadOnlyReferenceD1,
   type Rehearsal0058Invocation,
   read0058FixtureSnapshot,
   runD1Schema0058Rehearsal,
 } from "../scripts/deploy/schema-0058-rehearsal.ts";
+import { read0058VolumeReceipt } from "../scripts/deploy/schema-0058-volume-receipt.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
@@ -40,6 +43,18 @@ const ordinaryTarget = {
   r2: { bucketName: "takoserver-objects-rehearsal" },
   publicOrigin: "https://api.rehearsal.example.test",
   signing: { currentKeyId: "key-current" },
+} satisfies DeployTarget;
+const protectedTarget = {
+  ...ordinaryTarget,
+  environment: "production",
+  accountId: "b".repeat(32),
+  workerName: "takoserver-api-production",
+  d1: {
+    databaseName: "takoserver-runtime-production",
+    databaseId: "22222222-2222-4222-8222-222222222222",
+  },
+  r2: { bucketName: "takoserver-objects-production" },
+  publicOrigin: "https://api.production.example.test",
 } satisfies DeployTarget;
 
 function sqliteReader(database: Database) {
@@ -100,6 +115,7 @@ function processFixture(
   timeoutImportProbe = false,
   referenceDatabase?: Database,
   referenceDriftAfterSeed = false,
+  referenceDatabaseId = ordinaryTarget.d1.databaseId,
 ) {
   const calls: string[][] = [];
   const readQueries: string[] = [];
@@ -169,7 +185,7 @@ function processFixture(
         configPath &&
         referenceDatabase &&
         JSON.parse(readFileSync(configPath, "utf8")).d1_databases[0].database_id ===
-          ordinaryTarget.d1.databaseId
+          referenceDatabaseId
           ? referenceDatabase
           : database;
       if (
@@ -312,6 +328,7 @@ function makeOptions(
   timeoutImportProbe = false,
   referenceDatabase?: Database,
   referenceDriftAfterSeed = false,
+  referenceDatabaseId = ordinaryTarget.d1.databaseId,
 ) {
   const fixture = processFixture(
     database,
@@ -325,6 +342,7 @@ function makeOptions(
     timeoutImportProbe,
     referenceDatabase,
     referenceDriftAfterSeed,
+    referenceDatabaseId,
   );
   const providerIdentities = Array.isArray(providerIdentity)
     ? providerIdentity
@@ -1048,6 +1066,354 @@ test("receipt lookup treats only ENOENT as an absent marker", () => {
 });
 
 describe("0058 selected-reference volume producer", () => {
+  test("protected reference reader refuses attempted DML and multi-statement queries before transport", async () => {
+    let calls = 0;
+    const reader = new ReadOnlyReferenceD1("/unread-config", {
+      environment: { CLOUDFLARE_API_TOKEN: "reference-test-token" },
+      run: async () => {
+        calls += 1;
+        return ok("");
+      },
+    });
+    await expect(
+      reader.query(
+        "preflight",
+        "attempted reference write",
+        "DELETE FROM cloudflare_managed_worker_receipts",
+      ),
+    ).rejects.toBeInstanceOf(DeployError);
+    await expect(
+      reader.query(
+        "preflight",
+        "attempted reference write",
+        "SELECT 1; DELETE FROM cloudflare_managed_worker_receipts",
+      ),
+    ).rejects.toBeInstanceOf(DeployError);
+    await expect(
+      reader.statement(
+        "preflight",
+        "attempted reference write",
+        "UPDATE cloudflare_managed_worker_receipts SET state = 'deleted'",
+      ),
+    ).rejects.toBeInstanceOf(DeployError);
+    expect(calls).toBe(0);
+  });
+
+  test("explicit protected reference is read only while the isolated D1 receives one acknowledged import", async () => {
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    const original = await readProtected0058Snapshot(sqliteReader(reference), "preflight");
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("protected-reference-success");
+      const { fixture, options } = makeOptions(
+        directory,
+        isolated,
+        false,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+        false,
+        protectedTarget.d1.databaseId,
+      );
+      let referenceReads = 0;
+      const run = async (
+        command: readonly string[],
+        context?: { env?: Readonly<Record<string, string>> },
+      ) => {
+        const configIndex = command.indexOf("--config");
+        const configPath = configIndex < 0 ? undefined : command[configIndex + 1];
+        const referenceCommand =
+          configPath !== undefined &&
+          readFileSync(configPath, "utf8").includes(protectedTarget.d1.databaseId);
+        if (referenceCommand) {
+          referenceReads += 1;
+          expect(context?.env?.CLOUDFLARE_API_TOKEN).toBe("reference-test-token");
+          expect(command).toContain("--command");
+          expect(command).not.toContain("--file");
+          const sql = command[command.indexOf("--command") + 1];
+          expect(sql).toMatch(/^(?:SELECT\b|PRAGMA foreign_keys$)/u);
+          expect(sql).not.toContain(";");
+        } else if (command.includes("d1")) {
+          expect(context?.env?.CLOUDFLARE_API_TOKEN).toBe("test-token");
+        }
+        return await fixture.run(command);
+      };
+      const fetcher = async (request: Request) => {
+        if (request.url.includes(protectedTarget.d1.databaseId)) {
+          expect(request.headers.get("authorization")).toBe("Bearer reference-test-token");
+          return new Response(
+            JSON.stringify({
+              success: true,
+              result: {
+                uuid: protectedTarget.d1.databaseId,
+                name: protectedTarget.d1.databaseName,
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        expect(request.headers.get("authorization")).toBe("Bearer test-token");
+        return await options.fetcher(request);
+      };
+      const result = await runD1Schema0058Rehearsal(
+        { action: "apply", environment: "rehearsal", commit: COMMIT },
+        ordinaryTarget,
+        {
+          ...options,
+          run,
+          fetcher,
+          protectedReference: {
+            environment: "production",
+            target: protectedTarget,
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "reference-test-token" },
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        kind: "takoserver.d1-0058-protected-reference-volume@v1",
+        qualification: "injected-runner-local-test-only",
+        readyForProtectedApply: false,
+      });
+      expect(referenceReads).toBeGreaterThan(0);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(1);
+      expect(await readProtected0058Snapshot(sqliteReader(reference), "verification")).toEqual(
+        original,
+      );
+      expect(
+        readFileSync(
+          `${options.custodyPath}.0058-protected-reference-volume-qualified.json`,
+          "utf8",
+        ),
+      ).toContain('"referenceEnvironment":"production"');
+      const receipt = readFileSync(
+        `${options.custodyPath}.0058-protected-reference-volume-qualified.json`,
+        "utf8",
+      );
+      expect(JSON.parse(receipt).binding).toMatchObject({
+        referenceTargetD1: {
+          accountId: protectedTarget.accountId,
+          databaseId: protectedTarget.d1.databaseId,
+          databaseName: protectedTarget.d1.databaseName,
+        },
+        referenceEnvironment: "production",
+        referenceDigest: original.digest,
+        commit: COMMIT,
+      });
+      expect(receipt).not.toContain("reference-test-token");
+      expect(receipt).not.toContain("test-token");
+      expect(() =>
+        readFileSync(`${options.custodyPath}.0058-volume-qualified.json`, "utf8"),
+      ).toThrow();
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("unknown protected-reference import ACK retains custody and fresh status cannot replay or qualify", async () => {
+    const isolated = databaseThrough(57);
+    const reference = databaseThrough(57);
+    reference.exec(build0058SyntheticFixtureSql());
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      const directory = caseDirectory("protected-reference-unknown-ack");
+      const { fixture, options } = makeOptions(
+        directory,
+        isolated,
+        true,
+        false,
+        undefined,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        reference,
+        false,
+        protectedTarget.d1.databaseId,
+      );
+      const fetcher = async (request: Request) =>
+        request.url.includes(protectedTarget.d1.databaseId)
+          ? new Response(
+              JSON.stringify({
+                success: true,
+                result: {
+                  uuid: protectedTarget.d1.databaseId,
+                  name: protectedTarget.d1.databaseName,
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            )
+          : await options.fetcher(request);
+      const selected = {
+        ...options,
+        fetcher,
+        protectedReference: {
+          environment: "production",
+          target: protectedTarget,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "reference-test-token" },
+        },
+      } as const;
+      const invocation = { action: "apply", environment: "rehearsal", commit: COMMIT } as const;
+      const failure = await runD1Schema0058Rehearsal(invocation, ordinaryTarget, selected).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(DeployError);
+      expect(
+        readFileSync(
+          `${options.custodyPath}.0058-protected-reference-volume-dispatched.json`,
+          "utf8",
+        ),
+      ).toContain('"state":"dispatched"');
+      expect(() =>
+        readFileSync(
+          `${options.custodyPath}.0058-protected-reference-volume-qualified.json`,
+          "utf8",
+        ),
+      ).toThrow();
+      const status = await runD1Schema0058Rehearsal(
+        { ...invocation, action: "status" },
+        ordinaryTarget,
+        { ...selected, outputDirectory: join(directory, "fresh-status") },
+      );
+      expect(status).toMatchObject({
+        reconciliation: "status-only-no-replay",
+        readyForProtectedApply: false,
+      });
+      const replay = await runD1Schema0058Rehearsal(invocation, ordinaryTarget, {
+        ...selected,
+        outputDirectory: join(directory, "fresh-apply"),
+      });
+      expect(replay).toMatchObject({ reconciliation: "status-only-no-replay" });
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(1);
+      const wrongSource = await runD1Schema0058Rehearsal(
+        { ...invocation, commit: "b".repeat(40) },
+        ordinaryTarget,
+        { ...selected, outputDirectory: join(directory, "wrong-source") },
+      ).catch((error: unknown) => error);
+      expect(wrongSource).toBeInstanceOf(DeployError);
+      const wrongTarget = await runD1Schema0058Rehearsal(invocation, ordinaryTarget, {
+        ...selected,
+        protectedReference: {
+          ...selected.protectedReference,
+          target: { ...protectedTarget, accountId: "c".repeat(32) },
+        },
+        outputDirectory: join(directory, "wrong-target"),
+      }).catch((error: unknown) => error);
+      expect(wrongTarget).toBeInstanceOf(DeployError);
+      expect(
+        fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+      ).toHaveLength(1);
+    } finally {
+      isolated.close();
+      reference.close();
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
+
+  test("protected reference scope, provider identity, drift and capacity faults refuse before migration import", async () => {
+    const reviewer = process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+    process.env.TAKOSERVER_INDEPENDENT_REVIEW = "reviewer@example.test";
+    try {
+      for (const fault of ["scope", "identity", "drift", "capacity", "same-token"] as const) {
+        const isolated = databaseThrough(57);
+        const reference = databaseThrough(57);
+        const fixtureSql = build0058SyntheticFixtureSql();
+        reference.exec(fixtureSql);
+        if (fault === "capacity")
+          for (let index = 1; index <= 32; index++)
+            reference.exec(fixtureSql.replaceAll("synthetic-0058-", `bulk${index}-0058-`));
+        try {
+          const directory = caseDirectory(`protected-reference-${fault}`);
+          const { fixture, options } = makeOptions(
+            directory,
+            isolated,
+            false,
+            false,
+            undefined,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            reference,
+            fault === "drift",
+            protectedTarget.d1.databaseId,
+          );
+          const fetcher = async (request: Request) =>
+            fault !== "identity" && request.url.includes(protectedTarget.d1.databaseId)
+              ? new Response(
+                  JSON.stringify({
+                    success: true,
+                    result: {
+                      uuid: protectedTarget.d1.databaseId,
+                      name: protectedTarget.d1.databaseName,
+                    },
+                  }),
+                  { status: 200, headers: { "content-type": "application/json" } },
+                )
+              : await options.fetcher(request);
+          const failure = await runD1Schema0058Rehearsal(
+            { action: "apply", environment: "rehearsal", commit: COMMIT },
+            ordinaryTarget,
+            {
+              ...options,
+              fetcher,
+              protectedReference: {
+                environment: "production",
+                target:
+                  fault === "scope"
+                    ? { ...protectedTarget, environment: "integration" }
+                    : protectedTarget,
+                cloudflareEnvironment: {
+                  CLOUDFLARE_API_TOKEN:
+                    fault === "same-token" ? "test-token" : "reference-test-token",
+                },
+              },
+            },
+          ).catch((error: unknown) => error);
+          if (!(failure instanceof DeployError))
+            throw new Error(
+              `protected reference ${fault} returned ${failure instanceof Error ? failure.name : typeof failure}, not DeployError`,
+            );
+          expect(
+            fixture.fileImports.filter((path) => path.endsWith("migration-import.sql")),
+          ).toHaveLength(0);
+          expect(() =>
+            readFileSync(
+              `${options.custodyPath}.0058-protected-reference-volume-qualified.json`,
+              "utf8",
+            ),
+          ).toThrow();
+        } finally {
+          isolated.close();
+          reference.close();
+        }
+      }
+    } finally {
+      if (reviewer === undefined) delete process.env.TAKOSERVER_INDEPENDENT_REVIEW;
+      else process.env.TAKOSERVER_INDEPENDENT_REVIEW = reviewer;
+    }
+  });
   test("measures an ordinary 0057 reference and persists a distinct upper-bound receipt only after an acknowledged import", async () => {
     const isolated = databaseThrough(57);
     const reference = databaseThrough(57);
@@ -1293,28 +1659,104 @@ describe("0058 selected-reference volume producer", () => {
     }
   });
 
-  test("FIFO custody is refused without blocking the status seam", () => {
-    const child = spawnSync(
-      "timeout",
-      [
-        "3s",
-        process.execPath,
-        "test",
-        import.meta.path,
-        "--test-name-pattern",
-        "FIFO child status",
-      ],
-      {
-        env: { ...process.env, TAKOSERVER_0058_FIFO_CHILD: "1" },
+  test("3s watchdog distinguishes a blocking FIFO reader from the canonical bounded reader", () => {
+    const directory = caseDirectory("volume-fifo-watchdog");
+    const custodyPath = join(directory, "custody");
+    const dispatchedPath = `${custodyPath}.0058-volume-dispatched.json`;
+    expect(spawnSync("mkfifo", [dispatchedPath]).status).toBe(0);
+    const childEnvironment = {
+      PATH: process.env.PATH ?? "",
+      HOME: process.env.HOME ?? "",
+      ...(process.env.TMPDIR === undefined ? {} : { TMPDIR: process.env.TMPDIR }),
+      TAKOSERVER_0058_FIFO_PATH: custodyPath,
+    };
+    const runWatched = (script: string) =>
+      spawnSync("timeout", ["3s", process.execPath, "-e", script], {
+        env: childEnvironment,
         encoding: "utf8",
         timeout: 4_000,
+      });
+    // Deliberately blocking test double: no writer exists, so GNU timeout
+    // must stop it. It neither calls nor weakens the production reader.
+    const blocked = runWatched(
+      'import { openSync, constants } from "node:fs"; openSync(process.env.TAKOSERVER_0058_FIFO_PATH + ".0058-volume-dispatched.json", constants.O_RDONLY);',
+    );
+    expect(blocked.status).toBe(124);
+    const readerModule = new URL(
+      "../scripts/deploy/schema-0058-volume-receipt.ts",
+      import.meta.url,
+    );
+    const errorModule = new URL("../scripts/deploy/errors.ts", import.meta.url);
+    const readScript = `
+      import { read0058VolumeReceipt } from ${JSON.stringify(readerModule.href)};
+      import { DeployError } from ${JSON.stringify(errorModule.href)};
+      try {
+        read0058VolumeReceipt(process.env.TAKOSERVER_0058_FIFO_PATH, "dispatched");
+        process.exit(2);
+      } catch (error) {
+        if (!(error instanceof DeployError) || error.phase !== "preflight") process.exit(3);
+        process.stdout.write("receipt-refused:preflight\\n");
+      }
+    `;
+    const fifo = runWatched(readScript);
+    expect({ status: fifo.status, phase: fifo.stdout.trim() }).toEqual({
+      status: 0,
+      phase: "receipt-refused:preflight",
+    });
+    rmSync(dispatchedPath);
+    writeFileSync(dispatchedPath, Buffer.alloc(16 * 1024 + 1, 0x41), { mode: 0o600 });
+    const oversized = runWatched(readScript);
+    expect({ status: oversized.status, phase: oversized.stdout.trim() }).toEqual({
+      status: 0,
+      phase: "receipt-refused:preflight",
+    });
+    // The direct reader is also the one used by the full status seam below.
+    expect(() => read0058VolumeReceipt(custodyPath, "dispatched")).toThrow(DeployError);
+    rmSync(dispatchedPath);
+    const regularPath = join(directory, "regular-marker.json");
+    writeFileSync(regularPath, "{}\n", { mode: 0o600 });
+    symlinkSync(regularPath, dispatchedPath);
+    expect(() => read0058VolumeReceipt(custodyPath, "dispatched")).toThrow(
+      "could not be opened safely",
+    );
+  });
+
+  test("FIFO and oversize custody are refused by the full status seam", () => {
+    const child = spawnSync(
+      process.execPath,
+      ["test", import.meta.path, "--test-name-pattern", "FIFO child status"],
+      {
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: process.env.HOME ?? "",
+          ...(process.env.TMPDIR === undefined ? {} : { TMPDIR: process.env.TMPDIR }),
+          TAKOSERVER_0058_FIFO_CHILD: "1",
+        },
+        encoding: "utf8",
+        // This bounds the full fixture/rehearsal setup, not the FIFO read.
+        // The independent 3s watchdog above owns the nonblocking guarantee.
+        timeout: 15_000,
       },
     );
-    expect(child.status).toBe(0);
+    const phases = child.stdout.match(/0058-fifo-phase:[a-z-]+/gu) ?? [];
+    expect({
+      status: child.status,
+      timeout: (child.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+      phases,
+    }).toEqual({
+      status: 0,
+      timeout: null,
+      phases: [
+        "0058-fifo-phase:setup",
+        "0058-fifo-phase:status-fifo",
+        "0058-fifo-phase:status-oversize",
+      ],
+    });
   });
 
   test("FIFO child status", async () => {
     if (process.env.TAKOSERVER_0058_FIFO_CHILD !== "1") return;
+    process.stdout.write("0058-fifo-phase:setup\n");
     const isolated = databaseThrough(57);
     const reference = databaseThrough(57);
     reference.exec(build0058SyntheticFixtureSql());
@@ -1348,6 +1790,7 @@ describe("0058 selected-reference volume producer", () => {
       const dispatchedPath = `${options.custodyPath}.0058-volume-dispatched.json`;
       rmSync(dispatchedPath);
       expect(spawnSync("mkfifo", [dispatchedPath]).status).toBe(0);
+      process.stdout.write("0058-fifo-phase:status-fifo\n");
       const failure = await runD1Schema0058Rehearsal(
         { action: "status", environment: "rehearsal", commit: COMMIT },
         ordinaryTarget,
@@ -1356,6 +1799,7 @@ describe("0058 selected-reference volume producer", () => {
       expect(failure).toBeInstanceOf(DeployError);
       rmSync(dispatchedPath);
       writeFileSync(dispatchedPath, Buffer.alloc(16 * 1024 + 1, 0x41), { mode: 0o600 });
+      process.stdout.write("0058-fifo-phase:status-oversize\n");
       const oversized = await runD1Schema0058Rehearsal(
         { action: "status", environment: "rehearsal", commit: COMMIT },
         ordinaryTarget,

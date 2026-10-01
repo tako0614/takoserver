@@ -60,8 +60,21 @@ export interface VolumeReceipt {
   readonly digest: string;
 }
 
-function pathFor(custodyPath: string, state: VolumeReceipt["state"]): string {
-  return `${custodyPath}.0058-volume-${state}.json`;
+/** Disjoint custody: this never upgrades the selected-rehearsal v1 receipt. */
+export interface ProtectedReferenceVolumeReceipt
+  extends Omit<VolumeReceipt, "kind" | "binding" | "qualification"> {
+  readonly kind: "takoserver.d1-0058-protected-reference-volume@v1";
+  readonly binding: VolumeReceipt["binding"] & {
+    readonly referenceEnvironment: "integration" | "production";
+  };
+  readonly qualification?: "protected-reference-candidate-only" | "injected-runner-local-test-only";
+}
+
+type Receipt = VolumeReceipt | ProtectedReferenceVolumeReceipt;
+type Profile = "selected" | "protected";
+
+function pathFor(custodyPath: string, state: VolumeReceipt["state"], profile: Profile): string {
+  return `${custodyPath}.0058-${profile === "protected" ? "protected-reference-volume" : "volume"}-${state}.json`;
 }
 
 function hash(value: unknown): string {
@@ -109,7 +122,7 @@ function counts(value: unknown): boolean {
   );
 }
 
-function binding(value: unknown): value is VolumeReceipt["binding"] {
+function binding(value: unknown, profile: Profile): value is Receipt["binding"] {
   if (
     !object(value) ||
     !keys(value, [
@@ -134,10 +147,14 @@ function binding(value: unknown): value is VolumeReceipt["binding"] {
       "fixtureCounts",
       "fixtureBytes",
       "fixtureMaxBlobBytes",
+      ...(profile === "protected" ? ["referenceEnvironment"] : []),
     ])
   )
     return false;
   return (
+    (profile !== "protected" ||
+      value.referenceEnvironment === "integration" ||
+      value.referenceEnvironment === "production") &&
     target(value.referenceTargetD1) &&
     target(value.isolatedTargetD1) &&
     typeof value.commit === "string" &&
@@ -169,7 +186,11 @@ function binding(value: unknown): value is VolumeReceipt["binding"] {
   );
 }
 
-function validReceipt(value: Record<string, unknown>, state: VolumeReceipt["state"]): boolean {
+function validReceipt(
+  value: Record<string, unknown>,
+  state: VolumeReceipt["state"],
+  profile: Profile,
+): boolean {
   const common = ["kind", "state", "binding", "digest"];
   const fields =
     state === "prepared"
@@ -190,10 +211,13 @@ function validReceipt(value: Record<string, unknown>, state: VolumeReceipt["stat
           ];
   if (
     !keys(value, fields) ||
-    value.kind !== "takoserver.d1-0058-selected-reference-volume@v1" ||
+    value.kind !==
+      (profile === "protected"
+        ? "takoserver.d1-0058-protected-reference-volume@v1"
+        : "takoserver.d1-0058-selected-reference-volume@v1") ||
     value.state !== state ||
     !digest(value.digest) ||
-    !binding(value.binding)
+    !binding(value.binding, profile)
   )
     return false;
   if (state === "dispatched") return digest(value.preparedDigest);
@@ -208,7 +232,11 @@ function validReceipt(value: Record<string, unknown>, state: VolumeReceipt["stat
     value.providerAcknowledgement ===
       (injected ? "injected-runner-simulated" : "wrangler-command-ack-observed") &&
     value.qualification ===
-      (injected ? "injected-runner-local-test-only" : "selected-rehearsal-reference-only") &&
+      (injected
+        ? "injected-runner-local-test-only"
+        : profile === "protected"
+          ? "protected-reference-candidate-only"
+          : "selected-rehearsal-reference-only") &&
     value.rollbackProbes === "both-failed-and-exact-0057-restored" &&
     typeof value.observedAt === "string" &&
     typeof value.expiresAt === "string" &&
@@ -218,18 +246,21 @@ function validReceipt(value: Record<string, unknown>, state: VolumeReceipt["stat
   );
 }
 
-function sameBinding(left: VolumeReceipt["binding"], right: VolumeReceipt["binding"]): boolean {
+function sameBinding(left: Receipt["binding"], right: Receipt["binding"]): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function assertReceiptChain(custodyPath: string): {
-  readonly prepared: VolumeReceipt | null;
-  readonly dispatched: VolumeReceipt | null;
-  readonly qualified: VolumeReceipt | null;
+function assertReceiptChain(
+  custodyPath: string,
+  profile: Profile,
+): {
+  readonly prepared: Receipt | null;
+  readonly dispatched: Receipt | null;
+  readonly qualified: Receipt | null;
 } {
-  const prepared = read0058VolumeReceipt(custodyPath, "prepared");
-  const dispatched = read0058VolumeReceipt(custodyPath, "dispatched");
-  const qualified = read0058VolumeReceipt(custodyPath, "qualified");
+  const prepared = readReceipt(custodyPath, "prepared", profile);
+  const dispatched = readReceipt(custodyPath, "dispatched", profile);
+  const qualified = readReceipt(custodyPath, "qualified", profile);
   if (
     (dispatched !== null &&
       (prepared === null ||
@@ -244,14 +275,43 @@ function assertReceiptChain(custodyPath: string): {
   return { prepared, dispatched, qualified };
 }
 
-export const read0058VolumeChain = assertReceiptChain;
+export function read0058VolumeChain(custodyPath: string) {
+  return assertReceiptChain(custodyPath, "selected") as {
+    readonly prepared: VolumeReceipt | null;
+    readonly dispatched: VolumeReceipt | null;
+    readonly qualified: VolumeReceipt | null;
+  };
+}
+
+export function read0058ProtectedReferenceVolumeChain(custodyPath: string) {
+  return assertReceiptChain(custodyPath, "protected") as {
+    readonly prepared: ProtectedReferenceVolumeReceipt | null;
+    readonly dispatched: ProtectedReferenceVolumeReceipt | null;
+    readonly qualified: ProtectedReferenceVolumeReceipt | null;
+  };
+}
 
 export function persist0058VolumeReceipt(
   custodyPath: string,
   receipt: Omit<VolumeReceipt, "digest">,
 ): VolumeReceipt {
+  return persistReceipt(custodyPath, receipt, "selected") as VolumeReceipt;
+}
+
+export function persist0058ProtectedReferenceVolumeReceipt(
+  custodyPath: string,
+  receipt: Omit<ProtectedReferenceVolumeReceipt, "digest">,
+): ProtectedReferenceVolumeReceipt {
+  return persistReceipt(custodyPath, receipt, "protected") as ProtectedReferenceVolumeReceipt;
+}
+
+function persistReceipt(
+  custodyPath: string,
+  receipt: Omit<Receipt, "digest">,
+  profile: Profile,
+): Receipt {
   if (receipt.state !== "prepared") {
-    const chain = assertReceiptChain(custodyPath);
+    const chain = assertReceiptChain(custodyPath, profile);
     if (
       receipt.state === "dispatched"
         ? chain.prepared === null ||
@@ -278,8 +338,8 @@ export function persist0058VolumeReceipt(
     const info = fstatSync(directory);
     if (!info.isDirectory() || info.uid !== process.getuid?.() || (info.mode & 0o777) !== 0o700)
       throw preflightError("0058 volume receipt custody directory must be owner-owned 0700");
-    const complete: VolumeReceipt = { ...receipt, digest: hash(receipt) };
-    if (!validReceipt(complete as unknown as Record<string, unknown>, receipt.state))
+    const complete = { ...receipt, digest: hash(receipt) } as Receipt;
+    if (!validReceipt(complete as unknown as Record<string, unknown>, receipt.state, profile))
       throw preflightError("0058 volume receipt payload is invalid");
     const bytes = Buffer.from(`${JSON.stringify(complete)}\n`, "utf8");
     if (bytes.length > MAX_RECEIPT_BYTES)
@@ -287,7 +347,7 @@ export function persist0058VolumeReceipt(
     let file: number;
     try {
       file = openSync(
-        pathFor(custodyPath, receipt.state),
+        pathFor(custodyPath, receipt.state, profile),
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
         0o600,
       );
@@ -325,10 +385,18 @@ export function read0058VolumeReceipt(
   custodyPath: string,
   state: VolumeReceipt["state"],
 ): VolumeReceipt | null {
+  return readReceipt(custodyPath, state, "selected") as VolumeReceipt | null;
+}
+
+function readReceipt(
+  custodyPath: string,
+  state: VolumeReceipt["state"],
+  profile: Profile,
+): Receipt | null {
   let file: number;
   try {
     file = openSync(
-      pathFor(custodyPath, state),
+      pathFor(custodyPath, state, profile),
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
   } catch (error) {
@@ -359,9 +427,9 @@ export function read0058VolumeReceipt(
       throw preflightError("0058 volume receipt is malformed");
     const record = value as Record<string, unknown>;
     const { digest, ...payload } = record;
-    if (!validReceipt(record, state) || digest !== hash(payload))
+    if (!validReceipt(record, state, profile) || digest !== hash(payload))
       throw preflightError("0058 volume receipt is malformed or changed");
-    return record as unknown as VolumeReceipt;
+    return record as unknown as Receipt;
   } catch (error) {
     if (error instanceof SyntaxError) throw preflightError("0058 volume receipt is invalid JSON");
     throw error;
