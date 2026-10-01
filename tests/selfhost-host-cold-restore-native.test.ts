@@ -14,17 +14,24 @@ import { request as httpsRequest } from "node:https";
 import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { bytesDigest } from "../src/json.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
-import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
+import {
+  buildRealCoreVerifier,
+  realCoreVerificationRequest,
+} from "./helpers/real-core-verifier.ts";
 
 // Native-only: run inside an isolated network namespace with loopback enabled.
 // The real Bun entry owns both listeners; 443 is required by WorkerEndpoint@0.1.0.
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 const HOST_ORIGIN = "http://127.0.0.1:8787";
 const API_PORT = 8787;
+const CORE_VERIFIER_PORT = 8080;
+const CORE_VERIFIER_ORIGIN = `http://127.0.0.1:${CORE_VERIFIER_PORT}`;
 const WORKER_SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
 const SPACE = "default";
@@ -80,6 +87,7 @@ test.skipIf(WORKERD === null)(
     mkdirSync(restoredBase, { recursive: true, mode: 0o700 });
 
     const baseEnvironment = childEnvironment(fixture);
+    const coreVerifierArtifactDigest = takoformCoreVerifierArtifactDigest();
     const hostEnvironment = (root: string, database: string, tlsDirectory: string) => ({
       ...baseEnvironment,
       TAKOSERVER_DATA_ROOT: root,
@@ -95,12 +103,23 @@ test.skipIf(WORKERD === null)(
     });
     let host: Host | undefined;
     let admission: ReturnType<typeof Bun.spawn> | undefined;
-    let verifier: ReturnType<typeof Bun.serve> | undefined;
-    let verifierPort: number | undefined;
+    let verifier: ReturnType<typeof Bun.spawn> | undefined;
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     const cleanupFailures: string[] = [];
     try {
+      const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
+      verifier = Bun.spawn([coreVerifierBinary], {
+        cwd: process.cwd(),
+        env: {
+          ...baseEnvironment,
+          TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+        },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await waitForCoreVerifier(verifier, coreVerifierArtifactDigest);
       await createTls(sourceTls);
       host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
@@ -194,16 +213,11 @@ test.skipIf(WORKERD === null)(
       }
 
       // Self-host Forms are durably admitted before Worker resources are created.
-      // This fixture synthesizes verifier responses; it is not Core/Sigstore proof.
+      // Exercise released Core directly before Host records any Form admission.
       await stopHost(host, { requireWorker: false, dataRoot: sourceRoot });
       host = undefined;
-      const verifierFixture = createSyntheticPublisherSetVerifier();
-      verifier = Bun.serve({
-        hostname: "127.0.0.1",
-        port: 0,
-        fetch: (request) => verifierFixture.fetch(request),
-      });
-      verifierPort = verifier.port;
+      const publisherSetClosure = await loadPublisherSetClosure();
+      await proveRealCorePublisherSet(CORE_VERIFIER_ORIGIN, publisherSetClosure);
       try {
         admission = Bun.spawn(
           [
@@ -218,13 +232,13 @@ test.skipIf(WORKERD === null)(
             "--host-id",
             HOST_ORIGIN,
             "--core-verifier",
-            `http://127.0.0.1:${verifier.port}`,
+            CORE_VERIFIER_ORIGIN,
           ],
           {
             cwd: process.cwd(),
             env: hostEnvironment(sourceRoot, sourceDb, sourceTls),
             stdin: "ignore",
-            stdout: "ignore",
+            stdout: "pipe",
             stderr: "ignore",
           },
         );
@@ -241,19 +255,20 @@ test.skipIf(WORKERD === null)(
           await Bun.sleep(25);
         }
         exitCode = await completedAdmission.exited;
+        if (!(completedAdmission.stdout instanceof ReadableStream)) {
+          throw new Error("selfhost_form_admission_stdout_unavailable");
+        }
+        const admissionOutput = await new Response(completedAdmission.stdout).text();
         rememberDescendants(completedAdmission.pid, admissionDescendants);
         await waitForProcessIdentitiesGone(admissionDescendants.values());
         admission = undefined;
         if (exitCode !== 0) throw new Error("selfhost_form_admission_cli_nonzero_exit");
+        expect(admissionOutput).toMatch(
+          /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
+        );
       } finally {
         if (admission) await stopAdmissionProcess(admission);
         admission = undefined;
-        if (verifier) {
-          await verifier.stop(true);
-          await waitForPortClosed(verifierPort as number);
-          verifier = undefined;
-          verifierPort = undefined;
-        }
       }
 
       host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
@@ -542,10 +557,8 @@ test.skipIf(WORKERD === null)(
       }
       if (verifier) {
         try {
-          await verifier.stop(true);
-          await waitForPortClosed(verifierPort as number);
+          await stopVerifierProcess(verifier);
           verifier = undefined;
-          verifierPort = undefined;
         } catch (error) {
           cleanupFailures.push(errorTag(error));
         }
@@ -578,6 +591,123 @@ function childEnvironment(home: string): Record<string, string> {
     NO_COLOR: "1",
     CHECKPOINT_DISABLE: "1",
   };
+}
+
+async function waitForCoreVerifier(
+  verifier: ReturnType<typeof Bun.spawn>,
+  artifactDigest: string,
+): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (verifier.exitCode !== null) {
+      throw new Error(`selfhost_real_core_verifier_exited_${await verifier.exited}`);
+    }
+    try {
+      const response = await fetch(`${CORE_VERIFIER_ORIGIN}/v1/identity`);
+      if (response.ok) {
+        const identity = (await response.json()) as Json;
+        if (
+          identity.protocol === "takoserver.takoform-core-verifier@v1" &&
+          identity.coreVersion === "v1.1.0" &&
+          identity.coreCommit === "e0e48b864de2a127a255cb0574d37bbb0f1cac29" &&
+          identity.artifactDigest === artifactDigest
+        ) {
+          return;
+        }
+        throw new Error("selfhost_real_core_verifier_identity_mismatch");
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "selfhost_real_core_verifier_identity_mismatch"
+      ) {
+        throw error;
+      }
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("selfhost_real_core_verifier_startup_timeout");
+}
+
+async function proveRealCorePublisherSet(
+  verifierOrigin: string,
+  closure: Awaited<ReturnType<typeof loadPublisherSetClosure>>,
+): Promise<void> {
+  const endpoint = `${verifierOrigin}/v1/verify-set`;
+  const request = await realCoreVerificationRequest(closure);
+  const accepted = await postCoreVerification(endpoint, request);
+  expect(accepted.status).toBe(200);
+  const acceptedBody = (await accepted.json()) as Json;
+  expect((acceptedBody.packages as unknown[]).length).toBe(closure.identity.packageCount);
+  expect(closure.identity.packageCount).toBe(17);
+  expect(objectAt(acceptedBody, "identity").coreVersion).toBe("v1.1.0");
+  expect(objectAt(acceptedBody, "identity").coreCommit).toBe(
+    "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+  );
+
+  const packageTampered = structuredClone(request);
+  const packages = packageTampered.packages as Json[];
+  const firstPackage = packages[0];
+  const files = firstPackage?.files;
+  if (!Array.isArray(files) || !files[0]) {
+    throw new Error("selfhost_core_test_package_bytes_missing");
+  }
+  const firstFile = files[0] as Json;
+  const mutatedPackageBytes = Uint8Array.from(atob(stringAt(firstFile, "bytes")), (value) =>
+    value.charCodeAt(0),
+  );
+  if (mutatedPackageBytes.byteLength === 0) {
+    throw new Error("selfhost_core_test_package_bytes_empty");
+  }
+  mutatedPackageBytes[0] = (mutatedPackageBytes[0] as number) ^ 1;
+  files[0] = { ...firstFile, bytes: toBase64(mutatedPackageBytes) };
+  await expectCoreVerificationRefused(endpoint, packageTampered);
+
+  const publisherTampered = structuredClone(request);
+  const policyBytes = Uint8Array.from(
+    atob(stringAt(publisherTampered, "publisherPolicy")),
+    (value) => value.charCodeAt(0),
+  );
+  const policy = JSON.parse(new TextDecoder().decode(policyBytes)) as Json;
+  policy.ref = "refs/heads/release";
+  publisherTampered.publisherPolicy = toBase64(new TextEncoder().encode(JSON.stringify(policy)));
+  await expectCoreVerificationRefused(endpoint, publisherTampered);
+}
+
+async function postCoreVerification(endpoint: string, request: Json): Promise<Response> {
+  return fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+  });
+}
+
+async function expectCoreVerificationRefused(endpoint: string, request: Json): Promise<void> {
+  const response = await postCoreVerification(endpoint, request);
+  expect(response.status).toBe(422);
+  expect(response.headers.get("content-type")).toContain("application/json");
+  const body = (await response.json()) as Json;
+  expect(body.code).toBe("verification_refused");
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function stopVerifierProcess(verifier: ReturnType<typeof Bun.spawn>): Promise<void> {
+  if (verifier.exitCode === null) {
+    verifier.kill("SIGTERM");
+    const exitCode = await Promise.race([verifier.exited, Bun.sleep(5_000).then(() => null)]);
+    if (exitCode === null) {
+      verifier.kill("SIGKILL");
+      await verifier.exited;
+    }
+  }
+  await waitForPortClosed(CORE_VERIFIER_PORT);
 }
 
 function startHost(environment: Record<string, string>): ReturnType<typeof Bun.spawn> {
