@@ -1,7 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
-import { once } from "node:events";
 import { mkdir } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { dirname, isAbsolute } from "node:path";
 import { Readable } from "node:stream";
@@ -32,6 +31,28 @@ function validToken(got: string | undefined, expected: string): boolean {
   const left = Buffer.from(got);
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function waitForDrainOrClose(outgoing: ServerResponse, signal: AbortSignal) {
+  return new Promise<boolean>((resolve) => {
+    const cleanup = () => {
+      outgoing.off("drain", onDrain);
+      outgoing.off("close", onClose);
+      outgoing.off("error", onClose);
+      signal.removeEventListener("abort", onClose);
+    };
+    const finish = (drained: boolean) => {
+      cleanup();
+      resolve(drained);
+    };
+    const onDrain = () => finish(true);
+    const onClose = () => finish(false);
+    outgoing.once("drain", onDrain);
+    outgoing.once("close", onClose);
+    outgoing.once("error", onClose);
+    signal.addEventListener("abort", onClose, { once: true });
+    if (outgoing.destroyed || signal.aborted) onClose();
+  });
 }
 
 /** Ordinary streaming Actor calls use the same Host authority owner as upgrades. */
@@ -115,10 +136,20 @@ export async function openSelfhostActorHttpBroker(
         outgoing.end();
         return;
       }
-      for await (const chunk of Readable.fromWeb(response.body as never)) {
-        if (!outgoing.write(chunk)) await once(outgoing, "drain");
+      const responseBody = Readable.fromWeb(response.body as never);
+      const cancelBody = () => responseBody.destroy();
+      abort.signal.addEventListener("abort", cancelBody, { once: true });
+      if (abort.signal.aborted) cancelBody();
+      try {
+        for await (const chunk of responseBody) {
+          if (outgoing.destroyed || abort.signal.aborted) break;
+          if (!outgoing.write(chunk) && !(await waitForDrainOrClose(outgoing, abort.signal))) break;
+        }
+      } finally {
+        abort.signal.removeEventListener("abort", cancelBody);
+        if (!responseBody.readableEnded) responseBody.destroy();
       }
-      outgoing.end();
+      if (!outgoing.destroyed) outgoing.end();
     } catch {
       if (!outgoing.headersSent) outgoing.writeHead(503);
       outgoing.end();

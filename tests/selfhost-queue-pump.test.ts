@@ -422,6 +422,105 @@ test("takes at most maxConcurrency batches at a time", async () => {
   ]);
 });
 
+test("coalesces concurrent ticks and keeps the per-consumer concurrency ceiling", async () => {
+  const base = recordingRuntime();
+  let active = 0;
+  let maximumActive = 0;
+  let markStarted: (() => void) | undefined;
+  const firstProbeStarted = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  let markConcurrentProbeStarted: (() => void) | undefined;
+  const secondProbeStarted = new Promise<void>((resolve) => {
+    markConcurrentProbeStarted = resolve;
+  });
+  let releaseProbes: (() => void) | undefined;
+  const probesReleased = new Promise<void>((resolve) => {
+    releaseProbes = resolve;
+  });
+  const runtime: WorkerdRuntime = {
+    ...base.runtime,
+    async probe(name, path, init) {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      markStarted?.();
+      if (active === 2) markConcurrentProbeStarted?.();
+      try {
+        await probesReleased;
+        return (await base.runtime.probe?.(name, path, init)) ?? null;
+      } finally {
+        active -= 1;
+      }
+    },
+  };
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime,
+    targets: targets({
+      consumers: [{ ...CONSUMER, maxBatchSize: 1, maxConcurrency: 1 }],
+    }),
+    clock: () => new Date(millis),
+  });
+  await enqueue(2);
+
+  let first: Promise<number> | undefined;
+  let second: Promise<number> | undefined;
+  let coalesced = false;
+  let secondSettledBeforeRelease = false;
+  try {
+    first = pump.tick();
+    await firstProbeStarted;
+    second = pump.tick();
+    coalesced = second === first;
+    if (!coalesced) await secondProbeStarted;
+    let secondSettled = false;
+    void second.then(() => {
+      secondSettled = true;
+    });
+    await Promise.resolve();
+    secondSettledBeforeRelease = secondSettled;
+  } finally {
+    releaseProbes?.();
+    await first?.catch(() => {});
+    await second?.catch(() => {});
+  }
+
+  expect(secondSettledBeforeRelease).toBe(false);
+  expect(maximumActive).toBe(1);
+  expect(await Promise.all([first, second])).toEqual([2, 2]);
+  expect(coalesced).toBe(true);
+});
+
+test("a rejected tick releases the single-flight slot for the next pass", async () => {
+  let failNextList = true;
+  const listFailure = new Error("event targets temporarily unavailable");
+  const source = targets();
+  const targetSource: SelfhostEventTargets = {
+    async list() {
+      if (failNextList) {
+        failNextList = false;
+        throw listFailure;
+      }
+      return await source.list();
+    },
+    select: source.select,
+  };
+  const pump = createSelfhostQueuePump({
+    sql,
+    runtime: recordingRuntime().runtime,
+    targets: targetSource,
+    clock: () => new Date(millis),
+  });
+
+  const first = pump.tick();
+  const concurrent = pump.tick();
+  void first.catch(() => {});
+  void concurrent.catch(() => {});
+  expect(concurrent).toBe(first);
+  await expect(first).rejects.toBe(listFailure);
+  expect(await pump.tick()).toBe(0);
+});
+
 test("retries with the consumer's delay, and with the handler's when it named one", async () => {
   const runtime = recordingRuntime();
   runtime.answer = (delivery) => retryEvery(delivery);

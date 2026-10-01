@@ -3337,6 +3337,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         throw new TypeError("invalid provider repair limit");
       }
       const timestamp = now();
+      // A saved receipt is the exact provider result, not a completed Host
+      // commit. If the final batch was lost, maintenance must publish it under
+      // the same deferred operation without dispatching the provider again.
       const rows = await sql.query(
         `SELECT operation.*
          FROM ${DEFERRED_OPERATION_TABLE} AS operation
@@ -3358,14 +3361,16 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
            AND operation.protocol_generation = 1
            AND operation.terminal_json IS NULL
            AND (operation.lease_until IS NULL OR operation.lease_until <= ?)
-           AND saga.phase = 'planned'
-           AND saga.receipt_json IS NULL
-           AND (saga.execution_started_at IS NOT NULL
-             OR (
-               saga.operation_kind = 'import' AND
-               saga.import_selection_protocol = 1 AND
-               saga.import_selection_json IS NOT NULL
-             ))
+           AND (
+             (saga.phase = 'planned' AND saga.receipt_json IS NULL
+               AND (saga.execution_started_at IS NOT NULL
+                 OR (
+                   saga.operation_kind = 'import' AND
+                   saga.import_selection_protocol = 1 AND
+                   saga.import_selection_json IS NOT NULL
+                 )))
+             OR (saga.phase = 'executed' AND saga.receipt_json IS NOT NULL)
+           )
            AND (saga.execution_lease_until IS NULL OR saga.execution_lease_until <= ?)
          ORDER BY operation.updated_at, operation.id
          LIMIT ?`,

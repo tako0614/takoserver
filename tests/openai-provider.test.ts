@@ -54,13 +54,21 @@ describe("OpenAI-compatible upstream adapter", () => {
   });
 
   test("classifies an upstream refusal without exposing its response", async () => {
+    let cancelled = false;
     const gateway = createOpenAiGateway({
       baseUrl: "https://upstream.example/v1",
       models: [model],
       authorize: () => "Bearer upstream-secret",
       async fetch() {
-        return Response.json(
-          { error: { message: "account credential secret detail" } },
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("account credential secret detail"));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
           { status: 500 },
         );
       },
@@ -74,5 +82,70 @@ describe("OpenAI-compatible upstream adapter", () => {
       .catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(AiGatewayError);
     expect(String(error)).not.toContain("credential secret detail");
+    expect(cancelled).toBe(true);
+  });
+
+  test("caps an oversized body with lying or absent content length and cancels its remainder", async () => {
+    for (const headers of [{ "content-length": "1" }, {}]) {
+      let pulls = 0;
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            pulls += 1;
+            if (pulls === 1 || pulls === 2) {
+              controller.enqueue(new Uint8Array(pulls === 1 ? 1_500_000 : 750_000));
+            } else {
+              controller.close();
+            }
+          },
+          cancel() {
+            cancelled = true;
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const gateway = createOpenAiGateway({
+        baseUrl: "https://upstream.example/v1",
+        models: [model],
+        authorize: () => "Bearer upstream-secret",
+        async fetch() {
+          return new Response(body, { headers });
+        },
+      });
+
+      const error = await gateway
+        .chat(
+          { model: "takoserver-text", messages: [{ role: "user", content: "hello" }] },
+          { requestId: "ai_large", idempotencyKey: "chat-large" },
+        )
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(AiGatewayError);
+      expect((error as AiGatewayError).code).toBe("invalid_response");
+      expect(pulls).toBe(2);
+      expect(cancelled).toBe(true);
+    }
+  });
+
+  test("rejects a successful response without a body", async () => {
+    const gateway = createOpenAiGateway({
+      baseUrl: "https://upstream.example/v1",
+      models: [model],
+      authorize: () => "Bearer upstream-secret",
+      async fetch() {
+        return new Response(null);
+      },
+    });
+
+    const error = await gateway
+      .chat(
+        { model: "takoserver-text", messages: [{ role: "user", content: "hello" }] },
+        { requestId: "ai_empty", idempotencyKey: "chat-empty" },
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AiGatewayError);
+    expect((error as AiGatewayError).code).toBe("invalid_response");
   });
 });

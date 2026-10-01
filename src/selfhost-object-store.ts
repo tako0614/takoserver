@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { chmod, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, link, mkdir, open, readdir, rename, rm, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Sql } from "./ports.ts";
 
@@ -39,7 +39,10 @@ import type { Sql } from "./ports.ts";
  * Durable Object instead
  * ([ADR 0007](../docs/adr/0007-objectbucket-joins-the-implementation-catalog.md)).
  * A restart between `createMultipartUpload` and `completeMultipartUpload`
- * therefore preserves the part sizes and etags in either wrapper.
+ * therefore preserves the part sizes and etags in either wrapper. Part bytes
+ * are published at a SHA-256-derived name without replacing an acknowledged
+ * inode; only then does the receipt move. A same-content retry reuses the
+ * verified file rather than retaining another 5 GiB copy.
  *
  * Directory permission bits are fail-closed: this module requests `0700`,
  * tightens an existing directory, then refuses it if `stat` still reports any
@@ -88,6 +91,25 @@ const BUCKET_ID = /^tsb-[0-9a-f]{40}$/u;
 const STORAGE_ID = /^[0-9a-f]{32}$/u;
 const UPLOAD_ID = /^[0-9a-f]{32}$/u;
 const READ_CHUNK_BYTES = 512 * 1_024;
+const partLocks = new Map<string, Promise<void>>();
+
+/** Serializes same-part writes across store instances in this self-host process. */
+async function withPartLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = partLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  partLocks.set(key, tail);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (partLocks.get(key) === tail) partLocks.delete(key);
+  }
+}
 
 export type SelfhostObjectErrorCode =
   | "invalid_key"
@@ -260,6 +282,50 @@ export function createSelfhostObjectStore(
       throw new SelfhostObjectError("backend_unavailable");
     }
     return join(bucketDirectory(bucketId), "u", uploadId, String(partNumber));
+  };
+  const versionedPartPath = (
+    bucketId: string,
+    uploadId: string,
+    partNumber: number,
+    etag: string,
+  ): string => {
+    if (!/^[0-9a-f]{64}$/u.test(etag)) {
+      throw new SelfhostObjectError("backend_unavailable");
+    }
+    return `${partPath(bucketId, uploadId, partNumber)}-${etag}`;
+  };
+  const partPathForEtag = async (
+    bucketId: string,
+    uploadId: string,
+    partNumber: number,
+    etag: string,
+  ): Promise<string> => {
+    const versioned = versionedPartPath(bucketId, uploadId, partNumber, etag);
+    if (await stat(versioned).catch(() => null)) return versioned;
+    // Pre-versioned receipts stored their bytes at the part number alone.
+    return partPath(bucketId, uploadId, partNumber);
+  };
+  const partLockKey = (bucketId: string, uploadId: string, partNumber: number): string =>
+    `${root}\u0000${bucketId}\u0000${uploadId}\u0000${partNumber}`;
+  const fileMatchesPart = async (path: string, size: number, etag: string): Promise<boolean> => {
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      if ((await handle.stat()).size !== size) return false;
+      const digest = createHash("sha256");
+      for (let offset = 0; ; ) {
+        const buffer = new Uint8Array(READ_CHUNK_BYTES);
+        const read = await handle.read(buffer, 0, buffer.byteLength, offset);
+        if (read.bytesRead === 0) break;
+        offset += read.bytesRead;
+        digest.update(buffer.subarray(0, read.bytesRead));
+      }
+      return digest.digest("hex") === etag;
+    } catch {
+      return false;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   };
 
   /**
@@ -578,24 +644,87 @@ export function createSelfhostObjectStore(
       ) {
         throw new SelfhostObjectError("upload_not_found");
       }
-      const upload = await readUpload(sql, bucketId, uploadId);
-      if (!upload || upload.key !== key) throw new SelfhostObjectError("upload_not_found");
-      const staged = await stage(bucketId, body, options.contentLength, MAX_SELFHOST_OBJECT_BYTES);
-      const destination = partPath(bucketId, uploadId, partNumber);
-      await publish(staged.path, destination);
-      try {
-        await run(
-          sql,
-          "INSERT INTO selfhost_object_upload_parts (bucket_id, upload_id, part_number, size, etag) " +
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (bucket_id, upload_id, part_number) DO UPDATE SET " +
-            "size = excluded.size, etag = excluded.etag",
-          [bucketId, uploadId, partNumber, staged.size, staged.etag],
+      return await withPartLock(partLockKey(bucketId, uploadId, partNumber), async () => {
+        const upload = await readUpload(sql, bucketId, uploadId);
+        if (!upload || upload.key !== key) throw new SelfhostObjectError("upload_not_found");
+        const previous = (
+          await query(
+            sql,
+            "SELECT size, etag FROM selfhost_object_upload_parts " +
+              "WHERE bucket_id = ? AND upload_id = ? AND part_number = ?",
+            [bucketId, uploadId, partNumber],
+          )
+        )[0];
+        const previousPath =
+          typeof previous?.etag === "string"
+            ? await partPathForEtag(bucketId, uploadId, partNumber, previous.etag)
+            : undefined;
+        const staged = await stage(
+          bucketId,
+          body,
+          options.contentLength,
+          MAX_SELFHOST_OBJECT_BYTES,
         );
-      } catch {
-        await rm(destination, { force: true }).catch(() => undefined);
-        throw new SelfhostObjectError("upload_not_found");
-      }
-      return { etag: staged.etag, partNumber };
+        const destination = versionedPartPath(bucketId, uploadId, partNumber, staged.etag);
+        let created = false;
+        try {
+          await privateDirectory(join(bucketDirectory(bucketId), "u", uploadId));
+          // rename() overwrites a previous ack's inode. A hard link is an
+          // atomic no-overwrite publication; stage and destination share a root.
+          try {
+            await link(staged.path, destination);
+            created = true;
+          } catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) {
+              throw error;
+            }
+            if (!(await fileMatchesPart(destination, staged.size, staged.etag))) {
+              throw new SelfhostObjectError("backend_unavailable");
+            }
+          }
+        } catch (error) {
+          await rm(staged.path, { force: true }).catch(() => undefined);
+          throw error instanceof SelfhostObjectError
+            ? error
+            : new SelfhostObjectError("backend_unavailable");
+        }
+        await rm(staged.path, { force: true }).catch(() => undefined);
+        try {
+          await run(
+            sql,
+            "INSERT INTO selfhost_object_upload_parts " +
+              "(bucket_id, upload_id, part_number, size, etag) " +
+              "VALUES (?, ?, ?, ?, ?) ON CONFLICT (bucket_id, upload_id, part_number) DO UPDATE SET " +
+              "size = excluded.size, etag = excluded.etag",
+            [bucketId, uploadId, partNumber, staged.size, staged.etag],
+          );
+        } catch {
+          // Sql.run may have committed before its promise rejected. Read back
+          // before unlinking: otherwise this catch could delete acknowledged
+          // bytes. If readback is unavailable, retain the file and fail closed.
+          const receipt = await query(
+            sql,
+            "SELECT size, etag FROM selfhost_object_upload_parts " +
+              "WHERE bucket_id = ? AND upload_id = ? AND part_number = ?",
+            [bucketId, uploadId, partNumber],
+          ).catch(() => null);
+          if (receipt?.[0]?.etag === staged.etag && Number(receipt[0].size) === staged.size) {
+            // The requested state is durable even though the write's reply
+            // was lost. This also makes repeated lost-ack retries disk-bounded.
+            if (previousPath && previousPath !== destination) {
+              await rm(previousPath, { force: true }).catch(() => undefined);
+            }
+            return { etag: staged.etag, partNumber };
+          }
+          if (!receipt) throw new SelfhostObjectError("backend_unavailable");
+          if (created) await rm(destination, { force: true }).catch(() => undefined);
+          throw new SelfhostObjectError("upload_not_found");
+        }
+        if (previousPath && previousPath !== destination) {
+          await rm(previousPath, { force: true }).catch(() => undefined);
+        }
+        return { etag: staged.etag, partNumber };
+      });
     },
 
     async completeMultipartUpload(bucketId, key, uploadId, parts) {
@@ -652,15 +781,14 @@ export function createSelfhostObjectStore(
           0o600,
         );
         for (const part of parts) {
+          const known = recorded.get(part.partNumber);
+          if (!known) throw new SelfhostObjectError("invalid_part");
           const source = await open(
-            partPath(bucketId, uploadId, part.partNumber),
+            await partPathForEtag(bucketId, uploadId, part.partNumber, known.etag),
             fsConstants.O_RDONLY,
           );
           // The receipt is checked against the bytes, not just against the row.
-          // `uploadPart` renames a new file over the deterministic part path,
-          // so a part replaced while this complete was running would otherwise
-          // be assembled into an object whose multipart etag names bytes it no
-          // longer contains — and a same-size replacement would pass the total.
+          // A replacement may have moved the receipt since `recorded` was read.
           const digest = createHash("sha256");
           let copied = 0;
           try {
@@ -677,7 +805,6 @@ export function createSelfhostObjectStore(
           } finally {
             await source.close().catch(() => undefined);
           }
-          const known = recorded.get(part.partNumber);
           if (!known || copied !== known.size || digest.digest("hex") !== known.etag) {
             throw new SelfhostObjectError("invalid_part");
           }
