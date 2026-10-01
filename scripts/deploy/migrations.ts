@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { RemoteD1 } from "./d1.ts";
-import { type DeployPhase, preflightError } from "./errors.ts";
+import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 
 const MIGRATION_NAME = /^([0-9]{4})_[a-z0-9_]+\.sql$/u;
@@ -122,15 +122,22 @@ export async function readD1SchemaState(
     "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
       "FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
   );
-  const shape = canonicalSchemaShape(rows);
+  const shape = canonicalSchemaShape(rows, phase);
   return { applied, shape, shapeDigest: sha256(shape) };
 }
 
-export function canonicalSchemaShape(rows: readonly Record<string, unknown>[]): string {
+export function canonicalSchemaShape(
+  rows: readonly Record<string, unknown>[],
+  phase: DeployPhase = "preflight",
+): string {
   const normalized = rows.map((row) => {
     for (const field of ["type", "name", "tbl_name", "sql"] as const) {
       if (typeof row[field] !== "string") {
-        throw preflightError(`D1 schema shape row has no string ${field}`, schemaRowDetail(row));
+        throw schemaShapeError(
+          phase,
+          `D1 schema shape row has no string ${field}`,
+          schemaRowDetail(row),
+        );
       }
     }
     return {
@@ -144,9 +151,17 @@ export function canonicalSchemaShape(rows: readonly Record<string, unknown>[]): 
     `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
   );
   if (JSON.stringify(normalized) !== JSON.stringify(sorted)) {
-    throw preflightError("D1 schema shape readback is not canonically ordered");
+    throw schemaShapeError(phase, "D1 schema shape readback is not canonically ordered");
   }
   return `${JSON.stringify(normalized)}\n`;
+}
+
+function schemaShapeError(phase: DeployPhase, message: string, detail?: string) {
+  return phase === "preflight"
+    ? preflightError(message, detail)
+    : phase === "mutation"
+      ? mutationError(message, detail)
+      : verificationError(message, detail);
 }
 
 function schemaRowDetail(row: Record<string, unknown>): string {
