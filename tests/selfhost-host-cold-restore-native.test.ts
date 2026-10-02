@@ -60,6 +60,11 @@ const RESOURCE_DELETE_ORDER = [
 
 type Json = Record<string, unknown>;
 type Host = ReturnType<typeof startHost>;
+type NativeDiagnosticPhase = "pre_v2_worker_confirmed" | "v2_start_headers" | "v2_start_body";
+type NativeDiagnosticOutcome = "started" | "ok" | "timeout" | "error";
+type NativeDiagnosticTrace = {
+  readonly mark: (phase: NativeDiagnosticPhase, outcome: NativeDiagnosticOutcome) => void;
+};
 type ProcessIdentity = {
   readonly pid: number;
   readonly startTicks: string;
@@ -107,6 +112,14 @@ test.skipIf(WORKERD === null)(
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     const cleanupFailures: string[] = [];
+    const diagnosticStartedAt = performance.now();
+    const diagnosticTrace: NativeDiagnosticTrace = {
+      mark(phase, outcome) {
+        console.log(
+          `[selfhost-cold-restore] phase=${phase} outcome=${outcome} elapsed_ms=${Math.round(performance.now() - diagnosticStartedAt)}`,
+        );
+      },
+    };
     try {
       const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
       verifier = Bun.spawn([coreVerifierBinary], {
@@ -170,7 +183,11 @@ test.skipIf(WORKERD === null)(
         authorization: `Bearer ${apiToken}`,
         "takoform-organization": organizationId,
       };
-      async function publishModuleArtifact(moduleSource: string, key: string): Promise<string> {
+      async function publishModuleArtifact(
+        moduleSource: string,
+        key: string,
+        trace?: NativeDiagnosticTrace,
+      ): Promise<string> {
         const moduleBytes = new TextEncoder().encode(moduleSource);
         const moduleDigest = await bytesDigest(moduleBytes);
         const upload = await api<Json>(
@@ -193,6 +210,7 @@ test.skipIf(WORKERD === null)(
             },
           },
           { ...auth, "idempotency-key": `${key}-upload` },
+          trace,
         );
         const uploadId = stringAt(upload, "uploadId");
         expect(upload.missingBlobs).toContain(moduleDigest);
@@ -370,10 +388,15 @@ test.skipIf(WORKERD === null)(
       const hostname = new URL(endpointBefore).hostname;
       const markerBefore = await workerRequest(hostname, join(sourceTls, "worker-cert.pem"), "/");
       expect(markerBefore).toBe(WORKER_MARKER_V1);
+      diagnosticTrace.mark("pre_v2_worker_confirmed", "ok");
 
       // Publish V2 through the same public artifact and Form endpoints, then
       // update the existing Deployment behind its current revision fence.
-      const manifestDigestV2 = await publishModuleArtifact(MODULE_V2, "cold-restore-v2");
+      const manifestDigestV2 = await publishModuleArtifact(
+        MODULE_V2,
+        "cold-restore-v2",
+        diagnosticTrace,
+      );
       await apply("WorkerBundle", "cold-restore-bundle-v2", {
         manifestDigest: manifestDigestV2,
       });
@@ -988,20 +1011,28 @@ async function api<T = Json>(
   expectedStatus: number,
   body?: unknown,
   headers: Record<string, string> = {},
+  trace?: NativeDiagnosticTrace,
 ): Promise<T> {
-  const response = await fetch(`${HOST_ORIGIN}${path}`, {
-    method,
-    headers: {
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
-      ...headers,
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(10_000),
-  });
+  const request = () =>
+    fetch(`${HOST_ORIGIN}${path}`, {
+      method,
+      headers: {
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+        ...headers,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  const response = trace
+    ? await runDiagnosticStage(trace, "v2_start_headers", request)
+    : await request();
   if (response.status !== expectedStatus) {
     let code = "unknown";
     try {
-      const payload = (await response.json()) as { readonly error?: unknown };
+      const readPayload = () => response.json() as Promise<{ readonly error?: unknown }>;
+      const payload = trace
+        ? await runDiagnosticStage(trace, "v2_start_body", readPayload)
+        : await readPayload();
       const envelope = payload.error;
       if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
         const candidate = (envelope as { readonly code?: unknown }).code;
@@ -1018,7 +1049,28 @@ async function api<T = Json>(
     );
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  const readBody = () => response.json() as Promise<T>;
+  return trace ? await runDiagnosticStage(trace, "v2_start_body", readBody) : await readBody();
+}
+
+async function runDiagnosticStage<T>(
+  trace: NativeDiagnosticTrace | undefined,
+  phase: NativeDiagnosticPhase,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!trace) return await operation();
+  trace.mark(phase, "started");
+  try {
+    const result = await operation();
+    trace.mark(phase, "ok");
+    return result;
+  } catch (error) {
+    trace.mark(
+      phase,
+      error instanceof Error && error.name === "TimeoutError" ? "timeout" : "error",
+    );
+    throw error;
+  }
 }
 
 async function deleteResource(
