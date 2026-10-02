@@ -149,8 +149,7 @@ test("Form Package import overlaps bounded payload creates and publishes its ind
     writeOperationIdentity: backing.writeOperationIdentity,
     async create(key, body, options) {
       if (key.endsWith("/package-index.json")) {
-        indexPublishedAfterPayloads =
-          completedPayloadCreates === fileCount && activeCreates === 0;
+        indexPublishedAfterPayloads = completedPayloadCreates === fileCount && activeCreates === 0;
         return await backing.create(key, body, options);
       }
       activeCreates += 1;
@@ -319,7 +318,10 @@ test("concurrent identical Form Package imports converge through create-only sto
   expect(first.files.map(({ path, digest }) => ({ path, digest }))).toEqual(
     second.files.map(({ path, digest }) => ({ path, digest })),
   );
-  const page = await backing.list({ prefix: `${formPackagePrefix(pkg.packageDigest)}/`, limit: 10 });
+  const page = await backing.list({
+    prefix: `${formPackagePrefix(pkg.packageDigest)}/`,
+    limit: 10,
+  });
   expect(page.objects).toHaveLength(files.length + 1);
   expect(page.truncated).toBe(false);
 });
