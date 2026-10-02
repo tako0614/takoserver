@@ -19,6 +19,7 @@ import { bytesDigest } from "../src/json.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import {
   buildRealCoreVerifier,
@@ -75,6 +76,9 @@ const observedHostDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>(
 test.skipIf(WORKERD === null)(
   "a self-host updates, recovers, and restores its Worker at the same endpoint",
   async () => {
+    await assertIsolatedSelfhostNativeEnvironment({
+      fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
+    });
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-selfhost-cold-restore-"));
     chmodSync(fixture, 0o700);
     const sourceRoot = join(fixture, "source", "data");
@@ -135,6 +139,7 @@ test.skipIf(WORKERD === null)(
       await waitForCoreVerifier(verifier, coreVerifierArtifactDigest);
       await createTls(sourceTls);
       host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
 
       const operatorPrivateJwk = readFileSync(join(sourceRoot, "operator-key.jwk"), "utf8");
@@ -290,6 +295,7 @@ test.skipIf(WORKERD === null)(
       }
 
       host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
       const discovery = await api<Json>(
         "GET",
@@ -532,6 +538,7 @@ test.skipIf(WORKERD === null)(
       // operator identities, API token, and Worker endpoint remain unchanged.
       // There is no client resource publication after this point.
       host = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
       const restoredHostIdentity = processIdentity(host.pid);
       expect(await workerRequest(hostname, join(restoredTls, "worker-cert.pem"), "/")).toBe(
