@@ -1,4 +1,168 @@
-# Self-host backup and restore preparation
+# Self-host operations: install, admission, update, and recovery
+
+This guide covers the Bun self-host path from a source checkout to a first
+usable Takoform Host, then the operator's maintenance boundary. It documents
+the current source entrypoints, not a packaged installer or a published
+release channel. Select a reviewed source commit and retain its exact source
+and artifact provenance; this guide does not identify a latest release or
+claim GA status.
+
+## First install and first use
+
+1. From the selected, reviewed Takoserver checkout, install its locked
+   dependencies and start the Bun entrypoint:
+
+   ```sh
+   bun install --frozen-lockfile
+   bun src/entry-bun.ts
+   ```
+
+   The first boot initializes SQLite under `TAKOSERVER_DATA_ROOT` (default
+   `.takoserver`), creates signing keys, and, when no identity provider is
+   configured, prints a short-lived operator sign-in assertion valid for ten
+   minutes. Open the exact `/console` URL printed by the process and paste the
+   assertion. Treat the operator key under the data root and the printed
+   assertion as credentials; keep them out of shell history, shared logs, and
+   this repository. To create later assertions, use the printed command
+   `bun scripts/operator-key.ts sign-in google operator operator@localhost Operator`
+   with `TAKOSERVER_OPERATOR_KEY` set to that installation's key path.
+
+2. In the console, create or select the organization that will own Resources
+   and choose the exact stable Space identifier. Record the organization ID
+   from the Host; the admission command does not create either one. A fresh
+   Bun Host intentionally serves no Forms before this step's explicit
+   admission. Confirm that the normal self-host Provider3 mode is selected;
+   the retired Cloudflare ObjectBucket drain mode cannot be used for admission.
+
+3. Prepare the released Takoform Core verifier from this same source checkout.
+   Its Go module pins Core v1.1.0. Compute the artifact identity from the
+   checkout's own deploy helper, build the verifier, and start it only on a
+   host/network isolated from untrusted traffic. The verifier currently binds
+   `:8080` on all interfaces and has no bind-address flag; do not expose that
+   port publicly. Either restrict non-loopback access with the host's
+   operator-managed firewall, or run the verifier in a dedicated network
+   namespace. In the namespace case, the admission CLI must also run inside
+   that same namespace to reach `127.0.0.1:8080`; loopback in a different
+   namespace is a different interface:
+
+   ```sh
+   CORE_DIGEST="$(bun -e 'import { takoformCoreVerifierArtifactDigest } from "./scripts/deploy/form-authority.ts"; console.log(takoformCoreVerifierArtifactDigest())')"
+   (cd services/takoform-core-verifier && go build -o /absolute/operator-managed/path/takoform-core-verifier ./cmd/server)
+   TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST="$CORE_DIGEST" /absolute/operator-managed/path/takoform-core-verifier
+   ```
+
+   Keep that verifier process available at the address reachable from the
+   admission CLI while planning and applying admission. Do not substitute a stock npm `workerd`
+   binary for `TAKOSERVER_WORKERD_BINARY`: Worker execution requires the exact
+   currently reviewed, accepted workerd artifact and source configuration.
+   Without that artifact, worker-backed execution is unavailable rather than
+   silently selecting npm's binary.
+
+4. Stop the Bun Host through the supervisor actually used for this installation
+   and wait for its child `workerd` and all other writers to exit. Then run the
+   operator command from the selected source checkout. The first invocation is
+   plan-only; inspect its output. Apply only the plan you intend, using the
+   same checkout, verifier, data root, control database, Host origin,
+   organization, and Space. The CLI takes the data root from `--data-root` (or
+   `TAKOSERVER_DATA_ROOT`) but takes the database path only from
+   `TAKOSERVER_DB`; it has no database-path flag. If the running Host uses an
+   external `TAKOSERVER_DB`, pass that exact resolved path to both CLI
+   invocations. The examples below require the Host's effective database path
+   in either case: use the configured external path, or the resolved
+   `<data-root>/control.sqlite` default when the Host has no `TAKOSERVER_DB`.
+   If the Host's effective database path is unknown, do not run admission;
+   otherwise the CLI could open a different or newly created `control.sqlite`
+   instead of the Host's database.
+
+   ```sh
+   TAKOSERVER_DB=<resolved-control-database-path> \
+   bun scripts/selfhost-form-admission.ts <organizationId> <space> \
+     --data-root <resolved-data-root> --host-id <canonical-public-origin> \
+     --core-verifier http://127.0.0.1:8080
+   TAKOSERVER_DB=<resolved-control-database-path> \
+   bun scripts/selfhost-form-admission.ts <organizationId> <space> \
+     --data-root <resolved-data-root> --host-id <canonical-public-origin> \
+     --core-verifier http://127.0.0.1:8080 --apply
+   ```
+
+   Replace angle-bracket values with this installation's exact values,
+   including the absolute, resolved data-root and control-database paths the
+   Host uses. Pass `--data-root` even when the Host uses the default
+   `.takoserver`, resolved relative to the Host's working directory. Run both
+   commands in the same network namespace as the verifier, or use the same
+   explicitly secured bridge and matching reachable verifier URL. Do not put
+   secrets in the command: this admission path does not require a Cloudflare
+   token.
+   The command verifies the checkout-pinned Core identity, imports and verifies
+   all 17 embedded publisher packages, then installs the package set and
+   activates only the implemented subset for the selected organization/Space.
+   It does not promote all Forms as usable, or change the released Form
+   definitions. Re-running it replans from durable admission state.
+
+5. Restart the Host using its configured supervisor. Collect its stdout and
+   stderr, including the `takoserver listening` line. Check the public,
+   unauthenticated `GET /v1/forms` response and confirm it reports the expected
+   Host answer for the admitted definitions. Then sign in, create/use a scoped
+   organization API key as needed, perform one ordinary resource operation
+   through the supported console/client, and read it back through
+   `GET /v1/organizations/{organizationId}/resources/{resourceUid}`. A route
+   accepting connections or a process log line alone is not functional
+   readback.
+
+The Bun self-host does not currently provide an HTTP health/readiness API.
+`GET /healthz` belongs to the Cloudflare Worker entry, not this Bun entry. For
+the Bun process, operators must use supervisor process state, captured startup
+and runtime logs (including `workerd runtime child exited`, restart scheduling,
+and recovery-success diagnostics), and an authenticated functional readback.
+These signals do not constitute a monitoring or alerting service.
+
+## Update and code rollback
+
+Treat an update as selecting a new exact source commit, not as `git pull` on a
+live checkout or as floating to a presumed latest release. Before changing
+source, select and review the intended commit and the exact workerd artifact
+the new checkout expects. Ensure that exact commit is already available in the
+repository, then prepare a separate detached source checkout without moving the
+currently active one:
+
+```sh
+git worktree add --detach <new-checkout> <reviewed-commit>
+cd <new-checkout>
+bun install --frozen-lockfile
+```
+
+Keep the previous source checkout available so a code-only return is possible
+without changing the active source before the operator has selected it. Use
+the same operator-controlled process supervisor and protected configuration
+when selecting which checkout to run; this guide does not prescribe a service
+manager or its unit-file layout.
+
+For each update, first make the cold snapshot described below. Stop the Bun
+Host and all child/workload writers, deploy the selected source checkout and
+locked dependencies, then start that exact version under the existing
+protected configuration. Startup can apply forward SQLite migrations and
+resume queued work. Confirm startup diagnostics, the expected `GET /v1/forms`
+answer, and an authenticated readback of a known Resource before considering
+the update in service. If any post-start result is uncertain, stop further
+traffic/work through the existing supervisor and retain logs and the current
+database for diagnosis.
+
+Code rollback is not database rollback. To return to the previous code, stop
+the Host and all writers, confirm that the retained previous checkout's
+migration reader recognizes the database's complete recorded history and its
+runtime is compatible with the current persisted state, then select that
+checkout in the existing supervisor and restart it. Perform the same startup,
+Forms, and authenticated Resource readback checks as for an update. Do not test
+an unknown older binary by starting it against the primary database. Never
+restore an older database over the current one merely to make an older binary
+start. SQLite schema changes are forward-only; an unknown recorded migration
+is a refusal, not permission to edit, reset, or replace the database. If
+compatibility is not established, keep the current data intact and repair
+forward with a source version that understands it. A cold backup restore is a
+separate recovery operation with source fencing and identity ownership
+requirements below, not a routine code rollback.
+
+## Backup and restore preparation
 
 This procedure prepares a cold copy of one Bun self-host installation. It is
 not a tested disaster-recovery guarantee: the repository has no operator

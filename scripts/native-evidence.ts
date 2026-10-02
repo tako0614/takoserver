@@ -1,18 +1,17 @@
 /**
  * Native evidence that the portable gate cannot supply by itself.
  *
- * A few dozen tests in `tests/` exercise native runtime primitives against an
- * artifact that is deliberately not part of the dependency tree: the pinned
- * closed-graph `workerd` build, and the unqualified Actor qualification
- * candidate. Those tests gate on an operator-supplied absolute path, so when the
- * path is absent they do not run.
+ * Tests in `tests/` exercise three optional native capabilities: the pinned
+ * closed-graph `workerd` build, an unqualified Actor qualification candidate,
+ * and an opt-in local Docker container lifecycle fixture. The two binary-backed
+ * capabilities gate on operator-supplied paths; the Docker capability gates on
+ * its explicit opt-in and bounded fixture configuration.
  *
  * That choice is correct — `selectClosedGraphWorkerd` refuses to substitute a
- * package binary for the pinned bytes — but it used to be invisible. A green
- * `bun run check` reported 3643 passing tests and never said that 73 more tests
- * in 23 files had not executed. This module is the one place that names those
- * capabilities, validates a configured artifact, and counts what a given run did
- * not prove.
+ * package binary for the pinned bytes — but it used to be invisible. This module
+ * names the capabilities that gate tests and reports what a run did not prove.
+ * The Docker configuration inspection is deliberately bounded and performs no
+ * daemon or image I/O; only the later opted-in test exercises that local runtime.
  *
  * Two rules keep the report honest:
  *
@@ -41,6 +40,8 @@ export interface NativeEvidenceStatus {
   readonly state: NativeEvidenceState;
   /** One line explaining the state, quoted verbatim in the report. */
   readonly detail: string;
+  /** Ready means only that bounded inputs are valid, not that a gated test ran. */
+  readonly readinessOnly?: boolean;
 }
 
 /** Side-effect-free host probes, injected so the rules stay testable. */
@@ -68,6 +69,19 @@ export interface NativeEvidenceCapability {
 }
 
 const DIGEST = /^[a-f0-9]{64}$/u;
+const DOCKER_LIFECYCLE_FIXTURE_ENVIRONMENT = [
+  "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A",
+  "TAKOSERVER_NATIVE_CONTAINER_IMAGE_B",
+  "TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_A",
+  "TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_B",
+  "TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_VALUE_A",
+  "TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_VALUE_B",
+  "TAKOSERVER_NATIVE_CONTAINER_VERSION_A",
+  "TAKOSERVER_NATIVE_CONTAINER_VERSION_B",
+  "TAKOSERVER_NATIVE_CONTAINER_SERVER_A",
+  "TAKOSERVER_NATIVE_CONTAINER_SERVER_B",
+  "TAKOSERVER_NATIVE_CONTAINER_PORT",
+] as const;
 
 function missingOrUnusable(
   binary: string,
@@ -250,26 +264,72 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
         state: "ready",
         detail:
           "bounded local Form/image/socket/network inputs are configured; Docker execution and process-restart proof still require running the gated test",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
+    id: "docker-container-lifecycle",
+    label: "self-host Docker container lifecycle fixture",
+    environment: "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE",
+    companionEnvironment: DOCKER_LIFECYCLE_FIXTURE_ENVIRONMENT,
+    proves:
+      "local Docker fixture create, invocation, update, fresh-handle recovery, and delete; it does not prove host restart or a public-host/Cloudflare runtime",
+    enable:
+      "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE=1 plus both immutable image digests, provenance label/value pairs, versions, server headers, and TAKOSERVER_NATIVE_CONTAINER_PORT",
+    inspect: (configured, environment) => {
+      if (configured === undefined) {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE is not configured; Docker lifecycle tests are disabled",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: 'TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE must be exactly "1" when configured',
+        };
+      }
+      const values = new Map<string, string>();
+      for (const name of DOCKER_LIFECYCLE_FIXTURE_ENVIRONMENT) {
+        const value = environment[name]?.trim();
+        if (!value) return { state: "invalid", detail: `${name} is missing or empty` };
+        if (value.length > 512)
+          return { state: "invalid", detail: `${name} exceeds the 512-character input bound` };
+        values.set(name, value);
+      }
+      const imageA = values.get("TAKOSERVER_NATIVE_CONTAINER_IMAGE_A");
+      const imageB = values.get("TAKOSERVER_NATIVE_CONTAINER_IMAGE_B");
+      const immutableImage = /^[^\s@]+(?:\/[^\s@]+)*@sha256:[a-f0-9]{64}$/u;
+      if (
+        imageA === undefined ||
+        imageB === undefined ||
+        !immutableImage.test(imageA) ||
+        !immutableImage.test(imageB) ||
+        imageA === imageB
+      ) {
+        return {
+          state: "invalid",
+          detail: "fixture images must be distinct immutable repository digest references",
+        };
+      }
+      const port = Number(values.get("TAKOSERVER_NATIVE_CONTAINER_PORT"));
+      if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
+        return {
+          state: "invalid",
+          detail:
+            "TAKOSERVER_NATIVE_CONTAINER_PORT must be an unprivileged TCP port from 1024 through 65535",
+        };
+      }
+      return {
+        state: "ready",
+        detail: "fixture inputs are valid and bounded; Docker was not contacted or invoked",
+        readinessOnly: true,
       };
     },
   },
 ];
-
-/**
- * Environment variables that gate a test. `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`
- * is a companion of the workerd artifact rather than a capability of its own, so
- * a gate that names both belongs to the workerd artifact.
- */
-const CAPABILITY_BY_ENVIRONMENT: ReadonlyMap<string, string> = new Map(
-  NATIVE_EVIDENCE_CAPABILITIES.flatMap((capability) => [
-    [capability.environment, capability.id] as const,
-    ...capability.companionEnvironment.map((name) => [name, capability.id] as const),
-  ]),
-);
-
-const KNOWN_CAPABILITY_IDS: ReadonlySet<string> = new Set(
-  NATIVE_EVIDENCE_CAPABILITIES.map((capability) => capability.id),
-);
 
 export interface NativeEvidenceGate {
   /** Repository-relative test path. */
@@ -537,16 +597,18 @@ function skipIfArguments(masked: string): { start: number; end: number }[] {
 }
 
 function classify(environments: readonly string[], capabilities: readonly string[]): string | null {
-  const claimed = new Set<string>(capabilities);
-  for (const name of environments) {
-    const id = CAPABILITY_BY_ENVIRONMENT.get(name);
-    if (id !== undefined) claimed.add(id);
-  }
-  if (claimed.size !== 1) return null;
-  // A gate that mixes capabilities would misreport which artifact it needs, and
-  // a capability id nothing declares would otherwise pass by silence.
-  const only = [...claimed][0];
-  return only !== undefined && KNOWN_CAPABILITY_IDS.has(only) ? only : null;
+  // Two native suites may require the same immutable image inputs. Shared
+  // companions cannot be mapped to one owner; every named environment must
+  // belong to the selected capability, and an explicit ID resolves only a
+  // still-ambiguous shared-input gate.
+  const matches = NATIVE_EVIDENCE_CAPABILITIES.filter(
+    (capability) =>
+      capabilities.every((id) => id === capability.id) &&
+      environments.every(
+        (name) => name === capability.environment || capability.companionEnvironment.includes(name),
+      ),
+  );
+  return matches.length === 1 ? (matches[0]?.id ?? null) : null;
 }
 
 function testFiles(root: string): string[] {
@@ -615,6 +677,7 @@ export interface NativeEvidenceSummary {
   readonly enable: string;
   readonly tests: number;
   readonly files: number;
+  readonly readinessOnly: boolean;
 }
 
 export function summarizeNativeEvidence(input: {
@@ -639,6 +702,7 @@ export function summarizeNativeEvidence(input: {
       enable: capability.enable,
       tests: owned.length,
       files: new Set(owned.map((gate) => gate.file)).size,
+      readinessOnly: status.readinessOnly ?? false,
     };
   });
 }
@@ -662,6 +726,10 @@ export function renderNativeEvidenceReport(input: {
     } else if (summary.state === "invalid") {
       lines.push(
         `    REFUSED: ${summary.tests} tests in ${summary.files} files stay unproven, and a configured artifact that does not hold is a gate failure`,
+      );
+    } else if (summary.readinessOnly) {
+      lines.push(
+        `    ready for gated tests: ${summary.tests} tests in ${summary.files} files; runtime execution is not proven by this inspection`,
       );
     } else {
       lines.push(
