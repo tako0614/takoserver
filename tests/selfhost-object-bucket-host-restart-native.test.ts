@@ -18,6 +18,7 @@ import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-autho
 import { bytesDigest } from "../src/json.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
+import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import {
   buildRealCoreVerifier,
@@ -25,7 +26,7 @@ import {
 } from "./helpers/real-core-verifier.ts";
 
 const NATIVE_OPT_IN = process.env.TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART === "1";
-const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
+const WORKERD = process.env.TAKOSERVER_WORKERD_BINARY;
 const HOST_ORIGIN = "http://127.0.0.1:8787";
 const API_PORT = 8787;
 const CORE_VERIFIER_PORT = 8080;
@@ -72,10 +73,16 @@ const WORKER_MODULE = (bindingName: string) => `export default {
   },
 };`;
 
-test.skipIf(!NATIVE_OPT_IN)(
+test.skipIf(
+  !NATIVE_OPT_IN ||
+    nativeEvidenceBinary("object-bucket-host-restart", "TAKOSERVER_WORKERD_BINARY") === undefined,
+)(
   "an ObjectBucket managed through the public Host API stays scoped and usable after Host restart",
   async () => {
     if (!WORKERD) throw new Error("workerd native evidence is required when this test is opted in");
+    await assertIsolatedSelfhostNativeEnvironment({
+      fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
+    });
 
     // This is a real local Host journey: released publisher closure, real Core,
     // and the repository admission CLI. Do not replace that authority path with
@@ -114,6 +121,7 @@ test.skipIf(!NATIVE_OPT_IN)(
     let caughtFailure = false;
     let testFailure: unknown;
     try {
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [CORE_VERIFIER_PORT] });
       const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
       verifier = Bun.spawn([coreVerifierBinary], {
         cwd: process.cwd(),
@@ -125,10 +133,16 @@ test.skipIf(!NATIVE_OPT_IN)(
         stdout: "ignore",
         stderr: "ignore",
       });
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: verifier });
       await waitForCoreVerifier(verifier, coreVerifierArtifactDigest);
       await createTls(tlsDirectory);
 
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, 443],
+        ownedChild: verifier,
+      });
       host = startHost(hostEnvironment());
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host);
       const operatorPrivateJwk = readFileSync(join(dataRoot, "operator-key.jwk"), "utf8");
       const assertion = await signOperatorAssertion({
@@ -189,7 +203,12 @@ test.skipIf(!NATIVE_OPT_IN)(
         },
       );
       admission = undefined;
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, 443],
+        ownedChild: verifier,
+      });
       host = startHost(hostEnvironment());
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host);
       const firstHostPid = host.pid;
 
@@ -367,9 +386,14 @@ test.skipIf(!NATIVE_OPT_IN)(
 
       await stopHost(host);
       host = undefined;
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, 443],
+        ownedChild: verifier,
+      });
       host = startHost(hostEnvironment());
       if (host.pid === firstHostPid)
         throw new Error("selfhost_object_bucket_host_pid_not_replaced");
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: host });
       await waitForHost(host);
       const retainedBucket = await readResource(auth, forms, "ObjectBucket", "host-restart-media");
       const expectedMediaBucketName = bucketNames.get("host-restart-media");
