@@ -27,12 +27,12 @@ import {
   readQueueEventMessages,
   shouldInterceptQueueEvent,
 } from "./fixtures/selfhost-host-queue-process-child.ts";
+import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
-const NATIVE_AVAILABLE = WORKERD !== null && process.platform === "linux";
 const API_PORT = 8787;
 const WORKERD_PORT = 443;
 const API_ORIGIN = `http://127.0.0.1:${API_PORT}`;
@@ -130,9 +130,10 @@ test("the response-loss fixture records only a real ACK for the requested Queue 
 });
 
 // Native-only: fixed loopback 8787/443 belong in an isolated network namespace.
-test.skipIf(!NATIVE_AVAILABLE)(
+test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifact") === undefined)(
   "a stopped Host recovers an unknown Queue ACK from the same durable files and does not redeliver after ACK",
   async () => {
+    await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-host-queue-process-restart-"));
     chmodSync(fixture, 0o700);
     const dataRoot = join(fixture, "host-data");
@@ -198,6 +199,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
       // Host #0 creates the test-owned organization and API key. It then exits
       // before the official admission command opens the durable database.
       firstHost = startHost(hostEnvironment());
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: firstHost });
       await waitForHost(firstHost);
       const privateOperatorKey = readFileSync(join(dataRoot, "operator-key.jwk"), "utf8");
       const assertion = await signOperatorAssertion({
@@ -314,8 +316,10 @@ test.skipIf(!NATIVE_AVAILABLE)(
 
       // Host #1 accepts public Host resources and starts the actual Workerd
       // child. Identity/admission above are synthetic local fixtures only.
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
       firstHost = startHost(hostEnvironment(proxyOrigin));
       firstHostDescendants = new Map();
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: firstHost });
       await waitForHost(firstHost, firstHostDescendants);
       const workerAuth = ownerAuth;
       const formRefs = await discoverForms(workerAuth);
@@ -403,8 +407,10 @@ test.skipIf(!NATIVE_AVAILABLE)(
       const objectSnapshot = directorySnapshot(objectRoot);
       expect(objectSnapshot.length).toBeGreaterThan(0);
 
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
       secondHost = startHost(hostEnvironment(proxyOrigin));
       secondHostDescendants = new Map();
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: secondHost });
       await waitForHost(secondHost, secondHostDescendants);
       const secondHostIdentity = processIdentity(secondHost.pid);
       const secondWorkerd = uniqueLiveWorkerd(secondHost, secondHostDescendants);
