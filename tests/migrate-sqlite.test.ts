@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 
@@ -376,6 +378,329 @@ function artifactRoots(database: Database): readonly Record<string, unknown>[] {
  * "no such table" — which is what it did.
  */
 describe("bringing a local database up to date", () => {
+  test("bootstraps a truly fresh database in one atomic transaction", () => {
+    const database = new Database(":memory:");
+    const perMigrationReference = new Database(":memory:");
+    const transactionStatements: string[] = [];
+    const counted = {
+      exec(sql: string) {
+        if (/^(BEGIN IMMEDIATE|COMMIT|ROLLBACK)$/u.test(sql.trim())) {
+          transactionStatements.push(sql.trim());
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    const report = migrateSqlite(counted);
+
+    expect(transactionStatements).toEqual(["BEGIN IMMEDIATE", "COMMIT"]);
+    expect(report).toEqual({
+      applied: MIGRATIONS.map((migration) => migration.name),
+      alreadyApplied: 0,
+    });
+    expect(database.query("SELECT name FROM applied_migrations ORDER BY rowid").all()).toEqual(
+      MIGRATIONS.map((migration) => ({ name: migration.name })),
+    );
+    migrateSqlite({
+      exec(sql: string) {
+        return perMigrationReference.exec(sql);
+      },
+      query(sql: string) {
+        if (sql === "SELECT 1 FROM sqlite_schema LIMIT 1") {
+          return { all: () => [{ object: true }] };
+        }
+        return perMigrationReference.query(sql);
+      },
+    });
+    expect(
+      database
+        .query("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name")
+        .all(),
+    ).toEqual(
+      perMigrationReference
+        .query("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name")
+        .all(),
+    );
+    expect(database.query("SELECT name FROM applied_migrations ORDER BY name").all()).toEqual(
+      perMigrationReference.query("SELECT name FROM applied_migrations ORDER BY name").all(),
+    );
+  });
+
+  test("keeps concurrent fresh starters atomic under lock contention", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-migration-race-"));
+    const path = join(directory, "db.sqlite");
+    const migrationModule = new URL("../src/migrate-sqlite.ts", import.meta.url).href;
+    const childSource = `
+      import { Database } from "bun:sqlite";
+      import { migrateSqlite } from ${JSON.stringify(migrationModule)};
+      const database = new Database(${JSON.stringify(path)});
+      try { console.log(JSON.stringify(migrateSqlite(database))); }
+      finally { database.close(); }
+    `;
+    const spawn = () =>
+      Bun.spawn({
+        cmd: [process.execPath, "--eval", childSource],
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    const starters = [spawn(), spawn()];
+
+    try {
+      const attempts = await Promise.all(
+        starters.map(async (starter) => {
+          const exitCode = await starter.exited;
+          const stdout = await new Response(starter.stdout).text();
+          const stderr = await new Response(starter.stderr).text();
+          return { exitCode, stdout, stderr };
+        }),
+      );
+      const successfulAttempts = attempts.filter((attempt) => attempt.exitCode === 0);
+      expect(successfulAttempts.length).toBeGreaterThanOrEqual(1);
+      expect(successfulAttempts.length).toBeLessThanOrEqual(2);
+      const reports = successfulAttempts.map(
+        (attempt) =>
+          JSON.parse(attempt.stdout.trim()) as { applied: string[]; alreadyApplied: number },
+      );
+      expect(reports.some((report) => report.applied.length === MIGRATIONS.length)).toBe(true);
+      expect(
+        reports.every(
+          (report) => report.applied.length === 0 || report.applied.length === MIGRATIONS.length,
+        ),
+      ).toBe(true);
+      if (successfulAttempts.length === 1) {
+        expect(attempts.find((attempt) => attempt.exitCode !== 0)?.stderr).toMatch(
+          /SQLITE_BUSY|database is locked/u,
+        );
+      }
+
+      const reopened = new Database(path);
+      expect(migrateSqlite(reopened)).toEqual({ applied: [], alreadyApplied: MIGRATIONS.length });
+      expect(reopened.query("SELECT name FROM applied_migrations ORDER BY rowid").all()).toEqual(
+        MIGRATIONS.map((migration) => ({ name: migration.name })),
+      );
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  test("rolls a late fresh SQL failure back to empty and can retry after reopen", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-migration-"));
+    const path = join(directory, "db.sqlite");
+    const database = new Database(path);
+    let injected = false;
+    const failing = {
+      exec(sql: string) {
+        if (!injected && sql.includes("CREATE INDEX tf_resources_container_endpoint_hostname")) {
+          injected = true;
+          database.exec(sql);
+          throw new Error("injected SQL acknowledgement loss");
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    try {
+      expect(() => migrateSqlite(failing)).toThrow(
+        /0067_takoform_container_endpoint_hostname_index\.sql failed/u,
+      );
+      expect(injected).toBe(true);
+      database.close();
+      const reopened = new Database(path);
+      expect(reopened.query("SELECT COUNT(*) AS count FROM sqlite_schema").get()).toEqual({
+        count: 0,
+      });
+      expect(migrateSqlite(reopened).applied).toEqual(MIGRATIONS.map((item) => item.name));
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers a committed fresh bootstrap when the COMMIT acknowledgement is lost", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-migration-"));
+    const path = join(directory, "db.sqlite");
+    const database = new Database(path);
+    let lostCommitAcknowledgement = false;
+    const commitAckLoss = {
+      exec(sql: string) {
+        const result = database.exec(sql);
+        if (sql.trim() === "COMMIT" && !lostCommitAcknowledgement) {
+          lostCommitAcknowledgement = true;
+          throw new Error("injected COMMIT acknowledgement loss");
+        }
+        return result;
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    try {
+      expect(() => migrateSqlite(commitAckLoss)).toThrow(`${MIGRATIONS.at(-1)?.name} failed`);
+      database.close();
+      const reopened = new Database(path);
+      const report = migrateSqlite(reopened);
+      expect(report).toEqual({ applied: [], alreadyApplied: MIGRATIONS.length });
+      expect(reopened.query("SELECT name FROM applied_migrations ORDER BY rowid").all()).toEqual(
+        MIGRATIONS.map((migration) => ({ name: migration.name })),
+      );
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("rolls a failed fresh ledger write back to empty and can retry", () => {
+    const directory = mkdtempSync(join(tmpdir(), "takoserver-migration-"));
+    const path = join(directory, "db.sqlite");
+    const database = new Database(path);
+    let injected = false;
+    const failing = {
+      exec(sql: string) {
+        if (!injected && sql.startsWith("INSERT INTO applied_migrations")) {
+          injected = true;
+          throw new Error("injected ledger write failure");
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    try {
+      expect(() => migrateSqlite(failing)).toThrow(/0001_runtime_storage\.sql failed/u);
+      database.close();
+      const reopened = new Database(path);
+      expect(reopened.query("SELECT COUNT(*) AS count FROM sqlite_schema").get()).toEqual({
+        count: 0,
+      });
+      expect(migrateSqlite(reopened).applied).toEqual(MIGRATIONS.map((item) => item.name));
+      reopened.close();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps nonempty databases on the per-migration checkpoint path", () => {
+    const database = new Database(":memory:");
+    database.exec("CREATE TABLE operator_marker (id INTEGER PRIMARY KEY)");
+    const transactions: string[] = [];
+    const counted = {
+      exec(sql: string) {
+        if (/^(BEGIN IMMEDIATE|COMMIT|ROLLBACK)$/u.test(sql.trim())) {
+          transactions.push(sql.trim());
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    const report = migrateSqlite(counted);
+
+    expect(transactions[0]).toBe("BEGIN IMMEDIATE");
+    expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+    expect(report.applied).toEqual(MIGRATIONS.map((migration) => migration.name));
+    expect(
+      database.query("SELECT name FROM sqlite_schema WHERE name = 'operator_marker'").all(),
+    ).toHaveLength(1);
+  });
+
+  test("uses the per-migration path when either SQLite header field is nonzero", () => {
+    const metadataCases = [
+      {
+        statement: "PRAGMA user_version = 7;",
+        query: "PRAGMA user_version",
+        column: "user_version",
+        value: 7,
+      },
+      {
+        statement: "PRAGMA application_id = 42;",
+        query: "PRAGMA application_id",
+        column: "application_id",
+        value: 42,
+      },
+    ];
+
+    for (const metadataCase of metadataCases) {
+      const database = new Database(":memory:");
+      database.exec(metadataCase.statement);
+      const transactions: string[] = [];
+      const counted = {
+        exec(sql: string) {
+          if (/^(BEGIN IMMEDIATE|COMMIT|ROLLBACK)$/u.test(sql.trim())) {
+            transactions.push(sql.trim());
+          }
+          return database.exec(sql);
+        },
+        query(sql: string) {
+          return database.query(sql);
+        },
+      };
+
+      expect(migrateSqlite(counted).applied).toEqual(MIGRATIONS.map((migration) => migration.name));
+      expect(transactions[0]).toBe("BEGIN IMMEDIATE");
+      expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+      expect(database.query(metadataCase.query).all()).toEqual([
+        { [metadataCase.column]: metadataCase.value },
+      ]);
+      database.close();
+    }
+  });
+
+  test("treats an empty applied-migrations ledger as existing schema", () => {
+    const database = new Database(":memory:");
+    database.exec(`
+      CREATE TABLE applied_migrations (
+        name TEXT PRIMARY KEY NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+    const transactions: string[] = [];
+    const counted = {
+      exec(sql: string) {
+        if (/^(BEGIN IMMEDIATE|COMMIT|ROLLBACK)$/u.test(sql.trim())) {
+          transactions.push(sql.trim());
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    expect(migrateSqlite(counted).applied).toEqual(MIGRATIONS.map((migration) => migration.name));
+    expect(transactions[0]).toBe("BEGIN IMMEDIATE");
+    expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+  });
+
+  test("does not take a write transaction when reopening a fully migrated database", () => {
+    const database = new Database(":memory:");
+    migrateSqlite(database);
+    const noWriteLock = {
+      exec(sql: string) {
+        if (sql.trim() === "BEGIN IMMEDIATE") {
+          throw new Error("existing database startup must not take the fresh-bootstrap lock");
+        }
+        return database.exec(sql);
+      },
+      query(sql: string) {
+        return database.query(sql);
+      },
+    };
+
+    expect(migrateSqlite(noWriteLock)).toEqual({ applied: [], alreadyApplied: MIGRATIONS.length });
+  });
+
   test("keeps the applied artifact lifecycle migration immutable and repairs it forward", () => {
     const lifecycle = MIGRATIONS.find(
       (migration) => migration.name === "0031_takoform_artifact_lifecycle.sql",
