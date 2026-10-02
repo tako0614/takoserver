@@ -83,6 +83,18 @@ test("container service composes Docker transport, durable recovery and applicat
         response.writeHead(status, { "content-type": "application/json" });
         response.end(body === undefined ? undefined : JSON.stringify(body));
       };
+      if (path === "/networks/fixture-isolated" && request.method === "GET") {
+        reply(200, {
+          Name: "fixture-isolated",
+          Driver: "bridge",
+          Scope: "local",
+          Internal: true,
+          Ingress: false,
+          Attachable: false,
+          Labels: { "takoserver.installation": "fixture-host" },
+        });
+        return;
+      }
       if (path === "/images/create" && request.method === "POST") {
         reply(200, { status: "fixture image present" });
         return;
