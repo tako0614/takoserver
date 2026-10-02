@@ -1,15 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -34,8 +26,10 @@ import type {
   WranglerLifecycleDeployment,
   WranglerVersionPublicationLease,
 } from "../scripts/deploy/wrangler-state.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
-import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import {
+  applyQualifiedMigrationNames,
+  copyCurrentSchemaFixture,
+} from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
@@ -97,8 +91,8 @@ writeFileSync(
   { mode: 0o600 },
 );
 
-const APPLIED = MIGRATIONS.map(({ name }) => name);
-const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"));
+const APPLIED = applyQualifiedMigrationNames();
+const EXPECTED_SHAPE = applicationShape(join(sourceRoot, "migrations"), APPLIED);
 const COMPLETE_SCHEMA = schemaState(APPLIED, EXPECTED_SHAPE);
 const WRONG_SCHEMA = schemaState(APPLIED, "[]\n");
 
@@ -973,10 +967,10 @@ function schemaState(applied: readonly string[], shape: string): D1SchemaState {
   };
 }
 
-function applicationShape(directory: string): string {
+function applicationShape(directory: string, applied: readonly string[]): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort()) {
+    for (const name of applied) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database

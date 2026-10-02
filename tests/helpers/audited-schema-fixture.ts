@@ -1,6 +1,62 @@
-import { copyFileSync, mkdirSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/migrations.ts";
 import { MIGRATIONS } from "../../src/db-schema.ts";
+
+const APPLY_QUALIFIED_MIGRATION_END = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
+const CURRENT_SOURCE_MIGRATION_END = "0067_takoform_container_endpoint_hostname_index.sql";
+
+function applyQualifiedMigrations() {
+  const endIndex = MIGRATIONS.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
+  if (
+    endIndex !== 65 ||
+    MIGRATIONS.length !== 67 ||
+    MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END
+  ) {
+    throw new Error("apply-qualified schema fixture requires the exact audited 0001-0066 prefix");
+  }
+  return MIGRATIONS.slice(0, endIndex + 1);
+}
+
+/** Names present in deployed D1 under the existing 0001-0066 apply qualification. */
+export function applyQualifiedMigrationNames(): readonly string[] {
+  return applyQualifiedMigrations().map(({ name }) => name);
+}
+
+/** Actual D1 readback fixture for the existing apply-qualified 0001-0066 schema. */
+export function applyQualifiedSchemaState(): D1SchemaState {
+  const migrations = applyQualifiedMigrations();
+  const database = new Database(":memory:");
+  try {
+    for (const { name } of migrations) {
+      database.exec(readFileSync(resolve(import.meta.dir, "../../migrations", name), "utf8"));
+    }
+    const rows = database
+      .query(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
+          "FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+      )
+      .all() as Record<string, unknown>[];
+    const shape = canonicalSchemaShape(
+      rows.filter(
+        (row) =>
+          row.name !== "d1_migrations" &&
+          row.tbl_name !== "d1_migrations" &&
+          row.name !== "_cf_KV" &&
+          row.tbl_name !== "_cf_KV",
+      ),
+    );
+    return {
+      applied: migrations.map(({ name }) => name),
+      shape,
+      shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+    };
+  } finally {
+    database.close();
+  }
+}
 
 /** Frozen catch-up-wave source, distinct from the current integration schema. */
 export function copyAuditedSchemaFixture(directory: string): string {

@@ -366,7 +366,7 @@ describe("forward-only D1 schema surface", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-provider-selection-complete-"));
     try {
       const fixture = processFixture("rehearsal");
-      const state = migrationStateThrough(MIGRATIONS.length, "current-post");
+      const state = migrationStateThrough(66, "current-post");
       const status = await runD1Schema(
         { action: "status", environment: "integration", commit: COMMIT },
         integrationTarget,

@@ -1219,8 +1219,12 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0066 names and SHA-256 inventory, so a checkout with unreviewed 0067+
-  migrations is refused before qualification or provider mutation. The selected integration
+  0001–0067 names and SHA-256 source inventory, so a checkout with unreviewed
+  0068+ migrations is refused before qualification or provider mutation. The
+  selected integration lane projects only the audited through-prefix, with
+  apply and remote D1 qualification still capped at 0066; the source-only 0067
+  Container Endpoint index is not a new protected wave or D1 apply authority.
+  The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
   emits no rehearsal receipt or predecessor link. Its
@@ -1252,7 +1256,7 @@ drain claim.
 Worker publication and closure transition can qualify this profile only when
 the selected source catalog and target readback have the exact canonical
 0001–0057 applied prefix and **0058 as the next unapplied migration**. Later
-0059–0066 files in the source catalog remain unapplied and confer no apply
+0059–0067 files in the source catalog remain unapplied and confer no apply
 authority. The current and successor Version's source annotation, target
 bindings (including the exact maintenance var and native D1/R2 identities),
 secrets, routing, and the owner-injected private executor qualification still
