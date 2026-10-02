@@ -51,6 +51,8 @@ const CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS =
 const TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX =
   "0067_takoform_container_endpoint_hostname_index.sql";
 const CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY = "0068_cloudflare_provider_invocation_custody.sql";
+const CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK =
+  "0069_cloudflare_provider_invocation_delete_ack.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -88,6 +90,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
   TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
   CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+  CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -754,6 +757,9 @@ describe("bringing a local database up to date", () => {
     expect(MIGRATIONS[receiptMigrationIndex + 24]?.name).toBe(
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
     );
+    expect(MIGRATIONS[receiptMigrationIndex + 25]?.name).toBe(
+      CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
+    );
 
     const database = new Database(":memory:");
     database.exec(`
@@ -792,6 +798,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+      CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1071,6 +1078,7 @@ describe("bringing a local database up to date", () => {
         CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
         TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
         CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+        CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1643,6 +1651,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+      CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1792,6 +1801,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+      CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
     ]);
     expect(
       database
@@ -2748,6 +2758,7 @@ describe("bringing a local database up to date", () => {
       CLOUDFLARE_MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       TAKOFORM_CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       CLOUDFLARE_PROVIDER_INVOCATION_CUSTODY,
+      CLOUDFLARE_PROVIDER_INVOCATION_DELETE_ACK,
     ]);
     expect(
       database
