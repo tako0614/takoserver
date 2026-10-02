@@ -17,10 +17,12 @@ import { request as httpsRequest } from "node:https";
 import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "../src/operator-key.ts";
 import { selfhostObjectsRoot } from "../src/providers/selfhost.ts";
+import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import {
   isAcknowledgedQueueResponse,
@@ -29,13 +31,18 @@ import {
 } from "./fixtures/selfhost-host-queue-process-child.ts";
 import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
-import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
+import {
+  buildRealCoreVerifier,
+  realCoreVerificationRequest,
+} from "./helpers/real-core-verifier.ts";
 
 const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
 const API_PORT = 8787;
+const CORE_VERIFIER_PORT = 8080;
 const WORKERD_PORT = 443;
 const API_ORIGIN = `http://127.0.0.1:${API_PORT}`;
+const CORE_VERIFIER_ORIGIN = `http://127.0.0.1:${CORE_VERIFIER_PORT}`;
 const WORKER_SUFFIX = "apps.queue-process-restart.test";
 const SPACE = "default";
 const LANE = "/apis/forms.takoform.com/v1";
@@ -129,11 +136,51 @@ test("the response-loss fixture records only a real ACK for the requested Queue 
   expect(isAcknowledgedQueueResponse(204, ack, id)).toBe(false);
 });
 
-// Native-only: fixed loopback 8787/443 belong in an isolated network namespace.
+test("the exact released Core admission request contains the Queue and Worker Forms", async () => {
+  const closure = await loadPublisherSetClosure();
+  expect(closure.identity.packageCount).toBe(17);
+  const kinds = closure.packageSet.map((pkg) => pkg.formRef.kind);
+  expect(kinds).toContain("AtLeastOnceQueue");
+  expect(kinds).toContain("ModuleWorker");
+
+  const request = await realCoreVerificationRequest(closure);
+  const requestKinds = (request.packages as Json[]).map((pkg) => objectAt(pkg, "formRef").kind);
+  expect(requestKinds).toContain("AtLeastOnceQueue");
+  expect(requestKinds).toContain("ModuleWorker");
+});
+
+test("real Core identity and publisher-set response bodies have bounded reads", async () => {
+  let requests = 0;
+  const verifier = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch() {
+      requests += 1;
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  try {
+    await expect(fetchCoreIdentity(verifier.url.origin, 25)).rejects.toThrow();
+    await expect(postCoreVerification(verifier.url.origin, {}, 25)).rejects.toThrow();
+    expect(requests).toBe(2);
+  } finally {
+    verifier.stop(true);
+  }
+});
+
+// Native-only: fixed loopback 8787/8080/443 belong in an isolated network namespace.
 test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifact") === undefined)(
   "a stopped Host recovers an unknown Queue ACK from the same durable files and does not redeliver after ACK",
   async () => {
-    await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
+    await assertIsolatedSelfhostNativeEnvironment({
+      fixedPorts: [API_PORT, CORE_VERIFIER_PORT, WORKERD_PORT],
+    });
+    const goCache = process.env.TAKOSERVER_NATIVE_GO_CACHE;
+    const goModules = process.env.TAKOSERVER_NATIVE_GO_MODULES;
+    if (!goCache || !goModules) throw new Error("selfhost_queue_hdd_go_caches_required");
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-host-queue-process-restart-"));
     chmodSync(fixture, 0o700);
     const dataRoot = join(fixture, "host-data");
@@ -163,7 +210,7 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
           }
         : {}),
     });
-    let verifierServer: ReturnType<typeof Bun.serve> | undefined;
+    let coreVerifier: ReturnType<typeof Bun.spawn> | undefined;
     let proxyProcess: ReturnType<typeof Bun.spawn> | undefined;
     let firstHost: ReturnType<typeof Bun.spawn> | undefined;
     let secondHost: ReturnType<typeof Bun.spawn> | undefined;
@@ -198,6 +245,9 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
 
       // Host #0 creates the test-owned organization and API key. It then exits
       // before the official admission command opens the durable database.
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, CORE_VERIFIER_PORT, WORKERD_PORT],
+      });
       firstHost = startHost(hostEnvironment());
       await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: firstHost });
       await waitForHost(firstHost);
@@ -251,14 +301,23 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
       await stopHost(firstHost, firstHostDescendants);
       firstHost = undefined;
 
-      const syntheticVerifier = createSyntheticPublisherSetVerifier();
-      // This replays the publisher-set verifier boundary for released package
-      // bytes; it does not execute Core, Sigstore, Accounts, or OIDC.
-      verifierServer = Bun.serve({
-        hostname: "127.0.0.1",
-        port: 0,
-        fetch: (request) => syntheticVerifier.fetch(request),
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [CORE_VERIFIER_PORT] });
+      const coreVerifierArtifactDigest = takoformCoreVerifierArtifactDigest();
+      const publisherSetClosure = await loadPublisherSetClosure();
+      const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
+      coreVerifier = Bun.spawn([coreVerifierBinary], {
+        cwd: process.cwd(),
+        env: {
+          ...baseEnvironment,
+          TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+        },
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "ignore",
       });
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: coreVerifier });
+      await waitForCoreVerifier(coreVerifier, coreVerifierArtifactDigest);
+      await proveRealCorePublisherSet(CORE_VERIFIER_ORIGIN, publisherSetClosure);
       const admission = Bun.spawn(
         [
           process.execPath,
@@ -272,13 +331,13 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
           "--host-id",
           API_ORIGIN,
           "--core-verifier",
-          `http://127.0.0.1:${verifierServer.port}`,
+          CORE_VERIFIER_ORIGIN,
         ],
         {
           cwd: process.cwd(),
           env: hostEnvironment(),
           stdin: "ignore",
-          stdout: "ignore",
+          stdout: "pipe",
           stderr: "ignore",
         },
       );
@@ -292,8 +351,13 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
         throw new Error("selfhost_form_admission_timeout");
       }
       expect(admissionExit).toBe(0);
-      verifierServer.stop(true);
-      verifierServer = undefined;
+      if (!(admission.stdout instanceof ReadableStream)) {
+        throw new Error("selfhost_queue_admission_stdout_unavailable");
+      }
+      const admissionOutput = await new Response(admission.stdout).text();
+      expect(admissionOutput).toMatch(
+        /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
+      );
 
       proxyProcess = Bun.spawn(
         [process.execPath, "--no-env-file", "tests/fixtures/selfhost-host-queue-process-child.ts"],
@@ -315,11 +379,15 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
       const proxyOrigin = `http://127.0.0.1:${proxyPort}`;
 
       // Host #1 accepts public Host resources and starts the actual Workerd
-      // child. Identity/admission above are synthetic local fixtures only.
-      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
+      // child. The operator/account identity remains a disposable local fixture.
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, WORKERD_PORT],
+        ownedChild: coreVerifier,
+      });
       firstHost = startHost(hostEnvironment(proxyOrigin));
       firstHostDescendants = new Map();
       await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: firstHost });
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: coreVerifier });
       await waitForHost(firstHost, firstHostDescendants);
       const workerAuth = ownerAuth;
       const formRefs = await discoverForms(workerAuth);
@@ -407,10 +475,14 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
       const objectSnapshot = directorySnapshot(objectRoot);
       expect(objectSnapshot.length).toBeGreaterThan(0);
 
-      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [API_PORT, WORKERD_PORT] });
+      await assertIsolatedSelfhostNativeEnvironment({
+        fixedPorts: [API_PORT, WORKERD_PORT],
+        ownedChild: coreVerifier,
+      });
       secondHost = startHost(hostEnvironment(proxyOrigin));
       secondHostDescendants = new Map();
       await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: secondHost });
+      await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: coreVerifier });
       await waitForHost(secondHost, secondHostDescendants);
       const secondHostIdentity = processIdentity(secondHost.pid);
       const secondWorkerd = uniqueLiveWorkerd(secondHost, secondHostDescendants);
@@ -480,7 +552,14 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
           cleanupFailures.push("queue_proxy_cleanup_failed");
         }
       }
-      verifierServer?.stop(true);
+      if (coreVerifier) {
+        try {
+          await stopCoreVerifier(coreVerifier);
+          coreVerifier = undefined;
+        } catch (error) {
+          cleanupFailures.push(errorTag(error));
+        }
+      }
       if (cleanupFailures.length === 0) rmSync(fixture, { recursive: true, force: true });
     }
     if (cleanupFailures.length > 0) {
@@ -493,6 +572,98 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
   },
   360_000,
 );
+
+async function waitForCoreVerifier(
+  verifier: ReturnType<typeof Bun.spawn>,
+  artifactDigest: string,
+): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (verifier.exitCode !== null) throw new Error("selfhost_queue_core_verifier_exited");
+    try {
+      const identity = await fetchCoreIdentity(
+        CORE_VERIFIER_ORIGIN,
+        Math.min(750, Math.max(1, deadline - Date.now())),
+      );
+      if (identity) {
+        if (
+          identity.protocol !== "takoserver.takoform-core-verifier@v1" ||
+          identity.coreVersion !== "v1.1.0" ||
+          identity.coreCommit !== "e0e48b864de2a127a255cb0574d37bbb0f1cac29" ||
+          identity.artifactDigest !== artifactDigest
+        ) {
+          throw new Error("selfhost_queue_core_verifier_identity_mismatch");
+        }
+        return;
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "selfhost_queue_core_verifier_identity_mismatch"
+      ) {
+        throw error;
+      }
+    }
+    await Bun.sleep(25);
+  }
+  throw new Error("selfhost_queue_core_verifier_startup_timeout");
+}
+
+async function proveRealCorePublisherSet(
+  verifierOrigin: string,
+  closure: Awaited<ReturnType<typeof loadPublisherSetClosure>>,
+): Promise<void> {
+  const request = await realCoreVerificationRequest(closure);
+  const result = await postCoreVerification(verifierOrigin, request);
+  if (result.status !== 200 || !result.body) {
+    throw new Error("selfhost_queue_core_refused_publisher_closure");
+  }
+  const verified = result.body;
+  expect(closure.identity.packageCount).toBe(17);
+  expect((verified.packages as unknown[]).length).toBe(closure.identity.packageCount);
+  expect(objectAt(verified, "identity").coreVersion).toBe("v1.1.0");
+  expect(objectAt(verified, "identity").coreCommit).toBe(
+    "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+  );
+}
+
+async function fetchCoreIdentity(origin: string, timeoutMs: number): Promise<Json | null> {
+  const response = await fetch(`${origin}/v1/identity`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) return null;
+  return (await response.json()) as Json;
+}
+
+async function postCoreVerification(
+  origin: string,
+  request: Json,
+  timeoutMs = 15_000,
+): Promise<{ readonly status: number; readonly body: Json | null }> {
+  const response = await fetch(`${origin}/v1/verify-set`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  return {
+    status: response.status,
+    body: response.ok ? ((await response.json()) as Json) : null,
+  };
+}
+
+async function stopCoreVerifier(verifier: ReturnType<typeof Bun.spawn>): Promise<void> {
+  if (verifier.exitCode === null) {
+    verifier.kill("SIGTERM");
+    const stopped = await Promise.race([verifier.exited, Bun.sleep(5_000).then(() => null)]);
+    if (stopped === null) {
+      verifier.kill("SIGKILL");
+      const killed = await Promise.race([verifier.exited, Bun.sleep(2_000).then(() => null)]);
+      if (killed === null) throw new Error("selfhost_queue_core_verifier_termination_unknown");
+    }
+  }
+  await waitForPortClosed(CORE_VERIFIER_PORT);
+}
 
 function childEnvironment(home: string): Record<string, string> {
   return {
