@@ -8,17 +8,28 @@ import {
   type ResourceIdentity,
   succeeded,
 } from "../provider-port.ts";
-import type {
-  SelfhostContainerCapacityProfile,
-  SelfhostContainerRuntimeHandle,
-} from "../selfhost-container-bootstrap.ts";
 import { DockerHttpRevisionError } from "./docker-http-revision.ts";
 import {
+  type createSelfhostContainerRuntime,
   SelfhostContainerError,
   type SelfhostContainerIdentity,
   type SelfhostContainerObservation,
   type SelfhostContainerRevision,
 } from "./selfhost-container-runtime.ts";
+
+export type SelfhostContainerRuntimeHandle = Awaited<
+  ReturnType<typeof createSelfhostContainerRuntime>
+>;
+
+export interface SelfhostContainerCapacityProfile {
+  readonly id: "selfhost.container.http.standard";
+  /** Per-revision memory ceiling shared by the Host Offering and Docker. */
+  readonly memoryBytes: number;
+  /** Per-revision CPU ceiling shared by the Host Offering and Docker. */
+  readonly nanoCpus: number;
+  /** Per-container process ceiling. */
+  readonly pidsLimit: number;
+}
 
 export interface SelfhostContainerCapability {
   readonly runtime: SelfhostContainerRuntimeHandle;

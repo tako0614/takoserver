@@ -1,5 +1,9 @@
 import { isAbsolute, join } from "node:path";
 import { createDockerHttpRevisionRuntime } from "./providers/docker-http-revision.ts";
+import type {
+  SelfhostContainerCapacityProfile,
+  SelfhostContainerRuntimeHandle,
+} from "./providers/selfhost-container-lifecycle.ts";
 import {
   createSelfhostContainerRuntime,
   SelfhostContainerError,
@@ -8,15 +12,10 @@ import {
 } from "./providers/selfhost-container-runtime.ts";
 import type { StandaloneProviderMode } from "./standalone-provider-composition.ts";
 
-export interface SelfhostContainerCapacityProfile {
-  readonly id: "selfhost.container.http.standard";
-  /** Per-revision memory ceiling shared by the Host Offering and Docker. */
-  readonly memoryBytes: number;
-  /** Per-revision CPU ceiling shared by the Host Offering and Docker. */
-  readonly nanoCpus: number;
-  /** Per-container process ceiling. */
-  readonly pidsLimit: number;
-}
+export type {
+  SelfhostContainerCapacityProfile,
+  SelfhostContainerRuntimeHandle,
+} from "./providers/selfhost-container-lifecycle.ts";
 
 /**
  * The first opt-in self-host profile is intentionally one bounded, code-owned
@@ -38,10 +37,6 @@ export interface SelfhostContainerBootstrapConfiguration {
   readonly socketPath: string;
   readonly network: string;
 }
-
-export type SelfhostContainerRuntimeHandle = Awaited<
-  ReturnType<typeof createSelfhostContainerRuntime>
->;
 
 export interface SelfhostContainerBootstrap {
   readonly runtime: SelfhostContainerRuntimeHandle;
