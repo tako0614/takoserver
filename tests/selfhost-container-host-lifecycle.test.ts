@@ -30,6 +30,11 @@ import {
   loadVerifiedLocalContainerCandidate,
   SELFHOST_CONTAINER_CANDIDATE_SHA256,
 } from "./fixtures/selfhost-container-host-authority.ts";
+import {
+  captureAndIssueManagement,
+  createResellerProvision,
+  type HostJsonPost,
+} from "./fixtures/selfhost-container-host-reseller-requests.ts";
 
 const CANDIDATE_PROVENANCE = {
   repository: "takoform-forms",
@@ -583,41 +588,18 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
       ),
     ).toBe(true);
 
-    const quote = await http(
-      app,
-      "POST",
-      "/v1/reseller/quotes",
-      201,
-      { tenantRef: "tenant_container", offeringId: OFFERING_ID, quantity: 1 },
-      key,
-    );
-    const reservation = await http(
-      app,
-      "POST",
-      "/v1/reseller/reservations",
-      201,
-      {
-        tenantRef: "tenant_container",
-        quoteId: String((quote.body as { quote: { id: string } }).quote.id),
-      },
-      key,
-    );
-    const reservationId = String(
-      (reservation.body as { reservation: { id: string } }).reservation.id,
-    );
-    const issued = await http(
-      app,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/takoform-run-tokens`,
-      201,
-      { tenantRef: "tenant_container", resourceName: "service", expiresInSeconds: 600 },
-      key,
-    );
-    const bearer = {
-      authorization: `Bearer ${String(
-        (issued.body as { takoformRunToken: { token: string } }).takoformRunToken.token,
-      )}`,
-    };
+    const postHost: HostJsonPost = (path, expectedStatus, body, headers) =>
+      http(app, "POST", path, expectedStatus, body, headers).then(({ body: result }) => result);
+    const provision = await createResellerProvision(postHost, {
+      tenantRef: "tenant_container",
+      offeringId: OFFERING_ID,
+      resourceName: "service",
+      quantity: 1,
+      tokenExpiresInSeconds: 600,
+      apiKey: key,
+    });
+    const { reservationId } = provision;
+    const bearer = provision.provisionAuthorization;
     const desired = {
       apiVersion: FORM_REF.apiVersion,
       kind: FORM_REF.kind,
@@ -746,32 +728,21 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
     };
     expect(created.metadata.generation).toBe("1");
     expect(created.spec).toMatchObject({ ...CANDIDATE.desired, healthPath: LONG_HEALTH_PATH });
-    await http(
-      app,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/capture`,
-      200,
-      { tenantRef: "tenant_container", usage: { quantity: 1 } },
-      key,
-    );
-    const manageIssued = await http(
-      app,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/takoform-run-tokens`,
-      201,
-      {
-        tenantRef: "tenant_container",
-        resourceName: "service",
-        resourceUid: created.metadata.uid,
-        expiresInSeconds: 600,
-      },
-      key,
-    );
-    const manager = {
-      authorization: `Bearer ${String(
-        (manageIssued.body as { takoformRunToken: { token: string } }).takoformRunToken.token,
-      )}`,
-    };
+    const management = await captureAndIssueManagement(postHost, {
+      reservationId,
+      tenantRef: "tenant_container",
+      resourceName: "service",
+      resourceUid: created.metadata.uid,
+      captureQuantity: 1,
+      tokenExpiresInSeconds: 600,
+      apiKey: key,
+    });
+    expect(management.captureStatement).toMatchObject({
+      reservationId,
+      tenantRef: "tenant_container",
+      usage: { quantity: 1 },
+    });
+    const manager = management.managementAuthorization;
     const observed = await http(app, "GET", resourcePath, 200, undefined, manager);
     expect(observed.body).toMatchObject({ metadata: { uid: created.metadata.uid } });
     expect(docker.calls.some((call) => call.path === "/containers/create")).toBe(false);
