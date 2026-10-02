@@ -1008,6 +1008,14 @@ test.skipIf(
     );
     expect(replayedPrivateNative).toEqual(createdPrivateNative);
     expect(created.metadata.generation).toBe("1");
+    await api(
+      secondHost.baseUrl,
+      "POST",
+      `/v1/reseller/reservations/${reservationId}/capture`,
+      200,
+      { tenantRef: "tenant_container_native", usage: { quantity: 1 } },
+      apiKey,
+    );
     const management = await api(
       secondHost.baseUrl,
       "POST",
