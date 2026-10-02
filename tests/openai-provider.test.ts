@@ -128,6 +128,35 @@ describe("OpenAI-compatible upstream adapter", () => {
     }
   });
 
+  test("classifies a successful response body transport failure without exposing diagnostics", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"model":"@cf/provider/model-v1",'));
+        controller.error(new Error("socket reset after upstream-secret"));
+      },
+    });
+    const gateway = createOpenAiGateway({
+      baseUrl: "https://upstream.example/v1",
+      models: [model],
+      authorize: () => "Bearer upstream-secret",
+      async fetch() {
+        return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+
+    const error = await gateway
+      .chat(
+        { model: "takoserver-text", messages: [{ role: "user", content: "hello" }] },
+        { requestId: "ai_truncated", idempotencyKey: "chat-truncated" },
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AiGatewayError);
+    expect((error as AiGatewayError).code).toBe("unavailable");
+    expect(String(error)).not.toContain("socket reset");
+    expect(String(error)).not.toContain("upstream-secret");
+  });
+
   test("rejects a successful response without a body", async () => {
     const gateway = createOpenAiGateway({
       baseUrl: "https://upstream.example/v1",
