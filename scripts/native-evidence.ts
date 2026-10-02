@@ -1,12 +1,11 @@
 /**
  * Native evidence that the portable gate cannot supply by itself.
  *
- * Tests in `tests/` exercise four optional native capabilities: the pinned
+ * Tests in `tests/` exercise optional native capabilities including the pinned
  * closed-graph `workerd` build, an unqualified Actor qualification candidate,
- * an opt-in local Docker container lifecycle fixture, and a separate
- * Host-process Docker lifecycle fixture. The two binary-backed capabilities
- * gate on operator-supplied paths; both Docker capabilities gate on their
- * explicit opt-in and bounded fixture configuration.
+ * public Host ObjectBucket and artifact-upload journeys, and local Docker
+ * lifecycle fixtures. Binary-backed capabilities gate on operator-supplied
+ * paths; Docker capabilities gate on explicit opt-ins and bounded fixtures.
  *
  * That choice is correct — `selectClosedGraphWorkerd` refuses to substitute a
  * package binary for the pinned bytes — but it used to be invisible. This module
@@ -135,6 +134,101 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
         };
       }
       return { state: "ready", detail: `configured and verified as ${digest}` };
+    },
+  },
+  {
+    id: "object-bucket-host-restart",
+    label: "self-host ObjectBucket public Host API and process restart",
+    environment: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART",
+    companionEnvironment: ["TAKOSERVER_WORKERD_BINARY"],
+    proves:
+      "the released 17-package Core publisher closure, public Host ObjectBucket creation, local Worker HTTPS object access, distinct Host process restart against the same private root and SQLite database, bucket isolation, update/delete and file cleanup; only normal process exit/restart in an isolated loopback-only network namespace, not host reboot, SIGKILL, power loss or fsync durability",
+    enable:
+      "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART=1 and TAKOSERVER_WORKERD_BINARY set to the exact pinned closed-graph artifact",
+    inspect: (configured, environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART is not configured; public Host ObjectBucket process-restart evidence is disabled",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART must be exactly 1",
+        };
+      }
+      const binary = environment.TAKOSERVER_WORKERD_BINARY;
+      if (binary === undefined || binary.trim() === "") {
+        return {
+          state: "invalid",
+          detail: "the ObjectBucket Host process-restart opt-in requires TAKOSERVER_WORKERD_BINARY",
+        };
+      }
+      const unusable = missingOrUnusable(binary, probe);
+      if (unusable) return unusable;
+      if (
+        process.platform !== WORKERD_CLOSED_GRAPH_ARTIFACT.platform ||
+        process.arch !== WORKERD_CLOSED_GRAPH_ARTIFACT.arch
+      ) {
+        return {
+          state: "invalid",
+          detail: `the pinned artifact supports ${WORKERD_CLOSED_GRAPH_ARTIFACT.platform}/${WORKERD_CLOSED_GRAPH_ARTIFACT.arch}, this host is ${process.platform}/${process.arch}`,
+        };
+      }
+      const digest = probe.sha256(binary);
+      if (digest === null) {
+        return { state: "invalid", detail: "the configured workerd artifact could not be hashed" };
+      }
+      if (digest !== WORKERD_CLOSED_GRAPH_ARTIFACT.sha256) {
+        return {
+          state: "invalid",
+          detail: `the configured workerd bytes are ${digest}; the pinned artifact is ${WORKERD_CLOSED_GRAPH_ARTIFACT.sha256}`,
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "the dedicated ObjectBucket opt-in and pinned workerd artifact are configured; the gated isolated Host process-restart test must still run",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
+    id: "selfhost-artifact-upload",
+    label: "self-host public Host artifact upload lifecycle",
+    environment: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE",
+    companionEnvironment: [],
+    proves:
+      "the local public Host WorkerBundle artifact API accepts V1 upload start/blob/commit followed by V2 upload start without Form admission; it does not prove Form admission, Worker execution, Cloud runtime behavior, or object data-plane durability",
+    enable: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE=1 on Linux",
+    inspect: (configured) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE is not configured; the public Host artifact upload test is disabled",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE must be exactly 1",
+        };
+      }
+      if (process.platform !== "linux") {
+        return {
+          state: "invalid",
+          detail: "the self-host public Host artifact upload test requires Linux",
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "the exact opt-in and Linux prerequisite are present; only the gated public Host artifact upload test can establish lifecycle evidence",
+        readinessOnly: true,
+      };
     },
   },
   {
@@ -604,7 +698,9 @@ function classify(environments: readonly string[], capabilities: readonly string
   // still-ambiguous shared-input gate.
   const matches = NATIVE_EVIDENCE_CAPABILITIES.filter(
     (capability) =>
-      capabilities.every((id) => id === capability.id) &&
+      (capabilities.length > 0
+        ? capabilities.every((id) => id === capability.id)
+        : environments.includes(capability.environment)) &&
       environments.every(
         (name) => name === capability.environment || capability.companionEnvironment.includes(name),
       ),
