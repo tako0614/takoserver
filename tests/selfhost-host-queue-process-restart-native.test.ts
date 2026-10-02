@@ -18,10 +18,13 @@ import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
+import { createEphemeralSql } from "../src/compat.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "../src/operator-key.ts";
 import { selfhostObjectsRoot } from "../src/providers/selfhost.ts";
+import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 import {
@@ -215,6 +218,62 @@ test("real Core identity and publisher-set response bodies have bounded reads", 
   } finally {
     verifier.stop(true);
   }
+});
+
+test("Queue WorkerBundle upload-start request satisfies the real artifact handler", async () => {
+  let id = 0;
+  const bytes = new TextEncoder().encode(WORKER_SOURCE);
+  const digest = await bytesDigest(bytes);
+  const artifacts = createTakoformArtifacts({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    clock: () => new Date("2026-10-02T00:00:00.000Z"),
+    randomId: () => `queue-artifact-${++id}`,
+  });
+  const principal = { tenantId: "queue-restart-tenant", principalId: "api-key:queue-restart" };
+  const auth = {
+    authorization: "Bearer queue-restart-test",
+    "takoform-organization": principal.tenantId,
+  };
+  const response = await artifacts.handle(
+    new Request(`https://api.test${LANE}/artifacts/uploads`, {
+      method: "POST",
+      headers: { ...queueArtifactStartHeaders(auth), "content-type": "application/json" },
+      body: JSON.stringify({
+        manifest: {
+          apiVersion: "artifacts.takoform.com/v1alpha1",
+          kind: "WorkerBundle",
+          mainModule: "index.js",
+          modules: [
+            {
+              name: "index.js",
+              mediaType: "application/javascript+module",
+              size: bytes.byteLength,
+              digest,
+            },
+          ],
+        },
+      }),
+    }),
+    principal,
+    (code, status) => Response.json({ error: { code } }, { status }),
+  );
+  expect(response?.status).toBe(201);
+  if (!response) throw new Error("queue_artifact_start_handler_missing");
+  const upload = (await response.json()) as Json;
+  expect(upload.missingBlobs).toEqual([digest]);
+});
+
+test("API failure diagnostics expose only bounded stable error codes", async () => {
+  expect(
+    await boundedApiErrorCode(
+      Response.json(
+        { error: { code: "invalid_argument", message: "private response detail" } },
+        { status: 400 },
+      ),
+    ),
+  ).toBe("invalid_argument");
+  expect(await boundedApiErrorCode(new Response(new Uint8Array(4_097).fill(65)))).toBe("unknown");
 });
 
 // Native-only: fixed loopback 8787/8080/443 belong in an isolated network namespace.
@@ -1048,10 +1107,67 @@ async function api<T extends Json>(
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   if (response.status !== expectedStatus) {
-    await response.arrayBuffer();
-    throw new Error(`selfhost_api_${method}_${path}_status_${response.status}`);
+    const errorCode = await boundedApiErrorCode(response);
+    throw new Error(`selfhost_api_${method}_status_${response.status}_${errorCode}`);
   }
   return (await response.json()) as T;
+}
+
+async function boundedApiErrorCode(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return "unknown";
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  let complete = false;
+  const deadline = Date.now() + 1_000;
+  try {
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return "unknown";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let next: Awaited<ReturnType<typeof reader.read>> | null;
+      try {
+        next = await Promise.race([
+          reader.read(),
+          new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), remaining);
+          }),
+        ]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+      if (next === null) return "unknown";
+      if (next.done) {
+        complete = true;
+        break;
+      }
+      if (next.value.byteLength > 4_096 - size) return "unknown";
+      size += next.value.byteLength;
+      chunks.push(next.value);
+    }
+  } catch {
+    return "unknown";
+  } finally {
+    if (!complete) void reader.cancel().catch(() => undefined);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const envelope = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope)) {
+      return "unknown";
+    }
+    const error = (envelope as Record<string, unknown>).error;
+    if (typeof error !== "object" || error === null || Array.isArray(error)) return "unknown";
+    const code = (error as Record<string, unknown>).code;
+    return typeof code === "string" && /^[a-z][a-z0-9_.-]{0,63}$/u.test(code) ? code : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 async function discoverForms(auth: Record<string, string>): Promise<Map<string, Json>> {
@@ -1105,7 +1221,7 @@ async function uploadModule(source: string, auth: Record<string, string>): Promi
         ],
       },
     },
-    auth,
+    queueArtifactStartHeaders(auth),
   );
   const uploadId = stringAt(upload, "uploadId");
   const uploaded = await fetch(
@@ -1126,6 +1242,10 @@ async function uploadModule(source: string, auth: Record<string, string>): Promi
     { ...auth, "idempotency-key": "queue-process-restart-artifact-commit" },
   );
   return stringAt(committed, "manifestDigest");
+}
+
+function queueArtifactStartHeaders(auth: Record<string, string>): Record<string, string> {
+  return { ...auth, "idempotency-key": "queue-process-restart-artifact-start" };
 }
 
 async function applyResource(
