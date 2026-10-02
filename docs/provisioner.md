@@ -633,30 +633,52 @@ contracts and provider execution are implemented and verified.
 ### What the portable gate does with the opt-in evidence
 
 `bun run check` runs `check:native-evidence` immediately before the test phase.
-It names every capability that gates a test, validates a configured artifact, and
-counts what the run did not prove. That report is the authority for what a gate
-run executed; a green `bun run check` does not cover the native evidence below.
+It discovers every test gate, validates its configured prerequisites, and
+reports which gated tests remain unproven. The inventory contains three
+capabilities:
 
-| state | CI (`Takoserver quality`) | local `bun run check` |
-| --- | --- | --- |
-| `TAKOSERVER_WORKERD_BINARY` | not configured | not configured unless the operator sets it |
-| the tests it gates | skipped, reported as unproven | skipped, reported as unproven |
-| `TAKOSERVER_ACTOR_QUALIFICATION_BINARY` | not configured | not configured unless the operator sets it |
-| the tests it gates | skipped, reported as unproven | skipped, reported as unproven |
+| capability | configuration | CI (`Takoserver quality`) | local `bun run check` |
+| --- | --- | --- | --- |
+| pinned closed-graph `workerd` | `TAKOSERVER_WORKERD_BINARY`; workflow guard companion `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` where needed | not configured | not configured unless the operator supplies the pinned artifact |
+| Actor qualification candidate | `TAKOSERVER_ACTOR_QUALIFICATION_BINARY` and its declared `TAKOSERVER_ACTOR_QUALIFICATION_SHA256` | not configured | not configured unless the operator supplies the candidate and digest |
+| self-host Docker container lifecycle fixture | `TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE=1` plus the 11 fixture inputs below | not configured | disabled unless the operator opts in and supplies valid inputs |
 
-At this revision the report prints 65 gated tests in 15 files for the workerd
-artifact and 8 gated tests in 8 files for the Actor qualification candidate.
-Neither workflow supplies a native artifact, and it cannot: the pinned workerd
-build is not in the dependency tree and `selectClosedGraphWorkerd` refuses to
-substitute the package runtime for the pinned bytes. The gate therefore states
-the gap rather than reporting a pass count it did not earn.
+For the Docker lifecycle fixture, the 11 required inputs are:
+`TAKOSERVER_NATIVE_CONTAINER_IMAGE_A/B`,
+`TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_A/B`,
+`TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_VALUE_A/B`,
+`TAKOSERVER_NATIVE_CONTAINER_VERSION_A/B`,
+`TAKOSERVER_NATIVE_CONTAINER_SERVER_A/B`, and
+`TAKOSERVER_NATIVE_CONTAINER_PORT`. Both image values must be distinct immutable
+repository digest references. Every input must be nonempty and at most 512
+characters after trimming; the port must be an unprivileged TCP port from 1024
+through 65535.
 
-An *unconfigured* capability is not a gate failure, because the portable gate has
-to stay green on a machine without the artifact. A *configured* capability that
-does not hold is a failure: a relative path, a missing or non-executable file, a
-host platform that does not match the pin, bytes whose sha256 is not the pinned
-digest, or an Actor candidate without its declared digest all stop the gate
-before the tests run. A configured artifact never degrades back into skips.
+`bun run check:native-evidence` only inspects these environment values. For the
+Docker capability it does not contact the daemon, inspect or pull images, or
+execute the lifecycle test. Its `ready` state means only that the fixture
+configuration is valid; the report explicitly says runtime execution is not
+proven by that inspection. During `bun run check`, the later test phase runs the
+opted-in Docker test. Invalid configured inputs fail the evidence check instead
+of silently skipping; Docker availability and lifecycle behavior are determined
+only by that test's result.
+
+Neither CI nor the default local check supplies the optional native inputs. An
+unconfigured capability is reported as unproven rather than treated as a gate
+failure. A configured binary-backed capability that does not hold fails before
+tests run: for example, a relative/missing/non-executable path, a host platform
+that does not match the workerd pin, bytes whose sha256 differs from the pinned
+digest, or an Actor candidate without its declared digest. The pinned workerd
+build is not in the dependency tree, and `selectClosedGraphWorkerd` refuses to
+substitute the package runtime for those exact bytes.
+
+A successful opted-in Docker lifecycle test has a deliberately narrower scope:
+it exercises create, invocation, update, fresh-handle recovery, and delete via
+the private local Docker fixture within this process. It does not prove
+Takoserver Host wiring, Cloudflare/WfP execution, public-host integration,
+operating-system or host restart recovery, or process-restart durability. The
+report's test counts are discovered from the current test tree and are not a
+stable contract.
 
 Each gated test file also prints one line per capability per process when the
 capability is not configured, so

@@ -34,12 +34,40 @@ const space: string = rawSpace;
 const name: string = rawName;
 
 const LANE = "/apis/forms.takoform.com/v1";
+const conditionTypes = new Set([
+  "Ready",
+  "Reconciling",
+  "Degraded",
+  "Drifted",
+  "Blocked",
+  "Deleting",
+]);
+const conditionStatuses = new Set(["True", "False", "Unknown"]);
+const conditionReasons = new Set([
+  "Available",
+  "Provisioning",
+  "Reconciling",
+  "Failed",
+  "BackendUnavailable",
+  "SpecDrift",
+  "ExternalChange",
+  "DependencyMissing",
+  "DependencyInUse",
+  "PolicyDenied",
+  "UnsupportedCapability",
+  "Deleting",
+]);
 
 interface FormRef {
   readonly apiVersion: string;
   readonly kind: string;
   readonly definitionVersion: string;
   readonly schemaDigest: string;
+}
+
+interface ResourceReadback {
+  readonly body: string;
+  readonly generation: string;
 }
 
 // A kind usually has several installed definitions: the current one and the
@@ -60,11 +88,11 @@ function pathFor(ref: FormRef): string {
 }
 
 /** Finds which installed definition an existing resource was created under. */
-async function locate(): Promise<{ ref: FormRef; path: string; body: string } | null> {
+async function locate(): Promise<({ ref: FormRef; path: string } & ResourceReadback) | null> {
   for (const ref of definitions) {
     const path = pathFor(ref);
-    const response = await call("GET", path);
-    if (response.ok) return { ref, path, body: await response.text() };
+    const resource = await readResource(path, ref);
+    if (resource) return { ref, path, ...resource };
   }
   return null;
 }
@@ -87,9 +115,7 @@ if (command === "delete") {
     process.stderr.write(`no resource named ${name} under any installed ${kind} definition\n`);
     process.exit(1);
   }
-  const generation = String(
-    (JSON.parse(found.body) as { metadata: { generation: string } }).metadata.generation,
-  );
+  const generation = found.generation;
   const response = await call("DELETE", found.path, undefined, {
     "idempotency-key": `cli-delete-${name}-${Date.now()}`,
     "takoform-expected-generation": generation,
@@ -113,11 +139,9 @@ const resource = {
 };
 
 // An existing resource must be reviewed against the generation it is at.
-const existing = await call("GET", resourcePath);
-const generation = existing.ok
-  ? String(((await existing.json()) as { metadata: { generation: string } }).metadata.generation)
-  : null;
-if (!existing.ok) {
+const existing = await readResource(resourcePath, formRef);
+const generation = existing?.generation ?? null;
+if (!existing) {
   // A resource of this name may exist under a superseded definition. Applying
   // the current one would silently create a second resource beside it, so say
   // so rather than doing that.
@@ -170,6 +194,98 @@ async function call(
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+}
+
+/** Reads a resource, treating only its authoritative not-found envelope as absence. */
+async function readResource(path: string, ref: FormRef): Promise<ResourceReadback | null> {
+  const response = await call("GET", path);
+  const body = await response.text();
+  if (response.ok) {
+    const resource = parseResourceReadback(body, ref);
+    if (resource) return { body, generation: resource.generation };
+    process.stderr.write(
+      `resource read returned an invalid Takoform resource: ${response.status}\n`,
+    );
+    process.exit(1);
+  }
+  if (response.status === 404) {
+    try {
+      const envelope = JSON.parse(body) as { error?: { code?: unknown } };
+      if (envelope.error?.code === "resource_not_found") return null;
+    } catch {
+      // A malformed or non-envelope 404 is not evidence that a resource is absent.
+    }
+  }
+
+  process.stderr.write(`resource read failed: ${response.status} ${body}\n`);
+  process.exit(1);
+}
+
+/** Validates the stored-resource envelope and fences before accepting a readback. */
+function parseResourceReadback(body: string, ref: FormRef): { readonly generation: string } | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value)) return null;
+  const form = value.form;
+  const formRef = isRecord(form) ? form.formRef : undefined;
+  const metadata = value.metadata;
+  const status = value.status;
+  const spec = value.spec;
+  if (
+    value.apiVersion !== ref.apiVersion ||
+    value.kind !== ref.kind ||
+    !isRecord(formRef) ||
+    formRef.apiVersion !== ref.apiVersion ||
+    formRef.kind !== ref.kind ||
+    formRef.definitionVersion !== ref.definitionVersion ||
+    formRef.schemaDigest !== ref.schemaDigest ||
+    !isRecord(metadata) ||
+    metadata.name !== name ||
+    metadata.space !== space ||
+    typeof metadata.uid !== "string" ||
+    metadata.uid.length === 0 ||
+    !isPositiveCounter(metadata.generation) ||
+    !isPositiveCounter(metadata.revision) ||
+    !isRecord(spec) ||
+    !isRecord(status) ||
+    !isPositiveCounter(status.observedGeneration) ||
+    !Array.isArray(status.conditions) ||
+    !status.conditions.every(isTakoformCondition)
+  ) {
+    return null;
+  }
+  return { generation: metadata.generation };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isTakoformCondition(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.type === "string" &&
+    conditionTypes.has(value.type) &&
+    typeof value.status === "string" &&
+    conditionStatuses.has(value.status) &&
+    typeof value.reason === "string" &&
+    conditionReasons.has(value.reason) &&
+    typeof value.lastTransitionTime === "string" &&
+    (value.hostReason === undefined || typeof value.hostReason === "string") &&
+    (value.message === undefined || typeof value.message === "string")
+  );
+}
+
+function isPositiveCounter(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9][0-9]{0,18}$/u.test(value) &&
+    BigInt(value) <= 9_223_372_036_854_775_807n
+  );
 }
 
 /** Every installed definition of a kind, newest first. */
