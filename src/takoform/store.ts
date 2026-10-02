@@ -349,6 +349,10 @@ export interface StoredReplay {
 }
 
 export interface TakoformStore {
+  /** Bounded lookup of a committed Endpoint output; never a second route ledger. */
+  containerEndpointByHostname(
+    hostname: string,
+  ): Promise<{ readonly tenantId: string; readonly listing: ResourceListing } | null>;
   readResource(address: ResourceAddress): Promise<TakoformStoredResource | null>;
   readRelations(address: ResourceAddress): Promise<readonly TakoformStoredRelation[]>;
   relationHolders(tenantId: string, targetUid: string): Promise<readonly string[]>;
@@ -1060,6 +1064,23 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
   };
 
   return {
+    async containerEndpointByHostname(hostname) {
+      const rows = await sql.query(
+        `SELECT tenant_id, space, api_version, kind, name, uid, generation, revision,
+                updated_at, resource_json
+         FROM tf_resources
+         WHERE api_version = 'edge.forms.takoform.com'
+           AND kind = 'ContainerEndpoint'
+           AND CASE WHEN json_valid(resource_json) = 1
+             THEN json_extract(resource_json, '$.status.outputs.hostname')
+             ELSE NULL END = ?
+         LIMIT 2`,
+        [hostname],
+      );
+      if (rows.length === 0) return null;
+      if (rows.length !== 1 || !rows[0]) throw new Error("ambiguous_container_endpoint_hostname");
+      return { tenantId: text(rows[0].tenant_id), listing: resourceListing(rows[0]) };
+    },
     async readResource(address): Promise<TakoformStoredResource | null> {
       const rows = await sql.query(
         `SELECT resource_json, package_digest, implementation_digest FROM tf_resources

@@ -32,6 +32,7 @@ import { createProviderMetering } from "./provider-metering.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import type { Provider } from "./provider-port.ts";
 import { createReseller } from "./reseller.ts";
+import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import { createResourceDeploymentStore } from "./resource-deployments.ts";
 import {
   createResourceMigrationService,
@@ -55,6 +56,7 @@ import {
 } from "./takoform/host-authority.ts";
 import { createDeferredOperations } from "./takoform/operations.ts";
 import { createTakoformRoutes, DEFAULT_TAKOFORM_ROUTES } from "./takoform/routes.ts";
+import type { TakoformStore } from "./takoform/store.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import type {
   InstalledTakoformBinding,
@@ -91,6 +93,11 @@ import {
  */
 
 export interface AppPorts {
+  /** Host-only optional data-plane factory, built against these same canonical ledgers. */
+  readonly selfhostEndpointIngressFactory?: (context: {
+    readonly store: TakoformStore;
+    readonly deployments: ResourceDeploymentStore;
+  }) => (request: Request) => Promise<Response | null>;
   readonly sql: Sql;
   readonly objects: ObjectStoreAccess;
   readonly identity: ExternalIdentityVerifier;
@@ -649,6 +656,14 @@ export function buildApp(ports: AppPorts): App {
     randomId,
   });
   const router = createRouter({
+    ...(ports.selfhostEndpointIngressFactory
+      ? {
+          containerEndpointIngress: ports.selfhostEndpointIngressFactory({
+            store: inventory,
+            deployments,
+          }),
+        }
+      : {}),
     control,
     dataAi,
     aiAvailable: ports.ai !== undefined,

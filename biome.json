@@ -29,7 +29,10 @@
   },
   "overrides": [
     {
-      "includes": ["tests/fixtures/selfhost-container-service-candidate.json"],
+      "includes": [
+        "tests/fixtures/selfhost-container-service-candidate.json",
+        "tests/fixtures/selfhost-container-endpoint-candidate.json"
+      ],
       "formatter": {
         "enabled": false
       }

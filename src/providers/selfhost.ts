@@ -81,6 +81,12 @@ import {
 } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
 import {
+  createSelfhostContainerEndpointLifecycle,
+  LOCAL_CONTAINER_ENDPOINT_FORM,
+  parseSelfhostContainerEndpointNativeId,
+  type SelfhostContainerEndpointIngressCapability,
+} from "./selfhost-container-endpoint.ts";
+import {
   createSelfhostContainerLifecycle,
   type SelfhostContainerCapability,
   selfhostContainerNativeIdentity,
@@ -292,6 +298,8 @@ export interface SelfhostProviderOptions {
   readonly offerings: readonly ProviderOffering[];
   /** Explicit native runtime for an independently installed Container Form. */
   readonly container?: SelfhostContainerCapability;
+  /** Local unpublished Endpoint attachment; no route exists outside committed Host state. */
+  readonly containerEndpointIngress?: SelfhostContainerEndpointIngressCapability;
   /** Explicit, host-private VectorIndex SQL lifecycle service. */
   readonly vectorIndexStore?: VectorIndexStore;
   /** Exact technical relation authorities for post-delete native readback. */
@@ -695,6 +703,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const standardServices = createSelfhostStandardServices(options.standardServiceIntegrations);
   const containerLifecycle = options.container
     ? createSelfhostContainerLifecycle(options.container)
+    : null;
+  const containerEndpointLifecycle = options.containerEndpointIngress
+    ? createSelfhostContainerEndpointLifecycle(options.containerEndpointIngress)
     : null;
   const versionMaterializer = createSelfhostVersionMaterializer({
     root: versionsRoot,
@@ -3336,6 +3347,18 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         canonicalJson(candidate.form) === canonicalJson(offering.form),
     );
 
+  const isConfiguredContainerEndpointOffering = (offering: ProviderOffering): boolean =>
+    containerEndpointLifecycle !== null &&
+    offering.form.apiVersion === LOCAL_CONTAINER_ENDPOINT_FORM.apiVersion &&
+    offering.form.kind === LOCAL_CONTAINER_ENDPOINT_FORM.kind &&
+    offering.form.definitionVersion === LOCAL_CONTAINER_ENDPOINT_FORM.definitionVersion &&
+    offering.form.schemaDigest === LOCAL_CONTAINER_ENDPOINT_FORM.schemaDigest &&
+    options.offerings.some(
+      (candidate) =>
+        candidate.id === offering.id &&
+        canonicalJson(candidate.form) === canonicalJson(offering.form),
+    );
+
   /**
    * VectorIndex is intentionally opt-in on self-host.  The offering must be a
    * member of this provider's explicitly composed offering set and the
@@ -3651,6 +3674,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
+      if (isConfiguredContainerEndpointOffering(input.offering)) {
+        const native = parseSelfhostContainerEndpointNativeId(input.nativeId);
+        if (
+          !native ||
+          native.uid !== input.identity.uid ||
+          !input.identity.incarnationId ||
+          !input.identity.generation
+        )
+          throw new ProviderReadbackDescriptorError();
+        return {
+          apiVersion: PROVIDER_READBACK_API_VERSION,
+          provider: id,
+          kind: "ContainerEndpoint",
+          nativeId: input.nativeId,
+          data: {
+            resourceUid: native.uid,
+            incarnationId: input.identity.incarnationId,
+            generation: input.identity.generation,
+            hostname: native.hostname,
+          },
+        };
+      }
       if (containerLifecycle && isConfiguredContainerOffering(input.offering)) {
         const native = selfhostContainerNativeIdentity(input.nativeId);
         if (
@@ -3717,6 +3762,26 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       descriptor: ProviderNativeReadbackDescriptor;
       target?: ProviderReadAuthorityTarget;
     }): Promise<ProviderNativeAbsence> {
+      if (isConfiguredContainerEndpointOffering(input.offering)) {
+        const native = parseSelfhostContainerEndpointNativeId(input.descriptor.nativeId);
+        const { descriptor, target } = input;
+        if (
+          !native ||
+          !target ||
+          descriptor.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+          descriptor.provider !== id ||
+          descriptor.kind !== "ContainerEndpoint" ||
+          descriptor.data.resourceUid !== native.uid ||
+          descriptor.data.hostname !== native.hostname ||
+          descriptor.data.incarnationId !== target.incarnationId ||
+          descriptor.data.generation !== target.generation ||
+          target.resourceUid !== native.uid
+        )
+          return selfhostUnknown("malformed", false);
+        // No provider-native route is allocated. Host commit/tombstone state alone
+        // admits or revokes the data plane; this proves only provider-native absence.
+        return selfhostAbsence("absent", descriptor, "ContainerEndpoint", id);
+      }
       if (containerLifecycle && isConfiguredContainerOffering(input.offering)) {
         const descriptor = input.descriptor;
         const native = selfhostContainerNativeIdentity(descriptor.nativeId);
@@ -3931,6 +3996,8 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async recoverApply(input): Promise<ProviderTicket> {
+      if (containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering))
+        return await containerEndpointLifecycle.apply(input);
       if (isConfiguredVectorIndexOffering(input.offering)) {
         return await vectorRecoverApply(input);
       }
@@ -4001,6 +4068,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           return containerLifecycle && isConfiguredContainerOffering(input.offering)
             ? await containerLifecycle.apply(input, context)
             : failed("unavailable", "the local Container runtime is not installed");
+        if (dispatchKind(input.offering) === "ContainerEndpoint")
+          return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
+            ? await containerEndpointLifecycle.apply(input)
+            : failed("unavailable", "the local Container endpoint ingress is not installed");
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker":
             return await applyModuleWorker(input);
@@ -4049,6 +4120,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
           return containerLifecycle && isConfiguredContainerOffering(input.offering)
             ? await containerLifecycle.observe(input)
             : failed("unavailable", "the local Container runtime is not installed");
+        if (dispatchKind(input.offering) === "ContainerEndpoint")
+          return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
+            ? await containerEndpointLifecycle.observe(input)
+            : failed("unavailable", "the local Container endpoint ingress is not installed");
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
@@ -4323,6 +4398,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async delete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ContainerEndpoint")
+        return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
+          ? await containerEndpointLifecycle.delete(input)
+          : failed("unavailable", "the local Container endpoint ingress is not installed");
       if (dispatchKind(input.offering) === "ContainerService")
         return containerLifecycle && isConfiguredContainerOffering(input.offering)
           ? await containerLifecycle.delete(input)
@@ -4562,6 +4641,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
      * truth; it never calls `remove`, rewrites desired state, or reloads.
      */
     async recoverDelete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ContainerEndpoint")
+        return containerEndpointLifecycle && isConfiguredContainerEndpointOffering(input.offering)
+          ? await containerEndpointLifecycle.delete(input)
+          : failed("unavailable", "the local Container endpoint ingress is not installed");
       if (input.providerHandle) {
         return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
       }

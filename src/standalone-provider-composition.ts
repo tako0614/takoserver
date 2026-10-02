@@ -12,6 +12,10 @@ import type {
   SelfhostDataPlaneMaintenance,
   SelfhostEventRuntime,
 } from "./providers/selfhost.ts";
+import type {
+  SelfhostContainerEndpointHttpsIngressPort,
+  SelfhostContainerEndpointIngressCapability,
+} from "./providers/selfhost-container-endpoint.ts";
 import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
@@ -103,6 +107,7 @@ export interface StandaloneProviderComposition {
   readonly providers: readonly Provider[];
   readonly providerPacks: readonly ProviderPack[];
   readonly offerings: DeploymentComposition["offerings"];
+  readonly containerEndpointIngress?: SelfhostContainerEndpointIngressCapability;
 }
 
 export function createStandaloneProviderComposition(input: {
@@ -113,6 +118,7 @@ export function createStandaloneProviderComposition(input: {
   readonly runtime: WorkerdRuntime;
   /** Opt-in native execution; no Form or Offering is synthesized from configuration. */
   readonly container?: SelfhostContainerCapability;
+  readonly containerEndpointIngress?: SelfhostContainerEndpointHttpsIngressPort;
   /** Whether the entry verified the exact closed-graph workerd artifact. */
   readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
@@ -145,6 +151,9 @@ export function createStandaloneProviderComposition(input: {
       dataRoot: input.dataRoot,
       runtime: input.runtime,
       ...(input.container ? { container: input.container } : {}),
+      ...(input.containerEndpointIngress
+        ? { containerEndpointIngress: input.containerEndpointIngress }
+        : {}),
       ...(input.workerRuntimeAvailable === undefined
         ? {}
         : { workerRuntimeAvailable: input.workerRuntimeAvailable }),
@@ -167,6 +176,9 @@ export function createStandaloneProviderComposition(input: {
       providers: [composition.provider],
       providerPacks: composition.providerPacks,
       offerings: composition.offerings,
+      ...(composition.containerEndpointIngress
+        ? { containerEndpointIngress: composition.containerEndpointIngress }
+        : {}),
     };
   }
 
