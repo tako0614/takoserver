@@ -311,16 +311,16 @@ describe("0064 to 0065 runtime-input lease generation transition", () => {
     }
   });
 
-  test("refuses unreviewed 0069 source tail before provider I/O", async () => {
+  test("refuses an unreviewed post-0069 source tail before provider I/O", async () => {
     const unreviewed = join(root, "unreviewed");
     cpSync(migrations, unreviewed, { recursive: true });
     writeFileSync(
-      join(unreviewed, "0069_unreviewed_extension.sql"),
+      join(unreviewed, "0070_unreviewed_extension.sql"),
       "CREATE TABLE unreviewed(value TEXT);\n",
     );
     const f = fixture({ migrationDirectory: unreviewed });
     try {
-      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0068");
+      await expect(f.invoke("status")).rejects.toThrow("exact audited source inventory 0001-0069");
       expect(f.applies()).toBe(0);
     } finally {
       f.db.close();
