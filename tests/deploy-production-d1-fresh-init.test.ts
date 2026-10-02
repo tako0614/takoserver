@@ -237,13 +237,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0068_cloudflare_provider_invocation_custody.sql");
+        const tail = join(migrationDirectory, "0069_cloudflare_provider_invocation_delete_ack.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0069_unreviewed.sql"),
+            join(migrationDirectory, "0070_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -256,7 +256,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0068",
+            : "audited migration lineage must contain exactly 0001-0069",
         );
         expect(fixture.calls).toEqual([]);
       } finally {

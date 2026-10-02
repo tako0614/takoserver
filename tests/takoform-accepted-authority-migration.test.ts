@@ -14,6 +14,7 @@ const WORKER_RUNTIME_INPUT_LEASE_GENERATION = "0065_worker_runtime_input_lease_g
 const MANAGED_ACTOR_KV_CAPABILITY_CLAIMS = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 const CONTAINER_ENDPOINT_HOSTNAME_INDEX = "0067_takoform_container_endpoint_hostname_index.sql";
 const INVOCATION_CUSTODY_MIGRATION = "0068_cloudflare_provider_invocation_custody.sql";
+const INVOCATION_DELETE_ACK_MIGRATION = "0069_cloudflare_provider_invocation_delete_ack.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -233,6 +234,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       MANAGED_ACTOR_KV_CAPABILITY_CLAIMS,
       CONTAINER_ENDPOINT_HOSTNAME_INDEX,
       INVOCATION_CUSTODY_MIGRATION,
+      INVOCATION_DELETE_ACK_MIGRATION,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(
