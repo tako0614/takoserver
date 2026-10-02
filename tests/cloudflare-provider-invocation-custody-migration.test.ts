@@ -78,8 +78,9 @@ function createVersionReceipt(database: Database, suffix: string): void {
 
 test("0068 is the exact source-only successor while the qualified 0001-0066 ceiling remains fixed", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
-  expect(source.names).toHaveLength(68);
-  expect(source.names.at(-1)).toBe(MIGRATION_NAME);
+  expect(source.names).toHaveLength(69);
+  expect(source.names.at(-2)).toBe(MIGRATION_NAME);
+  expect(source.names.at(-1)).toBe("0069_cloudflare_provider_invocation_delete_ack.sql");
   const qualified = projectApplyQualifiedMigrationArtifact(source);
   expect(qualified.names).toHaveLength(66);
   expect(qualified.names.at(-1)).toBe("0066_cloudflare_managed_actor_kv_capability_claims.sql");
@@ -91,9 +92,9 @@ test("0068 is the exact source-only successor while the qualified 0001-0066 ceil
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
-    copyFileSync(tail.path, join(migrations, "0069_unreviewed.sql"));
+    copyFileSync(tail.path, join(migrations, "0070_unreviewed.sql"));
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly 0001-0068",
+      "audited migration lineage must contain exactly 0001-0069",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
