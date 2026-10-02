@@ -335,12 +335,12 @@ function validateInput(input: SelfhostContainerRevision): SelfhostContainerRevis
     typeof input.healthPath !== "string" ||
     !/^\/(?!\/)[^\s#]*$/u.test(input.healthPath) ||
     input.healthPath.includes("\\") ||
-    input.healthPath.length > 1024 ||
+    input.healthPath.length > 2048 ||
     !isJsonObject(input.environment) ||
     Object.keys(input.environment).length > 128 ||
     Object.entries(input.environment).some(
       ([key, value]) =>
-        !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) ||
+        !/^[A-Za-z_][A-Za-z0-9._-]*$/u.test(key) ||
         typeof value !== "string" ||
         value.includes("\0") ||
         value.length > 8192,

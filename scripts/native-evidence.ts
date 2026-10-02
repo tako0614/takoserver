@@ -1,11 +1,12 @@
 /**
  * Native evidence that the portable gate cannot supply by itself.
  *
- * Tests in `tests/` exercise three optional native capabilities: the pinned
+ * Tests in `tests/` exercise four optional native capabilities: the pinned
  * closed-graph `workerd` build, an unqualified Actor qualification candidate,
- * and an opt-in local Docker container lifecycle fixture. The two binary-backed
- * capabilities gate on operator-supplied paths; the Docker capability gates on
- * its explicit opt-in and bounded fixture configuration.
+ * an opt-in local Docker container lifecycle fixture, and a separate
+ * Host-process Docker lifecycle fixture. The two binary-backed capabilities
+ * gate on operator-supplied paths; both Docker capabilities gate on their
+ * explicit opt-in and bounded fixture configuration.
  *
  * That choice is correct — `selectClosedGraphWorkerd` refuses to substitute a
  * package binary for the pinned bytes — but it used to be invisible. This module
@@ -176,6 +177,99 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
   {
+    id: "container-host-lifecycle",
+    label: "local self-host Container Host process and Docker lifecycle",
+    environment: "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE",
+    companionEnvironment: [
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT",
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_B",
+      "TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET",
+      "TAKOSERVER_NATIVE_CONTAINER_NETWORK",
+    ],
+    proves:
+      "the explicitly selected local unpublished ContainerService Form through public Host CRUD across real OS-process restart and Docker lifecycle boundaries; it does not prove publisher admission, published support, or caller-facing HTTP Binding",
+    enable:
+      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Form artifact path/SHA-256, two distinct immutable image refs, Docker Unix socket path, and pre-created owned internal network. The gated test checks both exact RepoDigests are already local, but the runtime still sends Docker /images/create requests that may contact those images' public registry; this does not prove zero registry contact",
+    inspect: (configured, environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE is not configured; OS-process and Docker lifecycle remain unproven",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE must be exactly 1",
+        };
+      }
+      const artifact = environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT;
+      const expected = environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256;
+      if (artifact === undefined || !isAbsolute(artifact)) {
+        return {
+          state: "invalid",
+          detail: "the local ContainerService Form artifact path must be absolute",
+        };
+      }
+      if (expected !== "7ab6dce1bbbfecc69f5732abd25100db83168c640e8d1054f5a708ad4ef6a0b2") {
+        return {
+          state: "invalid",
+          detail: "the configured local Form artifact SHA-256 is not the reviewed final candidate",
+        };
+      }
+      const actual = probe.sha256(artifact);
+      if (actual === null || actual !== expected) {
+        return {
+          state: "invalid",
+          detail: "the configured local Form artifact is unreadable or does not match its SHA-256",
+        };
+      }
+      const imageA = environment.TAKOSERVER_NATIVE_CONTAINER_IMAGE_A;
+      const imageB = environment.TAKOSERVER_NATIVE_CONTAINER_IMAGE_B;
+      const imageRef =
+        /^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[a-f0-9]{64}$/u;
+      if (
+        imageA === undefined ||
+        imageB === undefined ||
+        !imageRef.test(imageA) ||
+        !imageRef.test(imageB) ||
+        imageA === imageB
+      ) {
+        return {
+          state: "invalid",
+          detail: "two distinct immutable OCI image references are required",
+        };
+      }
+      const socket = environment.TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET;
+      if (socket === undefined || !isAbsolute(socket) || socket.includes("\0")) {
+        return {
+          state: "invalid",
+          detail: "the Docker Unix socket path must be absolute",
+        };
+      }
+      const network = environment.TAKOSERVER_NATIVE_CONTAINER_NETWORK;
+      if (
+        network === undefined ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(network) ||
+        ["host", "bridge", "none"].includes(network)
+      ) {
+        return {
+          state: "invalid",
+          detail: "a non-reserved pre-created Docker network name is required",
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "bounded local Form/image/socket/network inputs are configured; Docker execution and process-restart proof still require running the gated test",
+        readinessOnly: true,
+      };
+    },
+  },
+  {
     id: "docker-container-lifecycle",
     label: "self-host Docker container lifecycle fixture",
     environment: "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE",
@@ -198,19 +292,14 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
           detail: 'TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE must be exactly "1" when configured',
         };
       }
-
       const values = new Map<string, string>();
       for (const name of DOCKER_LIFECYCLE_FIXTURE_ENVIRONMENT) {
         const value = environment[name]?.trim();
-        if (!value) {
-          return { state: "invalid", detail: `${name} is missing or empty` };
-        }
-        if (value.length > 512) {
+        if (!value) return { state: "invalid", detail: `${name} is missing or empty` };
+        if (value.length > 512)
           return { state: "invalid", detail: `${name} exceeds the 512-character input bound` };
-        }
         values.set(name, value);
       }
-
       const imageA = values.get("TAKOSERVER_NATIVE_CONTAINER_IMAGE_A");
       const imageB = values.get("TAKOSERVER_NATIVE_CONTAINER_IMAGE_B");
       const immutableImage = /^[^\s@]+(?:\/[^\s@]+)*@sha256:[a-f0-9]{64}$/u;
@@ -226,7 +315,6 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
           detail: "fixture images must be distinct immutable repository digest references",
         };
       }
-
       const port = Number(values.get("TAKOSERVER_NATIVE_CONTAINER_PORT"));
       if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) {
         return {
@@ -243,22 +331,6 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     },
   },
 ];
-
-/**
- * Environment variables that gate a test. `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY`
- * is a companion of the workerd artifact rather than a capability of its own, so
- * a gate that names both belongs to the workerd artifact.
- */
-const CAPABILITY_BY_ENVIRONMENT: ReadonlyMap<string, string> = new Map(
-  NATIVE_EVIDENCE_CAPABILITIES.flatMap((capability) => [
-    [capability.environment, capability.id] as const,
-    ...capability.companionEnvironment.map((name) => [name, capability.id] as const),
-  ]),
-);
-
-const KNOWN_CAPABILITY_IDS: ReadonlySet<string> = new Set(
-  NATIVE_EVIDENCE_CAPABILITIES.map((capability) => capability.id),
-);
 
 export interface NativeEvidenceGate {
   /** Repository-relative test path. */
@@ -526,16 +598,18 @@ function skipIfArguments(masked: string): { start: number; end: number }[] {
 }
 
 function classify(environments: readonly string[], capabilities: readonly string[]): string | null {
-  const claimed = new Set<string>(capabilities);
-  for (const name of environments) {
-    const id = CAPABILITY_BY_ENVIRONMENT.get(name);
-    if (id !== undefined) claimed.add(id);
-  }
-  if (claimed.size !== 1) return null;
-  // A gate that mixes capabilities would misreport which artifact it needs, and
-  // a capability id nothing declares would otherwise pass by silence.
-  const only = [...claimed][0];
-  return only !== undefined && KNOWN_CAPABILITY_IDS.has(only) ? only : null;
+  // Two native suites may require the same immutable image inputs. Shared
+  // companions cannot be mapped to one owner; every named environment must
+  // belong to the selected capability, and an explicit ID resolves only a
+  // still-ambiguous shared-input gate.
+  const matches = NATIVE_EVIDENCE_CAPABILITIES.filter(
+    (capability) =>
+      capabilities.every((id) => id === capability.id) &&
+      environments.every(
+        (name) => name === capability.environment || capability.companionEnvironment.includes(name),
+      ),
+  );
+  return matches.length === 1 ? (matches[0]?.id ?? null) : null;
 }
 
 function testFiles(root: string): string[] {

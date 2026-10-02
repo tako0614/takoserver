@@ -1233,9 +1233,6 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       }
       const address = addressOf(context.tenantId, body);
       const current = await store.readResource(address);
-      if (context.provisionOnly && current !== null) {
-        throw new TakoformHostError("resource_not_found", 404);
-      }
       if (
         context.expectedResourceUid !== undefined &&
         current?.metadata.uid !== context.expectedResourceUid
@@ -1253,11 +1250,23 @@ export function createTakoformEngine(options: CreateTakoformEngineOptions): Tako
       const fingerprint = mutationFingerprint(context.request, rawBodyDigest);
       const replay = await store.readReplay(replayKey);
       if (replay) {
+        // A provision bearer may recover only its still-current exact create.
+        // If that Resource was deleted, retain the receipt and refuse instead
+        // of releasing this key for a second create under the same bearer.
+        if (context.provisionOnly && current === null) {
+          throw new TakoformHostError("resource_not_found", 404);
+        }
         const replayed = replayedMutation(replay, fingerprint, current?.metadata.uid);
         if (replayed) return replayed;
         // The recorded resource no longer exists, so the key is released and
         // the request is served as a fresh mutation.
         await store.deleteReplay(replayKey);
+      }
+      // Provision authority for an existing Resource is only its original
+      // durable replay, whose principal, operation key, request fingerprint,
+      // and still-current Resource UID were proved above.
+      if (context.provisionOnly && current !== null) {
+        throw new TakoformHostError("resource_not_found", 404);
       }
 
       const create = current === null;

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import { createCatalog } from "../src/catalog.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { createProviderDriver, createProviderFormAvailability } from "../src/provider-driver.ts";
@@ -6,10 +7,12 @@ import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import { resolveRuntimeBindingMaterialRoute } from "../src/provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
+import type { SelfhostContainerCapability } from "../src/providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
+import { loadVerifiedLocalContainerCandidate } from "./fixtures/selfhost-container-host-authority.ts";
 
 /**
  * Released beta provider Forms remain installed behind the Provider Pack only
@@ -50,6 +53,7 @@ async function compose(
   workerRuntimeAvailable?: boolean,
   stableForms = stableProductionTakoformCatalog().forms,
   runtimeOverride?: WorkerdRuntime,
+  container?: SelfhostContainerCapability,
 ) {
   return createSelfhostComposition({
     edge: await buildEdgeForms(),
@@ -65,6 +69,7 @@ async function compose(
       },
     },
     edgeForms,
+    ...(container ? { container } : {}),
     ...(runtimeInputs ? { runtimeInputs } : {}),
     ...(workerRuntimeAvailable === undefined ? {} : { workerRuntimeAvailable }),
     now: new Date("2026-06-01T00:00:00.000Z"),
@@ -442,7 +447,101 @@ describe("the self-host catalog", () => {
     expect(unconfigured.provider.runtimeInputCapabilities).toBeUndefined();
 
     const configured = await compose(true, leases);
-    expect(configured.provider.runtimeInputCapabilities).toEqual({ maximumBindings: 64 });
+    expect(configured.provider.runtimeInputCapabilities).toEqual({
+      maximumBindings: 64,
+      forms: configured.provider.offerings
+        .filter((offering) => offering.form.kind === "WorkerVersion")
+        .map((offering) => offering.form),
+    });
+  });
+
+  test("offers only the exact reviewed local unpublished ContainerService package", async () => {
+    const candidate = await loadVerifiedLocalContainerCandidate(
+      join(import.meta.dir, "fixtures/selfhost-container-service-candidate.json"),
+    );
+    const form = candidate.form;
+    const nativeCalls: string[] = [];
+    const container: SelfhostContainerCapability = {
+      capacityProfile: {
+        id: "selfhost.container.http.standard",
+        memoryBytes: 256 * 1024 * 1024,
+        nanoCpus: 500_000_000,
+        pidsLimit: 128,
+      },
+      runtime: {
+        async reconcile() {
+          nativeCalls.push("reconcile");
+          throw new Error("composition must not reach native runtime");
+        },
+        async observe() {
+          nativeCalls.push("observe");
+          throw new Error("composition must not reach native runtime");
+        },
+        async fetch() {
+          nativeCalls.push("fetch");
+          throw new Error("composition must not reach native runtime");
+        },
+        async remove() {
+          nativeCalls.push("remove");
+          throw new Error("composition must not reach native runtime");
+        },
+        async close() {},
+      },
+    };
+    const forms = [...stableProductionTakoformCatalog().forms, form];
+    const exact = await compose(true, undefined, true, forms, undefined, container);
+    expect(
+      exact.offerings.filter((offering) => offering.form.kind === "ContainerService"),
+    ).toHaveLength(1);
+    expect(
+      (await compose(true, undefined, true, forms)).offerings.some(
+        (offering) => offering.form.kind === "ContainerService",
+      ),
+    ).toBe(false);
+    expect(
+      (await compose(true, undefined, true, undefined, undefined, container)).offerings.some(
+        (offering) => offering.form.kind === "ContainerService",
+      ),
+    ).toBe(false);
+
+    const changedSchema = {
+      ...form,
+      identity: {
+        ...form.identity,
+        formRef: {
+          ...form.identity.formRef,
+          schemaDigest: `sha256:${"f".repeat(64)}` as const,
+        },
+      },
+    };
+    const changedPackage = {
+      ...form,
+      identity: {
+        ...form.identity,
+        packageDigest: `sha256:${"e".repeat(64)}` as const,
+      },
+    };
+    await expect(
+      compose(
+        true,
+        undefined,
+        true,
+        [...stableProductionTakoformCatalog().forms, changedSchema],
+        undefined,
+        container,
+      ),
+    ).rejects.toThrow();
+    await expect(
+      compose(
+        true,
+        undefined,
+        true,
+        [...stableProductionTakoformCatalog().forms, changedPackage],
+        undefined,
+        container,
+      ),
+    ).rejects.toThrow();
+    expect(nativeCalls).toEqual([]);
   });
 
   test("projects that ceiling into the WorkerVersion support profile the provider reads", async () => {
@@ -452,16 +551,18 @@ describe("the self-host catalog", () => {
         form.identity.formRef.kind === "WorkerVersion",
     );
     if (!workerVersion) throw new Error("the stable WorkerVersion Form is missing");
+    const objectBucket = stableProductionTakoformCatalog().forms.find(
+      (form) =>
+        form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+        form.identity.formRef.kind === "ObjectBucket",
+    );
+    if (!objectBucket) throw new Error("the stable ObjectBucket Form is missing");
 
-    for (const [runtimeInputs, expected] of [
-      [undefined, 0],
-      [leases, 64],
-    ] as const) {
-      const composition = await compose(true, runtimeInputs);
-      const driver = createProviderDriver({
-        providers: [composition.provider],
+    const policyFor = (provider: Provider) =>
+      createProviderDriver({
+        providers: [provider],
         catalog: {
-          list: () => composition.offerings,
+          list: () => provider.offerings,
           async digest() {
             return `sha256:${"a".repeat(64)}` as const;
           },
@@ -470,9 +571,37 @@ describe("the self-host catalog", () => {
         } as never,
         deployments: {} as never,
         ledger: {} as never,
-      });
-      expect(driver.runtimeInputPolicy?.guaranteedMaximum(workerVersion)).toBe(expected);
+      }).runtimeInputPolicy;
+
+    for (const [runtimeInputs, expected] of [
+      [undefined, 0],
+      [leases, 64],
+    ] as const) {
+      const composition = await compose(true, runtimeInputs);
+      const policy = policyFor(composition.provider);
+      expect(policy?.guaranteedMaximum(workerVersion)).toBe(expected);
+      expect(policy?.guaranteedMaximum(objectBucket)).toBe(0);
     }
+
+    const configured = await compose(true, leases);
+    const legacyProvider: Provider = {
+      ...configured.provider,
+      runtimeInputCapabilities: { maximumBindings: 64 },
+    };
+    expect(policyFor(legacyProvider)?.guaranteedMaximum(objectBucket)).toBe(64);
+    const wrongSchemaProvider: Provider = {
+      ...configured.provider,
+      runtimeInputCapabilities: {
+        maximumBindings: 64,
+        forms: [
+          {
+            ...workerVersion.identity.formRef,
+            schemaDigest: `sha256:${"0".repeat(64)}`,
+          },
+        ],
+      },
+    };
+    expect(policyFor(wrongSchemaProvider)?.guaranteedMaximum(workerVersion)).toBe(0);
   });
 
   test("owns both halves of the object Binding, and fences the export", async () => {

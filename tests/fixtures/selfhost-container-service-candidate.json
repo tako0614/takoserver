@@ -1,0 +1,630 @@
+{
+  "publicationStatus": "UNPUBLISHED",
+  "contractClosure": "form-only; container.http Interface and module-worker.container-http Binding are withheld",
+  "form": {
+    "kind": "ContainerService",
+    "slug": "container-service",
+    "role": "identity",
+    "definition": {
+      "apiVersion": "edge.forms.takoform.com",
+      "kind": "ContainerService",
+      "definitionVersion": "0.1.0",
+      "title": "Container Service",
+      "description": "One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.",
+      "role": "identity",
+      "requiresHostApi": "forms.takoform.com/v1",
+      "desiredSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "description": "One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.",
+        "properties": {
+          "environment": {
+            "additionalProperties": {
+              "maxLength": 4096,
+              "pattern": "^[\\s\\S]*$",
+              "type": "string"
+            },
+            "default": {},
+            "description": "At most 64 ordinary bounded desired-state strings persisted/read back as ResourceSpec. Callers MUST NOT put secrets here; automatic secret-value detection/rejection is not provided.",
+            "maxProperties": 64,
+            "propertyNames": {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+              "type": "string",
+              "x-takoform-fieldPolicy": "portable-data-only-v1"
+            },
+            "type": "object"
+          },
+          "healthPath": {
+            "description": "Absolute path used by the Host to establish readiness before an update is made serving.",
+            "maxLength": 2048,
+            "pattern": "^/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+)*$|^/$",
+            "type": "string"
+          },
+          "httpPort": {
+            "description": "The private HTTP listener port inside the image; public port mapping and placement are Host-owned.",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "image": {
+            "description": "OCI image reference including its immutable sha256 manifest digest; mutable tags without a digest are refused.",
+            "maxLength": 512,
+            "pattern": "^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "outboundInternet": {
+            "default": false,
+            "description": "Whether this workload may initiate outbound Internet connections. Omission means false.",
+            "type": "boolean"
+          },
+          "requiredSensitiveVars": {
+            "default": [],
+            "description": "Names of required sensitive process variables only; values are supplied outside portable desired state. This initial executable local slice refuses a nonempty set.",
+            "items": {
+              "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "workloadRevision": {
+            "description": "Author-declared bounded revision identity for this desired workload; it is part of the exact operation fence, not a Host UID or generation.",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "healthPath",
+          "httpPort",
+          "image",
+          "workloadRevision"
+        ],
+        "title": "Container Service desired state",
+        "type": "object"
+      },
+      "lifecycleCapabilities": [
+        "create",
+        "read",
+        "update",
+        "delete",
+        "observe"
+      ],
+      "conformanceFixtures": [
+        {
+          "name": "canonical",
+          "desiredPath": "fixtures/desired.json"
+        }
+      ],
+      "negativeConformanceFixtures": [
+        {
+          "name": "reject-unexpected-property",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-unexpected-property.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-missing-image",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-missing-image.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-missing-http-port",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-missing-http-port.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-missing-health-path",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-missing-health-path.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-missing-workload-revision",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-missing-workload-revision.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-image",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-image.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-http-port",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-http-port.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-health-path",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-health-path.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-environment",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-environment.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-workload-revision",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-workload-revision.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-required-sensitive-vars",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-required-sensitive-vars.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-sensitive-requirement-values-not-names",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-sensitive-requirement-values-not-names.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-http-port-out-of-range",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-http-port-out-of-range.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-environment-value-too-long",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-environment-value-too-long.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-registry-port-out-of-range",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-registry-port-out-of-range.json",
+          "expectedFailure": "schema_validation_failed"
+        },
+        {
+          "name": "reject-health-path-empty-segment",
+          "stage": "desired",
+          "inputPath": "fixtures/negative-health-path-empty-segment.json",
+          "expectedFailure": "schema_validation_failed"
+        }
+      ]
+    },
+    "definitionJson": "{\n  \"apiVersion\": \"edge.forms.takoform.com\",\n  \"kind\": \"ContainerService\",\n  \"definitionVersion\": \"0.1.0\",\n  \"title\": \"Container Service\",\n  \"description\": \"One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.\",\n  \"role\": \"identity\",\n  \"requiresHostApi\": \"forms.takoform.com/v1\",\n  \"desiredSchema\": {\n    \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n    \"additionalProperties\": false,\n    \"description\": \"One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.\",\n    \"properties\": {\n      \"environment\": {\n        \"additionalProperties\": {\n          \"maxLength\": 4096,\n          \"pattern\": \"^[\\\\s\\\\S]*$\",\n          \"type\": \"string\"\n        },\n        \"default\": {},\n        \"description\": \"At most 64 ordinary bounded desired-state strings persisted/read back as ResourceSpec. Callers MUST NOT put secrets here; automatic secret-value detection/rejection is not provided.\",\n        \"maxProperties\": 64,\n        \"propertyNames\": {\n          \"pattern\": \"^[A-Za-z][A-Za-z0-9._-]{0,63}$\",\n          \"type\": \"string\",\n          \"x-takoform-fieldPolicy\": \"portable-data-only-v1\"\n        },\n        \"type\": \"object\"\n      },\n      \"healthPath\": {\n        \"description\": \"Absolute path used by the Host to establish readiness before an update is made serving.\",\n        \"maxLength\": 2048,\n        \"pattern\": \"^/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+)*$|^/$\",\n        \"type\": \"string\"\n      },\n      \"httpPort\": {\n        \"description\": \"The private HTTP listener port inside the image; public port mapping and placement are Host-owned.\",\n        \"maximum\": 65535,\n        \"minimum\": 1,\n        \"type\": \"integer\"\n      },\n      \"image\": {\n        \"description\": \"OCI image reference including its immutable sha256 manifest digest; mutable tags without a digest are refused.\",\n        \"maxLength\": 512,\n        \"pattern\": \"^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$\",\n        \"type\": \"string\"\n      },\n      \"outboundInternet\": {\n        \"default\": false,\n        \"description\": \"Whether this workload may initiate outbound Internet connections. Omission means false.\",\n        \"type\": \"boolean\"\n      },\n      \"requiredSensitiveVars\": {\n        \"default\": [],\n        \"description\": \"Names of required sensitive process variables only; values are supplied outside portable desired state. This initial executable local slice refuses a nonempty set.\",\n        \"items\": {\n          \"pattern\": \"^[A-Za-z][A-Za-z0-9._-]{0,63}$\",\n          \"type\": \"string\"\n        },\n        \"maxItems\": 64,\n        \"type\": \"array\",\n        \"uniqueItems\": true\n      },\n      \"workloadRevision\": {\n        \"description\": \"Author-declared bounded revision identity for this desired workload; it is part of the exact operation fence, not a Host UID or generation.\",\n        \"maxLength\": 128,\n        \"pattern\": \"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$\",\n        \"type\": \"string\"\n      }\n    },\n    \"required\": [\n      \"healthPath\",\n      \"httpPort\",\n      \"image\",\n      \"workloadRevision\"\n    ],\n    \"title\": \"Container Service desired state\",\n    \"type\": \"object\"\n  },\n  \"lifecycleCapabilities\": [\n    \"create\",\n    \"read\",\n    \"update\",\n    \"delete\",\n    \"observe\"\n  ],\n  \"conformanceFixtures\": [\n    {\n      \"name\": \"canonical\",\n      \"desiredPath\": \"fixtures/desired.json\"\n    }\n  ],\n  \"negativeConformanceFixtures\": [\n    {\n      \"name\": \"reject-unexpected-property\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-unexpected-property.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-image\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-image.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-http-port\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-http-port.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-health-path\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-health-path.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-workload-revision\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-workload-revision.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-image\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-image.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-http-port\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-http-port.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-health-path\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-health-path.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-environment\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-environment.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-workload-revision\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-workload-revision.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-required-sensitive-vars\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-required-sensitive-vars.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-sensitive-requirement-values-not-names\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-sensitive-requirement-values-not-names.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-http-port-out-of-range\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-http-port-out-of-range.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-environment-value-too-long\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-environment-value-too-long.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-registry-port-out-of-range\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-registry-port-out-of-range.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-health-path-empty-segment\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-health-path-empty-segment.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    }\n  ]\n}\n",
+    "fixtures": {
+      "desired.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-environment-value-too-long.json": {
+        "environment": {
+          "APP_MODE": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-environment.json": {
+        "environment": {
+          "VAR_00": "bounded",
+          "VAR_01": "bounded",
+          "VAR_02": "bounded",
+          "VAR_03": "bounded",
+          "VAR_04": "bounded",
+          "VAR_05": "bounded",
+          "VAR_06": "bounded",
+          "VAR_07": "bounded",
+          "VAR_08": "bounded",
+          "VAR_09": "bounded",
+          "VAR_10": "bounded",
+          "VAR_11": "bounded",
+          "VAR_12": "bounded",
+          "VAR_13": "bounded",
+          "VAR_14": "bounded",
+          "VAR_15": "bounded",
+          "VAR_16": "bounded",
+          "VAR_17": "bounded",
+          "VAR_18": "bounded",
+          "VAR_19": "bounded",
+          "VAR_20": "bounded",
+          "VAR_21": "bounded",
+          "VAR_22": "bounded",
+          "VAR_23": "bounded",
+          "VAR_24": "bounded",
+          "VAR_25": "bounded",
+          "VAR_26": "bounded",
+          "VAR_27": "bounded",
+          "VAR_28": "bounded",
+          "VAR_29": "bounded",
+          "VAR_30": "bounded",
+          "VAR_31": "bounded",
+          "VAR_32": "bounded",
+          "VAR_33": "bounded",
+          "VAR_34": "bounded",
+          "VAR_35": "bounded",
+          "VAR_36": "bounded",
+          "VAR_37": "bounded",
+          "VAR_38": "bounded",
+          "VAR_39": "bounded",
+          "VAR_40": "bounded",
+          "VAR_41": "bounded",
+          "VAR_42": "bounded",
+          "VAR_43": "bounded",
+          "VAR_44": "bounded",
+          "VAR_45": "bounded",
+          "VAR_46": "bounded",
+          "VAR_47": "bounded",
+          "VAR_48": "bounded",
+          "VAR_49": "bounded",
+          "VAR_50": "bounded",
+          "VAR_51": "bounded",
+          "VAR_52": "bounded",
+          "VAR_53": "bounded",
+          "VAR_54": "bounded",
+          "VAR_55": "bounded",
+          "VAR_56": "bounded",
+          "VAR_57": "bounded",
+          "VAR_58": "bounded",
+          "VAR_59": "bounded",
+          "VAR_60": "bounded",
+          "VAR_61": "bounded",
+          "VAR_62": "bounded",
+          "VAR_63": "bounded",
+          "VAR_64": "bounded"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-health-path-empty-segment.json": {
+        "environment": {
+          "APP_MODE": "production"
+        },
+        "healthPath": "//health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-health-path.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-http-port-out-of-range.json": {
+        "environment": {
+          "APP_MODE": "production"
+        },
+        "healthPath": "/health",
+        "httpPort": 65536,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-http-port.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 0,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-image.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app:latest",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-missing-health-path.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-missing-http-port.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-missing-image.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-missing-workload-revision.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": []
+      },
+      "negative-registry-port-out-of-range.json": {
+        "environment": {
+          "APP_MODE": "production"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "registry.example.com:99999/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "revision-1"
+      },
+      "negative-required-sensitive-vars.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [
+          "not/a/portable-name"
+        ],
+        "workloadRevision": "revision-1"
+      },
+      "negative-sensitive-requirement-values-not-names.json": {
+        "environment": {
+          "APP_MODE": "production"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [
+          "API_TOKEN=plaintext"
+        ],
+        "workloadRevision": "revision-1"
+      },
+      "negative-unexpected-property.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "takoformUnexpected": true,
+        "workloadRevision": "revision-1"
+      },
+      "negative-workload-revision.json": {
+        "environment": {
+          "APP.MODE": "production",
+          "APP_MODE": "standard"
+        },
+        "healthPath": "/health",
+        "httpPort": 8080,
+        "image": "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "outboundInternet": false,
+        "requiredSensitiveVars": [],
+        "workloadRevision": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+      }
+    }
+  },
+  "package": {
+    "packageIndexJson": "{\n  \"apiVersion\": \"packages.forms.takoform.com/v1alpha5\",\n  \"kind\": \"FormPackage\",\n  \"formRef\": {\n    \"apiVersion\": \"edge.forms.takoform.com\",\n    \"kind\": \"ContainerService\",\n    \"definitionVersion\": \"0.1.0\",\n    \"schemaDigest\": \"sha256:114d452395562573f46d9a879efa889ab42a3e43348d7db244e22df7d6e330e2\"\n  },\n  \"definitionPath\": \"definition.json\",\n  \"files\": [\n    {\n      \"path\": \"definition.json\",\n      \"mediaType\": \"application/vnd.takoform.form-definition.v1+json\",\n      \"size\": 10036,\n      \"digest\": \"sha256:a155c4d52b47f224b4efcdd4b99f3cd1fba6b0cff2096d6b9eed6aefaad64632\"\n    },\n    {\n      \"path\": \"fixtures/desired.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 333,\n      \"digest\": \"sha256:a05c4f7479f460471236d1df3e3e8215c4da337c5b7851a1100d830ae6d87951\"\n    },\n    {\n      \"path\": \"fixtures/negative-environment-value-too-long.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 4392,\n      \"digest\": \"sha256:65f3ae7d894a5f3f5af4309b6213b5618f523ef3f5b40b1c17c139eea3276fca\"\n    },\n    {\n      \"path\": \"fixtures/negative-environment.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 1900,\n      \"digest\": \"sha256:9a541abcb681e6f505d2652ee10819947d9e9905ebf0a142e708c746be4f5e68\"\n    },\n    {\n      \"path\": \"fixtures/negative-health-path-empty-segment.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 306,\n      \"digest\": \"sha256:af084a52058c8b078410353eb359a2a8becd7785a04ef80077a2841c78b5047a\"\n    },\n    {\n      \"path\": \"fixtures/negative-health-path.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 332,\n      \"digest\": \"sha256:121e598d91dd97cae6d86261acf48ccd71078023580c02978e990ea9287a5995\"\n    },\n    {\n      \"path\": \"fixtures/negative-http-port-out-of-range.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 306,\n      \"digest\": \"sha256:a4cd92d6b63c65916a324e8c04f9884065f9a0b35beae6507c0a6d324a89906f\"\n    },\n    {\n      \"path\": \"fixtures/negative-http-port.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 330,\n      \"digest\": \"sha256:244a37b7669aaa3d6d42ea6bbe69c21377db2f8f5219585924c0231116b40a8c\"\n    },\n    {\n      \"path\": \"fixtures/negative-image.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 268,\n      \"digest\": \"sha256:0a187025a1c933d061cfec632e3ab41fda14bc633f639ba32ae593d441e2c96e\"\n    },\n    {\n      \"path\": \"fixtures/negative-missing-health-path.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 306,\n      \"digest\": \"sha256:e4fd97a39d2bd53a72621a7e96395510186a7dc60b430203a4d4d03f5e00f44f\"\n    },\n    {\n      \"path\": \"fixtures/negative-missing-http-port.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 313,\n      \"digest\": \"sha256:2bfe165bb0067e36ebc3f840352cea87d4c54c014df8bdece7b825ac814a3088\"\n    },\n    {\n      \"path\": \"fixtures/negative-missing-image.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 227,\n      \"digest\": \"sha256:93ae3aa93d27c3d4eb77c3d8d62c969f986028053006dc87512393ae3f6e8411\"\n    },\n    {\n      \"path\": \"fixtures/negative-missing-workload-revision.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 297,\n      \"digest\": \"sha256:3df7a0f4ca3a485bb3e5e49b3bdc191d4bad8f197bcbadc87a26371cce7059eb\"\n    },\n    {\n      \"path\": \"fixtures/negative-registry-port-out-of-range.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 316,\n      \"digest\": \"sha256:fc3e05592ef0e15967f2f291824bbd36cf996291d5ee0c1e388672e8726eb2ea\"\n    },\n    {\n      \"path\": \"fixtures/negative-required-sensitive-vars.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 362,\n      \"digest\": \"sha256:488e9ce3af08f4d15fe844e930c90a90af4e49655e09862d933f040dda3bbc4c\"\n    },\n    {\n      \"path\": \"fixtures/negative-sensitive-requirement-values-not-names.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 334,\n      \"digest\": \"sha256:a174c937d876f9d331fc8b02d2fe629a7ab3ddf96f31e22978b82dffb802382a\"\n    },\n    {\n      \"path\": \"fixtures/negative-unexpected-property.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 363,\n      \"digest\": \"sha256:a11196bf46bec9bddb370357d5c3cf0ded13009991f7cfc01253033736d9e01a\"\n    },\n    {\n      \"path\": \"fixtures/negative-workload-revision.json\",\n      \"mediaType\": \"application/json\",\n      \"size\": 452,\n      \"digest\": \"sha256:0d759b0ee484d447c2747ff84a2977c6da289245124737c9949a46785565fd8c\"\n    }\n  ]\n}\n",
+    "packageDigest": "sha256:0fb3c53940180e3f661268e079f9dbc6667c4d1fbbc74b4561ebb5ffa2740d33",
+    "files": [
+      {
+        "path": "definition.json",
+        "mediaType": "application/vnd.takoform.form-definition.v1+json",
+        "size": 10036,
+        "digest": "sha256:a155c4d52b47f224b4efcdd4b99f3cd1fba6b0cff2096d6b9eed6aefaad64632",
+        "content": "{\n  \"apiVersion\": \"edge.forms.takoform.com\",\n  \"kind\": \"ContainerService\",\n  \"definitionVersion\": \"0.1.0\",\n  \"title\": \"Container Service\",\n  \"description\": \"One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.\",\n  \"role\": \"identity\",\n  \"requiresHostApi\": \"forms.takoform.com/v1\",\n  \"desiredSchema\": {\n    \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n    \"additionalProperties\": false,\n    \"description\": \"One logical private HTTP Container service identified by an OCI image pinned to a sha256 manifest digest. The Host provisions and operates exact execution revisions using Host Offering-owned capacity and placement; those are never customer desired fields. This Form-only local candidate does not publish caller-facing HTTP invocation; container.http and its Worker Binding remain a separate unresolved contract gap. The service exposes the declared HTTP port and health path. An update starts the exact requested workload revision, verifies health before moving serving traffic, and preserves the previous serving execution revision of the same Resource incarnation if startup or health fails. A lost operation acknowledgement is resolved by readback of the same resource UID, desired generation, and operation identity before retry; a mismatched identity is never adopted. Delete is fenced by the exact observed incarnation. Durable restart recovery reconciles persisted desired/observed generations and operation identity; it is not process-control through the request API. `requiredSensitiveVars` contains names only, never secret values. This initial local executable slice refuses any nonempty requiredSensitiveVars because the current Host API cannot supply secret material. `environment` is classified as ordinary nonsecret desired-state configuration and is persisted/read back as part of ResourceSpec. Callers MUST NOT put secrets in this field; the schema does not automatically detect or reject secret values. A separate sealed, generation-bound secret transport is not available. `outboundInternet` is explicitly false when omitted and becomes true only when requested.\",\n    \"properties\": {\n      \"environment\": {\n        \"additionalProperties\": {\n          \"maxLength\": 4096,\n          \"pattern\": \"^[\\\\s\\\\S]*$\",\n          \"type\": \"string\"\n        },\n        \"default\": {},\n        \"description\": \"At most 64 ordinary bounded desired-state strings persisted/read back as ResourceSpec. Callers MUST NOT put secrets here; automatic secret-value detection/rejection is not provided.\",\n        \"maxProperties\": 64,\n        \"propertyNames\": {\n          \"pattern\": \"^[A-Za-z][A-Za-z0-9._-]{0,63}$\",\n          \"type\": \"string\",\n          \"x-takoform-fieldPolicy\": \"portable-data-only-v1\"\n        },\n        \"type\": \"object\"\n      },\n      \"healthPath\": {\n        \"description\": \"Absolute path used by the Host to establish readiness before an update is made serving.\",\n        \"maxLength\": 2048,\n        \"pattern\": \"^/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+(?:/(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})+)*$|^/$\",\n        \"type\": \"string\"\n      },\n      \"httpPort\": {\n        \"description\": \"The private HTTP listener port inside the image; public port mapping and placement are Host-owned.\",\n        \"maximum\": 65535,\n        \"minimum\": 1,\n        \"type\": \"integer\"\n      },\n      \"image\": {\n        \"description\": \"OCI image reference including its immutable sha256 manifest digest; mutable tags without a digest are refused.\",\n        \"maxLength\": 512,\n        \"pattern\": \"^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[0-9a-f]{64}$\",\n        \"type\": \"string\"\n      },\n      \"outboundInternet\": {\n        \"default\": false,\n        \"description\": \"Whether this workload may initiate outbound Internet connections. Omission means false.\",\n        \"type\": \"boolean\"\n      },\n      \"requiredSensitiveVars\": {\n        \"default\": [],\n        \"description\": \"Names of required sensitive process variables only; values are supplied outside portable desired state. This initial executable local slice refuses a nonempty set.\",\n        \"items\": {\n          \"pattern\": \"^[A-Za-z][A-Za-z0-9._-]{0,63}$\",\n          \"type\": \"string\"\n        },\n        \"maxItems\": 64,\n        \"type\": \"array\",\n        \"uniqueItems\": true\n      },\n      \"workloadRevision\": {\n        \"description\": \"Author-declared bounded revision identity for this desired workload; it is part of the exact operation fence, not a Host UID or generation.\",\n        \"maxLength\": 128,\n        \"pattern\": \"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$\",\n        \"type\": \"string\"\n      }\n    },\n    \"required\": [\n      \"healthPath\",\n      \"httpPort\",\n      \"image\",\n      \"workloadRevision\"\n    ],\n    \"title\": \"Container Service desired state\",\n    \"type\": \"object\"\n  },\n  \"lifecycleCapabilities\": [\n    \"create\",\n    \"read\",\n    \"update\",\n    \"delete\",\n    \"observe\"\n  ],\n  \"conformanceFixtures\": [\n    {\n      \"name\": \"canonical\",\n      \"desiredPath\": \"fixtures/desired.json\"\n    }\n  ],\n  \"negativeConformanceFixtures\": [\n    {\n      \"name\": \"reject-unexpected-property\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-unexpected-property.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-image\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-image.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-http-port\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-http-port.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-health-path\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-health-path.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-missing-workload-revision\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-missing-workload-revision.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-image\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-image.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-http-port\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-http-port.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-health-path\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-health-path.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-environment\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-environment.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-workload-revision\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-workload-revision.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-required-sensitive-vars\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-required-sensitive-vars.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-sensitive-requirement-values-not-names\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-sensitive-requirement-values-not-names.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-http-port-out-of-range\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-http-port-out-of-range.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-environment-value-too-long\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-environment-value-too-long.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-registry-port-out-of-range\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-registry-port-out-of-range.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    },\n    {\n      \"name\": \"reject-health-path-empty-segment\",\n      \"stage\": \"desired\",\n      \"inputPath\": \"fixtures/negative-health-path-empty-segment.json\",\n      \"expectedFailure\": \"schema_validation_failed\"\n    }\n  ]\n}\n"
+      },
+      {
+        "path": "fixtures/desired.json",
+        "mediaType": "application/json",
+        "size": 333,
+        "digest": "sha256:a05c4f7479f460471236d1df3e3e8215c4da337c5b7851a1100d830ae6d87951",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-environment-value-too-long.json",
+        "mediaType": "application/json",
+        "size": 4392,
+        "digest": "sha256:65f3ae7d894a5f3f5af4309b6213b5618f523ef3f5b40b1c17c139eea3276fca",
+        "content": "{\n  \"environment\": {\n    \"APP_MODE\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-environment.json",
+        "mediaType": "application/json",
+        "size": 1900,
+        "digest": "sha256:9a541abcb681e6f505d2652ee10819947d9e9905ebf0a142e708c746be4f5e68",
+        "content": "{\n  \"environment\": {\n    \"VAR_00\": \"bounded\",\n    \"VAR_01\": \"bounded\",\n    \"VAR_02\": \"bounded\",\n    \"VAR_03\": \"bounded\",\n    \"VAR_04\": \"bounded\",\n    \"VAR_05\": \"bounded\",\n    \"VAR_06\": \"bounded\",\n    \"VAR_07\": \"bounded\",\n    \"VAR_08\": \"bounded\",\n    \"VAR_09\": \"bounded\",\n    \"VAR_10\": \"bounded\",\n    \"VAR_11\": \"bounded\",\n    \"VAR_12\": \"bounded\",\n    \"VAR_13\": \"bounded\",\n    \"VAR_14\": \"bounded\",\n    \"VAR_15\": \"bounded\",\n    \"VAR_16\": \"bounded\",\n    \"VAR_17\": \"bounded\",\n    \"VAR_18\": \"bounded\",\n    \"VAR_19\": \"bounded\",\n    \"VAR_20\": \"bounded\",\n    \"VAR_21\": \"bounded\",\n    \"VAR_22\": \"bounded\",\n    \"VAR_23\": \"bounded\",\n    \"VAR_24\": \"bounded\",\n    \"VAR_25\": \"bounded\",\n    \"VAR_26\": \"bounded\",\n    \"VAR_27\": \"bounded\",\n    \"VAR_28\": \"bounded\",\n    \"VAR_29\": \"bounded\",\n    \"VAR_30\": \"bounded\",\n    \"VAR_31\": \"bounded\",\n    \"VAR_32\": \"bounded\",\n    \"VAR_33\": \"bounded\",\n    \"VAR_34\": \"bounded\",\n    \"VAR_35\": \"bounded\",\n    \"VAR_36\": \"bounded\",\n    \"VAR_37\": \"bounded\",\n    \"VAR_38\": \"bounded\",\n    \"VAR_39\": \"bounded\",\n    \"VAR_40\": \"bounded\",\n    \"VAR_41\": \"bounded\",\n    \"VAR_42\": \"bounded\",\n    \"VAR_43\": \"bounded\",\n    \"VAR_44\": \"bounded\",\n    \"VAR_45\": \"bounded\",\n    \"VAR_46\": \"bounded\",\n    \"VAR_47\": \"bounded\",\n    \"VAR_48\": \"bounded\",\n    \"VAR_49\": \"bounded\",\n    \"VAR_50\": \"bounded\",\n    \"VAR_51\": \"bounded\",\n    \"VAR_52\": \"bounded\",\n    \"VAR_53\": \"bounded\",\n    \"VAR_54\": \"bounded\",\n    \"VAR_55\": \"bounded\",\n    \"VAR_56\": \"bounded\",\n    \"VAR_57\": \"bounded\",\n    \"VAR_58\": \"bounded\",\n    \"VAR_59\": \"bounded\",\n    \"VAR_60\": \"bounded\",\n    \"VAR_61\": \"bounded\",\n    \"VAR_62\": \"bounded\",\n    \"VAR_63\": \"bounded\",\n    \"VAR_64\": \"bounded\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-health-path-empty-segment.json",
+        "mediaType": "application/json",
+        "size": 306,
+        "digest": "sha256:af084a52058c8b078410353eb359a2a8becd7785a04ef80077a2841c78b5047a",
+        "content": "{\n  \"environment\": {\n    \"APP_MODE\": \"production\"\n  },\n  \"healthPath\": \"//health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-health-path.json",
+        "mediaType": "application/json",
+        "size": 332,
+        "digest": "sha256:121e598d91dd97cae6d86261acf48ccd71078023580c02978e990ea9287a5995",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-http-port-out-of-range.json",
+        "mediaType": "application/json",
+        "size": 306,
+        "digest": "sha256:a4cd92d6b63c65916a324e8c04f9884065f9a0b35beae6507c0a6d324a89906f",
+        "content": "{\n  \"environment\": {\n    \"APP_MODE\": \"production\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 65536,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-http-port.json",
+        "mediaType": "application/json",
+        "size": 330,
+        "digest": "sha256:244a37b7669aaa3d6d42ea6bbe69c21377db2f8f5219585924c0231116b40a8c",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 0,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-image.json",
+        "mediaType": "application/json",
+        "size": 268,
+        "digest": "sha256:0a187025a1c933d061cfec632e3ab41fda14bc633f639ba32ae593d441e2c96e",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app:latest\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-missing-health-path.json",
+        "mediaType": "application/json",
+        "size": 306,
+        "digest": "sha256:e4fd97a39d2bd53a72621a7e96395510186a7dc60b430203a4d4d03f5e00f44f",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-missing-http-port.json",
+        "mediaType": "application/json",
+        "size": 313,
+        "digest": "sha256:2bfe165bb0067e36ebc3f840352cea87d4c54c014df8bdece7b825ac814a3088",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-missing-image.json",
+        "mediaType": "application/json",
+        "size": 227,
+        "digest": "sha256:93ae3aa93d27c3d4eb77c3d8d62c969f986028053006dc87512393ae3f6e8411",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-missing-workload-revision.json",
+        "mediaType": "application/json",
+        "size": 297,
+        "digest": "sha256:3df7a0f4ca3a485bb3e5e49b3bdc191d4bad8f197bcbadc87a26371cce7059eb",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": []\n}\n"
+      },
+      {
+        "path": "fixtures/negative-registry-port-out-of-range.json",
+        "mediaType": "application/json",
+        "size": 316,
+        "digest": "sha256:fc3e05592ef0e15967f2f291824bbd36cf996291d5ee0c1e388672e8726eb2ea",
+        "content": "{\n  \"environment\": {\n    \"APP_MODE\": \"production\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"registry.example.com:99999/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-required-sensitive-vars.json",
+        "mediaType": "application/json",
+        "size": 362,
+        "digest": "sha256:488e9ce3af08f4d15fe844e930c90a90af4e49655e09862d933f040dda3bbc4c",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [\n    \"not/a/portable-name\"\n  ],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-sensitive-requirement-values-not-names.json",
+        "mediaType": "application/json",
+        "size": 334,
+        "digest": "sha256:a174c937d876f9d331fc8b02d2fe629a7ab3ddf96f31e22978b82dffb802382a",
+        "content": "{\n  \"environment\": {\n    \"APP_MODE\": \"production\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [\n    \"API_TOKEN=plaintext\"\n  ],\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-unexpected-property.json",
+        "mediaType": "application/json",
+        "size": 363,
+        "digest": "sha256:a11196bf46bec9bddb370357d5c3cf0ded13009991f7cfc01253033736d9e01a",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"takoformUnexpected\": true,\n  \"workloadRevision\": \"revision-1\"\n}\n"
+      },
+      {
+        "path": "fixtures/negative-workload-revision.json",
+        "mediaType": "application/json",
+        "size": 452,
+        "digest": "sha256:0d759b0ee484d447c2747ff84a2977c6da289245124737c9949a46785565fd8c",
+        "content": "{\n  \"environment\": {\n    \"APP.MODE\": \"production\",\n    \"APP_MODE\": \"standard\"\n  },\n  \"healthPath\": \"/health\",\n  \"httpPort\": 8080,\n  \"image\": \"ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"outboundInternet\": false,\n  \"requiredSensitiveVars\": [],\n  \"workloadRevision\": \"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\"\n}\n"
+      }
+    ]
+  },
+  "localLifecycleFixtures": [
+    {
+      "name": "healthy-update-cuts-over",
+      "negative": false,
+      "scenario": "A requested workload revision starts and its configured health path succeeds.",
+      "expected": "Only then does the exact requested revision become serving."
+    },
+    {
+      "name": "health-failure-preserves-old-serving",
+      "negative": true,
+      "scenario": "The new workload revision fails startup or its configured health check.",
+      "expected": "The new revision never receives serving traffic and the previous serving execution revision of the same Resource UID remains selected."
+    },
+    {
+      "name": "lost-ack-mismatched-readback-is-not-retried",
+      "negative": true,
+      "scenario": "An update acknowledgement is lost and readback does not match the same UID, desired generation, and operation identity.",
+      "expected": "Do not adopt or retry the mutation; preserve the prior serving incarnation and report unresolved outcome."
+    },
+    {
+      "name": "delete-stale-incarnation-is-refused",
+      "negative": true,
+      "scenario": "A delete observes an incarnation UID that differs from the exact incarnation fenced by the request.",
+      "expected": "Refuse deletion and leave the newer incarnation untouched."
+    },
+    {
+      "name": "restart-recovers-from-durable-operation-record",
+      "negative": false,
+      "scenario": "The API process restarts while a workload operation is unsettled.",
+      "expected": "Recover by reconciling durable desired/observed generations and operation identity; do not control a child process through an API request."
+    }
+  ]
+}

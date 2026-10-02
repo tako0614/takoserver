@@ -16,16 +16,28 @@ const revision: DockerHttpRevision = {
   healthPath: "/health",
   memoryBytes: 256 * 1024 * 1024,
   nanoCpus: 500_000_000,
-  environment: { MODE: "test" },
+  environment: { MODE: "test", "APP.MODE": "production", _TRACE: "enabled" },
 };
 
 function engineFixture() {
   const containers = new Map<string, JsonObject>();
   const calls: { method: string; path: string; body?: JsonObject }[] = [];
   let sequence = 0;
+  let network: JsonObject = {
+    Name: "installation-net",
+    Driver: "bridge",
+    Scope: "local",
+    Internal: true,
+    Ingress: false,
+    Attachable: false,
+    Labels: { "takoserver.installation": "selfhost-one" },
+  };
   const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (method, path, body) => {
     calls.push({ method, path, ...(body === undefined ? {} : { body }) });
     const url = new URL(path, "http://docker.invalid");
+    if (method === "GET" && url.pathname === "/networks/installation-net") {
+      return { status: 200, body: JSON.stringify(network) };
+    }
     if (url.pathname === "/images/create") return { status: 200, body: '{"status":"done"}\n' };
     if (url.pathname === "/containers/create" && body) {
       const name = url.searchParams.get("name");
@@ -83,7 +95,13 @@ function engineFixture() {
         status: request.url.endsWith("/health") ? 200 : 404,
       }),
   };
-  return { containers, calls, options, engine };
+  return {
+    containers,
+    calls,
+    options,
+    engine,
+    setNetwork: (value: JsonObject) => (network = value),
+  };
 }
 
 test("Docker HTTP revisions create, recover, coexist across update and delete only the exact revision", async () => {
@@ -106,6 +124,8 @@ test("Docker HTTP revisions create, recover, coexist across update and delete on
   const create = fixture.calls.find((call) => call.path.startsWith("/containers/create"));
   if (!create) throw new Error("Docker revision was not created");
   expect(create.body?.Image).toBe(revision.image);
+  expect(create.body?.Env).toContain("APP.MODE=production");
+  expect(create.body?.Env).toContain("_TRACE=enabled");
   expect(create.body?.HostConfig).toMatchObject({
     NetworkMode: "installation-net",
     Memory: 268435456,
@@ -150,6 +170,111 @@ test("Docker HTTP revision refuses mutable image, capacity excess and changed im
   ).rejects.toMatchObject({ code: "conflict" });
   expect(fixture.calls.slice(before).every((call) => call.method === "GET")).toBe(true);
   expect(fixture.containers.size).toBe(1);
+});
+
+test("Docker HTTP revision validates its exact owned internal network before pull or create", async () => {
+  const invalidNetworks: readonly JsonObject[] = [
+    { Name: "replacement-net", Driver: "bridge", Scope: "local", Internal: true },
+    { Name: "installation-net", Driver: "host", Scope: "local", Internal: true },
+    { Name: "installation-net", Driver: "bridge", Scope: "swarm", Internal: true },
+    { Name: "installation-net", Driver: "bridge", Scope: "local", Internal: false },
+    {
+      Name: "installation-net",
+      Driver: "bridge",
+      Scope: "local",
+      Internal: true,
+      Ingress: true,
+    },
+    {
+      Name: "installation-net",
+      Driver: "bridge",
+      Scope: "local",
+      Internal: true,
+      Ingress: false,
+      Attachable: true,
+    },
+    {
+      Name: "installation-net",
+      Driver: "bridge",
+      Scope: "local",
+      Internal: true,
+      Ingress: false,
+      Attachable: false,
+      Labels: { "takoserver.installation": "another-installation" },
+    },
+  ];
+
+  for (const network of invalidNetworks) {
+    const fixture = engineFixture();
+    fixture.setNetwork(network);
+    const runtime = createDockerHttpRevisionRuntime(fixture.options);
+    await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+    expect(fixture.calls.map((call) => call.path)).toContain("/networks/installation-net");
+    expect(fixture.calls.some((call) => call.path.startsWith("/images/create"))).toBe(false);
+    expect(fixture.calls.some((call) => call.path.startsWith("/containers/create"))).toBe(false);
+    expect(fixture.containers.size).toBe(0);
+  }
+});
+
+test("Docker HTTP revision keeps exact existing observation and removal safe after network drift", async () => {
+  const fixture = engineFixture();
+  const runtime = createDockerHttpRevisionRuntime(fixture.options);
+  const active = await runtime.reconcile(revision);
+  if (active.state !== "ready") throw new Error("Revision is not ready");
+
+  fixture.setNetwork({
+    Name: "installation-net",
+    Driver: "bridge",
+    Scope: "local",
+    Internal: false,
+    Ingress: false,
+    Attachable: false,
+    Labels: { "takoserver.installation": "selfhost-one" },
+  });
+  const before = fixture.calls.length;
+  expect(await runtime.observe(revision)).toEqual(active);
+  await runtime.remove(revision, active.nativeId);
+  expect(
+    fixture.calls.slice(before).some((call) => call.path === "/networks/installation-net"),
+  ).toBe(false);
+  expect(await runtime.observe(revision)).toEqual({ state: "absent" });
+});
+
+test("Docker HTTP revision refuses to start an exact stopped instance after network drift", async () => {
+  const fixture = engineFixture();
+  const runtime = createDockerHttpRevisionRuntime(fixture.options);
+  const active = await runtime.reconcile(revision);
+  if (active.state !== "ready") throw new Error("Revision is not ready");
+  const [name, current] = [...fixture.containers.entries()][0] ?? [];
+  if (!name || !current) throw new Error("Missing native container");
+  fixture.containers.set(name, { ...current, State: { Running: false } });
+  fixture.setNetwork({
+    Name: "installation-net",
+    Driver: "bridge",
+    Scope: "local",
+    Internal: false,
+    Ingress: false,
+    Attachable: false,
+    Labels: { "takoserver.installation": "selfhost-one" },
+  });
+
+  const before = fixture.calls.length;
+  await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+  expect(await runtime.observe(revision)).toEqual({
+    state: "stopped",
+    nativeId: active.nativeId,
+  });
+  expect(
+    fixture.calls
+      .slice(before)
+      .some((call) => call.path === `/containers/${active.nativeId}/start`),
+  ).toBe(false);
+  expect(
+    fixture.calls.slice(before).some((call) => call.path === "/networks/installation-net"),
+  ).toBe(true);
+
+  await runtime.remove(revision, active.nativeId);
+  expect(await runtime.observe(revision)).toEqual({ state: "absent" });
 });
 
 test("Docker HTTP revision retirement fences the exact observed native instance", async () => {

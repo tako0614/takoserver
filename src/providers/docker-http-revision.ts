@@ -83,7 +83,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       input.port > 65535 ||
       !/^\/(?!\/)[^\s#]*$/u.test(input.healthPath) ||
       input.healthPath.includes("\\") ||
-      input.healthPath.length > 1024 ||
+      input.healthPath.length > 2048 ||
       !positive(input.memoryBytes) ||
       input.memoryBytes > options.maxMemoryBytes ||
       !positive(input.nanoCpus) ||
@@ -92,7 +92,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       Object.keys(input.environment).length > 128 ||
       Object.entries(input.environment).some(
         ([key, value]) =>
-          !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key) ||
+          !/^[A-Za-z_][A-Za-z0-9._-]*$/u.test(key) ||
           typeof value !== "string" ||
           value.includes("\0") ||
           value.length > 8192,
@@ -179,6 +179,31 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     return value;
   }
 
+  /** A name alone does not establish that a Docker network is private or ours. */
+  async function requireOwnedInternalNetwork(): Promise<void> {
+    const response = await engine("GET", `/networks/${encodeURIComponent(options.network)}`);
+    if (response.status !== 200) throw new DockerHttpRevisionError("unavailable");
+    let value: unknown;
+    try {
+      value = JSON.parse(response.body);
+    } catch {
+      throw new DockerHttpRevisionError("unavailable");
+    }
+    if (
+      !isJsonObject(value) ||
+      value.Name !== options.network ||
+      value.Driver !== "bridge" ||
+      value.Scope !== "local" ||
+      value.Internal !== true ||
+      value.Ingress !== false ||
+      value.Attachable !== false ||
+      !isJsonObject(value.Labels) ||
+      value.Labels["takoserver.installation"] !== options.installationId
+    ) {
+      throw new DockerHttpRevisionError("conflict");
+    }
+  }
+
   async function observation(target: Desired): Promise<DockerHttpRevisionObservation> {
     const current = await inspect(target);
     if (!current) return { state: "absent" };
@@ -213,6 +238,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     async reconcile(input: DockerHttpRevision): Promise<DockerHttpRevisionObservation> {
       const target = await desired(input);
       if (!(await inspect(target))) {
+        // Verify the operator-owned isolation boundary before pulling an image
+        // or creating any native object. Existing exact instances remain
+        // observable and removable even if network configuration later drifts.
+        await requireOwnedInternalNetwork();
         const pull = await engine(
           "POST",
           `/images/create?fromImage=${encodeURIComponent(target.input.image)}`,
@@ -244,6 +273,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       const current = await inspect(target);
       if (!current) throw new DockerHttpRevisionError("unavailable");
       if (!isJsonObject(current.State) || current.State.Running !== true) {
+        await requireOwnedInternalNetwork();
         const started = await engine("POST", `/containers/${current.Id}/start`);
         if (started.status !== 204 && started.status !== 304) {
           throw new DockerHttpRevisionError("unavailable");

@@ -80,6 +80,11 @@ import {
   type WorkerdSite,
 } from "../workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../workerd-version-graph.ts";
+import {
+  createSelfhostContainerLifecycle,
+  type SelfhostContainerCapability,
+  selfhostContainerNativeIdentity,
+} from "./selfhost-container-lifecycle.ts";
 import { SELFHOST_WORKER_EDGE_QUEUE_BINDING_KIND } from "./selfhost-events.ts";
 import {
   SELFHOST_EDGE_OBJECTS_BINDING_REF,
@@ -285,6 +290,8 @@ export interface SelfhostArtifacts {
 export interface SelfhostProviderOptions {
   readonly id?: string;
   readonly offerings: readonly ProviderOffering[];
+  /** Explicit native runtime for an independently installed Container Form. */
+  readonly container?: SelfhostContainerCapability;
   /** Explicit, host-private VectorIndex SQL lifecycle service. */
   readonly vectorIndexStore?: VectorIndexStore;
   /** Exact technical relation authorities for post-delete native readback. */
@@ -686,6 +693,9 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
   const versionBindings = createSelfhostVersionBindingStore({ root: versionBindingsRoot });
   const runtimeInputs = options.runtimeInputs;
   const standardServices = createSelfhostStandardServices(options.standardServiceIntegrations);
+  const containerLifecycle = options.container
+    ? createSelfhostContainerLifecycle(options.container)
+    : null;
   const versionMaterializer = createSelfhostVersionMaterializer({
     root: versionsRoot,
     artifacts,
@@ -3315,6 +3325,17 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     return offering.kind;
   };
 
+  const isConfiguredContainerOffering = (offering: ProviderOffering): boolean =>
+    containerLifecycle !== null &&
+    offering.form.apiVersion === "edge.forms.takoform.com" &&
+    offering.form.kind === "ContainerService" &&
+    options.offerings.some(
+      (candidate) =>
+        candidate.id === offering.id &&
+        candidate.form.kind === "ContainerService" &&
+        canonicalJson(candidate.form) === canonicalJson(offering.form),
+    );
+
   /**
    * VectorIndex is intentionally opt-in on self-host.  The offering must be a
    * member of this provider's explicitly composed offering set and the
@@ -3594,7 +3615,14 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     // machine that advertised a non-zero ceiling without somewhere to seal a
     // value would turn a clean 422 at admission into a failure at apply.
     ...(runtimeInputs
-      ? { runtimeInputCapabilities: { maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS } }
+      ? {
+          runtimeInputCapabilities: {
+            maximumBindings: MAX_PROVIDER_RUNTIME_INPUT_BINDINGS,
+            forms: options.offerings
+              .filter((offering) => dispatchKind(offering) === "WorkerVersion")
+              .map((offering) => offering.form),
+          },
+        }
       : {}),
     workerEndpointOriginReservations: {
       // What the socket serves, told to the ledger that has to accept the
@@ -3623,6 +3651,27 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     createNativeReadbackDescriptor(
       input: ProviderNativeReadbackInput,
     ): ProviderNativeReadbackDescriptor {
+      if (containerLifecycle && isConfiguredContainerOffering(input.offering)) {
+        const native = selfhostContainerNativeIdentity(input.nativeId);
+        if (
+          !native ||
+          native.resourceUid !== input.identity.uid ||
+          native.incarnationId !== input.identity.incarnationId ||
+          !input.identity.generation
+        )
+          throw new ProviderReadbackDescriptorError();
+        return {
+          apiVersion: PROVIDER_READBACK_API_VERSION,
+          provider: id,
+          kind: "ContainerService",
+          nativeId: input.nativeId,
+          data: {
+            resourceUid: native.resourceUid,
+            incarnationId: native.incarnationId,
+            generation: input.identity.generation,
+          },
+        };
+      }
       const kind = vectorIndexKind(input.offering);
       if (kind === "VectorIndex") {
         const scope = selfhostVectorScope(input.identity);
@@ -3668,6 +3717,28 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       descriptor: ProviderNativeReadbackDescriptor;
       target?: ProviderReadAuthorityTarget;
     }): Promise<ProviderNativeAbsence> {
+      if (containerLifecycle && isConfiguredContainerOffering(input.offering)) {
+        const descriptor = input.descriptor;
+        const native = selfhostContainerNativeIdentity(descriptor.nativeId);
+        const target = input.target;
+        if (
+          !native ||
+          descriptor.apiVersion !== PROVIDER_READBACK_API_VERSION ||
+          descriptor.provider !== id ||
+          descriptor.kind !== "ContainerService" ||
+          descriptor.data.resourceUid !== native.resourceUid ||
+          descriptor.data.incarnationId !== native.incarnationId ||
+          !target ||
+          target.resourceUid !== native.resourceUid ||
+          target.incarnationId !== native.incarnationId ||
+          descriptor.data.generation !== target.generation
+        )
+          return selfhostUnknown("malformed", false);
+        const outcome = await containerLifecycle.absence(native);
+        return outcome === "unknown"
+          ? selfhostUnknown("transport", true)
+          : { outcome, evidence: { provider: id, kind: "ContainerService", state: outcome } };
+      }
       const kind = vectorIndexKind(input.offering);
       const parsed = validateSelfhostReadbackDescriptor(id, kind, input.descriptor);
       if (!parsed) return selfhostUnknown("malformed", false);
@@ -3913,11 +3984,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       }
     },
 
-    async convergeApply(input): Promise<ProviderTicket> {
-      return await this.apply({ ...input, operationMode: "recovery" });
+    async convergeApply(input, context): Promise<ProviderTicket> {
+      return await this.apply({ ...input, operationMode: "recovery" }, context);
     },
 
-    async apply(input): Promise<ProviderTicket> {
+    async apply(input, context): Promise<ProviderTicket> {
       let release: (() => void) | undefined;
       try {
         release = await acquireWorkerMutation(input);
@@ -3926,6 +3997,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         // the same one with an address-derived name it must keep.
         if (currentObjectBucket(input.offering)) return await applyObjectBucket(input);
         if (isConfiguredVectorIndexOffering(input.offering)) return await vectorApply(input);
+        if (dispatchKind(input.offering) === "ContainerService")
+          return containerLifecycle && isConfiguredContainerOffering(input.offering)
+            ? await containerLifecycle.apply(input, context)
+            : failed("unavailable", "the local Container runtime is not installed");
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker":
             return await applyModuleWorker(input);
@@ -3970,6 +4045,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     async observe(input): Promise<ProviderTicket> {
       try {
         if (isConfiguredVectorIndexOffering(input.offering)) return await vectorObserve(input);
+        if (dispatchKind(input.offering) === "ContainerService")
+          return containerLifecycle && isConfiguredContainerOffering(input.offering)
+            ? await containerLifecycle.observe(input)
+            : failed("unavailable", "the local Container runtime is not installed");
         switch (dispatchKind(input.offering)) {
           case "ModuleWorker": {
             const script = await scriptOf(input.identity.tenantRef, {
@@ -4244,6 +4323,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     },
 
     async delete(input): Promise<ProviderTicket> {
+      if (dispatchKind(input.offering) === "ContainerService")
+        return containerLifecycle && isConfiguredContainerOffering(input.offering)
+          ? await containerLifecycle.delete(input)
+          : failed("unavailable", "the local Container runtime is not installed");
       if (input.operationMode === "recovery" && !input.providerHandle) {
         return failed("unavailable", "provider mutation recovery requires an opaque handle", true);
       }
@@ -4482,6 +4565,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       if (input.providerHandle) {
         return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
       }
+      if (dispatchKind(input.offering) === "ContainerService")
+        return containerLifecycle && isConfiguredContainerOffering(input.offering)
+          ? await containerLifecycle.recoverDelete(input)
+          : failed("unavailable", "the local Container runtime is not installed");
       const done = (): ProviderTicket =>
         succeeded({ nativeId: input.nativeId, observed: { deleted: true }, outputs: {} });
       const uncertain = (): ProviderTicket =>
@@ -4644,6 +4731,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
         return failed("unavailable", "self-host delete recovery cannot poll this handle", true);
       }
       const kind = dispatchKind(input.offering);
+      if (kind === "ContainerService")
+        return containerLifecycle && isConfiguredContainerOffering(input.offering)
+          ? await containerLifecycle.delete(input)
+          : failed("unavailable", "the local Container runtime is not installed");
       if (
         kind === "ModuleWorker" ||
         kind === "WorkerDeployment" ||

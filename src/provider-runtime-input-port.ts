@@ -1,3 +1,4 @@
+import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { SqlParam, SqlStatement } from "./ports.ts";
 
 export const MAX_PROVIDER_RUNTIME_INPUT_BINDINGS = 64;
@@ -23,6 +24,8 @@ export interface ProviderRuntimeInputLeaseFence {
 /** Static truth a provider exposes only when its configured adapter can consume leases. */
 export interface ProviderRuntimeInputCapabilities {
   readonly maximumBindings: number;
+  /** Omitted for legacy provider-wide adapters; present means exact Form identities only. */
+  readonly forms?: readonly TakoformV1Alpha3FormRef[];
 }
 
 /** Exact logical address of one Worker runtime-input declaration. */

@@ -26,6 +26,7 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
 import type { SelfhostStandardServiceIntegration } from "./providers/selfhost-standard-services.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
@@ -86,6 +87,16 @@ export const SELFHOST_IDENTITY_CAPABILITY_KINDS: readonly YurucommuIdentityCapab
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
 const PROVIDER_INSTALLATION_REF = "local.primary";
 
+/** Exact reviewed, unpublished Form-only local candidate; not a released catalog projection. */
+const LOCAL_CONTAINER_FORM = {
+  apiVersion: "edge.forms.takoform.com",
+  kind: "ContainerService",
+  definitionVersion: "0.1.0",
+  schemaDigest: "sha256:114d452395562573f46d9a879efa889ab42a3e43348d7db244e22df7d6e330e2",
+} as const;
+const LOCAL_CONTAINER_PACKAGE_DIGEST =
+  "sha256:0fb3c53940180e3f661268e079f9dbc6667c4d1fbbc74b4561ebb5ffa2740d33";
+
 /** Forms the Host executes itself; they are never provider capabilities. */
 const HOST_INTRINSIC = new Set([
   "WorkerBundle",
@@ -101,6 +112,8 @@ export interface SelfhostCompositionOptions {
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  /** Explicit local native backend; an installed exact Form is required separately. */
+  readonly container?: SelfhostContainerCapability;
   /** False when this process did not verify the pinned closed-graph artifact. */
   readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
@@ -153,6 +166,43 @@ export function createSelfhostComposition(
   const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [];
   const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
   const technicalRelationOfferings: ProviderOffering[] = [];
+
+  // The ordinary released set has no ContainerService. Configuration alone
+  // therefore cannot advertise one; only a caller-supplied, already-verified
+  // exact publisher candidate plus a native runtime can enter this catalog.
+  const containerForms = options.stableForms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === LOCAL_CONTAINER_FORM.apiVersion &&
+      form.identity.formRef.kind === LOCAL_CONTAINER_FORM.kind &&
+      form.identity.formRef.definitionVersion === LOCAL_CONTAINER_FORM.definitionVersion,
+  );
+  if (containerForms.length > 1) throw new TypeError("ambiguous ContainerService installation");
+  const containerForm = containerForms[0];
+  if (options.container && containerForm) {
+    if (
+      containerForm.identity.formRef.schemaDigest !== LOCAL_CONTAINER_FORM.schemaDigest ||
+      containerForm.identity.packageDigest !== LOCAL_CONTAINER_PACKAGE_DIGEST ||
+      containerForm.role !== "identity" ||
+      !containerForm.operations.includes("create") ||
+      !containerForm.operations.includes("update") ||
+      !containerForm.operations.includes("delete") ||
+      !containerForm.operations.includes("observe")
+    )
+      throw new TypeError("ContainerService installation is incomplete");
+    const projected = edgeProviderOffering(containerForm, {
+      id: options.container.capacityProfile.id,
+      displayName: "Local HTTP container",
+      regions: ["global"],
+    });
+    // The portable Form may describe import, but this backend has no safe
+    // native adoption path. A Host Offering must not claim that capability.
+    const offering: ProviderOffering = {
+      ...projected,
+      capabilities: projected.capabilities.filter((capability) => capability !== "import"),
+    };
+    identityOfferings.push({ offering, resourceClass: "compute.container" });
+    technicalOfferings.push(offering);
+  }
 
   if (options.edgeForms) {
     for (const form of options.stableForms) {
@@ -227,6 +277,7 @@ export function createSelfhostComposition(
     dataRoot: options.dataRoot,
     runtime: options.runtime,
     artifacts: options.artifacts,
+    ...(options.container ? { container: options.container } : {}),
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined

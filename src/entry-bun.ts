@@ -32,6 +32,10 @@ import {
   selfhostWorkerEndpointPublication,
   selfhostWorkerEndpointScheme,
 } from "./selfhost-composition.ts";
+import {
+  createSelfhostContainerBootstrap,
+  createSelfhostContainerSignalHandler,
+} from "./selfhost-container-bootstrap.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
@@ -141,6 +145,11 @@ const providerMode = resolveStandaloneProviderMode({
   workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
   suffixes: process.env.TAKOSERVER_SUFFIXES,
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
+});
+const selfhostContainer = createSelfhostContainerBootstrap({
+  environment: process.env,
+  dataRoot,
+  providerMode,
 });
 
 // Organizations, keys, and the ledger are as durable as the files are: a
@@ -495,6 +504,14 @@ const providerComposition = createStandaloneProviderComposition({
     ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
     : {}),
   ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
+  ...(selfhostContainer
+    ? {
+        container: {
+          runtime: selfhostContainer.runtime,
+          capacityProfile: selfhostContainer.capacityProfile,
+        },
+      }
+    : {}),
   ...(dataPlanes
     ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
     : {}),
@@ -764,11 +781,16 @@ if (workerScheduler) {
  * the child is gone.
  */
 process.on("exit", () => workerd.stop());
+const handleSelfhostShutdown = createSelfhostContainerSignalHandler(
+  selfhostContainer,
+  () => {
+    process.stderr.write("the self-host Container runtime did not close cleanly\n");
+  },
+  () => workerd.stop(),
+  () => process.exit(0),
+);
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.on(signal, () => {
-    workerd.stop();
-    process.exit(0);
-  });
+  process.on(signal, handleSelfhostShutdown);
 }
 
 /**

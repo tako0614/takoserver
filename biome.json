@@ -27,6 +27,14 @@
     "indentStyle": "space",
     "lineWidth": 100
   },
+  "overrides": [
+    {
+      "includes": ["tests/fixtures/selfhost-container-service-candidate.json"],
+      "formatter": {
+        "enabled": false
+      }
+    }
+  ],
   "linter": {
     "enabled": true,
     "rules": {

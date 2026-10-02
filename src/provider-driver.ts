@@ -737,7 +737,7 @@ export function createProviderDriver(
         relations: input.relations,
         ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
       });
-    assertProviderRuntimeInputs(provider, input.spec);
+    assertProviderRuntimeInputs(provider, input.form.identity.formRef, input.spec);
     const sold = soldSelection?.sold;
     const offeringDigest = sold ? await catalog.digest(sold) : undefined;
     if (
@@ -890,11 +890,27 @@ export function createProviderDriver(
     } as const;
   };
 
-  const assertProviderRuntimeInputs = (provider: Provider, spec: JsonObject): void => {
+  const maximumRuntimeInputsForForm = (
+    provider: Provider,
+    form: TakoformV1Alpha3FormRef,
+  ): number => {
+    const capability = provider.runtimeInputCapabilities;
+    const maximum = capability?.maximumBindings ?? 0;
+    validateMaximumRuntimeInputBindings(maximum);
+    if (capability?.forms && !capability.forms.some((candidate) => sameForm(candidate, form))) {
+      return 0;
+    }
+    return maximum;
+  };
+
+  const assertProviderRuntimeInputs = (
+    provider: Provider,
+    form: TakoformV1Alpha3FormRef,
+    spec: JsonObject,
+  ): void => {
     const required = spec.requiredSensitiveVars;
     const count = Array.isArray(required) ? required.length : 0;
-    const maximum = provider.runtimeInputCapabilities?.maximumBindings ?? 0;
-    validateMaximumRuntimeInputBindings(maximum);
+    const maximum = maximumRuntimeInputsForForm(provider, form);
     if (count > maximum) throw new TakoformHostError("unsupported_capability", 422);
   };
 
@@ -905,7 +921,9 @@ export function createProviderDriver(
       );
       if (candidates.length === 0) return 0;
       return Math.min(
-        ...candidates.map((provider) => provider.runtimeInputCapabilities?.maximumBindings ?? 0),
+        ...candidates.map((provider) =>
+          maximumRuntimeInputsForForm(provider, form.identity.formRef),
+        ),
       );
     },
     async admit(input) {
@@ -915,7 +933,7 @@ export function createProviderDriver(
         relations: input.relations,
         ...(input.commercialAuthority ? { offeringId: input.commercialAuthority.offeringId } : {}),
       });
-      assertProviderRuntimeInputs(provider, input.spec);
+      assertProviderRuntimeInputs(provider, input.form.identity.formRef, input.spec);
     },
   };
 
