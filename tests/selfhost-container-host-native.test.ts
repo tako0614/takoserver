@@ -1118,7 +1118,7 @@ test.skipIf(
           offering.id === "selfhost.container.http.endpoint" &&
           offering.form.kind === ENDPOINT_REF.kind,
       ),
-    ).toBe(true);
+    ).toBe(false);
     const provision = await createResellerProvision(postHost(firstHost.baseUrl), {
       tenantRef: "tenant_container_native",
       offeringId: "selfhost.container.http.standard",
@@ -1278,6 +1278,38 @@ test.skipIf(
         },
       },
     };
+    const endpointFormPath = `/apis/forms.takoform.com/v1/forms?${new URLSearchParams({
+      space: "tenant_container_native",
+      group: ENDPOINT_REF.apiVersion,
+      kind: ENDPOINT_REF.kind,
+      definitionVersion: ENDPOINT_REF.definitionVersion,
+      schemaDigest: ENDPOINT_REF.schemaDigest,
+    })}`;
+    const endpointFormDiscovery = (await api(
+      secondHost.baseUrl,
+      "GET",
+      endpointFormPath,
+      200,
+      undefined,
+      apiKey,
+    )) as {
+      forms: {
+        identity: { formRef: typeof ENDPOINT_REF; packageDigest: string };
+        installed: boolean;
+        executable: boolean;
+        activated: boolean;
+      }[];
+    };
+    expect(endpointFormDiscovery.forms).toHaveLength(1);
+    expect(endpointFormDiscovery.forms[0]).toMatchObject({
+      identity: {
+        formRef: ENDPOINT_REF,
+        packageDigest: endpointCandidate.form.identity.packageDigest,
+      },
+      installed: true,
+      executable: true,
+      activated: true,
+    });
     const endpointPrepared = await api(
       secondHost.baseUrl,
       "POST",
