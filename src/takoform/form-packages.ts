@@ -24,6 +24,7 @@ import { validateFormRef } from "./forms.ts";
  * an admission decision, not uploaded by a customer Resource request.
  */
 export const FORM_PACKAGE_PREFIX = "formpkg/v1/sha256";
+const FORM_PACKAGE_PAYLOAD_CREATE_CONCURRENCY = 4;
 
 export type FormPackageDigest = `sha256:${string}`;
 
@@ -192,13 +193,24 @@ export function createFormPackageStore(objects: ObjectStore): FormPackageStore {
       // Payloads are created first, then the canonical index publishes the
       // complete prefix. Concurrent identical imports converge through the
       // exact-existing branch; a different existing byte fails closed.
-      for (const file of normal.files) {
-        await createExactObject(
-          objects,
-          formPackageKey(input.packageDigest, file.path),
-          file.bytes,
-          file.mediaType,
-        );
+      for (
+        let offset = 0;
+        offset < normal.files.length;
+        offset += FORM_PACKAGE_PAYLOAD_CREATE_CONCURRENCY
+      ) {
+        const pending = normal.files
+          .slice(offset, offset + FORM_PACKAGE_PAYLOAD_CREATE_CONCURRENCY)
+          .map((file) =>
+            createExactObject(
+              objects,
+              formPackageKey(input.packageDigest, file.path),
+              file.bytes,
+              file.mediaType,
+            ),
+          );
+        const results = await Promise.allSettled(pending);
+        const refusal = results.find((result) => result.status === "rejected");
+        if (refusal?.status === "rejected") throw refusal.reason;
       }
       await createExactObject(objects, indexKey, indexBytes, "application/json");
 
