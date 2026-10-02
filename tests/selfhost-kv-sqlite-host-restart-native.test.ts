@@ -94,7 +94,8 @@ type JourneyPhase =
   | "pre_restart_resource_readback"
   | "host_exit_restart"
   | "v2_read_after_restart"
-  | "dependency_delete_and_absence";
+  | "dependency_delete_and_absence"
+  | "owned_process_and_fixture_cleanup";
 type ProcessIdentity = {
   readonly pid: number;
   readonly startTicks: string;
@@ -105,20 +106,34 @@ const observedDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>();
 async function withJourneyPhase<T>(
   phase: JourneyPhase,
   operation: () => Promise<T> | T,
+  writeDiagnostic: (line: string) => void = (line) => console.info(line),
 ): Promise<T> {
   const startedAt = performance.now();
-  console.info(`[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=start`);
+  emitJourneyDiagnostic(
+    writeDiagnostic,
+    `[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=start`,
+  );
   try {
     const result = await operation();
-    console.info(
+    emitJourneyDiagnostic(
+      writeDiagnostic,
       `[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=ok elapsed_ms=${elapsedMilliseconds(startedAt)}`,
     );
     return result;
   } catch (error) {
-    console.info(
+    emitJourneyDiagnostic(
+      writeDiagnostic,
       `[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=failed error_class=${safeErrorClass(error)} elapsed_ms=${elapsedMilliseconds(startedAt)}`,
     );
     throw error;
+  }
+}
+
+function emitJourneyDiagnostic(writeDiagnostic: (line: string) => void, line: string): void {
+  try {
+    writeDiagnostic(line);
+  } catch {
+    // Diagnostics must never replace the actual phase result or its failure.
   }
 }
 
@@ -129,6 +144,62 @@ function elapsedMilliseconds(startedAt: number): number {
 function safeErrorClass(error: unknown): "timeout" | "operation" {
   return error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "operation";
 }
+
+test("self-host journey diagnostics classify safely and preserve the original failure", async () => {
+  const primaryFailure = new Error("sensitive primary failure");
+  const diagnostics: string[] = [];
+  let observedFailure: unknown;
+  try {
+    await withJourneyPhase(
+      "v1_data_write_readback",
+      () => Promise.reject(primaryFailure),
+      (line) => diagnostics.push(line),
+    );
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(observedFailure).toBe(primaryFailure);
+  expect(diagnostics).toHaveLength(2);
+  expect(diagnostics[0]).toBe(
+    "[selfhost-kv-sqlite-host-restart] phase=v1_data_write_readback outcome=start",
+  );
+  expect(diagnostics[1]).toMatch(
+    /^\[selfhost-kv-sqlite-host-restart\] phase=v1_data_write_readback outcome=failed error_class=operation elapsed_ms=\d+$/u,
+  );
+  expect(diagnostics.join("\n")).not.toContain(primaryFailure.message);
+
+  observedFailure = undefined;
+  try {
+    await withJourneyPhase(
+      "v1_data_write_readback",
+      () => Promise.reject(primaryFailure),
+      () => {
+        throw new Error("sensitive diagnostic sink failure");
+      },
+    );
+  } catch (error) {
+    observedFailure = error;
+  }
+  expect(observedFailure).toBe(primaryFailure);
+
+  diagnostics.length = 0;
+  const timeoutFailure = new DOMException("sensitive timeout detail", "TimeoutError");
+  try {
+    await withJourneyPhase(
+      "form_admission",
+      () => Promise.reject(timeoutFailure),
+      (line) => diagnostics.push(line),
+    );
+  } catch (error) {
+    observedFailure = error;
+  }
+  expect(observedFailure).toBe(timeoutFailure);
+  expect(diagnostics[1]).toMatch(
+    /^\[selfhost-kv-sqlite-host-restart\] phase=form_admission outcome=failed error_class=timeout elapsed_ms=\d+$/u,
+  );
+  expect(diagnostics.join("\n")).not.toContain(timeoutFailure.message);
+});
 
 const resources = [
   ["ModuleWorker", "journey-worker"],
@@ -710,35 +781,42 @@ test.skipIf(WORKERD === null)(
       primaryFailure = error;
       hasPrimaryFailure = true;
     } finally {
-      if (admission) {
-        try {
-          await stopOwnedProcess(admission);
-          admission = undefined;
-        } catch {
-          cleanupFailed = true;
-        }
+      try {
+        await withJourneyPhase("owned_process_and_fixture_cleanup", async () => {
+          if (admission) {
+            try {
+              await stopOwnedProcess(admission);
+              admission = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          if (host) {
+            try {
+              await stopHost(host);
+              host = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          if (verifier) {
+            try {
+              await stopOwnedProcess(verifier);
+              await waitForPortClosed(CORE_VERIFIER_PORT);
+              verifier = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          if (cleanupFailed) throw new Error("selfhost_kv_sqlite_restart_cleanup_failed");
+          rmSync(fixture, { recursive: true, force: true });
+        });
+      } catch {
+        cleanupFailed = true;
       }
-      if (host) {
-        try {
-          await stopHost(host);
-          host = undefined;
-        } catch {
-          cleanupFailed = true;
-        }
-      }
-      if (verifier) {
-        try {
-          await stopOwnedProcess(verifier);
-          await waitForPortClosed(CORE_VERIFIER_PORT);
-          verifier = undefined;
-        } catch {
-          cleanupFailed = true;
-        }
-      }
-      if (!cleanupFailed) rmSync(fixture, { recursive: true, force: true });
     }
-    if (cleanupFailed) throw new Error("selfhost_kv_sqlite_restart_cleanup_failed");
     if (hasPrimaryFailure) throw primaryFailure;
+    if (cleanupFailed) throw new Error("selfhost_kv_sqlite_restart_cleanup_failed");
   },
   300_000,
 );
