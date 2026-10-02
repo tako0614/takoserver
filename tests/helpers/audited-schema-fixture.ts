@@ -12,7 +12,7 @@ function applyQualifiedMigrations() {
   const endIndex = MIGRATIONS.findIndex(({ name }) => name === APPLY_QUALIFIED_MIGRATION_END);
   if (
     endIndex !== 65 ||
-    MIGRATIONS.length !== 67 ||
+    MIGRATIONS.length !== 68 ||
     MIGRATIONS.at(-1)?.name !== CURRENT_SOURCE_MIGRATION_END
   ) {
     throw new Error("apply-qualified schema fixture requires the exact audited 0001-0066 prefix");

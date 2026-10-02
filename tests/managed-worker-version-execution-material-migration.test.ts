@@ -22,6 +22,7 @@ const COMMITMENT = sha("c");
 const FORMAT = "takoserver.managed-worker-version-execution-material@v1";
 const ACTOR_KV_CAPABILITY_CLAIMS = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 const CONTAINER_ENDPOINT_HOSTNAME_INDEX = "0067_takoform_container_endpoint_hostname_index.sql";
+const INVOCATION_CUSTODY_MIGRATION = "0068_cloudflare_provider_invocation_custody.sql";
 
 const DOMAIN_MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
@@ -141,6 +142,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     "0065_worker_runtime_input_lease_generation.sql",
     ACTOR_KV_CAPABILITY_CLAIMS,
     CONTAINER_ENDPOINT_HOSTNAME_INDEX,
+    INVOCATION_CUSTODY_MIGRATION,
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();
