@@ -67,12 +67,68 @@ const MODULE_V2 = `export default {
 
 type Json = Record<string, unknown>;
 type Host = ReturnType<typeof startHost>;
+type JourneyPhase =
+  | "fixture_setup"
+  | "isolation_preflight"
+  | "core_verifier_build"
+  | "core_verifier_ready"
+  | "tls_setup"
+  | "initial_host_ready"
+  | "operator_bootstrap"
+  | "host_exit_for_admission"
+  | "core_verify_set"
+  | "form_admission"
+  | "admitted_host_ready"
+  | "form_catalog"
+  | "v1_artifact_upload"
+  | "migration_artifact_upload"
+  | "storage_resource_create"
+  | "migration_apply"
+  | "v2_artifact_upload"
+  | "v1_worker_version_create"
+  | "v2_worker_version_create"
+  | "initial_deployment"
+  | "endpoint_create"
+  | "v1_data_write_readback"
+  | "v2_deployment"
+  | "pre_restart_resource_readback"
+  | "host_exit_restart"
+  | "v2_read_after_restart"
+  | "dependency_delete_and_absence";
 type ProcessIdentity = {
   readonly pid: number;
   readonly startTicks: string;
   readonly executable: string;
 };
 const observedDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>();
+
+async function withJourneyPhase<T>(
+  phase: JourneyPhase,
+  operation: () => Promise<T> | T,
+): Promise<T> {
+  const startedAt = performance.now();
+  console.info(`[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=start`);
+  try {
+    const result = await operation();
+    console.info(
+      `[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=ok elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+    );
+    return result;
+  } catch (error) {
+    console.info(
+      `[selfhost-kv-sqlite-host-restart] phase=${phase} outcome=failed error_class=${safeErrorClass(error)} elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+    );
+    throw error;
+  }
+}
+
+function elapsedMilliseconds(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
+
+function safeErrorClass(error: unknown): "timeout" | "operation" {
+  return error instanceof DOMException && error.name === "TimeoutError" ? "timeout" : "operation";
+}
 
 const resources = [
   ["ModuleWorker", "journey-worker"],
@@ -109,10 +165,12 @@ test.skipIf(WORKERD === null)(
     const controlDirectory = join(fixture, "control-db");
     const controlDatabase = join(controlDirectory, "control.sqlite");
     const tlsDirectory = join(fixture, "tls");
-    mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
-    mkdirSync(controlDirectory, { recursive: true, mode: 0o700 });
-    mkdirSync(tlsDirectory, { recursive: true, mode: 0o700 });
-    chmodSync(fixture, 0o700);
+    await withJourneyPhase("fixture_setup", () => {
+      mkdirSync(sourceRoot, { recursive: true, mode: 0o700 });
+      mkdirSync(controlDirectory, { recursive: true, mode: 0o700 });
+      mkdirSync(tlsDirectory, { recursive: true, mode: 0o700 });
+      chmodSync(fixture, 0o700);
+    });
 
     const baseEnvironment = childEnvironment(fixture);
     const coreArtifactDigest = takoformCoreVerifierArtifactDigest();
@@ -137,10 +195,14 @@ test.skipIf(WORKERD === null)(
     let hasPrimaryFailure = false;
     let cleanupFailed = false;
     try {
-      await assertIsolatedSelfhostNativeEnvironment({
-        fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
-      });
-      const verifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
+      await withJourneyPhase("isolation_preflight", () =>
+        assertIsolatedSelfhostNativeEnvironment({
+          fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
+        }),
+      );
+      const verifierBinary = await withJourneyPhase("core_verifier_build", () =>
+        buildRealCoreVerifier(join(fixture, "core-verifier")),
+      );
       verifier = Bun.spawn([verifierBinary], {
         cwd: process.cwd(),
         env: { ...baseEnvironment, TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreArtifactDigest },
@@ -148,137 +210,158 @@ test.skipIf(WORKERD === null)(
         stdout: "ignore",
         stderr: "ignore",
       });
-      await waitForCoreVerifier(verifier, coreArtifactDigest);
-      await createTls(tlsDirectory);
-      host = startHost(hostEnvironment);
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
-
-      const operatorJwk = readFileSync(join(sourceRoot, "operator-key.jwk"), "utf8");
-      const assertion = await signOperatorAssertion({
-        privateJwk: operatorJwk,
-        claims: {
-          purpose: "sign-in",
-          aud: HOST_ORIGIN,
+      await withJourneyPhase("core_verifier_ready", () =>
+        waitForCoreVerifier(verifier as ReturnType<typeof Bun.spawn>, coreArtifactDigest),
+      );
+      await withJourneyPhase("tls_setup", () => createTls(tlsDirectory));
+      await withJourneyPhase("initial_host_ready", async () => {
+        host = startHost(hostEnvironment);
+        await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+      });
+      const { auth, organizationId } = await withJourneyPhase("operator_bootstrap", async () => {
+        const operatorJwk = readFileSync(join(sourceRoot, "operator-key.jwk"), "utf8");
+        const assertion = await signOperatorAssertion({
+          privateJwk: operatorJwk,
+          claims: {
+            purpose: "sign-in",
+            aud: HOST_ORIGIN,
+            provider: "google",
+            subject: "kv-sqlite-restart-operator",
+            email: "kv-sqlite-restart@localhost",
+            displayName: "KV SQLite Restart Operator",
+          },
+          nowSeconds: Math.floor(Date.now() / 1_000),
+          lifetimeSeconds: 60,
+        });
+        const session = await api<Json>("POST", "/v1/sessions", 200, {
           provider: "google",
-          subject: "kv-sqlite-restart-operator",
-          email: "kv-sqlite-restart@localhost",
-          displayName: "KV SQLite Restart Operator",
-        },
-        nowSeconds: Math.floor(Date.now() / 1_000),
-        lifetimeSeconds: 60,
+          method: "operator-assertion",
+          assertion,
+          sessionTtlSeconds: 60,
+        });
+        const sessionToken = stringAt(session, "sessionToken");
+        const created = await api<Json>(
+          "POST",
+          "/v1/organizations",
+          201,
+          { name: "KV SQLite process restart" },
+          { authorization: `Bearer ${sessionToken}` },
+        );
+        const organizationId = stringAt(objectAt(created, "organization"), "id");
+        const keyResponse = await api<Json>(
+          "POST",
+          `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
+          201,
+          {
+            name: "kv-sqlite-restart-native",
+            scopes: ["resources:read", "resources:write"],
+            expiresInSeconds: 600,
+          },
+          { authorization: `Bearer ${sessionToken}` },
+        );
+        return {
+          auth: {
+            authorization: `Bearer ${stringAt(keyResponse, "secret")}`,
+            "takoform-organization": organizationId,
+          },
+          organizationId,
+        };
       });
-      const session = await api<Json>("POST", "/v1/sessions", 200, {
-        provider: "google",
-        method: "operator-assertion",
-        assertion,
-        sessionTtlSeconds: 60,
-      });
-      const sessionToken = stringAt(session, "sessionToken");
-      const created = await api<Json>(
-        "POST",
-        "/v1/organizations",
-        201,
-        { name: "KV SQLite process restart" },
-        { authorization: `Bearer ${sessionToken}` },
-      );
-      const organizationId = stringAt(objectAt(created, "organization"), "id");
-      const keyResponse = await api<Json>(
-        "POST",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
-        201,
-        {
-          name: "kv-sqlite-restart-native",
-          scopes: ["resources:read", "resources:write"],
-          expiresInSeconds: 600,
-        },
-        { authorization: `Bearer ${sessionToken}` },
-      );
-      const auth = {
-        authorization: `Bearer ${stringAt(keyResponse, "secret")}`,
-        "takoform-organization": organizationId,
-      };
 
       // Run the same released-Core admission used by the other native Host
       // journey. The Host must be stopped while the CLI owns its SQLite file.
-      await stopHost(host);
+      const preAdmissionHost = host;
+      if (!preAdmissionHost) throw new Error("selfhost_initial_host_missing");
+      await withJourneyPhase("host_exit_for_admission", () => stopHost(preAdmissionHost));
       host = undefined;
-      const closure = await loadPublisherSetClosure();
-      const verifyRequest = await realCoreVerificationRequest(closure);
-      const verified = await fetch(`${CORE_VERIFIER_ORIGIN}/v1/verify-set`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(verifyRequest),
-        signal: AbortSignal.timeout(20_000),
+      await withJourneyPhase("core_verify_set", async () => {
+        const closure = await loadPublisherSetClosure();
+        const verifyRequest = await realCoreVerificationRequest(closure);
+        const verified = await fetch(`${CORE_VERIFIER_ORIGIN}/v1/verify-set`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(verifyRequest),
+          signal: AbortSignal.timeout(20_000),
+        });
+        expect(verified.status).toBe(200);
+        const verifiedBody = (await verified.json()) as Json;
+        expect(objectAt(verifiedBody, "identity")).toMatchObject({
+          coreVersion: "v1.1.0",
+          coreCommit: "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+        });
+        expect(Array.isArray(verifiedBody.packages) ? verifiedBody.packages.length : 0).toBe(17);
       });
-      expect(verified.status).toBe(200);
-      const verifiedBody = (await verified.json()) as Json;
-      expect(objectAt(verifiedBody, "identity")).toMatchObject({
-        coreVersion: "v1.1.0",
-        coreCommit: "e0e48b864de2a127a255cb0574d37bbb0f1cac29",
+      await withJourneyPhase("form_admission", async () => {
+        const admissionProcess = Bun.spawn(
+          [
+            process.execPath,
+            "--no-env-file",
+            "scripts/selfhost-form-admission.ts",
+            organizationId,
+            SPACE,
+            "--apply",
+            "--data-root",
+            sourceRoot,
+            "--host-id",
+            HOST_ORIGIN,
+            "--core-verifier",
+            CORE_VERIFIER_ORIGIN,
+          ],
+          {
+            cwd: process.cwd(),
+            env: hostEnvironment,
+            stdin: "ignore",
+            stdout: "pipe",
+            stderr: "ignore",
+          },
+        );
+        admission = admissionProcess;
+        const admissionStatus = await Promise.race([
+          admissionProcess.exited,
+          Bun.sleep(120_000).then(() => null),
+        ]);
+        if (admissionStatus === null) throw new Error("selfhost_form_admission_cli_timeout");
+        const admissionOutput = await new Response(admissionProcess.stdout).text();
+        admission = undefined;
+        expect(admissionStatus).toBe(0);
+        expect(admissionOutput).toMatch(
+          /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
+        );
       });
-      expect(Array.isArray(verifiedBody.packages) ? verifiedBody.packages.length : 0).toBe(17);
-      const admissionProcess = Bun.spawn(
-        [
-          process.execPath,
-          "--no-env-file",
-          "scripts/selfhost-form-admission.ts",
-          organizationId,
-          SPACE,
-          "--apply",
-          "--data-root",
-          sourceRoot,
-          "--host-id",
-          HOST_ORIGIN,
-          "--core-verifier",
-          CORE_VERIFIER_ORIGIN,
-        ],
-        {
-          cwd: process.cwd(),
-          env: hostEnvironment,
-          stdin: "ignore",
-          stdout: "pipe",
-          stderr: "ignore",
-        },
-      );
-      admission = admissionProcess;
-      const admissionStatus = await Promise.race([
-        admissionProcess.exited,
-        Bun.sleep(120_000).then(() => null),
-      ]);
-      if (admissionStatus === null) throw new Error("selfhost_form_admission_cli_timeout");
-      const admissionOutput = await new Response(admissionProcess.stdout).text();
-      admission = undefined;
-      expect(admissionStatus).toBe(0);
-      expect(admissionOutput).toMatch(
-        /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
-      );
 
-      host = startHost(hostEnvironment);
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
-      const formsResponse = await api<Json>(
-        "GET",
-        `${LANE}/forms?space=${SPACE}`,
-        200,
-        undefined,
-        auth,
-      );
-      const forms = new Map(
-        (Array.isArray(formsResponse.forms) ? (formsResponse.forms as Json[]) : []).map((form) => {
-          const identity = objectAt(form, "identity");
-          return [
-            stringAt(objectAt(identity, "formRef"), "kind"),
-            objectAt(identity, "formRef"),
-          ] as const;
-        }),
-      );
-      for (const kind of [
-        "EdgeKVNamespace",
-        "SQLiteDatabase",
-        "SQLiteMigrationSet",
-        "SQLiteMigrationApplication",
-      ]) {
-        if (!forms.has(kind)) throw new Error(`selfhost_released_form_missing_${kind}`);
-      }
+      await withJourneyPhase("admitted_host_ready", async () => {
+        host = startHost(hostEnvironment);
+        await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+      });
+      const forms = await withJourneyPhase("form_catalog", async () => {
+        const formsResponse = await api<Json>(
+          "GET",
+          `${LANE}/forms?space=${SPACE}`,
+          200,
+          undefined,
+          auth,
+        );
+        const discovered = new Map(
+          (Array.isArray(formsResponse.forms) ? (formsResponse.forms as Json[]) : []).map(
+            (form) => {
+              const identity = objectAt(form, "identity");
+              return [
+                stringAt(objectAt(identity, "formRef"), "kind"),
+                objectAt(identity, "formRef"),
+              ] as const;
+            },
+          ),
+        );
+        for (const kind of [
+          "EdgeKVNamespace",
+          "SQLiteDatabase",
+          "SQLiteMigrationSet",
+          "SQLiteMigrationApplication",
+        ]) {
+          if (!discovered.has(kind)) throw new Error(`selfhost_released_form_missing_${kind}`);
+        }
+        return discovered;
+      });
 
       const apply = async (
         kind: string,
@@ -368,206 +451,261 @@ test.skipIf(WORKERD === null)(
 
       const moduleV1Bytes = new TextEncoder().encode(MODULE_V1);
       const moduleV1Digest = await bytesDigest(moduleV1Bytes);
-      const moduleV1ManifestDigest = await uploadArtifact(
-        {
-          apiVersion: "artifacts.takoform.com/v1alpha1",
-          kind: "WorkerBundle",
-          mainModule: "index.js",
-          modules: [
-            {
-              name: "index.js",
-              mediaType: "application/javascript+module",
-              size: moduleV1Bytes.byteLength,
-              digest: moduleV1Digest,
-            },
-          ],
-        },
-        [{ digest: moduleV1Digest, bytes: moduleV1Bytes }],
-        "journey-v1",
+      const moduleV1ManifestDigest = await withJourneyPhase("v1_artifact_upload", () =>
+        uploadArtifact(
+          {
+            apiVersion: "artifacts.takoform.com/v1alpha1",
+            kind: "WorkerBundle",
+            mainModule: "index.js",
+            modules: [
+              {
+                name: "index.js",
+                mediaType: "application/javascript+module",
+                size: moduleV1Bytes.byteLength,
+                digest: moduleV1Digest,
+              },
+            ],
+          },
+          [{ digest: moduleV1Digest, bytes: moduleV1Bytes }],
+          "journey-v1",
+        ),
       );
       const migrationBytes = new TextEncoder().encode(
         `CREATE TABLE ${TABLE} (id TEXT PRIMARY KEY, body TEXT NOT NULL);`,
       );
       const migrationDigest = await bytesDigest(migrationBytes);
-      const migrationManifestDigest = await uploadArtifact(
-        {
-          apiVersion: "artifacts.takoform.com/v1alpha1",
-          kind: "MigrationBundle",
-          files: [
-            {
-              path: "0001_restart_notes.sql",
-              mediaType: "application/sql",
-              size: migrationBytes.byteLength,
-              digest: migrationDigest,
-            },
-          ],
-        },
-        [{ digest: migrationDigest, bytes: migrationBytes }],
-        "journey-migration",
+      const migrationManifestDigest = await withJourneyPhase("migration_artifact_upload", () =>
+        uploadArtifact(
+          {
+            apiVersion: "artifacts.takoform.com/v1alpha1",
+            kind: "MigrationBundle",
+            files: [
+              {
+                path: "0001_restart_notes.sql",
+                mediaType: "application/sql",
+                size: migrationBytes.byteLength,
+                digest: migrationDigest,
+              },
+            ],
+          },
+          [{ digest: migrationDigest, bytes: migrationBytes }],
+          "journey-migration",
+        ),
       );
 
-      await apply("ModuleWorker", "journey-worker", {});
-      const kvV1 = await apply("EdgeKVNamespace", "journey-kv", {});
-      const databaseV1 = await apply("SQLiteDatabase", "journey-db", {});
-      const migrationSet = await apply("SQLiteMigrationSet", "journey-migrations", {
-        manifestDigest: migrationManifestDigest,
+      const { kvV1, databaseV1 } = await withJourneyPhase("storage_resource_create", async () => {
+        await apply("ModuleWorker", "journey-worker", {});
+        const kvV1 = await apply("EdgeKVNamespace", "journey-kv", {});
+        const databaseV1 = await apply("SQLiteDatabase", "journey-db", {});
+        return { kvV1, databaseV1 };
       });
-      const migrationApplication = await apply(
-        "SQLiteMigrationApplication",
-        "journey-migration-application",
-        {
-          database: reference("SQLiteDatabase", "journey-db"),
-          migrationSet: reference("SQLiteMigrationSet", "journey-migrations"),
+      const { migrationSet, migrationApplication } = await withJourneyPhase(
+        "migration_apply",
+        async () => {
+          const migrationSet = await apply("SQLiteMigrationSet", "journey-migrations", {
+            manifestDigest: migrationManifestDigest,
+          });
+          const migrationApplication = await apply(
+            "SQLiteMigrationApplication",
+            "journey-migration-application",
+            {
+              database: reference("SQLiteDatabase", "journey-db"),
+              migrationSet: reference("SQLiteMigrationSet", "journey-migrations"),
+            },
+          );
+          return { migrationSet, migrationApplication };
         },
       );
       const moduleV2Bytes = new TextEncoder().encode(MODULE_V2);
       const moduleV2Digest = await bytesDigest(moduleV2Bytes);
-      const moduleV2ManifestDigest = await uploadArtifact(
-        {
-          apiVersion: "artifacts.takoform.com/v1alpha1",
-          kind: "WorkerBundle",
-          mainModule: "index.js",
-          modules: [
-            {
-              name: "index.js",
-              mediaType: "application/javascript+module",
-              size: moduleV2Bytes.byteLength,
-              digest: moduleV2Digest,
-            },
-          ],
-        },
-        [{ digest: moduleV2Digest, bytes: moduleV2Bytes }],
-        "journey-v2",
+      const moduleV2ManifestDigest = await withJourneyPhase("v2_artifact_upload", () =>
+        uploadArtifact(
+          {
+            apiVersion: "artifacts.takoform.com/v1alpha1",
+            kind: "WorkerBundle",
+            mainModule: "index.js",
+            modules: [
+              {
+                name: "index.js",
+                mediaType: "application/javascript+module",
+                size: moduleV2Bytes.byteLength,
+                digest: moduleV2Digest,
+              },
+            ],
+          },
+          [{ digest: moduleV2Digest, bytes: moduleV2Bytes }],
+          "journey-v2",
+        ),
       );
-      await apply("WorkerBundle", "journey-bundle-v1", { manifestDigest: moduleV1ManifestDigest });
-      await apply("WorkerVersion", "journey-version-v1", {
-        worker: reference("ModuleWorker", "journey-worker"),
-        bundle: reference("WorkerBundle", "journey-bundle-v1"),
-        handlers: ["fetch"],
-        requiredSensitiveVars: [],
-        kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", "journey-kv") }],
-        sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", "journey-db") }],
+      await withJourneyPhase("v1_worker_version_create", async () => {
+        await apply("WorkerBundle", "journey-bundle-v1", {
+          manifestDigest: moduleV1ManifestDigest,
+        });
+        await apply("WorkerVersion", "journey-version-v1", {
+          worker: reference("ModuleWorker", "journey-worker"),
+          bundle: reference("WorkerBundle", "journey-bundle-v1"),
+          handlers: ["fetch"],
+          requiredSensitiveVars: [],
+          kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", "journey-kv") }],
+          sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", "journey-db") }],
+        });
       });
-      await apply("WorkerBundle", "journey-bundle-v2", { manifestDigest: moduleV2ManifestDigest });
-      await apply("WorkerVersion", "journey-version-v2", {
-        worker: reference("ModuleWorker", "journey-worker"),
-        bundle: reference("WorkerBundle", "journey-bundle-v2"),
-        handlers: ["fetch"],
-        requiredSensitiveVars: [],
-        kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", "journey-kv") }],
-        sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", "journey-db") }],
+      await withJourneyPhase("v2_worker_version_create", async () => {
+        await apply("WorkerBundle", "journey-bundle-v2", {
+          manifestDigest: moduleV2ManifestDigest,
+        });
+        await apply("WorkerVersion", "journey-version-v2", {
+          worker: reference("ModuleWorker", "journey-worker"),
+          bundle: reference("WorkerBundle", "journey-bundle-v2"),
+          handlers: ["fetch"],
+          requiredSensitiveVars: [],
+          kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", "journey-kv") }],
+          sqliteBindings: [{ name: "DB", resource: reference("SQLiteDatabase", "journey-db") }],
+        });
       });
-      const deploymentV1 = await apply("WorkerDeployment", "journey-deployment", {
-        worker: reference("ModuleWorker", "journey-worker"),
-        versions: [
-          { workerVersion: reference("WorkerVersion", "journey-version-v1"), weight: 10_000 },
-        ],
-      });
-      const endpoint = await apply("WorkerEndpoint", "journey-endpoint", {
-        worker: reference("ModuleWorker", "journey-worker"),
-      });
+      const deploymentV1 = await withJourneyPhase("initial_deployment", () =>
+        apply("WorkerDeployment", "journey-deployment", {
+          worker: reference("ModuleWorker", "journey-worker"),
+          versions: [
+            { workerVersion: reference("WorkerVersion", "journey-version-v1"), weight: 10_000 },
+          ],
+        }),
+      );
+      const endpoint = await withJourneyPhase("endpoint_create", () =>
+        apply("WorkerEndpoint", "journey-endpoint", {
+          worker: reference("ModuleWorker", "journey-worker"),
+        }),
+      );
       const endpointUrl = output(endpoint, "url");
       const hostname = new URL(endpointUrl).hostname;
       expect(new URL(endpointUrl).protocol).toBe("https:");
       expect(new URL(endpointUrl).port).toBe("");
       const cert = join(tlsDirectory, "worker-cert.pem");
-      expect(await workerRequest(hostname, cert, "/")).toBe("v1");
-      expect(JSON.parse(await workerRequest(hostname, cert, "/write"))).toEqual({
-        version: "v1",
-        written: true,
-      });
-      const beforeUpdate = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
-      expect(beforeUpdate).toMatchObject({
-        version: "v1",
-        value: VALUE,
-        rows: [{ id: "kept", body: VALUE }],
+      await withJourneyPhase("v1_data_write_readback", async () => {
+        expect(await workerRequest(hostname, cert, "/")).toBe("v1");
+        expect(JSON.parse(await workerRequest(hostname, cert, "/write"))).toEqual({
+          version: "v1",
+          written: true,
+        });
+        const beforeUpdate = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(beforeUpdate).toMatchObject({
+          version: "v1",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
       });
 
-      const deploymentPath = resourcePath(forms, "WorkerDeployment", "journey-deployment");
-      const deploymentCurrent = await api<Json>("GET", deploymentPath, 200, undefined, auth);
-      const deploymentV2 = await apply(
-        "WorkerDeployment",
-        "journey-deployment",
-        {
-          worker: reference("ModuleWorker", "journey-worker"),
-          versions: [
-            { workerVersion: reference("WorkerVersion", "journey-version-v2"), weight: 10_000 },
-          ],
-        },
-        { current: deploymentCurrent },
-      );
-      expect(stringAt(objectAt(deploymentV2, "metadata"), "uid")).toBe(
-        stringAt(objectAt(deploymentV1, "metadata"), "uid"),
-      );
-      expect(stringAt(objectAt(deploymentV2, "metadata"), "revision")).not.toBe(
-        stringAt(objectAt(deploymentV1, "metadata"), "revision"),
-      );
-      const beforeRestart = await resourceGraph(auth, forms, resources);
-      expect(
-        stringAt(
-          resourceGraphItem(beforeRestart, "WorkerEndpoint", "journey-endpoint").outputs ?? {},
-          "url",
-        ),
-      ).toBe(endpointUrl);
-      expect(resourceGraphItem(beforeRestart, "EdgeKVNamespace", "journey-kv").uid).toBe(
-        stringAt(objectAt(kvV1, "metadata"), "uid"),
-      );
-      expect(resourceGraphItem(beforeRestart, "SQLiteDatabase", "journey-db").uid).toBe(
-        stringAt(objectAt(databaseV1, "metadata"), "uid"),
-      );
-      expect(resourceGraphItem(beforeRestart, "SQLiteMigrationSet", "journey-migrations").uid).toBe(
-        stringAt(objectAt(migrationSet, "metadata"), "uid"),
-      );
-      expect(
-        resourceGraphItem(
-          beforeRestart,
-          "SQLiteMigrationApplication",
-          "journey-migration-application",
-        ),
-      ).toMatchObject({
-        uid: stringAt(objectAt(migrationApplication, "metadata"), "uid"),
-        revision: stringAt(objectAt(migrationApplication, "metadata"), "revision"),
+      const deploymentV2 = await withJourneyPhase("v2_deployment", async () => {
+        const deploymentPath = resourcePath(forms, "WorkerDeployment", "journey-deployment");
+        const deploymentCurrent = await api<Json>("GET", deploymentPath, 200, undefined, auth);
+        const deploymentV2 = await apply(
+          "WorkerDeployment",
+          "journey-deployment",
+          {
+            worker: reference("ModuleWorker", "journey-worker"),
+            versions: [
+              {
+                workerVersion: reference("WorkerVersion", "journey-version-v2"),
+                weight: 10_000,
+              },
+            ],
+          },
+          { current: deploymentCurrent },
+        );
+        expect(stringAt(objectAt(deploymentV2, "metadata"), "uid")).toBe(
+          stringAt(objectAt(deploymentV1, "metadata"), "uid"),
+        );
+        expect(stringAt(objectAt(deploymentV2, "metadata"), "revision")).not.toBe(
+          stringAt(objectAt(deploymentV1, "metadata"), "revision"),
+        );
+        return deploymentV2;
       });
-      expect(await workerRequest(hostname, cert, "/")).toBe("v2");
-
-      rememberDescendants(host);
-      const oldHostIdentity = processIdentity(host.pid);
-      const acceptedWorkerd = acceptedWorkerdPath(sourceRoot);
-      if (!existsSync(acceptedWorkerd)) throw new Error("accepted_workerd_snapshot_missing");
-      const oldWorkerd = uniqueWorkerd(host, acceptedWorkerd);
-      await stopHost(host);
-      host = undefined;
-      expect(identityIsLive(oldHostIdentity)).toBe(false);
-      expect(identityIsLive(oldWorkerd)).toBe(false);
-
-      // Restart the real entrypoint against the same data root, control DB, and
-      // TLS paths. No resource mutation or migration-application PUT follows.
-      host = startHost(hostEnvironment);
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
-      const newHostIdentity = processIdentity(host.pid);
-      expect(newHostIdentity.pid).not.toBe(oldHostIdentity.pid);
-      expect(newHostIdentity.executable).toBe(oldHostIdentity.executable);
-      const restored = await resourceGraph(auth, forms, resources);
-      expect(restored).toEqual(beforeRestart);
-      const afterRestartBody = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
-      expect(afterRestartBody).toMatchObject({
-        version: "v2",
-        value: VALUE,
-        rows: [{ id: "kept", body: VALUE }],
+      const beforeRestart = await withJourneyPhase("pre_restart_resource_readback", async () => {
+        const beforeRestart = await resourceGraph(auth, forms, resources);
+        expect(
+          stringAt(
+            resourceGraphItem(beforeRestart, "WorkerEndpoint", "journey-endpoint").outputs ?? {},
+            "url",
+          ),
+        ).toBe(endpointUrl);
+        expect(resourceGraphItem(beforeRestart, "EdgeKVNamespace", "journey-kv").uid).toBe(
+          stringAt(objectAt(kvV1, "metadata"), "uid"),
+        );
+        expect(resourceGraphItem(beforeRestart, "SQLiteDatabase", "journey-db").uid).toBe(
+          stringAt(objectAt(databaseV1, "metadata"), "uid"),
+        );
+        expect(
+          resourceGraphItem(beforeRestart, "SQLiteMigrationSet", "journey-migrations").uid,
+        ).toBe(stringAt(objectAt(migrationSet, "metadata"), "uid"));
+        expect(
+          resourceGraphItem(
+            beforeRestart,
+            "SQLiteMigrationApplication",
+            "journey-migration-application",
+          ),
+        ).toMatchObject({
+          uid: stringAt(objectAt(migrationApplication, "metadata"), "uid"),
+          revision: stringAt(objectAt(migrationApplication, "metadata"), "revision"),
+        });
+        expect(stringAt(objectAt(deploymentV2, "metadata"), "uid")).toBe(
+          stringAt(objectAt(deploymentV1, "metadata"), "uid"),
+        );
+        expect(await workerRequest(hostname, cert, "/")).toBe("v2");
+        return beforeRestart;
       });
-      rememberDescendants(host);
-      const newWorkerd = uniqueWorkerd(host, acceptedWorkerd);
-      expect(newWorkerd.pid).not.toBe(oldWorkerd.pid);
-      expect(identityIsLive(newWorkerd)).toBe(true);
 
-      for (const [kind, name] of deleteOrder) {
-        await deleteResource(auth, forms, kind, name);
-      }
-      for (const [kind, name] of resources) {
-        await expectResourceAbsent(auth, forms, kind, name);
-      }
-      const finalHostIdentity = processIdentity(host.pid);
-      expect(identityIsLive(finalHostIdentity)).toBe(true);
+      const restartIdentities = await withJourneyPhase("host_exit_restart", async () => {
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_pre_restart_host_missing");
+        rememberDescendants(currentHost);
+        const oldHostIdentity = processIdentity(currentHost.pid);
+        const acceptedWorkerd = acceptedWorkerdPath(sourceRoot);
+        if (!existsSync(acceptedWorkerd)) throw new Error("accepted_workerd_snapshot_missing");
+        const oldWorkerd = uniqueWorkerd(currentHost, acceptedWorkerd);
+        await stopHost(currentHost);
+        host = undefined;
+        expect(identityIsLive(oldHostIdentity)).toBe(false);
+        expect(identityIsLive(oldWorkerd)).toBe(false);
+
+        // Restart the real entrypoint against the same data root, control DB,
+        // and TLS paths. No resource mutation or migration-application PUT follows.
+        host = startHost(hostEnvironment);
+        await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        const newHostIdentity = processIdentity(host.pid);
+        expect(newHostIdentity.pid).not.toBe(oldHostIdentity.pid);
+        expect(newHostIdentity.executable).toBe(oldHostIdentity.executable);
+        return { oldWorkerd, acceptedWorkerd, newHostIdentity };
+      });
+
+      await withJourneyPhase("v2_read_after_restart", async () => {
+        const restored = await resourceGraph(auth, forms, resources);
+        expect(restored).toEqual(beforeRestart);
+        const afterRestartBody = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(afterRestartBody).toMatchObject({
+          version: "v2",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_post_restart_host_missing");
+        rememberDescendants(currentHost);
+        const newWorkerd = uniqueWorkerd(currentHost, restartIdentities.acceptedWorkerd);
+        expect(newWorkerd.pid).not.toBe(restartIdentities.oldWorkerd.pid);
+        expect(identityIsLive(newWorkerd)).toBe(true);
+        expect(identityIsLive(restartIdentities.newHostIdentity)).toBe(true);
+      });
+
+      await withJourneyPhase("dependency_delete_and_absence", async () => {
+        for (const [kind, name] of deleteOrder) {
+          await deleteResource(auth, forms, kind, name);
+        }
+        for (const [kind, name] of resources) {
+          await expectResourceAbsent(auth, forms, kind, name);
+        }
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_post_restart_host_missing");
+        expect(identityIsLive(processIdentity(currentHost.pid))).toBe(true);
+      });
     } catch (error) {
       primaryFailure = error;
       hasPrimaryFailure = true;
