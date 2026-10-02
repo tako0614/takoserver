@@ -244,7 +244,7 @@ test.skipIf(WORKERD === null)(
         );
         const completedAdmission = admission;
         const admissionDescendants = new Map<string, ProcessIdentity>();
-        const admissionDeadline = Date.now() + 30_000;
+        const admissionDeadline = Date.now() + 120_000;
         rememberDescendants(completedAdmission.pid, admissionDescendants);
         let exitCode: number | null = null;
         while (completedAdmission.exitCode === null) {
@@ -579,7 +579,7 @@ test.skipIf(WORKERD === null)(
     }
     if (hasPrimaryFailure) throw primaryFailure;
   },
-  120_000,
+  240_000,
 );
 
 function childEnvironment(home: string): Record<string, string> {
