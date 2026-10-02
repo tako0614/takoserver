@@ -92,9 +92,11 @@ describe("self-host Form admission CLI", () => {
       fetch: (request) => verifier.fetch(request),
     });
     try {
-      const lastActivated = [...SELFHOST_CATALOG.entries].sort((left, right) =>
-        canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
-      ).at(-1);
+      const lastActivated = [...SELFHOST_CATALOG.entries]
+        .sort((left, right) =>
+          canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
+        )
+        .at(-1);
       if (!lastActivated) throw new Error("self-host implementation catalog is empty");
       const targetRefJson = canonicalJson(lastActivated.formRef);
       const quoteSql = (value: string) => value.replaceAll("'", "''");
@@ -128,18 +130,12 @@ describe("self-host Form admission CLI", () => {
       const partial = new Database(databasePath);
       try {
         expect(countRows(partial, "tf_form_install_events")).toBe(installedBeforeRetry);
-        expect(countDistinctFormRefs(partial, "tf_form_install_events")).toBe(
-          installedBeforeRetry,
-        );
+        expect(countDistinctFormRefs(partial, "tf_form_install_events")).toBe(installedBeforeRetry);
         expect(countRows(partial, "tf_form_support_events")).toBe(IMPLEMENTED);
         expect(countDistinctFormRefs(partial, "tf_form_support_events")).toBe(IMPLEMENTED);
         expect(countRows(partial, "tf_form_activation_events")).toBe(IMPLEMENTED - 1);
-        expect(countDistinctFormRefs(partial, "tf_form_activation_events")).toBe(
-          IMPLEMENTED - 1,
-        );
-        expect(countRows(partial, "tf_form_activation_events", "active = 1")).toBe(
-          IMPLEMENTED - 1,
-        );
+        expect(countDistinctFormRefs(partial, "tf_form_activation_events")).toBe(IMPLEMENTED - 1);
+        expect(countRows(partial, "tf_form_activation_events", "active = 1")).toBe(IMPLEMENTED - 1);
         expect(
           partial
             .query(
@@ -165,9 +161,7 @@ describe("self-host Form admission CLI", () => {
         expect(countDistinctFormRefs(converged, "tf_form_support_events")).toBe(IMPLEMENTED);
         expect(countRows(converged, "tf_form_activation_events")).toBe(IMPLEMENTED);
         expect(countDistinctFormRefs(converged, "tf_form_activation_events")).toBe(IMPLEMENTED);
-        expect(countRows(converged, "tf_form_activation_events", "active = 1")).toBe(
-          IMPLEMENTED,
-        );
+        expect(countRows(converged, "tf_form_activation_events", "active = 1")).toBe(IMPLEMENTED);
       } finally {
         converged.close();
       }
