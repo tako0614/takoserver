@@ -1,4 +1,5 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { statSync } from "node:fs";
 import { connect as connectTcp } from "node:net";
 
 export interface IsolatedSelfhostNativeObservation {
@@ -31,6 +32,29 @@ export function assertIsolatedSelfhostNativeObservation(
   }
 }
 
+export function parseIsolatedSelfhostNativeLinkObservation(output: string): {
+  readonly interfaces: readonly string[];
+  readonly loopbackIsUp: boolean;
+} {
+  const interfaces: string[] = [];
+  let loopbackIsUp = false;
+  const lines = output.trim().split("\n");
+  if (lines.length === 0 || lines[0] === "") {
+    throw new Error("isolated_selfhost_native_network_observation_malformed");
+  }
+  for (const line of lines) {
+    const match = /^\s*\d+:\s+([^:]+):\s+<([^>]*)>/u.exec(line);
+    if (!match) throw new Error("isolated_selfhost_native_network_observation_malformed");
+    const name = match[1]?.split("@", 1)[0];
+    if (!name) throw new Error("isolated_selfhost_native_network_observation_malformed");
+    interfaces.push(name);
+    if (name === "lo") {
+      loopbackIsUp = match[2]?.split(",").includes("UP") ?? false;
+    }
+  }
+  return { interfaces: interfaces.sort(), loopbackIsUp };
+}
+
 export async function assertIsolatedSelfhostNativeEnvironment(input: {
   readonly fixedPorts: readonly number[];
   readonly ownedChild?: { readonly exitCode: number | null };
@@ -55,16 +79,20 @@ function readNetworkObservation(
   try {
     const selfNetworkNamespace = statSync("/proc/self/ns/net").ino;
     const initNetworkNamespace = statSync("/proc/1/ns/net").ino;
-    const interfaces = readdirSync("/sys/class/net").sort();
-    const loopbackFlags = Number.parseInt(
-      readFileSync("/sys/class/net/lo/flags", "utf8").trim(),
-      16,
-    );
+    // sysfs can remain pinned to the mount namespace's original netns even
+    // after unshare(CLONE_NEWNET), so query rtnetlink through `ip` instead.
+    const linkOutput = execFileSync("ip", ["-o", "link", "show"], {
+      encoding: "utf8",
+      maxBuffer: 16 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+    });
+    const { interfaces, loopbackIsUp } = parseIsolatedSelfhostNativeLinkObservation(linkOutput);
     return {
       selfNetworkNamespace,
       initNetworkNamespace,
       interfaces,
-      loopbackIsUp: Number.isSafeInteger(loopbackFlags) && (loopbackFlags & 0x1) !== 0,
+      loopbackIsUp,
       ...(ownedChildExitCode === undefined ? {} : { ownedChildExitCode }),
     };
   } catch {
