@@ -246,7 +246,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
         authorization: `Bearer ${apiToken}`,
         "takoform-organization": organizationId,
       };
-      await stopHost(firstHost, firstHostDescendants, false);
+      await stopHost(firstHost, firstHostDescendants);
       firstHost = undefined;
 
       const syntheticVerifier = createSyntheticPublisherSetVerifier();
@@ -396,7 +396,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
 
       const firstHostIdentity = processIdentity(firstHost.pid);
       const firstWorkerd = uniqueLiveWorkerd(firstHost, firstHostDescendants);
-      await stopHost(firstHost, firstHostDescendants, true);
+      await crashHost(firstHost, firstHostDescendants, firstHostIdentity, firstWorkerd);
       firstHost = undefined;
       const databaseIdentity = fileIdentity(databasePath);
       const objectRoot = selfhostObjectsRoot(dataRoot);
@@ -449,7 +449,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
       ] as const) {
         if (!host) continue;
         try {
-          await stopHost(host, descendants, false);
+          await stopHost(host, descendants);
         } catch (error) {
           cleanupFailures.push(errorTag(error));
         }
@@ -541,12 +541,12 @@ async function waitForHost(
 async function stopHost(
   host: ReturnType<typeof Bun.spawn>,
   knownDescendants: Map<string, ProcessIdentity> | undefined,
-  requireWorkerd: boolean,
 ): Promise<void> {
   const descendants = knownDescendants ?? new Map<string, ProcessIdentity>();
   rememberDescendants(host.pid, descendants);
-  if (host.exitCode !== null) throw new Error("selfhost_host_exited_before_stop");
-  if (requireWorkerd) uniqueLiveWorkerd(host, descendants);
+  if (host.exitCode !== null || host.signalCode !== null) {
+    throw new Error("selfhost_host_exited_before_stop");
+  }
   host.kill("SIGTERM");
   const exitCode = await Promise.race([host.exited, Bun.sleep(10_000).then(() => null)]);
   if (exitCode === null) {
@@ -559,6 +559,53 @@ async function stopHost(
   await waitForPortClosed(WORKERD_PORT);
   const finalExitCode = exitCode ?? host.exitCode;
   if (finalExitCode !== 0) throw new Error(`selfhost_host_exit_nonzero_${finalExitCode}`);
+}
+
+async function crashHost(
+  host: ReturnType<typeof Bun.spawn>,
+  knownDescendants: Map<string, ProcessIdentity>,
+  hostIdentity: ProcessIdentity,
+  workerd: ProcessIdentity,
+): Promise<void> {
+  const descendants = knownDescendants;
+  rememberDescendants(host.pid, descendants);
+  if (host.exitCode !== null || host.signalCode !== null) {
+    throw new Error("selfhost_host_exited_before_crash");
+  }
+  const currentHost = processIdentity(host.pid);
+  if (
+    !sameIdentity(currentHost, hostIdentity) ||
+    currentHost.executable !== hostIdentity.executable
+  ) {
+    throw new Error("selfhost_host_identity_changed_before_crash");
+  }
+  const currentWorkerd = uniqueLiveWorkerd(host, descendants);
+  if (!sameIdentity(currentWorkerd, workerd) || currentWorkerd.executable !== workerd.executable) {
+    throw new Error("selfhost_workerd_identity_changed_before_crash");
+  }
+  host.kill("SIGKILL");
+  const exitCode = await Promise.race([host.exited, Bun.sleep(10_000).then(() => null)]);
+  if (exitCode === null) throw new Error("selfhost_host_sigkill_timeout");
+  expect(host.signalCode).toBe("SIGKILL");
+
+  // A SIGKILL cannot run Host shutdown hooks. If its one verified Workerd
+  // child remains, signal only that exact PID while its start time and
+  // executable still match the identity captured before the Host crash.
+  if (identityIsLive(workerd)) {
+    const current = processIdentity(workerd.pid);
+    if (sameIdentity(current, workerd) && current.executable === workerd.executable) {
+      try {
+        process.kill(workerd.pid, "SIGKILL");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+          throw new Error("selfhost_workerd_sigkill_failed");
+        }
+      }
+    }
+  }
+  await waitForProcessIdentitiesGone(descendants.values());
+  await waitForPortClosed(API_PORT);
+  await waitForPortClosed(WORKERD_PORT);
 }
 
 function uniqueLiveWorkerd(
