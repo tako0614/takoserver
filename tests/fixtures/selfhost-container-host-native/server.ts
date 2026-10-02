@@ -109,7 +109,7 @@ const composition = createStandaloneProviderComposition({
 const app = buildApp({
   sql,
   objects,
-  publicOrigin: "http://container-host-native.test",
+  publicOrigin: "https://container-host-native.test",
   forms,
   bindings: candidates.bindings,
   hostForms: forms,

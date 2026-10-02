@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { buildApp } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createFileObjectStore } from "../src/objects-fs.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { createDockerHttpRevisionRuntime } from "../src/providers/docker-http-revision.ts";
@@ -1067,6 +1068,119 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
   } finally {
     await containerRuntime.close();
     database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("public Host child starts and serves non-mutating discovery over loopback", async () => {
+  const artifact = join(import.meta.dir, "fixtures/selfhost-container-service-candidate.json");
+  const candidate = await loadVerifiedLocalContainerCandidate(artifact);
+  const root = mkdtempSync(join(tmpdir(), "container-host-child-startup-"));
+  const database = new Database(join(root, "control.sqlite"));
+  let child: ReturnType<typeof Bun.spawn> | undefined;
+  let databaseOpen = true;
+  try {
+    migrateSqlite(database);
+    await installLocalContainerCandidateForTest({
+      sql: createSqliteSql(database),
+      objects: createFileObjectStore({ root: join(root, "objects") }),
+      hostId: "https://container-host-native.test",
+      candidate,
+    });
+    database.close();
+    databaseOpen = false;
+
+    const dockerSocket = join(root, "docker-not-used.sock");
+    const spawned = Bun.spawn(
+      [
+        process.execPath,
+        "--no-env-file",
+        "tests/fixtures/selfhost-container-host-native/server.ts",
+      ],
+      {
+        cwd: join(import.meta.dir, ".."),
+        env: {
+          PATH: process.env.PATH ?? "",
+          HOME: "/tmp",
+          TAKOSERVER_NATIVE_CONTAINER_TEST_ROOT: root,
+          TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT: artifact,
+          TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET: dockerSocket,
+          TAKOSERVER_NATIVE_CONTAINER_NETWORK: "startup-diagnostic-no-docker",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    child = spawned;
+    const stdout = spawned.stdout;
+    const stderr = spawned.stderr;
+    if (!(stdout instanceof ReadableStream) || !(stderr instanceof ReadableStream)) {
+      throw new Error("Host child did not expose bounded startup streams");
+    }
+
+    const reader = stdout.getReader();
+    const decoder = new TextDecoder();
+    let buffered = "";
+    const ready = (async () => {
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done) return { kind: "stdout-ended" as const };
+          buffered += decoder.decode(next.value, { stream: true });
+          const newline = buffered.indexOf("\n");
+          if (newline < 0) continue;
+          const line = buffered.slice(0, newline);
+          const match = /^READY ([0-9]{1,5})$/u.exec(line);
+          return match
+            ? { kind: "ready" as const, port: Number(match[1]) }
+            : { kind: "invalid-ready" as const };
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    })();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      ready,
+      spawned.exited.then(() => ({ kind: "child-exited" as const })),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timeout = setTimeout(() => resolve({ kind: "timeout" }), 15_000);
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (outcome.kind !== "ready") {
+      spawned.kill("SIGKILL");
+      await spawned.exited;
+      const startupStderr = await new Response(stderr).text();
+      if (startupStderr.includes("issuer must be an HTTPS origin")) {
+        const location = startupStderr.match(/src\/token\.ts:\d+:\d+/u)?.[0];
+        throw new Error(
+          `Host child failed before READY: token issuer must be an HTTPS origin${location ? ` (${location})` : ""}`,
+        );
+      }
+      throw new Error(
+        outcome.kind === "timeout"
+          ? "Host child did not become ready within 15 seconds"
+          : "Host child exited before READY",
+      );
+    }
+
+    const response = await fetch(`http://127.0.0.1:${outcome.port}/.well-known/takoserver`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      product: "takoserver",
+      apiVersion: "v1",
+      endpoints: {
+        api: "https://container-host-native.test",
+        openapi: "https://container-host-native.test/openapi.json",
+      },
+    });
+  } finally {
+    if (child) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    if (databaseOpen) database.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -20,7 +20,7 @@ const IMAGE_A = process.env.TAKOSERVER_NATIVE_CONTAINER_IMAGE_A;
 const IMAGE_B = process.env.TAKOSERVER_NATIVE_CONTAINER_IMAGE_B;
 const DOCKER_SOCKET = process.env.TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET;
 const NETWORK = process.env.TAKOSERVER_NATIVE_CONTAINER_NETWORK;
-const HOST_ID = "http://container-host-native.test";
+const HOST_ID = "https://container-host-native.test";
 const FORM_REF = {
   apiVersion: "edge.forms.takoform.com",
   kind: "ContainerService",
