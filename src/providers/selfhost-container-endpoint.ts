@@ -29,8 +29,14 @@ export const LOCAL_CONTAINER_ENDPOINT_FORM = {
 export const LOCAL_CONTAINER_ENDPOINT_PACKAGE_DIGEST =
   "sha256:c5ee452369ddafc1ba15d76adcdcc1611ff558d2e385a3f1f6379a4cce86b288";
 
+/** Shared type marker; only the listener owner can establish live qualification. */
+export const SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND: unique symbol = Symbol(
+  "selfhost-container-endpoint-https-ingress",
+);
+
 /** Supplied only after the owning entry has qualified the actual HTTPS 443 ingress and suffix. */
 export interface SelfhostContainerEndpointHttpsIngressPort {
+  readonly [SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND]: true;
   readonly configuredSuffix: string;
   readonly publicOrigin: `https://${string}`;
   readonly port: 443;
@@ -54,6 +60,7 @@ export function validateSelfhostContainerEndpointIngressPort(
   value.assertServing();
   const suffix = value.configuredSuffix;
   if (
+    value[SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND] !== true ||
     value.port !== 443 ||
     value.publicOrigin !== `https://${suffix}` ||
     suffix !== suffix.toLowerCase() ||

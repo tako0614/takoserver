@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -32,6 +32,7 @@ const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-mi
 const expectedApplicationShape = applicationShape(currentMigrations);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
+const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 66);
 const DATABASE_ID = "00000000-0000-4000-8000-000000000051";
 const TARGET_DATABASE = "takoserver-runtime-integration";
 const TARGET_BUCKET = "takoserver-objects-integration";
@@ -57,7 +58,7 @@ const invocation = {
 
 const emptyState = state([], []);
 const completeState = stateWithShape(
-  MIGRATIONS.map(({ name }) => name),
+  APPLY_MIGRATIONS.map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -124,7 +125,7 @@ function editedSchemaSqlState(
 function applicationShape(directory: string): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort()) {
+    for (const name of readdirSync(directory).sort().slice(0, 66)) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -301,7 +302,7 @@ describe("integration storage generation bootstrap", () => {
       generation: GENERATION,
       d1: { databaseId: DATABASE_ID, databaseName: GENERATED_NAME },
       r2: { bucketName: GENERATED_NAME },
-      appliedMigrations: MIGRATIONS.map(({ name }) => name),
+      appliedMigrations: APPLY_MIGRATIONS.map(({ name }) => name),
     });
     expect(proof.migrationDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
     expect(proof.schemaShapeDigest).toBe(completeState.shapeDigest);
@@ -488,7 +489,7 @@ describe("integration storage generation bootstrap", () => {
       const results = sql.startsWith("SELECT name FROM sqlite_schema")
         ? schemaRows.filter(({ type }) => type === "table").map(({ name }) => ({ name }))
         : sql.includes("FROM d1_migrations ORDER BY id")
-          ? MIGRATIONS.map(({ name }) => ({ name }))
+          ? APPLY_MIGRATIONS.map(({ name }) => ({ name }))
           : sql.startsWith("SELECT type, name, tbl_name, COALESCE(sql, '') AS sql")
             ? schemaRows
             : null;
@@ -782,6 +783,43 @@ describe("integration storage generation bootstrap", () => {
     ).toBe(false);
   });
 
+  test("source-tail drift is refused before integration storage provider access", async () => {
+    for (const drift of ["missing", "changed", "extra"] as const) {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-storage-source-${drift}-`));
+      try {
+        const migrationDirectory = join(root, "migrations");
+        cpSync(currentMigrations, migrationDirectory, { recursive: true });
+        const tail = join(
+          migrationDirectory,
+          "0067_takoform_container_endpoint_hostname_index.sql",
+        );
+        if (drift === "missing") rmSync(tail);
+        else if (drift === "changed") {
+          writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
+        } else {
+          writeFileSync(
+            join(migrationDirectory, "0068_unreviewed.sql"),
+            "CREATE TABLE unreviewed (id TEXT);\n",
+          );
+        }
+        const fixture = providerFixture();
+        await expect(
+          runIntegrationStorageGeneration(invocation, target, {
+            ...options(fixture.provider),
+            migrationDirectory,
+          }),
+        ).rejects.toThrow(
+          drift === "changed"
+            ? "exact audited migration SHA-256"
+            : "audited migration lineage must contain exactly 0001-0067",
+        );
+        expect(fixture.calls).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("refuses preexisting names and a repeated absence-fence race before D1 create", async () => {
     const existing = providerFixture({ existingD1: { name: GENERATED_NAME, uuid: DATABASE_ID } });
     await expect(
@@ -809,7 +847,7 @@ describe("integration storage generation bootstrap", () => {
     expect(result).toMatchObject({
       d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
       r2: { bucketName: GENERATED_NAME },
-      appliedMigrations: MIGRATIONS.map(({ name }) => name),
+      appliedMigrations: APPLY_MIGRATIONS.map(({ name }) => name),
       generation: GENERATION,
       commit: COMMIT,
     });
@@ -834,6 +872,30 @@ describe("integration storage generation bootstrap", () => {
     expect(process.commands.some((command) => command.includes("apply"))).toBe(false);
     expect(process.importDigests).toHaveLength(1);
     expect(result.migrationImportDigest).toBe(process.importDigests[0]);
+  });
+
+  test("the generated storage payload seals only the apply-qualified 0001-0066 prefix", async () => {
+    const fixture = providerFixture();
+    const outputDirectory = mkdtempSync(join(tmpdir(), "takoserver-storage-payload-"));
+    try {
+      const result = await runIntegrationStorageGeneration(invocation, target, {
+        ...options(fixture.provider),
+        outputDirectory,
+      });
+      expect(result.appliedMigrations).toEqual(APPLY_MIGRATIONS.map(({ name }) => name));
+      const sealedMigrations = join(outputDirectory, "release", "payload", "migrations");
+      expect(readdirSync(sealedMigrations).sort()).toEqual(
+        APPLY_MIGRATIONS.map(({ name }) => name),
+      );
+      const migrationImport = readFileSync(
+        join(outputDirectory, "release", "payload", "migration-import.sql"),
+        "utf8",
+      );
+      expect(migrationImport).toContain("0066_cloudflare_managed_actor_kv_capability_claims.sql");
+      expect(migrationImport).not.toContain("0067_takoform_container_endpoint_hostname_index.sql");
+    } finally {
+      rmSync(outputDirectory, { recursive: true, force: true });
+    }
   });
 
   test("refuses malformed create identity and nonempty new D1 without R2", async () => {
@@ -894,7 +956,7 @@ describe("integration storage generation bootstrap", () => {
         options(wrongShape.provider, [
           emptyState,
           stateWithShape(
-            MIGRATIONS.map(({ name }) => name),
+            APPLY_MIGRATIONS.map(({ name }) => name),
             "[]\n",
           ),
         ]),
@@ -955,7 +1017,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0067_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0068_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -963,7 +1025,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0066");
+      ).rejects.toThrow("exactly 0001-0067");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

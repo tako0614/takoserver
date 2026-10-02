@@ -1,19 +1,13 @@
 import { createPrivateKey, createPublicKey, X509Certificate } from "node:crypto";
 import { connect as tlsConnect } from "node:tls";
+import type { SelfhostContainerEndpointHttpsIngressPort } from "./providers/selfhost-container-endpoint.ts";
+import { SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND } from "./providers/selfhost-container-endpoint.ts";
+
+export type { SelfhostContainerEndpointHttpsIngressPort } from "./providers/selfhost-container-endpoint.ts";
 
 export const SELFHOST_CONTAINER_ENDPOINT_HTTPS_ENVIRONMENT = Object.freeze({
   suffix: "TAKOSERVER_SELFHOST_CONTAINER_ENDPOINT_SUFFIX",
 });
-
-const ingressPortBrand: unique symbol = Symbol("selfhost-container-endpoint-https-ingress");
-
-export interface SelfhostContainerEndpointHttpsIngressPort {
-  readonly [ingressPortBrand]: true;
-  readonly configuredSuffix: string;
-  readonly publicOrigin: string;
-  readonly port: 443;
-  assertServing(): void;
-}
 
 export interface SelfhostContainerEndpointHttpsConfiguration {
   readonly configuredSuffix: string;
@@ -28,7 +22,7 @@ export interface SelfhostContainerEndpointHttpsListener {
 }
 
 interface ListenerServer {
-  readonly port: number;
+  readonly port: number | undefined;
   stop(closeActiveConnections?: boolean): void | Promise<void>;
 }
 
@@ -266,8 +260,8 @@ export async function createSelfhostContainerEndpointHttpsListener(input: {
   }
 
   active = true;
-  const ingress: SelfhostContainerEndpointHttpsIngressPort = Object.freeze({
-    [ingressPortBrand]: true,
+  const ingress = Object.freeze({
+    [SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND]: true,
     configuredSuffix: suffix,
     publicOrigin: `https://${suffix}`,
     port: 443,
@@ -275,7 +269,7 @@ export async function createSelfhostContainerEndpointHttpsListener(input: {
       if (!active || server.port !== 443)
         throw new Error("Container Endpoint HTTPS ingress is not serving");
     },
-  });
+  } satisfies SelfhostContainerEndpointHttpsIngressPort);
   let closed = false;
   return {
     ingress,

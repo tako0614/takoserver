@@ -588,7 +588,8 @@ const providerComposition = createStandaloneProviderComposition({
       }
     : {}),
 });
-if (selfhostContainerEndpointHttps && !providerComposition.containerEndpointIngress) {
+const containerEndpointIngress = providerComposition.containerEndpointIngress;
+if (selfhostContainerEndpointHttps && !containerEndpointIngress) {
   await selfhostContainerEndpointHttps.close();
   selfhostContainerEndpointHttps = undefined;
   process.stderr.write(
@@ -761,13 +762,11 @@ const app = buildApp({
           }),
       }
     : {}),
-  ...(selfhostContainerEndpointHttps &&
-  selfhostContainer &&
-  providerComposition.containerEndpointIngress
+  ...(selfhostContainerEndpointHttps && selfhostContainer && containerEndpointIngress
     ? {
         selfhostEndpointIngressFactory: ({ store, deployments }) => {
           selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
-            qualification: providerComposition.containerEndpointIngress,
+            qualification: containerEndpointIngress,
             store,
             deployments,
           });

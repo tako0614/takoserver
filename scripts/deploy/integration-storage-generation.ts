@@ -31,7 +31,12 @@ import {
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
-import { readAuditedMigrationArtifact, type SchemaReader } from "./schema.ts";
+import {
+  projectApplyQualifiedMigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+  readSealedApplyQualifiedMigrationArtifact,
+  type SchemaReader,
+} from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
@@ -232,8 +237,10 @@ export async function verifyIntegrationStorageGenerationTarget(
     );
   }
 
-  const sourceArtifact = readAuditedMigrationArtifact(
-    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
+    readCurrentAuditedMigrationSourceArtifact(
+      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    ),
   );
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const temporary = options.outputDirectory === undefined;
@@ -490,8 +497,10 @@ async function applyStorageGeneration(
   );
   await qualifySource({ environment: "integration", commit: invocation.commit, run });
 
-  const sourceArtifact = readAuditedMigrationArtifact(
-    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
+    readCurrentAuditedMigrationSourceArtifact(
+      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    ),
   );
   await checkedMigrationGate(run);
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
@@ -518,7 +527,7 @@ async function applyStorageGeneration(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readAuditedMigrationArtifact(migrationOutput);
+    const sealedArtifact = readSealedApplyQualifiedMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)

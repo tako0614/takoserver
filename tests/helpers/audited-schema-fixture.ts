@@ -24,14 +24,14 @@ export function copyAuditedSchemaFixture(directory: string): string {
  * Worker domain receipts, 0059 apply provider selection, 0060 operation
  * generation, 0061 accepted authority continuity, and 0062 import provider
  * selection, 0063 managed Queue retirement fencing, 0064 staged Actor owner
- * claims, 0065 runtime-input lease generation, and 0066 Actor KV capability
- * claims. */
+ * claims, 0065 runtime-input lease generation, 0066 Actor KV capability
+ * claims, and source-only audited 0067 hostname lookup index. */
 export function copyCurrentSchemaFixture(directory: string): string {
   if (
-    MIGRATIONS.length !== 66 ||
-    MIGRATIONS.at(-1)?.name !== "0066_cloudflare_managed_actor_kv_capability_claims.sql"
+    MIGRATIONS.length !== 67 ||
+    MIGRATIONS.at(-1)?.name !== "0067_takoform_container_endpoint_hostname_index.sql"
   ) {
-    throw new Error("current schema fixture requires the audited 0001-0066 lineage");
+    throw new Error("current schema fixture requires the audited 0001-0067 source inventory");
   }
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   for (const { name } of MIGRATIONS) {

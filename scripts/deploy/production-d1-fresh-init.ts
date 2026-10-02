@@ -37,7 +37,11 @@ import {
   sealDirectory,
   unsealDirectory,
 } from "./qualification.ts";
-import { readAuditedMigrationArtifact } from "./schema.ts";
+import {
+  projectApplyQualifiedMigrationArtifact,
+  readCurrentAuditedMigrationSourceArtifact,
+  readSealedApplyQualifiedMigrationArtifact,
+} from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 
 const ACCOUNT_ID = /^[0-9a-f]{32}$/u;
@@ -121,8 +125,10 @@ export async function runProductionD1FreshInit(
   options: ProductionD1FreshInitOptions = {},
 ): Promise<Record<string, unknown>> {
   const names = validateInvocation(invocation, target);
-  const sourceArtifact = readAuditedMigrationArtifact(
-    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+  const sourceArtifact = projectApplyQualifiedMigrationArtifact(
+    readCurrentAuditedMigrationSourceArtifact(
+      options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
+    ),
   );
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
   const expectedApplicationShapeDigest = `sha256:${createHash("sha256")
@@ -254,7 +260,7 @@ async function applyFreshProductionD1(
   invocation: ProductionD1FreshInitInvocation,
   target: DeployTarget,
   names: FreshD1Names,
-  sourceArtifact: ReturnType<typeof readAuditedMigrationArtifact>,
+  sourceArtifact: ReturnType<typeof readCurrentAuditedMigrationSourceArtifact>,
   expectedApplicationShape: string,
   expectedApplicationShapeDigest: string,
   incumbent: IncumbentProductionD1,
@@ -295,7 +301,7 @@ async function applyFreshProductionD1(
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
     }
-    const sealedArtifact = readAuditedMigrationArtifact(migrationOutput);
+    const sealedArtifact = readSealedApplyQualifiedMigrationArtifact(migrationOutput);
     if (
       sealedArtifact.digest !== sourceArtifact.digest ||
       JSON.stringify(sealedArtifact.names) !== JSON.stringify(sourceArtifact.names)

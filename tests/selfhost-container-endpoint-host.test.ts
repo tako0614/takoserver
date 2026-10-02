@@ -8,6 +8,7 @@ import { buildEdgeForms } from "../src/edge-forms.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createDockerHttpRevisionRuntime } from "../src/providers/docker-http-revision.ts";
+import { SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND } from "../src/providers/selfhost-container-endpoint.ts";
 import { createSelfhostContainerRuntime } from "../src/providers/selfhost-container-runtime.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { hasExactLocalContainerEndpointCandidatePair } from "../src/selfhost-composition.ts";
@@ -46,6 +47,7 @@ const SERVICE_SPEC = {
   requiredSensitiveVars: [],
 };
 const QUALIFIED_INGRESS = {
+  [SELFHOST_CONTAINER_ENDPOINT_HTTPS_INGRESS_BRAND]: true,
   configuredSuffix: "container.test",
   publicOrigin: "https://container.test",
   port: 443,

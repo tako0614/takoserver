@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -28,6 +28,7 @@ const currentMigrations = copyCurrentSchemaFixture(join(fixtureRoot, "current-mi
 const expectedApplicationShape = applicationShape(currentMigrations);
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
+const APPLY_MIGRATIONS = MIGRATIONS.slice(0, 66);
 const ACCOUNT_ID = "a10162d23653f1ad1193dabf520a5dd0";
 const DATABASE_ID = "00000000-0000-4000-8000-000000000061";
 const INCUMBENT_DATABASE = "takoserver-runtime-ga-20260820";
@@ -55,7 +56,7 @@ const invocation = {
 
 const emptyState = stateWithShape([], "[]\n");
 const completeState = stateWithShape(
-  MIGRATIONS.map(({ name }) => name),
+  APPLY_MIGRATIONS.map(({ name }) => name),
   expectedApplicationShape,
 );
 
@@ -72,7 +73,7 @@ function stateWithShape(applied: readonly string[], shape: string): D1SchemaStat
 function applicationShape(directory: string): string {
   const database = new Database(":memory:");
   try {
-    for (const name of readdirSync(directory).sort()) {
+    for (const name of readdirSync(directory).sort().slice(0, 66)) {
       database.exec(readFileSync(join(directory, name), "utf8"));
     }
     const rows = database
@@ -204,8 +205,8 @@ describe("production D1 fresh init", () => {
       environment: "production",
       generation: GENERATION,
       d1: { databaseName: FRESH_NAME, databaseId: null, present: false },
-      migrationCount: MIGRATIONS.length,
-      throughMigration: MIGRATIONS[MIGRATIONS.length - 1]?.name,
+      migrationCount: APPLY_MIGRATIONS.length,
+      throughMigration: APPLY_MIGRATIONS[APPLY_MIGRATIONS.length - 1]?.name,
       readyForApply: true,
     });
     expect(result.incumbent).toMatchObject({
@@ -230,6 +231,43 @@ describe("production D1 fresh init", () => {
     expect(fixture.calls).toEqual([`listD1:${FRESH_NAME}`]);
   });
 
+  test("source-tail drift is refused before production D1 provider access", async () => {
+    for (const drift of ["missing", "changed", "extra"] as const) {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-fresh-source-${drift}-`));
+      try {
+        const migrationDirectory = join(root, "migrations");
+        cpSync(currentMigrations, migrationDirectory, { recursive: true });
+        const tail = join(
+          migrationDirectory,
+          "0067_takoform_container_endpoint_hostname_index.sql",
+        );
+        if (drift === "missing") rmSync(tail);
+        else if (drift === "changed") {
+          writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
+        } else {
+          writeFileSync(
+            join(migrationDirectory, "0068_unreviewed.sql"),
+            "CREATE TABLE unreviewed (id TEXT);\n",
+          );
+        }
+        const fixture = providerFixture();
+        await expect(
+          runProductionD1FreshInit({ ...invocation, action: "status" }, target, {
+            provider: fixture.provider,
+            migrationDirectory,
+          }),
+        ).rejects.toThrow(
+          drift === "changed"
+            ? "exact audited migration SHA-256"
+            : "audited migration lineage must contain exactly 0001-0067",
+        );
+        expect(fixture.calls).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("apply creates one empty production database and applies the exact 0001-0066 lineage", async () => {
     const fixture = providerFixture();
     const process = processFixture();
@@ -247,7 +285,7 @@ describe("production D1 fresh init", () => {
       reviewer: "independent-reviewer",
       d1: { databaseName: FRESH_NAME, databaseId: DATABASE_ID },
       schemaShapeDigest: completeState.shapeDigest,
-      appliedMigrations: MIGRATIONS.map(({ name }) => name),
+      appliedMigrations: APPLY_MIGRATIONS.map(({ name }) => name),
       targetBinding: { status: "not-written" },
     });
     expect(result.incumbent).toMatchObject({ databaseName: INCUMBENT_DATABASE });
@@ -323,6 +361,16 @@ describe("production D1 fresh init", () => {
         },
       });
       expect(result.d1).toEqual({ databaseName: FRESH_NAME, databaseId: DATABASE_ID });
+      const sealedMigrations = join(outputDirectory, "release", "payload", "migrations");
+      expect(readdirSync(sealedMigrations).sort()).toEqual(
+        APPLY_MIGRATIONS.map(({ name }) => name),
+      );
+      const migrationImport = readFileSync(
+        join(outputDirectory, "release", "payload", "migration-import.sql"),
+        "utf8",
+      );
+      expect(migrationImport).toContain("0066_cloudflare_managed_actor_kv_capability_claims.sql");
+      expect(migrationImport).not.toContain("0067_takoform_container_endpoint_hostname_index.sql");
     } finally {
       rmSync(outputDirectory, { recursive: true, force: true });
     }

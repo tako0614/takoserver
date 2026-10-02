@@ -112,7 +112,6 @@ test("Container HTTPS refuses Workerd and Worker endpoint 443 conflicts before e
     expect(() =>
       parseSelfhostContainerEndpointHttpsConfiguration(endpointEnvironment, {
         containerRuntimeConfigured: true,
-        controlPort: 8787,
         ...ports,
       }),
     ).toThrow("cannot share the Bun control or Workerd listener");
@@ -239,7 +238,7 @@ test("dedicated TLS dispatch is Endpoint-only and never falls through to Host ro
     ["GET", "/_takoserver/health/live"],
     ["POST", "/provision/x"],
     ["OPTIONS", "/v1/resources/example"],
-  ]) {
+  ] as const) {
     const response = await dispatch(new Request(`https://${endpointHost}${path}`, { method }));
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(`${method} ${path}`);
@@ -449,9 +448,11 @@ test("ephemeral local TLS SNI proof is real but does not mint fixed-443 capabili
     fetch: () => new Response(null, { status: 204 }),
   });
   try {
+    const port = server.port;
+    if (port === undefined) throw new Error("Bun did not bind the ephemeral TLS fixture");
     const proof = await verifySelfhostContainerEndpointHttpsHandshake({
       host: "127.0.0.1",
-      port: server.port,
+      port,
       suffix,
       certificateChain: fixture.certificateChain,
     });
