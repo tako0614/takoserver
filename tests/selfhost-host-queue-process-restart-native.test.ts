@@ -16,7 +16,7 @@ import {
 import { request as httpsRequest } from "node:https";
 import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -147,6 +147,52 @@ test("the exact released Core admission request contains the Queue and Worker Fo
   const requestKinds = (request.packages as Json[]).map((pkg) => objectAt(pkg, "formRef").kind);
   expect(requestKinds).toContain("AtLeastOnceQueue");
   expect(requestKinds).toContain("ModuleWorker");
+});
+
+test("Queue Host preload resolves from an absolute Bun module path", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "queue-preload-argv-test-"));
+  chmodSync(fixture, 0o700);
+  try {
+    const environment = {
+      ...childEnvironment(fixture),
+      TAKOSERVER_QUEUE_RESTART_FIXTURE_MODE: "preload",
+      TAKOSERVER_QUEUE_RESTART_PROXY_ORIGIN: "http://127.0.0.1:9",
+    };
+    const result = Bun.spawnSync(hostCommand(environment, ["--eval", "void 0"]), {
+      cwd: process.cwd(),
+      env: environment,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(result.exitCode).toBe(0);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("Queue cleanup does not replace the primary failure", () => {
+  const primary = new Error("selfhost_host_start_exit_1");
+  let observed: unknown;
+  try {
+    throwQueueCleanupFailure(primary, true, ["owned_child_cleanup_failed"]);
+  } catch (error) {
+    observed = error;
+  }
+  expect(observed).toBeInstanceOf(AggregateError);
+  const aggregate = observed as AggregateError;
+  expect(aggregate.errors[0]).toBe(primary);
+  expect(aggregate.cause).toBe(primary);
+  let primaryOnly: unknown;
+  try {
+    throwQueueCleanupFailure(primary, true, []);
+  } catch (error) {
+    primaryOnly = error;
+  }
+  expect(primaryOnly).toBe(primary);
+  expect(() => throwQueueCleanupFailure(undefined, false, ["owned_child_cleanup_failed"])).toThrow(
+    "selfhost_queue_process_cleanup_owned_child_cleanup_failed_after_none",
+  );
 });
 
 test("real Core identity and publisher-set response bodies have bounded reads", async () => {
@@ -560,15 +606,15 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
           cleanupFailures.push(errorTag(error));
         }
       }
-      if (cleanupFailures.length === 0) rmSync(fixture, { recursive: true, force: true });
+      if (cleanupFailures.length === 0) {
+        try {
+          rmSync(fixture, { recursive: true, force: true });
+        } catch {
+          cleanupFailures.push("fixture_cleanup_failed");
+        }
+      }
     }
-    if (cleanupFailures.length > 0) {
-      const primaryTag = hasPrimaryFailure ? errorTag(primaryFailure) : "none";
-      throw new Error(
-        `selfhost_queue_process_cleanup_${cleanupFailures.join("_")}_after_${primaryTag}`,
-      );
-    }
-    if (hasPrimaryFailure) throw primaryFailure;
+    throwQueueCleanupFailure(primaryFailure, hasPrimaryFailure, cleanupFailures);
   },
   360_000,
 );
@@ -676,12 +722,38 @@ function childEnvironment(home: string): Record<string, string> {
   };
 }
 
-function startHost(environment: Record<string, string>): ReturnType<typeof Bun.spawn> {
+function hostCommand(
+  environment: Record<string, string>,
+  target: readonly string[] = ["src/entry-bun.ts"],
+): string[] {
   const preload =
     environment.TAKOSERVER_QUEUE_RESTART_FIXTURE_MODE === "preload"
-      ? ["--preload", "tests/fixtures/selfhost-host-queue-process-child.ts"]
+      ? ["--preload", resolve("tests/fixtures/selfhost-host-queue-process-child.ts")]
       : [];
-  const host = Bun.spawn([process.execPath, "--no-env-file", ...preload, "src/entry-bun.ts"], {
+  return [process.execPath, "--no-env-file", ...preload, ...target];
+}
+
+function throwQueueCleanupFailure(
+  primaryFailure: unknown,
+  hasPrimaryFailure: boolean,
+  cleanupFailures: readonly string[],
+): void {
+  if (hasPrimaryFailure && cleanupFailures.length === 0) throw primaryFailure;
+  if (hasPrimaryFailure) {
+    const primaryTag = errorTag(primaryFailure);
+    throw new AggregateError(
+      [primaryFailure, ...cleanupFailures],
+      `selfhost_queue_process_cleanup_${cleanupFailures.join("_")}_after_${primaryTag}`,
+      { cause: primaryFailure },
+    );
+  }
+  if (cleanupFailures.length > 0) {
+    throw new Error(`selfhost_queue_process_cleanup_${cleanupFailures.join("_")}_after_none`);
+  }
+}
+
+function startHost(environment: Record<string, string>): ReturnType<typeof Bun.spawn> {
+  const host = Bun.spawn(hostCommand(environment), {
     cwd: process.cwd(),
     env: environment,
     stdin: "ignore",
