@@ -140,6 +140,37 @@ Host/control-plane readiness and application-level health remain distinct.
 these Bun-only diagnostics do not change that entry or the shared OpenAPI
 contract.
 
+### Container Endpoint HTTPS listener
+
+The opt-in Bun self-host Container lane can own a dedicated HTTPS listener on
+TCP 443 for Container Endpoint traffic. It is Container-only: it does not front
+the Bun control listener, route Worker endpoints, or change the existing
+Workerd-owned Worker TLS behavior described by [ADR 0009](../adr/0009-a-self-host-publishes-the-scheme-its-socket-serves.md).
+Do not configure the Bun control listener or Workerd on port 443 at the same
+time. When the Container Endpoint lane is explicitly enabled, the Host also
+refuses a Worker endpoint port declaration of 443 because this dedicated
+listener is not a shared Worker/control gateway.
+
+Set `TAKOSERVER_SELFHOST_CONTAINER_ENDPOINT_SUFFIX` to one operator-selected
+DNS suffix, and configure the existing
+`TAKOSERVER_WORKERD_TLS_CERT_FILE` / `TAKOSERVER_WORKERD_TLS_KEY_FILE`
+certificate material (or the existing inline PEM pair). Bun independently
+checks that the certificate covers the one-label `ce-<40 hex>.<suffix>`
+hostname shape, binds its own listener on 443, and performs a local SNI
+handshake before it exposes a serving capability. The PEM pair is shared
+configuration material; Workerd's listener and scheme continue to use their
+existing rules.
+
+The configured suffix is an operator input, not proof of DNS ownership. The
+local certificate and socket checks do not prove public certificate trust,
+external DNS resolution, firewall/NAT routing, or internet reachability. The
+operator remains responsible for those external facts. There is no listener or
+Container Endpoint Offering unless the exact supported Service and Endpoint
+package pair and the opt-in Container runtime are both present. The released
+default set of 17 Forms does not gain a Container Form through this setting;
+local candidate fixtures and a successful local handshake do not publish or
+admit a Form package.
+
 For incidents, operators should still collect supervisor process state and
 captured startup/runtime logs (including `workerd runtime child exited`,
 restart scheduling, and recovery-success diagnostics), then perform an

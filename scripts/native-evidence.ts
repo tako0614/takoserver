@@ -189,9 +189,9 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
       "TAKOSERVER_NATIVE_CONTAINER_NETWORK",
     ],
     proves:
-      "the explicitly selected local unpublished ContainerService Form through public Host CRUD across real OS-process restart and Docker lifecycle boundaries; it does not prove publisher admission, published support, or caller-facing HTTP Binding",
+      "the explicitly selected local unpublished ContainerService and exact repository-fixture ContainerEndpoint Forms through public Host CRUD, actual OS-process restart, lost-acknowledgement replay, Docker ownership and lifecycle readback, and loopback TCP 443 TLS/SNI; it does not prove publisher admission, published support, public DNS or certificate trust, or portable HTTP Binding",
     enable:
-      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Form artifact path/SHA-256, two distinct immutable image refs, Docker Unix socket path, and pre-created owned internal network. The gated test checks both exact RepoDigests are already local, but the runtime still sends Docker /images/create requests that may contact those images' public registry; this does not prove zero registry contact",
+      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Service Form artifact path/SHA-256, the frozen repository Endpoint fixture, two distinct immutable image refs, Docker Unix socket path, pre-created owned internal network, and available loopback TCP port 443. The gated test checks both exact RepoDigests are already local, but the runtime still sends Docker /images/create requests that may contact those images' public registry; this does not prove zero registry contact",
     inspect: (configured, environment, probe) => {
       if (configured === undefined || configured.trim() === "") {
         return {

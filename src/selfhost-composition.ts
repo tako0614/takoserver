@@ -26,6 +26,13 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import {
+  LOCAL_CONTAINER_ENDPOINT_FORM,
+  LOCAL_CONTAINER_ENDPOINT_PACKAGE_DIGEST,
+  type SelfhostContainerEndpointHttpsIngressPort,
+  type SelfhostContainerEndpointIngressCapability,
+  validateSelfhostContainerEndpointIngressPort,
+} from "./providers/selfhost-container-endpoint.ts";
 import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
 import type { SelfhostStandardServiceIntegration } from "./providers/selfhost-standard-services.ts";
@@ -97,6 +104,54 @@ const LOCAL_CONTAINER_FORM = {
 const LOCAL_CONTAINER_PACKAGE_DIGEST =
   "sha256:0fb3c53940180e3f661268e079f9dbc6667c4d1fbbc74b4561ebb5ffa2740d33";
 
+/** Pure pre-bind gate for the optional local HTTPS listener; not Form admission. */
+export function hasExactLocalContainerEndpointCandidatePair(
+  forms: readonly InstalledTakoformForm[],
+): boolean {
+  const exact = (
+    form: InstalledTakoformForm,
+    ref: {
+      readonly apiVersion: string;
+      readonly kind: string;
+      readonly definitionVersion: string;
+      readonly schemaDigest: string;
+    },
+    digest: string,
+    role: "identity" | "attachment",
+  ) =>
+    form.identity.formRef.apiVersion === ref.apiVersion &&
+    form.identity.formRef.kind === ref.kind &&
+    form.identity.formRef.definitionVersion === ref.definitionVersion &&
+    form.identity.formRef.schemaDigest === ref.schemaDigest &&
+    form.identity.packageDigest === digest &&
+    form.role === role;
+  const service = forms.filter(
+    (form) =>
+      form.identity.formRef.kind === LOCAL_CONTAINER_FORM.kind &&
+      form.identity.formRef.apiVersion === LOCAL_CONTAINER_FORM.apiVersion &&
+      form.identity.formRef.definitionVersion === LOCAL_CONTAINER_FORM.definitionVersion,
+  );
+  const endpoint = forms.filter(
+    (form) =>
+      form.identity.formRef.kind === LOCAL_CONTAINER_ENDPOINT_FORM.kind &&
+      form.identity.formRef.apiVersion === LOCAL_CONTAINER_ENDPOINT_FORM.apiVersion &&
+      form.identity.formRef.definitionVersion === LOCAL_CONTAINER_ENDPOINT_FORM.definitionVersion,
+  );
+  return (
+    service.length === 1 &&
+    service[0] !== undefined &&
+    endpoint.length === 1 &&
+    endpoint[0] !== undefined &&
+    exact(service[0], LOCAL_CONTAINER_FORM, LOCAL_CONTAINER_PACKAGE_DIGEST, "identity") &&
+    exact(
+      endpoint[0],
+      LOCAL_CONTAINER_ENDPOINT_FORM,
+      LOCAL_CONTAINER_ENDPOINT_PACKAGE_DIGEST,
+      "attachment",
+    )
+  );
+}
+
 /** Forms the Host executes itself; they are never provider capabilities. */
 const HOST_INTRINSIC = new Set([
   "WorkerBundle",
@@ -114,6 +169,8 @@ export interface SelfhostCompositionOptions {
   readonly runtime: WorkerdRuntime;
   /** Explicit local native backend; an installed exact Form is required separately. */
   readonly container?: SelfhostContainerCapability;
+  /** Explicit proof-backed public HTTPS 443 ingress; absence advertises no Endpoint. */
+  readonly containerEndpointIngress?: SelfhostContainerEndpointHttpsIngressPort;
   /** False when this process did not verify the pinned closed-graph artifact. */
   readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
@@ -151,6 +208,7 @@ export interface SelfhostCompositionOptions {
 
 export interface SelfhostComposition extends DeploymentComposition {
   readonly provider: Provider;
+  readonly containerEndpointIngress?: SelfhostContainerEndpointIngressCapability;
 }
 
 export function createSelfhostComposition(
@@ -178,6 +236,11 @@ export function createSelfhostComposition(
   );
   if (containerForms.length > 1) throw new TypeError("ambiguous ContainerService installation");
   const containerForm = containerForms[0];
+  if (options.containerEndpointIngress) {
+    validateSelfhostContainerEndpointIngressPort(options.containerEndpointIngress);
+    if (!options.container)
+      throw new TypeError("ContainerEndpoint ingress requires the local Container runtime");
+  }
   if (options.container && containerForm) {
     if (
       containerForm.identity.formRef.schemaDigest !== LOCAL_CONTAINER_FORM.schemaDigest ||
@@ -202,6 +265,40 @@ export function createSelfhostComposition(
     };
     identityOfferings.push({ offering, resourceClass: "compute.container" });
     technicalOfferings.push(offering);
+  }
+
+  // This attachment inherits its target ContainerService installation. It is
+  // never a retail candidate, and its public ingress is absent without an
+  // independently qualified HTTPS listener on an owned suffix.
+  const endpointForms = options.stableForms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === LOCAL_CONTAINER_ENDPOINT_FORM.apiVersion &&
+      form.identity.formRef.kind === LOCAL_CONTAINER_ENDPOINT_FORM.kind &&
+      form.identity.formRef.definitionVersion === LOCAL_CONTAINER_ENDPOINT_FORM.definitionVersion,
+  );
+  if (endpointForms.length > 1) throw new TypeError("ambiguous ContainerEndpoint installation");
+  const endpointForm = endpointForms[0];
+  const endpointIngress =
+    options.container && options.containerEndpointIngress && containerForm && endpointForm
+      ? { runtime: options.container.runtime, qualification: options.containerEndpointIngress }
+      : undefined;
+  if (endpointIngress && endpointForm) {
+    if (
+      endpointForm.identity.formRef.schemaDigest !== LOCAL_CONTAINER_ENDPOINT_FORM.schemaDigest ||
+      endpointForm.identity.packageDigest !== LOCAL_CONTAINER_ENDPOINT_PACKAGE_DIGEST ||
+      endpointForm.role !== "attachment" ||
+      !endpointForm.operations.includes("create") ||
+      !endpointForm.operations.includes("delete") ||
+      !endpointForm.operations.includes("observe") ||
+      endpointForm.operations.includes("update") ||
+      endpointForm.operations.includes("import")
+    )
+      throw new TypeError("ContainerEndpoint installation is incomplete");
+    const offering = edgeProviderOffering(endpointForm, {
+      id: "selfhost.container.http.endpoint",
+    });
+    technicalOfferings.push(offering);
+    technicalRelationOfferings.push(offering);
   }
 
   if (options.edgeForms) {
@@ -278,6 +375,7 @@ export function createSelfhostComposition(
     runtime: options.runtime,
     artifacts: options.artifacts,
     ...(options.container ? { container: options.container } : {}),
+    ...(endpointIngress ? { containerEndpointIngress: endpointIngress } : {}),
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined
@@ -401,7 +499,11 @@ export function createSelfhostComposition(
   // `/provision/v1`. The current ObjectBucket is a candidate now — this machine
   // realizes the supply — while the retained v1beta1 identity stays
   // recovery-only under its own address-derived names.
-  return { ...compiled, provider };
+  return {
+    ...compiled,
+    provider,
+    ...(endpointIngress ? { containerEndpointIngress: endpointIngress } : {}),
+  };
 }
 
 const SELFHOST_EDGE_RELATION_KINDS = new Set([
@@ -411,6 +513,7 @@ const SELFHOST_EDGE_RELATION_KINDS = new Set([
   "WorkerEndpoint",
   "WorkerCronTrigger",
   "QueueConsumer",
+  "ContainerEndpoint",
 ]);
 
 const SELFHOST_RELATION_READBACK_ANCHORS: Readonly<Record<string, readonly string[]>> = {
@@ -420,6 +523,7 @@ const SELFHOST_RELATION_READBACK_ANCHORS: Readonly<Record<string, readonly strin
   WorkerEndpoint: ["ModuleWorker"],
   WorkerCronTrigger: ["ModuleWorker"],
   QueueConsumer: ["ModuleWorker", "AtLeastOnceQueue"],
+  ContainerEndpoint: ["ContainerService"],
 };
 
 function createSelfhostNativeReadbackAuthorities(

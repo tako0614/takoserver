@@ -3,7 +3,6 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
-  copyFileSync,
   cpSync,
   existsSync,
   mkdtempSync,
@@ -26,8 +25,10 @@ import type { CommandResult } from "../scripts/deploy/process.ts";
 import {
   runD1SchemaRehearsalBaseline as runBaseline,
   runD1Schema as runSchema,
+  SCHEMA_WAVE_BOUNDARIES,
   type SchemaProcess,
   type SchemaReader,
+  type SchemaWaveBoundary,
 } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
@@ -46,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0067_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0067_container_runtime_input_custody (id TEXT);\n",
+    "0068_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0068_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0068_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0068_container_runtime_input_rewrap (id TEXT);\n",
+    "0069_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0069_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0069_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0069_container_runtime_input_acceptance (id TEXT);\n",
+    "0070_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0070_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -68,8 +69,9 @@ function currentIntegrationMigrations(directory: string): string {
 }
 
 // These cases exercise fixed next-wave boundaries from the current audited
-// 0001-0066 source. Historical 0001-0049 fixtures are passed explicitly by
-// tests that exercise frozen import/lineage behavior.
+// 0001-0067 source closure. The apply ceiling remains 0066. Historical
+// 0001-0049 fixtures are passed explicitly by tests that exercise frozen
+// import/lineage behavior.
 function runD1Schema(...[invocation, selectedTarget, options]: Parameters<typeof runSchema>) {
   return runSchema(invocation, selectedTarget, {
     migrationDirectory: currentMigrations,
@@ -700,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0066");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0067");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1134,42 +1136,171 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0066");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0067");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("a fixed wave refuses migrations outside the exact audited 0001-0066 inventory", async () => {
-    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-lineage-extension-"));
+  test("audited 0067 is source closure only and leaves existing apply boundaries unchanged", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0067-source-only-"));
     try {
-      const migrationDirectory = join(root, "migrations");
-      cpSync(currentMigrations, migrationDirectory, { recursive: true });
-      copyFileSync(
-        join(migrationDirectory, "0052_workflow_termination_intent.sql"),
-        join(migrationDirectory, "0067_unreviewed_extension.sql"),
-      );
-      const failure = await runD1Schema(
+      const result = await runD1Schema(
         {
           action: "status",
-          environment: "rehearsal",
+          environment: "integration",
           commit: COMMIT,
-          throughMigration: "0028",
+          throughMigration: "0057",
         },
-        target,
+        { ...target, environment: "integration" },
         {
-          reader: readerSequence([stateThrough(22, "l")]),
-          migrationDirectory,
+          reader: dataReaderSequence([stateThrough(56, "0067-source-only")]),
+          migrationDirectory: currentMigrations,
           outputDirectory: join(root, "work"),
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
-      ).catch((error) => error);
-      expect(failure.message).toContain("exact audited source inventory 0001-0066");
+      );
+
+      expect(result).toMatchObject({
+        throughMigration: "0057_cloudflare_managed_worker_version_execution_material.sql",
+        pendingMigrations: ["0057_cloudflare_managed_worker_version_execution_material.sql"],
+      });
+      expect(SCHEMA_WAVE_BOUNDARIES.at(-1)).toBe("0058");
+      expect(SCHEMA_WAVE_BOUNDARIES.map(String)).not.toContain("0067");
+
+      const integrationTail = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
+        {
+          reader: dataReaderSequence([stateThrough(66, "after-0066")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "integration-tail"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      );
+      expect(integrationTail).toMatchObject({
+        throughMigration: "0066_cloudflare_managed_actor_kv_capability_claims.sql",
+        pendingMigrations: [],
+        nextPendingMigration: null,
+      });
+
+      const beyondApplyCeiling = processFixture("rehearsal");
+      const outOfAuthorityStatus = await runD1Schema(
+        { action: "status", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
+        {
+          run: beyondApplyCeiling.run,
+          reader: dataReaderSequence([stateThrough(67, "already-at-source-only-0067")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "out-of-authority-status"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(outOfAuthorityStatus).toBeInstanceOf(DeployError);
+      expect(String(outOfAuthorityStatus)).toContain(
+        "outside the 0001-0066 apply-qualified ceiling",
+      );
+      expect(beyondApplyCeiling.calls).toHaveLength(0);
+
+      const outOfAuthorityApply = await runD1Schema(
+        { action: "apply", environment: "integration", commit: COMMIT },
+        { ...target, environment: "integration" },
+        {
+          run: beyondApplyCeiling.run,
+          reader: dataReaderSequence([stateThrough(67, "already-at-source-only-0067")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "out-of-authority-apply"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(outOfAuthorityApply).toBeInstanceOf(DeployError);
+      expect(String(outOfAuthorityApply)).toContain(
+        "outside the 0001-0066 apply-qualified ceiling",
+      );
+      expect(beyondApplyCeiling.calls).toHaveLength(0);
+
+      const fixture = processFixture();
+      const unapprovedBoundary = await runD1Schema(
+        {
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+          throughMigration: "0067" as unknown as SchemaWaveBoundary,
+        },
+        { ...target, environment: "integration" },
+        {
+          run: fixture.run,
+          reader: dataReaderSequence([stateThrough(66, "after-0066")]),
+          migrationDirectory: currentMigrations,
+          outputDirectory: join(root, "unapproved"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+        },
+      ).catch((error: unknown) => error);
+
+      expect(unapprovedBoundary).toBeInstanceOf(DeployError);
+      expect(String(unapprovedBoundary)).toContain("not an approved fixed wave boundary");
+      expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  for (const drift of [
+    { name: "missing", expected: "exact audited source inventory 0001-0067" },
+    { name: "changed", expected: "exact audited migration SHA-256" },
+    { name: "extra", expected: "exact audited source inventory 0001-0067" },
+  ] as const) {
+    test(`current 0067 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+      const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0067-${drift.name}-`));
+      try {
+        const migrationDirectory = join(root, "migrations");
+        cpSync(currentMigrations, migrationDirectory, { recursive: true });
+        const migration0067 = join(
+          migrationDirectory,
+          "0067_takoform_container_endpoint_hostname_index.sql",
+        );
+        if (drift.name === "missing") {
+          rmSync(migration0067);
+        } else if (drift.name === "changed") {
+          writeFileSync(
+            migration0067,
+            `${readFileSync(migration0067, "utf8")}\n-- mutated after source audit\n`,
+          );
+        } else {
+          writeFileSync(
+            join(migrationDirectory, "0068_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0068_unreviewed_extension (id TEXT);\n",
+            { mode: 0o600 },
+          );
+        }
+
+        const fixture = processFixture();
+        const failure = await runD1Schema(
+          {
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+            throughMigration: "0057",
+          },
+          { ...target, environment: "integration" },
+          {
+            run: fixture.run,
+            reader: dataReaderSequence([stateThrough(56, "0067-drift")]),
+            migrationDirectory,
+            outputDirectory: join(root, "work"),
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          },
+        ).catch((error: unknown) => error);
+
+        expect(failure).toBeInstanceOf(DeployError);
+        expect(String(failure)).toContain(drift.expected);
+        expect(fixture.calls).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 
   for (const refusedBoundary of ["0059", "0060", "0061", "0062", "0063", "0064", "0065"] as const) {
     test(`${refusedBoundary} remains unavailable as a rehearsal or production fixed-wave boundary`, async () => {

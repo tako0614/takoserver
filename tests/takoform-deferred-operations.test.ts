@@ -128,6 +128,97 @@ afterAll(() => {
 });
 
 describe("durable deferred Takoform operations", () => {
+  test("replays a completed delete without touching a same-name replacement", async () => {
+    const memory = new InMemoryTakoformResourceDriver();
+    let deletes = 0;
+    const driver: TakoformResourceDriver = {
+      ...memory,
+      selectApply: (input) => memory.selectApply(input),
+      apply: (input) => memory.apply(input),
+      observe: (input) => memory.observe(input),
+      delete: async (input) => {
+        deletes += 1;
+        return await memory.delete(input);
+      },
+    };
+    const harness = persistentHarness(undefined, driver, [form], {
+      shouldDefer: () => true,
+      pollsBeforeCommit: 1,
+      executeOnAccept: true,
+    });
+    let opened = harness.open();
+    const name = "delete-replay-replacement";
+    const desired = desiredResource(name, "original");
+    const review = await prepareReview(opened.host, desired);
+    const resourcePath = `${lane}/resources/example.forms.invalid/DeferredThing/${name}`;
+    const created = await opened.host.handle(
+      request(resourcePath, "primary", {
+        method: "PUT",
+        headers: { "idempotency-key": "replacement-original-create", "if-none-match": "*" },
+        body: JSON.stringify({ ...desired, review }),
+      }),
+    );
+    expect(created?.status).toBe(201);
+    if (!created) throw new Error("original create returned no response");
+    const originalUid = ((await created.json()) as { metadata: { uid: string } }).metadata.uid;
+    const deletePath = `${resourcePath}?${new URLSearchParams({
+      space: "main",
+      group: form.identity.formRef.apiVersion,
+      kind: form.identity.formRef.kind,
+      definitionVersion: form.identity.formRef.definitionVersion,
+      schemaDigest: form.identity.formRef.schemaDigest,
+    })}`;
+    const remove = (path = deletePath, token = "primary", key = "replacement-delete") =>
+      opened.host.handle(
+        request(path, token, {
+          method: "DELETE",
+          headers: {
+            "idempotency-key": key,
+            "takoform-expected-generation": "1",
+          },
+        }),
+      );
+    expect((await remove())?.status).toBe(204);
+    expect(deletes).toBe(1);
+    opened.close();
+    opened = harness.open();
+    expect((await remove(deletePath, "primary", "replacement-new-delete"))?.status).toBe(404);
+    expect((await remove(deletePath, "alternate"))?.status).toBe(404);
+    expect((await remove(deletePath, "other-tenant"))?.status).toBe(404);
+    expect((await remove(deletePath, "revoked"))?.status).toBe(401);
+    const changedFence = await opened.host.handle(
+      request(deletePath, "primary", {
+        method: "DELETE",
+        headers: {
+          "idempotency-key": "replacement-delete",
+          "takoform-expected-generation": "2",
+        },
+      }),
+    );
+    expect(changedFence?.status).toBe(400);
+    expect(deletes).toBe(1);
+    expect((await remove())?.status).toBe(204);
+    expect(deletes).toBe(1);
+    const nextDesired = desiredResource(name, "replacement");
+    const nextReview = await prepareReview(opened.host, nextDesired);
+    const replacement = await opened.host.handle(
+      request(resourcePath, "primary", {
+        method: "PUT",
+        headers: { "idempotency-key": "replacement-next-create", "if-none-match": "*" },
+        body: JSON.stringify({ ...nextDesired, review: nextReview }),
+      }),
+    );
+    expect(replacement?.status).toBe(201);
+    if (!replacement) throw new Error("replacement create returned no response");
+    const replacementUid = ((await replacement.json()) as { metadata: { uid: string } }).metadata
+      .uid;
+    expect(replacementUid).not.toBe(originalUid);
+    expect((await remove())?.status).toBe(204);
+    expect(deletes).toBe(1);
+    expect((await remove(deletePath, "primary", "replacement-new-delete"))?.status).toBe(204);
+    expect(deletes).toBe(2);
+    opened.close();
+  });
   test("serializes concurrent same-operation provider execution in the real store", async () => {
     const memory = new InMemoryTakoformResourceDriver();
     const entered = deferred();

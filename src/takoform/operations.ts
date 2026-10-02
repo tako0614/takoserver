@@ -1,7 +1,7 @@
 import { sanitizedMessage } from "../error-envelope.ts";
-import { canonicalJson } from "../json.ts";
+import { canonicalJson, isSha256Digest } from "../json.ts";
 import type { Clock, JsonObject } from "../ports.ts";
-import { acceptedAuthorityFromGrant } from "./accepted-authority.ts";
+import { acceptedAuthorityFromGrant, assertAcceptedAuthorityGrant } from "./accepted-authority.ts";
 import type { EngineContext, EngineMutationCommit, TakoformEngine } from "./engine.ts";
 import { exactInstalledForm, type FormRegistry, sameFormRef } from "./forms.ts";
 import type { TakoformHostAuthority } from "./host-authority.ts";
@@ -136,6 +136,106 @@ export function createDeferredOperations(input: {
       if (context.beforeCreate || context.commercialAuthority || context.provisionOnly) {
         return null;
       }
+      // A retained deferred receipt is identified by the original request,
+      // not by the lifecycle operation a live Resource would select today.
+      // In particular, an immutable Form's successful create is still a
+      // create replay after the Resource exists, and a successful delete is
+      // still a delete replay after it no longer exists.
+      const key = idempotencyKey(context.request);
+      const fingerprint = mutationFingerprint(
+        context.request,
+        await requestBodyDigest(context.request),
+      );
+      const replaySpace =
+        operation === "delete"
+          ? deleteReplaySpace(context, input.resourceQueryIncludesPathIdentity)
+          : (
+              await acceptedMutation(
+                context,
+                path,
+                operation,
+                input.forms,
+                input.store,
+                undefined,
+                input.resourceQueryIncludesPathIdentity,
+              )
+            ).space;
+      const replayKey = [
+        "deferred-v1",
+        context.tenantId,
+        context.principalId,
+        replaySpace,
+        operation,
+        key,
+      ].join("\0");
+      const existingReplay = await input.store.readDeferredOperationByReplay(replayKey);
+      if (existingReplay) {
+        if (existingReplay.fingerprint !== fingerprint) throw new TakoformHostError();
+        if (existingReplay.operation !== operation) {
+          throw new TakoformHostError("resource_not_found", 404);
+        }
+        if (operation === "delete") {
+          if (!sameReplayTarget(existingReplay, context, path, replaySpace)) {
+            throw new TakoformHostError("resource_not_found", 404);
+          }
+          if (isSuccessfulDelete(existingReplay)) {
+            return immediateTerminalResponse(existingReplay, "delete", input.omitObservedStatus);
+          }
+        } else if (!(await replayRetired(existingReplay, input.store))) {
+          const parsed = await acceptedMutation(
+            context,
+            path,
+            operation,
+            input.forms,
+            input.store,
+            undefined,
+            input.resourceQueryIncludesPathIdentity,
+          );
+          if (
+            !sameReplayTarget(existingReplay, context, path, parsed.space) ||
+            !sameFormRef(existingReplay.target.formRef, parsed.formRef) ||
+            (context.expectedResourceUid !== undefined &&
+              parsed.current?.metadata.uid !== context.expectedResourceUid) ||
+            (parsed.current &&
+              parsed.current.metadata.uid !==
+                (existingReplay.acceptedUid ?? existingReplay.resourceUid))
+          ) {
+            throw new TakoformHostError("resource_not_found", 404);
+          }
+          const originalOperation =
+            operation === "import"
+              ? "import"
+              : existingReplay.acceptedUid === undefined
+                ? "create"
+                : "update";
+          if (input.authority) {
+            const grant = await input.authority.authorizeMutation({
+              operation: originalOperation,
+              context: {
+                tenantId: context.tenantId,
+                principalId: context.principalId,
+                space: parsed.space,
+              },
+              formRef: parsed.formRef,
+            });
+            if (operation === "apply" && existingReplay.acceptedAuthority) {
+              try {
+                assertAcceptedAuthorityGrant({
+                  summary: existingReplay.acceptedAuthority,
+                  lifecycleOperation: originalOperation as "create" | "update",
+                  formRef: parsed.formRef,
+                  grant,
+                });
+              } catch {
+                throw new TakoformHostError("form_unavailable", 503);
+              }
+            }
+          }
+          return input.configuration.executeOnAccept
+            ? await executeAccepted(existingReplay, originalOperation, context.lifetime)
+            : acceptedResponse(existingReplay.id, retryAfterSeconds);
+        }
+      }
       const accepted = await acceptedMutation(
         context,
         path,
@@ -156,20 +256,7 @@ export function createDeferredOperations(input: {
         return null;
       }
 
-      const key = idempotencyKey(context.request);
-      const replayKey = [
-        "deferred-v1",
-        context.tenantId,
-        context.principalId,
-        accepted.space,
-        operation,
-        key,
-      ].join("\0");
-      const fingerprint = mutationFingerprint(
-        context.request,
-        await requestBodyDigest(context.request),
-      );
-      const replay = await input.store.readDeferredOperationByReplay(replayKey);
+      const replay = existingReplay;
       if (replay) {
         if (replay.fingerprint !== fingerprint) throw new TakoformHostError();
         if (await replayRetired(replay, input.store)) {
@@ -802,6 +889,61 @@ async function acceptedMutation(
     space,
     current,
   };
+}
+
+function deleteReplaySpace(
+  context: EngineContext,
+  resourceQueryIncludesPathIdentity = false,
+): string {
+  exactQuery(
+    context.url,
+    resourceQueryIncludesPathIdentity
+      ? ["space", "group", "kind", "definitionVersion", "schemaDigest"]
+      : ["space", "definitionVersion", "schemaDigest"],
+  );
+  return requiredQuery(context.url, "space");
+}
+
+function sameReplayTarget(
+  replay: DeferredOperationRecord,
+  context: EngineContext,
+  path: ResourcePath,
+  space: string,
+): boolean {
+  if (
+    replay.tenantId !== context.tenantId ||
+    replay.principalId !== context.principalId ||
+    replay.target.space !== space ||
+    replay.target.apiVersion !== path.apiVersion ||
+    replay.target.kind !== path.kind ||
+    replay.target.name !== path.name
+  ) {
+    return false;
+  }
+  if (replay.operation !== "delete") return true;
+  if (
+    context.url.searchParams.has("group") &&
+    requiredQuery(context.url, "group") !== path.apiVersion
+  ) {
+    return false;
+  }
+  if (context.url.searchParams.has("kind") && requiredQuery(context.url, "kind") !== path.kind) {
+    return false;
+  }
+  const schemaDigest = requiredQuery(context.url, "schemaDigest");
+  if (!isSha256Digest(schemaDigest)) throw new TakoformHostError();
+  return sameFormRef(replay.target.formRef, {
+    apiVersion: path.apiVersion,
+    kind: path.kind,
+    definitionVersion: requiredQuery(context.url, "definitionVersion"),
+    schemaDigest,
+  });
+}
+
+function isSuccessfulDelete(replay: DeferredOperationRecord): boolean {
+  if (replay.operation !== "delete" || replay.phase !== "succeeded") return false;
+  const document = terminalDocument(replay);
+  return isRecord(document.result) && document.result.deleted === true;
 }
 
 function retainedLifecycleHeaders(request: Request): Readonly<Record<string, string>> {

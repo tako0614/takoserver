@@ -24,15 +24,13 @@ import {
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
+import { applyQualifiedSchemaState } from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
-import {
-  completeIntegrationStorageState,
-  integrationStorageVerificationOptions,
-} from "./helpers/integration-storage-generation-verification.ts";
+import { integrationStorageVerificationOptions as baseIntegrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
 
 const COMMIT = "a".repeat(40);
 const PREVIOUS_COMMIT = "b".repeat(40);
@@ -62,6 +60,16 @@ const SUCCESSFUL_FORM_GATE_COMMANDS = new Set([
   "bun run check:integration-form-packages",
   "bun run build:form-authority-worker",
 ]);
+
+function integrationStorageVerificationOptions(
+  target: DeployTarget,
+  input: Parameters<typeof baseIntegrationStorageVerificationOptions>[1] = {},
+) {
+  return baseIntegrationStorageVerificationOptions(target, {
+    ...input,
+    readState: input.readState ?? (async () => applyQualifiedSchemaState()),
+  });
+}
 const BUNDLE = "export default class FormAuthorityEntrypoint {}\n";
 const PUBLIC_BUNDLE = "export default { async fetch() { return new Response('public'); } };\n";
 const BUNDLE_DIGEST = `sha256:${createHash("sha256").update(BUNDLE).digest("hex")}` as const;
@@ -1190,7 +1198,7 @@ describe("ordinary integration Form code gate", () => {
     let schemaReads = 0;
     try {
       const process = fakeProcess({ onUpload: () => (uploaded = true) });
-      const completeState = completeIntegrationStorageState();
+      const completeState = applyQualifiedSchemaState();
       expect(completeState.applied).toContain("0058_cloudflare_managed_worker_domain_receipts.sql");
       const storageVerification = integrationStorageVerificationOptions(formStorageTarget, {
         provider: {
@@ -1250,7 +1258,7 @@ describe("ordinary integration Form code gate", () => {
     let schemaReads = 0;
     try {
       const process = fakeProcess({ onUpload: () => (uploaded = true) });
-      const firstState = completeIntegrationStorageState();
+      const firstState = applyQualifiedSchemaState();
       const rows = JSON.parse(firstState.shape) as {
         readonly type: string;
         readonly name: string;
@@ -1321,7 +1329,7 @@ describe("ordinary integration Form code gate", () => {
       const root = mkdtempSync(join(tmpdir(), "takoserver-form-code-gate-storage-refusal-"));
       let uploaded = false;
       const process = fakeProcess({ onUpload: () => (uploaded = true) });
-      const completeState = completeIntegrationStorageState();
+      const completeState = applyQualifiedSchemaState();
       const storageVerification =
         failureKind === "missing D1"
           ? integrationStorageVerificationOptions(formStorageTarget, {
@@ -4099,7 +4107,7 @@ describe("released-Core Form authority bootstrap", () => {
         { authorityWorkerVersionId: RELEASED_CORE_VERSION_ID },
         { authorityWorkerVersionId: RELEASED_CORE_SUCCESSOR_VERSION_ID },
       ]);
-      const state = completeIntegrationStorageState();
+      const state = applyQualifiedSchemaState();
       const result = await applyRoutineExactTarget({
         run: process.run,
         state: releasedCoreState({ present: true, isUploaded: () => uploaded }, formStorageTarget),

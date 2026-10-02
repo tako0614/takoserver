@@ -22,6 +22,8 @@ import type { TakoformHost } from "./takoform/types.ts";
  */
 
 export interface CreateRouterOptions {
+  /** Dedicated qualified HTTPS hostname dispatch, ahead of every Host path and CORS rule. */
+  readonly containerEndpointIngress?: (request: Request) => Promise<Response | null>;
   readonly control: ControlRoutes;
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
@@ -46,6 +48,8 @@ export function createRouter(options: CreateRouterOptions): Router {
   const route = dispatch(options, origin);
 
   return async (request, lifetime) => {
+    const endpoint = await options.containerEndpointIngress?.(request);
+    if (endpoint) return endpoint;
     // A browser asking whether it may make the real call. Answering it is the
     // whole of preflight; nothing is routed and nothing is authenticated.
     if (request.method === "OPTIONS" && request.headers.get("origin")) {

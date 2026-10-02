@@ -24,16 +24,14 @@ import {
   LEGACY_PUBLIC_PARENT_SECRET,
   type WorkerClosureDelta,
 } from "../scripts/deploy/worker-state.ts";
+import { applyQualifiedSchemaState } from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
-import {
-  completeIntegrationStorageState,
-  integrationStorageVerificationOptions,
-} from "./helpers/integration-storage-generation-verification.ts";
+import { integrationStorageVerificationOptions as baseIntegrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
 
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
@@ -47,6 +45,16 @@ const STORAGE_DATABASE_ID = "00000000-0000-4000-8000-0000000000a5";
 const STORAGE_GENERATION = "f".repeat(32);
 const PREDECESSOR_STORAGE_BUCKET = `takoserver-i-${"e".repeat(32)}`;
 const STORAGE_NAME = `takoserver-i-${STORAGE_GENERATION}`;
+
+function integrationStorageVerificationOptions(
+  target: DeployTarget,
+  input: Parameters<typeof baseIntegrationStorageVerificationOptions>[1] = {},
+) {
+  return baseIntegrationStorageVerificationOptions(target, {
+    ...input,
+    readState: input.readState ?? (async () => applyQualifiedSchemaState()),
+  });
+}
 
 const RETIRED_VAR = "TAKOSERVER_STANDARD_SERVICE_SUPPLIES";
 const ADDED_VAR = "TAKOSERVER_OBJECT_BUCKET_SUPPLIES";
@@ -848,7 +856,7 @@ describe("reviewed Worker closure transition", () => {
             {
               readState: async () => {
                 fenceEvents.push("generated-storage-schema");
-                return completeIntegrationStorageState();
+                return applyQualifiedSchemaState();
               },
             },
           ),
@@ -991,7 +999,7 @@ describe("reviewed Worker closure transition", () => {
 
   test("storage rebind stops at the immediate schema fence and on a failed gate before upload", async () => {
     await withRoot("takoserver-closure-storage-rebind-fence-", async (root) => {
-      const complete = completeIntegrationStorageState();
+      const complete = applyQualifiedSchemaState();
       const changedShape = "[]\n";
       const changed = {
         ...complete,
