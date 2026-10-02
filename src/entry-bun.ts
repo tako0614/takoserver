@@ -37,6 +37,11 @@ import {
   createSelfhostContainerSignalHandler,
 } from "./selfhost-container-bootstrap.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
+import {
+  createSelfhostBunFetchHandler,
+  createSelfhostHealthHandler,
+  type SelfhostStartupRestoreOutcome,
+} from "./selfhost-health.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -814,12 +819,15 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
  * operator would diagnose it, and `has()` already fails closed, so nothing is
  * observed Ready on a runtime that is not running.
  */
+let startupRestore: SelfhostStartupRestoreOutcome;
 try {
   const restored = await workerdRuntime.restore();
+  startupRestore = restored.length === 0 ? "empty" : "restored";
   if (restored.length > 0) {
     console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
   }
 } catch (error) {
+  startupRestore = "failed";
   process.stderr.write(
     `the Worker runtime could not be restored at boot: ${
       error instanceof Error ? error.message : "unknown error"
@@ -827,14 +835,22 @@ try {
   );
 }
 
+const selfhostHealth = createSelfhostHealthHandler({
+  sql,
+  startupRestore,
+  supervisor: workerd,
+});
+
 Bun.serve({
   port,
   // Longer than the default, because publishing a site means uploading its
   // files and a request that is doing real work is not an idle one.
   idleTimeout: 120,
-  async fetch(request) {
-    return (await provision(request)) ?? (await app.fetch(request));
-  },
+  fetch: createSelfhostBunFetchHandler({
+    health: selfhostHealth,
+    provision,
+    appFetch: (request) => app.fetch(request),
+  }),
 });
 if (dataPlanes) {
   // Recorded, because an operator debugging a Worker's storage needs to know

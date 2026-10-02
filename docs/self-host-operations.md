@@ -109,12 +109,42 @@ claim GA status.
    accepting connections or a process log line alone is not functional
    readback.
 
-The Bun self-host does not currently provide an HTTP health/readiness API.
-`GET /healthz` belongs to the Cloudflare Worker entry, not this Bun entry. For
-the Bun process, operators must use supervisor process state, captured startup
-and runtime logs (including `workerd runtime child exited`, restart scheduling,
-and recovery-success diagnostics), and an authenticated functional readback.
-These signals do not constitute a monitoring or alerting service.
+The Bun self-host exposes two unauthenticated, no-store operational probes,
+outside the Host API v1 and the shared OpenAPI route table:
+
+- `GET /_takoserver/health/live` returns `200` while the Bun HTTP handler is
+  responding. It does not query SQLite or the Worker runtime.
+- `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
+  a one-second response deadline, then samples the current workerd supervisor
+  state. It returns `200` only when SQLite answered and the required runtime is
+  either currently serving or not required; otherwise it returns `503`.
+
+The readiness body contains only fixed state labels: `database` is `readable`
+or `unavailable`; `workerRuntime` is `not-required`, `starting`, `serving`,
+`recovering`, `restore-failed`, or `unavailable`; and `supervisor` is the
+current child lifecycle state (`idle`, `starting`, `serving`, `recovering`, or
+`unavailable`). An empty successful boot restore with no published Workers is
+`not-required`, not a failure. A failed boot restore remains `restore-failed`
+for this process even if a later child passes its listener check: that check
+does not prove the entire durable published graph was restored. A process
+restart performs the authoritative boot restore again.
+
+These probes are observational only: they do not call restore, spawn or ensure
+workerd, or run a product/provisioner route. The response contains no raw
+errors, paths, organization or Resource identifiers, workload counts, or
+secrets. A `serving` result means this Host's current workerd child passed the
+Host-owned listener readiness check; it is not a claim that every Form,
+provider, or tenant Worker application is ready. In particular,
+Host/control-plane readiness and application-level health remain distinct.
+`GET /healthz` on the Cloudflare Worker entry is a separate runtime surface;
+these Bun-only diagnostics do not change that entry or the shared OpenAPI
+contract.
+
+For incidents, operators should still collect supervisor process state and
+captured startup/runtime logs (including `workerd runtime child exited`,
+restart scheduling, and recovery-success diagnostics), then perform an
+authenticated functional readback. These probes and signals do not constitute
+a monitoring or alerting service.
 
 ## Update and code rollback
 

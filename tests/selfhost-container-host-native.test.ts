@@ -11,6 +11,11 @@ import {
   installLocalContainerCandidateForTest,
   loadVerifiedLocalContainerCandidate,
 } from "./fixtures/selfhost-container-host-authority.ts";
+import {
+  captureAndIssueManagement,
+  createResellerProvision,
+  type HostJsonPost,
+} from "./fixtures/selfhost-container-host-reseller-requests.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const ENABLED = nativeEvidenceBinary("container-host-lifecycle") ?? null;
@@ -448,6 +453,11 @@ async function api(
   return text ? (JSON.parse(text) as Record<string, unknown>) : {};
 }
 
+function postHost(baseUrl: string): HostJsonPost {
+  return (path, expectedStatus, body, headers) =>
+    api(baseUrl, "POST", path, expectedStatus, body, headers);
+}
+
 const BACKEND_UNAVAILABLE_RETRY_WINDOW_MS = 30_000;
 const BACKEND_UNAVAILABLE_MAX_ATTEMPTS = 8;
 
@@ -864,41 +874,16 @@ test.skipIf(
           offering.form.kind === FORM_REF.kind,
       ),
     ).toBe(true);
-    const quote = await api(
-      firstHost.baseUrl,
-      "POST",
-      "/v1/reseller/quotes",
-      201,
-      {
-        tenantRef: "tenant_container_native",
-        offeringId: "selfhost.container.http.standard",
-        quantity: 1,
-      },
+    const provision = await createResellerProvision(postHost(firstHost.baseUrl), {
+      tenantRef: "tenant_container_native",
+      offeringId: "selfhost.container.http.standard",
+      resourceName: "service",
+      quantity: 1,
+      tokenExpiresInSeconds: 900,
       apiKey,
-    );
-    const reservation = await api(
-      firstHost.baseUrl,
-      "POST",
-      "/v1/reseller/reservations",
-      201,
-      {
-        tenantRef: "tenant_container_native",
-        quoteId: String((quote as { quote: { id: string } }).quote.id),
-      },
-      apiKey,
-    );
-    const reservationId = String((reservation as { reservation: { id: string } }).reservation.id);
-    const provision = await api(
-      firstHost.baseUrl,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/takoform-run-tokens`,
-      201,
-      { tenantRef: "tenant_container_native", resourceName: "service", expiresInSeconds: 900 },
-      apiKey,
-    );
-    const provisionToken = {
-      authorization: `Bearer ${String((provision as { takoformRunToken: { token: string } }).takoformRunToken.token)}`,
-    };
+    });
+    const { reservationId } = provision;
+    const provisionToken = provision.provisionAuthorization;
     const desired = {
       apiVersion: FORM_REF.apiVersion,
       kind: FORM_REF.kind,
@@ -1008,30 +993,21 @@ test.skipIf(
     );
     expect(replayedPrivateNative).toEqual(createdPrivateNative);
     expect(created.metadata.generation).toBe("1");
-    await api(
-      secondHost.baseUrl,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/capture`,
-      200,
-      { tenantRef: "tenant_container_native", usage: { quantity: 1 } },
+    const management = await captureAndIssueManagement(postHost(secondHost.baseUrl), {
+      reservationId,
+      tenantRef: "tenant_container_native",
+      resourceName: "service",
+      resourceUid: created.metadata.uid,
+      captureQuantity: 1,
+      tokenExpiresInSeconds: 900,
       apiKey,
-    );
-    const management = await api(
-      secondHost.baseUrl,
-      "POST",
-      `/v1/reseller/reservations/${reservationId}/takoform-run-tokens`,
-      201,
-      {
-        tenantRef: "tenant_container_native",
-        resourceName: "service",
-        resourceUid: created.metadata.uid,
-        expiresInSeconds: 900,
-      },
-      apiKey,
-    );
-    const manager = {
-      authorization: `Bearer ${String((management as { takoformRunToken: { token: string } }).takoformRunToken.token)}`,
-    };
+    });
+    expect(management.captureStatement).toMatchObject({
+      reservationId,
+      tenantRef: "tenant_container_native",
+      usage: { quantity: 1 },
+    });
+    const manager = management.managementAuthorization;
     const readAfterRestart = await api(
       secondHost.baseUrl,
       "GET",

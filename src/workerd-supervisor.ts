@@ -27,7 +27,15 @@ export interface WorkerdSupervisor {
   ensure(configPath: string): Promise<void>;
   /** Whether the child is currently alive and has passed readiness. */
   isReady(): boolean;
+  /** A fresh read-only view of the child lifecycle; it does not start recovery. */
+  snapshot(): WorkerdSupervisorSnapshot;
   stop(): void;
+}
+
+export type WorkerdSupervisorState = "idle" | "starting" | "serving" | "recovering" | "unavailable";
+
+export interface WorkerdSupervisorSnapshot {
+  readonly state: WorkerdSupervisorState;
 }
 
 type CancelScheduledRestart = () => void;
@@ -90,6 +98,8 @@ export function createWorkerdSupervisor(options: {
   // therefore rejects once and cannot turn into an unbounded background loop.
   let desired: DesiredRuntime | null = null;
   let pendingRestart: PendingRestart | null = null;
+  let firstStartFailed = false;
+  let stoppedAfterRequiredRuntime = false;
   let nextEpoch = 0;
   let nextRestartId = 0;
 
@@ -263,6 +273,8 @@ export function createWorkerdSupervisor(options: {
       }
 
       entry.ready = true;
+      firstStartFailed = false;
+      stoppedAfterRequiredRuntime = false;
       if (!desired) {
         desired = { configPath, epoch, restartAttempt: 0 };
       }
@@ -276,6 +288,7 @@ export function createWorkerdSupervisor(options: {
         kill(entry);
         if (running === entry) running = null;
       }
+      if (!recovery) firstStartFailed = true;
       throw error;
     }
   };
@@ -301,9 +314,11 @@ export function createWorkerdSupervisor(options: {
       if (running?.ready) return;
       if (starting) return await starting.promise;
       if (!options.binary) {
+        firstStartFailed = true;
         throw new Error("workerd runtime binary is required to activate Worker serving");
       }
       if (!options.readiness) {
+        firstStartFailed = true;
         throw new Error("workerd runtime readiness probe is required to activate Worker serving");
       }
 
@@ -317,9 +332,26 @@ export function createWorkerdSupervisor(options: {
       return running?.ready === true;
     },
 
+    snapshot() {
+      let state: WorkerdSupervisorState;
+      if (running?.ready) state = "serving";
+      else if (starting) state = desired ? "recovering" : "starting";
+      else if (pendingRestart) state = "recovering";
+      else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
+      else state = "idle";
+      return Object.freeze({ state });
+    },
+
     stop() {
+      stoppedAfterRequiredRuntime =
+        desired !== null ||
+        running !== null ||
+        starting !== null ||
+        pendingRestart !== null ||
+        firstStartFailed;
       nextEpoch += 1;
       desired = null;
+      firstStartFailed = false;
       cancelPendingRestart();
       const entry = running;
       running = null;
