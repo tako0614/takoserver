@@ -543,7 +543,7 @@ describe("bringing a local database up to date", () => {
     };
 
     try {
-      expect(() => migrateSqlite(commitAckLoss)).toThrow(/migration 0067_.* failed/u);
+      expect(() => migrateSqlite(commitAckLoss)).toThrow(`${MIGRATIONS.at(-1)?.name} failed`);
       database.close();
       const reopened = new Database(path);
       const report = migrateSqlite(reopened);
