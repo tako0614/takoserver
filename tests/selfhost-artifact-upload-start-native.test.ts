@@ -4,8 +4,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } f
 import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createEphemeralSql } from "../src/compat.ts";
 import { bytesDigest } from "../src/json.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
+import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 
 const HOST_ORIGIN = "http://127.0.0.1:8787";
@@ -234,15 +237,12 @@ async function publishModuleArtifact(
   const started = await startModuleArtifact(bytes, `${idempotencyPrefix}-upload`, auth);
   mark("v1_start", "ok");
   expect(started.missingBlobs.includes(started.digest)).toBe(true);
-  const blob = await fetch(
-    `${HOST_ORIGIN}${LANE}/artifacts/uploads/${encodeURIComponent(started.uploadId)}/blobs/${encodeURIComponent(started.digest)}`,
-    {
-      method: "PUT",
-      headers: auth,
-      body: bytes as unknown as BodyInit,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    },
-  );
+  const blob = await fetch(`${HOST_ORIGIN}${artifactBlobPath(started.uploadId, started.digest)}`, {
+    method: "PUT",
+    headers: auth,
+    body: bytes as unknown as BodyInit,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
   expect(blob.status).toBe(201);
   await blob.arrayBuffer();
   mark("v1_blob", "ok");
@@ -291,6 +291,67 @@ async function startModuleArtifact(
   if (!Array.isArray(missingBlobs)) throw new Error("selfhost_missing_blobs_shape");
   return { uploadId: stringAt(upload, "uploadId"), digest, missingBlobs };
 }
+
+test("artifact blob URL preserves the literal digest colon required by the real handler", async () => {
+  const bytes = new TextEncoder().encode("portable artifact URL contract");
+  const digest = await bytesDigest(bytes);
+  let id = 0;
+  const artifacts = createTakoformArtifacts({
+    sql: createEphemeralSql(),
+    objects: createMemoryObjectStore(),
+    clock: () => new Date("2026-10-02T00:00:00.000Z"),
+    randomId: () => `artifact-${++id}`,
+  });
+  const principal = { tenantId: "tenant-test", principalId: "api-key:artifact-url-test" };
+  const failure = (code: string, status: number) => Response.json({ error: { code } }, { status });
+  const started = await artifacts.handle(
+    new Request(`https://api.test${LANE}/artifacts/uploads`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "artifact-url-start" },
+      body: JSON.stringify({
+        manifest: {
+          apiVersion: "artifacts.takoform.com/v1alpha1",
+          kind: "WorkerBundle",
+          mainModule: "index.js",
+          modules: [
+            {
+              name: "index.js",
+              mediaType: "application/javascript+module",
+              size: bytes.byteLength,
+              digest,
+            },
+          ],
+        },
+      }),
+    }),
+    principal,
+    failure,
+  );
+  expect(started?.status).toBe(201);
+  if (!started) throw new Error("artifact_start_route_missing");
+  const startBody = (await started.json()) as Json;
+  const uploadId = stringAt(startBody, "uploadId");
+
+  const encoded = await artifacts.handle(
+    new Request(
+      `https://api.test${LANE}/artifacts/uploads/${encodeURIComponent(uploadId)}/blobs/${encodeURIComponent(digest)}`,
+      { method: "PUT", body: bytes as unknown as BodyInit },
+    ),
+    principal,
+    failure,
+  );
+  expect(encoded?.status).toBe(400);
+
+  const canonical = await artifacts.handle(
+    new Request(`https://api.test${artifactBlobPath(uploadId, digest)}`, {
+      method: "PUT",
+      body: bytes as unknown as BodyInit,
+    }),
+    principal,
+    failure,
+  );
+  expect(canonical?.status).toBe(201);
+});
 
 async function requestJson<T extends Json>(
   method: string,
@@ -360,6 +421,10 @@ function hasReplayReceipt(databasePath: string, replayKey: string): boolean {
   } finally {
     database.close();
   }
+}
+
+function artifactBlobPath(uploadId: string, digest: string): string {
+  return `${LANE}/artifacts/uploads/${encodeURIComponent(uploadId)}/blobs/${digest}`;
 }
 
 function tcpPortIsClosed(port: number): Promise<boolean> {
