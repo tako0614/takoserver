@@ -12,6 +12,7 @@ import type {
   SelfhostDataPlaneMaintenance,
   SelfhostEventRuntime,
 } from "./providers/selfhost.ts";
+import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
@@ -110,6 +111,8 @@ export function createStandaloneProviderComposition(input: {
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  /** Opt-in native execution; no Form or Offering is synthesized from configuration. */
+  readonly container?: SelfhostContainerCapability;
   /** Whether the entry verified the exact closed-graph workerd artifact. */
   readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
@@ -141,6 +144,7 @@ export function createStandaloneProviderComposition(input: {
       edge: input.edge,
       dataRoot: input.dataRoot,
       runtime: input.runtime,
+      ...(input.container ? { container: input.container } : {}),
       ...(input.workerRuntimeAvailable === undefined
         ? {}
         : { workerRuntimeAvailable: input.workerRuntimeAvailable }),
@@ -173,6 +177,9 @@ export function createStandaloneProviderComposition(input: {
     throw new TypeError(
       "the retired Cloudflare ObjectBucket drain consumes no runtime-input lease",
     );
+  }
+  if (input.container) {
+    throw new TypeError("the retired Cloudflare drain cannot compose a local Container runtime");
   }
   if (input.dataPlaneAddress) {
     throw new TypeError("the retired Cloudflare ObjectBucket drain publishes no Worker Version");

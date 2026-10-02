@@ -442,7 +442,12 @@ describe("the self-host catalog", () => {
     expect(unconfigured.provider.runtimeInputCapabilities).toBeUndefined();
 
     const configured = await compose(true, leases);
-    expect(configured.provider.runtimeInputCapabilities).toEqual({ maximumBindings: 64 });
+    expect(configured.provider.runtimeInputCapabilities).toEqual({
+      maximumBindings: 64,
+      forms: configured.provider.offerings
+        .filter((offering) => offering.form.kind === "WorkerVersion")
+        .map((offering) => offering.form),
+    });
   });
 
   test("projects that ceiling into the WorkerVersion support profile the provider reads", async () => {
@@ -452,16 +457,18 @@ describe("the self-host catalog", () => {
         form.identity.formRef.kind === "WorkerVersion",
     );
     if (!workerVersion) throw new Error("the stable WorkerVersion Form is missing");
+    const objectBucket = stableProductionTakoformCatalog().forms.find(
+      (form) =>
+        form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+        form.identity.formRef.kind === "ObjectBucket",
+    );
+    if (!objectBucket) throw new Error("the stable ObjectBucket Form is missing");
 
-    for (const [runtimeInputs, expected] of [
-      [undefined, 0],
-      [leases, 64],
-    ] as const) {
-      const composition = await compose(true, runtimeInputs);
-      const driver = createProviderDriver({
-        providers: [composition.provider],
+    const policyFor = (provider: Provider) =>
+      createProviderDriver({
+        providers: [provider],
         catalog: {
-          list: () => composition.offerings,
+          list: () => provider.offerings,
           async digest() {
             return `sha256:${"a".repeat(64)}` as const;
           },
@@ -470,9 +477,37 @@ describe("the self-host catalog", () => {
         } as never,
         deployments: {} as never,
         ledger: {} as never,
-      });
-      expect(driver.runtimeInputPolicy?.guaranteedMaximum(workerVersion)).toBe(expected);
+      }).runtimeInputPolicy;
+
+    for (const [runtimeInputs, expected] of [
+      [undefined, 0],
+      [leases, 64],
+    ] as const) {
+      const composition = await compose(true, runtimeInputs);
+      const policy = policyFor(composition.provider);
+      expect(policy?.guaranteedMaximum(workerVersion)).toBe(expected);
+      expect(policy?.guaranteedMaximum(objectBucket)).toBe(0);
     }
+
+    const configured = await compose(true, leases);
+    const legacyProvider: Provider = {
+      ...configured.provider,
+      runtimeInputCapabilities: { maximumBindings: 64 },
+    };
+    expect(policyFor(legacyProvider)?.guaranteedMaximum(objectBucket)).toBe(64);
+    const wrongSchemaProvider: Provider = {
+      ...configured.provider,
+      runtimeInputCapabilities: {
+        maximumBindings: 64,
+        forms: [
+          {
+            ...workerVersion.identity.formRef,
+            schemaDigest: `sha256:${"0".repeat(64)}`,
+          },
+        ],
+      },
+    };
+    expect(policyFor(wrongSchemaProvider)?.guaranteedMaximum(workerVersion)).toBe(0);
   });
 
   test("owns both halves of the object Binding, and fences the export", async () => {

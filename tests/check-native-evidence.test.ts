@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   collectNativeEvidenceGates,
+  NATIVE_EVIDENCE_CAPABILITIES,
   type NativeEvidenceGate,
   type NativeEvidenceProbe,
   nativeEvidenceExitCode,
@@ -155,6 +156,19 @@ test("classifies a gate that names a capability instead of an environment", asyn
       'test.skipIf(nativeEvidenceBinary("something-else") === undefined)("k", () => {});',
       "",
     ].join("\n"),
+    "l.test.ts": [
+      'import { test } from "bun:test";',
+      'import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";',
+      'const container = nativeEvidenceBinary("container-host-lifecycle");',
+      "const form = process.env.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT;",
+      "const formSha = process.env.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256;",
+      "const imageA = process.env.TAKOSERVER_NATIVE_CONTAINER_IMAGE_A;",
+      "const imageB = process.env.TAKOSERVER_NATIVE_CONTAINER_IMAGE_B;",
+      "const socket = process.env.TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET;",
+      "const network = process.env.TAKOSERVER_NATIVE_CONTAINER_NETWORK;",
+      'test.skipIf(container === undefined || form === undefined || formSha === undefined || imageA === undefined || imageB === undefined || socket === undefined || network === undefined)("l", () => {});',
+      "",
+    ].join("\n"),
   });
   try {
     const gates = collectNativeEvidenceGates(root);
@@ -164,15 +178,73 @@ test("classifies a gate that names a capability instead of an environment", asyn
       ["h.test.ts", "actor-qualification"],
       ["j.test.ts", "workerd-artifact"],
       ["k.test.ts", null],
+      ["l.test.ts", "container-host-lifecycle"],
     ]);
     expect(gates[1]?.environments).toEqual([
       "TAKOSERVER_WORKERD_BINARY",
       "TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY",
     ]);
     expect(gates[4]?.capabilities).toEqual(["something-else"]);
+    expect(gates[5]?.environments).toEqual([
+      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE",
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT",
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_B",
+      "TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET",
+      "TAKOSERVER_NATIVE_CONTAINER_NETWORK",
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Container Host native evidence validates bounded inputs without claiming execution", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "container-host-lifecycle",
+  );
+  if (!capability) throw new Error("Container Host native evidence capability missing");
+  const artifact = "/fixtures/final-container-candidate.json";
+  const environment = {
+    TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE: "1",
+    TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT: artifact,
+    TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256:
+      "7ab6dce1bbbfecc69f5732abd25100db83168c640e8d1054f5a708ad4ef6a0b2",
+    TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: "nginxinc/nginx-unprivileged@sha256:" + "a".repeat(64),
+    TAKOSERVER_NATIVE_CONTAINER_IMAGE_B: "nginxinc/nginx-unprivileged@sha256:" + "b".repeat(64),
+    TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET: "/var/run/docker.sock",
+    TAKOSERVER_NATIVE_CONTAINER_NETWORK: "takoserver-test-internal",
+  };
+  const ready = capability.inspect(
+    "1",
+    environment,
+    probe({
+      digests: { [artifact]: environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256 },
+    }),
+  );
+  expect(ready.state).toBe("ready");
+  expect(ready.detail).toContain("still require running the gated test");
+  expect(
+    capability.inspect(
+      "1",
+      {
+        ...environment,
+        TAKOSERVER_NATIVE_CONTAINER_IMAGE_B: environment.TAKOSERVER_NATIVE_CONTAINER_IMAGE_A,
+      },
+      probe({
+        digests: { [artifact]: environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256 },
+      }),
+    ).state,
+  ).toBe("invalid");
+  expect(
+    capability.inspect(
+      "1",
+      { ...environment, TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256: "0".repeat(64) },
+      probe({
+        digests: { [artifact]: environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256 },
+      }),
+    ).state,
+  ).toBe("invalid");
 });
 
 test("counts only the tests a capability gates, per file", () => {

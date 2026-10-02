@@ -161,6 +161,98 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
       return { state: "ready", detail: `configured and verified as ${digest}` };
     },
   },
+  {
+    id: "container-host-lifecycle",
+    label: "local self-host Container Host process and Docker lifecycle",
+    environment: "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE",
+    companionEnvironment: [
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT",
+      "TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A",
+      "TAKOSERVER_NATIVE_CONTAINER_IMAGE_B",
+      "TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET",
+      "TAKOSERVER_NATIVE_CONTAINER_NETWORK",
+    ],
+    proves:
+      "the explicitly selected local unpublished ContainerService Form through public Host CRUD across real OS-process restart and Docker lifecycle boundaries; it does not prove publisher admission, published support, or caller-facing HTTP Binding",
+    enable:
+      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Form artifact path/SHA-256, two distinct immutable image refs, Docker Unix socket path, and pre-created owned internal network",
+    inspect: (configured, environment, probe) => {
+      if (configured === undefined || configured.trim() === "") {
+        return {
+          state: "unconfigured",
+          detail:
+            "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE is not configured; OS-process and Docker lifecycle remain unproven",
+        };
+      }
+      if (configured !== "1") {
+        return {
+          state: "invalid",
+          detail: "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE must be exactly 1",
+        };
+      }
+      const artifact = environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT;
+      const expected = environment.TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256;
+      if (artifact === undefined || !isAbsolute(artifact)) {
+        return {
+          state: "invalid",
+          detail: "the local ContainerService Form artifact path must be absolute",
+        };
+      }
+      if (expected !== "7ab6dce1bbbfecc69f5732abd25100db83168c640e8d1054f5a708ad4ef6a0b2") {
+        return {
+          state: "invalid",
+          detail: "the configured local Form artifact SHA-256 is not the reviewed final candidate",
+        };
+      }
+      const actual = probe.sha256(artifact);
+      if (actual === null || actual !== expected) {
+        return {
+          state: "invalid",
+          detail: "the configured local Form artifact is unreadable or does not match its SHA-256",
+        };
+      }
+      const imageA = environment.TAKOSERVER_NATIVE_CONTAINER_IMAGE_A;
+      const imageB = environment.TAKOSERVER_NATIVE_CONTAINER_IMAGE_B;
+      const imageRef =
+        /^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?\/)?[a-z0-9]+(?:[._-][a-z0-9]+)*(?:\/[a-z0-9]+(?:[._-][a-z0-9]+)*)*@sha256:[a-f0-9]{64}$/u;
+      if (
+        imageA === undefined ||
+        imageB === undefined ||
+        !imageRef.test(imageA) ||
+        !imageRef.test(imageB) ||
+        imageA === imageB
+      ) {
+        return {
+          state: "invalid",
+          detail: "two distinct immutable OCI image references are required",
+        };
+      }
+      const socket = environment.TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET;
+      if (socket === undefined || !isAbsolute(socket) || socket.includes("\0")) {
+        return {
+          state: "invalid",
+          detail: "the Docker Unix socket path must be absolute",
+        };
+      }
+      const network = environment.TAKOSERVER_NATIVE_CONTAINER_NETWORK;
+      if (
+        network === undefined ||
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(network) ||
+        ["host", "bridge", "none"].includes(network)
+      ) {
+        return {
+          state: "invalid",
+          detail: "a non-reserved pre-created Docker network name is required",
+        };
+      }
+      return {
+        state: "ready",
+        detail:
+          "bounded local Form/image/socket/network inputs are configured; Docker execution and process-restart proof still require running the gated test",
+      };
+    },
+  },
 ];
 
 /**

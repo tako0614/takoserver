@@ -26,6 +26,7 @@ import {
   type SelfhostEventRuntime,
   type SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
+import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_BINDING_REF } from "./providers/selfhost-runtime-bindings.ts";
 import type { SelfhostStandardServiceIntegration } from "./providers/selfhost-standard-services.ts";
 import { createSelfhostRuntimeBindingMaterializer } from "./selfhost-runtime-binding-materializer.ts";
@@ -101,6 +102,8 @@ export interface SelfhostCompositionOptions {
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  /** Explicit local native backend; an installed exact Form is required separately. */
+  readonly container?: SelfhostContainerCapability;
   /** False when this process did not verify the pinned closed-graph artifact. */
   readonly workerRuntimeAvailable?: boolean;
   readonly artifacts: SelfhostArtifacts;
@@ -153,6 +156,42 @@ export function createSelfhostComposition(
   const identityOfferings: { offering: ProviderOffering; resourceClass: string }[] = [];
   const technicalOfferings: ProviderOffering[] = [objectBucketOffering];
   const technicalRelationOfferings: ProviderOffering[] = [];
+
+  // The ordinary released set has no ContainerService. Configuration alone
+  // therefore cannot advertise one; only a caller-supplied, already-verified
+  // exact publisher candidate plus a native runtime can enter this catalog.
+  const containerForms = options.stableForms.filter(
+    (form) =>
+      form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
+      form.identity.formRef.kind === "ContainerService" &&
+      form.identity.formRef.definitionVersion === "0.1.0",
+  );
+  if (containerForms.length > 1) throw new TypeError("ambiguous ContainerService installation");
+  const containerForm = containerForms[0];
+  if (options.container && containerForm) {
+    if (
+      containerForm.role !== "identity" ||
+      !containerForm.identity.packageDigest ||
+      !containerForm.operations.includes("create") ||
+      !containerForm.operations.includes("update") ||
+      !containerForm.operations.includes("delete") ||
+      !containerForm.operations.includes("observe")
+    )
+      throw new TypeError("ContainerService installation is incomplete");
+    const projected = edgeProviderOffering(containerForm, {
+      id: options.container.capacityProfile.id,
+      displayName: "Local HTTP container",
+      regions: ["global"],
+    });
+    // The portable Form may describe import, but this backend has no safe
+    // native adoption path. A Host Offering must not claim that capability.
+    const offering: ProviderOffering = {
+      ...projected,
+      capabilities: projected.capabilities.filter((capability) => capability !== "import"),
+    };
+    identityOfferings.push({ offering, resourceClass: "compute.container" });
+    technicalOfferings.push(offering);
+  }
 
   if (options.edgeForms) {
     for (const form of options.stableForms) {
@@ -227,6 +266,7 @@ export function createSelfhostComposition(
     dataRoot: options.dataRoot,
     runtime: options.runtime,
     artifacts: options.artifacts,
+    ...(options.container ? { container: options.container } : {}),
     ...(options.workerEndpointSuffix ? { workerEndpointSuffix: options.workerEndpointSuffix } : {}),
     ...(options.workerEndpointScheme ? { workerEndpointScheme: options.workerEndpointScheme } : {}),
     ...(options.workerEndpointPort === undefined
