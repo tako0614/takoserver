@@ -354,7 +354,8 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       );
       if (applied.failure) {
         process.stdout.write(
-          `failure at command ${applied.failure.index}: ${applied.failure.code}; run status and re-plan\n`,
+          `failure at command ${applied.failure.index}: ${applied.failure.code}; ` +
+            "inspect persisted state and re-run this command to re-plan\n",
         );
         process.exitCode = 1;
       }
