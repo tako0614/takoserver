@@ -19,6 +19,7 @@ import { bytesDigest } from "../src/json.ts";
 import { signOperatorAssertion } from "../src/operator-key.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import {
   buildRealCoreVerifier,
@@ -60,6 +61,37 @@ const RESOURCE_DELETE_ORDER = [
 
 type Json = Record<string, unknown>;
 type Host = ReturnType<typeof startHost>;
+type NativeDiagnosticPhase =
+  | "core_verifier_build"
+  | "core_verifier_spawn"
+  | "core_identity"
+  | "core_publisher_set"
+  | "initial_host_ready"
+  | "operator_session"
+  | "organization_create"
+  | "api_key_create"
+  | "form_admission"
+  | "post_admission_host_ready"
+  | "form_discovery"
+  | "v1_artifact_start_headers"
+  | "v1_artifact_start_body"
+  | "v1_artifact_blob"
+  | "v1_artifact_commit_headers"
+  | "v1_artifact_commit_body"
+  | "v1_module_worker_apply"
+  | "v1_bundle_apply"
+  | "v1_version_apply"
+  | "v1_deployment_apply"
+  | "v1_endpoint_apply"
+  | "v1_worker_https"
+  | "pre_v2_worker_confirmed"
+  | "v2_start_headers"
+  | "v2_start_body"
+  | "restored_host_ready";
+type NativeDiagnosticOutcome = "started" | "ok" | "timeout" | "error";
+type NativeDiagnosticTrace = {
+  readonly mark: (phase: NativeDiagnosticPhase, outcome: NativeDiagnosticOutcome) => void;
+};
 type ProcessIdentity = {
   readonly pid: number;
   readonly startTicks: string;
@@ -70,6 +102,9 @@ const observedHostDescendants = new WeakMap<Host, Map<string, ProcessIdentity>>(
 test.skipIf(WORKERD === null)(
   "a self-host updates, recovers, and restores its Worker at the same endpoint",
   async () => {
+    await assertIsolatedSelfhostNativeEnvironment({
+      fixedPorts: [API_PORT, CORE_VERIFIER_PORT, 443],
+    });
     const fixture = mkdtempSync(join(tmpdir(), "takoserver-selfhost-cold-restore-"));
     chmodSync(fixture, 0o700);
     const sourceRoot = join(fixture, "source", "data");
@@ -107,22 +142,47 @@ test.skipIf(WORKERD === null)(
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     const cleanupFailures: string[] = [];
+    const diagnosticStartedAt = performance.now();
+    const diagnosticTrace: NativeDiagnosticTrace = {
+      mark(phase, outcome) {
+        try {
+          console.log(
+            `[selfhost-cold-restore] phase=${phase} outcome=${outcome} elapsed_ms=${Math.round(performance.now() - diagnosticStartedAt)}`,
+          );
+        } catch {
+          // Native diagnostic output is best-effort and must not affect the journey.
+        }
+      },
+    };
     try {
-      const coreVerifierBinary = buildRealCoreVerifier(join(fixture, "core-verifier"));
-      verifier = Bun.spawn([coreVerifierBinary], {
-        cwd: process.cwd(),
-        env: {
-          ...baseEnvironment,
-          TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
-        },
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
+      const coreVerifierBinary = await runDiagnosticStage(
+        diagnosticTrace,
+        "core_verifier_build",
+        () => buildRealCoreVerifier(join(fixture, "core-verifier")),
+      );
+      verifier = await runDiagnosticStage(diagnosticTrace, "core_verifier_spawn", () =>
+        Bun.spawn([coreVerifierBinary], {
+          cwd: process.cwd(),
+          env: {
+            ...baseEnvironment,
+            TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST: coreVerifierArtifactDigest,
+          },
+          stdin: "ignore",
+          stdout: "ignore",
+          stderr: "ignore",
+        }),
+      );
+      await runDiagnosticStage(diagnosticTrace, "core_identity", () =>
+        waitForCoreVerifier(verifier as Host, coreVerifierArtifactDigest),
+      );
+      host = await runDiagnosticStage(diagnosticTrace, "initial_host_ready", async () => {
+        await createTls(sourceTls);
+        const startedHost = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
+        host = startedHost;
+        await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: startedHost });
+        await waitForHost(startedHost, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        return startedHost;
       });
-      await waitForCoreVerifier(verifier, coreVerifierArtifactDigest);
-      await createTls(sourceTls);
-      host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
 
       const operatorPrivateJwk = readFileSync(join(sourceRoot, "operator-key.jwk"), "utf8");
       const assertion = await signOperatorAssertion({
@@ -138,39 +198,50 @@ test.skipIf(WORKERD === null)(
         nowSeconds: Math.floor(Date.now() / 1_000),
         lifetimeSeconds: 60,
       });
-      const session = await api<Json>("POST", "/v1/sessions", 200, {
-        provider: "google",
-        method: "operator-assertion",
-        assertion,
-        sessionTtlSeconds: 60,
-      });
+      const session = await runDiagnosticStage(diagnosticTrace, "operator_session", () =>
+        api<Json>("POST", "/v1/sessions", 200, {
+          provider: "google",
+          method: "operator-assertion",
+          assertion,
+          sessionTtlSeconds: 60,
+        }),
+      );
       const sessionToken = stringAt(session, "sessionToken");
-      const created = await api<Json>(
-        "POST",
-        "/v1/organizations",
-        201,
-        { name: "Self-host cold restore" },
-        { authorization: `Bearer ${sessionToken}` },
+      const created = await runDiagnosticStage(diagnosticTrace, "organization_create", () =>
+        api<Json>(
+          "POST",
+          "/v1/organizations",
+          201,
+          { name: "Self-host cold restore" },
+          { authorization: `Bearer ${sessionToken}` },
+        ),
       );
       const organization = objectAt(created, "organization");
       const organizationId = stringAt(organization, "id");
-      const apiKeyResponse = await api<Json>(
-        "POST",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
-        201,
-        {
-          name: "cold-restore-native",
-          scopes: ["resources:read", "resources:write"],
-          expiresInSeconds: 600,
-        },
-        { authorization: `Bearer ${sessionToken}` },
+      const apiKeyResponse = await runDiagnosticStage(diagnosticTrace, "api_key_create", () =>
+        api<Json>(
+          "POST",
+          `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys`,
+          201,
+          {
+            name: "cold-restore-native",
+            scopes: ["resources:read", "resources:write"],
+            expiresInSeconds: 600,
+          },
+          { authorization: `Bearer ${sessionToken}` },
+        ),
       );
       const apiToken = stringAt(apiKeyResponse, "secret");
       const auth = {
         authorization: `Bearer ${apiToken}`,
         "takoform-organization": organizationId,
       };
-      async function publishModuleArtifact(moduleSource: string, key: string): Promise<string> {
+      async function publishModuleArtifact(
+        moduleSource: string,
+        key: string,
+        trace?: NativeDiagnosticTrace,
+        scope?: "v1" | "v2",
+      ): Promise<string> {
         const moduleBytes = new TextEncoder().encode(moduleSource);
         const moduleDigest = await bytesDigest(moduleBytes);
         const upload = await api<Json>(
@@ -193,21 +264,40 @@ test.skipIf(WORKERD === null)(
             },
           },
           { ...auth, "idempotency-key": `${key}-upload` },
+          trace,
+          scope === "v1"
+            ? { headers: "v1_artifact_start_headers", body: "v1_artifact_start_body" }
+            : undefined,
         );
         const uploadId = stringAt(upload, "uploadId");
         expect(upload.missingBlobs).toContain(moduleDigest);
-        const uploaded = await fetch(
-          `${HOST_ORIGIN}${LANE}/artifacts/uploads/${uploadId}/blobs/${moduleDigest}`,
-          { method: "PUT", headers: auth, body: moduleBytes },
-        );
-        expect(uploaded.status).toBe(201);
-        await uploaded.arrayBuffer();
+        if (scope === "v1") {
+          await runDiagnosticStage(trace, "v1_artifact_blob", async () => {
+            const uploaded = await fetch(
+              `${HOST_ORIGIN}${LANE}/artifacts/uploads/${uploadId}/blobs/${moduleDigest}`,
+              { method: "PUT", headers: auth, body: moduleBytes },
+            );
+            expect(uploaded.status).toBe(201);
+            await uploaded.arrayBuffer();
+          });
+        } else {
+          const uploaded = await fetch(
+            `${HOST_ORIGIN}${LANE}/artifacts/uploads/${uploadId}/blobs/${moduleDigest}`,
+            { method: "PUT", headers: auth, body: moduleBytes },
+          );
+          expect(uploaded.status).toBe(201);
+          await uploaded.arrayBuffer();
+        }
         const artifact = await api<Json>(
           "POST",
           `${LANE}/artifacts/uploads/${uploadId}/commit`,
           201,
           undefined,
           { ...auth, "idempotency-key": `${key}-commit` },
+          scope === "v1" ? trace : undefined,
+          scope === "v1"
+            ? { headers: "v1_artifact_commit_headers", body: "v1_artifact_commit_body" }
+            : undefined,
         );
         return stringAt(artifact, "manifestDigest");
       }
@@ -216,69 +306,75 @@ test.skipIf(WORKERD === null)(
       // Exercise released Core directly before Host records any Form admission.
       await stopHost(host, { requireWorker: false, dataRoot: sourceRoot });
       host = undefined;
-      const publisherSetClosure = await loadPublisherSetClosure();
-      await proveRealCorePublisherSet(CORE_VERIFIER_ORIGIN, publisherSetClosure);
-      try {
-        admission = Bun.spawn(
-          [
-            process.execPath,
-            "--no-env-file",
-            "scripts/selfhost-form-admission.ts",
-            organizationId,
-            SPACE,
-            "--apply",
-            "--data-root",
-            sourceRoot,
-            "--host-id",
-            HOST_ORIGIN,
-            "--core-verifier",
-            CORE_VERIFIER_ORIGIN,
-          ],
-          {
-            cwd: process.cwd(),
-            env: hostEnvironment(sourceRoot, sourceDb, sourceTls),
-            stdin: "ignore",
-            stdout: "pipe",
-            stderr: "ignore",
-          },
-        );
-        const completedAdmission = admission;
-        const admissionDescendants = new Map<string, ProcessIdentity>();
-        const admissionDeadline = Date.now() + 120_000;
-        rememberDescendants(completedAdmission.pid, admissionDescendants);
-        let exitCode: number | null = null;
-        while (completedAdmission.exitCode === null) {
-          if (Date.now() >= admissionDeadline) {
-            throw new Error("selfhost_form_admission_cli_timeout");
-          }
+      await runDiagnosticStage(diagnosticTrace, "core_publisher_set", async () => {
+        const publisherSetClosure = await loadPublisherSetClosure();
+        await proveRealCorePublisherSet(CORE_VERIFIER_ORIGIN, publisherSetClosure);
+      });
+      await runDiagnosticStage(diagnosticTrace, "form_admission", async () => {
+        try {
+          const spawnedAdmission = Bun.spawn(
+            [
+              process.execPath,
+              "--no-env-file",
+              "scripts/selfhost-form-admission.ts",
+              organizationId,
+              SPACE,
+              "--apply",
+              "--data-root",
+              sourceRoot,
+              "--host-id",
+              HOST_ORIGIN,
+              "--core-verifier",
+              CORE_VERIFIER_ORIGIN,
+            ],
+            {
+              cwd: process.cwd(),
+              env: hostEnvironment(sourceRoot, sourceDb, sourceTls),
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "ignore",
+            },
+          );
+          admission = spawnedAdmission;
+          const completedAdmission = spawnedAdmission;
+          const admissionDescendants = new Map<string, ProcessIdentity>();
+          const admissionDeadline = Date.now() + 120_000;
           rememberDescendants(completedAdmission.pid, admissionDescendants);
-          await Bun.sleep(25);
+          let exitCode: number | null = null;
+          while (completedAdmission.exitCode === null) {
+            if (Date.now() >= admissionDeadline) {
+              throw new Error("selfhost_form_admission_cli_timeout");
+            }
+            rememberDescendants(completedAdmission.pid, admissionDescendants);
+            await Bun.sleep(25);
+          }
+          exitCode = await completedAdmission.exited;
+          if (!(completedAdmission.stdout instanceof ReadableStream)) {
+            throw new Error("selfhost_form_admission_stdout_unavailable");
+          }
+          const admissionOutput = await new Response(completedAdmission.stdout).text();
+          rememberDescendants(completedAdmission.pid, admissionDescendants);
+          await waitForProcessIdentitiesGone(admissionDescendants.values());
+          admission = undefined;
+          if (exitCode !== 0) throw new Error("selfhost_form_admission_cli_nonzero_exit");
+          expect(admissionOutput).toMatch(
+            /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
+          );
+        } finally {
+          if (admission) await stopAdmissionProcess(admission);
+          admission = undefined;
         }
-        exitCode = await completedAdmission.exited;
-        if (!(completedAdmission.stdout instanceof ReadableStream)) {
-          throw new Error("selfhost_form_admission_stdout_unavailable");
-        }
-        const admissionOutput = await new Response(completedAdmission.stdout).text();
-        rememberDescendants(completedAdmission.pid, admissionDescendants);
-        await waitForProcessIdentitiesGone(admissionDescendants.values());
-        admission = undefined;
-        if (exitCode !== 0) throw new Error("selfhost_form_admission_cli_nonzero_exit");
-        expect(admissionOutput).toMatch(
-          /^apply: converged \([1-9]\d* receipt\(s\), released-core\)$/m,
-        );
-      } finally {
-        if (admission) await stopAdmissionProcess(admission);
-        admission = undefined;
-      }
+      });
 
-      host = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
-      const discovery = await api<Json>(
-        "GET",
-        `${LANE}/forms?space=${SPACE}`,
-        200,
-        undefined,
-        auth,
+      host = await runDiagnosticStage(diagnosticTrace, "post_admission_host_ready", async () => {
+        const startedHost = startHost(hostEnvironment(sourceRoot, sourceDb, sourceTls));
+        host = startedHost;
+        await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: startedHost });
+        await waitForHost(startedHost, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        return startedHost;
+      });
+      const discovery = await runDiagnosticStage(diagnosticTrace, "form_discovery", () =>
+        api<Json>("GET", `${LANE}/forms?space=${SPACE}`, 200, undefined, auth),
       );
       const forms = new Map(
         (discovery.forms as Json[]).map((form) => {
@@ -286,7 +382,12 @@ test.skipIf(WORKERD === null)(
           return [stringAt(objectAt(identity, "formRef"), "kind"), objectAt(identity, "formRef")];
         }),
       );
-      const manifestDigestV1 = await publishModuleArtifact(MODULE_V1, "cold-restore-v1");
+      const manifestDigestV1 = await publishModuleArtifact(
+        MODULE_V1,
+        "cold-restore-v1",
+        diagnosticTrace,
+        "v1",
+      );
 
       const reference = (kind: string, name: string) => ({
         apiVersion: "edge.forms.takoform.com",
@@ -345,35 +446,55 @@ test.skipIf(WORKERD === null)(
         );
       }
 
-      const moduleWorkerV1 = await apply("ModuleWorker", "cold-restore-worker", {});
-      await apply("WorkerBundle", "cold-restore-bundle", {
-        manifestDigest: manifestDigestV1,
-      });
-      await apply("WorkerVersion", "cold-restore-version", {
-        worker: reference("ModuleWorker", "cold-restore-worker"),
-        bundle: reference("WorkerBundle", "cold-restore-bundle"),
-        handlers: ["fetch"],
-        requiredSensitiveVars: [],
-      });
-      const deploymentV1 = await apply("WorkerDeployment", "cold-restore-deployment", {
-        worker: reference("ModuleWorker", "cold-restore-worker"),
-        versions: [
-          { workerVersion: reference("WorkerVersion", "cold-restore-version"), weight: 10_000 },
-        ],
-      });
-      const endpointResource = await apply("WorkerEndpoint", "cold-restore-endpoint", {
-        worker: reference("ModuleWorker", "cold-restore-worker"),
-      });
+      const moduleWorkerV1 = await runDiagnosticStage(
+        diagnosticTrace,
+        "v1_module_worker_apply",
+        () => apply("ModuleWorker", "cold-restore-worker", {}),
+      );
+      await runDiagnosticStage(diagnosticTrace, "v1_bundle_apply", () =>
+        apply("WorkerBundle", "cold-restore-bundle", { manifestDigest: manifestDigestV1 }),
+      );
+      await runDiagnosticStage(diagnosticTrace, "v1_version_apply", () =>
+        apply("WorkerVersion", "cold-restore-version", {
+          worker: reference("ModuleWorker", "cold-restore-worker"),
+          bundle: reference("WorkerBundle", "cold-restore-bundle"),
+          handlers: ["fetch"],
+          requiredSensitiveVars: [],
+        }),
+      );
+      const deploymentV1 = await runDiagnosticStage(diagnosticTrace, "v1_deployment_apply", () =>
+        apply("WorkerDeployment", "cold-restore-deployment", {
+          worker: reference("ModuleWorker", "cold-restore-worker"),
+          versions: [
+            {
+              workerVersion: reference("WorkerVersion", "cold-restore-version"),
+              weight: 10_000,
+            },
+          ],
+        }),
+      );
+      const endpointResource = await runDiagnosticStage(diagnosticTrace, "v1_endpoint_apply", () =>
+        apply("WorkerEndpoint", "cold-restore-endpoint", {
+          worker: reference("ModuleWorker", "cold-restore-worker"),
+        }),
+      );
       const endpointBefore = output(endpointResource, "url");
       expect(new URL(endpointBefore).protocol).toBe("https:");
       expect(new URL(endpointBefore).port).toBe("");
       const hostname = new URL(endpointBefore).hostname;
-      const markerBefore = await workerRequest(hostname, join(sourceTls, "worker-cert.pem"), "/");
+      const markerBefore = await runDiagnosticStage(diagnosticTrace, "v1_worker_https", () =>
+        workerRequest(hostname, join(sourceTls, "worker-cert.pem"), "/"),
+      );
       expect(markerBefore).toBe(WORKER_MARKER_V1);
+      diagnosticTrace.mark("pre_v2_worker_confirmed", "ok");
 
       // Publish V2 through the same public artifact and Form endpoints, then
       // update the existing Deployment behind its current revision fence.
-      const manifestDigestV2 = await publishModuleArtifact(MODULE_V2, "cold-restore-v2");
+      const manifestDigestV2 = await publishModuleArtifact(
+        MODULE_V2,
+        "cold-restore-v2",
+        diagnosticTrace,
+      );
       await apply("WorkerBundle", "cold-restore-bundle-v2", {
         manifestDigest: manifestDigestV2,
       });
@@ -508,8 +629,13 @@ test.skipIf(WORKERD === null)(
       // Only external TLS file paths are rebased. The origin, ports, signing and
       // operator identities, API token, and Worker endpoint remain unchanged.
       // There is no client resource publication after this point.
-      host = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
-      await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+      host = await runDiagnosticStage(diagnosticTrace, "restored_host_ready", async () => {
+        const startedHost = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
+        host = startedHost;
+        await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: startedHost });
+        await waitForHost(startedHost, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        return startedHost;
+      });
       const restoredHostIdentity = processIdentity(host.pid);
       expect(await workerRequest(hostname, join(restoredTls, "worker-cert.pem"), "/")).toBe(
         WORKER_MARKER_V2,
@@ -551,33 +677,30 @@ test.skipIf(WORKERD === null)(
         try {
           await stopAdmissionProcess(admission);
           admission = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("admission_stop_failed");
         }
       }
       if (verifier) {
         try {
           await stopVerifierProcess(verifier);
           verifier = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("verifier_stop_failed");
         }
       }
       if (host) {
         try {
           await cleanupHost(host);
           host = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("host_stop_failed");
         }
       }
-      if (cleanupFailures.length === 0) rmSync(fixture, { recursive: true, force: true });
     }
-    if (cleanupFailures.length > 0) {
-      const primaryTag = hasPrimaryFailure ? errorTag(primaryFailure) : "none";
-      throw new Error(`selfhost_cleanup_failed_${cleanupFailures.join("_")}_after_${primaryTag}`);
-    }
-    if (hasPrimaryFailure) throw primaryFailure;
+    finishColdRestore(primaryFailure, hasPrimaryFailure, cleanupFailures, () =>
+      rmSync(fixture, { recursive: true, force: true }),
+    );
   },
   240_000,
 );
@@ -918,11 +1041,6 @@ function processExecutable(pid: number): string | null {
   }
 }
 
-function errorTag(error: unknown): string {
-  if (error instanceof Error && /^[a-z0-9_]+$/u.test(error.message)) return error.message;
-  return "unknown";
-}
-
 async function waitForProcessIdentitiesGone(identities: Iterable<ProcessIdentity>): Promise<void> {
   const captured = [...identities];
   const deadline = Date.now() + 5_000;
@@ -988,20 +1106,32 @@ async function api<T = Json>(
   expectedStatus: number,
   body?: unknown,
   headers: Record<string, string> = {},
+  trace?: NativeDiagnosticTrace,
+  tracePhases: {
+    readonly headers: NativeDiagnosticPhase;
+    readonly body: NativeDiagnosticPhase;
+  } = { headers: "v2_start_headers", body: "v2_start_body" },
 ): Promise<T> {
-  const response = await fetch(`${HOST_ORIGIN}${path}`, {
-    method,
-    headers: {
-      ...(body === undefined ? {} : { "content-type": "application/json" }),
-      ...headers,
-    },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    signal: AbortSignal.timeout(10_000),
-  });
+  const request = () =>
+    fetch(`${HOST_ORIGIN}${path}`, {
+      method,
+      headers: {
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+        ...headers,
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(10_000),
+    });
+  const response = trace
+    ? await runDiagnosticStage(trace, tracePhases.headers, request)
+    : await request();
   if (response.status !== expectedStatus) {
     let code = "unknown";
     try {
-      const payload = (await response.json()) as { readonly error?: unknown };
+      const readPayload = () => response.json() as Promise<{ readonly error?: unknown }>;
+      const payload = trace
+        ? await runDiagnosticStage(trace, tracePhases.body, readPayload)
+        : await readPayload();
       const envelope = payload.error;
       if (typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)) {
         const candidate = (envelope as { readonly code?: unknown }).code;
@@ -1018,7 +1148,158 @@ async function api<T = Json>(
     );
   }
   if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  const readBody = () => response.json() as Promise<T>;
+  return trace ? await runDiagnosticStage(trace, tracePhases.body, readBody) : await readBody();
+}
+
+async function runDiagnosticStage<T>(
+  trace: NativeDiagnosticTrace | undefined,
+  phase: NativeDiagnosticPhase,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  if (!trace) return await operation();
+  markNativeDiagnostic(trace, phase, "started");
+  try {
+    const result = await operation();
+    markNativeDiagnostic(trace, phase, "ok");
+    return result;
+  } catch (error) {
+    markNativeDiagnostic(
+      trace,
+      phase,
+      error instanceof Error && error.name === "TimeoutError" ? "timeout" : "error",
+    );
+    throw error;
+  }
+}
+
+function markNativeDiagnostic(
+  trace: NativeDiagnosticTrace,
+  phase: NativeDiagnosticPhase,
+  outcome: NativeDiagnosticOutcome,
+): void {
+  try {
+    trace.mark(phase, outcome);
+  } catch {
+    // Observer failure must never skip work, replace success, or mask the cause.
+  }
+}
+
+test("self-host diagnostic observer failures do not change stage results", async () => {
+  const observed: Array<[NativeDiagnosticPhase, NativeDiagnosticOutcome]> = [];
+  const trace: NativeDiagnosticTrace = {
+    mark(phase, outcome) {
+      observed.push([phase, outcome]);
+      throw new Error("diagnostic output unavailable");
+    },
+  };
+  const value = { completed: true };
+  let operationCount = 0;
+
+  const result = await runDiagnosticStage(trace, "core_identity", () => {
+    operationCount += 1;
+    return value;
+  });
+
+  expect(result).toBe(value);
+  expect(operationCount).toBe(1);
+  expect(observed).toEqual([
+    ["core_identity", "started"],
+    ["core_identity", "ok"],
+  ]);
+
+  observed.length = 0;
+  const originalError = new Error("stage failed");
+  let caught: unknown;
+  try {
+    await runDiagnosticStage(trace, "form_admission", () => Promise.reject(originalError));
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(caught).toBe(originalError);
+  expect(observed).toEqual([
+    ["form_admission", "started"],
+    ["form_admission", "error"],
+  ]);
+});
+
+test("self-host fixture removal failure preserves the primary test failure", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  const cleanupFailures: string[] = [];
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, cleanupFailures, () => {
+      throw new Error("fixture removal detail must not replace the primary failure");
+    });
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(observedFailure).toBeInstanceOf(Error);
+  expect((observedFailure as Error).message).toBe(
+    "selfhost_cleanup_failed_fixture_remove_failed_after_primary_failure",
+  );
+  expect((observedFailure as Error).cause).toBe(primaryFailure);
+  expect(cleanupFailures).toEqual(["fixture_remove_failed"]);
+});
+
+test("self-host stop failure retains fixture and primary cause", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  const cleanupFailures = ["host_stop_failed"];
+  let removedFixture = false;
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, cleanupFailures, () => {
+      removedFixture = true;
+    });
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(removedFixture).toBe(false);
+  expect((observedFailure as Error).message).toBe(
+    "selfhost_cleanup_failed_host_stop_failed_after_primary_failure",
+  );
+  expect((observedFailure as Error).cause).toBe(primaryFailure);
+});
+
+test("self-host cleanup without secondary failures rethrows the original error", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, [], () => undefined);
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(observedFailure).toBe(primaryFailure);
+});
+
+function finishColdRestore(
+  primaryFailure: unknown,
+  hasPrimaryFailure: boolean,
+  cleanupFailures: string[],
+  removeFixture: () => void,
+): void {
+  if (cleanupFailures.length === 0) {
+    try {
+      removeFixture();
+    } catch {
+      cleanupFailures.push("fixture_remove_failed");
+    }
+  }
+  if (cleanupFailures.length > 0) {
+    const suffix = hasPrimaryFailure ? "after_primary_failure" : "without_primary_failure";
+    throw new Error(
+      `selfhost_cleanup_failed_${cleanupFailures.join("_")}_${suffix}`,
+      hasPrimaryFailure ? { cause: primaryFailure } : undefined,
+    );
+  }
+  if (hasPrimaryFailure) throw primaryFailure;
 }
 
 async function deleteResource(
