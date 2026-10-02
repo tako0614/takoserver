@@ -99,6 +99,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
       const model = configured.get(publicModel);
       if (!model) throw new AiGatewayError("invalid_response");
       const upstreamRequest: JsonObject = { ...request, model: model.upstreamId, stream: false };
+      const signal = AbortSignal.timeout(timeoutMs);
 
       let response: Response;
       try {
@@ -113,7 +114,7 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
               "x-request-id": context.requestId,
             },
             body: JSON.stringify(upstreamRequest),
-            signal: AbortSignal.timeout(timeoutMs),
+            signal,
           }),
         );
       } catch {
@@ -131,7 +132,13 @@ export function createOpenAiGateway(options: OpenAiGatewayOptions): AiGateway {
         await response.body?.cancel().catch(() => undefined);
         throw new AiGatewayError("invalid_response");
       }
-      const bytes = await readResponseBody(response);
+      let bytes: Uint8Array;
+      try {
+        bytes = await readResponseBody(response);
+      } catch (error) {
+        if (error instanceof AiGatewayError || signal.aborted) throw error;
+        throw new AiGatewayError("unavailable");
+      }
       if (bytes.byteLength > MAX_RESPONSE_BYTES) throw new AiGatewayError("invalid_response");
 
       let parsed: unknown;

@@ -171,6 +171,38 @@ test("a native upstream disconnect before response headers is classified without
   expect(String(error)).not.toContain(UPSTREAM_SECRET);
 });
 
+test("a native disconnect during a successful response body is classified without leaking transport detail", async () => {
+  let requestAccepted = false;
+  let connectionClosed = false;
+  const server = await startServer((request, response) => {
+    requestAccepted = true;
+    response.writeHead(200, {
+      "content-length": "256",
+      "content-type": "application/json",
+    });
+    response.write('{"model":"@cf/provider/model-v1",');
+    response.on("close", () => {
+      connectionClosed = true;
+    });
+    setTimeout(() => request.socket.destroy(), 25);
+  });
+
+  const error = await gatewayFor(server)
+    .chat(
+      { model: "takoserver-text", messages: [{ role: "user", content: "hello" }] },
+      { requestId: "ai_truncated", idempotencyKey: "chat-truncated" },
+    )
+    .catch((caught: unknown) => caught);
+  await waitFor(() => connectionClosed);
+
+  expect(requestAccepted).toBe(true);
+  expect(error).toBeInstanceOf(AiGatewayError);
+  expect((error as AiGatewayError).code).toBe("unavailable");
+  expect(String(error)).not.toContain("socket");
+  expect(String(error)).not.toContain(UPSTREAM_SECRET);
+  expect(connectionClosed).toBe(true);
+});
+
 function gatewayFor(server: Server) {
   const address = server.address();
   if (!address || typeof address === "string")
