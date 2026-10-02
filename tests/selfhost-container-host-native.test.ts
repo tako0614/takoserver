@@ -448,15 +448,112 @@ async function api(
   return text ? (JSON.parse(text) as Record<string, unknown>) : {};
 }
 
-async function dropAcknowledgementAtLoopbackProxy(
+const BACKEND_UNAVAILABLE_RETRY_WINDOW_MS = 30_000;
+const BACKEND_UNAVAILABLE_MAX_ATTEMPTS = 8;
+
+async function isRetryableBackendUnavailable(response: Response): Promise<boolean> {
+  if (response.status !== 503 || response.body === null) return false;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let responseBytes = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      const remaining = 4096 - responseBytes;
+      if (next.value.byteLength > remaining) {
+        await reader.cancel();
+        return false;
+      }
+      chunks.push(next.value);
+      responseBytes += next.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  try {
+    const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+      error?: { code?: unknown };
+    };
+    return parsed.error?.code === "backend_unavailable";
+  } catch {
+    return false;
+  }
+}
+
+function retryAfterMs(value: string | null, attempt: number): number {
+  const header = value?.trim();
+  if (header && /^[0-9]{1,6}$/u.test(header)) return Number(header) * 1000;
+  if (header) {
+    const date = Date.parse(header);
+    if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  }
+  const upperBound = Math.min(4000, 250 * 2 ** attempt);
+  return Math.floor(Math.random() * upperBound);
+}
+
+async function waitForBackendRetry(delayMs: number, deadline: number): Promise<void> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0 || delayMs >= remaining) {
+    throw new Error("Host retry deadline elapsed");
+  }
+  if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function apiWithBackendUnavailableRetry(
   baseUrl: string,
   method: string,
   path: string,
   expectedStatus: number,
-  body: unknown,
+  body?: unknown,
+  headers: Record<string, string> = {},
+): Promise<Record<string, unknown>> {
+  const bodyText = body === undefined ? undefined : JSON.stringify(body);
+  const deadline = Date.now() + BACKEND_UNAVAILABLE_RETRY_WINDOW_MS;
+  for (let attempt = 0; attempt < BACKEND_UNAVAILABLE_MAX_ATTEMPTS; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error("Host retry deadline elapsed");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), remaining);
+    try {
+      const response = await fetch(new URL(path, baseUrl), {
+        method,
+        headers: {
+          ...headers,
+          ...(bodyText === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(bodyText === undefined ? {} : { body: bodyText }),
+        signal: controller.signal,
+      });
+      if (response.status === expectedStatus) {
+        const text = await response.text();
+        return text ? (JSON.parse(text) as Record<string, unknown>) : {};
+      }
+      const retryAfter = response.headers.get("retry-after");
+      const retryable = await isRetryableBackendUnavailable(response);
+      if (retryable) {
+        await waitForBackendRetry(retryAfterMs(retryAfter, attempt), deadline);
+        continue;
+      }
+      await response.body?.cancel();
+      throw new Error(
+        `Host API returned unexpected HTTP status (${expectedStatus}/${response.status})`,
+      );
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw new Error("Host retry attempt limit reached");
+}
+
+async function proxySingleAttemptWithAckDrop(
+  target: URL,
+  method: string,
+  expectedStatus: number,
+  bodyText: string | undefined,
   headers: Record<string, string>,
-): Promise<void> {
-  const target = new URL(path, baseUrl);
+  deadline: number,
+): Promise<{ readonly status: number; readonly retryAfter: string | null }> {
   let resolveHostStatus: (status: number) => void = () => undefined;
   let rejectHostStatus: (error: Error) => void = () => undefined;
   const hostStatus = new Promise<number>((resolve, reject) => {
@@ -473,21 +570,30 @@ async function dropAcknowledgementAtLoopbackProxy(
         headers: { ...clientRequest.headers, host: target.host },
       },
       (upstreamResponse) => {
-        upstreamResponse.on("data", () => undefined);
+        const status = upstreamResponse.statusCode ?? 0;
+        if (status !== expectedStatus) {
+          const responseHeaders: Record<string, string> = {};
+          const contentType = upstreamResponse.headers["content-type"];
+          const retryAfter = upstreamResponse.headers["retry-after"];
+          if (typeof contentType === "string") responseHeaders["content-type"] = contentType;
+          if (typeof retryAfter === "string") responseHeaders["retry-after"] = retryAfter;
+          clientResponse.writeHead(status, responseHeaders);
+        }
+        upstreamResponse.on("data", (chunk: Uint8Array) => {
+          if (status !== expectedStatus) clientResponse.write(chunk);
+        });
         upstreamResponse.on("error", () => {
           rejectHostStatus(new Error("Host response stream failed before completion"));
           clientResponse.destroy();
         });
         upstreamResponse.on("end", () => {
-          const status = upstreamResponse.statusCode ?? 0;
           resolveHostStatus(status);
           if (status === expectedStatus) {
-            // The Host has completed the operation and its HTTP response reached
-            // the proxy. Destroy the client-facing connection without forwarding
-            // status or body, modeling a lost acknowledgement in transit.
+            // Do not expose a successful 201/204 to the caller. The separate
+            // process-restart assertion replays this exact request later.
+            clientResponse.socket?.destroy();
             clientResponse.destroy();
           } else {
-            clientResponse.writeHead(status);
             clientResponse.end();
           }
         });
@@ -505,8 +611,16 @@ async function dropAcknowledgementAtLoopbackProxy(
   });
   const address = proxy.address();
   if (!address || typeof address === "string") throw new Error("loopback fault proxy did not bind");
-  let clientObservedResponse = false;
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new Error("loopback ACK-drop request deadline elapsed");
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      controller.abort();
+      reject(new Error("loopback ACK-drop request deadline elapsed"));
+    }, remaining);
+  });
   try {
     const clientResponse = fetch(
       `http://127.0.0.1:${address.port}${target.pathname}${target.search}`,
@@ -514,35 +628,135 @@ async function dropAcknowledgementAtLoopbackProxy(
         method,
         headers: {
           ...headers,
-          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...(bodyText === undefined ? {} : { "content-type": "application/json" }),
         },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(bodyText === undefined ? {} : { body: bodyText }),
+        signal: controller.signal,
       },
-    )
-      .then(async (response) => {
-        clientObservedResponse = true;
-        await response.arrayBuffer();
-        return response.status;
-      })
-      .catch(() => null);
-    const [actualHostStatus, clientStatus] = await Promise.race([
+    ).catch(() => null);
+    const [actualStatus, response] = await Promise.race([
       Promise.all([hostStatus, clientResponse]),
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("loopback ACK-drop proxy timed out")), 30_000);
-      }),
+      timeoutPromise,
     ]);
-    if (actualHostStatus !== expectedStatus) {
-      throw new Error(`Host operation returned unexpected status ${actualHostStatus}`);
+    if (actualStatus === expectedStatus) {
+      if (response !== null) {
+        await response.body?.cancel();
+        throw new Error(
+          `fault proxy forwarded a successful Host acknowledgement (client status ${response.status})`,
+        );
+      }
+      return { status: actualStatus, retryAfter: null };
     }
-    if (clientObservedResponse || clientStatus !== null) {
-      throw new Error("fault proxy forwarded a Host acknowledgement to the caller");
+    if (response === null || response.status !== actualStatus) {
+      throw new Error(`Host operation returned unexpected status ${actualStatus}`);
     }
+    const retryAfter = response.headers.get("retry-after");
+    const retryable = await Promise.race([isRetryableBackendUnavailable(response), timeoutPromise]);
+    if (!retryable) {
+      throw new Error(`Host operation returned unexpected status ${actualStatus}`);
+    }
+    return { status: actualStatus, retryAfter };
   } finally {
     if (timeout) clearTimeout(timeout);
+    controller.abort();
     proxy.closeAllConnections();
     await new Promise<void>((resolve) => proxy.close(() => resolve()));
   }
 }
+
+async function dropAcknowledgementAtLoopbackProxy(
+  baseUrl: string,
+  method: string,
+  path: string,
+  expectedStatus: number,
+  body: unknown,
+  headers: Record<string, string>,
+): Promise<void> {
+  const target = new URL(path, baseUrl);
+  const bodyText = body === undefined ? undefined : JSON.stringify(body);
+  const deadline = Date.now() + BACKEND_UNAVAILABLE_RETRY_WINDOW_MS;
+  for (let attempt = 0; attempt < BACKEND_UNAVAILABLE_MAX_ATTEMPTS; attempt += 1) {
+    const result = await proxySingleAttemptWithAckDrop(
+      target,
+      method,
+      expectedStatus,
+      bodyText,
+      headers,
+      deadline,
+    );
+    if (result.status === expectedStatus) return;
+    if (result.status !== 503) {
+      throw new Error(`Host operation returned unexpected status ${result.status}`);
+    }
+    await waitForBackendRetry(retryAfterMs(result.retryAfter, attempt), deadline);
+  }
+  throw new Error("Host retry attempt limit reached");
+}
+
+test("backend-unavailable retry reuses the exact request before dropping success ACK", async () => {
+  const observed: Array<{
+    readonly body: string;
+    readonly authorization: string | undefined;
+    readonly idempotencyKey: string | undefined;
+    readonly ifNoneMatch: string | undefined;
+  }> = [];
+  const upstream = createServer((request, response) => {
+    const chunks: Uint8Array[] = [];
+    request.on("data", (chunk: Uint8Array) => chunks.push(chunk));
+    request.on("end", () => {
+      observed.push({
+        body: Buffer.concat(chunks).toString("utf8"),
+        authorization: request.headers.authorization,
+        idempotencyKey: Array.isArray(request.headers["idempotency-key"])
+          ? request.headers["idempotency-key"].join(",")
+          : request.headers["idempotency-key"],
+        ifNoneMatch: Array.isArray(request.headers["if-none-match"])
+          ? request.headers["if-none-match"].join(",")
+          : request.headers["if-none-match"],
+      });
+      if (observed.length === 1) {
+        response.writeHead(503, {
+          "content-type": "application/json",
+          "retry-after": "0",
+        });
+        response.end(JSON.stringify({ error: { code: "backend_unavailable" } }));
+      } else {
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({ accepted: true }));
+      }
+    });
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  if (!address || typeof address === "string") throw new Error("retry test server did not bind");
+  const requestBody = { apiVersion: "forms.test/v1", metadata: { name: "stable" } };
+  const requestHeaders = {
+    authorization: "Bearer synthetic-native-retry-principal",
+    "idempotency-key": "native-retry-same-key",
+    "if-none-match": "*",
+  };
+  try {
+    await dropAcknowledgementAtLoopbackProxy(
+      `http://127.0.0.1:${address.port}`,
+      "PUT",
+      "/resources/stable",
+      201,
+      requestBody,
+      requestHeaders,
+    );
+  } finally {
+    upstream.closeAllConnections();
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+  expect(observed).toHaveLength(2);
+  expect(observed[0]).toEqual(observed[1]);
+  expect(observed[0]).toMatchObject({
+    body: JSON.stringify(requestBody),
+    authorization: requestHeaders.authorization,
+    idempotencyKey: requestHeaders["idempotency-key"],
+    ifNoneMatch: "*",
+  });
+});
 
 test.skipIf(
   ENABLED === null ||
@@ -765,7 +979,7 @@ test.skipIf(
     const secondHost = await startHost(root);
     expect(secondHost.process.pid).not.toBe(firstPid);
     await assertOwnedInternalNetwork(socketPath, networkName);
-    const replayedCreate = await api(
+    const replayedCreate = await apiWithBackendUnavailableRetry(
       secondHost.baseUrl,
       "PUT",
       createPath,
@@ -848,7 +1062,7 @@ test.skipIf(
       "if-match": `"${created.metadata.revision}"`,
       "takoform-expected-generation": "1",
     };
-    const updated = await api(
+    const updated = await apiWithBackendUnavailableRetry(
       secondHost.baseUrl,
       "PUT",
       createPath,
@@ -906,7 +1120,7 @@ test.skipIf(
 
     const thirdHost = await startHost(root);
     expect(thirdHost.process.pid).not.toBe(secondHost.process.pid);
-    const replayedDelete = await api(
+    const replayedDelete = await apiWithBackendUnavailableRetry(
       thirdHost.baseUrl,
       "DELETE",
       deletePath,

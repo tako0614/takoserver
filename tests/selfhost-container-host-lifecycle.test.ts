@@ -303,6 +303,7 @@ function dockerFixture() {
   const calls: { method: string; path: string; body?: Record<string, unknown> }[] = [];
   let sequence = 0;
   let loseNextCreateAck = false;
+  const unhealthyRevisionIps = new Set<string>();
   const network = {
     Name: "host-test-net",
     Driver: "bridge",
@@ -339,7 +340,9 @@ function dockerFixture() {
         HostConfig: body.HostConfig ?? {},
         Mounts: [],
         State: { Running: false },
-        NetworkSettings: { Networks: { "host-test-net": { IPAddress: "172.22.0.10" } } },
+        NetworkSettings: {
+          Networks: { "host-test-net": { IPAddress: `172.22.0.${sequence + 9}` } },
+        },
       });
       if (loseNextCreateAck) {
         loseNextCreateAck = false;
@@ -376,7 +379,10 @@ function dockerFixture() {
     maxNanoCpus: 1_000_000_000,
     pidsLimit: 64,
     engine,
-    healthFetch: async () => new Response("ok", { status: 200 }),
+    healthFetch: async (request: Request) => {
+      const ready = !unhealthyRevisionIps.has(new URL(request.url).hostname);
+      return new Response(ready ? "ok" : "starting", { status: ready ? 200 : 503 });
+    },
   };
   return {
     containers,
@@ -384,6 +390,11 @@ function dockerFixture() {
     options,
     loseCreateAck() {
       loseNextCreateAck = true;
+    },
+    setHealthReady(revisionOrdinal: number, ready: boolean) {
+      const ip = `172.22.0.${revisionOrdinal + 9}`;
+      if (ready) unhealthyRevisionIps.delete(ip);
+      else unhealthyRevisionIps.add(ip);
     },
   };
 }
@@ -658,22 +669,39 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
       "idempotency-key": "container-create-1",
       "if-none-match": "*",
     };
+    const createPath = `/apis/forms.takoform.com/v1/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/service`;
+    const resourcePath = `${createPath}?${query}`;
+    docker.setHealthReady(1, false);
+    const startingCreate = await http(
+      app,
+      "PUT",
+      createPath,
+      503,
+      createRequestBody,
+      createRequestHeaders,
+    );
+    expect(startingCreate.body).toMatchObject({
+      error: { code: "backend_unavailable", retryable: true },
+    });
+    expect(docker.containers.size).toBe(1);
+    expect(docker.calls.filter((call) => call.path.startsWith("/containers/create"))).toHaveLength(
+      1,
+    );
+    const pendingNativeId = [...docker.containers.values()][0]?.Id;
+    expect(typeof pendingNativeId).toBe("string");
+    const uncommitted = await http(app, "GET", resourcePath, 404, undefined, resourceWriter);
+    expect(uncommitted.body).toMatchObject({ error: { code: "resource_not_found" } });
+    docker.setHealthReady(1, true);
     try {
       const lostCreateAcknowledgement = await app.fetch(
-        new Request(
-          new URL(
-            `/apis/forms.takoform.com/v1/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/service`,
-            ORIGIN,
-          ),
-          {
-            method: "PUT",
-            headers: {
-              ...createRequestHeaders,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify(createRequestBody),
+        new Request(new URL(createPath, ORIGIN), {
+          method: "PUT",
+          headers: {
+            ...createRequestHeaders,
+            "content-type": "application/json",
           },
-        ),
+          body: JSON.stringify(createRequestBody),
+        }),
       );
       // Deliberately drop the complete Host response as an acknowledgement
       // fault; only the exact original request is replayed after reopening
@@ -689,6 +717,7 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
       throw new Error(`${String(error)}; dockerCalls=${JSON.stringify(docker.calls)}`);
     }
     expect(docker.containers.size).toBe(1);
+    expect([...docker.containers.values()][0]?.Id).toBe(pendingNativeId);
     await containerRuntime.close();
     database.close();
     database = new Database(join(root, "control.sqlite"));
@@ -703,7 +732,7 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
     const applied = await http(
       app,
       "PUT",
-      `/apis/forms.takoform.com/v1/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/service`,
+      createPath,
       201,
       createRequestBody,
       createRequestHeaders,
@@ -717,7 +746,6 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
     };
     expect(created.metadata.generation).toBe("1");
     expect(created.spec).toMatchObject({ ...CANDIDATE.desired, healthPath: LONG_HEALTH_PATH });
-    const resourcePath = `/apis/forms.takoform.com/v1/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/service?${query}`;
     await http(
       app,
       "POST",
@@ -803,25 +831,52 @@ test("publisher-emitted unpublished Form selects the Host Offering for a normal 
       updatedDesired,
       { ...manager, "takoform-expected-generation": created.metadata.generation },
     );
+    const updateRequestBody = {
+      ...updatedDesired,
+      review: {
+        prepareDigest: String(
+          (updatePrepared.body as { review: { prepareDigest: string } }).review.prepareDigest,
+        ),
+      },
+    };
+    const updateRequestHeaders = {
+      ...manager,
+      "idempotency-key": "container-update-1",
+      "if-match": `"${created.metadata.revision}"`,
+      "takoform-expected-generation": created.metadata.generation,
+    };
+    docker.setHealthReady(2, false);
+    const startingUpdate = await http(
+      app,
+      "PUT",
+      createPath,
+      503,
+      updateRequestBody,
+      updateRequestHeaders,
+    );
+    expect(startingUpdate.body).toMatchObject({
+      error: { code: "backend_unavailable", retryable: true },
+    });
+    expect(docker.containers.size).toBe(2);
+    const stillServing = await http(app, "GET", resourcePath, 200, undefined, manager);
+    expect(stillServing.body).toMatchObject({
+      metadata: { uid: created.metadata.uid, generation: "1" },
+    });
+    expect(
+      (
+        stillServing.body as { status: { conditions: { type: string; status: string }[] } }
+      ).status.conditions.some(
+        (condition) => condition.type === "Ready" && condition.status === "True",
+      ),
+    ).toBe(true);
+    docker.setHealthReady(2, true);
     const updated = await http(
       app,
       "PUT",
-      `/apis/forms.takoform.com/v1/resources/${FORM_REF.apiVersion}/${FORM_REF.kind}/service`,
+      createPath,
       200,
-      {
-        ...updatedDesired,
-        review: {
-          prepareDigest: String(
-            (updatePrepared.body as { review: { prepareDigest: string } }).review.prepareDigest,
-          ),
-        },
-      },
-      {
-        ...manager,
-        "idempotency-key": "container-update-1",
-        "if-match": `"${created.metadata.revision}"`,
-        "takoform-expected-generation": created.metadata.generation,
-      },
+      updateRequestBody,
+      updateRequestHeaders,
     );
     expect(updated.body).toMatchObject({
       metadata: { uid: created.metadata.uid, generation: "2" },
