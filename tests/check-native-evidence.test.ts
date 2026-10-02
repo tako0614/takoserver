@@ -317,8 +317,8 @@ test("Container Host native evidence validates bounded inputs without claiming e
     TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT: artifact,
     TAKOSERVER_NATIVE_CONTAINER_FORM_ARTIFACT_SHA256:
       "7ab6dce1bbbfecc69f5732abd25100db83168c640e8d1054f5a708ad4ef6a0b2",
-    TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: "nginxinc/nginx-unprivileged@sha256:" + "a".repeat(64),
-    TAKOSERVER_NATIVE_CONTAINER_IMAGE_B: "nginxinc/nginx-unprivileged@sha256:" + "b".repeat(64),
+    TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: `nginxinc/nginx-unprivileged@sha256:${"a".repeat(64)}`,
+    TAKOSERVER_NATIVE_CONTAINER_IMAGE_B: `nginxinc/nginx-unprivileged@sha256:${"b".repeat(64)}`,
     TAKOSERVER_NATIVE_CONTAINER_DOCKER_SOCKET: "/var/run/docker.sock",
     TAKOSERVER_NATIVE_CONTAINER_NETWORK: "takoserver-test-internal",
   };
@@ -331,6 +331,7 @@ test("Container Host native evidence validates bounded inputs without claiming e
   );
   expect(ready.state).toBe("ready");
   expect(ready.detail).toContain("still require running the gated test");
+  expect(capability.enable).toContain("may contact those images' public registry");
   expect(
     capability.inspect(
       "1",

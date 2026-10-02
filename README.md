@@ -597,8 +597,14 @@ with explicit memory, CPU and PID ceilings. Exact revision names and labels
 allow recovery without creating a second container; old and new revisions may
 coexist, and deletion addresses only the selected native revision. Its caller
 must still own resource admission, desired revision, traffic cutover and
-retirement. This primitive is not wired into a public Container resource or
-Offering and does not by itself make container installation available.
+retirement. The opt-in self-host composition connects these responsibilities
+to the existing Host lifecycle for a caller-selected, verified exact
+`ContainerService@0.1.0` Form. The current released Form catalog contains no
+ContainerService: configuring Docker alone does not publish, install, activate
+or offer one. The local Form-only qualification fixture is unpublished and
+does not provide a portable HTTP Interface or Binding. See
+[local Container backend](docs/provisioner.md#local-container-backend-source-qualification)
+for configuration and the remaining publication boundary.
 
 This is an in-process composition seam, not another Host API or serialized
 credential format. The public Worker imports only the credential-free executor

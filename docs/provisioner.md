@@ -98,6 +98,7 @@ pack. Relevant variables are:
 |---|---|
 | `TAKOSERVER_PROVISIONER_TOKEN` | Shared endpoint credential. Without it the provisioning path is not served. |
 | `TAKOSERVER_DATA_ROOT` / `TAKOSERVER_DB` | Durable local state. |
+| `TAKOSERVER_SELFHOST_CONTAINER_DOCKER_SOCKET` / `TAKOSERVER_SELFHOST_CONTAINER_NETWORK` | Optional local Container backend. Both or neither; absolute Unix socket and an operator-owned internal bridge. Configuration does not make a Container Form available. See below. |
 | `TAKOSERVER_WORKERD_BINARY` | Absolute path to the exact closed-graph workerd artifact. Takoserver verifies it, snapshots those bytes under the private data root, and uses only that snapshot for inspection and serving. Without it, or when its digest or resolver probe disagrees, Worker execution is disabled while unrelated self-host capabilities remain available. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS` | Set to exactly `1` to serve `POST /v1/selfhost/tenant-run-credentials`; otherwise that path is a 404. |
 | `TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID` | Optional dedicated runner-credential key identity (default `takoserver-selfhost-tenant-run`). It must differ from the ordinary runtime signing key id; each validated id owns a separate `0600` private-key file under the data root. |
@@ -118,6 +119,45 @@ control and artifact writes require capabilities their HTTP adapters do not
 provide. `TAKOSERVER_ZONES` is rejected because DNS and
 Worker-route authority belongs to the private deployment owner. The retired
 implicit `TAKOSERVER_EDGE_FORMS` switch is rejected as well.
+
+### Local Container backend: source qualification
+
+The stable self-host composition can connect an explicitly selected, verified
+`ContainerService@0.1.0` Form to the existing Host Resource/Deployment lifecycle.
+The current released catalog does not include that Form. The ordinary Bun entry
+still uses that catalog; setting the two Docker variables does not install a
+package, activate support, or add a customer Offering. Qualification currently
+uses an explicitly unpublished Form-only fixture, not a published release.
+Only that reviewed candidate's full FormRef and package digest are accepted;
+matching the kind and version alone does not grant an Offering.
+
+The backend requires durable local state and `stable-selfhost` mode. It ignores
+ambient `DOCKER_HOST`; the configured socket is operator-owned supply, not a
+customer credential. Before pulling an image, creating a revision or starting
+a stopped revision, it verifies the selected network's exact name, local bridge
+driver, `Internal=true`, `Ingress=false`, `Attachable=false`, and
+`takoserver.installation=local.primary` label. It neither creates nor relabels a
+network. An operator can prepare a dedicated network with:
+
+```sh
+docker network create --driver bridge --internal \
+  --label takoserver.installation=local.primary takoserver-local-containers
+```
+
+The code-owned profile limits each revision to 256 MiB, 0.5 CPU and 128 PIDs;
+these are not aggregate scheduling guarantees. State remains under the selected
+data root. A missing runtime journal is unknown, not proof that a native
+container is absent, and does not authorize forgetting its Host Deployment.
+
+The local Form-only contract has no portable HTTP Interface or Binding, no
+import, and no sensitive runtime-input handoff. Nonempty `requiredSensitiveVars`
+is refused before provider mutation. This internal-network backend also refuses
+`outboundInternet=true` and NUL characters in environment values, even though
+the local Form's schema permits those values; schema validity alone is not an
+execution guarantee. `environment` is ordinary persisted Resource spec: do not
+put secrets there; no automatic secret detection is claimed. Native HTTP
+invocation and local management tests do not establish
+portable Worker-to-Container connectivity, Cloudflare execution or GA readiness.
 
 ### Self-host runner credentials
 

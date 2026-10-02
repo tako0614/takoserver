@@ -1,11 +1,12 @@
 /**
  * Native evidence that the portable gate cannot supply by itself.
  *
- * Tests in `tests/` exercise three optional native capabilities: the pinned
+ * Tests in `tests/` exercise four optional native capabilities: the pinned
  * closed-graph `workerd` build, an unqualified Actor qualification candidate,
- * and an opt-in local Docker container lifecycle fixture. The two binary-backed
- * capabilities gate on operator-supplied paths; the Docker capability gates on
- * its explicit opt-in and bounded fixture configuration.
+ * an opt-in local Docker container lifecycle fixture, and a separate
+ * Host-process Docker lifecycle fixture. The two binary-backed capabilities
+ * gate on operator-supplied paths; both Docker capabilities gate on their
+ * explicit opt-in and bounded fixture configuration.
  *
  * That choice is correct — `selectClosedGraphWorkerd` refuses to substitute a
  * package binary for the pinned bytes — but it used to be invisible. This module
@@ -190,7 +191,7 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
     proves:
       "the explicitly selected local unpublished ContainerService Form through public Host CRUD across real OS-process restart and Docker lifecycle boundaries; it does not prove publisher admission, published support, or caller-facing HTTP Binding",
     enable:
-      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Form artifact path/SHA-256, two distinct immutable image refs, Docker Unix socket path, and pre-created owned internal network",
+      "TAKOSERVER_NATIVE_CONTAINER_HOST_LIFECYCLE=1 plus the exact local Form artifact path/SHA-256, two distinct immutable image refs, Docker Unix socket path, and pre-created owned internal network. The gated test checks both exact RepoDigests are already local, but the runtime still sends Docker /images/create requests that may contact those images' public registry; this does not prove zero registry contact",
     inspect: (configured, environment, probe) => {
       if (configured === undefined || configured.trim() === "") {
         return {
