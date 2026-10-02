@@ -208,7 +208,7 @@ async function assertOwnedInternalNetwork(socketPath: string, name: string): Pro
 }
 
 async function assertCachedImmutableImage(socketPath: string, image: string): Promise<void> {
-  if (!/^docker\.io\/nginxinc\/nginx-unprivileged@sha256:[a-f0-9]{64}$/u.test(image)) {
+  if (!/^(?:docker\.io\/)?nginxinc\/nginx-unprivileged@sha256:[a-f0-9]{64}$/u.test(image)) {
     throw new Error("native fixture images must be exact Docker Hub nginx-unprivileged digests");
   }
   const response = await dockerGet(socketPath, `/images/${encodeURIComponent(image)}/json`);
