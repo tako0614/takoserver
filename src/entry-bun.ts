@@ -28,6 +28,7 @@ import {
 } from "./runtime-input-preparations.ts";
 import { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import {
+  hasExactLocalContainerEndpointCandidatePair,
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointPublication,
   selfhostWorkerEndpointScheme,
@@ -35,7 +36,16 @@ import {
 import {
   createSelfhostContainerBootstrap,
   createSelfhostContainerSignalHandler,
+  parseSelfhostContainerBootstrapConfiguration,
 } from "./selfhost-container-bootstrap.ts";
+import {
+  createSelfhostContainerEndpointHttpsDispatch,
+  createSelfhostContainerEndpointHttpsListenerIfSupported,
+  parseSelfhostContainerEndpointHttpsConfiguration,
+  type SelfhostContainerEndpointHttpsListener,
+  validateSelfhostContainerEndpointHttpsCertificate,
+} from "./selfhost-container-endpoint-https.ts";
+import { createSelfhostContainerEndpointIngress } from "./selfhost-container-endpoint-ingress.ts";
 import { serveSelfhostDataPlanes } from "./selfhost-data-planes.ts";
 import {
   createSelfhostBunFetchHandler,
@@ -138,6 +148,75 @@ const port = Number(process.env.PORT ?? 8787);
 
 /** Everything this machine keeps lives under one directory. */
 const dataRoot = process.env.TAKOSERVER_DATA_ROOT ?? ".takoserver";
+const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
+  ? Number(process.env.TAKOSERVER_WORKERD_PORT)
+  : 8788;
+const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
+  ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
+  : workerdPort;
+if (
+  !Number.isSafeInteger(workerEndpointPort) ||
+  workerEndpointPort < 1 ||
+  workerEndpointPort > 65_535
+) {
+  throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
+}
+const parsedContainerConfiguration = parseSelfhostContainerBootstrapConfiguration(process.env);
+const containerEndpointHttpsConfiguration = parseSelfhostContainerEndpointHttpsConfiguration(
+  process.env,
+  {
+    containerRuntimeConfigured: parsedContainerConfiguration !== undefined,
+    controlPort: port,
+    workerdPort,
+    workerEndpointPort,
+  },
+);
+/**
+ * Keep the existing Workerd TLS inputs and parsing semantics as the one source
+ * of certificate material. Container HTTPS validates and handshakes its own
+ * listener independently; Workerd's socket and published scheme remain owned
+ * by the existing Workerd configuration.
+ */
+const workerdTls = (() => {
+  const read = (path: string, name: string): string => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      throw new Error(`${name} could not be read: ${path}`);
+    }
+  };
+  const certificateFile = process.env[SELFHOST_TLS_ENVIRONMENT.certificateFile]?.trim();
+  const privateKeyFile = process.env[SELFHOST_TLS_ENVIRONMENT.privateKeyFile]?.trim();
+  const certificate = process.env[SELFHOST_TLS_ENVIRONMENT.certificate]?.trim();
+  const privateKey = process.env[SELFHOST_TLS_ENVIRONMENT.privateKey]?.trim();
+  const certificateChain = certificateFile
+    ? read(certificateFile, SELFHOST_TLS_ENVIRONMENT.certificateFile)
+    : certificate;
+  const key = privateKeyFile
+    ? read(privateKeyFile, SELFHOST_TLS_ENVIRONMENT.privateKeyFile)
+    : privateKey;
+  if (!certificateChain && !key) return undefined;
+  if (!certificateChain || !key) {
+    throw new Error(
+      `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
+        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
+        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
+    );
+  }
+  return { certificateChain, privateKey: key };
+})();
+if (containerEndpointHttpsConfiguration) {
+  if (!workerdTls) {
+    throw new Error(
+      "Container Endpoint HTTPS requires the existing Worker TLS certificate and key material",
+    );
+  }
+  validateSelfhostContainerEndpointHttpsCertificate({
+    configuredSuffix: containerEndpointHttpsConfiguration.configuredSuffix,
+    certificateChain: workerdTls.certificateChain,
+    privateKey: workerdTls.privateKey,
+  });
+}
 const providerMode = resolveStandaloneProviderMode({
   retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
   cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
@@ -183,10 +262,6 @@ const sql = (() => {
   }
   return createSqliteSql(database);
 })();
-const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
-  ? Number(process.env.TAKOSERVER_WORKERD_PORT)
-  : 8788;
-
 /**
  * The port a published Worker endpoint address carries.
  *
@@ -197,55 +272,6 @@ const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
  * that puts an ordinary front end on 443 in front of workerd says so here, and
  * the scheme's default is normalized away rather than published.
  */
-const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
-  ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
-  : workerdPort;
-if (
-  !Number.isSafeInteger(workerEndpointPort) ||
-  workerEndpointPort < 1 ||
-  workerEndpointPort > 65_535
-) {
-  throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
-}
-
-/**
- * The certificate this machine's Worker socket serves, if the operator gave it
- * one.
- *
- * Either both halves as PEM file paths, or both as PEM text; one half alone is
- * a configuration error rather than a silent fallback to plain HTTP, because
- * the scheme the Host publishes follows this and an operator who thought they
- * had configured TLS must not be given `http://` addresses instead.
- */
-const workerdTls = (() => {
-  const read = (path: string, name: string): string => {
-    try {
-      return readFileSync(path, "utf8");
-    } catch {
-      throw new Error(`${name} could not be read: ${path}`);
-    }
-  };
-  const certificateFile = process.env[SELFHOST_TLS_ENVIRONMENT.certificateFile]?.trim();
-  const privateKeyFile = process.env[SELFHOST_TLS_ENVIRONMENT.privateKeyFile]?.trim();
-  const certificate = process.env[SELFHOST_TLS_ENVIRONMENT.certificate]?.trim();
-  const privateKey = process.env[SELFHOST_TLS_ENVIRONMENT.privateKey]?.trim();
-  const certificateChain = certificateFile
-    ? read(certificateFile, SELFHOST_TLS_ENVIRONMENT.certificateFile)
-    : certificate;
-  const key = privateKeyFile
-    ? read(privateKeyFile, SELFHOST_TLS_ENVIRONMENT.privateKeyFile)
-    : privateKey;
-  if (!certificateChain && !key) return undefined;
-  if (!certificateChain || !key) {
-    throw new Error(
-      `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
-        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
-        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
-    );
-  }
-  return { certificateChain, privateKey: key };
-})();
-
 /**
  * The scheme Worker endpoints are published under, and the sentence an operator
  * has to read when it is `http` on a name that is not this machine.
@@ -319,6 +345,32 @@ const objects =
 const clock = () => new Date();
 const edge = await buildEdgeForms();
 const currentCandidates = currentTakoformCandidates();
+let selfhostContainerEndpointHttps: SelfhostContainerEndpointHttpsListener | undefined;
+if (containerEndpointHttpsConfiguration) {
+  // The listener itself proves its port and certificate after binding; it is
+  // created only after the exact Form package preflight and only for the
+  // explicit Container runtime opt-in.
+  selfhostContainerEndpointHttps = await createSelfhostContainerEndpointHttpsListenerIfSupported({
+    configuration: containerEndpointHttpsConfiguration,
+    containerRuntimeConfigured: selfhostContainer !== undefined,
+    exactCandidatePair: hasExactLocalContainerEndpointCandidatePair(currentCandidates.forms),
+    ...(workerdTls
+      ? { certificateChain: workerdTls.certificateChain, privateKey: workerdTls.privateKey }
+      : {}),
+  });
+  if (!selfhostContainerEndpointHttps) {
+    process.stderr.write(
+      "Container Endpoint HTTPS is configured but unavailable: the exact supported Service/Endpoint package pair is absent; no HTTPS listener was opened.\n",
+    );
+  }
+}
+// Register immediately after binding, before later async composition steps can
+// fail. The listener close revokes assertServing before asking Bun to stop it.
+if (selfhostContainerEndpointHttps) {
+  process.once("exit", () => {
+    void selfhostContainerEndpointHttps?.close();
+  });
+}
 
 // The provider reads committed bundles through the same artifact store the
 // Host writes them to, so a Worker can only be published from bytes a tenant
@@ -517,6 +569,9 @@ const providerComposition = createStandaloneProviderComposition({
         },
       }
     : {}),
+  ...(selfhostContainerEndpointHttps
+    ? { containerEndpointIngress: selfhostContainerEndpointHttps.ingress }
+    : {}),
   ...(dataPlanes
     ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
     : {}),
@@ -533,6 +588,13 @@ const providerComposition = createStandaloneProviderComposition({
       }
     : {}),
 });
+if (selfhostContainerEndpointHttps && !providerComposition.containerEndpointIngress) {
+  await selfhostContainerEndpointHttps.close();
+  selfhostContainerEndpointHttps = undefined;
+  process.stderr.write(
+    "Container Endpoint HTTPS is configured but unsupported by this exact Provider composition; listener closed and no Endpoint Offering is active.\n",
+  );
+}
 const { providers, providerPacks, offerings } = providerComposition;
 
 const unconfigured = {
@@ -659,6 +721,7 @@ if (selfhostTenantRunCredentialSigningKey) {
 }
 
 const configuredAi = aiGateway();
+let selfhostEndpointIngressFetch: ((request: Request) => Promise<Response | null>) | undefined;
 const app = buildApp({
   sql,
   objects,
@@ -698,9 +761,37 @@ const app = buildApp({
           }),
       }
     : {}),
+  ...(selfhostContainerEndpointHttps &&
+  selfhostContainer &&
+  providerComposition.containerEndpointIngress
+    ? {
+        selfhostEndpointIngressFactory: ({ store, deployments }) => {
+          selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
+            qualification: providerComposition.containerEndpointIngress,
+            store,
+            deployments,
+          });
+          return selfhostEndpointIngressFetch;
+        },
+      }
+    : {}),
   ...(runtimeInputs ? { runtimeInputs } : {}),
   clock,
 });
+// Install only the callback composed against this Host's canonical stores. A
+// suffix miss becomes a private 404 on this dedicated listener and can never
+// fall through to Host health, provisioning, or API routes.
+if (selfhostContainerEndpointHttps) {
+  if (!selfhostEndpointIngressFetch) {
+    await selfhostContainerEndpointHttps.close();
+    selfhostContainerEndpointHttps = undefined;
+    throw new Error("Container Endpoint HTTPS could not install its exact Host ingress handler");
+  }
+  const endpointFetch = selfhostEndpointIngressFetch;
+  selfhostContainerEndpointHttps.installEndpointFetch(
+    createSelfhostContainerEndpointHttpsDispatch(endpointFetch),
+  );
+}
 
 // Background settlement. One pass at a time: overlapping ticks would compete
 // for the same rows and waste the claim they cannot win.
@@ -785,8 +876,10 @@ if (workerScheduler) {
  * replaces the default disposition, so each one ends the process itself after
  * the child is gone.
  */
-process.on("exit", () => workerd.stop());
-const handleSelfhostShutdown = createSelfhostContainerSignalHandler(
+process.on("exit", () => {
+  workerd.stop();
+});
+const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
   selfhostContainer,
   () => {
     process.stderr.write("the self-host Container runtime did not close cleanly\n");
@@ -794,6 +887,16 @@ const handleSelfhostShutdown = createSelfhostContainerSignalHandler(
   () => workerd.stop(),
   () => process.exit(0),
 );
+const handleSelfhostShutdown = () => {
+  const closeIngress = selfhostContainerEndpointHttps
+    ? selfhostContainerEndpointHttps.close()
+    : Promise.resolve();
+  return closeIngress
+    .catch(() => {
+      process.stderr.write("the self-host Container HTTPS listener did not close cleanly\n");
+    })
+    .finally(handleContainerAndWorkerdShutdown);
+};
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, handleSelfhostShutdown);
 }
