@@ -352,7 +352,10 @@ exact current 17-package publisher closure over its real loopback HTTP API,
 requires acceptance, then requires refusal of changed package bytes and a
 valid-but-wrong publisher ref at that same verification endpoint. The actual
 self-host admission CLI then applies the unchanged closure through its existing
-`--core-verifier` interface.
+`--core-verifier` interface. The native harness allows up to 120 seconds for
+that local apply process and 240 seconds for the entire native test; these are
+test budgets, not a production CLI or Host API deadline. The child-stop,
+Host-readiness, Worker-recovery, and cleanup bounds are unchanged.
 
 For example, provide Bun 1.4.0, Go, and the existing local Go caches in `PATH`
 and the two cache variables; no module download or network fallback is used:
@@ -363,7 +366,7 @@ env -i PATH="$PATH" TMPDIR=/tmp \
   TAKOSERVER_NATIVE_GO_MODULES=/path/to/existing/go-module-cache \
   TAKOSERVER_WORKERD_BINARY=/absolute/path/to/accepted-workerd \
   unshare --net sh -c \
-  'ip link set lo up && bun --no-env-file test --timeout 120000 tests/selfhost-host-cold-restore-native.test.ts'
+  'ip link set lo up && bun --no-env-file test --timeout 240000 tests/selfhost-host-cold-restore-native.test.ts'
 ```
 
 An unset artifact explicitly skips this native case; a portable check therefore

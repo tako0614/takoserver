@@ -106,6 +106,226 @@ test("Form Package import is create-only and accepts only exact existing bytes",
   ).toBeNull();
 });
 
+test("Form Package import overlaps bounded payload creates and publishes its index last", async () => {
+  const fileCount = 8;
+  const files = await Promise.all(
+    Array.from({ length: fileCount }, async (_, index) => {
+      const bytes = new TextEncoder().encode(`payload-${index}`);
+      const fileDigest = (await bytesDigest(bytes)) as AdmissionDigest;
+      return {
+        path: `payload-${index}.json`,
+        bytes,
+        digest: fileDigest,
+        mediaType: "application/json",
+      };
+    }),
+  );
+  const manifest = packageManifest({
+    formRef: FORM_REF,
+    files: files.map(({ path, digest, bytes, mediaType }) => ({
+      path,
+      digest,
+      size: bytes.byteLength,
+      mediaType,
+    })),
+  });
+  const pkg: FormPackageInput = {
+    packageDigest: (await canonicalDigest(manifest)) as AdmissionDigest,
+    formRef: FORM_REF,
+    files,
+    manifest,
+  };
+
+  const backing = createMemoryObjectStore();
+  let activeCreates = 0;
+  let maximumActiveCreates = 0;
+  let completedPayloadCreates = 0;
+  let indexPublishedAfterPayloads = false;
+  let releaseSecondPayload!: () => void;
+  const secondPayloadStarted = new Promise<void>((resolve) => {
+    releaseSecondPayload = resolve;
+  });
+  const delayedObjects: ObjectStore = {
+    writeOperationIdentity: backing.writeOperationIdentity,
+    async create(key, body, options) {
+      if (key.endsWith("/package-index.json")) {
+        indexPublishedAfterPayloads = completedPayloadCreates === fileCount && activeCreates === 0;
+        return await backing.create(key, body, options);
+      }
+      activeCreates += 1;
+      maximumActiveCreates = Math.max(maximumActiveCreates, activeCreates);
+      if (completedPayloadCreates === 0 && activeCreates === 1) {
+        await Promise.race([
+          secondPayloadStarted,
+          new Promise<void>((resolve) => setTimeout(resolve, 25)),
+        ]);
+      } else {
+        releaseSecondPayload();
+      }
+      try {
+        return await backing.create(key, body, options);
+      } finally {
+        activeCreates -= 1;
+        completedPayloadCreates += 1;
+      }
+    },
+    put: (key, body, options) => backing.put(key, body, options),
+    get: (key) => backing.get(key),
+    head: (key) => backing.head(key),
+    delete: (key) => backing.delete(key),
+    list: (input) => backing.list(input),
+  };
+
+  const packages = createFormPackageStore(delayedObjects);
+  const stored = await packages.put(pkg);
+
+  expect(maximumActiveCreates).toBeGreaterThan(1);
+  expect(maximumActiveCreates).toBeLessThanOrEqual(4);
+  expect(indexPublishedAfterPayloads).toBe(true);
+  expect(stored.files).toHaveLength(fileCount);
+});
+
+test("Form Package import drains started payload creates before refusing", async () => {
+  const fileCount = 8;
+  const files = await Promise.all(
+    Array.from({ length: fileCount }, async (_, index) => {
+      const bytes = new TextEncoder().encode(`payload-${index}`);
+      const fileDigest = (await bytesDigest(bytes)) as AdmissionDigest;
+      return {
+        path: `payload-${index}.json`,
+        bytes,
+        digest: fileDigest,
+        mediaType: "application/json",
+      };
+    }),
+  );
+  const manifest = packageManifest({
+    formRef: FORM_REF,
+    files: files.map(({ path, digest, bytes, mediaType }) => ({
+      path,
+      digest,
+      size: bytes.byteLength,
+      mediaType,
+    })),
+  });
+  const pkg: FormPackageInput = {
+    packageDigest: (await canonicalDigest(manifest)) as AdmissionDigest,
+    formRef: FORM_REF,
+    files,
+    manifest,
+  };
+
+  const backing = createMemoryObjectStore();
+  let started = 0;
+  let settled = 0;
+  let active = 0;
+  let indexCreateAttempts = 0;
+  let releaseBatch!: () => void;
+  const firstBatchStarted = new Promise<void>((resolve) => {
+    releaseBatch = resolve;
+  });
+  const delayedObjects: ObjectStore = {
+    writeOperationIdentity: backing.writeOperationIdentity,
+    async create(key, body, options) {
+      if (key.endsWith("/package-index.json")) {
+        indexCreateAttempts += 1;
+        return await backing.create(key, body, options);
+      }
+      started += 1;
+      active += 1;
+      if (active === 4) releaseBatch();
+      if (active === 1) {
+        await Promise.race([
+          firstBatchStarted,
+          new Promise<void>((resolve) => setTimeout(resolve, 25)),
+        ]);
+      }
+      try {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        if (key.endsWith("/payload-2.json")) throw new Error("fixture object refusal");
+        return await backing.create(key, body, options);
+      } finally {
+        active -= 1;
+        settled += 1;
+      }
+    },
+    put: (key, body, options) => backing.put(key, body, options),
+    get: (key) => backing.get(key),
+    head: (key) => backing.head(key),
+    delete: (key) => backing.delete(key),
+    list: (input) => backing.list(input),
+  };
+
+  const packages = createFormPackageStore(delayedObjects);
+  await expect(packages.put(pkg)).rejects.toThrow("fixture object refusal");
+  const settledAtRefusal = settled;
+  await new Promise((resolve) => setTimeout(resolve, 15));
+
+  expect(started).toBe(4);
+  expect(settledAtRefusal).toBe(4);
+  expect(active).toBe(0);
+  expect(settled).toBe(settledAtRefusal);
+  expect(indexCreateAttempts).toBe(0);
+});
+
+test("concurrent identical Form Package imports converge through create-only storage", async () => {
+  const files = await Promise.all(
+    Array.from({ length: 4 }, async (_, index) => {
+      const bytes = new TextEncoder().encode(`concurrent-payload-${index}`);
+      const fileDigest = (await bytesDigest(bytes)) as AdmissionDigest;
+      return {
+        path: `concurrent-${index}.json`,
+        bytes,
+        digest: fileDigest,
+        mediaType: "application/json",
+      };
+    }),
+  );
+  const manifest = packageManifest({
+    formRef: FORM_REF,
+    files: files.map(({ path, digest, bytes, mediaType }) => ({
+      path,
+      digest,
+      size: bytes.byteLength,
+      mediaType,
+    })),
+  });
+  const pkg: FormPackageInput = {
+    packageDigest: (await canonicalDigest(manifest)) as AdmissionDigest,
+    formRef: FORM_REF,
+    files,
+    manifest,
+  };
+  const backing = createMemoryObjectStore();
+  const concurrentObjects: ObjectStore = {
+    writeOperationIdentity: backing.writeOperationIdentity,
+    async create(key, body, options) {
+      await Promise.resolve();
+      return await backing.create(key, body, options);
+    },
+    put: (key, body, options) => backing.put(key, body, options),
+    get: (key) => backing.get(key),
+    head: (key) => backing.head(key),
+    delete: (key) => backing.delete(key),
+    list: (input) => backing.list(input),
+  };
+  const packages = createFormPackageStore(concurrentObjects);
+
+  const [first, second] = await Promise.all([packages.put(pkg), packages.put(pkg)]);
+
+  expect(first.packageDigest).toBe(pkg.packageDigest);
+  expect(second.packageDigest).toBe(pkg.packageDigest);
+  expect(first.files.map(({ path, digest }) => ({ path, digest }))).toEqual(
+    second.files.map(({ path, digest }) => ({ path, digest })),
+  );
+  const page = await backing.list({
+    prefix: `${formPackagePrefix(pkg.packageDigest)}/`,
+    limit: 10,
+  });
+  expect(page.objects).toHaveLength(files.length + 1);
+  expect(page.truncated).toBe(false);
+});
+
 function admissionReport(
   pkg: FormPackageInput,
   pub: AdmissionPublisherPin,
