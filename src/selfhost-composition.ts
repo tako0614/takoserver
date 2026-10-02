@@ -87,6 +87,16 @@ export const SELFHOST_IDENTITY_CAPABILITY_KINDS: readonly YurucommuIdentityCapab
 const SUPPLY_CONTRACT_REF = "local.ownership-contract";
 const PROVIDER_INSTALLATION_REF = "local.primary";
 
+/** Exact reviewed, unpublished Form-only local candidate; not a released catalog projection. */
+const LOCAL_CONTAINER_FORM = {
+  apiVersion: "edge.forms.takoform.com",
+  kind: "ContainerService",
+  definitionVersion: "0.1.0",
+  schemaDigest: "sha256:114d452395562573f46d9a879efa889ab42a3e43348d7db244e22df7d6e330e2",
+} as const;
+const LOCAL_CONTAINER_PACKAGE_DIGEST =
+  "sha256:0fb3c53940180e3f661268e079f9dbc6667c4d1fbbc74b4561ebb5ffa2740d33";
+
 /** Forms the Host executes itself; they are never provider capabilities. */
 const HOST_INTRINSIC = new Set([
   "WorkerBundle",
@@ -162,16 +172,17 @@ export function createSelfhostComposition(
   // exact publisher candidate plus a native runtime can enter this catalog.
   const containerForms = options.stableForms.filter(
     (form) =>
-      form.identity.formRef.apiVersion === "edge.forms.takoform.com" &&
-      form.identity.formRef.kind === "ContainerService" &&
-      form.identity.formRef.definitionVersion === "0.1.0",
+      form.identity.formRef.apiVersion === LOCAL_CONTAINER_FORM.apiVersion &&
+      form.identity.formRef.kind === LOCAL_CONTAINER_FORM.kind &&
+      form.identity.formRef.definitionVersion === LOCAL_CONTAINER_FORM.definitionVersion,
   );
   if (containerForms.length > 1) throw new TypeError("ambiguous ContainerService installation");
   const containerForm = containerForms[0];
   if (options.container && containerForm) {
     if (
+      containerForm.identity.formRef.schemaDigest !== LOCAL_CONTAINER_FORM.schemaDigest ||
+      containerForm.identity.packageDigest !== LOCAL_CONTAINER_PACKAGE_DIGEST ||
       containerForm.role !== "identity" ||
-      !containerForm.identity.packageDigest ||
       !containerForm.operations.includes("create") ||
       !containerForm.operations.includes("update") ||
       !containerForm.operations.includes("delete") ||
