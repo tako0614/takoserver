@@ -677,33 +677,30 @@ test.skipIf(WORKERD === null)(
         try {
           await stopAdmissionProcess(admission);
           admission = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("admission_stop_failed");
         }
       }
       if (verifier) {
         try {
           await stopVerifierProcess(verifier);
           verifier = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("verifier_stop_failed");
         }
       }
       if (host) {
         try {
           await cleanupHost(host);
           host = undefined;
-        } catch (error) {
-          cleanupFailures.push(errorTag(error));
+        } catch {
+          cleanupFailures.push("host_stop_failed");
         }
       }
-      if (cleanupFailures.length === 0) rmSync(fixture, { recursive: true, force: true });
     }
-    if (cleanupFailures.length > 0) {
-      const primaryTag = hasPrimaryFailure ? errorTag(primaryFailure) : "none";
-      throw new Error(`selfhost_cleanup_failed_${cleanupFailures.join("_")}_after_${primaryTag}`);
-    }
-    if (hasPrimaryFailure) throw primaryFailure;
+    finishColdRestore(primaryFailure, hasPrimaryFailure, cleanupFailures, () =>
+      rmSync(fixture, { recursive: true, force: true }),
+    );
   },
   240_000,
 );
@@ -1044,11 +1041,6 @@ function processExecutable(pid: number): string | null {
   }
 }
 
-function errorTag(error: unknown): string {
-  if (error instanceof Error && /^[a-z0-9_]+$/u.test(error.message)) return error.message;
-  return "unknown";
-}
-
 async function waitForProcessIdentitiesGone(identities: Iterable<ProcessIdentity>): Promise<void> {
   const captured = [...identities];
   const deadline = Date.now() + 5_000;
@@ -1231,6 +1223,84 @@ test("self-host diagnostic observer failures do not change stage results", async
     ["form_admission", "error"],
   ]);
 });
+
+test("self-host fixture removal failure preserves the primary test failure", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  const cleanupFailures: string[] = [];
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, cleanupFailures, () => {
+      throw new Error("fixture removal detail must not replace the primary failure");
+    });
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(observedFailure).toBeInstanceOf(Error);
+  expect((observedFailure as Error).message).toBe(
+    "selfhost_cleanup_failed_fixture_remove_failed_after_primary_failure",
+  );
+  expect((observedFailure as Error).cause).toBe(primaryFailure);
+  expect(cleanupFailures).toEqual(["fixture_remove_failed"]);
+});
+
+test("self-host stop failure retains fixture and primary cause", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  const cleanupFailures = ["host_stop_failed"];
+  let removedFixture = false;
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, cleanupFailures, () => {
+      removedFixture = true;
+    });
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(removedFixture).toBe(false);
+  expect((observedFailure as Error).message).toBe(
+    "selfhost_cleanup_failed_host_stop_failed_after_primary_failure",
+  );
+  expect((observedFailure as Error).cause).toBe(primaryFailure);
+});
+
+test("self-host cleanup without secondary failures rethrows the original error", () => {
+  const primaryFailure = new Error("selfhost_native_primary_failure");
+  let observedFailure: unknown;
+
+  try {
+    finishColdRestore(primaryFailure, true, [], () => undefined);
+  } catch (error) {
+    observedFailure = error;
+  }
+
+  expect(observedFailure).toBe(primaryFailure);
+});
+
+function finishColdRestore(
+  primaryFailure: unknown,
+  hasPrimaryFailure: boolean,
+  cleanupFailures: string[],
+  removeFixture: () => void,
+): void {
+  if (cleanupFailures.length === 0) {
+    try {
+      removeFixture();
+    } catch {
+      cleanupFailures.push("fixture_remove_failed");
+    }
+  }
+  if (cleanupFailures.length > 0) {
+    const suffix = hasPrimaryFailure ? "after_primary_failure" : "without_primary_failure";
+    throw new Error(
+      `selfhost_cleanup_failed_${cleanupFailures.join("_")}_${suffix}`,
+      hasPrimaryFailure ? { cause: primaryFailure } : undefined,
+    );
+  }
+  if (hasPrimaryFailure) throw primaryFailure;
+}
 
 async function deleteResource(
   auth: Record<string, string>,
