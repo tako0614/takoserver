@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   collectNativeEvidenceGates,
+  NATIVE_EVIDENCE_CAPABILITIES,
   type NativeEvidenceGate,
   type NativeEvidenceProbe,
   nativeEvidenceExitCode,
@@ -14,6 +15,37 @@ import {
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
 const WORKERD_DIGEST = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
+const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
+
+const DOCKER_FIXTURE_ENVIRONMENT = {
+  TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: `registry.example.test/takoserver/a@sha256:${"a".repeat(64)}`,
+  TAKOSERVER_NATIVE_CONTAINER_IMAGE_B: `registry.example.test/takoserver/b@sha256:${"b".repeat(64)}`,
+  TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_A: "org.example.fixture.a",
+  TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_B: "org.example.fixture.b",
+  TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_VALUE_A: "fixture-a-provenance",
+  TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_VALUE_B: "fixture-b-provenance",
+  TAKOSERVER_NATIVE_CONTAINER_VERSION_A: "1.2.3",
+  TAKOSERVER_NATIVE_CONTAINER_VERSION_B: "2.3.4",
+  TAKOSERVER_NATIVE_CONTAINER_SERVER_A: "fixture-server-a",
+  TAKOSERVER_NATIVE_CONTAINER_SERVER_B: "fixture-server-b",
+  TAKOSERVER_NATIVE_CONTAINER_PORT: "18080",
+} as const;
+
+function dockerLifecycleSummary(environment: Readonly<Record<string, string | undefined>>) {
+  const gates: NativeEvidenceGate[] = [
+    {
+      file: "selfhost-container-native.test.ts",
+      environments: [DOCKER_LIFECYCLE_ENV],
+      capability: "docker-container-lifecycle",
+    },
+  ];
+  const summaries = summarizeNativeEvidence({ gates, environment, probe: probe() });
+  return {
+    gates,
+    summary: summaries.find((entry) => entry.capability === "docker-container-lifecycle"),
+    summaries,
+  };
+}
 
 function probe(
   input: { readonly digests?: Readonly<Record<string, string>> } = {},
@@ -73,6 +105,82 @@ test("classifies a gate by the environment it names, through a local alias", asy
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("classifies the repository self-host container lifecycle gate", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const lifecycle = gates.filter((gate) => gate.file === "tests/selfhost-container-native.test.ts");
+
+  expect(lifecycle).toHaveLength(1);
+  expect(lifecycle[0]?.environments).toEqual([DOCKER_LIFECYCLE_ENV]);
+  expect(lifecycle[0]?.capability).toBe("docker-container-lifecycle");
+  expect(gates.every((gate) => gate.capability !== null)).toBe(true);
+});
+
+test("registers the Docker lifecycle gate's exact eleven fixture inputs as companions", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "docker-container-lifecycle",
+  );
+
+  expect(capability?.environment).toBe(DOCKER_LIFECYCLE_ENV);
+  expect(capability?.companionEnvironment).toEqual(Object.keys(DOCKER_FIXTURE_ENVIRONMENT));
+  expect(capability?.companionEnvironment).toHaveLength(11);
+});
+
+test("reports an absent Docker lifecycle opt-in as disabled and unproven", () => {
+  const result = dockerLifecycleSummary({});
+
+  expect(result.summary?.state).toBe("unconfigured");
+  expect(result.summary?.detail).toContain("Docker lifecycle tests are disabled");
+  expect(nativeEvidenceExitCode(result)).toBe(0);
+  expect(renderNativeEvidenceReport(result).join("\n")).toContain("NOT PROVEN BY THIS RUN");
+});
+
+test("rejects invalid Docker lifecycle opt-in values instead of silently disabling", () => {
+  for (const flag of ["", "0", "true"]) {
+    const result = dockerLifecycleSummary({ [DOCKER_LIFECYCLE_ENV]: flag });
+
+    expect(result.summary?.state).toBe("invalid");
+    expect(result.summary?.detail).toContain('must be exactly "1"');
+    expect(nativeEvidenceExitCode(result)).toBe(1);
+  }
+});
+
+test("rejects an enabled Docker lifecycle gate when fixture inputs are missing", () => {
+  const result = dockerLifecycleSummary({ [DOCKER_LIFECYCLE_ENV]: "1" });
+
+  expect(result.summary?.state).toBe("invalid");
+  expect(result.summary?.detail).toContain(
+    "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A is missing or empty",
+  );
+  expect(nativeEvidenceExitCode(result)).toBe(1);
+});
+
+test("rejects mutable or malformed Docker fixture image references", () => {
+  const result = dockerLifecycleSummary({
+    [DOCKER_LIFECYCLE_ENV]: "1",
+    ...DOCKER_FIXTURE_ENVIRONMENT,
+    TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: "registry.example.test/takoserver/a:latest",
+  });
+
+  expect(result.summary?.state).toBe("invalid");
+  expect(result.summary?.detail).toContain("distinct immutable repository digest references");
+  expect(nativeEvidenceExitCode(result)).toBe(1);
+});
+
+test("accepts bounded Docker fixture inputs as ready-to-run without claiming execution", () => {
+  const result = dockerLifecycleSummary({
+    [DOCKER_LIFECYCLE_ENV]: "1",
+    ...DOCKER_FIXTURE_ENVIRONMENT,
+  });
+
+  expect(result.summary?.state).toBe("ready");
+  expect(result.summary?.detail).toContain("fixture inputs are valid");
+  expect(result.summary?.detail).toContain("Docker was not contacted");
+  const report = renderNativeEvidenceReport(result).join("\n");
+  expect(report).toContain("runtime execution is not proven by this inspection");
+  expect(report).not.toContain("proven by this run");
+  expect(nativeEvidenceExitCode(result)).toBe(0);
 });
 
 test("ignores import-shaped lines inside embedded fixture module sources", async () => {

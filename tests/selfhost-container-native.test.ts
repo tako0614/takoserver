@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { createDockerHttpRevisionRuntime } from "../src/providers/docker-http-revision.ts";
 import { createSelfhostContainerRuntime } from "../src/providers/selfhost-container-runtime.ts";
 
-const OPT_IN = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
 const IMAGE_A = "TAKOSERVER_NATIVE_CONTAINER_IMAGE_A";
 const IMAGE_B = "TAKOSERVER_NATIVE_CONTAINER_IMAGE_B";
 const PROVENANCE_LABEL_A = "TAKOSERVER_NATIVE_CONTAINER_PROVENANCE_LABEL_A";
@@ -524,7 +523,7 @@ test("network cleanup refuses foreign labels and surfaces removal failures", asy
   ).rejects.toThrow("simulated cleanup failure");
 });
 
-test.skipIf(process.env[OPT_IN] !== "1")(
+test.skipIf(process.env.TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE !== "1")(
   "self-host container completes a native Docker lifecycle on an isolated local fixture",
   async () => {
     const fixture = fixtureConfig();
