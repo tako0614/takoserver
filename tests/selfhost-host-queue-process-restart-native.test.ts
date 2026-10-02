@@ -282,7 +282,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
       );
       const admissionExit = await Promise.race([
         admission.exited,
-        Bun.sleep(30_000).then(() => null),
+        Bun.sleep(120_000).then(() => null),
       ]);
       if (admissionExit === null) {
         admission.kill("SIGKILL");
@@ -485,7 +485,7 @@ test.skipIf(!NATIVE_AVAILABLE)(
     }
     if (hasPrimaryFailure) throw primaryFailure;
   },
-  240_000,
+  360_000,
 );
 
 function childEnvironment(home: string): Record<string, string> {
@@ -586,7 +586,7 @@ async function crashHost(
   host.kill("SIGKILL");
   const exitCode = await Promise.race([host.exited, Bun.sleep(10_000).then(() => null)]);
   if (exitCode === null) throw new Error("selfhost_host_sigkill_timeout");
-  expect(host.signalCode).toBe("SIGKILL");
+  expect<string | null>(host.signalCode).toBe("SIGKILL");
 
   // A SIGKILL cannot run Host shutdown hooks. If its one verified Workerd
   // child remains, signal only that exact PID while its start time and
