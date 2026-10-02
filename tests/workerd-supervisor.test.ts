@@ -58,6 +58,77 @@ async function settle(): Promise<void> {
  * and that a machine without the binary fails the serving operation.
  */
 describe("keeping workerd running", () => {
+  test("exposes a fresh snapshot across child start, exit, and automatic recovery", async () => {
+    const children: TestChild[] = [];
+    const readiness = [deferred<boolean>(), deferred<boolean>()];
+    const restarts: Array<() => void> = [];
+    let readinessIndex = 0;
+    const supervisor = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => {
+        const child = testChild();
+        children.push(child);
+        return child.process;
+      },
+      readiness: async () => {
+        const current = readiness[readinessIndex++];
+        if (!current) throw new Error("unexpected readiness attempt");
+        return await current.promise;
+      },
+      scheduleRestart: (run) => {
+        restarts.push(run);
+        return () => undefined;
+      },
+    });
+
+    const initial = supervisor.snapshot();
+    expect(initial).toEqual({ state: "idle" });
+    expect(supervisor.snapshot()).not.toBe(initial);
+
+    const starting = supervisor.ensure("/data/workerd.capnp");
+    await settle();
+    expect(supervisor.snapshot()).toEqual({ state: "starting" });
+    readiness[0]?.resolve(true);
+    await starting;
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+
+    children[0]?.exit();
+    await settle();
+    expect(supervisor.snapshot()).toEqual({ state: "recovering" });
+
+    restarts[0]?.();
+    await settle();
+    expect(supervisor.snapshot()).toEqual({ state: "recovering" });
+    readiness[1]?.resolve(true);
+    await settle();
+    expect(supervisor.snapshot()).toEqual({ state: "serving" });
+
+    supervisor.stop();
+    expect(supervisor.snapshot()).toEqual({ state: "unavailable" });
+  });
+
+  test("records an unavailable first start without treating an untouched supervisor as required", async () => {
+    let spawnCalls = 0;
+    const untouched = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => {
+        spawnCalls++;
+        return { kill() {} };
+      },
+      readiness: async () => true,
+    });
+    expect(untouched.snapshot()).toEqual({ state: "idle" });
+    expect(spawnCalls).toBe(0);
+
+    const unavailable = createWorkerdSupervisor({
+      binary: "/usr/bin/workerd",
+      spawn: () => ({ kill() {} }),
+      readiness: async () => false,
+    });
+    await expect(unavailable.ensure("/data/workerd.capnp")).rejects.toThrow("readiness");
+    expect(unavailable.snapshot()).toEqual({ state: "unavailable" });
+  });
+
   test("starts once however many times it is asked", async () => {
     const started: string[][] = [];
     const supervisor = createWorkerdSupervisor({
