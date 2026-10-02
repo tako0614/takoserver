@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
-import { canonicalDigest } from "../src/json.ts";
+import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { Provider } from "../src/provider-port.ts";
 import { deriveRuntimeImplementationCatalog } from "../src/public-worker-implementation.ts";
@@ -80,9 +80,109 @@ describe("self-host Form admission CLI", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("reopens partial admission across CLI processes without duplicate events", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tsa-cli-reopen-"));
+    // This loopback fixture replays synthetic verifier responses; it exercises
+    // durable CLI recovery, not released-Core or publisher-trust qualification.
+    const verifier = createSyntheticPublisherSetVerifier();
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => verifier.fetch(request),
+    });
+    try {
+      const lastActivated = [...SELFHOST_CATALOG.entries]
+        .sort((left, right) =>
+          canonicalJson(left.formRef).localeCompare(canonicalJson(right.formRef)),
+        )
+        .at(-1);
+      if (!lastActivated) throw new Error("self-host implementation catalog is empty");
+      const targetRefJson = canonicalJson(lastActivated.formRef);
+      const quoteSql = (value: string) => value.replaceAll("'", "''");
+      const databasePath = join(root, "control.sqlite");
+      const seed = new Database(databasePath);
+      try {
+        for (const migration of MIGRATIONS) seed.exec(migration.sql);
+        seed.exec(
+          `CREATE TRIGGER fail_last_selfhost_activation
+           BEFORE INSERT ON tf_form_activation_events
+           WHEN NEW.form_ref_json = '${quoteSql(targetRefJson)}' AND NEW.active = 1
+           BEGIN SELECT RAISE(ABORT, 'synthetic late activation failure'); END`,
+        );
+      } finally {
+        seed.close();
+      }
+
+      const verifierUrl = `http://127.0.0.1:${server.port}`;
+      const failed = await runAdmissionCli(root, {}, verifierUrl);
+      expect(failed.exitCode).not.toBe(0);
+      expect(failed.stdout).toContain("apply: partial");
+      expect(failed.stdout).toContain("failure at command");
+      expect(failed.stdout).toContain(
+        `installed ${PACKAGE_COUNT}, supported ${IMPLEMENTED}, active ${IMPLEMENTED - 1}`,
+      );
+      expect(failed.stdout).toContain("inspect persisted state and re-run this command to re-plan");
+
+      const installedBeforeRetry = currentTakoformCandidates().forms.filter(
+        (form) => canonicalJson(form.identity.formRef).localeCompare(targetRefJson) <= 0,
+      ).length;
+      const partial = new Database(databasePath);
+      try {
+        expect(countRows(partial, "tf_form_install_events")).toBe(installedBeforeRetry);
+        expect(countDistinctFormRefs(partial, "tf_form_install_events")).toBe(installedBeforeRetry);
+        expect(countRows(partial, "tf_form_support_events")).toBe(IMPLEMENTED);
+        expect(countDistinctFormRefs(partial, "tf_form_support_events")).toBe(IMPLEMENTED);
+        expect(countRows(partial, "tf_form_activation_events")).toBe(IMPLEMENTED - 1);
+        expect(countDistinctFormRefs(partial, "tf_form_activation_events")).toBe(IMPLEMENTED - 1);
+        expect(countRows(partial, "tf_form_activation_events", "active = 1")).toBe(IMPLEMENTED - 1);
+        expect(
+          partial
+            .query(
+              "SELECT count(*) AS count FROM tf_form_activation_events WHERE form_ref_json = ?",
+            )
+            .get(targetRefJson),
+        ).toEqual({ count: 0 });
+        partial.exec("DROP TRIGGER fail_last_selfhost_activation");
+      } finally {
+        partial.close();
+      }
+
+      const reopened = await runAdmissionCli(root, {}, verifierUrl);
+      expect(reopened.exitCode).toBe(0);
+      expect(reopened.stdout).toContain("apply: converged");
+      expect(reopened.stdout).toContain(`installed ${PACKAGE_COUNT}, supported ${IMPLEMENTED}`);
+      expect(reopened.stdout).toContain(`active ${IMPLEMENTED}`);
+      const converged = new Database(databasePath);
+      try {
+        expect(countRows(converged, "tf_form_install_events")).toBe(PACKAGE_COUNT);
+        expect(countDistinctFormRefs(converged, "tf_form_install_events")).toBe(PACKAGE_COUNT);
+        expect(countRows(converged, "tf_form_support_events")).toBe(IMPLEMENTED);
+        expect(countDistinctFormRefs(converged, "tf_form_support_events")).toBe(IMPLEMENTED);
+        expect(countRows(converged, "tf_form_activation_events")).toBe(IMPLEMENTED);
+        expect(countDistinctFormRefs(converged, "tf_form_activation_events")).toBe(IMPLEMENTED);
+        expect(countRows(converged, "tf_form_activation_events", "active = 1")).toBe(IMPLEMENTED);
+      } finally {
+        converged.close();
+      }
+      expect(verifier.calls).toEqual([
+        "/v1/identity",
+        "/v1/verify-set",
+        "/v1/identity",
+        "/v1/verify-set",
+      ]);
+    } finally {
+      server.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
-async function runAdmissionCli(root: string, environment: Readonly<Record<string, string>>) {
+async function runAdmissionCli(
+  root: string,
+  environment: Readonly<Record<string, string>>,
+  coreVerifierUrl = "http://127.0.0.1:1",
+) {
   const child = Bun.spawn(
     [
       process.execPath,
@@ -92,8 +192,10 @@ async function runAdmissionCli(root: string, environment: Readonly<Record<string
       "default",
       "--data-root",
       root,
+      "--host-id",
+      "http://localhost:8787",
       "--core-verifier",
-      "http://127.0.0.1:1",
+      coreVerifierUrl,
       "--apply",
     ],
     {
@@ -103,12 +205,26 @@ async function runAdmissionCli(root: string, environment: Readonly<Record<string
       stderr: "pipe",
     },
   );
-  const [exitCode, stderr] = await Promise.all([
+  const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
-    new Response(child.stderr).text(),
     new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
   ]);
-  return { exitCode, stderr };
+  return { exitCode, stdout, stderr };
+}
+
+function countRows(database: Database, table: string, where?: string): number {
+  const result = database
+    .query(`SELECT count(*) AS count FROM ${table}${where ? ` WHERE ${where}` : ""}`)
+    .get() as { readonly count: number } | null;
+  return result?.count ?? 0;
+}
+
+function countDistinctFormRefs(database: Database, table: string): number {
+  const result = database
+    .query(`SELECT count(DISTINCT form_ref_key) AS count FROM ${table}`)
+    .get() as { readonly count: number } | null;
+  return result?.count ?? 0;
 }
 
 describe("self-host Form admission", () => {
