@@ -16,6 +16,8 @@ import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
 
 const WORKERD_DIGEST = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
 const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
+const OBJECT_BUCKET_HOST_RESTART_ENV = "TAKOSERVER_NATIVE_OBJECT_BUCKET_HOST_RESTART";
+const SELFHOST_ARTIFACT_UPLOAD_ENV = "TAKOSERVER_SELFHOST_ARTIFACT_UPLOAD_NATIVE";
 
 const DOCKER_FIXTURE_ENVIRONMENT = {
   TAKOSERVER_NATIVE_CONTAINER_IMAGE_A: `registry.example.test/takoserver/a@sha256:${"a".repeat(64)}`,
@@ -115,6 +117,94 @@ test("classifies the repository self-host container lifecycle gate", () => {
   expect(lifecycle[0]?.environments).toEqual([DOCKER_LIFECYCLE_ENV]);
   expect(lifecycle[0]?.capability).toBe("docker-container-lifecycle");
   expect(gates.every((gate) => gate.capability !== null)).toBe(true);
+});
+
+test("classifies the isolated ObjectBucket Host restart gate with pinned workerd companion", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const objectBucket = gates.filter(
+    (gate) => gate.file === "tests/selfhost-object-bucket-host-restart-native.test.ts",
+  );
+
+  expect(objectBucket).toHaveLength(1);
+  expect(objectBucket[0]?.environments).toEqual([
+    OBJECT_BUCKET_HOST_RESTART_ENV,
+    "TAKOSERVER_WORKERD_BINARY",
+  ]);
+  expect(objectBucket[0]?.capabilities).toEqual(["object-bucket-host-restart"]);
+  expect(objectBucket[0]?.capability).toBe("object-bucket-host-restart");
+  expect(gates.every((gate) => gate.capability !== null)).toBe(true);
+});
+
+test("requires exact ObjectBucket opt-in and pinned workerd without claiming test execution", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "object-bucket-host-restart",
+  );
+  expect(capability?.environment).toBe(OBJECT_BUCKET_HOST_RESTART_ENV);
+  expect(capability?.companionEnvironment).toEqual(["TAKOSERVER_WORKERD_BINARY"]);
+
+  const inspect = capability?.inspect;
+  if (!inspect) throw new Error("object_bucket_host_restart_capability_missing");
+  expect(inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(inspect("1", {}, probe()).state).toBe("invalid");
+  expect(
+    inspect(
+      "1",
+      { TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+      probe({ digests: { "/native/workerd": WORKERD_DIGEST } }),
+    ),
+  ).toMatchObject({ state: "ready", readinessOnly: true });
+  expect(
+    inspect(
+      "true",
+      { TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+      probe({ digests: { "/native/workerd": WORKERD_DIGEST } }),
+    ).state,
+  ).toBe("invalid");
+  expect(
+    inspect(
+      "1",
+      { TAKOSERVER_WORKERD_BINARY: "/native/workerd" },
+      probe({ digests: { "/native/workerd": "0".repeat(64) } }),
+    ).state,
+  ).toBe("invalid");
+});
+
+test("classifies the public Host artifact upload gate without adding a workerd dependency", async () => {
+  const root = await fixture({
+    "selfhost-artifact-upload-start-native.test.ts": [
+      'import { test } from "bun:test";',
+      `const optedIn = process.env.${SELFHOST_ARTIFACT_UPLOAD_ENV} === "1";`,
+      'test.skipIf(!optedIn)("public Host artifact upload", () => {});',
+      "",
+    ].join("\n"),
+  });
+  try {
+    const gates = collectNativeEvidenceGates(root);
+    expect(gates).toHaveLength(1);
+    expect(gates[0]?.file).toBe("selfhost-artifact-upload-start-native.test.ts");
+    expect(gates[0]?.environments).toEqual([SELFHOST_ARTIFACT_UPLOAD_ENV]);
+    expect(gates[0]?.capability).toBe("selfhost-artifact-upload");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("validates the artifact upload opt-in as readiness only", () => {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find(
+    (entry) => entry.id === "selfhost-artifact-upload",
+  );
+  if (!capability) throw new Error("selfhost artifact upload capability missing");
+  expect(capability.environment).toBe(SELFHOST_ARTIFACT_UPLOAD_ENV);
+  expect(capability.companionEnvironment).toEqual([]);
+  expect(capability.inspect(undefined, {}, probe()).state).toBe("unconfigured");
+  expect(capability.inspect("true", {}, probe()).state).toBe("invalid");
+  expect(capability.inspect("1", {}, probe())).toMatchObject({
+    state: process.platform === "linux" ? "ready" : "invalid",
+    ...(process.platform === "linux" ? { readinessOnly: true } : {}),
+  });
+  expect(capability.proves).toContain("V1 upload start/blob/commit followed by V2 upload start");
+  expect(capability.proves).toContain("without Form admission");
+  expect(capability.proves).not.toContain("Cloudflare");
 });
 
 test("registers the Docker lifecycle gate's exact eleven fixture inputs as companions", () => {
