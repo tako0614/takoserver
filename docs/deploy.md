@@ -1219,13 +1219,16 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0068 names and SHA-256 source inventory, so a checkout with unreviewed
-  0069+ migrations is refused before qualification or provider mutation. The
+  0001–0069 names and SHA-256 source inventory, so a checkout with unreviewed
+  0070+ migrations is refused before qualification or provider mutation. The
   selected integration lane projects only the audited through-prefix, with
   apply and remote D1 qualification still capped at 0066. The source-only 0067
-  Container Endpoint index and 0068 future provider-invocation custody schema
-  are not new protected waves or D1 apply authority; 0068 also initializes its
-  admission epoch closed and does not activate an invocation writer.
+  Container Endpoint index, 0068 future provider-invocation custody schema and
+  0069 future delete-ack proof projection are source-only: they are not new
+  protected waves or D1 apply authority. Migration 0068 initializes its
+  admission epoch closed and does not activate an invocation writer; 0069 does
+  not qualify a live delete or migration apply. The apply-qualified ceiling
+  remains 0066, and the protected 0058 evidence gate is unchanged.
   The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
@@ -1707,7 +1710,7 @@ must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
 table has a separate in-place integration wave only after exact 0063; a fresh
 integration storage generation can use the full audited lineage. An unreviewed
-0069-or-later tail is refused.
+0070-or-later tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and
