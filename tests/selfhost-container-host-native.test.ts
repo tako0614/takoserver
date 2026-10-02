@@ -41,6 +41,45 @@ const FORM_REF = {
 const ENDPOINT_REF = SELFHOST_CONTAINER_ENDPOINT_FORM_REF;
 const ENDPOINT_SUFFIX = "container.test";
 
+test("Docker inventory permits image labels but rejects missing or foreign native ownership", () => {
+  const identity = `sha256:${"a".repeat(64)}`;
+  const revision = `sha256:${"b".repeat(64)}`;
+  const imageLabels = {
+    maintainer: "nginx-unprivileged",
+    "org.opencontainers.image.source": "https://example.invalid/nginx",
+  };
+  const labels = {
+    ...imageLabels,
+    "takoserver.identity": identity,
+    "takoserver.revision": revision,
+  };
+  expect(hasNativeContainerOwnershipLabels(`/takoserver-${"a".repeat(64)}`, labels)).toBe(true);
+  expect(
+    hasNativeContainerOwnershipLabels(`/takoserver-${"a".repeat(64)}`, {
+      ...imageLabels,
+      "takoserver.revision": revision,
+    }),
+  ).toBe(false);
+  expect(
+    hasNativeContainerOwnershipLabels(`/takoserver-${"a".repeat(64)}`, {
+      ...labels,
+      "takoserver.revision": "not-a-digest",
+    }),
+  ).toBe(false);
+  expect(
+    hasNativeContainerOwnershipLabels(`/takoserver-${"a".repeat(64)}`, {
+      ...labels,
+      "takoserver.identity": `sha256:${"c".repeat(64)}`,
+    }),
+  ).toBe(false);
+  expect(
+    hasNativeContainerOwnershipLabels(`/takoserver-${"a".repeat(64)}`, {
+      ...labels,
+      "takoserver.owner": "foreign-installation",
+    }),
+  ).toBe(false);
+});
+
 let root: string | undefined;
 let hostProcess: ReturnType<typeof Bun.spawn> | undefined;
 let hostBaseUrl: string | undefined;
@@ -326,6 +365,31 @@ function newNetworkContainers(
   return containers.filter((container) => !baselineIds.has(idOf(container)));
 }
 
+function hasNativeContainerOwnershipLabels(name: unknown, labels: unknown): boolean {
+  if (
+    typeof name !== "string" ||
+    typeof labels !== "object" ||
+    labels === null ||
+    Array.isArray(labels)
+  ) {
+    return false;
+  }
+  const values = labels as Record<string, unknown>;
+  const providerLabelNames = Object.keys(values)
+    .filter((label) => label.startsWith("takoserver."))
+    .sort();
+  if (providerLabelNames.join("\0") !== "takoserver.identity\0takoserver.revision") return false;
+  const identity = values["takoserver.identity"];
+  const revision = values["takoserver.revision"];
+  return (
+    typeof identity === "string" &&
+    /^sha256:[a-f0-9]{64}$/u.test(identity) &&
+    name === `/takoserver-${identity.slice("sha256:".length)}` &&
+    typeof revision === "string" &&
+    /^sha256:[a-f0-9]{64}$/u.test(revision)
+  );
+}
+
 function assertContainerSummary(container: DockerContainerSummary, expectedImage: string): void {
   const name = Array.isArray(container.Names)
     ? container.Names.find((value): value is string => typeof value === "string")
@@ -334,9 +398,7 @@ function assertContainerSummary(container: DockerContainerSummary, expectedImage
   expect(typeof name).toBe("string");
   expect(name?.startsWith("/takoserver-")).toBe(true);
   expect(container.Image).toBe(expectedImage);
-  expect(Object.keys(labels ?? {}).sort()).toEqual(["takoserver.identity", "takoserver.revision"]);
-  expect(labels?.["takoserver.identity"]).toMatch(/^sha256:[a-f0-9]{64}$/u);
-  expect(labels?.["takoserver.revision"]).toMatch(/^sha256:[a-f0-9]{64}$/u);
+  expect(hasNativeContainerOwnershipLabels(name, labels)).toBe(true);
 }
 
 async function listNetworkContainers(
