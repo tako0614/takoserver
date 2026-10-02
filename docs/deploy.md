@@ -1219,11 +1219,13 @@ managed customer runtime.
 
   Integration may select one of the same audited boundaries to exercise a
   bounded protected wave. The selector is checked against the immutable
-  0001–0067 names and SHA-256 source inventory, so a checkout with unreviewed
-  0068+ migrations is refused before qualification or provider mutation. The
+  0001–0068 names and SHA-256 source inventory, so a checkout with unreviewed
+  0069+ migrations is refused before qualification or provider mutation. The
   selected integration lane projects only the audited through-prefix, with
-  apply and remote D1 qualification still capped at 0066; the source-only 0067
-  Container Endpoint index is not a new protected wave or D1 apply authority.
+  apply and remote D1 qualification still capped at 0066. The source-only 0067
+  Container Endpoint index and 0068 future provider-invocation custody schema
+  are not new protected waves or D1 apply authority; 0068 also initializes its
+  admission epoch closed and does not activate an invocation writer.
   The selected integration
   lane keeps every named data preflight, lease, compatibility fence, and
   mutation/readback check, but it applies only the selected through-prefix and
@@ -1256,7 +1258,7 @@ drain claim.
 Worker publication and closure transition can qualify this profile only when
 the selected source catalog and target readback have the exact canonical
 0001–0057 applied prefix and **0058 as the next unapplied migration**. Later
-0059–0067 files in the source catalog remain unapplied and confer no apply
+0059–0068 files in the source catalog remain unapplied and confer no apply
 authority. The current and successor Version's source annotation, target
 bindings (including the exact maintenance var and native D1/R2 identities),
 secrets, routing, and the owner-injected private executor qualification still
@@ -1705,7 +1707,7 @@ must have the canonical 0062 application shape. Protected rehearsal and
 production selectors remain capped at 0057. The audited 0064 Actor-owner
 table has a separate in-place integration wave only after exact 0063; a fresh
 integration storage generation can use the full audited lineage. An unreviewed
-0067 tail is refused.
+0069-or-later tail is refused.
 
 0063 creates only the durable managed Queue retirement marker, helper-phase
 rows, route tripwire and their immutable/no-regression guards. It rewrites and
