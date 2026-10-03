@@ -77,6 +77,8 @@ export interface SelfhostActorPublicRuntime {
     uncertain(): void;
   };
   actorForwardSockets(): readonly WorkerdActorForwardSocket[];
+  isOpen(): boolean;
+  isRestored(): boolean;
   close(): Promise<void>;
 }
 
@@ -141,6 +143,7 @@ export async function openSelfhostActorPublicRuntime(options: {
   const brokers = new Map<string, ForwardBrokers>();
   let admitted = new Set<string>();
   let closed = false;
+  let restored = false;
 
   const prove = async (publication: WorkerdActorForwardPublication): Promise<void> => {
     const stored = await versionBindings.read(publication.script, publication.versionId);
@@ -248,10 +251,12 @@ export async function openSelfhostActorPublicRuntime(options: {
     activated(publications: readonly WorkerdActorForwardPublication[]): void {
       if (closed) return;
       const next = new Set(publications.flatMap((item) => item.bindings.map(brokerKey)));
-      admitted = [...next].every((key) => brokers.has(key)) ? next : new Set();
+      restored = [...next].every((key) => brokers.has(key));
+      admitted = restored ? next : new Set();
     },
     uncertain(): void {
       admitted = new Set();
+      restored = false;
     },
   });
 
@@ -261,9 +266,12 @@ export async function openSelfhostActorPublicRuntime(options: {
     actorForwardLifecycle: lifecycle,
     actorForwardSockets: () =>
       closed ? [] : [...brokers.values()].map((pair) => pair.socketMapping),
+    isOpen: () => !closed,
+    isRestored: () => !closed && restored,
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
+      restored = false;
       admitted = new Set();
       await Promise.all([...brokers.values()].map((pair) => pair.close()));
       await host.close();

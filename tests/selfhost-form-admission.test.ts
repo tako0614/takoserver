@@ -1,21 +1,32 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
+import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
+import { createAppResourceStoreBundle } from "../src/app.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { Provider } from "../src/provider-port.ts";
+import { SELFHOST_ACTOR_BINDING_REF } from "../src/providers/selfhost.ts";
 import { deriveRuntimeImplementationCatalog } from "../src/public-worker-implementation.ts";
+import {
+  openSelfhostActorPublicRuntime,
+  type SelfhostActorPublicRuntime,
+} from "../src/selfhost-actor-public-runtime.ts";
 import { SELFHOST_IDENTITY_CAPABILITY_KINDS } from "../src/selfhost-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
-import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
+import { deriveSelfhostFormAuthorityCatalog } from "../src/takoform/host-admission-endpoint.ts";
+import {
+  selfhostLifecycleCapabilityManifest,
+  yurucommuLifecycleCapabilityManifest,
+} from "../src/takoform/implementation-catalog.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
@@ -228,6 +239,133 @@ function countDistinctFormRefs(database: Database, table: string): number {
 }
 
 describe("self-host Form admission", () => {
+  test("a restored local Actor owner admits the exact released namespace lifecycle", async () => {
+    const fixture = dataRoot();
+    let owner: SelfhostActorPublicRuntime | undefined;
+    try {
+      const candidates = currentTakoformCandidates();
+      const actorForm = candidates.forms.find(
+        (form) => form.identity.formRef.kind === "ActorNamespace",
+      );
+      if (!actorForm) throw new Error("released Actor Form missing");
+      const stores = createAppResourceStoreBundle(fixture.sql, () => new Date());
+      owner = await openSelfhostActorPublicRuntime({
+        dataRoot: fixture.root,
+        runtimeRoot: fixture.root,
+        socketParent: join(fixture.root, "actor-forward-sockets"),
+        binary: "/never-execute",
+        graph: createActorResourceGraphReader({ store: stores.inventory, form: actorForm }),
+        deployments: stores.deployments,
+        providerPackRef: "local",
+        providerInstallationRef: "local.primary",
+      });
+      const runtime = createWorkerdRuntime({
+        root: fixture.root,
+        binary: "/never-execute",
+        actorForwardSockets: () => owner?.actorForwardSockets() ?? [],
+        actorForwardLifecycle: owner.actorForwardLifecycle,
+      });
+      const provider = await fixture.provider(owner, runtime);
+      const source = {
+        provider,
+        stableForms: candidates.forms,
+        stableBindings: candidates.bindings,
+        actorRuntime: owner,
+      };
+      const capabilities = selfhostLifecycleCapabilityManifest(
+        SELFHOST_IDENTITY_CAPABILITY_KINDS,
+        actorForm,
+      );
+      const implementationPayloadDigest = await canonicalDigest({
+        kind: "takoserver.selfhost-form-implementation@v1",
+        capabilities,
+      });
+      await expect(
+        deriveSelfhostFormAuthorityCatalog({ implementationPayloadDigest, capabilities, source }),
+      ).rejects.toMatchObject({ code: "production_not_ready" });
+      expect(await runtime.restore()).toEqual([]);
+      expect(owner.isRestored()).toBe(true);
+      const catalog = await deriveSelfhostFormAuthorityCatalog({
+        implementationPayloadDigest,
+        capabilities,
+        source,
+      });
+      expect(
+        catalog.entries.find((entry) => entry.formRef.kind === "ActorNamespace")?.operations,
+      ).toEqual(["create", "read", "delete", "import", "observe"]);
+      expect(catalog.capabilityDigest).not.toBe(SELFHOST_CATALOG.capabilityDigest);
+      await expect(
+        deriveSelfhostFormAuthorityCatalog({
+          implementationPayloadDigest,
+          capabilities,
+          source: { provider, stableForms: candidates.forms, stableBindings: candidates.bindings },
+        }),
+      ).rejects.toMatchObject({ code: "identity_mismatch" });
+      await expect(
+        deriveSelfhostFormAuthorityCatalog({
+          implementationPayloadDigest,
+          capabilities,
+          source: {
+            ...source,
+            stableBindings: candidates.bindings.filter(
+              (binding) =>
+                canonicalJson(binding.bindingRef) !== canonicalJson(SELFHOST_ACTOR_BINDING_REF),
+            ),
+          },
+        }),
+      ).rejects.toMatchObject({ code: "production_not_ready" });
+      await expect(
+        deriveSelfhostFormAuthorityCatalog({
+          implementationPayloadDigest,
+          capabilities,
+          source: {
+            ...source,
+            provider: Object.assign(Object.create(provider) as Provider, {
+              offerings: provider.offerings.filter(
+                (offering) => offering.form.kind !== "ActorNamespace",
+              ),
+            }),
+          },
+        }),
+      ).rejects.toMatchObject({ code: "production_not_ready" });
+      const verifier = createSyntheticPublisherSetVerifier();
+      const result = await runSelfhostFormAdmission({
+        organizationId: "org_actor_source",
+        space: "default",
+        hostId: "http://localhost:8787",
+        coreVerifierUrl: "http://127.0.0.1:1",
+        apply: true,
+        sql: fixture.sql,
+        objects: fixture.objects,
+        provider,
+        actorRuntime: owner,
+        fetch: verifier.fetch,
+      });
+      expect(result.applied?.status).toBe("converged");
+      expect(
+        result.applied?.readback.forms.find((form) => form.formRef.kind === "ActorNamespace"),
+      ).toMatchObject({
+        installed: true,
+        supported: true,
+        operations: ["create", "read", "delete", "import", "observe"],
+        activationHead: { present: true, active: true },
+      });
+      const broken = join(fixture.root, "workers", "broken");
+      mkdirSync(broken, { recursive: true });
+      writeFileSync(join(broken, "takoserver-site.json"), '{"publicationStorageLayout":');
+      await expect(runtime.restore()).rejects.toThrow("unusable worker deployment pointer");
+      expect(owner.isRestored()).toBe(false);
+      await expect(
+        deriveSelfhostFormAuthorityCatalog({ implementationPayloadDigest, capabilities, source }),
+      ).rejects.toMatchObject({ code: "production_not_ready" });
+      expect(await fixture.sql.query("SELECT count(*) AS c FROM tf_form_support_events")).toEqual([
+        { c: IMPLEMENTED + 1 },
+      ]);
+    } finally {
+      await owner?.close();
+      fixture.close();
+    }
+  }, 30_000);
   test("plans the exact publisher set as a dry run and records nothing", async () => {
     const fixture = dataRoot();
     try {
@@ -401,7 +539,10 @@ function dataRoot() {
     root,
     sql: createSqliteSql(database),
     objects,
-    async provider() {
+    async provider(
+      actorRuntime?: SelfhostActorPublicRuntime,
+      runtime?: ReturnType<typeof createWorkerdRuntime>,
+    ) {
       const artifacts = createTakoformArtifacts({
         sql: createSqliteSql(database),
         objects,
@@ -411,12 +552,14 @@ function dataRoot() {
       const composition = createStandaloneProviderComposition({
         mode: "stable-selfhost",
         stableForms: currentTakoformCandidates().forms,
+        stableBindings: currentTakoformCandidates().bindings,
         edge: await buildEdgeForms(),
         dataRoot: root,
-        runtime: createWorkerdRuntime({ root, binary: null }),
+        runtime: runtime ?? createWorkerdRuntime({ root, binary: null }),
+        ...(actorRuntime ? { actorRuntime } : {}),
         // These admission tests inspect the concrete Provider method surface,
         // not native workerd qualification or runtime service availability.
-        workerRuntimeAvailable: false,
+        workerRuntimeAvailable: actorRuntime !== undefined,
         artifacts: {
           manifest: (tenantRef, digest) => artifacts.resolveManifest(tenantRef, digest),
           async blob(digest) {

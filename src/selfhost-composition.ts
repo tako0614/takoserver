@@ -222,7 +222,10 @@ export interface SelfhostComposition extends DeploymentComposition {
 }
 
 /** Exact released local closure, not a name-based Actor capability switch. */
-function hasExactActorClosure(options: SelfhostCompositionOptions): boolean {
+export function hasExactSelfhostActorClosure(options: {
+  readonly stableForms: readonly InstalledTakoformForm[];
+  readonly stableBindings?: readonly InstalledTakoformBinding[];
+}): boolean {
   const pinned = currentTakoformCandidates();
   for (const kind of ["ActorNamespace", "ModuleWorker", "WorkerVersion", "WorkerDeployment"]) {
     const expected = pinned.forms.filter((item) => item.identity.formRef.kind === kind);
@@ -254,7 +257,7 @@ export function createSelfhostComposition(
   const actorRuntime = isOwnedSelfhostActorPublicRuntime(options.actorRuntime)
     ? options.actorRuntime
     : undefined;
-  if (actorRuntime && (!workerRuntimeAvailable || !hasExactActorClosure(options))) {
+  if (actorRuntime && (!workerRuntimeAvailable || !hasExactSelfhostActorClosure(options))) {
     throw new TypeError("self-host Actor closure or native Worker runtime unavailable");
   }
   const objectBucketOffering = edgeProviderOffering(options.edge.objectBucket.form, {

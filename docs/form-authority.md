@@ -450,8 +450,9 @@ the exact new implementation identity, a realized Host-owned zone grant, and
 qualified backend behavior; fresh import remains unavailable. The integration-only
 `actor-forward` candidate uses this same public manifest, so its capability and
 implementation identities also rotate. Existing Actor DEV heads and operator
-descriptors must not be reused as proof for the new identity. `ActorNamespace` and
-`DurableWorkflow` have no handlers, so they remain installed and discoverable only
+descriptors must not be reused as proof for the new identity. On the ordinary
+public Worker, `ActorNamespace` and `DurableWorkflow` have no handlers, so they
+remain installed and discoverable only
 (`supported: false`). Neither may have an active activation head; retained inactive
 history is not discarded. Deactivate any existing active heads before deploying
 a catalog that removes their capability. No operation is advertised unless it
@@ -478,9 +479,10 @@ self-host is its own, holding object bodies under
 `<data root>/selfhost/objects/` and their metadata under migration `0041`, with
 a Provider Pack that owns both halves of the `module-worker.object-bucket`
 materialization. So `scripts/selfhost-form-admission.ts` records the Form with
-its five operations. The two Hosts share the same capability manifest,
-including intrinsic StaticAssetBundle support, while their implementation
-digests differ: a self-host binds the manifest through its own payload kind,
+its five operations. The base self-host and public Worker share the same
+ObjectBucket capability projection, including intrinsic StaticAssetBundle
+support, while their implementation digests differ: a self-host binds the
+manifest through its own payload kind,
 and the public Worker additionally binds a sealed runtime payload. These
 identities are derived from the selected code and exact publisher packages,
 not supplied by an operator. Enabling StaticAssetBundle changes the capability
@@ -527,7 +529,7 @@ Core, sends the whole 17-package raw closure to it once per apply, installs
 every package, and supports and activates only the implemented subset for the
 named organization and Space. That subset is derived rather than restated:
 `SELFHOST_IDENTITY_CAPABILITY_KINDS` is `SELFHOST_IDENTITY_CLASSES` — the
-static map naming every identity Form a self-host build realizes a supply for —
+static map naming the ordinary identity Forms a self-host build realizes a supply for —
 filtered against the catalog's identity kinds. It is a fact about this build,
 not about one machine's configuration, so a machine that switches the released
 Edge Family off (`edgeForms: false`) offers no identity Forms at all while
@@ -535,10 +537,41 @@ admission still records all five with their full operation sets. Widening the
 map is what rotates the capability digest; narrowing what one machine happens
 to compose is not.
 
-The self-host's Form implementation identity is the canonical digest of the
-capability manifest it serves; it has no separately sealed Worker payload.
+The self-host's Form implementation identity derives from the canonical
+capability manifest it serves, its payload digest, the exact 17 Form identities,
+and the actual handler set. It has no separately sealed Worker payload.
 Re-running the command re-plans from the durable heads and converges with zero
 commands when nothing changed.
+
+### Conditional local Actor source support
+
+The self-host-only Actor candidate extends that base catalog only when its
+closed-graph workerd artifact was selected, the owned Actor namespace/broker
+runtime opened, the exact released `ActorNamespace@0.1.0`, `ModuleWorker@0.1.0`,
+`WorkerVersion@0.3.0`, `WorkerDeployment@0.2.0`, and
+`module-worker.actor@1.0.0` BindingDefinition are installed, and immutable
+Worker publications were restored against that same owner. A fresh Host with
+no published Worker can pass an exact empty restore; an already-created Actor
+is not a prerequisite for publishing its Form support. Missing owner, closure,
+or failed restore keeps the Actor Form installed but unsupported.
+
+The self-host admission command runs against a stopped server, so its Actor
+support event records an implemented source capability, **not** a live
+`Ready` assertion. The serving entry independently restores the real broker
+and Worker graph before opening its listener; resource observation and
+execution readiness still depend on current class-holder Deployment and
+namespace state. Source-only synthetic tests do not qualify native HTTP,
+WebSocket, alarms, quotas, crash recovery, or OS-process restart.
+
+This conditional widening adds only the Form's declared `create`, `read`,
+`delete`, `import`, and `observe` operations, never `update`. It rotates the
+self-host capability and implementation digests while preserving the previous
+no-Actor catalog and all published Form/API/schema identities. Reconvergence
+is a new append-only support/activation event using the new exact
+implementation identity under the existing admission policy, not a silent
+rewrite of old heads. The Hosted/public Worker catalog and its historical
+digests are unchanged; the Hosted Actor supply parser still refuses Actor
+pricing and metering configuration.
 
 ## Integration cutover order
 
@@ -674,8 +707,10 @@ released-Core-verified public publisher set:
 - `ActorNamespace`, `DurableWorkflow`, `StaticAssetBundle`, and
   `WorkerCustomDomain` at definition version `0.1.0`.
 
-The executable implementation catalog is a separate, derived support subset:
-it currently has 15 entries. `WorkerCustomDomain`'s public source capability
+The ordinary public executable implementation catalog is a separate, derived
+support subset with 15 entries. A self-host with the qualified local Actor
+owner has one additional Actor entry; its default catalog does not.
+`WorkerCustomDomain`'s public source capability
 is conditional on an exact tenant/hostname zone grant and excludes fresh
 `import`; this source catalog is not evidence of current live support or
 activation. Retained native-receipt recovery is separate from fresh import.

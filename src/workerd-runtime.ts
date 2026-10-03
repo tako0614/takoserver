@@ -1638,11 +1638,22 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // asked for, which is exactly what deferring the start to the first
       // publish was avoiding.
       return await exclusiveActivation(async () => {
-        requireCertainRuntime();
-        const published = await readPublished(scriptsRoot, assetsRoot);
-        if (published.length === 0) return [];
-        await activate(published, published);
-        return published.map((entry) => entry.name);
+        try {
+          requireCertainRuntime();
+          const published = await readPublished(scriptsRoot, assetsRoot);
+          if (published.length === 0) {
+            // Empty boot has no workerd process, but the owned Actor broker
+            // graph has still been reconstructed and proven empty. This is a
+            // successful immutable restore, not a serving-readiness signal.
+            options.actorForwardLifecycle?.activated([]);
+            return [];
+          }
+          await activate(published, published);
+          return published.map((entry) => entry.name);
+        } catch (error) {
+          options.actorForwardLifecycle?.uncertain();
+          throw error;
+        }
       });
     },
 
