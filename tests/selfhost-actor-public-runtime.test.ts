@@ -268,6 +268,7 @@ test("Actor reservations release failed attempts and reuse bounded broker slots 
       };
     };
     const first = await publication(0);
+    const publications = [first];
     const failedAttempt = await owner.actorForwardLifecycle.reserve([first]);
     expect(owner.actorForwardSockets()).toHaveLength(1);
     await failedAttempt.release();
@@ -282,6 +283,7 @@ test("Actor reservations release failed attempts and reuse bounded broker slots 
     expect(owner.isRestored()).toBe(true);
     for (let index = 1; index <= 129; index += 1) {
       const next = await publication(index);
+      publications.push(next);
       const reservation = await owner.actorForwardLifecycle.reserve([next]);
       owner.actorForwardLifecycle.activated([next]);
       await reservation.release();
@@ -291,6 +293,14 @@ test("Actor reservations release failed attempts and reuse bounded broker slots 
     owner.actorForwardLifecycle.activated([]);
     const finalReservation = await owner.actorForwardLifecycle.reserve([]);
     await finalReservation.release();
+    expect(owner.actorForwardSockets()).toEqual([]);
+    const full = await owner.actorForwardLifecycle.reserve(publications.slice(0, 128));
+    expect(owner.actorForwardSockets()).toHaveLength(128);
+    await full.release();
+    expect(owner.actorForwardSockets()).toEqual([]);
+    await expect(owner.actorForwardLifecycle.reserve(publications.slice(0, 129))).rejects.toThrow(
+      "Actor forward socket capacity exceeded",
+    );
     expect(owner.actorForwardSockets()).toEqual([]);
   } finally {
     await owner.close();
