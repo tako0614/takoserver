@@ -415,6 +415,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/space-id.ts",
       "src/takoform/store.ts",
       "src/takoform/types.ts",
+      "src/workflow-resource-lifecycle.ts",
     ]);
     const previouslyClassified = new Set(publicFormIdentityAuthorityPaths());
     expect(
@@ -515,6 +516,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/takoform/worker-aggregate.ts",
       "src/takoform/worker-runtime-contract.ts",
       "src/worker-endpoint-origin-reservations.ts",
+      "src/workflow-resource-lifecycle.ts",
     ];
     expect(publicFormIdentityAuthorityPaths()).toEqual(expected);
     expect(authoritySensitiveWorkerPaths([...expected, "src/catalog.ts"])).toEqual(expected);
