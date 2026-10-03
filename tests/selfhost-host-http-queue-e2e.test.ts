@@ -45,6 +45,7 @@ const KINDS = [
   "WorkerVersion",
   "WorkerDeployment",
   "WorkerEndpoint",
+  "WorkerCronTrigger",
   "QueueConsumer",
 ] as const;
 
@@ -54,6 +55,11 @@ interface Observation {
   readonly attempts: number;
   readonly queue: string;
   readonly body: string;
+}
+
+interface ScheduledObservation {
+  readonly cron: string;
+  readonly scheduledTime: number;
 }
 
 const TENANT = `async function readSeen(env) {
@@ -67,7 +73,19 @@ export default {
       return Response.json({ id: await env.QUEUE.send("public-api-retry") });
     }
     if (path === "/seen") return Response.json({ seen: await readSeen(env) });
+    if (path === "/scheduled") {
+      const value = await env.KV.get("scheduled");
+      return Response.json({
+        scheduled: value === null ? [] : JSON.parse(new TextDecoder().decode(value)),
+      });
+    }
     return Response.json({ ready: true });
+  },
+  async scheduled(event, env) {
+    const value = await env.KV.get("scheduled");
+    const scheduled = value === null ? [] : JSON.parse(new TextDecoder().decode(value));
+    scheduled.push({ cron: event.cron, scheduledTime: event.scheduledTime });
+    await env.KV.put("scheduled", JSON.stringify(scheduled));
   },
   async queue(batch, env) {
     const seen = await readSeen(env);
@@ -84,7 +102,7 @@ export default {
 };`;
 
 test.skipIf(WORKERD === null)(
-  "public Host resources deliver retries and a fresh dead-letter message through native HTTPS",
+  "public Host resources deliver Queue retries and scheduled Cron updates through native HTTPS",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-host-http-queue-"));
     const children: ReturnType<typeof Bun.spawn>[] = [];
@@ -94,6 +112,8 @@ test.skipIf(WORKERD === null)(
       const tls = await testCertificate(root);
       const sql = createEphemeralSql();
       const objects = createMemoryObjectStore();
+      // This fixture uses ephemeral SQLite/object storage and an in-process Host;
+      // it verifies public resource readback, not OS-process restart recovery.
       let millis = Date.now();
       const clock = () => new Date(millis);
       const access = createSelfhostDataPlaneAccess(root);
@@ -358,7 +378,7 @@ test.skipIf(WORKERD === null)(
       await apply("WorkerVersion", "journey-v1", {
         worker: reference("ModuleWorker", "journey-worker"),
         bundle: reference("WorkerBundle", "journey-bundle"),
-        handlers: ["fetch", "queue"],
+        handlers: ["fetch", "queue", "scheduled"],
         requiredSensitiveVars: [],
         kvBindings: [{ name: "KV", resource: reference("EdgeKVNamespace", "journey-cache") }],
         queueProducerBindings: [{ name: "QUEUE", resource: reference("AtLeastOnceQueue", SOURCE) }],
@@ -428,6 +448,117 @@ test.skipIf(WORKERD === null)(
       millis += 60_000;
       await pump.tick();
       expect(await observed()).toEqual(delivered);
+
+      const cronForm = forms.get("WorkerCronTrigger");
+      if (!cronForm) throw new Error("required Form missing: WorkerCronTrigger");
+      const cronName = "journey-cron";
+      const cronPath = `${LANE}/resources/${cronForm.apiVersion}/WorkerCronTrigger/${cronName}?${new URLSearchParams(
+        {
+          space: SPACE,
+          definitionVersion: cronForm.definitionVersion,
+          schemaDigest: cronForm.schemaDigest,
+        },
+      )}`;
+      const cronA = "*/3 * * * *";
+      const cronB = "*/5 * * * *";
+      const initialCron = await apply("WorkerCronTrigger", cronName, {
+        cron: cronA,
+        worker: reference("ModuleWorker", "journey-worker"),
+      });
+      expect(initialCron.status.outputs).toBeDefined();
+      const cronResource = await call<{
+        metadata: { uid: string; generation: string; revision: string };
+        spec: { cron: string };
+      }>("GET", cronPath, 200);
+      expect(cronResource.spec.cron).toBe(cronA);
+
+      const scheduled = async () =>
+        ((await (await ask("/scheduled")).json()) as { scheduled: ScheduledObservation[] })
+          .scheduled;
+      const cronStart = (Math.floor(millis / 86_400_000) + 1) * 86_400_000 + 2 * 60_000;
+      millis = cronStart;
+      expect(await scheduler.tick()).toBe(0);
+      millis = cronStart + 60_000;
+      expect(await scheduler.tick()).toBe(1);
+      expect(await scheduled()).toEqual([{ cron: cronA, scheduledTime: cronStart + 60_000 }]);
+
+      const changedCron = {
+        apiVersion: cronForm.apiVersion,
+        kind: "WorkerCronTrigger",
+        form: { formRef: cronForm },
+        metadata: { name: cronName, space: SPACE },
+        spec: {
+          cron: cronB,
+          worker: reference("ModuleWorker", "journey-worker"),
+        },
+      };
+      const preparedCronUpdate = await call<{ review: { prepareDigest: string } }>(
+        "POST",
+        `${LANE}/resources/prepare`,
+        200,
+        changedCron,
+        { "takoform-expected-generation": cronResource.metadata.generation },
+      );
+      const updatedCron = await call<{
+        metadata: { uid: string; generation: string; revision: string };
+        spec: { cron: string };
+      }>(
+        "PUT",
+        cronPath,
+        200,
+        {
+          ...changedCron,
+          expectedUid: cronResource.metadata.uid,
+          expectedGeneration: cronResource.metadata.generation,
+          review: preparedCronUpdate.review,
+        },
+        {
+          "idempotency-key": "WorkerCronTrigger-journey-cron-update-b",
+          "if-match": `"${cronResource.metadata.revision}"`,
+          "takoform-expected-generation": cronResource.metadata.generation,
+        },
+      );
+      expect(updatedCron.metadata.uid).toBe(cronResource.metadata.uid);
+      expect(updatedCron.metadata.generation).not.toBe(cronResource.metadata.generation);
+      expect(updatedCron.metadata.revision).not.toBe(cronResource.metadata.revision);
+      expect(updatedCron.spec.cron).toBe(cronB);
+      expect(await call<typeof updatedCron>("GET", cronPath, 200)).toMatchObject({
+        metadata: { uid: cronResource.metadata.uid },
+        spec: { cron: cronB },
+      });
+
+      expect(await scheduler.tick()).toBe(0);
+      millis = cronStart + 3 * 60_000;
+      expect(await scheduler.tick()).toBe(1);
+      expect(await scheduled()).toEqual([
+        { cron: cronA, scheduledTime: cronStart + 60_000 },
+        { cron: cronB, scheduledTime: cronStart + 3 * 60_000 },
+      ]);
+      millis = cronStart + 4 * 60_000;
+      expect(await scheduler.tick()).toBe(0);
+      expect(await scheduled()).toHaveLength(2);
+
+      const deleteCron = await app.fetch(
+        new Request(`${HOST_ORIGIN}${cronPath}`, {
+          method: "DELETE",
+          headers: {
+            ...auth,
+            "idempotency-key": "WorkerCronTrigger-journey-cron-delete",
+            "if-match": `"${updatedCron.metadata.revision}"`,
+            "takoform-expected-generation": updatedCron.metadata.generation,
+          },
+        }),
+      );
+      expect(deleteCron.status).toBe(204);
+      expect((await deleteCron.arrayBuffer()).byteLength).toBe(0);
+      const deletedCron = await app.fetch(
+        new Request(`${HOST_ORIGIN}${cronPath}`, { headers: auth }),
+      );
+      expect(deletedCron.status).toBe(404);
+      await deletedCron.arrayBuffer();
+      millis = cronStart + 8 * 60_000;
+      expect(await scheduler.tick()).toBe(0);
+      expect(await scheduled()).toHaveLength(2);
     } finally {
       supervisor?.stop();
       await Promise.all(children.map((child) => child.exited));
