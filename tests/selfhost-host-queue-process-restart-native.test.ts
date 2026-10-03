@@ -18,15 +18,21 @@ import { connect as connectTcp } from "node:net";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { takoformCoreVerifierArtifactDigest } from "../scripts/deploy/form-authority.ts";
+import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
+import { buildApp } from "../src/app.ts";
 import { createEphemeralSql } from "../src/compat.ts";
+import { buildEdgeForms } from "../src/edge-forms.ts";
 import { bytesDigest } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { ensureOperatorKey, signOperatorAssertion } from "../src/operator-key.ts";
 import { selfhostObjectsRoot } from "../src/providers/selfhost.ts";
+import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
+import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
 import {
   createQueueEventProxy,
   isAcknowledgedQueueResponse,
@@ -39,6 +45,7 @@ import {
   buildRealCoreVerifier,
   realCoreVerificationRequest,
 } from "./helpers/real-core-verifier.ts";
+import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 const EVENT_PATH = "/.well-known/takoserver/managed-worker-events/v1";
 const WORKERD = nativeEvidenceBinary("workerd-artifact") ?? null;
@@ -62,6 +69,10 @@ export default {
     }
     if (path === "/seen") return Response.json({ seen: await seen(env) });
     if (path === "/object") {
+      if (request.method === "DELETE") {
+        await env.BUCKET.delete("queue-recovery/effect");
+        return Response.json({ deleted: true });
+      }
       const object = await env.BUCKET.get("queue-recovery/effect");
       return object === null ? new Response(null, { status: 404 }) : new Response(object.body);
     }
@@ -81,6 +92,192 @@ export default {
     for (const message of batch.messages) message.acknowledge();
   },
 };`;
+
+test("public Queue Resource update and fenced deletion preserve identity and report absence", async () => {
+  const root = mkdtempSync(join(tmpdir(), "takoserver-queue-resource-lifecycle-"));
+  const sql = createEphemeralSql();
+  const objects = createMemoryObjectStore();
+  const clock = () => new Date();
+  const candidates = currentTakoformCandidates();
+  const artifacts = createTakoformArtifacts({
+    sql,
+    objects,
+    clock,
+    randomId: () => crypto.randomUUID(),
+  });
+  const composition = createStandaloneProviderComposition({
+    mode: "stable-selfhost",
+    stableForms: candidates.forms,
+    edge: await buildEdgeForms(),
+    dataRoot: root,
+    runtime: createWorkerdRuntime({ root, binary: null }),
+    workerRuntimeAvailable: false,
+    artifacts: {
+      manifest: (tenantId, digest) => artifacts.resolveManifest(tenantId, digest),
+      async blob(digest) {
+        const object = await objects.get(`art/${digest.slice("sha256:".length)}`);
+        return object ? new Uint8Array(await new Response(object.body).arrayBuffer()) : null;
+      },
+    },
+    now: clock(),
+  });
+  const app = buildApp({
+    sql,
+    objects,
+    publicOrigin: API_ORIGIN,
+    clock,
+    forms: candidates.forms,
+    bindings: candidates.bindings,
+    hostForms: candidates.forms,
+    hostBindings: candidates.bindings,
+    ...composition,
+    artifacts,
+    identity: {
+      async verify() {
+        return {
+          providerSubject: "queue-lifecycle-test",
+          email: "queue-lifecycle@example.test",
+          displayName: "Queue lifecycle test",
+        };
+      },
+    },
+    settlement: {
+      async verify() {
+        throw new Error("self-host Queue lifecycle must not require external funding");
+      },
+    },
+  });
+  let auth: Record<string, string> = {};
+  async function call<T>(
+    method: string,
+    path: string,
+    expectedStatus: number,
+    body?: unknown,
+    headers: Record<string, string> = {},
+  ): Promise<T> {
+    const response = await app.fetch(
+      new Request(`${API_ORIGIN}${path}`, {
+        method,
+        headers: {
+          ...auth,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...headers,
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+    );
+    if (response.status !== expectedStatus) {
+      const code = await boundedApiErrorCode(response);
+      throw new Error(`queue_resource_${method.toLowerCase()}_${response.status}_${code}`);
+    }
+    if (response.status === 204) return undefined as T;
+    return (await response.json()) as T;
+  }
+
+  try {
+    const session = await call<{ sessionToken: string }>("POST", "/v1/sessions", 200, {
+      provider: "google",
+      assertion: "synthetic-queue-lifecycle-identity",
+    });
+    auth = { authorization: `Bearer ${session.sessionToken}` };
+    const { organization } = await call<{ organization: { id: string } }>(
+      "POST",
+      "/v1/organizations",
+      201,
+      { name: "Queue Resource lifecycle" },
+    );
+    auth["takoform-organization"] = organization.id;
+
+    const provider = composition.providers[0];
+    if (!provider) throw new Error("queue_lifecycle_provider_missing");
+    const admission = await runSelfhostFormAdmission({
+      organizationId: organization.id,
+      space: SPACE,
+      hostId: API_ORIGIN,
+      coreVerifierUrl: "http://127.0.0.1:1",
+      apply: true,
+      sql,
+      objects,
+      provider,
+      fetch: createSyntheticPublisherSetVerifier().fetch,
+    });
+    expect(admission.applied?.status).toBe("converged");
+
+    const discovery = await call<{ forms: { identity: { formRef: Json } }[] }>(
+      "GET",
+      `${LANE}/forms?space=${SPACE}`,
+      200,
+    );
+    const form = discovery.forms
+      .map((entry) => entry.identity.formRef)
+      .find((entry) => entry.kind === "AtLeastOnceQueue");
+    if (!form) throw new Error("queue_lifecycle_form_missing");
+    const query = new URLSearchParams({
+      space: SPACE,
+      definitionVersion: stringAt(form, "definitionVersion"),
+      schemaDigest: stringAt(form, "schemaDigest"),
+    });
+    const path = `${LANE}/resources/${stringAt(form, "apiVersion")}/AtLeastOnceQueue/queue-lifecycle?${query}`;
+    const desired = (messageRetentionSeconds: number) => ({
+      apiVersion: stringAt(form, "apiVersion"),
+      kind: "AtLeastOnceQueue",
+      form: { formRef: form },
+      metadata: { name: "queue-lifecycle", space: SPACE },
+      spec: { messageRetentionSeconds, deliveryDelaySeconds: 0 },
+    });
+    const initialDesired = desired(345_600);
+    const createReview = await call<{ review: Json }>(
+      "POST",
+      `${LANE}/resources/prepare`,
+      200,
+      initialDesired,
+    );
+    const created = await call<Json>(
+      "PUT",
+      path,
+      201,
+      { ...initialDesired, review: createReview.review },
+      { "idempotency-key": "queue-lifecycle-create", "if-none-match": "*" },
+    );
+    const createdMetadata = objectAt(created, "metadata");
+    const updateDesired = desired(604_800);
+    const updateReview = await call<{ review: Json }>(
+      "POST",
+      `${LANE}/resources/prepare`,
+      200,
+      updateDesired,
+      { "takoform-expected-generation": stringAt(createdMetadata, "generation") },
+    );
+    const updated = await call<Json>(
+      "PUT",
+      path,
+      200,
+      { ...updateDesired, review: updateReview.review },
+      {
+        "idempotency-key": "queue-lifecycle-update",
+        "if-match": `"${stringAt(createdMetadata, "revision")}"`,
+        "takoform-expected-generation": stringAt(createdMetadata, "generation"),
+      },
+    );
+    const updatedMetadata = objectAt(updated, "metadata");
+    expect(stringAt(updatedMetadata, "uid")).toBe(stringAt(createdMetadata, "uid"));
+    expect(stringAt(updatedMetadata, "generation")).not.toBe(
+      stringAt(createdMetadata, "generation"),
+    );
+    expect(updated.spec).toMatchObject(updateDesired.spec);
+    expect(await call<Json>("GET", path, 200)).toEqual(updated);
+
+    await call<undefined>("DELETE", path, 204, undefined, {
+      "idempotency-key": "queue-lifecycle-delete",
+      "if-match": `"${stringAt(updatedMetadata, "revision")}"`,
+      "takoform-expected-generation": stringAt(updatedMetadata, "generation"),
+    });
+    const missing = await call<Json>("GET", path, 404);
+    expect(stringAt(objectAt(missing, "error"), "code")).toBe("resource_not_found");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 interface Json {
   readonly [key: string]: unknown;
@@ -837,33 +1034,75 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
         name,
       });
       const manifestDigest = await uploadModule(WORKER_SOURCE, workerAuth);
-      await applyResource(formRefs, workerAuth, "ModuleWorker", "queue-restart-worker", {});
-      await applyResource(formRefs, workerAuth, "EdgeKVNamespace", "queue-restart-kv", {});
-      await applyResource(formRefs, workerAuth, "AtLeastOnceQueue", "queue-restart-source", {
-        messageRetentionSeconds: 345_600,
-        deliveryDelaySeconds: 0,
-      });
-      await applyResource(formRefs, workerAuth, "ObjectBucket", "queue-restart-bucket", {});
-      await applyResource(formRefs, workerAuth, "WorkerBundle", "queue-restart-bundle", {
-        manifestDigest,
-      });
-      await applyResource(formRefs, workerAuth, "WorkerVersion", "queue-restart-version", {
-        worker: ref("ModuleWorker", "queue-restart-worker"),
-        bundle: ref("WorkerBundle", "queue-restart-bundle"),
-        handlers: ["fetch", "queue"],
-        requiredSensitiveVars: [],
-        kvBindings: [{ name: "KV", resource: ref("EdgeKVNamespace", "queue-restart-kv") }],
-        bucketBindings: [{ name: "BUCKET", resource: ref("ObjectBucket", "queue-restart-bucket") }],
-        queueProducerBindings: [
-          { name: "QUEUE", resource: ref("AtLeastOnceQueue", "queue-restart-source") },
-        ],
-      });
-      await applyResource(formRefs, workerAuth, "WorkerDeployment", "queue-restart-live", {
-        worker: ref("ModuleWorker", "queue-restart-worker"),
-        versions: [
-          { workerVersion: ref("WorkerVersion", "queue-restart-version"), weight: 10_000 },
-        ],
-      });
+      const moduleWorker = await applyResource(
+        formRefs,
+        workerAuth,
+        "ModuleWorker",
+        "queue-restart-worker",
+        {},
+      );
+      const kvNamespace = await applyResource(
+        formRefs,
+        workerAuth,
+        "EdgeKVNamespace",
+        "queue-restart-kv",
+        {},
+      );
+      const sourceQueue = await applyResource(
+        formRefs,
+        workerAuth,
+        "AtLeastOnceQueue",
+        "queue-restart-source",
+        {
+          messageRetentionSeconds: 345_600,
+          deliveryDelaySeconds: 0,
+        },
+      );
+      const objectBucket = await applyResource(
+        formRefs,
+        workerAuth,
+        "ObjectBucket",
+        "queue-restart-bucket",
+        {},
+      );
+      const workerBundle = await applyResource(
+        formRefs,
+        workerAuth,
+        "WorkerBundle",
+        "queue-restart-bundle",
+        { manifestDigest },
+      );
+      const workerVersion = await applyResource(
+        formRefs,
+        workerAuth,
+        "WorkerVersion",
+        "queue-restart-version",
+        {
+          worker: ref("ModuleWorker", "queue-restart-worker"),
+          bundle: ref("WorkerBundle", "queue-restart-bundle"),
+          handlers: ["fetch", "queue"],
+          requiredSensitiveVars: [],
+          kvBindings: [{ name: "KV", resource: ref("EdgeKVNamespace", "queue-restart-kv") }],
+          bucketBindings: [
+            { name: "BUCKET", resource: ref("ObjectBucket", "queue-restart-bucket") },
+          ],
+          queueProducerBindings: [
+            { name: "QUEUE", resource: ref("AtLeastOnceQueue", "queue-restart-source") },
+          ],
+        },
+      );
+      const workerDeployment = await applyResource(
+        formRefs,
+        workerAuth,
+        "WorkerDeployment",
+        "queue-restart-live",
+        {
+          worker: ref("ModuleWorker", "queue-restart-worker"),
+          versions: [
+            { workerVersion: ref("WorkerVersion", "queue-restart-version"), weight: 10_000 },
+          ],
+        },
+      );
       const endpoint = await applyResource(
         formRefs,
         workerAuth,
@@ -871,15 +1110,21 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
         "queue-restart-endpoint",
         { worker: ref("ModuleWorker", "queue-restart-worker") },
       );
-      await applyResource(formRefs, workerAuth, "QueueConsumer", "queue-restart-consumer", {
-        worker: ref("ModuleWorker", "queue-restart-worker"),
-        queue: ref("AtLeastOnceQueue", "queue-restart-source"),
-        maxBatchSize: 1,
-        maxBatchTimeoutSeconds: 0,
-        maxConcurrency: 1,
-        maxRetries: 2,
-        retryDelaySeconds: 1,
-      });
+      const queueConsumer = await applyResource(
+        formRefs,
+        workerAuth,
+        "QueueConsumer",
+        "queue-restart-consumer",
+        {
+          worker: ref("ModuleWorker", "queue-restart-worker"),
+          queue: ref("AtLeastOnceQueue", "queue-restart-source"),
+          maxBatchSize: 1,
+          maxBatchTimeoutSeconds: 0,
+          maxConcurrency: 1,
+          maxRetries: 2,
+          retryDelaySeconds: 1,
+        },
+      );
       const endpointUrl = new URL(outputAt(endpoint, "url"));
       reportWorkerEndpointFacts(workerEndpointFacts(endpointUrl, WORKER_SUFFIX));
       expect(endpointUrl.protocol).toBe("https:");
@@ -965,6 +1210,95 @@ test.skipIf(process.platform !== "linux" || nativeEvidenceBinary("workerd-artifa
         { id: acceptedBody.id, attempts: 2 },
       ]);
       expect(directorySnapshot(objectRoot)).toEqual(objectSnapshot);
+
+      const updatedQueue = await updateResource(
+        formRefs,
+        workerAuth,
+        "AtLeastOnceQueue",
+        "queue-restart-source",
+        { messageRetentionSeconds: 604_800, deliveryDelaySeconds: 0 },
+      );
+      expect(stringAt(objectAt(updatedQueue, "metadata"), "uid")).toBe(
+        stringAt(objectAt(sourceQueue, "metadata"), "uid"),
+      );
+      expect(updatedQueue.spec).toMatchObject({
+        messageRetentionSeconds: 604_800,
+        deliveryDelaySeconds: 0,
+      });
+      expect(
+        await readResource(formRefs, workerAuth, "AtLeastOnceQueue", "queue-restart-source"),
+      ).toEqual(updatedQueue);
+
+      const clearedObject = await requestWorker("/object", "DELETE");
+      expect(clearedObject.status).toBe(200);
+      expect(await clearedObject.json()).toEqual({ deleted: true });
+      const missingObject = await requestWorker("/object");
+      expect(missingObject.status).toBe(404);
+      await missingObject.arrayBuffer();
+
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "QueueConsumer",
+        "queue-restart-consumer",
+        queueConsumer,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "WorkerEndpoint",
+        "queue-restart-endpoint",
+        endpoint,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "WorkerDeployment",
+        "queue-restart-live",
+        workerDeployment,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "WorkerVersion",
+        "queue-restart-version",
+        workerVersion,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "WorkerBundle",
+        "queue-restart-bundle",
+        workerBundle,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "EdgeKVNamespace",
+        "queue-restart-kv",
+        kvNamespace,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "AtLeastOnceQueue",
+        "queue-restart-source",
+        updatedQueue,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "ObjectBucket",
+        "queue-restart-bucket",
+        objectBucket,
+      );
+      await deleteResource(
+        formRefs,
+        workerAuth,
+        "ModuleWorker",
+        "queue-restart-worker",
+        moduleWorker,
+      );
     } catch (error) {
       primaryFailure = error;
       hasPrimaryFailure = true;
@@ -1433,7 +1767,7 @@ function outputAt(value: Json, name: string): string {
   return stringAt(objectAt(objectAt(value, "status"), "outputs"), name);
 }
 
-async function api<T extends Json>(
+async function api<T = Json>(
   origin: string,
   method: string,
   path: string,
@@ -1453,6 +1787,7 @@ async function api<T extends Json>(
     const errorCode = await boundedApiErrorCode(response);
     throw new Error(`selfhost_api_${method}_status_${response.status}_${errorCode}`);
   }
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
@@ -1632,6 +1967,99 @@ async function applyResource(
       "if-none-match": "*",
     },
   );
+}
+
+async function readResource(
+  forms: Map<string, Json>,
+  auth: Record<string, string>,
+  kind: string,
+  name: string,
+): Promise<Json> {
+  const formRef = forms.get(kind);
+  if (!formRef) throw new Error(`selfhost_form_missing_${kind}`);
+  const query = new URLSearchParams({
+    space: SPACE,
+    definitionVersion: stringAt(formRef, "definitionVersion"),
+    schemaDigest: stringAt(formRef, "schemaDigest"),
+  });
+  return api<Json>(
+    API_ORIGIN,
+    "GET",
+    `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
+    200,
+    undefined,
+    auth,
+  );
+}
+
+async function updateResource(
+  forms: Map<string, Json>,
+  auth: Record<string, string>,
+  kind: string,
+  name: string,
+  spec: Json,
+): Promise<Json> {
+  const formRef = forms.get(kind);
+  if (!formRef) throw new Error(`selfhost_form_missing_${kind}`);
+  const current = await readResource(forms, auth, kind, name);
+  const currentMetadata = objectAt(current, "metadata");
+  const desired = {
+    apiVersion: stringAt(formRef, "apiVersion"),
+    kind,
+    form: { formRef },
+    metadata: { name, space: SPACE },
+    spec,
+  };
+  const prepared = await api<Json>(API_ORIGIN, "POST", `${LANE}/resources/prepare`, 200, desired, {
+    ...auth,
+    "takoform-expected-generation": stringAt(currentMetadata, "generation"),
+  });
+  const query = new URLSearchParams({
+    space: SPACE,
+    definitionVersion: stringAt(formRef, "definitionVersion"),
+    schemaDigest: stringAt(formRef, "schemaDigest"),
+  });
+  return api<Json>(
+    API_ORIGIN,
+    "PUT",
+    `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
+    200,
+    { ...desired, review: objectAt(prepared, "review") },
+    {
+      ...auth,
+      "idempotency-key": `queue-process-restart-${kind}-${name}-update`,
+      "if-match": `"${stringAt(currentMetadata, "revision")}"`,
+      "takoform-expected-generation": stringAt(currentMetadata, "generation"),
+    },
+  );
+}
+
+async function deleteResource(
+  forms: Map<string, Json>,
+  auth: Record<string, string>,
+  kind: string,
+  name: string,
+  expectedResource: Json,
+): Promise<void> {
+  const formRef = forms.get(kind);
+  if (!formRef) throw new Error(`selfhost_form_missing_${kind}`);
+  const query = new URLSearchParams({
+    space: SPACE,
+    definitionVersion: stringAt(formRef, "definitionVersion"),
+    schemaDigest: stringAt(formRef, "schemaDigest"),
+  });
+  const path = `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`;
+  const current = await api<Json>(API_ORIGIN, "GET", path, 200, undefined, auth);
+  const metadata = objectAt(current, "metadata");
+  expect(stringAt(metadata, "uid")).toBe(stringAt(objectAt(expectedResource, "metadata"), "uid"));
+  await api<undefined>(API_ORIGIN, "DELETE", path, 204, undefined, {
+    ...auth,
+    "idempotency-key": `queue-process-restart-${kind}-${name}-delete`,
+    "takoform-expected-generation": stringAt(metadata, "generation"),
+    "if-match": `"${stringAt(metadata, "revision")}"`,
+  });
+  const missing = await api<Json>(API_ORIGIN, "GET", path, 404, undefined, auth);
+  expect(stringAt(objectAt(missing, "error"), "code")).toBe("resource_not_found");
 }
 
 async function workerRequest(
