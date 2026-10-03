@@ -15,6 +15,7 @@
  */
 
 import { inspectActorClassV2Candidate } from "./actor-class-candidate-inspection.ts";
+import { ACTOR_ABI_INTERFACE_REFS, parseActorAbiRef } from "./actor-abi-ref.ts";
 
 const SafeArrayIsArray = Array.isArray;
 const SafeError = Error;
@@ -258,7 +259,7 @@ export interface ActorAbiProfile {
 
 const LEGACY_PROFILE: ActorAbiProfile = SafeObjectFreeze({
   kind: "legacy",
-  schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+  schemaDigest: ACTOR_ABI_INTERFACE_REFS.legacy.schemaDigest,
   socketMessageBytes: 8_388_608,
   socketAttachmentBytes: 8_192,
   socketOutboundQueueBytes: 8_388_608,
@@ -267,7 +268,7 @@ const LEGACY_PROFILE: ActorAbiProfile = SafeObjectFreeze({
 });
 const V2_PROFILE: ActorAbiProfile = SafeObjectFreeze({
   kind: "v2",
-  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+  schemaDigest: ACTOR_ABI_INTERFACE_REFS.v2.schemaDigest,
   socketMessageBytes: 33_554_432,
   socketAttachmentBytes: 16_384,
   socketOutboundQueueBytes: 33_554_432,
@@ -286,22 +287,9 @@ export function actorAbiProfile(value: ActorAbiProfile | undefined): ActorAbiPro
 
 /** No name-only, version-only or unknown-digest fallback. */
 export function resolveActorAbiProfile(ref: unknown): ActorAbiProfile {
-  try {
-    const value = closedRecord(
-      ref,
-      ["apiVersion", "name", "version", "schemaDigest"],
-      "Actor runtime InterfaceRef",
-    );
-    if (value.apiVersion === "interfaces.takoform.com/v1alpha1" && value.name === "worker.actor") {
-      if (value.version === "1.0.0" && value.schemaDigest === LEGACY_PROFILE.schemaDigest)
-        return LEGACY_PROFILE;
-      if (value.version === "2.0.0" && value.schemaDigest === V2_PROFILE.schemaDigest)
-        return V2_PROFILE;
-    }
-  } catch {
-    // An accessor or malformed ref cannot select an ABI.
-  }
-  throw unavailable("Actor runtime InterfaceRef is unavailable");
+  const parsed = parseActorAbiRef(ref);
+  if (!parsed) throw unavailable("Actor runtime InterfaceRef is unavailable");
+  return parsed.kind === "legacy" ? LEGACY_PROFILE : V2_PROFILE;
 }
 
 type PreparedInspection = {

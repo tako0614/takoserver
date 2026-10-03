@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import { isJsonObject } from "../json.ts";
 import { isStableStandardServiceProtocol } from "../standard-service-port.ts";
 import { parseStrictJson } from "../strict-json.ts";
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "../interface-ref.ts";
 
 /**
  * Durable runtime bindings for one immutable Worker Version.
@@ -77,6 +79,8 @@ const FORMAT_V6 = "takoserver.selfhost-version-bindings@v6";
 const FORMAT_V7 = "takoserver.selfhost-version-bindings@v7";
 /** Adds exact Actor relation metadata only to Versions that declare Actor bindings. */
 const FORMAT_V8 = "takoserver.selfhost-version-bindings@v8";
+/** Adds the exact selected Actor runtime InterfaceRef to selected bindings. */
+const FORMAT_V9 = "takoserver.selfhost-version-bindings@v9";
 const LEASE_GENERATION = /^[A-Za-z0-9_-]{16}$/u;
 
 export const SELFHOST_VERSION_DATA_BINDING_KINDS = [
@@ -166,6 +170,8 @@ export interface SelfhostVersionActorBinding {
   readonly namespaceResourceUid: string;
   readonly workerResourceUid: string;
   readonly className: string;
+  /** Exact installed Actor runtime contract selected for this immutable binding. */
+  readonly runtimeClassRef?: TakoformInterfaceRef;
 }
 
 /** Derives one private facade credential from an immutable Version secret. */
@@ -993,37 +999,94 @@ function normalizeActorBindings(
     !RESOURCE_UID.test(versionUid)
   )
     throw new SelfhostVersionBindingStoreError("corrupt");
-  const sorted = [...bindings].sort((a, b) =>
-    String(a?.name ?? "").localeCompare(String(b?.name ?? "")),
-  );
+  const baseKeys = [
+    "className",
+    "name",
+    "namespaceResourceUid",
+    "tenantId",
+    "workerResourceUid",
+  ] as const;
+  const sorted = bindings
+    .map((candidate) => {
+      const base = ownDataRecord(candidate, baseKeys);
+      const withRuntimeClassRef = base
+        ? undefined
+        : ownDataRecord(candidate, [...baseKeys, "runtimeClassRef"]);
+      const binding = base ?? withRuntimeClassRef;
+      if (!binding) throw new SelfhostVersionBindingStoreError("corrupt");
+      const runtimeClassRef = withRuntimeClassRef
+        ? normalizeActorRuntimeClassRef(withRuntimeClassRef.runtimeClassRef)
+        : undefined;
+      if (
+        typeof binding.name !== "string" ||
+        binding.name.length > 64 ||
+        !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.name) ||
+        typeof binding.tenantId !== "string" ||
+        binding.tenantId.length === 0 ||
+        binding.tenantId.length > 256 ||
+        binding.tenantId.includes("\u0000") ||
+        typeof binding.namespaceResourceUid !== "string" ||
+        !RESOURCE_UID.test(binding.namespaceResourceUid) ||
+        typeof binding.workerResourceUid !== "string" ||
+        !RESOURCE_UID.test(binding.workerResourceUid) ||
+        typeof binding.className !== "string" ||
+        binding.className.length > 64 ||
+        !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.className)
+      ) {
+        throw new SelfhostVersionBindingStoreError("corrupt");
+      }
+      return {
+        name: binding.name,
+        tenantId: binding.tenantId,
+        namespaceResourceUid: binding.namespaceResourceUid,
+        workerResourceUid: binding.workerResourceUid,
+        className: binding.className,
+        ...(runtimeClassRef ? { runtimeClassRef } : {}),
+      } satisfies SelfhostVersionActorBinding;
+    })
+    .sort((left, right) => left.name.localeCompare(right.name));
   const names = new Set<string>();
   for (const binding of sorted) {
-    if (
-      typeof binding !== "object" ||
-      binding === null ||
-      Array.isArray(binding) ||
-      Object.keys(binding).sort().join(",") !==
-        "className,name,namespaceResourceUid,tenantId,workerResourceUid" ||
-      typeof binding.name !== "string" ||
-      binding.name.length > 64 ||
-      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.name) ||
-      names.has(binding.name) ||
-      typeof binding.tenantId !== "string" ||
-      binding.tenantId.length === 0 ||
-      binding.tenantId.length > 256 ||
-      binding.tenantId.includes("\u0000") ||
-      typeof binding.namespaceResourceUid !== "string" ||
-      !RESOURCE_UID.test(binding.namespaceResourceUid) ||
-      typeof binding.workerResourceUid !== "string" ||
-      !RESOURCE_UID.test(binding.workerResourceUid) ||
-      typeof binding.className !== "string" ||
-      binding.className.length > 64 ||
-      !/^[A-Za-z_$][A-Za-z0-9_$]*$/u.test(binding.className)
-    )
-      throw new SelfhostVersionBindingStoreError("corrupt");
+    if (names.has(binding.name)) throw new SelfhostVersionBindingStoreError("corrupt");
     names.add(binding.name);
   }
-  return sorted.map((binding) => ({ ...binding }));
+  return sorted;
+}
+
+/** Reads a closed own-data-property record without invoking input accessors. */
+function ownDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const ownKeys = Reflect.ownKeys(value);
+  if (
+    ownKeys.length !== expectedKeys.length ||
+    ownKeys.some((key) => typeof key !== "string") ||
+    (ownKeys as string[]).sort().join(",") !== [...expectedKeys].sort().join(",")
+  ) {
+    return null;
+  }
+  const result: Record<string, unknown> = Object.create(null);
+  for (const key of expectedKeys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || !descriptor.enumerable) return null;
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+
+function normalizeActorRuntimeClassRef(value: unknown): TakoformInterfaceRef {
+  const record = ownDataRecord(value, ["apiVersion", "name", "schemaDigest", "version"]);
+  if (
+    !record ||
+    typeof record.apiVersion !== "string" ||
+    typeof record.name !== "string" ||
+    typeof record.version !== "string" ||
+    typeof record.schemaDigest !== "string"
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  const parsed = parseActorAbiRef(record);
+  if (!parsed) throw new SelfhostVersionBindingStoreError("corrupt");
+  return parsed.ref;
 }
 
 function validateExternalServiceJsonValue(value: string): void {
@@ -1332,11 +1395,19 @@ type SelfhostVersionBindingFormat =
   | typeof FORMAT_V5
   | typeof FORMAT_V6
   | typeof FORMAT_V7
-  | typeof FORMAT_V8;
+  | typeof FORMAT_V8
+  | typeof FORMAT_V9;
 
 function formatForSet(
   set: SelfhostVersionBindingSet,
-): typeof FORMAT_V4 | typeof FORMAT_V5 | typeof FORMAT_V6 | typeof FORMAT_V7 | typeof FORMAT_V8 {
+):
+  | typeof FORMAT_V4
+  | typeof FORMAT_V5
+  | typeof FORMAT_V6
+  | typeof FORMAT_V7
+  | typeof FORMAT_V8
+  | typeof FORMAT_V9 {
+  if (set.actorBindings?.some((binding) => binding.runtimeClassRef !== undefined)) return FORMAT_V9;
   if (set.actorBindings?.length) return FORMAT_V8;
   if (set.runtimeInputGeneration) return FORMAT_V7;
   if (hasVectorDataBinding(set)) return FORMAT_V6;
@@ -1368,7 +1439,12 @@ function canonicalRecord(
     ? {
         bindings: set.dataPlane.bindings.map((binding) => {
           if (binding.kind === "edge.vector") {
-            if (format !== FORMAT_V6 && format !== FORMAT_V7 && format !== FORMAT_V8) {
+            if (
+              format !== FORMAT_V6 &&
+              format !== FORMAT_V7 &&
+              format !== FORMAT_V8 &&
+              format !== FORMAT_V9
+            ) {
               throw new SelfhostVersionBindingStoreError("corrupt");
             }
             return {
@@ -1459,11 +1535,12 @@ function canonicalRecord(
   return JSON.stringify({
     format,
     salt,
-    ...(format === FORMAT_V7 || (format === FORMAT_V8 && current.runtimeInputGeneration)
+    ...(format === FORMAT_V7 ||
+    ((format === FORMAT_V8 || format === FORMAT_V9) && current.runtimeInputGeneration)
       ? { runtimeInputGeneration: current.runtimeInputGeneration }
       : {}),
     workerResourceUid: current.workerResourceUid,
-    ...(format === FORMAT_V8
+    ...(format === FORMAT_V8 || format === FORMAT_V9
       ? {
           workerVersionResourceUid: current.workerVersionResourceUid,
           actorBindings: current.actorBindings,
@@ -1541,7 +1618,9 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
                   ? FORMAT_V7
                   : record.format === FORMAT_V8 && isVersion8Keys(keys)
                     ? FORMAT_V8
-                    : null;
+                    : record.format === FORMAT_V9 && isVersion9Keys(keys)
+                      ? FORMAT_V9
+                      : null;
   if (
     format === null ||
     typeof record.salt !== "string" ||
@@ -1556,7 +1635,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
       format === FORMAT_V5 ||
       format === FORMAT_V6 ||
       format === FORMAT_V7 ||
-      format === FORMAT_V8) &&
+      format === FORMAT_V8 ||
+      format === FORMAT_V9) &&
       "dataPlane" in record);
   const planeToken = format === FORMAT_V1 ? undefined : (record.planeToken as unknown);
   if (
@@ -1571,7 +1651,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V5 ||
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
-    format === FORMAT_V8
+    format === FORMAT_V8 ||
+    format === FORMAT_V9
       ? record.eventToken
       : undefined;
   if (
@@ -1580,7 +1661,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
       format === FORMAT_V5 ||
       format === FORMAT_V6 ||
       format === FORMAT_V7 ||
-      format === FORMAT_V8) &&
+      format === FORMAT_V8 ||
+      format === FORMAT_V9) &&
     (typeof eventToken !== "string" || decodedLength(eventToken) !== EVENT_TOKEN_BYTES)
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1594,7 +1676,8 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V5 ||
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
-    format === FORMAT_V8
+    format === FORMAT_V8 ||
+    format === FORMAT_V9
       ? normalizeHandlers(parsedHandlers(record.handlers))
       : legacyPlane
         ? normalizeHandlers(legacyPlane.handlers)
@@ -1604,22 +1687,23 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     format === FORMAT_V5 ||
     format === FORMAT_V6 ||
     format === FORMAT_V7 ||
-    format === FORMAT_V8
+    format === FORMAT_V8 ||
+    format === FORMAT_V9
       ? {
           workerResourceUid: parsedResourceUid(record.workerResourceUid),
           serviceBindings: parsedServiceBindings(record.serviceBindings),
         }
       : {}),
-    ...(format === FORMAT_V8
+    ...(format === FORMAT_V8 || format === FORMAT_V9
       ? {
           workerVersionResourceUid: parsedResourceUid(record.workerVersionResourceUid),
-          actorBindings: parsedActorBindings(record.actorBindings),
+          actorBindings: parsedActorBindings(record.actorBindings, format === FORMAT_V9),
         }
       : {}),
     ...(handlers ? { handlers } : {}),
     vars: parsedBindings(record.vars),
     sensitiveVars: parsedBindings(record.sensitiveVars),
-    ...((format === FORMAT_V7 || format === FORMAT_V8) &&
+    ...((format === FORMAT_V7 || format === FORMAT_V8 || format === FORMAT_V9) &&
     record.runtimeInputGeneration !== undefined
       ? { runtimeInputGeneration: parsedRuntimeInputGeneration(record.runtimeInputGeneration) }
       : {}),
@@ -1627,11 +1711,18 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
       ? {
           dataPlane: parsedDataPlane(
             format === FORMAT_V2 ? { bindings: legacyPlane?.bindings } : record.dataPlane,
-            format === FORMAT_V6 || format === FORMAT_V7 || format === FORMAT_V8,
+            format === FORMAT_V6 ||
+              format === FORMAT_V7 ||
+              format === FORMAT_V8 ||
+              format === FORMAT_V9,
           ),
         }
       : {}),
-    ...(format === FORMAT_V5 || format === FORMAT_V6 || format === FORMAT_V7 || format === FORMAT_V8
+    ...(format === FORMAT_V5 ||
+    format === FORMAT_V6 ||
+    format === FORMAT_V7 ||
+    format === FORMAT_V8 ||
+    format === FORMAT_V9
       ? { externalServices: parsedExternalServices(record.externalServices) }
       : {}),
   });
@@ -1644,8 +1735,14 @@ function parseStored(bytes: Uint8Array): StoredSelfhostVersionBindings {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
   if (
-    format === FORMAT_V8 &&
+    (format === FORMAT_V8 || format === FORMAT_V9) &&
     set.sensitiveVars.length > 0 !== Boolean(set.runtimeInputGeneration)
+  ) {
+    throw new SelfhostVersionBindingStoreError("corrupt");
+  }
+  if (
+    (format === FORMAT_V8 && set.actorBindings?.some((binding) => binding.runtimeClassRef)) ||
+    (format === FORMAT_V9 && !set.actorBindings?.some((binding) => binding.runtimeClassRef))
   ) {
     throw new SelfhostVersionBindingStoreError("corrupt");
   }
@@ -1748,6 +1845,11 @@ function isVersion8Keys(keys: string): boolean {
   return false;
 }
 
+/** `@v9` keeps the V8 envelope and adds the ref only inside selected Actor entries. */
+function isVersion9Keys(keys: string): boolean {
+  return isVersion8Keys(keys);
+}
+
 function parsedRuntimeInputGeneration(value: unknown): string {
   if (typeof value !== "string" || !LEASE_GENERATION.test(value)) {
     throw new SelfhostVersionBindingStoreError("corrupt");
@@ -1777,8 +1879,25 @@ function parsedServiceBindings(value: unknown): readonly SelfhostVersionServiceB
   });
 }
 
-function parsedActorBindings(value: unknown): readonly SelfhostVersionActorBinding[] {
+function parsedActorBindings(
+  value: unknown,
+  allowRuntimeClassRef: boolean,
+): readonly SelfhostVersionActorBinding[] {
   if (!Array.isArray(value)) throw new SelfhostVersionBindingStoreError("corrupt");
+  const baseKeys = [
+    "className",
+    "name",
+    "namespaceResourceUid",
+    "tenantId",
+    "workerResourceUid",
+  ] as const;
+  for (const entry of value) {
+    const base = ownDataRecord(entry, baseKeys);
+    const withRuntimeClassRef = allowRuntimeClassRef
+      ? ownDataRecord(entry, [...baseKeys, "runtimeClassRef"])
+      : null;
+    if (!base && !withRuntimeClassRef) throw new SelfhostVersionBindingStoreError("corrupt");
+  }
   return value as readonly SelfhostVersionActorBinding[];
 }
 
