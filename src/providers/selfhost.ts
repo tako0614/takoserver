@@ -6780,12 +6780,15 @@ function normalizedHostname(value: unknown): string | undefined {
   return /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(hostname) ? hostname : undefined;
 }
 
-function isReleasedSelfhostCronForm(form: ProviderOffering["form"]): boolean {
+export function isReleasedSelfhostCronForm(form: ProviderOffering["form"]): boolean {
+  if (form.kind !== "WorkerCronTrigger" || form.definitionVersion !== "0.1.0") return false;
   return (
-    form.apiVersion === "edge.forms.takoform.com/v1beta1" &&
-    form.kind === "WorkerCronTrigger" &&
-    form.definitionVersion === "0.1.0" &&
-    form.schemaDigest === "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a"
+    (form.apiVersion === "edge.forms.takoform.com" &&
+      form.schemaDigest ===
+        "sha256:5faa838c794b3326d0377d641db6247d4320b6ce39b1b0bb660d4deec18fe5ed") ||
+    (form.apiVersion === "edge.forms.takoform.com/v1beta1" &&
+      form.schemaDigest ===
+        "sha256:ef4fdfc91638154766db821c97ef3d097619c610a5c3784888541ce307c82b8a")
   );
 }
 

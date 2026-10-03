@@ -64,6 +64,75 @@ async function compose(
 }
 
 describe("the standalone Bun provider composition", () => {
+  test("rehydrates current and retained Cron owners from their exact Form families", async () => {
+    const edge = await buildEdgeForms();
+    const currentForms = stableProductionTakoformCatalog().forms;
+    const installedForms = [...currentForms, ...edge.forms];
+    const currentCron = currentForms.find(
+      (form) => form.identity.formRef.kind === "WorkerCronTrigger",
+    );
+    const retainedCron = edge.forms.find(
+      (form) => form.identity.formRef.kind === "WorkerCronTrigger",
+    );
+    if (!currentCron || !retainedCron) {
+      throw new Error("current and retained released Cron Forms are required");
+    }
+    const queries: Parameters<TakoformStore["resourcesByRelation"]>[0][] = [];
+    const inventory: Pick<TakoformStore, "resourcesByRelation"> = {
+      async resourcesByRelation(query) {
+        queries.push(query);
+        return query.sourceApiVersion === currentCron.identity.formRef.apiVersion
+          ? [cronOwner(currentForms, "uid-current-cron", "0 * * * *", "space-a", "worker-a")]
+          : [cronOwner(edge.forms, "uid-retained-cron", "15 * * * *", "space-a", "worker-a")];
+      },
+    };
+    const listCronOwners = createSelfhostCronOwnerReader({ inventory, forms: installedForms });
+
+    await expect(
+      listCronOwners({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: currentCron.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({
+      complete: true,
+      owners: [{ resourceUid: "uid-current-cron", cron: "0 * * * *" }],
+    });
+    await expect(
+      listCronOwners({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: retainedCron.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({
+      complete: true,
+      owners: [{ resourceUid: "uid-retained-cron", cron: "15 * * * *" }],
+    });
+    expect(queries.map((query) => query.sourceApiVersion)).toEqual([
+      currentCron.identity.formRef.apiVersion,
+      retainedCron.identity.formRef.apiVersion,
+    ]);
+
+    const countBeforeWrongRef = queries.length;
+    await expect(
+      listCronOwners({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: {
+          ...currentCron.identity.formRef,
+          schemaDigest: `sha256:${"0".repeat(64)}`,
+        },
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+    expect(queries).toHaveLength(countBeforeWrongRef);
+  });
+
   test("projects exact same-expression Cron owners only from the requested Host scope", async () => {
     const edge = await buildEdgeForms();
     const cronForm = edge.forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
@@ -172,6 +241,75 @@ describe("the standalone Bun provider composition", () => {
     });
     await expect(
       unreadable({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: cronForm.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+  });
+
+  test("current Cron owner projection refuses package drift and an overflowing page", async () => {
+    const currentForms = stableProductionTakoformCatalog().forms;
+    const cronForm = currentForms.find(
+      (form) => form.identity.formRef.kind === "WorkerCronTrigger",
+    );
+    if (!cronForm) throw new Error("current released Cron Form is required");
+    const validOwner = cronOwner(
+      currentForms,
+      "uid-current-cron",
+      "0 * * * *",
+      "space-a",
+      "worker-a",
+    );
+    const drifted = cronOwner(
+      currentForms,
+      "uid-drifted-current-cron",
+      "0 * * * *",
+      "space-a",
+      "worker-a",
+      {
+        packageDigest: `sha256:${"0".repeat(64)}`,
+        implementationDigest: `sha256:${"1".repeat(64)}`,
+      },
+    );
+    const listDrifted = createSelfhostCronOwnerReader({
+      forms: currentForms,
+      inventory: {
+        async resourcesByRelation() {
+          return [validOwner, drifted];
+        },
+      },
+    });
+    await expect(
+      listDrifted({
+        tenantRef: "tenant-a",
+        space: "space-a",
+        workerResourceUid: "worker-a",
+        form: cronForm.identity.formRef,
+        limit: MAX_SELFHOST_CRON_OWNERS + 1,
+      }),
+    ).resolves.toEqual({ complete: false });
+
+    const listOverflow = createSelfhostCronOwnerReader({
+      forms: currentForms,
+      inventory: {
+        async resourcesByRelation() {
+          return Array.from({ length: MAX_SELFHOST_CRON_OWNERS + 1 }, (_, index) =>
+            cronOwner(
+              currentForms,
+              `uid-current-cron-${index}`,
+              "0 * * * *",
+              "space-a",
+              "worker-a",
+            ),
+          );
+        },
+      },
+    });
+    await expect(
+      listOverflow({
         tenantRef: "tenant-a",
         space: "space-a",
         workerResourceUid: "worker-a",
@@ -420,7 +558,11 @@ function cronOwner(
   cron: string,
   space: string,
   workerUid: string,
-  formRefOverrides: { readonly schemaDigest?: `sha256:${string}` } = {},
+  formOverrides: {
+    readonly schemaDigest?: `sha256:${string}`;
+    readonly packageDigest?: `sha256:${string}`;
+    readonly implementationDigest?: `sha256:${string}`;
+  } = {},
 ): RelatedResource {
   const cronForm = forms.find((form) => form.identity.formRef.kind === "WorkerCronTrigger");
   const workerForm = forms.find((form) => form.identity.formRef.kind === "ModuleWorker");
@@ -431,9 +573,13 @@ function cronOwner(
       kind: cronForm.identity.formRef.kind,
       form: {
         ...cronForm.identity,
+        ...(formOverrides.packageDigest ? { packageDigest: formOverrides.packageDigest } : {}),
+        ...(formOverrides.implementationDigest
+          ? { implementationDigest: formOverrides.implementationDigest }
+          : {}),
         formRef: {
           ...cronForm.identity.formRef,
-          ...formRefOverrides,
+          ...(formOverrides.schemaDigest ? { schemaDigest: formOverrides.schemaDigest } : {}),
         },
       },
       metadata: { name: uid, space, uid, generation: "1", revision: "1" },

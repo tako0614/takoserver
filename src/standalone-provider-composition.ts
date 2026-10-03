@@ -13,7 +13,7 @@ import type {
   SelfhostEventRuntime,
   SelfhostProviderOptions,
 } from "./providers/selfhost.ts";
-import { MAX_SELFHOST_CRON_OWNERS } from "./providers/selfhost.ts";
+import { isReleasedSelfhostCronForm, MAX_SELFHOST_CRON_OWNERS } from "./providers/selfhost.ts";
 import type {
   SelfhostContainerEndpointHttpsIngressPort,
   SelfhostContainerEndpointIngressCapability,
@@ -121,23 +121,24 @@ export interface StandaloneProviderComposition {
  */
 export function createSelfhostCronOwnerReader(input: {
   readonly inventory: Pick<TakoformStore, "resourcesByRelation">;
-  /** Exact installed Forms available to this composition, including the released Cron Form. */
+  /** Canonical current and retained edge Forms available to this composition. */
   readonly forms: readonly InstalledTakoformForm[];
 }): NonNullable<SelfhostProviderOptions["listCronOwners"]> {
-  const cronForms = input.forms.filter(
-    (form) =>
-      form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1beta1" &&
-      form.identity.formRef.kind === "WorkerCronTrigger",
-  );
-  const workerForms = input.forms.filter(
-    (form) =>
-      form.identity.formRef.apiVersion === "edge.forms.takoform.com/v1beta1" &&
-      form.identity.formRef.kind === "ModuleWorker",
-  );
-  const cronForm = cronForms.length === 1 ? cronForms[0] : undefined;
-  const workerForm = workerForms.length === 1 ? workerForms[0] : undefined;
-
   return async ({ tenantRef, space, workerResourceUid, form, limit }) => {
+    const cronForms = input.forms.filter(
+      (candidate) =>
+        isReleasedSelfhostCronForm(candidate.identity.formRef) &&
+        sameCronFormRef(form, candidate.identity.formRef),
+    );
+    const cronForm = cronForms.length === 1 ? cronForms[0] : undefined;
+    const workerForms = cronForm
+      ? input.forms.filter(
+          (candidate) =>
+            candidate.identity.formRef.apiVersion === cronForm.identity.formRef.apiVersion &&
+            candidate.identity.formRef.kind === "ModuleWorker",
+        )
+      : [];
+    const workerForm = workerForms.length === 1 ? workerForms[0] : undefined;
     if (
       !cronForm ||
       !workerForm ||

@@ -47,6 +47,7 @@ import {
   TAKOFORM_MAXIMUM_FILE_BUNDLE_FILES,
   TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES,
 } from "../src/takoform/limits.ts";
+import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { TakoformStandardServiceProjection } from "../src/takoform/types.ts";
 import {
   createWorkerdRuntime,
@@ -5691,12 +5692,13 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       readonly name: string;
       readonly uid: string;
       readonly cron: string;
+      readonly offering?: ProviderOffering;
       readonly previous?: { readonly nativeId: string; readonly spec: ReturnType<typeof cronSpec> };
     },
   ) =>
     local.apply({
       operationId: input.operationId,
-      offering: offering("WorkerCronTrigger"),
+      offering: input.offering ?? offering("WorkerCronTrigger"),
       identity: { ...identity(input.name), uid: input.uid },
       spec: cronSpec(input.cron),
       relations: [relation("/worker", "ModuleWorker", "hello")],
@@ -5711,11 +5713,12 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
       readonly uid: string;
       readonly nativeId: string;
       readonly cron: string;
+      readonly offering?: ProviderOffering;
     },
   ) =>
     local.delete({
       operationId: input.operationId,
-      offering: offering("WorkerCronTrigger"),
+      offering: input.offering ?? offering("WorkerCronTrigger"),
       identity: { ...identity(input.name), uid: input.uid },
       nativeId: input.nativeId,
       spec: cronSpec(input.cron),
@@ -5729,6 +5732,58 @@ describe("attaching a Queue Consumer and a Cron Trigger", () => {
     state.crons = [...crons];
     await writeFile(path, JSON.stringify(state), "utf8");
   };
+
+  test("accepts the exact currently published Cron Form identity", async () => {
+    const currentCron = stableProductionTakoformCatalog().forms.find(
+      (form) => form.identity.formRef.kind === "WorkerCronTrigger",
+    );
+    if (!currentCron) throw new Error("the current released Cron Form is required");
+    const local = provider({ runtime: servingRuntime().runtime, events: EVENTS });
+    await publish(local, false, undefined, false, ["fetch", "scheduled"]);
+
+    const currentOffering = {
+      ...offering("WorkerCronTrigger"),
+      form: currentCron.identity.formRef,
+    };
+    const created = await applyOwnedCron(local, {
+      operationId: "op_current_cron_create",
+      name: "hello-cron",
+      uid: "uid-hello-cron",
+      cron: "0 * * * *",
+      offering: currentOffering,
+    });
+    expect(created).toMatchObject({ phase: "succeeded" });
+    if (created.phase !== "succeeded") throw new Error("current Cron create did not succeed");
+
+    const updated = await applyOwnedCron(local, {
+      operationId: "op_current_cron_update",
+      name: "hello-cron",
+      uid: "uid-hello-cron",
+      cron: "15 * * * *",
+      offering: currentOffering,
+      previous: { nativeId: created.result.nativeId, spec: cronSpec("0 * * * *") },
+    });
+    expect(updated).toMatchObject({ phase: "succeeded" });
+    expect(
+      await applyOwnedCron(local, {
+        operationId: "op_current_cron_replay",
+        name: "hello-cron",
+        uid: "uid-hello-cron",
+        cron: "15 * * * *",
+        offering: currentOffering,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+    expect(
+      await deleteOwnedCron(local, {
+        operationId: "op_current_cron_delete",
+        name: "hello-cron",
+        uid: "uid-hello-cron",
+        nativeId: created.result.nativeId,
+        cron: "15 * * * *",
+        offering: currentOffering,
+      }),
+    ).toMatchObject({ phase: "succeeded" });
+  });
 
   test("direct Cron adoption cannot borrow another Resource UID's native schedule", async () => {
     const runtime = servingRuntime();
