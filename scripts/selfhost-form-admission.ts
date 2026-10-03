@@ -18,6 +18,10 @@ import {
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
+import {
+  createSelfhostProductionFormAuthorityComposition,
+  deriveSelfhostFormAuthorityCatalog,
+} from "../src/selfhost-form-authority-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -34,11 +38,7 @@ import type {
   FormAuthorityPlan,
   FormAuthorityPlanRequest,
 } from "../src/takoform/host-admission-coordinator.ts";
-import {
-  createSelfhostProductionFormAuthorityComposition,
-  deriveSelfhostFormAuthorityCatalog,
-  type FormAuthorityEndpointConfiguration,
-} from "../src/takoform/host-admission-endpoint.ts";
+import type { FormAuthorityEndpointConfiguration } from "../src/takoform/host-admission-endpoint.ts";
 import { selfhostLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";

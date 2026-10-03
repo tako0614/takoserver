@@ -21,11 +21,11 @@ import {
   hasExactSelfhostActorClosure,
   SELFHOST_IDENTITY_CAPABILITY_KINDS,
 } from "../src/selfhost-composition.ts";
+import { deriveSelfhostFormAuthorityCatalog } from "../src/selfhost-form-authority-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStandaloneProviderComposition } from "../src/standalone-provider-composition.ts";
 import { createTakoformArtifacts } from "../src/takoform/artifacts.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
-import { deriveSelfhostFormAuthorityCatalog } from "../src/takoform/host-admission-endpoint.ts";
 import {
   selfhostLifecycleCapabilityManifest,
   yurucommuLifecycleCapabilityManifest,
