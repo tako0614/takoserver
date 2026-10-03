@@ -629,8 +629,10 @@ const providerComposition = createStandaloneProviderComposition({
   mode: providerMode,
   edge,
   stableForms: currentCandidates.forms,
+  stableBindings: currentCandidates.bindings,
   dataRoot,
   runtime: workerdRuntime,
+  ...(actorRuntime ? { actorRuntime } : {}),
   workerRuntimeAvailable: workerdBinary !== null,
   artifacts: providerArtifacts,
   ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX

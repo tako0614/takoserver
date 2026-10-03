@@ -237,7 +237,7 @@ const SELFHOST_SERVICE_BINDING_REF = Object.freeze({
   version: "1.0.0",
   schemaDigest: "sha256:79c3a23e506ffc4607ea2921e3dbe76c7d44b20c76e6181e65c611239b9c51aa",
 });
-const SELFHOST_ACTOR_BINDING_REF = Object.freeze({
+export const SELFHOST_ACTOR_BINDING_REF = Object.freeze({
   apiVersion: "bindings.takoform.com/v1alpha2",
   name: "module-worker.actor",
   version: "1.0.0",

@@ -2,12 +2,19 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { selfhostVersionBindingsRoot } from "../src/providers/selfhost.ts";
+import {
+  SELFHOST_ACTOR_BINDING_REF,
+  selfhostVersionBindingsRoot,
+} from "../src/providers/selfhost.ts";
 import { createSelfhostVersionBindingStore } from "../src/providers/selfhost-version-bindings.ts";
 import {
   deriveSelfhostActorForwardToken,
   openSelfhostActorPublicRuntime,
 } from "../src/selfhost-actor-public-runtime.ts";
+import {
+  createSelfhostRuntimeBindingMaterializer,
+  SELFHOST_ACTOR_MATERIAL_KIND,
+} from "../src/selfhost-runtime-binding-materializer.ts";
 import type { WorkerdActorForwardPublication } from "../src/workerd-runtime.ts";
 import { fixture, scope } from "./helpers/actor-resource-fixture.ts";
 
@@ -85,6 +92,68 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
   });
   try {
     await owner.actorNamespace.registerNamespace(scope);
+    await f.deployments.create({
+      tenantId: scope.tenantId,
+      id: "deployment-actor",
+      resourceUid: scope.namespaceResourceUid,
+      offeringId: "compute.actor.stable-v1.standard",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      nativeId: `selfhost-actor:${scope.namespaceResourceUid}`,
+      state: "active",
+      observed: {},
+      outputs: { resourceUid: scope.namespaceResourceUid },
+    });
+    const deployment = await f.deployments.active(scope.tenantId, scope.namespaceResourceUid);
+    if (!deployment) throw new Error("Actor deployment unavailable");
+    const relation = {
+      pointer: "/actorBindings/0/resource",
+      relation: "/actorBindings/*/resource",
+      targetUid: scope.namespaceResourceUid,
+      bindingRef: SELFHOST_ACTOR_BINDING_REF,
+      resource: f.source,
+      deployment,
+    };
+    const materializer = createSelfhostRuntimeBindingMaterializer("selfhost", owner);
+    const route = {
+      bindingRef: SELFHOST_ACTOR_BINDING_REF,
+      materialKind: SELFHOST_ACTOR_MATERIAL_KIND,
+    };
+    const exported = await materializer.exporter?.exportTarget({
+      tenantId: scope.tenantId,
+      relation,
+      route,
+    });
+    expect(exported).toBeDefined();
+    const material = await materializer.importer?.importBinding({
+      tenantId: scope.tenantId,
+      source: {
+        tenantRef: scope.tenantId,
+        space: "default",
+        name: "caller",
+        uid: set.workerResourceUid,
+      },
+      sourceSpec: {},
+      name: "COUNTER",
+      relation,
+      route,
+      exported: {
+        providerPackRef: "selfhost",
+        materialKind: SELFHOST_ACTOR_MATERIAL_KIND,
+        material: exported,
+      },
+    });
+    expect(material).toEqual({
+      kind: SELFHOST_ACTOR_MATERIAL_KIND,
+      tenantId: scope.tenantId,
+      namespaceResourceUid: scope.namespaceResourceUid,
+      workerResourceUid: f.target.metadata.uid,
+      className: "Counter",
+    });
+    expect(JSON.stringify(material)).not.toContain("token");
+    expect(
+      await materializer.exporter?.exportTarget({ tenantId: "other", relation, route }),
+    ).toBeNull();
     expect(owner.actorForwardSockets()).toEqual([]);
     await bindings.write("caller", "version-legacy", set);
     await expect(

@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCatalog } from "../src/catalog.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
@@ -7,9 +9,12 @@ import type { Provider, ProviderRelation } from "../src/provider-port.ts";
 import { resolveRuntimeBindingMaterialRoute } from "../src/provider-runtime-bindings.ts";
 import type { ProviderRuntimeInputLeasePort } from "../src/provider-runtime-input-port.ts";
 import { EDGE_OBJECTS_BINDING_REF } from "../src/providers/cloudflare-runtime-bindings.ts";
+import { SELFHOST_ACTOR_BINDING_REF } from "../src/providers/selfhost.ts";
 import type { SelfhostContainerCapability } from "../src/providers/selfhost-container-lifecycle.ts";
 import { SELFHOST_EDGE_OBJECTS_MATERIAL_KIND } from "../src/providers/selfhost-runtime-bindings.ts";
+import { openSelfhostActorPublicRuntime } from "../src/selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "../src/selfhost-composition.ts";
+import { SELFHOST_ACTOR_MATERIAL_KIND } from "../src/selfhost-runtime-binding-materializer.ts";
 import { stableProductionTakoformCatalog } from "../src/takoform/stable-production-catalog.ts";
 import type { WorkerdRuntime } from "../src/workerd-runtime.ts";
 import { loadVerifiedLocalContainerCandidate } from "./fixtures/selfhost-container-host-authority.ts";
@@ -124,6 +129,75 @@ function bucketRelation(
 }
 
 describe("the self-host catalog", () => {
+  test("adds local Actor only with an owned runtime and exact released closure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "actor-composition-"));
+    const released = stableProductionTakoformCatalog();
+    const actorRuntime = await openSelfhostActorPublicRuntime({
+      dataRoot: root,
+      runtimeRoot: root,
+      socketParent: join(root, "sockets"),
+      binary: "/never-execute",
+      graph: async () => null,
+      deployments: { active: async () => null },
+      providerPackRef: "local",
+      providerInstallationRef: "local.primary",
+    });
+    const options = {
+      edge: await buildEdgeForms(),
+      stableForms: released.forms,
+      stableBindings: released.bindings,
+      dataRoot: root,
+      runtime,
+      artifacts: { manifest: async () => null, blob: async () => null },
+      edgeForms: true,
+      now: new Date("2026-10-03T00:00:00.000Z"),
+    };
+    try {
+      expect(
+        createSelfhostComposition(options).offerings.some(
+          (item) => item.form.kind === "ActorNamespace",
+        ),
+      ).toBe(false);
+      const composed = createSelfhostComposition({ ...options, actorRuntime });
+      const actor = composed.offerings.find((item) => item.form.kind === "ActorNamespace");
+      expect(actor).toMatchObject({
+        id: "compute.actor.stable-v1.standard",
+        resourceClass: "compute.actor",
+        providerPackRef: "local",
+        providerInstallationRef: "local.primary",
+        pricePlan: {
+          currency: "USD",
+          provisioning: { meter: "resource.create", amountMinor: 0 },
+          meters: [],
+        },
+      });
+      expect(actor?.pricePlan?.meters).toEqual([]);
+      expect(
+        resolveRuntimeBindingMaterialRoute({
+          bindingRef: SELFHOST_ACTOR_BINDING_REF,
+          consumer: composed.providerPacks[0]?.runtimeBindingMaterializer,
+          target: composed.providerPacks[0]?.runtimeBindingMaterializer,
+        }),
+      ).toEqual({
+        bindingRef: SELFHOST_ACTOR_BINDING_REF,
+        materialKind: SELFHOST_ACTOR_MATERIAL_KIND,
+      });
+      const tampered = released.forms.map((item) =>
+        item.identity.formRef.kind === "ActorNamespace"
+          ? {
+              ...item,
+              identity: { ...item.identity, packageDigest: `sha256:${"0".repeat(64)}` as const },
+            }
+          : item,
+      );
+      expect(() =>
+        createSelfhostComposition({ ...options, stableForms: tampered, actorRuntime }),
+      ).toThrow("Actor closure");
+    } finally {
+      await actorRuntime.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   test("does not advertise Worker execution when the pinned runtime is unavailable", async () => {
     const composition = await compose(true, undefined, false);
     expect(composition.offerings.map((offering) => offering.form.kind).sort()).toEqual([
