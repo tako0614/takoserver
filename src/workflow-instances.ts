@@ -14,6 +14,11 @@ import {
   rowValue,
   WorkflowInputError,
 } from "./workflow-data.ts";
+import {
+  requireWorkflowResourceDeletionContribution,
+  type WorkflowResourceDeletionContribution,
+  workflowResourceLiveSql,
+} from "./workflow-resource-lifecycle.ts";
 
 export { WORKFLOW_MAX_DOCUMENT_BYTES, WORKFLOW_MAX_TOP_PROPERTIES } from "./workflow-data.ts";
 
@@ -103,6 +108,8 @@ export interface WorkflowInstancesOptions {
   readonly randomId: () => string;
   /** Opt into the exact unpublished v3 event-retention contract. */
   readonly workflowInterfaceRef?: TakoformInterfaceRef;
+  /** Exact source-only Resource admission, bound to this very Sql object. */
+  readonly workflowResourceDeletion?: WorkflowResourceDeletionContribution;
 }
 
 export interface WorkflowInstances {
@@ -205,6 +212,19 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
     throw new TypeError("unsupported workflow interface reference");
   }
   const workflowV3Enabled = options.workflowInterfaceRef !== undefined;
+  if (options.workflowResourceDeletion) {
+    if (!workflowV3Enabled) throw new TypeError("Workflow Resource lifecycle requires exact v3");
+    requireWorkflowResourceDeletionContribution(options.workflowResourceDeletion, options.sql);
+  }
+  const liveInstance = options.workflowResourceDeletion
+    ? workflowResourceLiveSql(
+        "tf_workflow_instances.tenant_id",
+        "tf_workflow_instances.workflow_resource_uid",
+      )
+    : "1 = 1";
+  const liveSelected = options.workflowResourceDeletion
+    ? workflowResourceLiveSql("instance.tenant_id", "instance.workflow_resource_uid")
+    : "1 = 1";
 
   const randomId = options.randomId;
   const now = (): number => {
@@ -213,6 +233,14 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
       throw new Error("the workflow instance clock returned an invalid instant");
     }
     return timestamp;
+  };
+  const selectedResourceLive = async (scope: WorkflowScope): Promise<boolean> => {
+    if (!options.workflowResourceDeletion) return true;
+    const rows = await options.sql.query(
+      `SELECT 1 AS live WHERE ${workflowResourceLiveSql("?", "?")}`,
+      [scope.tenantId, scope.workflowResourceUid],
+    );
+    return rows.length === 1;
   };
 
   return {
@@ -284,7 +312,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                         SELECT 1
                         FROM tf_workflow_instances
                         WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
-                      )`,
+                      ) AND ${options.workflowResourceDeletion ? workflowResourceLiveSql("?", "?") : "1 = 1"}`,
                 params: [
                   normalizedScope.tenantId,
                   normalizedScope.workflowResourceUid,
@@ -298,6 +326,9 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                   normalizedScope.tenantId,
                   normalizedScope.workflowResourceUid,
                   instanceId,
+                  ...(options.workflowResourceDeletion
+                    ? [normalizedScope.tenantId, normalizedScope.workflowResourceUid]
+                    : []),
                 ],
               },
             ]);
@@ -321,6 +352,9 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
             // id; no caller-visible instance exists until the INSERT wins.
             instanceId = undefined;
             continue;
+          }
+          if (!(await selectedResourceLive(normalizedScope))) {
+            throw new WorkflowInstanceError("unknown_instance");
           }
           throw new Error("workflow create guard did not produce an instance");
         }
@@ -622,6 +656,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                         AND instance.run_owner IS NULL AND instance.run_lease_until IS NULL
                         AND instance.termination_requested = 0
                         AND instance.deadline_at > ? AND instance.retention_until > ?
+                        AND ${liveSelected}
                     )
                     AND NOT EXISTS (
                       SELECT 1 FROM tf_workflow_events AS event
@@ -664,6 +699,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
                     AND run_owner IS NULL AND run_lease_until IS NULL
                     AND termination_requested = 0
                     AND deadline_at > ? AND retention_until > ?
+                    AND ${liveInstance}
                     AND EXISTS (
                       SELECT 1 FROM tf_workflow_steps AS step
                       WHERE step.execution_id = tf_workflow_instances.execution_id
@@ -720,6 +756,9 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
         throw new WorkflowInstanceError("instance_terminal");
       }
       if (after.revision === attempt.revision) {
+        if (!(await selectedResourceLive(scope))) {
+          throw new WorkflowInstanceError("unknown_instance");
+        }
         const termination = await options.sql.query(
           `SELECT termination_requested FROM tf_workflow_instances
            WHERE tenant_id = ? AND workflow_resource_uid = ? AND instance_id = ?
@@ -821,6 +860,7 @@ export function createWorkflowInstances(options: WorkflowInstancesOptions): Work
               AND instance.retention_until > ? AND instance.deadline_at > ?
               AND instance.status IN ('queued', 'running', 'sleeping', 'waiting')
               AND instance.termination_requested = 0
+              AND ${liveSelected}
               AND (SELECT count(*) FROM tf_workflow_events AS existing
                    WHERE existing.tenant_id = instance.tenant_id
                      AND existing.workflow_resource_uid = instance.workflow_resource_uid

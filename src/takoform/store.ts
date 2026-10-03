@@ -12,6 +12,17 @@ import {
   type ResourceExecutionEvidenceResponse,
 } from "../resource-execution-evidence.ts";
 import {
+  assertWorkflowResourceDeletionReady,
+  isSelectedWorkflowResourceFormRef,
+  requireWorkflowResourceDeletionContribution,
+  type WorkflowResourceDeletionContribution,
+  workflowDeletionClosedGuard,
+  workflowDeletionCommitFence,
+  workflowDeletionPurgeStatements,
+  workflowDeletionReadyFence,
+  workflowResourceLiveSql,
+} from "../workflow-resource-lifecycle.ts";
+import {
   type AcceptedAuthoritySummary,
   assertAcceptedAuthorityRecord,
   encodeAcceptedAuthority,
@@ -869,7 +880,14 @@ function legacyOperationConflictError(): TakoformHostError {
   );
 }
 
-export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
+export function createTakoformStore(
+  sql: Sql,
+  clock: Clock,
+  workflowResourceDeletion?: WorkflowResourceDeletionContribution,
+): TakoformStore {
+  if (workflowResourceDeletion) {
+    requireWorkflowResourceDeletionContribution(workflowResourceDeletion, sql);
+  }
   const now = (): number => clock().getTime();
 
   const readDeferredBy = async (
@@ -1627,6 +1645,22 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
 
     async prepareResourceDeletion(input): Promise<ResourceDeletionTombstone> {
       const timestamp = now();
+      const selectedWorkflow =
+        workflowResourceDeletion && isSelectedWorkflowResourceFormRef(input.formRef);
+      if (selectedWorkflow) {
+        await assertWorkflowResourceDeletionReady(workflowResourceDeletion, {
+          tenantId: input.tenantId,
+          resourceUid: input.resourceUid,
+          now: timestamp,
+        });
+      }
+      const workflowReady = selectedWorkflow
+        ? workflowDeletionReadyFence({
+            tenantId: input.tenantId,
+            resourceUid: input.resourceUid,
+            now: timestamp,
+          })
+        : null;
       const [targetClaimStart, targetClaimEnd] = await resourceDependencyTargetClaimRange(
         input.tenantId,
         input.resourceUid,
@@ -1652,7 +1686,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             AND runtime_input.worker_resource_uid = ?
             AND runtime_input.state = 'claimed'
             AND runtime_input.claim_expires_at > ?
-        )`;
+        )${workflowReady ? ` AND ${workflowReady.sql} AND ${workflowResourceLiveSql("?", "?", "live-or-pending")}` : ""}`;
       const availableParams = (): readonly SqlParam[] => [
         targetClaimStart,
         targetClaimEnd,
@@ -1663,6 +1697,8 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         input.tenantId,
         input.resourceUid,
         timestamp,
+        ...(workflowReady?.params ?? []),
+        ...(workflowReady ? [input.tenantId, input.resourceUid] : []),
       ];
       try {
         await sql.batch([
@@ -1737,6 +1773,13 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ]);
       } catch (error) {
         if (!(error instanceof SqlError) || error.code !== "constraint") throw error;
+        if (selectedWorkflow) {
+          await assertWorkflowResourceDeletionReady(workflowResourceDeletion, {
+            tenantId: input.tenantId,
+            resourceUid: input.resourceUid,
+            now: now(),
+          });
+        }
         const identity = await sql.query(
           `SELECT space, api_version, kind, name, form_ref_json, state
            FROM tf_resource_deletion_attestations
@@ -3118,6 +3161,14 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
+      const workflow =
+        workflowResourceDeletion && mutation.kind === "delete"
+          ? workflowDeletionCommitFence({
+              tenantId: input.tenantId,
+              resourceUid: mutation.resourceUid,
+              now: now(),
+            })
+          : null;
       const statements = providerMutationCommitStatements({
         guard,
         tenantId: input.tenantId,
@@ -3127,8 +3178,9 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         mutation,
         claimOwnerId: input.operationId,
         now: now(),
-        additionalFence: authority.sql,
-        additionalFenceParams: authority.params,
+        additionalFence: workflow ? `(${authority.sql}) AND (${workflow.sql})` : authority.sql,
+        additionalFenceParams: [...authority.params, ...(workflow?.params ?? [])],
+        purgeSelectedWorkflow: workflow !== null,
       });
       try {
         await sql.batch(statements);
@@ -3545,6 +3597,21 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
       const authority = mutation.authorityFence
         ? await authorityFenceSql(mutation.authorityFence)
         : { sql: "1 = 1", params: [] as readonly SqlParam[] };
+      const workflow =
+        workflowResourceDeletion && mutation.kind === "delete"
+          ? workflowDeletionCommitFence({
+              tenantId: operation.tenantId,
+              resourceUid: mutation.resourceUid,
+              now: timestamp,
+            })
+          : null;
+      const workflowClosed = workflow
+        ? workflowDeletionClosedGuard({
+            token: boundedGuard(`workflow_closed_${guard}`),
+            tenantId: operation.tenantId,
+            resourceUid: mutation.resourceUid,
+          })
+        : null;
       const providerSagaFence = receiptJson
         ? `EXISTS (
         SELECT 1 FROM ${PROVIDER_MUTATION_SAGA_TABLE}
@@ -3563,6 +3630,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
                                      AND ${deployment.fence}
                                      AND ${deletionFence.sql}
                                      AND ${providerEffect.fence}
+                                     AND ${workflow?.sql ?? "1 = 1"}
                                      AND (${authority.sql}) THEN 1 ELSE 0 END`,
           params: [
             guard,
@@ -3594,6 +3662,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             ...deployment.fenceParams,
             ...deletionFence.params,
             ...providerEffect.fenceParams,
+            ...(workflow?.params ?? []),
             ...authority.params,
           ],
         },
@@ -3601,6 +3670,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
         ...deployment.statements,
         ...providerEffect.statements,
         ...deletionTombstoneStatements(mutation, timestamp),
+        ...(workflowClosed ? [workflowClosed.check] : []),
         ...executionEvidence.statements,
       ];
       if (mutation.kind === "write") {
@@ -3661,6 +3731,14 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             ...(fencesRevision ? [operation.acceptedRevision ?? ""] : []),
           ],
         });
+        if (workflow) {
+          statements.push(
+            ...workflowDeletionPurgeStatements({
+              tenantId: operation.tenantId,
+              resourceUid: mutation.resourceUid,
+            }),
+          );
+        }
       }
       statements.push(
         {
@@ -3730,6 +3808,7 @@ export function createTakoformStore(sql: Sql, clock: Clock): TakoformStore {
             ]
           : []),
         ...dependencyGuards.cleanup,
+        ...(workflowClosed ? [workflowClosed.cleanup] : []),
         {
           sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
           params: [executionEvidenceGuard],
@@ -5668,6 +5747,7 @@ function providerMutationCommitStatements(input: {
   readonly now: number;
   readonly additionalFence?: string;
   readonly additionalFenceParams?: readonly SqlParam[];
+  readonly purgeSelectedWorkflow?: boolean;
   readonly beforeOperationStatements?: readonly SqlStatement[];
 }): SqlStatement[] {
   const { mutation } = input;
@@ -5688,6 +5768,13 @@ function providerMutationCommitStatements(input: {
   const deployment = deploymentMutationSql(mutation.providerReceipt, input.now);
   const providerEffect = providerEffectSql(mutation, input.now);
   const deletionFence = deletionTombstoneFence(mutation, input.operationId);
+  const workflowClosed = input.purgeSelectedWorkflow
+    ? workflowDeletionClosedGuard({
+        token: boundedGuard(`workflow_closed_${input.guard}`),
+        tenantId: input.tenantId,
+        resourceUid: mutation.resourceUid,
+      })
+    : null;
   const executionEvidence = resourceExecutionEvidenceSql({
     tenantId: input.tenantId,
     operationId: input.operationId,
@@ -5778,6 +5865,7 @@ function providerMutationCommitStatements(input: {
     ...deployment.statements,
     ...providerEffect.statements,
     ...deletionTombstoneStatements(mutation, input.now),
+    ...(workflowClosed ? [workflowClosed.check] : []),
     ...executionEvidence.statements,
   ];
   if (mutation.kind === "write") {
@@ -5831,6 +5919,14 @@ function providerMutationCommitStatements(input: {
               AND revision = ?`,
       params: [...key, mutation.expectedRevision ?? ""],
     });
+    if (input.purgeSelectedWorkflow) {
+      statements.push(
+        ...workflowDeletionPurgeStatements({
+          tenantId: input.tenantId,
+          resourceUid: mutation.resourceUid,
+        }),
+      );
+    }
   }
   statements.push(
     {
@@ -5892,6 +5988,7 @@ function providerMutationCommitStatements(input: {
         ]
       : []),
     ...dependencyGuards.cleanup,
+    ...(workflowClosed ? [workflowClosed.cleanup] : []),
     {
       sql: "DELETE FROM tf_operation_commit_guards WHERE token = ?",
       params: [executionEvidenceGuard],
