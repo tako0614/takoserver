@@ -3,11 +3,11 @@ import { createHash, createHmac, randomBytes as nodeRandomBytes } from "node:cry
 import { existsSync, constants as fsConstants } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { parseActorAbiRef } from "../actor-abi-ref.ts";
+import type { TakoformInterfaceRef } from "../interface-ref.ts";
 import { isJsonObject } from "../json.ts";
 import { isStableStandardServiceProtocol } from "../standard-service-port.ts";
 import { parseStrictJson } from "../strict-json.ts";
-import { parseActorAbiRef } from "../actor-abi-ref.ts";
-import type { TakoformInterfaceRef } from "../interface-ref.ts";
 
 /**
  * Durable runtime bindings for one immutable Worker Version.
@@ -1054,7 +1054,10 @@ function normalizeActorBindings(
 }
 
 /** Reads a closed own-data-property record without invoking input accessors. */
-function ownDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | null {
+function ownDataRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const ownKeys = Reflect.ownKeys(value);
   if (

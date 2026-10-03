@@ -20,12 +20,15 @@ test("Actor ABI refs resolve only as complete canonical frozen tuples", () => {
 
 test("Actor ABI ref parsing accepts legacy non-enumerable data and refuses untrusted shapes", () => {
   const expected = ACTOR_ABI_INTERFACE_REFS.v2;
-  const nonEnumerable = Object.defineProperties({}, {
-    apiVersion: { value: expected.apiVersion },
-    name: { value: expected.name },
-    version: { value: expected.version },
-    schemaDigest: { value: expected.schemaDigest },
-  });
+  const nonEnumerable = Object.defineProperties(
+    {},
+    {
+      apiVersion: { value: expected.apiVersion },
+      name: { value: expected.name },
+      version: { value: expected.version },
+      schemaDigest: { value: expected.schemaDigest },
+    },
+  );
   expect(parseActorAbiRef(nonEnumerable)?.ref).toBe(expected);
 
   let getterCalls = 0;

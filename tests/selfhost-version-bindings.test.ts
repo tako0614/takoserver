@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 import {
   createSelfhostVersionBindingStore,
   deriveSelfhostActorForwardToken,
@@ -10,7 +11,6 @@ import {
   type SelfhostVersionBindingSet,
   type SelfhostVersionBindingStore,
 } from "../src/providers/selfhost-version-bindings.ts";
-import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
 
 /**
  * The environment of one immutable Worker Version, kept outside the version
@@ -114,7 +114,8 @@ test("Actor runtime InterfaceRefs are retained only in a new immutable V9 bindin
     apiVersion: "interfaces.takoform.com/v1alpha1" as const,
     name: "worker.actor",
     version: "2.0.0",
-    schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
+    schemaDigest:
+      "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51" as const,
   };
   const legacy = {
     ...SET,
@@ -169,8 +170,9 @@ test("Actor runtime InterfaceRefs are retained only in a new immutable V9 bindin
   expect(Object.isFrozen(stored.actorBindings?.[1]?.runtimeClassRef)).toBe(true);
 
   runtimeClassRef.version = "changed-after-write";
-  expect((await store.read("sw-v2-actor", "v-1"))?.actorBindings?.[1]?.runtimeClassRef?.version)
-    .toBe("2.0.0");
+  expect(
+    (await store.read("sw-v2-actor", "v-1"))?.actorBindings?.[1]?.runtimeClassRef?.version,
+  ).toBe("2.0.0");
   expect(await readFile(path, "utf8")).toBe(bytes);
 });
 
@@ -209,18 +211,21 @@ test("Actor runtime InterfaceRefs reject unknown tuples, extra fields, and acces
   }
 
   let getterCalls = 0;
-  const accessorRef = Object.defineProperties({}, {
-    apiVersion: { enumerable: true, value: validRef.apiVersion },
-    name: { enumerable: true, value: validRef.name },
-    version: { enumerable: true, value: validRef.version },
-    schemaDigest: {
-      enumerable: true,
-      get() {
-        getterCalls += 1;
-        return validRef.schemaDigest;
+  const accessorRef = Object.defineProperties(
+    {},
+    {
+      apiVersion: { enumerable: true, value: validRef.apiVersion },
+      name: { enumerable: true, value: validRef.name },
+      version: { enumerable: true, value: validRef.version },
+      schemaDigest: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return validRef.schemaDigest;
+        },
       },
     },
-  }) as unknown as TakoformInterfaceRef;
+  ) as unknown as TakoformInterfaceRef;
   await expect(
     store.write("sw-accessor-ref", "v-1", {
       ...SET,

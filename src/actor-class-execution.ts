@@ -14,8 +14,8 @@
  * does not claim to prove it.
  */
 
-import { inspectActorClassV2Candidate } from "./actor-class-candidate-inspection.ts";
 import { ACTOR_ABI_INTERFACE_REFS, parseActorAbiRef } from "./actor-abi-ref.ts";
+import { inspectActorClassV2Candidate } from "./actor-class-candidate-inspection.ts";
 
 const SafeArrayIsArray = Array.isArray;
 const SafeError = Error;
