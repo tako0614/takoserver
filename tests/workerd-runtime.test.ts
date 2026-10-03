@@ -1596,14 +1596,39 @@ test("live Actor socket graph requires exact per-Version token for weighted call
     httpSocketPath: join(root, `actor-http-${index}.sock`),
     upgradeSocketPath: join(root, `actor-upgrade-${index}.sock`),
   }));
+  const tokensByVersion = new Map(
+    withActors.versions.map((version) => [
+      version.workerVersionUid,
+      version.site.actorForward.bindings[0]?.token,
+    ]),
+  );
   let current = sockets;
+  const prepared: string[][] = [];
+  const activated: string[][] = [];
   const runtime = createWorkerdRuntime({
     root,
     isReady: () => true,
     actorForwardSockets: () => current,
+    actorForwardLifecycle: {
+      async prepare(publications) {
+        prepared.push(publications.map((item) => item.workerVersionResourceUid));
+        for (const item of publications) {
+          expect(item.bindings[0]?.token).toBe(tokensByVersion.get(item.workerVersionResourceUid));
+        }
+      },
+      activated(publications) {
+        activated.push(publications.map((item) => item.workerVersionResourceUid));
+      },
+      uncertain() {},
+    },
   });
   if (!runtime.publish) throw new Error("weighted publication unavailable");
   await runtime.publish("site", withActors);
+  expect(prepared).toHaveLength(1);
+  expect(new Set(prepared[0])).toEqual(
+    new Set(["uid-WorkerVersion-site-a", "uid-WorkerVersion-site-b"]),
+  );
+  expect(activated).toEqual(prepared);
   const rendered = await readFile(join(root, "workers", "workerd.capnp"), "utf8");
   for (const socket of sockets) {
     expect(rendered).toContain(`unix:${socket.httpSocketPath}`);

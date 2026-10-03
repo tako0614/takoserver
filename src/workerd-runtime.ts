@@ -117,6 +117,15 @@ export interface WorkerdActorForwardSocket {
   readonly upgradeSocketPath: string;
 }
 
+/** Exact immutable publication identities handed to the Host-private Actor owner. */
+export interface WorkerdActorForwardPublication {
+  readonly script: string;
+  readonly workerResourceUid: string;
+  readonly versionId: string;
+  readonly workerVersionResourceUid: string;
+  readonly bindings: readonly WorkerdActorForwardBinding[];
+}
+
 interface WorkerdAssetManifest {
   readonly storageLayout: typeof WORKERD_ASSET_STORAGE_LAYOUT;
   readonly notFoundHandling: "none" | "single-page-application";
@@ -450,6 +459,14 @@ export interface WorkerdRuntimeOptions {
   readonly actorForwardSockets?:
     | readonly WorkerdActorForwardSocket[]
     | (() => readonly WorkerdActorForwardSocket[]);
+  /** Prepare sockets against the same closed graph this activation will render. */
+  readonly actorForwardLifecycle?: {
+    prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void>;
+    /** Called only after the exact activation marker is committed. Must not throw. */
+    activated(publications: readonly WorkerdActorForwardPublication[]): void;
+    /** An unproved activation cannot authorize any new Actor calls. Must not throw. */
+    uncertain(): void;
+  };
   /**
    * Terminates TLS on that port with this keypair. Absent means the socket is
    * plain HTTP, which is what the Host must then publish as the endpoint
@@ -770,6 +787,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
    */
   const writeRendered = async (published: readonly PublishedDeployment[]): Promise<void> => {
     await options.beforeRender?.();
+    await options.actorForwardLifecycle?.prepare(actorForwardPublications(published));
     const actorSockets = actorForwardSockets();
     if (serviceSocketDirectory !== undefined) {
       await requireSocketRoot();
@@ -929,6 +947,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // Its absence must not precede a marker write that could still fail.
       if (pointer?.commitAfterActivation) await pointer.commit();
       retainRenderedRouters(published);
+      options.actorForwardLifecycle?.activated(actorForwardPublications(published));
     } catch (failure) {
       if (
         serviceSocketDirectory !== undefined &&
@@ -938,6 +957,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // disrupt the old listeners by trying a second render of an unknown
         // filesystem. No pointer commit has happened; refuse serving claims.
         await clearFailedActivation(failure);
+        options.actorForwardLifecycle?.uncertain();
         throw failure;
       }
       if (serviceSocketDirectory !== undefined && !graphProved) {
@@ -946,6 +966,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // can recover it; do not race that process with a rollback sweep.
         privateSocketUncertain = true;
         await clearFailedActivation(failure);
+        options.actorForwardLifecycle?.uncertain();
         throw failure;
       }
       try {
@@ -962,6 +983,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         // marker commit, especially during boot restore.
         await writeActivation(activationPath, activated(previous));
         retainRenderedRouters(previous);
+        options.actorForwardLifecycle?.activated(actorForwardPublications(previous));
       } catch (rollbackFailure) {
         // The child may now be serving either graph. No per-script marker is
         // trustworthy across a failed process boundary, so fail closed for
@@ -972,6 +994,7 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
           "worker runtime activation state is unknown",
         );
         await clearFailedActivation(unknownState);
+        options.actorForwardLifecycle?.uncertain();
         throw unknownState;
       }
       throw failure;
@@ -3928,6 +3951,32 @@ interface ResolvedActorForwardService {
   readonly upgradeService: string;
   readonly httpSocketPath: string;
   readonly upgradeSocketPath: string;
+}
+
+function actorForwardPublications(
+  published: readonly PublishedDeployment[],
+): readonly WorkerdActorForwardPublication[] {
+  return published.flatMap((deployment) =>
+    deployment.variants.flatMap((variant) => {
+      if (variant.manifest.actorForward === undefined) return [];
+      if (
+        !deployment.weighted ||
+        !deployment.workerResourceUid ||
+        !variant.versionId ||
+        !variant.workerVersionUid
+      )
+        throw new Error("Actor forward requires an immutable weighted Version");
+      return [
+        {
+          script: deployment.name,
+          workerResourceUid: deployment.workerResourceUid,
+          versionId: variant.versionId,
+          workerVersionResourceUid: variant.workerVersionUid,
+          bindings: validActorForward(variant.manifest.actorForward).bindings,
+        },
+      ];
+    }),
+  );
 }
 
 function resolveActorForwardServices(
