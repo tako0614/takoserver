@@ -84,6 +84,8 @@ export function createSelfhostActorExecutionHost(options: {
   readonly basisPoint?: () => number;
   /** Fault injection only: an unknown registration ACK must be retryable from exact bytes. */
   readonly afterRegistrationLinkBeforeSync?: () => Promise<void>;
+  /** Fault injection only: deletion retains the lease until native data is gone. */
+  readonly beforeNamespaceStorageDelete?: () => Promise<void>;
 }) {
   if (!isAbsolute(options.runtimeRoot) || !isAbsolute(options.storageRoot))
     throw new Error("Actor owner roots must be absolute");
@@ -155,8 +157,17 @@ export function createSelfhostActorExecutionHost(options: {
         await link(source, path);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if ((await readFile(path, "utf8")) !== bytes)
-          throw new Error("Actor namespace registration changed");
+        // A pre-fsync historical registration may have the right name and
+        // bytes without durable file data. Re-ACK only after syncing that
+        // existing inode, not the unused temporary inode above.
+        const existing = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        try {
+          if ((await existing.readFile("utf8")) !== bytes)
+            throw new Error("Actor namespace registration changed");
+          await existing.sync();
+        } finally {
+          await existing.close();
+        }
       }
       await options.afterRegistrationLinkBeforeSync?.();
       await syncDirectory(registrations);
@@ -164,6 +175,24 @@ export function createSelfhostActorExecutionHost(options: {
       await rm(temporary, { recursive: true, force: true });
       await syncDirectory(options.storageRoot);
     }
+  };
+  const registeredScope = async (key: string, scope: ActorScope): Promise<boolean> => {
+    let raw: string;
+    try {
+      raw = await readFile(registrationPath(key), "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+    if (
+      raw !==
+      JSON.stringify({
+        tenantId: scope.tenantId,
+        namespaceResourceUid: scope.namespaceResourceUid,
+      })
+    )
+      throw new Error("Actor namespace registration changed");
+    return true;
   };
   const exclusive = <T>(owner: Owner, callback: () => Promise<T>): Promise<T> => {
     const result = owner.tail.then(callback);
@@ -243,7 +272,7 @@ export function createSelfhostActorExecutionHost(options: {
     // its process. Coalesce every stale alarm wake into one out-of-band refresh.
     owner.refreshing = Promise.resolve()
       .then(async () => {
-        const warmed = await activate(identity, AbortSignal.timeout(30_000), false);
+        const warmed = await activate(identity, AbortSignal.timeout(30_000));
         release(warmed.session);
       })
       .catch(() => {
@@ -257,7 +286,6 @@ export function createSelfhostActorExecutionHost(options: {
   const activate = async (
     identity: ActorScope,
     signal: AbortSignal,
-    register: boolean,
   ): Promise<{ readonly session: Session; readonly variantKey: string }> => {
     if (stopped || !identity.tenantId || !identity.namespaceResourceUid)
       throw new Error("Actor namespace unavailable");
@@ -273,6 +301,8 @@ export function createSelfhostActorExecutionHost(options: {
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
       if (stopped || current.revoked || revoked.has(key)) throw new Error("Actor owner stopped");
+      if (!(await registeredScope(key, identity)))
+        throw new ActorAuthorityUnavailable("Actor namespace is not registered");
       const graph = await options.graph(identity, signal);
       if (
         !graph ||
@@ -328,7 +358,6 @@ export function createSelfhostActorExecutionHost(options: {
       if (current.session?.selection !== selection || current.session.dead) {
         await retire(current);
         if (revoked.has(key)) throw new ActorAuthorityUnavailable("Actor namespace revoked");
-        if (register) await persistScope(key, identity);
         if (!current.locked) {
           await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
           // Exclusive across Host instances. A crash leaves this lease in
@@ -337,6 +366,10 @@ export function createSelfhostActorExecutionHost(options: {
           await mkdir(join(options.storageRoot, "leases", key), { mode: 0o700 });
           current.locked = true;
         }
+        // Registration can be revoked while authority reads or lease
+        // acquisition yield; a current graph alone cannot open retained SQL.
+        if (!(await registeredScope(key, identity)))
+          throw new ActorAuthorityUnavailable("Actor namespace is not registered");
         let process: WorkerdActorNamespace;
         let admittedSession: Session | undefined;
         const admitEvent = async (
@@ -496,7 +529,7 @@ export function createSelfhostActorExecutionHost(options: {
               // workerd can reconstruct its native alarm wake.
               for (let attempt = 0; attempt < 3 && !stopped; attempt += 1) {
                 try {
-                  const warmed = await activate(identity, AbortSignal.timeout(30_000), false);
+                  const warmed = await activate(identity, AbortSignal.timeout(30_000));
                   release(warmed.session);
                   return;
                 } catch (error) {
@@ -616,7 +649,7 @@ export function createSelfhostActorExecutionHost(options: {
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       for (let attempt = 1; attempt <= 3; attempt += 1) {
         try {
-          const acquired = await activate(scope, AbortSignal.timeout(30_000), false);
+          const acquired = await activate(scope, AbortSignal.timeout(30_000));
           release(acquired.session);
           break;
         } catch (error) {
@@ -685,23 +718,7 @@ export function createSelfhostActorExecutionHost(options: {
       await ready;
       if (!validScope(scope)) return false;
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
-      let raw: string;
-      try {
-        raw = await readFile(registrationPath(key), "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-        throw error;
-      }
-      if (
-        raw !==
-        JSON.stringify({
-          tenantId: scope.tenantId,
-          namespaceResourceUid: scope.namespaceResourceUid,
-        })
-      ) {
-        throw new Error("Actor namespace registration changed");
-      }
-      return true;
+      return registeredScope(key, scope);
     },
     async namespaceAbsent(scope: ActorScope): Promise<boolean> {
       await ready;
@@ -729,48 +746,39 @@ export function createSelfhostActorExecutionHost(options: {
           revoked.delete(key);
           throw new Error("Actor namespace has active executions");
         }
+        // The canonical Resource deletion attestation must already have
+        // withdrawn graph authority. A standalone owner call is not a
+        // tombstone and may not destroy a still-live namespace.
+        if (await options.graph(scope, AbortSignal.timeout(30_000))) {
+          revoked.delete(key);
+          throw new Error("Actor namespace still has Resource authority");
+        }
         if (owner) owner.revoked = true;
         if (owner) await retire(owner);
-        // A lease left by another Host process is not permission to destroy its data.
+        // Hold the cross-Host lease through registration and SQL removal.
+        // Releasing it earlier would let a peer open the same native files.
         if (!owner?.locked) {
-          try {
-            await lstat(join(options.storageRoot, "leases", key));
-            throw new Error("Actor namespace lease unavailable");
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-          }
-        }
-        if (owner?.locked) {
-          await rm(join(options.storageRoot, "leases", key), { recursive: true });
+          await mkdir(join(options.storageRoot, "leases"), { recursive: true, mode: 0o700 });
+          await syncDirectory(options.storageRoot);
+          // An existing peer/stale lease fails closed; it is never stolen.
+          await mkdir(join(options.storageRoot, "leases", key), { mode: 0o700 });
           await syncDirectory(join(options.storageRoot, "leases"));
-          owner.locked = false;
+          if (owner) owner.locked = true;
         }
-        let registered = false;
-        try {
-          const raw = await readFile(registrationPath(key), "utf8");
-          if (
-            raw !==
-            JSON.stringify({
-              tenantId: scope.tenantId,
-              namespaceResourceUid: scope.namespaceResourceUid,
-            })
-          ) {
-            throw new Error("Actor namespace registration changed");
-          }
-          registered = true;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        if (registered) {
+        if (await registeredScope(key, scope)) {
           await unlink(registrationPath(key));
           await syncDirectory(registrations);
         }
+        await options.beforeNamespaceStorageDelete?.();
         await rm(join(options.storageRoot, "namespaces", key), { recursive: true, force: true });
         try {
           await syncDirectory(join(options.storageRoot, "namespaces"));
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
+        await rm(join(options.storageRoot, "leases", key), { recursive: true });
+        await syncDirectory(join(options.storageRoot, "leases"));
+        if (owner) owner.locked = false;
         coldStartFailures.delete(key);
         owners.delete(key);
       };
@@ -782,7 +790,7 @@ export function createSelfhostActorExecutionHost(options: {
       await ready;
       // Capture caller-owned identity before any asynchronous resolution.
       const identity = { ...scope };
-      const acquired = await activate(identity, request.signal, true);
+      const acquired = await activate(identity, request.signal);
       let released = false;
       const releaseOnce = (): void => {
         if (released) return;
@@ -861,7 +869,7 @@ export function createSelfhostActorExecutionHost(options: {
       if (!scope.id || scope.id.includes("\u0000")) throw new Error("Actor namespace unavailable");
       await ready;
       const identity = { ...scope };
-      const acquired = await activate(identity, request.signal, true);
+      const acquired = await activate(identity, request.signal);
       let settled = false;
       const finish = (): void => {
         if (settled) return;
@@ -941,7 +949,8 @@ export function createSelfhostActorExecutionHost(options: {
           [...owners].map(([key, owner]) =>
             exclusive(owner, async () => {
               await retire(owner);
-              if (owner.locked) {
+              // Failed revocation retains its fence even during shutdown.
+              if (owner.locked && !owner.revoked) {
                 await rm(join(options.storageRoot, "leases", key), { recursive: true });
                 owner.locked = false;
               }

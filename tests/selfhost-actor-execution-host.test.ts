@@ -60,13 +60,16 @@ test("Actor owner rejects persisted relation/deployment gaps before native alloc
     providerInstallationRef: "wrong-installation",
   });
   try {
+    await owner.ready;
+    await owner.registerNamespace(scope);
+    await owner.registerNamespace({ ...scope, tenantId: "other" });
     await expect(owner.fetch({ ...scope, id: "a" }, request())).rejects.toThrow(
       "realization unavailable",
     );
     await expect(owner.fetch({ ...scope, tenantId: "other", id: "a" }, request())).rejects.toThrow(
       "Resource unavailable",
     );
-    expect(await stat(join(root, "state")).catch(() => null)).toBeNull();
+    expect(await stat(join(root, "state", "namespaces")).catch(() => null)).toBeNull();
   } finally {
     await owner.close();
     f.database.close();
@@ -418,6 +421,7 @@ export class Counter extends Base {
         "selector-worker",
         publication("generation-selector", selectorWorker.metadata.uid, "selector-worker"),
       );
+      await owner.registerNamespace(scope);
       const initial = await (await owner.fetch(identity, request("/increment"))).json();
       expect(initial).toEqual({ id: identity.id, value: 1, version: "a" });
       expect(await (await owner.fetch(identity, request("/env"))).json()).toEqual({
@@ -535,10 +539,12 @@ export class Counter extends Base {
       owner = makeOwner();
       expect((await (await owner.fetch(identity, request())).json()).value).toBe(2);
       const badIdentity = { ...identity, namespaceResourceUid: badNamespaceUid };
+      await owner.registerNamespace(badIdentity);
       await expect(owner.fetch(badIdentity, request())).rejects.toThrow(
         "native child exited during startup",
       );
       const selectorBadIdentity = { ...identity, namespaceResourceUid: selectorNamespaceUid };
+      await owner.registerNamespace(selectorBadIdentity);
       expect((await (await owner.fetch(selectorBadIdentity, request())).json()).value).toBe(0);
       await writeFile(join(runtimeRoot, "workers", "selector-worker", "takoserver-site.json"), "{");
       const pendingBeforeRestart = (await (
@@ -683,6 +689,10 @@ export class Counter extends Base {
       f.database.query("DELETE FROM tf_resources WHERE uid = ?").run(scope.namespaceResourceUid);
       const replacement = resource(actorForm, "counter", "namespace-replacement");
       insert(f.database, replacement, [f.relation]);
+      await owner.registerNamespace({
+        ...identity,
+        namespaceResourceUid: replacement.metadata.uid,
+      });
       expect(
         (
           await (
@@ -805,6 +815,7 @@ export class Counter extends Base {
       const updateResource = resource(actorForm, "counter-autonomous-version-update", updateUid);
       insert(f.database, updateResource, [f.relation]);
       const updateIdentity = { ...identity, id: "updated-b", namespaceResourceUid: updateUid };
+      await owner.registerNamespace(updateIdentity);
       basisPoint = 0;
       await (await owner.fetch(updateIdentity, request("/alarm-set?delay=2000"))).json();
       const startsBeforeAutonomousUpdate = (await readFile(childPidFile, "utf8"))

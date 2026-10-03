@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
@@ -281,6 +282,35 @@ test("an unacknowledged Actor registration is retried from the exact existing re
   }
 });
 
+test("a retained pre-fsync Actor registration can be re-acknowledged without changing identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-legacy-registration-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-legacy-one" };
+  const storageRoot = join(root, "actor");
+  const registrations = join(storageRoot, "registrations");
+  const key = createHash("sha256")
+    .update(JSON.stringify([scope.tenantId, scope.namespaceResourceUid]))
+    .digest("hex");
+  await mkdir(registrations, { recursive: true });
+  await writeFile(join(registrations, `${key}.json`), JSON.stringify(scope));
+  const host = createSelfhostActorExecutionHost({
+    runtimeRoot: join(root, "runtime"),
+    storageRoot,
+    binary: "/unused/workerd",
+    graph: async () => null,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await host.ready;
+    await host.registerNamespace(scope);
+    expect(await host.hasNamespace(scope)).toBe(true);
+  } finally {
+    await host.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("revocation fences a pending Actor authority read before native startup", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-revoke-race-"));
   const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-race-one" };
@@ -320,6 +350,82 @@ test("revocation fences a pending Actor authority read before native startup", a
     ).rejects.toThrow("revoked");
   } finally {
     release();
+    await host.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("deletion retains the exclusive lease until native data is removed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-delete-lease-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-delete-one" };
+  const storageRoot = join(root, "actor");
+  const key = createHash("sha256")
+    .update(JSON.stringify([scope.tenantId, scope.namespaceResourceUid]))
+    .digest("hex");
+  let entered!: () => void;
+  const deleting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let proceed!: () => void;
+  const resumed = new Promise<void>((resolve) => {
+    proceed = resolve;
+  });
+  const options = {
+    runtimeRoot: join(root, "runtime"),
+    storageRoot,
+    binary: "/unused/workerd",
+    graph: async () => null,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+  } as const;
+  const host = createSelfhostActorExecutionHost({
+    ...options,
+    async beforeNamespaceStorageDelete() {
+      entered();
+      await resumed;
+    },
+  });
+  const peer = createSelfhostActorExecutionHost(options);
+  try {
+    await Promise.all([host.ready, peer.ready]);
+    await host.registerNamespace(scope);
+    const forget = host.forgetNamespace(scope);
+    await deleting;
+    expect((await lstat(join(storageRoot, "leases", key))).isDirectory()).toBe(true);
+    await expect(
+      peer.fetch({ ...scope, id: "one" }, new Request("http://actor.invalid/")),
+    ).rejects.toThrow("not registered");
+    await expect(peer.forgetNamespace(scope)).rejects.toThrow();
+    proceed();
+    await forget;
+    expect(await host.namespaceAbsent(scope)).toBe(true);
+  } finally {
+    proceed();
+    await Promise.all([host.close(), peer.close()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner refuses to delete a namespace while canonical graph authority remains", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-live-delete-"));
+  const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-live-one" };
+  const host = createSelfhostActorExecutionHost({
+    runtimeRoot: join(root, "runtime"),
+    storageRoot: join(root, "actor"),
+    binary: "/unused/workerd",
+    graph: async () =>
+      ({ tenantId: scope.tenantId, namespace: { uid: scope.namespaceResourceUid } }) as never,
+    deployments: { active: async () => null },
+    providerPackRef: "local.pack",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await host.ready;
+    await host.registerNamespace(scope);
+    await expect(host.forgetNamespace(scope)).rejects.toThrow("Resource authority");
+    expect(await host.hasNamespace(scope)).toBe(true);
+  } finally {
     await host.close();
     await rm(root, { recursive: true, force: true });
   }
