@@ -7,6 +7,7 @@ import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-executio
 test("Actor namespace registration persists its UID and can be revoked without starting an Actor", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-public-binding-"));
   const scope = { tenantId: "tenant-one", namespaceResourceUid: "uid-actor-counter-one" };
+  const otherTenant = { tenantId: "tenant-two", namespaceResourceUid: scope.namespaceResourceUid };
   const options = {
     runtimeRoot: join(root, "runtime"),
     storageRoot: join(root, "actor"),
@@ -20,7 +21,9 @@ test("Actor namespace registration persists its UID and can be revoked without s
   try {
     await host.ready;
     await host.registerNamespace(scope);
+    await host.registerNamespace(otherTenant);
     expect(await host.hasNamespace(scope)).toBe(true);
+    expect(await host.hasNamespace(otherTenant)).toBe(true);
     await host.close();
     const restored = createSelfhostActorExecutionHost(options);
     try {
@@ -28,6 +31,7 @@ test("Actor namespace registration persists its UID and can be revoked without s
       expect(await restored.hasNamespace(scope)).toBe(true);
       await restored.forgetNamespace(scope);
       expect(await restored.hasNamespace(scope)).toBe(false);
+      expect(await restored.hasNamespace(otherTenant)).toBe(true);
     } finally {
       await restored.close();
     }

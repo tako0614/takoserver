@@ -44,6 +44,7 @@ interface Owner {
   tail: Promise<void>;
   session?: Session;
   locked: boolean;
+  revoked?: boolean;
   refreshing?: Promise<void>;
 }
 
@@ -240,7 +241,7 @@ export function createSelfhostActorExecutionHost(options: {
     // Only lifecycle selection is queued here. Individual IDs run under
     // native input gates, not a second generic application scheduler.
     const session = await exclusive(current, async () => {
-      if (stopped) throw new Error("Actor owner stopped");
+      if (stopped || current.revoked) throw new Error("Actor owner stopped");
       const graph = await options.graph(identity, signal);
       if (
         !graph ||
@@ -638,7 +639,7 @@ export function createSelfhostActorExecutionHost(options: {
         owners.set(key, owner);
       }
       await exclusive(owner, async () => {
-        if (stopped) throw new Error("Actor owner stopped");
+        if (stopped || owner.revoked) throw new Error("Actor owner stopped");
         await persistScope(key, { ...scope });
       });
     },
@@ -672,6 +673,11 @@ export function createSelfhostActorExecutionHost(options: {
       const key = keyOf(scope.tenantId, scope.namespaceResourceUid);
       const owner = owners.get(key);
       const forget = async (): Promise<void> => {
+        if (stopped) throw new Error("Actor owner stopped");
+        if (owner?.session && owner.session.active > 0 && !owner.session.dead) {
+          throw new Error("Actor namespace has active executions");
+        }
+        if (owner) owner.revoked = true;
         if (owner) await retire(owner);
         // A lease left by another Host process is not permission to destroy its data.
         if (!owner?.locked) {
