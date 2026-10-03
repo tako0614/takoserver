@@ -73,6 +73,9 @@ function controlledChild() {
     get exitCode() {
       return exitCode;
     },
+    get signalCode() {
+      return null;
+    },
     exited,
     kill(signal?: number | NodeJS.Signals) {
       if (exitCode !== null) return;
@@ -166,6 +169,60 @@ test("Actor startup abort reaps its child before a fresh namespace start", async
     expect(secondChild.killSignals).toEqual(["SIGKILL"]);
     expect(await pathExists(childRoots[1] ?? "")).toBe(false);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 12_000);
+
+test("Actor startup rejects a signaled child before readiness probing and does not kill it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-signaled-startup-test-"));
+  const storagePath = join(root, "state");
+  await mkdir(storagePath, { mode: 0o700 });
+  const childRoots: string[] = [];
+  const killSignals: string[] = [];
+  let readinessCalls = 0;
+  const exitedChild = {
+    exitCode: null,
+    signalCode: "SIGTERM",
+    exited: Promise.resolve(143),
+    kill(signal?: number | NodeJS.Signals) {
+      killSignals.push(String(signal ?? ""));
+    },
+  } satisfies ReturnType<WorkerdActorNativeProcessAdapter["spawn"]>;
+  const processAdapter: WorkerdActorNativeProcessAdapter = {
+    spawn(_binary, config) {
+      childRoots.push(dirname(config));
+      return exitedChild;
+    },
+    probeReadiness() {
+      readinessCalls += 1;
+      return Promise.resolve(new Response(null, { status: 204 }));
+    },
+  };
+  const options = {
+    namespaceKey: createHash("sha256").update("actor-signaled-startup").digest("hex"),
+    storagePath,
+    className: "Actor",
+    graph: graph(),
+    signal: new AbortController().signal,
+    admitAlarm: async () => null,
+    completeAlarm() {},
+    admitSocket: async () => null,
+    completeSocket() {},
+    processAdapter,
+  };
+
+  let namespace: Awaited<ReturnType<typeof openWorkerdActorNamespace>> | undefined;
+  try {
+    const opening = openWorkerdActorNamespace("/unused/workerd", options).then((opened) => {
+      namespace = opened;
+      return opened;
+    });
+    await expect(opening).rejects.toThrow("Actor native child exited during startup");
+    expect(readinessCalls).toBe(0);
+    expect(killSignals).toEqual([]);
+    expect(await pathExists(childRoots[0] ?? "")).toBe(false);
+  } finally {
+    await namespace?.close();
     await rm(root, { recursive: true, force: true });
   }
 }, 12_000);

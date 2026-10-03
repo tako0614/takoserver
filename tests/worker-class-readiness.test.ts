@@ -29,6 +29,10 @@ const published = stableProductionTakoformCatalog().forms.find(
   (form) => form.identity.formRef.kind === "ActorNamespace",
 );
 if (!published?.workerClassRuntime) throw new Error("published Actor fixture missing");
+const publishedWorkflow = stableProductionTakoformCatalog().forms.find(
+  (form) => form.identity.formRef.kind === "DurableWorkflow",
+);
+if (!publishedWorkflow?.workerClassRuntime) throw new Error("published Workflow fixture missing");
 // Test-only forward identity. No current package/admission/profile is changed.
 const runtimeClassRef = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
@@ -153,10 +157,21 @@ function fixture() {
 
 test("class allocation requires exact explicit ABI capability; existing inferred ABI stays denied", () => {
   const { runtime } = fixture();
+  const historicalInferred = structuredClone(published);
+  if (!historicalInferred.workerClassRuntime) throw new Error("historical Actor fixture missing");
+  Reflect.deleteProperty(historicalInferred.workerClassRuntime, "runtimeClassRef");
   expect(() => validateClassHolderRuntime(form, runtime)).not.toThrow();
   expect(supportsClassHolderRuntime(form)).toBe(false);
+  expect(published.workerClassRuntime?.runtimeClassRef).toEqual(published.providedInterfaces?.[0]);
+  expect(publishedWorkflow.workerClassRuntime?.runtimeClassRef).toEqual(
+    publishedWorkflow.providedInterfaces?.[0],
+  );
+  expect(supportsClassHolderRuntime(published)).toBe(false);
+  expect(supportsClassHolderRuntime(publishedWorkflow)).toBe(false);
   expect(
-    supportsClassHolderRuntime(published, { contracts: [{ ...contract, ...published.identity }] }),
+    supportsClassHolderRuntime(historicalInferred, {
+      contracts: [{ ...contract, ...published.identity }],
+    }),
   ).toBe(false);
   for (const changed of [
     { ...contract, packageDigest: `sha256:${"e".repeat(64)}` as const },

@@ -138,6 +138,8 @@ export async function openSelfhostActorUpgradeBroker(
   options: SelfhostActorUpgradeBrokerOptions,
 ): Promise<{
   readonly socketPath: string;
+  /** Keep provisional commit/abandon ingress until those leases settle. */
+  retire(): Promise<void>;
   close(): Promise<void>;
 }> {
   if (!isAbsolute(options.socketPath) || !/^[0-9a-f]{64}$/u.test(options.token))
@@ -145,21 +147,54 @@ export async function openSelfhostActorUpgradeBroker(
   await mkdir(dirname(options.socketPath), { recursive: true, mode: 0o700 });
   const pending = new Map<string, Pending>();
   const sockets = new Set<Socket>();
+  const settling = new Set<Promise<void>>();
   let admitting = 0;
+  let retiring = false;
+  let settlementFailed = false;
+  let stopping = false;
+  let resolveRetirement: (() => void) | undefined;
+  let rejectRetirement: ((error: Error) => void) | undefined;
+  let retirement: Promise<void> | undefined;
+  const stopAccepting = (): void => {
+    if (stopping) return;
+    stopping = true;
+    server.close((error) => {
+      if (error || settlementFailed)
+        rejectRetirement?.(new Error("Actor broker provisional settlement unproved"));
+      else resolveRetirement?.();
+    });
+  };
+  const maybeStopAccepting = (): void => {
+    if (retiring && pending.size === 0 && admitting === 0 && settling.size === 0) stopAccepting();
+  };
   const abandon = (id: string): void => {
     const entry = pending.get(id);
     if (!entry || entry.state === "committed" || entry.state === "abandoned") return;
     entry.state = "abandoned";
     clearTimeout(entry.timer);
     pending.delete(id);
-    try {
-      void entry.lease.abandonTransport(entry.ownerBearer).catch(() => entry.lease.abandon());
-    } catch {
-      /* The Host lease also expires independently. */
-    } finally {
-      entry.upstream.destroy();
-      entry.client.destroy();
-    }
+    let settlement!: Promise<void>;
+    settlement = (async () => {
+      try {
+        await Promise.resolve().then(() => entry.lease.abandonTransport(entry.ownerBearer));
+      } catch {
+        // A local lease release is not proof that the native provisional
+        // transport settled. Do not report this broker as cleanly retired.
+        settlementFailed = true;
+        try {
+          entry.lease.abandon();
+        } catch {
+          /* The Host lease also expires independently. */
+        }
+      } finally {
+        settling.delete(settlement);
+        maybeStopAccepting();
+      }
+    })();
+    settling.add(settlement);
+    entry.upstream.destroy();
+    entry.client.destroy();
+    maybeStopAccepting();
   };
   const server: Server = createServer((client) => {
     sockets.add(client);
@@ -212,6 +247,7 @@ export async function openSelfhostActorUpgradeBroker(
             record.state = "committed";
             clearTimeout(record.timer);
             pending.delete(reservationId);
+            maybeStopAccepting();
             if (record.upstreamTail.length) record.client.write(record.upstreamTail);
             if (record.clientTail.length) record.upstream.write(record.clientTail);
             record.client.pipe(record.upstream);
@@ -224,6 +260,10 @@ export async function openSelfhostActorUpgradeBroker(
             abandon(reservationId);
             reply(client, 503);
           }
+          return;
+        }
+        if (retiring) {
+          reply(client, 503);
           return;
         }
         const match = /^GET (\S+) HTTP\/1\.1$/u.exec(parsed.first);
@@ -321,9 +361,14 @@ export async function openSelfhostActorUpgradeBroker(
         if (id) abandon(id);
         else {
           try {
-            if (lease && ownerBearer)
-              await lease.abandonTransport(ownerBearer).catch(() => lease?.abandon());
-            else lease?.abandon();
+            if (lease && ownerBearer) {
+              try {
+                await lease.abandonTransport(ownerBearer);
+              } catch {
+                settlementFailed = true;
+                lease.abandon();
+              }
+            } else lease?.abandon();
           } catch {
             /* Broker expiry and caller disconnect remain independent. */
           }
@@ -331,9 +376,20 @@ export async function openSelfhostActorUpgradeBroker(
         reply(client, 503);
       } finally {
         if (counted) admitting -= 1;
+        maybeStopAccepting();
       }
     })();
   });
+  const beginRetirement = (): Promise<void> => {
+    if (!retirement)
+      retirement = new Promise<void>((resolve, reject) => {
+        resolveRetirement = resolve;
+        rejectRetirement = reject;
+      });
+    retiring = true;
+    maybeStopAccepting();
+    return retirement;
+  };
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(options.socketPath, () => {
@@ -343,10 +399,12 @@ export async function openSelfhostActorUpgradeBroker(
   });
   return Object.freeze({
     socketPath: options.socketPath,
+    retire: beginRetirement,
     async close(): Promise<void> {
+      const drained = beginRetirement();
       for (const id of pending.keys()) abandon(id);
       for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await drained;
     },
   });
 }

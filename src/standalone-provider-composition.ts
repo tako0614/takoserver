@@ -17,8 +17,9 @@ import type {
   SelfhostContainerEndpointIngressCapability,
 } from "./providers/selfhost-container-endpoint.ts";
 import type { SelfhostContainerCapability } from "./providers/selfhost-container-lifecycle.ts";
+import type { SelfhostActorPublicRuntime } from "./selfhost-actor-public-runtime.ts";
 import { createSelfhostComposition } from "./selfhost-composition.ts";
-import type { InstalledTakoformForm } from "./takoform/types.ts";
+import type { InstalledTakoformBinding, InstalledTakoformForm } from "./takoform/types.ts";
 import type { WorkerdRuntime } from "./workerd-runtime.ts";
 
 export const RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN = "cloudflare-object-bucket-drain" as const;
@@ -113,9 +114,11 @@ export interface StandaloneProviderComposition {
 export function createStandaloneProviderComposition(input: {
   readonly mode: StandaloneProviderMode;
   readonly stableForms: readonly InstalledTakoformForm[];
+  readonly stableBindings?: readonly InstalledTakoformBinding[];
   readonly edge: EdgeFormBundle;
   readonly dataRoot: string;
   readonly runtime: WorkerdRuntime;
+  readonly actorRuntime?: SelfhostActorPublicRuntime;
   /** Opt-in native execution; no Form or Offering is synthesized from configuration. */
   readonly container?: SelfhostContainerCapability;
   readonly containerEndpointIngress?: SelfhostContainerEndpointHttpsIngressPort;
@@ -147,9 +150,11 @@ export function createStandaloneProviderComposition(input: {
     }
     const composition = createSelfhostComposition({
       stableForms: input.stableForms,
+      ...(input.stableBindings ? { stableBindings: input.stableBindings } : {}),
       edge: input.edge,
       dataRoot: input.dataRoot,
       runtime: input.runtime,
+      ...(input.actorRuntime ? { actorRuntime: input.actorRuntime } : {}),
       ...(input.container ? { container: input.container } : {}),
       ...(input.containerEndpointIngress
         ? { containerEndpointIngress: input.containerEndpointIngress }

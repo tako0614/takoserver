@@ -29,6 +29,7 @@ export async function openSelfhostActorForwardBrokers(options: {
   readonly executionHost: ExecutionHost;
 }): Promise<{
   readonly socketMapping: WorkerdActorForwardSocket;
+  retire(): Promise<void>;
   close(): Promise<void>;
 }> {
   if (
@@ -61,11 +62,19 @@ export async function openSelfhostActorForwardBrokers(options: {
     socketMapping: Object.freeze({
       tenantId,
       namespaceResourceUid,
+      token: options.token,
       httpSocketPath: http.socketPath,
       upgradeSocketPath: upgrade.socketPath,
     }),
+    async retire() {
+      await Promise.all([upgrade.retire(), http.retire()]);
+    },
     async close() {
-      await Promise.all([upgrade.close(), http.close()]);
+      // The native owner must remain alive until *both* private listeners
+      // finish teardown, even when one transport reports uncertainty first.
+      const results = await Promise.allSettled([upgrade.close(), http.close()]);
+      if (results.some((result) => result.status === "rejected"))
+        throw new Error("Actor forward broker close incomplete");
     },
   });
 }

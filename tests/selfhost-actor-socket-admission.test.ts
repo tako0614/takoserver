@@ -117,6 +117,8 @@ const socketAdmissionTest = async () => {
   });
   let leaseId: string | undefined;
   try {
+    await owner.registerNamespace(scope);
+    await owner.registerNamespace(otherScope);
     await (
       await owner.fetch({ ...scope, id: "actor-a" }, new Request("http://example.invalid/"))
     ).json();
@@ -269,6 +271,7 @@ const duplexTargetLeaseTest = async () => {
     ).rejects.toThrow("invalid_upgrade");
     expect(opened).toHaveLength(0);
 
+    await owner.registerNamespace(scope);
     const first = await owner.reserveDuplex({ ...scope, id: "actor-a" }, ingress());
     expect(first.target.socketPath).toBe("/tmp/unused-actor-upgrade.sock");
     expect(first.target.headers["x-test-id"]).toBe("actor-a");

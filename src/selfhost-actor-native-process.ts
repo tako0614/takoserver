@@ -34,7 +34,14 @@ export interface WorkerdActorNamespaceOptions {
   readonly processAdapter?: WorkerdActorNativeProcessAdapter;
 }
 
-type WorkerdActorNativeChild = Pick<ReturnType<typeof Bun.spawn>, "exitCode" | "exited" | "kill">;
+type WorkerdActorNativeChild = Pick<
+  ReturnType<typeof Bun.spawn>,
+  "exitCode" | "signalCode" | "exited" | "kill"
+>;
+
+function isActorNativeChildTerminal(child: WorkerdActorNativeChild | undefined): boolean {
+  return child !== undefined && (child.exitCode !== null || child.signalCode !== null);
+}
 
 /** Kept injectable so process startup/abort cleanup can be proven without workerd. */
 export interface WorkerdActorNativeProcessAdapter {
@@ -443,6 +450,7 @@ export default {
     async fetch(request) {
       if (
         closing ||
+        isActorNativeChildTerminal(child) ||
         request.method !== "POST" ||
         request.headers.get("x-takoserver-private-alarm-admission") !== admissionToken
       )
@@ -489,6 +497,7 @@ export default {
         if (!admissionResult) return new Response(null, { status: 503 });
         if (
           !verified ||
+          isActorNativeChildTerminal(child) ||
           closing ||
           admissionResult.generationKey !== graph.generationKey ||
           admissionResult.epoch !== epoch ||
@@ -516,7 +525,7 @@ export default {
       verified = false;
       admission.stop(true);
       if (child) {
-        child.kill("SIGKILL");
+        if (!isActorNativeChildTerminal(child)) child.kill("SIGKILL");
         await child.exited;
       }
       // Retained namespace storage is deliberately outside this directory.
@@ -572,7 +581,7 @@ export default {
     const startupDeadlineAt = Date.now() + 20_000;
     for (let attempt = 0; attempt < 200 && Date.now() < startupDeadlineAt; attempt += 1) {
       options.signal.throwIfAborted();
-      if (startingChild.exitCode !== null)
+      if (isActorNativeChildTerminal(startingChild))
         throw new Error("Actor native child exited during startup");
       let response: Response;
       try {
@@ -609,13 +618,14 @@ export default {
         verified = false;
       }),
       enableAlarmAdmission() {
-        if (!closing && runningChild.exitCode === null) verified = true;
+        if (!closing && !isActorNativeChildTerminal(runningChild)) verified = true;
       },
       disableAlarmAdmission() {
         verified = false;
       },
       async fetch(id, request, variantKey) {
-        if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (closing || isActorNativeChildTerminal(child))
+          throw new Error("Actor namespace unavailable");
         if (!variantKeys.includes(variantKey))
           throw new Error("Actor Version selection unavailable");
         const headers = new Headers(request.headers);
@@ -630,7 +640,8 @@ export default {
         });
       },
       duplexTarget(id, variantKey) {
-        if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (closing || isActorNativeChildTerminal(child))
+          throw new Error("Actor namespace unavailable");
         if (!id || id.includes("\u0000") || !variantKeys.includes(variantKey))
           throw new Error("Actor Version selection unavailable");
         return Object.freeze({
@@ -643,7 +654,8 @@ export default {
         });
       },
       async settleDuplex(id, bearer, action) {
-        if (closing || child?.exitCode !== null) throw new Error("Actor namespace unavailable");
+        if (closing || isActorNativeChildTerminal(child))
+          throw new Error("Actor namespace unavailable");
         if (
           !id ||
           id.includes("\u0000") ||

@@ -116,3 +116,102 @@ test("a disconnect before fetch resolves cancels the later response body", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("retiring a token waits for an accepted HTTP response body without destroying it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-http-retire-"));
+  const releaseBody = Promise.withResolvers<void>();
+  const bodyStarted = Promise.withResolvers<void>();
+  const token = "c".repeat(64);
+  let fetchCalls = 0;
+  const broker = await openSelfhostActorHttpBroker({
+    socketPath: join(root, "broker.sock"),
+    token,
+    async fetch() {
+      fetchCalls += 1;
+      if (fetchCalls > 1) return new Response("unexpected new admission");
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("before"));
+            bodyStarted.resolve();
+            void releaseBody.promise.then(() => {
+              controller.enqueue(new TextEncoder().encode("after"));
+              controller.close();
+            });
+          },
+        }),
+      );
+    },
+  });
+  const client = createConnection({ path: broker.socketPath });
+  let newcomer: ReturnType<typeof createConnection> | undefined;
+  let response = "";
+  client.on("data", (bytes) => {
+    response += bytes.toString("utf8");
+  });
+  try {
+    await once(client, "connect");
+    const ended = once(client, "end");
+    client.write(
+      [
+        "GET /invoke HTTP/1.1",
+        "Host: actor.invalid",
+        `x-takoserver-private-broker-token: ${token}`,
+        "x-takoserver-private-broker-actor-id: actor-a",
+        "Connection: close",
+        "\r\n",
+      ].join("\r\n"),
+    );
+    await bodyStarted.promise;
+    const draining = broker.retire();
+    expect(
+      await Promise.race([draining.then(() => "resolved"), Bun.sleep(20).then(() => "pending")]),
+    ).toBe("pending");
+
+    newcomer = createConnection({ path: broker.socketPath });
+    const newAdmission = await new Promise<{ kind: "error"; code: string } | { kind: "response" }>(
+      (resolve, reject) => {
+        const timer = setTimeout(() => {
+          newcomer?.destroy();
+          reject(new Error("new Actor HTTP admission did not settle after retirement"));
+        }, 500);
+        newcomer?.once("error", (error: NodeJS.ErrnoException) => {
+          clearTimeout(timer);
+          resolve({ kind: "error", code: error.code ?? "unknown" });
+        });
+        newcomer?.once("connect", () => {
+          newcomer?.write(
+            [
+              "GET /new HTTP/1.1",
+              "Host: actor.invalid",
+              `x-takoserver-private-broker-token: ${token}`,
+              "x-takoserver-private-broker-actor-id: actor-b",
+              "Connection: close",
+              "\r\n",
+            ].join("\r\n"),
+          );
+        });
+        newcomer?.once("data", () => {
+          clearTimeout(timer);
+          resolve({ kind: "response" });
+        });
+      },
+    );
+    expect(newAdmission.kind).toBe("error");
+    if (newAdmission.kind === "error")
+      expect(["ECONNREFUSED", "ENOENT"].includes(newAdmission.code)).toBe(true);
+    expect(fetchCalls).toBe(1);
+
+    releaseBody.resolve();
+    await ended;
+    await draining;
+    expect(response).toContain("before");
+    expect(response).toContain("after");
+  } finally {
+    releaseBody.resolve();
+    client.destroy();
+    newcomer?.destroy();
+    await broker.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -213,6 +213,14 @@ export function createExactFormPackageSource(
   };
 }
 
+/** Internal composition seam for an already-derived, exact Host catalog. */
+export function createSelectedFormAuthorityComposition(
+  input: Parameters<typeof createComposition>[0],
+  selectedCatalog: TakoformImplementationCatalog,
+): Promise<FormAuthorityComposition> {
+  return createComposition(input, selectedCatalog);
+}
+
 async function createComposition(
   input: {
     readonly configuration: FormAuthorityEndpointConfiguration;

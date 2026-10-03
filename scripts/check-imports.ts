@@ -90,7 +90,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-brokers)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-container-(?:bootstrap|endpoint-(?:ingress|https))|selfhost-data-planes|selfhost-health|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/(?:(?:workflow-http|actor-native)-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-brokers|public-runtime)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-container-(?:bootstrap|endpoint-(?:ingress|https))|selfhost-data-planes|selfhost-form-authority-composition|selfhost-health|selfhost-object-store|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-startup-instructions|selfhost-tenant-run-credentials|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/(?:(?:workflow-http|actor-native)-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "release-data"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
@@ -150,12 +150,14 @@ for (const path of walk("src")) {
 }
 
 // ---------------------------------------------------------------------------
-// Bundle hygiene: the Workers entry must not be able to reach a host-only
-// implementation, even indirectly. `scripts/build-worker.ts` checks the emitted
+// Bundle hygiene: a Workers entry must not be able to reach a host-only
+// implementation, even indirectly. The Worker build scripts check emitted
 // bytes; this checks the graph, so the mistake is caught before a build.
 // ---------------------------------------------------------------------------
 
-const WORKER_ENTRY = "src/entry-cloudflare-worker.ts";
+const WORKER_ENTRIES = walk("src").filter((path) =>
+  /^src\/entry-(?:[^/]+-)?worker\.ts$/u.test(path),
+);
 const HOST_ONLY = [
   "src/sql-sqlite.ts",
   "src/objects-mem.ts",
@@ -174,6 +176,9 @@ const HOST_ONLY = [
   "src/workerd-execution-guard.ts",
   "src/selfhost-workflow-execution-host.ts",
   "src/selfhost-actor-execution-host.ts",
+  "src/selfhost-actor-public-runtime.ts",
+  "src/selfhost-form-authority-composition.ts",
+  "src/selfhost-startup-instructions.ts",
   "src/selfhost-actor-native-process.ts",
   "src/selfhost-workflow-preparation.ts",
   "src/selfhost-workflow-http-transport.ts",
@@ -191,13 +196,17 @@ const HOST_ONLY = [
   "src/objects-r2-http.ts",
 ];
 
-if (existsSync(WORKER_ENTRY)) {
-  const reachable = reachableFrom([WORKER_ENTRY]);
+for (const entry of WORKER_ENTRIES) {
+  const reachable = reachableFrom([entry]);
   for (const banned of HOST_ONLY) {
     if (reachable.has(banned)) {
-      violations.push(`${WORKER_ENTRY} transitively imports host-only module ${banned}`);
+      violations.push(`${entry} transitively imports host-only module ${banned}`);
     }
   }
+  // Public supply may not hold a parent-provider implementation. Route-less
+  // authority Workers use the existing Cloudflare Form runtime to inspect
+  // handler coverage, so this narrower rule remains on the public entry.
+  if (entry !== "src/entry-cloudflare-worker.ts" && entry !== "src/entry-worker.ts") continue;
   for (const banned of [
     "src/providers/cloudflare.ts",
     "src/providers/cloudflare-provider-executor-rpc.ts",
@@ -210,9 +219,7 @@ if (existsSync(WORKER_ENTRY)) {
     "src/providers/wasabi-meter.ts",
   ]) {
     if (reachable.has(banned)) {
-      violations.push(
-        `${WORKER_ENTRY} transitively imports private parent-provider module ${banned}`,
-      );
+      violations.push(`${entry} transitively imports private parent-provider module ${banned}`);
     }
   }
   for (const path of reachable) {
@@ -224,7 +231,7 @@ if (existsSync(WORKER_ENTRY)) {
       "TAKOSERVER_WASABI_SECRET_ACCESS_KEY",
     ]) {
       if (source.includes(forbidden)) {
-        violations.push(`${WORKER_ENTRY} reaches ${path}, which names private ${forbidden}`);
+        violations.push(`${entry} reaches ${path}, which names private ${forbidden}`);
       }
     }
   }

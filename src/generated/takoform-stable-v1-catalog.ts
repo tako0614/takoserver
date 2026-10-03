@@ -1764,6 +1764,12 @@ export const STABLE_PRODUCTION_TAKOFORM_CATALOG = {
       operations: ["create", "read", "delete", "import", "observe"],
       workerClassRuntime: {
         providedInterface: "worker.workflow",
+        runtimeClassRef: {
+          apiVersion: "interfaces.takoform.com/v1alpha1",
+          name: "worker.workflow",
+          version: "1.0.0",
+          schemaDigest: "sha256:6b652dd311975da84469a5ec44f48acbc6db2097d1473988bd5424a85fda4294",
+        },
         className: "/className",
         workerRelation: "/worker",
         deploymentForm: {
@@ -1855,6 +1861,12 @@ export const STABLE_PRODUCTION_TAKOFORM_CATALOG = {
       operations: ["create", "read", "delete", "import", "observe"],
       workerClassRuntime: {
         providedInterface: "worker.actor",
+        runtimeClassRef: {
+          apiVersion: "interfaces.takoform.com/v1alpha1",
+          name: "worker.actor",
+          version: "1.0.0",
+          schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+        },
         className: "/className",
         workerRelation: "/worker",
         deploymentForm: {

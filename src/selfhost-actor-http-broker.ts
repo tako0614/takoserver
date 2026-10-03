@@ -60,6 +60,8 @@ export async function openSelfhostActorHttpBroker(
   options: SelfhostActorHttpBrokerOptions,
 ): Promise<{
   readonly socketPath: string;
+  /** Stop accepting new calls and wait for already accepted bodies to drain. */
+  retire(): Promise<void>;
   close(): Promise<void>;
 }> {
   if (!isAbsolute(options.socketPath) || !/^[0-9a-f]{64}$/u.test(options.token))
@@ -166,11 +168,17 @@ export async function openSelfhostActorHttpBroker(
       resolve();
     });
   });
+  let stopping: Promise<void> | undefined;
+  const retire = (): Promise<void> => {
+    stopping ??= new Promise<void>((resolve) => server.close(() => resolve()));
+    return stopping;
+  };
   return Object.freeze({
     socketPath: options.socketPath,
+    retire,
     async close(): Promise<void> {
       for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await retire();
     },
   });
 }

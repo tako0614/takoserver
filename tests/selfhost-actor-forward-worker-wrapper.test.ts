@@ -57,3 +57,21 @@ test("forward Actor wrapper rejects token, service, module and binding alias amb
     }),
   ).toThrow();
 });
+
+test("forward Actor wrapper admits the published 64-binding bound but not 65", () => {
+  const bindings = Array.from({ length: 64 }, (_, index) => ({
+    ...binding,
+    publicName: `ROOM_${index}`,
+    httpService: `__TAKOSERVER_ACTOR_HTTP_${index.toString().padStart(5, "0")}`,
+    upgradeService: `__TAKOSERVER_ACTOR_UPGRADE_${index.toString().padStart(5, "0")}`,
+  }));
+  const options = { runtimeModule: "runtime.mjs", innerModule: "inner.mjs", bindings };
+  const source = selfhostActorForwardEntrypointSource(options);
+  expect(source).toContain('"publicName":"ROOM_63"');
+  expect(() =>
+    selfhostActorForwardEntrypointSource({
+      ...options,
+      bindings: [...bindings, { ...binding, publicName: "ROOM_64" }],
+    }),
+  ).toThrow("Actor forward wrapper configuration invalid");
+});

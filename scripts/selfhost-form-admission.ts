@@ -1,17 +1,27 @@
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
+import { createAppResourceStoreBundle } from "../src/app.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import type { ObjectStore, Sql } from "../src/ports.ts";
 import type { Provider } from "../src/provider-port.ts";
-import { derivePublicFormImplementationIdentity } from "../src/public-worker-implementation.ts";
 import {
+  openSelfhostActorPublicRuntime,
+  type SelfhostActorPublicRuntime,
+} from "../src/selfhost-actor-public-runtime.ts";
+import {
+  hasExactSelfhostActorClosure,
   SELFHOST_IDENTITY_CAPABILITY_KINDS,
   SELFHOST_TLS_ENVIRONMENT,
   selfhostWorkerEndpointScheme,
 } from "../src/selfhost-composition.ts";
+import {
+  createSelfhostProductionFormAuthorityComposition,
+  deriveSelfhostFormAuthorityCatalog,
+} from "../src/selfhost-form-authority-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
   createStandaloneProviderComposition,
@@ -28,12 +38,8 @@ import type {
   FormAuthorityPlan,
   FormAuthorityPlanRequest,
 } from "../src/takoform/host-admission-coordinator.ts";
-import {
-  createProductionFormAuthorityComposition,
-  deriveFormAuthorityIdentity,
-  type FormAuthorityEndpointConfiguration,
-} from "../src/takoform/host-admission-endpoint.ts";
-import { yurucommuLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
+import type { FormAuthorityEndpointConfiguration } from "../src/takoform/host-admission-endpoint.ts";
+import { selfhostLifecycleCapabilityManifest } from "../src/takoform/implementation-catalog.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -68,6 +74,8 @@ export interface SelfhostFormAdmissionOptions {
   readonly hostId: string;
   readonly coreVerifierUrl: string;
   readonly apply: boolean;
+  /** Explicitly deactivate the selected Space before contracting support. */
+  readonly deactivate?: boolean;
   readonly sql: Sql;
   readonly objects: ObjectStore;
   /**
@@ -76,6 +84,8 @@ export interface SelfhostFormAdmissionOptions {
    * service availability qualification.
    */
   readonly provider: Provider;
+  /** Actual restored native owner; never a configuration or feature flag. */
+  readonly actorRuntime?: SelfhostActorPublicRuntime;
   readonly fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 }
 
@@ -123,40 +133,50 @@ export async function runSelfhostFormAdmission(
   // `module-worker.object-bucket` materialization, so the Form is recorded with
   // the five operations it declares rather than with the empty set ADR 0007
   // describes for a Host without that supply (see its second rotation).
-  const capabilities = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
+  const candidates = currentTakoformCandidates();
+  const source = {
+    provider: options.provider,
+    stableForms: candidates.forms,
+    stableBindings: candidates.bindings,
+    ...(options.actorRuntime ? { actorRuntime: options.actorRuntime } : {}),
+  };
+  const capabilities = selfhostLifecycleCapabilityManifest(
+    SELFHOST_IDENTITY_CAPABILITY_KINDS,
+    options.actorRuntime
+      ? candidates.forms.find((form) => form.identity.formRef.kind === "ActorNamespace")
+      : undefined,
+  );
   const implementationPayloadDigest = await canonicalDigest({
     kind: "takoserver.selfhost-form-implementation@v1",
     capabilities,
   });
-  const handlerSurface = options.provider as unknown as Readonly<Record<string, unknown>>;
-  const semantic = await derivePublicFormImplementationIdentity({
+  const catalog = await deriveSelfhostFormAuthorityCatalog({
     implementationPayloadDigest,
     capabilities,
-    handlerSurface,
+    source,
   });
   const configuration: FormAuthorityEndpointConfiguration = {
     environment: "production",
     hostId: options.hostId,
     workerArtifactDigest: implementationPayloadDigest,
     publicWorkerVersionId: "00000000-0000-4000-8000-000000000000",
-    implementationPayloadDigest: semantic.implementationPayloadDigest,
-    implementationDigest: semantic.implementationDigest,
+    implementationPayloadDigest,
+    implementationDigest: catalog.implementationDigest,
     capabilities,
     coreVerifierArtifactDigest: artifactDigest,
   };
-  const identity = await deriveFormAuthorityIdentity(configuration, handlerSurface);
   const live = {
     kind: "takoserver.public-host-identity@v2" as const,
-    hostId: identity.hostId,
-    workerVersionId: identity.publicWorkerVersionId,
-    workerArtifactDigest: identity.workerArtifactDigest,
-    implementationPayloadDigest: semantic.implementationPayloadDigest,
-    capabilityDigest: semantic.capabilityDigest,
-    implementationDigest: identity.implementationDigest,
+    hostId: configuration.hostId,
+    workerVersionId: configuration.publicWorkerVersionId,
+    workerArtifactDigest: configuration.workerArtifactDigest,
+    implementationPayloadDigest,
+    capabilityDigest: catalog.capabilityDigest,
+    implementationDigest: catalog.implementationDigest,
   };
-  const composition = await createProductionFormAuthorityComposition({
+  const composition = await createSelfhostProductionFormAuthorityComposition({
     configuration,
-    handlerSurface,
+    source,
     bindings: {
       sql: options.sql,
       objects: options.objects,
@@ -176,11 +196,13 @@ export async function runSelfhostFormAdmission(
       kind: "space",
       tenantId: options.organizationId,
       space: options.space,
-      desiredActive: true,
+      desiredActive: options.deactivate !== true,
     },
     evidence: closure.evidence,
     actor: "takoserver-selfhost-operator",
-    reason: `self-host admission of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`,
+    reason: options.deactivate
+      ? `self-host deactivation of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`
+      : `self-host admission of ${closure.identity.setTag} for ${options.organizationId}/${options.space}`,
   };
   const plan = await composition.endpoint.plan(request);
   if (!options.apply) return { plan, applied: null };
@@ -207,7 +229,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
   const [organizationId, space] = positional;
   if (!organizationId || !space) {
     process.stderr.write(
-      "usage: selfhost-form-admission.ts <organizationId> <space> [--apply] [--data-root DIR] [--host-id ORIGIN] [--core-verifier URL]\n",
+      "usage: selfhost-form-admission.ts <organizationId> <space> [--apply] [--deactivate] [--data-root DIR] [--host-id ORIGIN] [--core-verifier URL]\n",
     );
     process.exit(2);
   }
@@ -234,6 +256,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     throw new Error("self-host Form admission requires durable local state");
   }
   const database = new Database(databasePath);
+  let actorRuntime: SelfhostActorPublicRuntime | undefined;
   try {
     const sql = createSqliteSql(database);
     const objects = createFileObjectStore({ root: dataRoot });
@@ -287,13 +310,65 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     ) {
       throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
     }
+    const clock = () => new Date();
+    const resourceStores = createAppResourceStoreBundle(sql, clock);
+    const candidates = currentTakoformCandidates();
+    // A partial package closure is a base self-host capability profile. Do
+    // not construct an Actor owner that composition must later reject: the
+    // admission plan still has to converge previously supported Actor Forms
+    // back to unsupported when the exact sibling/Binding closure is absent.
+    const actorForm = hasExactSelfhostActorClosure({
+      stableForms: candidates.forms,
+      stableBindings: candidates.bindings,
+    })
+      ? candidates.forms.find((form) => form.identity.formRef.kind === "ActorNamespace")
+      : undefined;
+    if (workerdSelection.binary && actorForm) {
+      try {
+        actorRuntime = await openSelfhostActorPublicRuntime({
+          dataRoot,
+          runtimeRoot: dataRoot,
+          socketParent: join(dataRoot, "actor-forward-sockets"),
+          binary: workerdSelection.binary,
+          graph: createActorResourceGraphReader({
+            store: resourceStores.inventory,
+            form: actorForm,
+          }),
+          deployments: resourceStores.deployments,
+          providerPackRef: "local",
+          providerInstallationRef: "local.primary",
+        });
+      } catch {
+        // An absent owner is a supported-empty Actor capability, not a
+        // successful native qualification or a reason to mutate admission.
+        process.stderr.write("self-host Actor owner unavailable; Actor support stays absent\n");
+      }
+    }
     const runtime = createWorkerdRuntime({
       root: dataRoot,
       binary: workerdSelection.binary,
       port: workerdPort,
       ...(tls ? { tls } : {}),
+      ...(actorRuntime
+        ? {
+            actorForwardSockets: () => actorRuntime?.actorForwardSockets() ?? [],
+            actorForwardLifecycle: actorRuntime.actorForwardLifecycle,
+          }
+        : {}),
     });
-    const clock = () => new Date();
+    if (actorRuntime) {
+      try {
+        // The stopped-server CLI validates the immutable publication graph
+        // and broker map without starting a supervised workerd child. This
+        // qualifies implemented support, never live serving readiness.
+        await runtime.restore();
+      } catch {
+        actorRuntime.actorForwardLifecycle.uncertain();
+        await actorRuntime.close();
+        actorRuntime = undefined;
+        process.stderr.write("self-host Actor restore unavailable; Actor support stays absent\n");
+      }
+    }
     const artifactStore = createTakoformArtifacts({
       sql,
       objects,
@@ -310,10 +385,12 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
     };
     const providerComposition = createStandaloneProviderComposition({
       mode,
-      stableForms: currentTakoformCandidates().forms,
+      stableForms: candidates.forms,
+      stableBindings: candidates.bindings,
       edge: await buildEdgeForms(),
       dataRoot,
       runtime,
+      ...(actorRuntime ? { actorRuntime } : {}),
       workerRuntimeAvailable: workerdSelection.binary !== null,
       artifacts: providerArtifacts,
       ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
@@ -334,9 +411,11 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       hostId: flag("host-id") ?? process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787",
       coreVerifierUrl: flag("core-verifier") ?? "http://127.0.0.1:8080",
       apply: args.includes("--apply"),
+      deactivate: args.includes("--deactivate"),
       sql,
       objects,
       provider,
+      ...(actorRuntime ? { actorRuntime } : {}),
     });
     const { plan, applied } = result;
     process.stdout.write(
@@ -361,6 +440,7 @@ export async function runSelfhostFormAdmissionCli(args: readonly string[]): Prom
       }
     }
   } finally {
+    await actorRuntime?.close();
     database.close();
   }
 }

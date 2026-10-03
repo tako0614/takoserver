@@ -9,6 +9,7 @@ import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts
 import {
   deriveImplementationCatalog,
   exactPublisherFormCandidates,
+  selfhostLifecycleCapabilityManifest,
   YURUCOMMU_FORM_VERSIONS,
   YURUCOMMU_IDENTITY_CAPABILITY_KINDS,
   yurucommuFormCandidates,
@@ -33,6 +34,29 @@ const HISTORICAL_SELFHOST_IMPLEMENTATION_DIGESTS = [
 ] as const;
 
 describe("Form authority implementation catalog", () => {
+  test("self-host Actor widening is exact and leaves the previous manifest unchanged", async () => {
+    const actor = currentTakoformCandidates().forms.find(
+      (form) => form.identity.formRef.kind === "ActorNamespace",
+    );
+    if (!actor) throw new Error("released Actor Form missing");
+    const previous = yurucommuLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS);
+    expect(selfhostLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS)).toEqual(
+      previous,
+    );
+    const widened = selfhostLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS, actor);
+    expect(widened.forms.ActorNamespace).toEqual(["create", "read", "delete", "import", "observe"]);
+    expect(widened.forms.ActorNamespace).not.toContain("update");
+    expect(await canonicalDigest(widened)).not.toBe(await canonicalDigest(previous));
+    expect(() =>
+      selfhostLifecycleCapabilityManifest(SELFHOST_IDENTITY_CAPABILITY_KINDS, {
+        ...actor,
+        identity: {
+          ...actor.identity,
+          packageDigest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+        },
+      }),
+    ).toThrow("exact released self-host Actor Form unavailable");
+  });
   test("feeds every exact publisher identity into generic admission", () => {
     const source = currentTakoformCandidates().forms;
     const forms = exactPublisherFormCandidates(source);
