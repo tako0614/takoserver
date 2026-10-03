@@ -13,6 +13,7 @@ describe("forward Takoform source candidate projection", () => {
     expect(canonicalJson(first)).toBe(canonicalJson(second));
     expect(first.provenance.classification).toBe("unpublished-source-candidate");
     expect(first.provenance.publicationStatus).toBe("unpublished");
+    expect(first.provenance.repositoryCommit).toBe("41e4907c4d90d8c2b0a6a8e0fdcebc9e457e0212");
     expect(first.provenance.repositoryCommit).toBe(first.provenance.sourceCommit);
     expect(first.forms).toHaveLength(17);
 

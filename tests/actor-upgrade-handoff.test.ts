@@ -1,15 +1,140 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
   createActorUpgradeHandoff,
+  createActorUpgradeResponse,
   installActorResponseRuntime,
 } from "../src/actor-upgrade-handoff.ts";
 
 const NativeResponse = Response;
+const v2Profile = resolveActorAbiProfile({
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "2.0.0",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+});
 beforeEach(() => installActorResponseRuntime());
 afterEach(() => {
   globalThis.Response = NativeResponse;
+});
+test("v2 branded 101 cannot be cloned but constructor aliases preserve its source", () => {
+  const response = createActorUpgradeResponse(new Headers(), v2Profile);
+  expect(response.status).toBe(101);
+  expect(() => response.clone()).toThrow(TypeError);
+  const alias = new Response(null, response);
+  expect(alias.status).toBe(101);
+  expect(() => alias.clone()).toThrow(TypeError);
+  const legacy = createActorUpgradeResponse(new Headers());
+  expect(legacy.clone().status).toBe(101);
+});
+
+test("v2 handoff preserves 101 clone refusal through a real reservation", async () => {
+  const handoff = createActorUpgradeHandoff(
+    request(),
+    {
+      async open() {
+        return {
+          response: new NativeResponse(null, { status: 101 }),
+          commit() {},
+          abandon() {},
+        };
+      },
+    },
+    30_000,
+    v2Profile,
+  );
+  try {
+    const response = await handoff.actor.fetch(request());
+    expect(() => response.clone()).toThrow(TypeError);
+    const alias = new Response(null, response);
+    expect((await handoff.finish(alias)).status).toBe(101);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
+test("handoffs do not commit a reserved response from a different ABI scope", async () => {
+  const transport = {
+    async open() {
+      return {
+        response: new NativeResponse(null, { status: 101 }),
+        commit() {},
+        abandon() {},
+      };
+    },
+  };
+  const forward = createActorUpgradeHandoff(request(), transport, 30_000, v2Profile);
+  const legacy = createActorUpgradeHandoff(request(), transport);
+  try {
+    const response = await forward.actor.fetch(request());
+    expect((await legacy.finish(response)).status).toBe(503);
+    expect((await forward.finish(response)).status).toBe(101);
+  } finally {
+    await Promise.all([forward.abandon(), legacy.abandon()]);
+  }
+});
+
+test("one handoff keeps mixed binding profiles on their own slots and abandons the unused reservation", async () => {
+  const events: string[] = [];
+  const handoff = createActorUpgradeHandoff(request(), {
+    async open(selected) {
+      const id = new URL(selected.url).pathname;
+      return {
+        response: new NativeResponse(null, { status: 101 }),
+        ...(id === "/v2" ? { profile: v2Profile } : {}),
+        commit() {
+          events.push(`commit:${id}`);
+        },
+        abandon() {
+          events.push(`abandon:${id}`);
+        },
+      };
+    },
+  });
+  try {
+    const legacy = await handoff.actor.fetch(new Request("http://worker.invalid/legacy"));
+    const v2 = await handoff.actor.fetch(new Request("http://worker.invalid/v2"));
+    expect(legacy.clone().status).toBe(101);
+    expect(() => v2.clone()).toThrow(TypeError);
+    expect((await handoff.finish(new Response(null, v2))).status).toBe(101);
+    expect(events).toEqual(["abandon:/legacy", "commit:/v2"]);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
+test("fixed-profile handoff rejects a differently branded reservation", async () => {
+  let abandoned = 0;
+  const handoff = createActorUpgradeHandoff(
+    request(),
+    {
+      async open() {
+        return {
+          response: new NativeResponse(null, { status: 101 }),
+          profile: resolveActorAbiProfile({
+            apiVersion: "interfaces.takoform.com/v1alpha1",
+            name: "worker.actor",
+            version: "1.0.0",
+            schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+          }),
+          commit() {},
+          abandon() {
+            abandoned += 1;
+          },
+        };
+      },
+    },
+    30_000,
+    v2Profile,
+  );
+  try {
+    await expect(handoff.actor.fetch(request())).rejects.toThrow("backend_unavailable");
+    expect(abandoned).toBe(1);
+  } finally {
+    await handoff.abandon();
+  }
 });
 function request(): Request {
   return new Request("http://worker.invalid/socket", {

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   SELFHOST_WORKER_PRELUDE_MODULE,
   selfhostWorkerPreludeSource,
@@ -15,6 +15,124 @@ import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 const binary = nativeEvidenceBinary("actor-qualification");
 const digest = process.env.TAKOSERVER_ACTOR_QUALIFICATION_SHA256;
 const encoder = new TextEncoder();
+const forwardRef = {
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "2.0.0",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+} as const;
+
+test("Actor namespace refuses an unknown full InterfaceRef before starting a child", async () => {
+  let spawned = false;
+  await expect(
+    openWorkerdActorNamespace("/unused/workerd", {
+      namespaceKey: "a".repeat(64),
+      storagePath: "/unused/actor-state",
+      className: "Actor",
+      graph: graph(),
+      signal: new AbortController().signal,
+      runtimeClassRef: {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.actor",
+        version: "2.0.0",
+        schemaDigest: `sha256:${"0".repeat(64)}`,
+      },
+      admitAlarm: async () => null,
+      completeAlarm() {},
+      admitSocket: async () => null,
+      completeSocket() {},
+      processAdapter: {
+        spawn() {
+          spawned = true;
+          throw new Error("child start attempted");
+        },
+        probeReadiness: async () => new Response(null, { status: 204 }),
+      },
+    }),
+  ).rejects.toThrow("Actor runtime InterfaceRef is unavailable");
+  expect(spawned).toBe(false);
+});
+
+test("selected Actor InterfaceRef reaches every generated child and owner without a native launch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-v2-generated-profile-"));
+  let configPath = "";
+  let refReads = 0;
+  let finish!: (code: number) => void;
+  const exited = new Promise<number>((resolve) => {
+    finish = resolve;
+  });
+  const child = {
+    exitCode: null as number | null,
+    signalCode: null,
+    exited,
+    kill() {
+      this.exitCode = 137;
+      finish(137);
+    },
+  };
+  let namespace: Awaited<ReturnType<typeof openWorkerdActorNamespace>> | undefined;
+  try {
+    namespace = await openWorkerdActorNamespace("/unused/workerd", {
+      namespaceKey: "b".repeat(64),
+      storagePath: join(root, "state"),
+      className: "Actor",
+      graph: graph(),
+      signal: new AbortController().signal,
+      get runtimeClassRef() {
+        refReads += 1;
+        if (refReads > 1) throw new Error("Actor InterfaceRef read twice");
+        return forwardRef;
+      },
+      admitAlarm: async () => null,
+      completeAlarm() {},
+      admitSocket: async () => null,
+      completeSocket() {},
+      processAdapter: {
+        spawn(_binary, path) {
+          configPath = path;
+          return child;
+        },
+        probeReadiness: async () => new Response(null, { status: 204 }),
+      },
+    });
+    expect(refReads).toBe(1);
+    const childRoot = dirname(configPath);
+    const paths = await readdir(childRoot, { recursive: true });
+    const sources = await Promise.all(
+      paths
+        .filter((path) => /module-\d+$/u.test(path))
+        .map(async (path) => ({
+          path,
+          source: await readFile(join(childRoot, path), "utf8"),
+        })),
+    );
+    const entries = sources.filter(
+      ({ path, source }) =>
+        path.startsWith("actor-versions/") && source.includes("const INSPECTION_TOKEN ="),
+    );
+    const owners = sources.filter(
+      ({ path, source }) =>
+        path.startsWith("host-private/") && source.includes("const inspectionTokens ="),
+    );
+    expect(entries).toHaveLength(2);
+    expect(owners).toHaveLength(1);
+    const parser = new Bun.Transpiler({ loader: "js" });
+    for (const { source } of [...entries, ...owners]) {
+      expect(() => parser.transformSync(source)).not.toThrow();
+      expect(source).toContain(forwardRef.schemaDigest);
+      expect(source).toContain("resolveActorAbiProfile");
+    }
+    for (const { source } of entries) {
+      expect(source).toContain('action === "callback-error"');
+      expect(source).toContain("execution.socketError(");
+      expect(source).toContain("ABI_PROFILE?.socketMessageBytes");
+    }
+    expect(owners[0]?.source).toContain("undefined, undefined, ABI_PROFILE");
+  } finally {
+    await namespace?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function graph(invalidSecond = false): WorkerdActiveActorGraph {
   const validActor = `export class Actor {
