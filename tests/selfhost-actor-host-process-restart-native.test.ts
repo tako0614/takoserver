@@ -20,6 +20,7 @@ import { signOperatorAssertion } from "../src/operator-key.ts";
 import { currentTakoformCandidates } from "../src/takoform/current-candidates.ts";
 import { loadPublisherSetClosure } from "../src/takoform/publisher-set-closure.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { workerPortOwnership } from "../src/workerd-linux-process.ts";
 import { assertIsolatedSelfhostNativeEnvironment } from "./helpers/isolated-selfhost-native.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 import {
@@ -39,6 +40,7 @@ const HOST_SUFFIX = "apps.actor-selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
 const SPACE = "default";
 const ACTOR_NAME = "same-room";
+const BOOTSTRAP_DIAGNOSTIC_COMPLETE = Symbol("bootstrap_diagnostic_complete");
 const WORKER_MODULE = `
 export class Counter {
   constructor(context, env) { this.context = context; this.env = env; }
@@ -77,8 +79,89 @@ type ProcessIdentity = {
   readonly startTicks: string;
   readonly executable: string;
 };
+type HostReadinessObservation = {
+  readonly hostPortOwnershipBefore: "owned";
+  readonly hostPortOwnershipAfter: "owned";
+  readonly directStatus: 200;
+  readonly publicStatus: 200;
+  readonly discoveryBodyBytes: number;
+  readonly discoveryBodySha256: string;
+};
+type HostOutputObservation = {
+  readonly state: {
+    operatorKeyGeneratedAtExpectedPath: boolean;
+    listeningAtConfiguredPort: boolean;
+    stderrPresent: boolean;
+    stderrClasses: string[];
+  };
+  readonly drained: Promise<void>;
+};
 type Auth = Record<string, string>;
 type FormMap = Map<string, Json>;
+
+test("public Actor proxy returns explicit 502 when its Host upstream is absent", async () => {
+  const reservation = createServer();
+  await new Promise<void>((resolve, reject) => {
+    reservation.once("error", reject);
+    reservation.listen(0, "127.0.0.1", resolve);
+  });
+  const address = reservation.address();
+  if (!address || typeof address === "string") throw new Error("actor_proxy_probe_port_missing");
+  const upstreamPort = address.port;
+  await new Promise<void>((resolve, reject) =>
+    reservation.close((error) => (error ? reject(error) : resolve())),
+  );
+
+  const proxy = await createPublicApiProxy(upstreamPort, 0);
+  try {
+    const address = proxy.server.address();
+    if (!address || typeof address === "string")
+      throw new Error("actor_proxy_probe_listener_missing");
+    const response = await fetch(`http://127.0.0.1:${address.port}/.well-known/takoform/v1`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    expect(response.status).toBe(502);
+    expect((await response.arrayBuffer()).byteLength).toBe(0);
+  } finally {
+    await closePublicApiProxy(proxy);
+  }
+});
+
+test("public Actor proxy preserves successful upstream headers and streamed body", async () => {
+  const upstream = createServer((_incoming, outgoing) => {
+    outgoing.writeHead(200, {
+      "content-type": "application/json",
+      "x-upstream-marker": "preserved",
+    });
+    outgoing.write('{"part":');
+    setTimeout(() => outgoing.end("true}"), 10);
+  });
+  await new Promise<void>((resolve, reject) => {
+    upstream.once("error", reject);
+    upstream.listen(0, "127.0.0.1", resolve);
+  });
+  const upstreamAddress = upstream.address();
+  if (!upstreamAddress || typeof upstreamAddress === "string") {
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    throw new Error("actor_proxy_upstream_port_missing");
+  }
+  const proxy = await createPublicApiProxy(upstreamAddress.port, 0);
+  try {
+    const publicAddress = proxy.server.address();
+    if (!publicAddress || typeof publicAddress === "string") {
+      throw new Error("actor_proxy_listener_missing");
+    }
+    const response = await fetch(`http://127.0.0.1:${publicAddress.port}/stream`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-upstream-marker")).toBe("preserved");
+    expect(await response.text()).toBe('{"part":true}');
+  } finally {
+    await closePublicApiProxy(proxy);
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
 
 test.skipIf(WORKERD === null)(
   "public Host routes a released Actor over HTTP/WSS and restores it after SIGTERM Host restarts",
@@ -93,6 +176,9 @@ test.skipIf(WORKERD === null)(
     let host: Child | undefined;
     let admission: Child | undefined;
     let proxy: PublicApiProxy | undefined;
+    let hostOutput: HostOutputObservation | undefined;
+    let diagnosticHostIdentity: ProcessIdentity | undefined;
+    let diagnosticVerifierIdentity: ProcessIdentity | undefined;
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     try {
@@ -137,8 +223,72 @@ test.skipIf(WORKERD === null)(
       await waitForCoreVerifier(verifier, coreDigest);
       await createTls(tlsDirectory);
 
-      host = startHost(hostEnvironment);
-      await waitForHost(host);
+      const bootstrapDiagnostic = process.env.TAKOSERVER_ACTOR_BOOTSTRAP_DIAGNOSTIC === "1";
+      if (bootstrapDiagnostic) {
+        const captured = startHostWithCapturedOutput(hostEnvironment);
+        host = captured.child;
+        hostOutput = observeHostOutput(
+          captured.stdout,
+          captured.stderr,
+          join(dataRoot, "operator-key.jwk"),
+          HOST_PORT,
+        );
+      } else {
+        host = startHost(hostEnvironment);
+      }
+      let readiness: HostReadinessObservation;
+      try {
+        readiness = await waitForHost(host);
+      } catch (error) {
+        if (bootstrapDiagnostic) {
+          diagnosticHostIdentity = processIdentity(host.pid);
+          diagnosticVerifierIdentity = processIdentity(verifier.pid);
+          const failedDiagnostic = {
+            phase: "public_host_readiness_failed",
+            cwd: process.cwd(),
+            configuredDataRoot: dataRoot,
+            configuredDatabase: controlDatabase,
+            host: diagnosticHostIdentity,
+            hostExitCode: host.exitCode,
+            verifier: diagnosticVerifierIdentity,
+            hostPortOwnership: await workerPortOwnership(HOST_PORT, host.pid),
+            proxyListenerOwnership: await workerPortOwnership(PUBLIC_PROXY_PORT, process.pid),
+            operatorKey: safeFileMetadata(join(dataRoot, "operator-key.jwk")),
+            controlDatabase: safeFileMetadata(controlDatabase),
+            hostOutput: hostOutput?.state,
+            failureClass: error instanceof Error ? error.name : "unknown",
+          };
+          console.log(`ACTOR_BOOTSTRAP_DIAGNOSTIC=${JSON.stringify(failedDiagnostic)}`);
+        }
+        throw error;
+      }
+      if (bootstrapDiagnostic) {
+        await Bun.sleep(25);
+        const keyMetadata = safeFileMetadata(join(dataRoot, "operator-key.jwk"));
+        diagnosticHostIdentity = processIdentity(host.pid);
+        diagnosticVerifierIdentity = processIdentity(verifier.pid);
+        const diagnostic = {
+          phase: "public_host_bootstrap_ready",
+          cwd: process.cwd(),
+          configuredDataRoot: dataRoot,
+          configuredDatabase: controlDatabase,
+          cwdDefaultRoot: join(process.cwd(), ".takoserver"),
+          host: diagnosticHostIdentity,
+          hostExitCode: host.exitCode,
+          verifier: diagnosticVerifierIdentity,
+          testProcess: processIdentity(process.pid),
+          readiness,
+          proxyListenerOwnership: await workerPortOwnership(PUBLIC_PROXY_PORT, process.pid),
+          operatorKey: keyMetadata,
+          controlDatabase: safeFileMetadata(controlDatabase),
+          cwdDefaultRootMetadata: safeFileMetadata(join(process.cwd(), ".takoserver")),
+          hostOutput: hostOutput?.state,
+        };
+        console.log(`ACTOR_BOOTSTRAP_DIAGNOSTIC=${JSON.stringify(diagnostic)}`);
+        expect(keyMetadata.exists).toBe(true);
+        expect(keyMetadata.mode).toBe("600");
+        throw BOOTSTRAP_DIAGNOSTIC_COMPLETE;
+      }
       const { primary, secondary, primaryOrg, secondaryOrg } =
         await bootstrapOrganizations(dataRoot);
 
@@ -488,8 +638,10 @@ test.skipIf(WORKERD === null)(
       await deleteResource(secondary, secondaryForms, "WorkerBundle", "actor-bundle");
       await deleteResource(secondary, secondaryForms, "ModuleWorker", "actor-worker");
     } catch (error) {
-      hasPrimaryFailure = true;
-      primaryFailure = error;
+      if (error !== BOOTSTRAP_DIAGNOSTIC_COMPLETE) {
+        hasPrimaryFailure = true;
+        primaryFailure = error;
+      }
     } finally {
       const cleanupFailures: string[] = [];
       const attemptCleanup = async (label: string, action: () => Promise<void>): Promise<void> => {
@@ -506,6 +658,8 @@ test.skipIf(WORKERD === null)(
       if (verifier && verifier.exitCode === null)
         await attemptCleanup("verifier", () => stopOwnedWithIdentity(verifier as Child));
       if (proxy) await attemptCleanup("proxy", () => closePublicApiProxy(proxy as PublicApiProxy));
+      if (hostOutput)
+        await attemptCleanup("host_output", () => (hostOutput as HostOutputObservation).drained);
       const childrenExited = [admission, host, verifier].every(
         (child) => child === undefined || child.exitCode !== null,
       );
@@ -517,6 +671,34 @@ test.skipIf(WORKERD === null)(
         }
       } else {
         cleanupFailures.push("child_still_running");
+      }
+      let fixtureRemoved = false;
+      try {
+        fixtureRemoved = pathIsAbsent(fixture);
+      } catch {
+        cleanupFailures.push("fixture_check");
+      }
+      if (!fixtureRemoved && !cleanupFailures.includes("fixture")) {
+        cleanupFailures.push("fixture_retained");
+      }
+      if (process.env.TAKOSERVER_ACTOR_BOOTSTRAP_DIAGNOSTIC === "1") {
+        console.log(
+          `ACTOR_BOOTSTRAP_CLEANUP=${JSON.stringify({
+            phase: "cleanup_result",
+            cleanupFailures,
+            childExitCodes: {
+              host: host?.exitCode ?? null,
+              verifier: verifier?.exitCode ?? null,
+            },
+            hostIdentityStillLive: diagnosticHostIdentity
+              ? identityIsLive(diagnosticHostIdentity)
+              : null,
+            verifierIdentityStillLive: diagnosticVerifierIdentity
+              ? identityIsLive(diagnosticVerifierIdentity)
+              : null,
+            fixtureRemoved,
+          })}`,
+        );
       }
       if (cleanupFailures.length > 0) {
         if (!hasPrimaryFailure) {
@@ -549,6 +731,92 @@ function startHost(environment: Record<string, string>): Child {
     stdout: "ignore",
     stderr: "ignore",
   });
+}
+
+function startHostWithCapturedOutput(environment: Record<string, string>): {
+  readonly child: Child;
+  readonly stdout: ReadableStream<Uint8Array>;
+  readonly stderr: ReadableStream<Uint8Array>;
+} {
+  const child = Bun.spawn([process.execPath, "--no-env-file", "src/entry-bun.ts"], {
+    cwd: process.cwd(),
+    env: environment,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (!child.stdout || !child.stderr) throw new Error("actor_host_diagnostic_stream_missing");
+  return { child, stdout: child.stdout, stderr: child.stderr };
+}
+
+function observeHostOutput(
+  stdout: ReadableStream<Uint8Array>,
+  stderr: ReadableStream<Uint8Array>,
+  expectedKeyPath: string,
+  hostPort: number,
+): HostOutputObservation {
+  const state = {
+    operatorKeyGeneratedAtExpectedPath: false,
+    listeningAtConfiguredPort: false,
+    stderrPresent: false,
+    stderrClasses: new Set<string>(),
+  };
+  const safeErrorClasses = [
+    "EADDRINUSE",
+    "ECONNREFUSED",
+    "ENOENT",
+    "EACCES",
+    "EPERM",
+    "EINVAL",
+    "SQLITE_BUSY",
+    "SQLITE_CORRUPT",
+  ];
+  const drain = async (
+    stream: ReadableStream<Uint8Array>,
+    kind: "stdout" | "stderr",
+  ): Promise<void> => {
+    const reader = stream.getReader();
+    let tail = "";
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) return;
+      tail = (tail + new TextDecoder().decode(item.value)).slice(-8 * 1024);
+      const lines = tail.split("\n");
+      tail = lines.pop() ?? "";
+      for (const line of lines) {
+        if (kind === "stdout") {
+          if (line.includes(`generated an operator key at ${expectedKeyPath}`)) {
+            state.operatorKeyGeneratedAtExpectedPath = true;
+          }
+          if (line.includes(`takoserver listening on :${hostPort}`)) {
+            state.listeningAtConfiguredPort = true;
+          }
+        } else {
+          state.stderrPresent = true;
+          for (const code of safeErrorClasses) {
+            if (line.includes(code)) state.stderrClasses.add(code);
+          }
+        }
+      }
+    }
+  };
+  return {
+    state: {
+      get operatorKeyGeneratedAtExpectedPath() {
+        return state.operatorKeyGeneratedAtExpectedPath;
+      },
+      get listeningAtConfiguredPort() {
+        return state.listeningAtConfiguredPort;
+      },
+      get stderrPresent() {
+        return state.stderrPresent;
+      },
+      get stderrClasses() {
+        return [...state.stderrClasses].sort();
+      },
+    },
+    drained: Promise.all([drain(stdout, "stdout"), drain(stderr, "stderr")]).then(() => undefined),
+  };
 }
 
 async function bootstrapOrganizations(dataRoot: string): Promise<{
@@ -649,22 +917,88 @@ async function waitForCoreVerifier(child: Child, artifactDigest: string): Promis
   throw new Error("actor_real_core_startup_timeout");
 }
 
-async function waitForHost(child: Child): Promise<void> {
+async function waitForHost(child: Child): Promise<HostReadinessObservation> {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
     await assertIsolatedSelfhostNativeEnvironment({ fixedPorts: [], ownedChild: child });
+    let ownerBefore: "vacant" | "owned" | "foreign";
     try {
-      const response = await fetch(`${PUBLIC_ORIGIN}/.well-known/takoform/v1`, {
-        signal: AbortSignal.timeout(500),
-      });
-      await response.arrayBuffer();
-      if (response.ok) return;
+      ownerBefore = await workerPortOwnership(HOST_PORT, child.pid);
     } catch {
-      // Keep probing the actual public Host listener through the test transport.
+      await Bun.sleep(50);
+      continue;
+    }
+    if (ownerBefore !== "owned") {
+      await Bun.sleep(50);
+      continue;
+    }
+    try {
+      const [directResponse, publicResponse] = await Promise.all([
+        fetch(`http://127.0.0.1:${HOST_PORT}/.well-known/takoform/v1`, {
+          signal: AbortSignal.timeout(500),
+        }),
+        fetch(`${PUBLIC_ORIGIN}/.well-known/takoform/v1`, {
+          signal: AbortSignal.timeout(500),
+        }),
+      ]);
+      const [directBody, publicBody] = await Promise.all([
+        directResponse.arrayBuffer().then((body) => new Uint8Array(body)),
+        publicResponse.arrayBuffer().then((body) => new Uint8Array(body)),
+      ]);
+      const ownerAfter = await workerPortOwnership(HOST_PORT, child.pid);
+      if (
+        ownerAfter === "owned" &&
+        directResponse.status === 200 &&
+        publicResponse.status === 200 &&
+        sameBytes(directBody, publicBody) &&
+        isTakoformDiscoveryBody(directBody)
+      ) {
+        return {
+          hostPortOwnershipBefore: ownerBefore,
+          hostPortOwnershipAfter: ownerAfter,
+          directStatus: 200,
+          publicStatus: 200,
+          discoveryBodyBytes: directBody.byteLength,
+          discoveryBodySha256: createHash("sha256").update(directBody).digest("hex"),
+        };
+      }
+    } catch {
+      // A failed direct or proxied probe is not evidence of Host readiness.
     }
     await Bun.sleep(50);
   }
   throw new Error("actor_public_host_not_ready");
+}
+
+function safeFileMetadata(path: string): { exists: boolean; mode?: string; bytes?: number } {
+  try {
+    const stat = lstatSync(path);
+    return { exists: true, mode: (stat.mode & 0o777).toString(8), bytes: stat.size };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false };
+    throw new Error("actor_safe_file_metadata_unavailable");
+  }
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  return left.every((byte, index) => byte === right[index]);
+}
+
+function isTakoformDiscoveryBody(bytes: Uint8Array): boolean {
+  if (bytes.byteLength === 0) return false;
+  try {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as Json;
+    const features = objectAt(value, "features");
+    return (
+      Array.isArray(value.api_versions) &&
+      value.api_versions.includes("forms.takoform.com/v1") &&
+      features.service_forms === true &&
+      features.exact_form_ref === true
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function stopOwned(child: Child): Promise<void> {
@@ -1092,7 +1426,17 @@ function createPublicApiProxy(upstreamPort: number, publicPort: number) {
         response.pipe(outgoing);
       },
     );
-    upstream.once("error", () => outgoing.destroy());
+    upstream.once("error", () => {
+      if (outgoing.destroyed) return;
+      if (outgoing.headersSent) {
+        outgoing.destroy();
+        return;
+      }
+      // Bun's fetch can surface a destroyed proxy socket as an empty 200. Make
+      // an upstream connect failure an explicit bounded error response instead.
+      outgoing.writeHead(502, { "content-length": "0" });
+      outgoing.end();
+    });
     incoming.pipe(upstream);
   });
   return new Promise<{
