@@ -8,6 +8,144 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSelfhostActorForwardBrokers } from "../src/selfhost-actor-forward-brokers.ts";
 
+test("forward context rejects an unknown Actor InterfaceRef before using bindings", async () => {
+  const { createSelfhostActorForwardContext } = await import(
+    "../src/selfhost-actor-forward-runtime.ts"
+  );
+  let tenantRead = false;
+  expect(() =>
+    createSelfhostActorForwardContext({
+      rawEnv: new Proxy(
+        {},
+        {
+          get() {
+            tenantRead = true;
+            throw new Error("tenant environment read");
+          },
+        },
+      ),
+      bindings: [
+        {
+          publicName: "ROOM",
+          httpService: "HTTP",
+          upgradeService: "UPGRADE",
+          token: "a".repeat(64),
+          runtimeClassRef: {
+            apiVersion: "interfaces.takoform.com/v1alpha1",
+            name: "worker.actor",
+            version: "2.0.0",
+            schemaDigest: `sha256:${"0".repeat(64)}`,
+          },
+        },
+      ],
+    }),
+  ).toThrow("Actor runtime InterfaceRef is unavailable");
+  expect(tenantRead).toBe(false);
+});
+
+test("forward binding captures its trusted InterfaceRef once before tenant execution", async () => {
+  const { createSelfhostActorForwardContext } = await import(
+    "../src/selfhost-actor-forward-runtime.ts"
+  );
+  let reads = 0;
+  const context = createSelfhostActorForwardContext({
+    rawEnv: {},
+    bindings: [
+      {
+        publicName: "ROOM",
+        httpService: "HTTP",
+        upgradeService: "UPGRADE",
+        token: "a".repeat(64),
+        get runtimeClassRef() {
+          reads += 1;
+          if (reads > 1) throw new Error("InterfaceRef read twice");
+          return {
+            apiVersion: "interfaces.takoform.com/v1alpha1",
+            name: "worker.actor",
+            version: "2.0.0",
+            schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+          };
+        },
+      },
+    ],
+  });
+  expect(reads).toBe(1);
+  expect(context.rawEnv.ROOM).toBeDefined();
+});
+
+test("mixed forward bindings retain separate 101 clone rules and abandon the unused reservation", () => {
+  const runtime = new URL("../src/selfhost-actor-forward-runtime.ts", import.meta.url).href;
+  const source = `
+const NativeResponse = Response;
+Object.defineProperty(NativeResponse.prototype, "webSocket", {
+  configurable: true,
+  get() { return this.__socket ?? null; },
+});
+const { createSelfhostActorForwardContext, installActorResponseRuntime } = await import(${JSON.stringify(runtime)});
+installActorResponseRuntime();
+const events = [];
+const ref = {
+  apiVersion: "interfaces.takoform.com/v1alpha1",
+  name: "worker.actor",
+  version: "2.0.0",
+  schemaDigest: "sha256:b027b2129eb4e361d469f09d6d7fd7ab1abb2ee54e185da9169ec4c893487a51",
+};
+function service(name, reservation) {
+  return {
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (path.startsWith("/__broker/")) {
+        events.push(name + ":" + path.split("/")[2]);
+        return new NativeResponse(null, { status: 204 });
+      }
+      const response = new NativeResponse(null, {
+        status: 101,
+        headers: { "x-takoserver-private-broker-reservation": reservation },
+      });
+      Object.defineProperty(response, "__socket", { value: {} });
+      return response;
+    },
+  };
+}
+const original = new Request("http://worker.invalid/socket", {
+  headers: {
+    upgrade: "websocket", connection: "Upgrade", "sec-websocket-version": "13",
+    "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+  },
+});
+const context = createSelfhostActorForwardContext({
+  original,
+  rawEnv: {
+    OLD_HTTP: service("old", "00000000-0000-4000-8000-000000000001"),
+    OLD_UPGRADE: service("old", "00000000-0000-4000-8000-000000000001"),
+    NEW_HTTP: service("new", "00000000-0000-4000-8000-000000000002"),
+    NEW_UPGRADE: service("new", "00000000-0000-4000-8000-000000000002"),
+  },
+  bindings: [
+    { publicName: "OLD", httpService: "OLD_HTTP", upgradeService: "OLD_UPGRADE", token: "a".repeat(64) },
+    { publicName: "NEW", httpService: "NEW_HTTP", upgradeService: "NEW_UPGRADE", token: "b".repeat(64), runtimeClassRef: ref },
+  ],
+});
+const oldId = context.rawEnv.OLD.idFromName("old");
+const newId = context.rawEnv.NEW.idFromName("new");
+const oldResponse = await context.rawEnv.OLD.get(oldId).fetch(new Request(original));
+const newResponse = await context.rawEnv.NEW.get(newId).fetch(new Request(original));
+let newCloneRefused = false;
+try { newResponse.clone(); } catch (error) { newCloneRefused = error instanceof TypeError; }
+if (!newCloneRefused || oldResponse.clone().status !== 101) throw new Error("mixed clone rule failed");
+const completed = await context.finish(new Response(null, newResponse));
+if (completed.status !== 101 || events.join(",") !== "old:abandon,new:commit")
+  throw new Error("mixed reservation settlement failed: " + events.join(","));
+process.stdout.write("mixed-binding-ok");
+`;
+  const child = Bun.spawnSync([process.execPath, "-e", source], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(child.exitCode, new TextDecoder().decode(child.stderr)).toBe(0);
+  expect(new TextDecoder().decode(child.stdout)).toBe("mixed-binding-ok");
+});
+
 test("Actor forward brokers bind exact Host scope and reject unauthenticated calls", async () => {
   const root = await mkdtemp(join(tmpdir(), "actor-forward-brokers-"));
   const calls: unknown[] = [];

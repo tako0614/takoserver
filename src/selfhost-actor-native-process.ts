@@ -2,6 +2,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { resolveActorAbiProfile } from "./actor-class-execution.ts";
 import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "./generated/actor-native-bootstrap.ts";
 import { SELFHOST_WORKER_PROJECT_ENV_EXPORT } from "./providers/selfhost-worker-wrapper.ts";
 import { type WorkerdActiveActorGraph, writeWorkerdPrivateExecution } from "./workerd-runtime.ts";
@@ -11,6 +12,8 @@ export interface WorkerdActorNamespaceOptions {
   readonly namespaceKey: string;
   readonly storagePath: string;
   readonly className: string;
+  /** Host-selected complete Actor InterfaceRef; omission keeps the released ABI. */
+  readonly runtimeClassRef?: unknown;
   readonly graph: WorkerdActiveActorGraph;
   readonly signal: AbortSignal;
   /** Host authority callbacks; neither is exposed to application modules. */
@@ -191,6 +194,20 @@ export async function openWorkerdActorNamespace(
       options.ownerDeadlines.producerMs <= 0)
   )
     throw new Error("unusable Actor owner test deadline");
+  const selectedRuntimeClassRef = options.runtimeClassRef;
+  const selectedProfile =
+    selectedRuntimeClassRef === undefined
+      ? undefined
+      : resolveActorAbiProfile(selectedRuntimeClassRef);
+  // Serialize only a canonical, fully validated ref, never a caller object with hooks.
+  const runtimeClassRef = selectedProfile
+    ? {
+        apiVersion: "interfaces.takoform.com/v1alpha1",
+        name: "worker.actor",
+        version: selectedProfile.kind === "v2" ? "2.0.0" : "1.0.0",
+        schemaDigest: selectedProfile.schemaDigest,
+      }
+    : undefined;
   const graph = structuredClone(options.graph);
   if (
     !/^[a-f0-9]{64}$/u.test(graph.generationKey) ||
@@ -236,7 +253,7 @@ export async function openWorkerdActorNamespace(
     hostModules.set(helper, encoder.encode(ACTOR_NATIVE_BOOTSTRAP_SOURCE));
     hostModules.set(
       entry,
-      encoder.encode(`import { createNativeActorExecution, createActorNativeUpgradeHeaders, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass, installActorResponseRuntime } from ${literal(`./${helper}`)};
+      encoder.encode(`import { createNativeActorExecution, createActorNativeUpgradeHeaders, createActorNativeAlarmPort, createActorNativeSocketPort, signActorNativeUpgradeDecision, inspectActorClass, prepareActorClassInspection, resolveActorAbiProfile, installActorResponseRuntime } from ${literal(`./${helper}`)};
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeResponse = Response;
@@ -256,6 +273,7 @@ const SafeTextDecode = TextDecoder.prototype.decode;
 const SafeUint8Array = Uint8Array;
 const SafeEncodeURIComponent = encodeURIComponent;
 const SafeNumberIsSafeInteger = Number.isSafeInteger;
+const ABI_PROFILE = ${runtimeClassRef ? `resolveActorAbiProfile(${literal(runtimeClassRef)})` : "undefined"};
 installActorResponseRuntime();
 const INSPECTION_HEADER = "x-takoserver-private-actor-class-inspection";
 const INSPECTION_TOKEN = ${literal(inspectionToken)};
@@ -279,7 +297,9 @@ async function inspectVersion(request) {
   inspection ??= (async () => {
     try {
       const namespace = await import(${literal(`./${site.mainModule}`)});
-      inspectActorClass(namespace, ${literal(options.className)});
+      if (ABI_PROFILE?.kind === "v2")
+        prepareActorClassInspection({ namespace, exportName: ${literal(options.className)}, profile: ABI_PROFILE });
+      else inspectActorClass(namespace, ${literal(options.className)});
       return 204;
     } catch {
       return 422;
@@ -292,7 +312,7 @@ export class ActorChild {
     const id = state.id.toString();
     const alarm = createActorNativeAlarmPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id);
     this.id = id;
-    this.execution = Promise.all([import(${literal(`./${wrapper}`)}), import(${literal(`./${site.mainModule}`)})]).then(([wrapper, namespace]) => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id, env: wrapper.${SELFHOST_WORKER_PROJECT_ENV_EXPORT}(env), storage: state.storage, alarm, socketPort: nonce => createActorNativeSocketPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id, nonce) }));
+    this.execution = Promise.all([import(${literal(`./${wrapper}`)}), import(${literal(`./${site.mainModule}`)})]).then(([wrapper, namespace]) => createNativeActorExecution({ namespace, exportName: ${literal(options.className)}, id, env: wrapper.${SELFHOST_WORKER_PROJECT_ENV_EXPORT}(env), storage: state.storage, alarm, profile: ABI_PROFILE, socketPort: nonce => createActorNativeSocketPort(env.__TAKOSERVER_ACTOR_ALARM_OWNER, ${literal(alarmToken)}, id, nonce, ABI_PROFILE) }));
   }
   async fetch(request) {
     const incoming = SafeApply(SafeRequestHeaders, request, []);
@@ -310,7 +330,7 @@ export class ActorChild {
           const kind = SafeApply(SafeHeadersGet, incoming, [SOCKET_KIND]);
           if (kind !== "text" && kind !== "binary") return new SafeResponse(null, { status: 503 });
           const bytes = new SafeUint8Array(await SafeApply(SafeRequestArrayBuffer, request, []));
-          if (bytes.byteLength > 8388608) return new SafeResponse(null, { status: 503 });
+          if (bytes.byteLength > (ABI_PROFILE?.socketMessageBytes ?? 8388608)) return new SafeResponse(null, { status: 503 });
           const data = kind === "text" ? SafeApply(SafeTextDecode, new SafeTextDecoder("utf-8", { fatal: true }), [bytes]) : bytes;
           await execution.socketMessage(socketId, data, SafeApply(SafeRequestSignal, request, []), nonce);
         } else if (action === "callback-close") {
@@ -318,6 +338,11 @@ export class ActorChild {
           if (!event || typeof event !== "object" || !SafeNumberIsSafeInteger(event.code) || typeof event.reason !== "string" || typeof event.wasClean !== "boolean")
             return new SafeResponse(null, { status: 503 });
           await execution.socketClose(socketId, { code: event.code, reason: event.reason, wasClean: event.wasClean }, SafeApply(SafeRequestSignal, request, []), nonce);
+        } else if (action === "callback-error" && ABI_PROFILE?.kind === "v2") {
+          const event = await SafeApply(SafeRequestJson, request, []);
+          if (!event || typeof event !== "object" || event.code !== "transport_error")
+            return new SafeResponse(null, { status: 503 });
+          await execution.socketError(socketId, { code: "transport_error" }, SafeApply(SafeRequestSignal, request, []), nonce);
         } else return new SafeResponse(null, { status: 503 });
       }
       return new SafeResponse(null, { status: 204 });
@@ -376,8 +401,9 @@ export default { fetch(request) { return inspectVersion(request); } };`),
   const inspectionTokens = nativeVariants.map((variant) => variant.inspectionToken);
   ownerModules.set(
     owner,
-    encoder.encode(`import { createActorNativeOwner, createActorNativeIngress } from ${literal(`./${first.helper}`)};
-export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}${options.ownerDeadlines ? `, ${JSON.stringify(options.ownerDeadlines)}` : ""});
+    encoder.encode(`import { createActorNativeOwner, createActorNativeIngress, resolveActorAbiProfile } from ${literal(`./${first.helper}`)};
+const ABI_PROFILE = ${runtimeClassRef ? `resolveActorAbiProfile(${literal(runtimeClassRef)})` : "undefined"};
+export const ActorOwner = createActorNativeOwner(${literal(deliveryToken)}, ${literal(admissionToken)}, ${JSON.stringify({ generationKey: graph.generationKey, epoch, variantKeys })}, ${options.ownerDeadlines ? JSON.stringify(options.ownerDeadlines) : "undefined"}, undefined, undefined, ABI_PROFILE);
 const ingress = createActorNativeIngress(${literal(token)}, ${literal(alarmToken)});
 const inspectionTokens = ${JSON.stringify(inspectionTokens)};
 let inspections;

@@ -1,4 +1,9 @@
 import { createActorAddressing } from "./actor-addressing.ts";
+import {
+  type ActorAbiProfile,
+  actorAbiProfile,
+  resolveActorAbiProfile,
+} from "./actor-class-execution.ts";
 import { createActorNamespace } from "./actor-namespace-facade.ts";
 import { createActorUpgradeHandoff } from "./actor-upgrade-handoff.ts";
 
@@ -37,6 +42,8 @@ export interface SelfhostActorForwardBinding {
   readonly httpService: string;
   readonly upgradeService: string;
   readonly token: string;
+  /** Trusted Host metadata; absent bindings retain the released Actor ABI. */
+  readonly runtimeClassRef?: unknown;
 }
 
 type NativeService = { fetch(request: Request): Promise<Response> };
@@ -87,6 +94,7 @@ export function createSelfhostActorForwardContext(options: {
   failure(): Response;
 } {
   const selected = new SafeWeakMap<Request, Selection>();
+  const bindingProfiles = new SafeWeakMap<SelfhostActorForwardBinding, ActorAbiProfile>();
   const handoff = options.original
     ? createActorUpgradeHandoff(options.original, {
         async open(request, ingress) {
@@ -109,6 +117,10 @@ export function createSelfhostActorForwardContext(options: {
           )
             throw new Error("invalid_upgrade");
           const binding = selection.binding;
+          const profile = SafeApply(SafeWeakMapGet, bindingProfiles, [binding]) as
+            | ActorAbiProfile
+            | undefined;
+          if (profile === undefined) throw new Error("Actor binding unavailable");
           const actorService = service(options.rawEnv, binding.upgradeService);
           const nativeFetch = actorService.fetch;
           const native = (await SafeApply(nativeFetch, actorService, [
@@ -161,6 +173,7 @@ export function createSelfhostActorForwardContext(options: {
           };
           return SafeObjectFreeze({
             response,
+            profile,
             commit: () => control("commit"),
             abandon: () => control("abandon"),
           });
@@ -170,6 +183,12 @@ export function createSelfhostActorForwardContext(options: {
   const rawEnv = SafeObjectCreate(options.rawEnv) as Record<string, unknown>;
   for (let index = 0; index < options.bindings.length; index += 1) {
     const binding = options.bindings[index] as SelfhostActorForwardBinding;
+    const runtimeClassRef = binding.runtimeClassRef;
+    const profile =
+      runtimeClassRef === undefined
+        ? actorAbiProfile(undefined)
+        : resolveActorAbiProfile(runtimeClassRef);
+    SafeApply(SafeWeakMapSet, bindingProfiles, [binding, profile]);
     const addressing = createActorAddressing();
     const namespace = createActorNamespace({
       addressing,

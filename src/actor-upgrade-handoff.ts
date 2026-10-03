@@ -51,6 +51,8 @@ const NativeClearTimeout = clearTimeout;
 export interface NativeActorUpgradeReservation {
   /** Native 101 stays only in the Host-private wrapper. */
   readonly response: Response;
+  /** Host-selected per-binding ABI. Never sourced from application headers. */
+  readonly profile?: ActorAbiProfile;
   /** Marks Host transport acceptance, not network receipt of the client head. */
   commit(): void | Promise<void>;
   /** Idempotently discards a provisional connection. */
@@ -83,6 +85,7 @@ export interface NativeActorUpgradeTransport {
 
 type Slot = {
   readonly owner: object;
+  readonly profile: ActorAbiProfile;
   readonly reservation: NativeActorUpgradeReservation;
   readonly handshake: Headers;
   timer: ReturnType<typeof setTimeout> | undefined;
@@ -271,7 +274,7 @@ export function createActorUpgradeHandoff(
     reservationMs <= 0
   )
     throw new Error("Actor upgrade handoff unavailable");
-  const profile = actorAbiProfile(selectedProfile);
+  const fixedProfile = actorAbiProfile(selectedProfile);
   const signal = NativeReflectApply(NativeRequestSignal, original, []) as AbortSignal;
   const ingressHeaders = NativeReflectApply(NativeRequestHeaders, original, []) as Headers;
   const ingressGet = (name: string): string | null =>
@@ -325,6 +328,16 @@ export function createActorUpgradeHandoff(
       )
         throw new Error("invalid_upgrade");
       const reservation = await transport.open(request, ingress);
+      let profile: ActorAbiProfile;
+      try {
+        const selected = reservation.profile;
+        profile = selected === undefined ? fixedProfile : actorAbiProfile(selected);
+        if (selectedProfile !== undefined && profile !== fixedProfile)
+          throw new Error("Actor upgrade ABI mismatch");
+      } catch {
+        await reservation.abandon();
+        throw new Error("backend_unavailable");
+      }
       let status: number;
       let selected: string | null;
       try {
@@ -365,7 +378,14 @@ export function createActorUpgradeHandoff(
       }
       const handshake = copyHeaders(responseHeaders(reservation.response));
       const outcome = createActorUpgradeResponse(handshake, profile);
-      const slot: Slot = { owner, handshake, reservation, state: "provisional", timer: undefined };
+      const slot: Slot = {
+        owner,
+        profile,
+        handshake,
+        reservation,
+        state: "provisional",
+        timer: undefined,
+      };
       NativeReflectApply(NativeWeakMapSet, slots, [outcome, slot]);
       NativeReflectApply(NativeSetAdd, open, [slot]);
       slot.timer = NativeSetTimeout(() => {
@@ -391,7 +411,7 @@ export function createActorUpgradeHandoff(
         alreadyClosed ||
         slot?.owner !== owner ||
         slot.state !== "provisional" ||
-        (source !== undefined && sourceProfile !== profile) ||
+        (source !== undefined && sourceProfile !== slot.profile) ||
         aborted()
       ) {
         await abandonOpen();

@@ -75,6 +75,67 @@ test("handoffs do not commit a reserved response from a different ABI scope", as
     await Promise.all([forward.abandon(), legacy.abandon()]);
   }
 });
+
+test("one handoff keeps mixed binding profiles on their own slots and abandons the unused reservation", async () => {
+  const events: string[] = [];
+  const handoff = createActorUpgradeHandoff(request(), {
+    async open(selected) {
+      const id = new URL(selected.url).pathname;
+      return {
+        response: new NativeResponse(null, { status: 101 }),
+        ...(id === "/v2" ? { profile: v2Profile } : {}),
+        commit() {
+          events.push(`commit:${id}`);
+        },
+        abandon() {
+          events.push(`abandon:${id}`);
+        },
+      };
+    },
+  });
+  try {
+    const legacy = await handoff.actor.fetch(new Request("http://worker.invalid/legacy"));
+    const v2 = await handoff.actor.fetch(new Request("http://worker.invalid/v2"));
+    expect(legacy.clone().status).toBe(101);
+    expect(() => v2.clone()).toThrow(TypeError);
+    expect((await handoff.finish(new Response(null, v2))).status).toBe(101);
+    expect(events).toEqual(["abandon:/legacy", "commit:/v2"]);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
+test("fixed-profile handoff rejects a differently branded reservation", async () => {
+  let abandoned = 0;
+  const handoff = createActorUpgradeHandoff(
+    request(),
+    {
+      async open() {
+        return {
+          response: new NativeResponse(null, { status: 101 }),
+          profile: resolveActorAbiProfile({
+            apiVersion: "interfaces.takoform.com/v1alpha1",
+            name: "worker.actor",
+            version: "1.0.0",
+            schemaDigest: "sha256:f5428fb587de80261dd7363dc5b8a3f4aab7e469fa1b5fce8441ad9acbec8218",
+          }),
+          commit() {},
+          abandon() {
+            abandoned += 1;
+          },
+        };
+      },
+    },
+    30_000,
+    v2Profile,
+  );
+  try {
+    await expect(handoff.actor.fetch(request())).rejects.toThrow("backend_unavailable");
+    expect(abandoned).toBe(1);
+  } finally {
+    await handoff.abandon();
+  }
+});
 function request(): Request {
   return new Request("http://worker.invalid/socket", {
     headers: {

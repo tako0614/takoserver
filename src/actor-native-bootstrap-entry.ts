@@ -1,4 +1,8 @@
-export { inspectActorClass } from "./actor-class-execution.ts";
+export {
+  inspectActorClass,
+  prepareActorClassInspection,
+  resolveActorAbiProfile,
+} from "./actor-class-execution.ts";
 export {
   createActorNativeUpgradeHeaders,
   createNativeActorExecution,
