@@ -40,6 +40,9 @@ const CORE_VERIFIER_ORIGIN = `http://127.0.0.1:${CORE_VERIFIER_PORT}`;
 const WORKER_SUFFIX = "apps.selfhost.test";
 const LANE = "/apis/forms.takoform.com/v1";
 const SPACE = "default";
+const MUTATION_RESPONSE_TIMEOUT_MS = 20_000;
+const OPERATION_RECOVERY_BUDGET_MS = 30_000;
+const OPERATION_ID_PATTERN = /^op_[A-Za-z0-9][A-Za-z0-9._-]{0,124}$/u;
 const KEY = "host-restart/shared-object.txt";
 const FOREIGN_KEY = "host-restart/foreign-sentinel.txt";
 const LOCAL_SECRET = "bucket-object-after-host-restart";
@@ -627,14 +630,16 @@ test.skipIf(
         );
         const query = formQuery(formRef);
         return await operationStep("put", () =>
-          api<Json>(
-            "PUT",
-            `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
-            201,
-            { ...desired, review: objectAt(prepared, "review") },
-            { ...auth, "idempotency-key": `create-${kind}-${name}`, "if-none-match": "*" },
-            "put",
-          ),
+          applyWithOperationRecovery({
+            path: `${LANE}/resources/${stringAt(formRef, "apiVersion")}/${kind}/${name}?${query}`,
+            body: { ...desired, review: objectAt(prepared, "review") },
+            headers: {
+              ...auth,
+              "idempotency-key": `create-${kind}-${name}`,
+              "if-none-match": "*",
+            },
+            expected: { apiVersion: stringAt(formRef, "apiVersion"), kind, name, space: SPACE },
+          }),
         );
       };
 
@@ -1259,31 +1264,18 @@ async function api<T = Json>(
   headers: Record<string, string> = {},
   operation: JourneyDiagnosticOperation = "request",
   fetchRequest: HostApiFetch = (request) => fetch(request),
+  timeoutMilliseconds = 10_000,
 ): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetchRequest(
-      new Request(`${HOST_ORIGIN}${path}`, {
-        method,
-        headers: {
-          ...(body === undefined ? {} : { "content-type": "application/json" }),
-          ...headers,
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        signal: AbortSignal.timeout(10_000),
-      }),
-    );
-  } catch (cause) {
-    throw new JourneyApiFailure(
-      operation,
-      method,
-      "transport",
-      undefined,
-      expectedStatus,
-      undefined,
-      cause,
-    );
-  }
+  const response = await apiResponse(
+    method,
+    path,
+    expectedStatus,
+    body,
+    headers,
+    operation,
+    fetchRequest,
+    timeoutMilliseconds,
+  );
   if (response.status !== expectedStatus) {
     const code = await boundedApiErrorCode(response);
     throw new JourneyApiFailure(
@@ -1309,6 +1301,190 @@ async function api<T = Json>(
       cause,
     );
   }
+}
+
+async function apiResponse(
+  method: JourneyHttpMethod,
+  path: string,
+  expectedStatus: number,
+  body: unknown,
+  headers: Record<string, string>,
+  operation: JourneyDiagnosticOperation,
+  fetchRequest: HostApiFetch,
+  timeoutMilliseconds: number,
+): Promise<Response> {
+  try {
+    return await fetchRequest(
+      new Request(`${HOST_ORIGIN}${path}`, {
+        method,
+        headers: {
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...headers,
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(timeoutMilliseconds),
+      }),
+    );
+  } catch (cause) {
+    throw new JourneyApiFailure(
+      operation,
+      method,
+      "transport",
+      undefined,
+      expectedStatus,
+      undefined,
+      cause,
+    );
+  }
+}
+
+async function applyWithOperationRecovery(input: {
+  readonly path: string;
+  readonly body: Json;
+  readonly headers: Record<string, string>;
+  readonly expected: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly name: string;
+    readonly space: string;
+  };
+}): Promise<Json> {
+  const startedAt = performance.now();
+  const submission = await apiResponse(
+    "PUT",
+    input.path,
+    201,
+    input.body,
+    input.headers,
+    "put",
+    (request) => fetch(request),
+    MUTATION_RESPONSE_TIMEOUT_MS,
+  );
+  if (submission.status === 201) {
+    const resource = (await submission.json()) as Json;
+    assertMutationResourceIdentity(resource, input.expected);
+    observeJourneyDiagnostic(
+      `[selfhost-object-bucket-host-restart] operation=put outcome=resource status=201 elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+    );
+    return resource;
+  }
+  if (submission.status !== 202) {
+    const code = await boundedApiErrorCode(submission);
+    throw new JourneyApiFailure("put", "PUT", "http_status", submission.status, 201, code);
+  }
+
+  const accepted = (await submission.json()) as Json;
+  const acceptedOperation = objectAt(accepted, "operation");
+  const operationId = stringAt(acceptedOperation, "id");
+  if (
+    acceptedOperation.apiVersion !== "operations.takoform.com/v1alpha1" ||
+    acceptedOperation.kind !== "Operation" ||
+    acceptedOperation.done !== false ||
+    !OPERATION_ID_PATTERN.test(operationId)
+  ) {
+    throw new Error("selfhost_object_bucket_operation_acceptance_invalid");
+  }
+  observeJourneyDiagnostic(
+    `[selfhost-object-bucket-host-restart] operation=put outcome=accepted status=202 elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+  );
+
+  const recoveryDeadline = performance.now() + OPERATION_RECOVERY_BUDGET_MS;
+  const operationPath = `${LANE}/operations/${encodeURIComponent(operationId)}`;
+  let delay = retryAfterDelayMilliseconds(submission.headers, 0);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const remaining = recoveryDeadline - performance.now();
+    if (remaining <= delay + 1) {
+      throw new Error("selfhost_object_bucket_operation_wait_deadline_exceeded");
+    }
+    if (delay > 0) await Bun.sleep(delay);
+    const timeoutMilliseconds = Math.max(
+      1,
+      Math.min(MUTATION_RESPONSE_TIMEOUT_MS, Math.floor(recoveryDeadline - performance.now())),
+    );
+    const pollResponse = await apiResponse(
+      "GET",
+      operationPath,
+      200,
+      undefined,
+      input.headers,
+      "request",
+      (request) => fetch(request),
+      timeoutMilliseconds,
+    );
+    if (pollResponse.status !== 200) {
+      const code = await boundedApiErrorCode(pollResponse);
+      throw new JourneyApiFailure("request", "GET", "http_status", pollResponse.status, 200, code);
+    }
+    const poll = (await pollResponse.json()) as Json;
+    if (
+      poll.id !== operationId ||
+      poll.apiVersion !== "operations.takoform.com/v1alpha1" ||
+      poll.kind !== "Operation"
+    ) {
+      throw new Error("selfhost_object_bucket_operation_response_invalid");
+    }
+    if (poll.done === true) {
+      if (poll.error !== undefined) {
+        const error =
+          typeof poll.error === "object" && poll.error !== null ? (poll.error as Json) : undefined;
+        const code =
+          typeof error?.code === "string" && /^[a-z][a-z0-9_]{0,63}$/u.test(error.code)
+            ? error.code
+            : "unknown";
+        throw new Error(`selfhost_object_bucket_operation_failed_${code}`);
+      }
+      const result = objectAt(poll, "result");
+      const resource = objectAt(result, "resource");
+      assertMutationResourceIdentity(resource, input.expected);
+      observeJourneyDiagnostic(
+        `[selfhost-object-bucket-host-restart] operation=operation_poll outcome=settled status=200 elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+      );
+      return resource;
+    }
+    if (poll.done !== false) throw new Error("selfhost_object_bucket_operation_state_invalid");
+    observeJourneyDiagnostic(
+      `[selfhost-object-bucket-host-restart] operation=operation_poll outcome=pending status=200 elapsed_ms=${elapsedMilliseconds(startedAt)}`,
+    );
+    delay = retryAfterDelayMilliseconds(pollResponse.headers, attempt + 1);
+  }
+  throw new Error("selfhost_object_bucket_operation_poll_limit_exceeded");
+}
+
+function assertMutationResourceIdentity(
+  resource: Json,
+  expected: {
+    readonly apiVersion: string;
+    readonly kind: string;
+    readonly name: string;
+    readonly space: string;
+  },
+): void {
+  const metadata = objectAt(resource, "metadata");
+  if (
+    resource.apiVersion !== expected.apiVersion ||
+    resource.kind !== expected.kind ||
+    metadata.name !== expected.name ||
+    metadata.space !== expected.space ||
+    typeof metadata.uid !== "string" ||
+    metadata.uid.length === 0
+  ) {
+    throw new Error("selfhost_object_bucket_mutation_identity_invalid");
+  }
+}
+
+function retryAfterDelayMilliseconds(headers: Headers, attempt: number): number {
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter === null) {
+    return Math.floor(Math.random() * Math.min(1_000, 100 * 2 ** Math.min(attempt, 3)));
+  }
+  if (!/^(0|[1-9][0-9]*)$/u.test(retryAfter)) {
+    throw new Error("selfhost_object_bucket_retry_after_invalid");
+  }
+  const milliseconds = Number(retryAfter) * 1_000;
+  if (!Number.isSafeInteger(milliseconds)) {
+    throw new Error("selfhost_object_bucket_retry_after_invalid");
+  }
+  return milliseconds;
 }
 
 async function boundedApiErrorCode(response: Response): Promise<string> {
