@@ -94,6 +94,11 @@ type JourneyPhase =
   | "pre_restart_resource_readback"
   | "host_exit_restart"
   | "v2_read_after_restart"
+  | "pre_parent_sigkill_storage_readback"
+  | "host_parent_sigkill"
+  | "host_foreign_listener_refusal"
+  | "host_parent_sigkill_recovery"
+  | "post_parent_sigkill_resource_readback"
   | "dependency_delete_and_absence"
   | "owned_process_and_fixture_cleanup";
 type ProcessIdentity = {
@@ -262,6 +267,8 @@ test.skipIf(WORKERD === null)(
     let verifier: ReturnType<typeof Bun.spawn> | undefined;
     let admission: ReturnType<typeof Bun.spawn> | undefined;
     let host: Host | undefined;
+    let foreignWorkerListener: ReturnType<typeof Bun.serve> | undefined;
+    const parentKilledWorkerds: ProcessIdentity[] = [];
     let primaryFailure: unknown;
     let hasPrimaryFailure = false;
     let cleanupFailed = false;
@@ -766,6 +773,151 @@ test.skipIf(WORKERD === null)(
         expect(identityIsLive(restartIdentities.newHostIdentity)).toBe(true);
       });
 
+      await withJourneyPhase("pre_parent_sigkill_storage_readback", async () => {
+        const body = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(body).toMatchObject({
+          version: "v2",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
+      });
+
+      const parentCrashIdentities = await withJourneyPhase("host_parent_sigkill", async () => {
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_pre_parent_sigkill_host_missing");
+        rememberDescendants(currentHost);
+        const oldHostIdentity = processIdentity(currentHost.pid);
+        const acceptedWorkerd = acceptedWorkerdPath(sourceRoot);
+        if (!existsSync(acceptedWorkerd)) throw new Error("accepted_workerd_snapshot_missing");
+        const oldWorkerd = uniqueWorkerd(currentHost, acceptedWorkerd);
+
+        currentHost.kill("SIGKILL");
+        const exitCode = await Promise.race([
+          currentHost.exited,
+          Bun.sleep(5_000).then(() => null),
+        ]);
+        if (exitCode === null) throw new Error("selfhost_host_sigkill_timeout");
+        host = undefined;
+        parentKilledWorkerds.push(oldWorkerd);
+        expect<string | null>(currentHost.signalCode).toBe("SIGKILL");
+        expect(identityIsLive(oldHostIdentity)).toBe(false);
+
+        // Recovery must observe the kernel's parent-death cleanup. Do not
+        // signal the Workerd child here; exact-identity cleanup is finalizer-only.
+        await waitForProcessIdentitiesGone([oldWorkerd]);
+        await waitForPortClosed(API_PORT);
+        await waitForPortClosed(443);
+        expect(identityIsLive(oldWorkerd)).toBe(false);
+        return { oldHostIdentity, oldWorkerd, acceptedWorkerd };
+      });
+
+      const foreignAttempt = await withJourneyPhase("host_foreign_listener_refusal", async () => {
+        const configPath = join(sourceRoot, "workers", "workerd.capnp");
+        const configBeforeForeignListener = readFileSync(configPath);
+        const certificate = readFileSync(cert, "utf8");
+        const privateKey = readFileSync(join(tlsDirectory, "worker-key.pem"), "utf8");
+        foreignWorkerListener = Bun.serve({
+          hostname: "127.0.0.1",
+          port: 443,
+          tls: { cert: certificate, key: privateKey },
+          fetch: () => new Response("foreign-listener-marker"),
+        });
+        expect(foreignWorkerListener.port).toBe(443);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+
+        host = startHost(hostEnvironment);
+        await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+        rememberDescendants(host);
+        const failedRestoreHost = host;
+        const failedRestoreHostIdentity = processIdentity(failedRestoreHost.pid);
+        const live = await fetch(`${HOST_ORIGIN}/_takoserver/health/live`, {
+          signal: AbortSignal.timeout(1_000),
+        });
+        expect(live.status).toBe(200);
+        expect(await live.json()).toEqual({ status: "live" });
+        const ready = await fetch(`${HOST_ORIGIN}/_takoserver/health/ready`, {
+          signal: AbortSignal.timeout(1_000),
+        });
+        expect(ready.status).toBe(503);
+        expect(await ready.json()).toMatchObject({
+          status: "not_ready",
+          database: "readable",
+          workerRuntime: "restore-failed",
+          supervisor: "unavailable",
+        });
+        expect(readFileSync(configPath)).toEqual(configBeforeForeignListener);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+        expect(identityIsLive(failedRestoreHostIdentity)).toBe(true);
+        expect(
+          [...(observedDescendants.get(failedRestoreHost)?.values() ?? [])].filter(
+            (identity) =>
+              identity.executable === parentCrashIdentities.acceptedWorkerd &&
+              identityIsLive(identity),
+          ),
+        ).toHaveLength(0);
+
+        await stopHostWhileWorkerPortForeign(failedRestoreHost);
+        host = undefined;
+        expect(identityIsLive(failedRestoreHostIdentity)).toBe(false);
+        expect(await workerRequest(hostname, cert, "/")).toBe("foreign-listener-marker");
+        foreignWorkerListener.stop(true);
+        foreignWorkerListener = undefined;
+        await waitForPortClosed(443);
+        return { failedRestoreHostIdentity };
+      });
+
+      const parentCrashRecovery = await withJourneyPhase(
+        "host_parent_sigkill_recovery",
+        async () => {
+          host = startHost(hostEnvironment);
+          await waitForHost(host, `${HOST_ORIGIN}/.well-known/takoform/v1`);
+          const recoveredHost = host;
+          const newHostIdentity = processIdentity(recoveredHost.pid);
+          expect(newHostIdentity.pid).not.toBe(parentCrashIdentities.oldHostIdentity.pid);
+          expect(newHostIdentity.startTicks).not.toBe(
+            parentCrashIdentities.oldHostIdentity.startTicks,
+          );
+          expect(newHostIdentity.pid).not.toBe(foreignAttempt.failedRestoreHostIdentity.pid);
+          expect(newHostIdentity.startTicks).not.toBe(
+            foreignAttempt.failedRestoreHostIdentity.startTicks,
+          );
+          expect(newHostIdentity.executable).toBe(parentCrashIdentities.oldHostIdentity.executable);
+
+          const ready = await fetch(`${HOST_ORIGIN}/_takoserver/health/ready`, {
+            signal: AbortSignal.timeout(1_000),
+          });
+          expect(ready.status).toBe(200);
+          expect(await ready.json()).toMatchObject({
+            status: "ready",
+            database: "readable",
+            workerRuntime: "serving",
+          });
+          return { newHostIdentity };
+        },
+      );
+
+      await withJourneyPhase("post_parent_sigkill_resource_readback", async () => {
+        const restored = await resourceGraph(auth, forms, resources);
+        expect(restored).toEqual(beforeRestart);
+        const body = JSON.parse(await workerRequest(hostname, cert, "/read")) as Json;
+        expect(body).toMatchObject({
+          version: "v2",
+          value: VALUE,
+          rows: [{ id: "kept", body: VALUE }],
+        });
+        expect(await workerRequest(hostname, cert, "/")).toBe("v2");
+
+        const currentHost = host;
+        if (!currentHost) throw new Error("selfhost_post_parent_sigkill_host_missing");
+        rememberDescendants(currentHost);
+        const restoredWorkerd = uniqueWorkerd(currentHost, parentCrashIdentities.acceptedWorkerd);
+        expect(restoredWorkerd.pid).not.toBe(parentCrashIdentities.oldWorkerd.pid);
+        expect(restoredWorkerd.startTicks).not.toBe(parentCrashIdentities.oldWorkerd.startTicks);
+        expect(restoredWorkerd.executable).toBe(parentCrashIdentities.acceptedWorkerd);
+        expect(identityIsLive(restoredWorkerd)).toBe(true);
+        expect(identityIsLive(parentCrashRecovery.newHostIdentity)).toBe(true);
+      });
+
       await withJourneyPhase("dependency_delete_and_absence", async () => {
         for (const [kind, name] of deleteOrder) {
           await deleteResource(auth, forms, kind, name);
@@ -791,10 +943,33 @@ test.skipIf(WORKERD === null)(
               cleanupFailed = true;
             }
           }
+          if (host && foreignWorkerListener) {
+            try {
+              await stopHostWhileWorkerPortForeign(host);
+              host = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          if (foreignWorkerListener) {
+            try {
+              foreignWorkerListener.stop(true);
+              foreignWorkerListener = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
           if (host) {
             try {
               await stopHost(host);
               host = undefined;
+            } catch {
+              cleanupFailed = true;
+            }
+          }
+          for (const identity of parentKilledWorkerds) {
+            try {
+              await stopOwnedIdentityAfterFailure(identity);
             } catch {
               cleanupFailed = true;
             }
@@ -1089,6 +1264,38 @@ async function stopHost(host: Host): Promise<void> {
   await waitForProcessIdentitiesGone(descendants.values());
   await waitForPortClosed(API_PORT);
   await waitForPortClosed(443);
+}
+
+async function stopHostWhileWorkerPortForeign(host: Host): Promise<void> {
+  rememberDescendants(host);
+  const descendants = observedDescendants.get(host) ?? new Map<string, ProcessIdentity>();
+  if (host.exitCode !== null || host.signalCode !== null) {
+    throw new Error("selfhost_host_exited_before_foreign_listener_stop");
+  }
+  const expectedHost = processIdentity(host.pid);
+  host.kill("SIGTERM");
+  const exitCode = await Promise.race([host.exited, Bun.sleep(5_000).then(() => null)]);
+  if (exitCode === null) throw new Error("selfhost_host_foreign_listener_stop_timeout");
+  if (exitCode !== 0) throw new Error("selfhost_host_foreign_listener_stop_failed");
+  expect(identityIsLive(expectedHost)).toBe(false);
+  await waitForProcessIdentitiesGone(descendants.values());
+  await waitForPortClosed(API_PORT);
+}
+
+async function stopOwnedIdentityAfterFailure(identity: ProcessIdentity): Promise<void> {
+  if (!identityIsLive(identity)) return;
+  const current = processIdentity(identity.pid);
+  if (current.startTicks !== identity.startTicks || current.executable !== identity.executable) {
+    throw new Error("selfhost_cleanup_process_identity_changed");
+  }
+  try {
+    process.kill(identity.pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+      throw new Error("selfhost_owned_process_cleanup_failed");
+    }
+  }
+  await waitForProcessIdentitiesGone([identity]);
 }
 
 async function stopOwnedProcess(child: ReturnType<typeof Bun.spawn>): Promise<void> {

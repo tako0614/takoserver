@@ -56,7 +56,12 @@ claim GA status.
    binary for `TAKOSERVER_WORKERD_BINARY`: Worker execution requires the exact
    currently reviewed, accepted workerd artifact and source configuration.
    Without that artifact, worker-backed execution is unavailable rather than
-   silently selecting npm's binary.
+   silently selecting npm's binary. This Linux/x64 Worker lane also requires
+   `/usr/bin/setpriv`, `/bin/sh`, and mounted Linux `/proc`. The Host uses them
+   to bind its workerd child to the Host process and verify that the configured
+   Worker TCP port belongs to that child. Missing support disables Worker
+   serving rather than falling back to an unbound child; SQLite and storage
+   remain independent.
 
 4. Stop the Bun Host through the supervisor actually used for this installation
    and wait for its child `workerd` and all other writers to exit. Then run the

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { workerPortOwnership } from "./workerd-linux-process.ts";
 
 /**
  * Keeping workerd running.
@@ -18,6 +19,7 @@ import { join } from "node:path";
 
 export interface WorkerdProcess {
   kill(): void;
+  readonly pid?: number;
   /** Bun exposes this promise; test doubles may omit it. */
   readonly exited?: Promise<number>;
 }
@@ -29,6 +31,8 @@ export interface WorkerdSupervisor {
   isReady(): boolean;
   /** A fresh read-only view of the child lifecycle; it does not start recovery. */
   snapshot(): WorkerdSupervisorSnapshot;
+  /** Refuse to rewrite a watched config while an unknown process owns its port. */
+  assertMayRender(): Promise<void>;
   stop(): void;
 }
 
@@ -79,8 +83,9 @@ export function findWorkerd(repositoryRoot: string): string | null {
 export function createWorkerdSupervisor(options: {
   readonly binary: string | null;
   readonly spawn: (command: readonly string[]) => WorkerdProcess;
+  readonly listenerPort?: number;
   /** A real listener/readiness check supplied by the serving composition. */
-  readonly readiness?: (configPath: string) => Promise<boolean>;
+  readonly readiness?: (configPath: string, child: WorkerdProcess) => Promise<boolean>;
   readonly log?: (message: string) => void;
   /** Internal clock seam for deterministic recovery tests. */
   readonly scheduleRestart?: ScheduleRestart;
@@ -219,7 +224,9 @@ export function createWorkerdSupervisor(options: {
   };
 
   const awaitReadiness = async (entry: RuntimeEntry): Promise<boolean> => {
-    const readiness = Promise.resolve().then(() => options.readiness?.(entry.configPath));
+    const readiness = Promise.resolve().then(() =>
+      options.readiness?.(entry.configPath, entry.process),
+    );
     const exited = entry.process.exited;
     if (!exited) return (await readiness) ?? false;
 
@@ -340,6 +347,14 @@ export function createWorkerdSupervisor(options: {
       else if (desired || firstStartFailed || stoppedAfterRequiredRuntime) state = "unavailable";
       else state = "idle";
       return Object.freeze({ state });
+    },
+
+    async assertMayRender() {
+      if (options.listenerPort === undefined) return;
+      const ownership = await workerPortOwnership(options.listenerPort, running?.process.pid);
+      if (ownership === "foreign") {
+        throw new Error("workerd listener port is occupied by a process not owned by this Host");
+      }
     },
 
     stop() {

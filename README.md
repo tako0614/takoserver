@@ -349,6 +349,11 @@ Takoserver copies the verified bytes into its private data root and executes
 that snapshot for both inspection and serving. Replacing the configured input
 path therefore cannot silently change the runtime identity of an already
 running process.
+On the supported Linux/x64 Worker path, `/usr/bin/setpriv`, `/bin/sh`, and
+Linux `/proc` are also required: the child is bound to the Bun Host's lifetime
+and its TCP listener must belong to that exact child. If these prerequisites
+are missing, Worker serving fails closed; the Host's storage paths do not
+require them.
 
 A Worker that declares static assets gets them through Host-private asset
 services; no native `ASSETS` binding is exposed to tenant code.

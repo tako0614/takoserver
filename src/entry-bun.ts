@@ -69,6 +69,7 @@ import {
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
+import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
 
@@ -309,14 +310,22 @@ const workerdBinary = workerdSelection.binary;
 if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
 const workerd = createWorkerdSupervisor({
   binary: workerdBinary,
-  spawn: (command) => Bun.spawn(command as string[], { stdout: "inherit", stderr: "inherit" }),
+  listenerPort: workerdPort,
+  spawn: (command) =>
+    spawnWorkerdWithParentDeath(command, { stdout: "inherit", stderr: "inherit" }),
   log: (message) => process.stdout.write(`${message}\n`),
-  readiness: async () => {
-    // A successful HTTP response (including the router's honest 404) proves
-    // that the child is listening. Retry briefly to cover workerd startup
-    // without recording a serving marker before a real liveness check.
+  readiness: async (_configPath, child) => {
+    // HTTP alone can be answered by an orphan or a foreign listener. Require
+    // the kernel listener inode to be held by this exact spawned PID both
+    // before and after the response.
     for (let attempt = 0; attempt < 20; attempt += 1) {
       try {
+        const before = await workerPortOwnership(workerdPort, child.pid);
+        if (before === "foreign") return false;
+        if (before !== "owned") {
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+          continue;
+        }
         // By address over loopback, so a certificate naming the endpoint suffix
         // is not the thing being checked here — that the child is listening is.
         const response = await fetch(
@@ -326,10 +335,16 @@ const workerd = createWorkerdSupervisor({
             signal: AbortSignal.timeout(250),
           },
         );
-        return response.status >= 100;
+        if (
+          response.status >= 100 &&
+          (await workerPortOwnership(workerdPort, child.pid)) === "owned"
+        )
+          return true;
       } catch {
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        // The child may still be starting, or /proc may be unavailable. The
+        // latter must never turn an unrelated HTTP listener into readiness.
       }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
     return false;
   },
@@ -496,6 +511,7 @@ const workerdRuntime = createWorkerdRuntime({
   // Host transport from this process, not a Version's saved ephemeral port.
   ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
   ...(workerdTls ? { tls: workerdTls } : {}),
+  beforeRender: () => workerd.assertMayRender(),
   isReady: () => workerd.isReady(),
   async onReload(configPath) {
     // Started on the first publish rather than unconditionally, so a machine
