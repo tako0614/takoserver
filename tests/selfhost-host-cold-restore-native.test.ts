@@ -401,6 +401,7 @@ test.skipIf(WORKERD === null)(
         options: {
           readonly expectedGeneration?: string;
           readonly ifMatchRevision?: string;
+          readonly idempotencyKey?: string;
         } = {},
       ): Promise<Json> {
         const formRef = forms.get(kind);
@@ -435,7 +436,8 @@ test.skipIf(WORKERD === null)(
           { ...desired, review },
           {
             ...auth,
-            "idempotency-key": `${kind}-${name}-${updating ? "update" : "create"}`,
+            "idempotency-key":
+              options.idempotencyKey ?? `${kind}-${name}-${updating ? "update" : "create"}`,
             ...(updating
               ? {
                   "if-match": `"${options.ifMatchRevision}"`,
@@ -628,7 +630,8 @@ test.skipIf(WORKERD === null)(
 
       // Only external TLS file paths are rebased. The origin, ports, signing and
       // operator identities, API token, and Worker endpoint remain unchanged.
-      // There is no client resource publication after this point.
+      // The client does not mutate resources until restored state has been
+      // read back through the new Host and its Worker data plane.
       host = await runDiagnosticStage(diagnosticTrace, "restored_host_ready", async () => {
         const startedHost = startHost(hostEnvironment(restoredRoot, restoredDb, restoredTls));
         host = startedHost;
@@ -651,15 +654,75 @@ test.skipIf(WORKERD === null)(
       );
       expect(endpointAfter).toBe(endpointBefore);
 
+      // Update the recovered Deployment through the normal prepared public
+      // Host path, selecting the already-retained V1 bundle/version. This
+      // exercises If-Match and expected-generation against the restored state.
+      const deploymentBeforeRestoreUpdate = resourceGraphItem(
+        graphAfter,
+        "WorkerDeployment",
+        "cold-restore-deployment",
+      );
+      const restoredDeploymentV1Spec = {
+        worker: reference("ModuleWorker", "cold-restore-worker"),
+        versions: [
+          {
+            workerVersion: reference("WorkerVersion", "cold-restore-version"),
+            weight: 10_000,
+          },
+        ],
+      };
+      const restoredDeploymentV1 = await apply(
+        "WorkerDeployment",
+        "cold-restore-deployment",
+        restoredDeploymentV1Spec,
+        {
+          expectedGeneration: stringAt(deploymentBeforeRestoreUpdate, "generation"),
+          ifMatchRevision: stringAt(deploymentBeforeRestoreUpdate, "revision"),
+          idempotencyKey: "WorkerDeployment-cold-restore-deployment-select-v1",
+        },
+      );
+      const restoredDeploymentV1Metadata = objectAt(restoredDeploymentV1, "metadata");
+      const deploymentUid = stringAt(deploymentBeforeRestoreUpdate, "uid");
+      const generationBeforeRestoreUpdate = BigInt(
+        stringAt(deploymentBeforeRestoreUpdate, "generation"),
+      );
+      expect(stringAt(restoredDeploymentV1Metadata, "uid")).toBe(deploymentUid);
+      expect(BigInt(stringAt(restoredDeploymentV1Metadata, "generation"))).toBe(
+        generationBeforeRestoreUpdate + 1n,
+      );
+      expect(stringAt(restoredDeploymentV1Metadata, "revision")).not.toBe(
+        stringAt(deploymentBeforeRestoreUpdate, "revision"),
+      );
+
+      const graphAfterRestoreUpdate = await readResourceGraph(auth, forms);
+      const deploymentAfterRestoreUpdate = resourceGraphItem(
+        graphAfterRestoreUpdate,
+        "WorkerDeployment",
+        "cold-restore-deployment",
+      );
+      expect(stringAt(deploymentAfterRestoreUpdate, "uid")).toBe(deploymentUid);
+      expect(BigInt(stringAt(deploymentAfterRestoreUpdate, "generation"))).toBe(
+        generationBeforeRestoreUpdate + 1n,
+      );
+      expect(stringAt(deploymentAfterRestoreUpdate, "revision")).not.toBe(
+        stringAt(deploymentBeforeRestoreUpdate, "revision"),
+      );
+      const restoredDeploymentSpec = objectAt(deploymentAfterRestoreUpdate, "spec");
+      expect(restoredDeploymentSpec).toEqual(restoredDeploymentV1Spec);
+      expect(await workerRequest(hostname, join(restoredTls, "worker-cert.pem"), "/")).toBe(
+        WORKER_MARKER_V1,
+      );
+
       // Delete through the public Host API in reverse dependency order. Each
-      // delete uses generation/revision read from the same public resource GET.
+      // delete reads the latest post-update generation/revision from the public
+      // API before applying its own conditional mutation.
       for (const [kind, name] of RESOURCE_DELETE_ORDER) {
         await deleteResource(
           auth,
           forms,
           kind,
           name,
-          stringAt(resourceGraphItem(graphAfter, kind, name), "uid"),
+          stringAt(resourceGraphItem(graphAfterRestoreUpdate, kind, name), "uid"),
         );
       }
       await waitForWorkerEndpointRemoval(
@@ -667,7 +730,7 @@ test.skipIf(WORKERD === null)(
         restoredHostIdentity,
         hostname,
         join(restoredTls, "worker-cert.pem"),
-        WORKER_MARKER_V2,
+        WORKER_MARKER_V1,
       );
     } catch (error) {
       primaryFailure = error;
@@ -1356,6 +1419,7 @@ async function readResourceGraph(
       kind,
       name,
       uid: stringAt(metadata, "uid"),
+      generation: stringAt(metadata, "generation"),
       revision: stringAt(metadata, "revision"),
       spec: objectAt(resource, "spec"),
       ...(status.outputs === undefined ? {} : { outputs: objectValue(status.outputs, "outputs") }),
