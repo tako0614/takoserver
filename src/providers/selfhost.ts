@@ -2208,7 +2208,7 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     const actorNamespace = options.actorNamespace;
     if (
       !Array.isArray(raw) ||
-      raw.length > 32 ||
+      raw.length > 64 ||
       !actorNamespace ||
       input.offering.bindingRefs.filter(
         (ref) => canonicalJson(ref) === canonicalJson(SELFHOST_ACTOR_BINDING_REF),
@@ -2534,6 +2534,13 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
       (!input.identity.uid || !RESOURCE_UID.test(input.identity.uid))
     ) {
       return failed("invalid_spec", "the Worker Version has no exact Resource UID");
+    }
+    if (actorBindings.length > 0 && (!runtime.publish || !runtime.publishActorDeployment)) {
+      return failed(
+        "unavailable",
+        "the Actor Version needs a capacity-qualified weighted runtime",
+        true,
+      );
     }
     if (dataBindings.length > 0 && !options.dataPlaneAddress) {
       return failed(
@@ -3119,8 +3126,11 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     };
     // Full materialization, bindings, module inspection, event gates, and
     // service UID fencing are prepared before durable activation state moves.
-    const preparedWorkerResourceUid = runtime.publish
-      ? (await prepareWeightedRuntimePublication(script, next)).workerResourceUid
+    const preparedPublication = runtime.publish
+      ? await prepareWeightedRuntimePublication(script, next)
+      : null;
+    const preparedWorkerResourceUid = preparedPublication
+      ? preparedPublication.workerResourceUid
       : (
           await prepareRuntimeVersion(
             script,
@@ -3133,9 +3143,32 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
     if (preparedWorkerResourceUid !== desired.workerResourceUid) {
       return failed("invalid_spec", "the deployed Versions do not belong to this Worker");
     }
-    await writeScriptState(script, current, next);
+    const actorDeployment =
+      preparedPublication?.versions.some((version) => version.site.actorForward !== undefined) ??
+      false;
+    const publishActorDeployment = runtime.publishActorDeployment?.bind(runtime);
+    if (actorDeployment && (!publishActorDeployment || !preparedPublication)) {
+      return failed("unavailable", "the Actor deployment capacity owner is unavailable", true);
+    }
     try {
-      await publishScript(script);
+      if (actorDeployment && preparedPublication && publishActorDeployment) {
+        // The runtime owns one activation queue from complete-graph reservation
+        // through this Provider-owned CAS and pointer publication. Capacity
+        // refusal happens before any desired-state write; later reload failure
+        // retains the ordinary recoverable desired-state semantics.
+        await runtimeOperation(() =>
+          publishActorDeployment(script, preparedPublication, async () => {
+            await writeScriptState(script, current, next);
+          }),
+        );
+        await probeReadiness(
+          script,
+          createHash("sha256").update(preparedPublication.generation, "utf8").digest("hex"),
+        );
+      } else {
+        await writeScriptState(script, current, next);
+        await publishScript(script);
+      }
     } catch (error) {
       if (error instanceof SelfhostFailure) return error.ticket;
       throw error;

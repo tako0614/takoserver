@@ -138,6 +138,8 @@ export async function openSelfhostActorUpgradeBroker(
   options: SelfhostActorUpgradeBrokerOptions,
 ): Promise<{
   readonly socketPath: string;
+  /** Keep provisional commit/abandon ingress until those leases settle. */
+  retire(): Promise<void>;
   close(): Promise<void>;
 }> {
   if (!isAbsolute(options.socketPath) || !/^[0-9a-f]{64}$/u.test(options.token))
@@ -146,12 +148,24 @@ export async function openSelfhostActorUpgradeBroker(
   const pending = new Map<string, Pending>();
   const sockets = new Set<Socket>();
   let admitting = 0;
+  let retiring = false;
+  let stopping: Promise<void> | undefined;
+  let resolveRetirement: (() => void) | undefined;
+  let retirement: Promise<void> | undefined;
+  const stopAccepting = (): void => {
+    stopping ??= new Promise<void>((resolve) => server.close(() => resolve()));
+    void stopping.then(() => resolveRetirement?.());
+  };
+  const maybeStopAccepting = (): void => {
+    if (retiring && pending.size === 0 && admitting === 0) stopAccepting();
+  };
   const abandon = (id: string): void => {
     const entry = pending.get(id);
     if (!entry || entry.state === "committed" || entry.state === "abandoned") return;
     entry.state = "abandoned";
     clearTimeout(entry.timer);
     pending.delete(id);
+    maybeStopAccepting();
     try {
       void entry.lease.abandonTransport(entry.ownerBearer).catch(() => entry.lease.abandon());
     } catch {
@@ -212,6 +226,7 @@ export async function openSelfhostActorUpgradeBroker(
             record.state = "committed";
             clearTimeout(record.timer);
             pending.delete(reservationId);
+            maybeStopAccepting();
             if (record.upstreamTail.length) record.client.write(record.upstreamTail);
             if (record.clientTail.length) record.upstream.write(record.clientTail);
             record.client.pipe(record.upstream);
@@ -224,6 +239,10 @@ export async function openSelfhostActorUpgradeBroker(
             abandon(reservationId);
             reply(client, 503);
           }
+          return;
+        }
+        if (retiring) {
+          reply(client, 503);
           return;
         }
         const match = /^GET (\S+) HTTP\/1\.1$/u.exec(parsed.first);
@@ -331,6 +350,7 @@ export async function openSelfhostActorUpgradeBroker(
         reply(client, 503);
       } finally {
         if (counted) admitting -= 1;
+        maybeStopAccepting();
       }
     })();
   });
@@ -343,10 +363,23 @@ export async function openSelfhostActorUpgradeBroker(
   });
   return Object.freeze({
     socketPath: options.socketPath,
+    retire(): Promise<void> {
+      if (!retirement) {
+        retirement = new Promise<void>((resolve) => {
+          resolveRetirement = resolve;
+        });
+        if (stopping) void stopping.then(() => resolveRetirement?.());
+      }
+      retiring = true;
+      maybeStopAccepting();
+      return retirement;
+    },
     async close(): Promise<void> {
       for (const id of pending.keys()) abandon(id);
       for (const socket of sockets) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      retiring = true;
+      stopAccepting();
+      await stopping;
     },
   });
 }

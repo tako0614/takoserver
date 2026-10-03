@@ -197,3 +197,104 @@ test("Actor broker owner restores exact v8 Version tokens for two callers of one
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("Actor reservations release failed attempts and reuse bounded broker slots across updates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "actor-public-capacity-"));
+  const f = fixture();
+  const owner = await openSelfhostActorPublicRuntime({
+    dataRoot: root,
+    runtimeRoot: root,
+    socketParent: join(root, "sockets"),
+    binary: "/never-execute",
+    graph: f.read,
+    deployments: f.deployments,
+    providerPackRef: "selfhost",
+    providerInstallationRef: "local.primary",
+  });
+  try {
+    await f.deployments.create({
+      tenantId: scope.tenantId,
+      id: "deployment-holder",
+      resourceUid: f.target.metadata.uid,
+      offeringId: "worker-local",
+      providerPackRef: "selfhost",
+      providerInstallationRef: "local.primary",
+      nativeId: "selfhost-worker:worker:operation-1",
+      state: "active",
+      observed: {},
+      outputs: { scriptName: "worker" },
+    });
+    await owner.actorNamespace.registerNamespace(scope);
+    const bindings = createSelfhostVersionBindingStore({ root: selfhostVersionBindingsRoot(root) });
+    const actorBinding = {
+      name: "COUNTER",
+      tenantId: scope.tenantId,
+      namespaceResourceUid: scope.namespaceResourceUid,
+      workerResourceUid: f.target.metadata.uid,
+      className: "Counter",
+    };
+    const publication = async (index: number): Promise<WorkerdActorForwardPublication> => {
+      const workerVersionResourceUid = `uid-caller-version-${index}`;
+      const versionId = `version-${index}`;
+      const stored = await bindings.write("caller", versionId, {
+        workerResourceUid: "uid-caller-worker",
+        workerVersionResourceUid,
+        handlers: ["fetch"],
+        vars: [],
+        sensitiveVars: [],
+        serviceBindings: [],
+        actorBindings: [actorBinding],
+      });
+      if (!stored.eventToken) throw new Error("event token unavailable");
+      return {
+        script: "caller",
+        workerResourceUid: "uid-caller-worker",
+        versionId,
+        workerVersionResourceUid,
+        bindings: [
+          {
+            publicName: actorBinding.name,
+            tenantId: actorBinding.tenantId,
+            namespaceResourceUid: actorBinding.namespaceResourceUid,
+            httpService: "__TAKOSERVER_ACTOR_HTTP_00000",
+            upgradeService: "__TAKOSERVER_ACTOR_UPGRADE_00000",
+            token: deriveSelfhostActorForwardToken({
+              eventToken: stored.eventToken,
+              workerVersionResourceUid,
+              binding: actorBinding,
+            }),
+          },
+        ],
+      };
+    };
+    const first = await publication(0);
+    const failedAttempt = await owner.actorForwardLifecycle.reserve([first]);
+    expect(owner.actorForwardSockets()).toHaveLength(1);
+    await failedAttempt.release();
+    await failedAttempt.release();
+    expect(owner.actorForwardSockets()).toEqual([]);
+    // The same exact private paths can be opened again after the attempt
+    // failed before activation; no stale socket or leaked capacity remains.
+    const retry = await owner.actorForwardLifecycle.reserve([first]);
+    expect(owner.actorForwardSockets()).toHaveLength(1);
+    owner.actorForwardLifecycle.activated([first]);
+    await retry.release();
+    expect(owner.isRestored()).toBe(true);
+    for (let index = 1; index <= 129; index += 1) {
+      const next = await publication(index);
+      const reservation = await owner.actorForwardLifecycle.reserve([next]);
+      owner.actorForwardLifecycle.activated([next]);
+      await reservation.release();
+      expect(owner.actorForwardSockets()).toHaveLength(1);
+      expect(owner.actorForwardSockets()[0]?.token).toBe(next.bindings[0]?.token);
+    }
+    owner.actorForwardLifecycle.activated([]);
+    const finalReservation = await owner.actorForwardLifecycle.reserve([]);
+    await finalReservation.release();
+    expect(owner.actorForwardSockets()).toEqual([]);
+  } finally {
+    await owner.close();
+    f.database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

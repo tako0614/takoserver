@@ -363,6 +363,13 @@ class-holder Worker Deployment, and immutable caller Version. The Version
 retains private exact Actor metadata; old records without it are never
 inferred into Actor support. The private forwarding credential and sockets are
 not tenant bindings or Resource output. `workflowBindings` remain refused.
+The released Worker Version permits up to 64 Actor bindings. The private v8
+record, wrapper, and workerd graph use that same per-Version bound; the local
+owner permits at most 128 simultaneously retained broker pairs across all
+weighted active Versions and in-flight retired transports. A proposed
+Deployment that would exceed that finite installation capacity is refused
+before its durable desired-state write. This is an execution capacity limit,
+not a narrower Form schema or an unlimited local Offering.
 Observation and import do not treat a retained unsupported Version as satisfying
 the declaration. Omitted or empty lists keep existing behavior; a non-array
 value is `invalid_spec`. No Form/API/schema identity changes with this source

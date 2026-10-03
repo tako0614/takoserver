@@ -90,6 +90,36 @@ test("Actor metadata is a strict new private Version record and cannot adopt an 
   expect(existsSync(join(root, "sw-unreadable", "v-unreadable.json"))).toBe(false);
 });
 
+test("private v8 Actor metadata preserves the published 64-binding bound exactly", async () => {
+  const bindings = Array.from({ length: 64 }, (_, index) => ({
+    name: `ACTOR_${index}`,
+    tenantId: "tenant-a",
+    namespaceResourceUid: "uid-ActorNamespace-counter",
+    workerResourceUid: "uid-ModuleWorker-counter",
+    className: "Counter",
+  }));
+  const candidate = {
+    ...SET,
+    vars: [],
+    sensitiveVars: [],
+    workerVersionResourceUid: "uid-WorkerVersion-sixty-four",
+    actorBindings: bindings,
+  };
+  expect(
+    (await store.write("sw-sixty-four", "v-sixty-four", candidate)).actorBindings,
+  ).toHaveLength(64);
+  expect((await store.read("sw-sixty-four", "v-sixty-four"))?.actorBindings).toHaveLength(64);
+  const first = bindings[0];
+  if (!first) throw new Error("Actor binding fixture unavailable");
+  await expect(
+    store.write("sw-sixty-five", "v-sixty-five", {
+      ...candidate,
+      actorBindings: [...bindings, { ...first, name: "ACTOR_64" }],
+    }),
+  ).rejects.toThrow();
+  expect(existsSync(join(root, "sw-sixty-five", "v-sixty-five.json"))).toBe(false);
+});
+
 test("complete external binding envelope is bounded before a runtime write", () => {
   const value = JSON.stringify({ value: "a".repeat(3 * 1024 * 1024) });
   expect(() =>

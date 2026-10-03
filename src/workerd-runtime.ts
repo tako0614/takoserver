@@ -312,6 +312,12 @@ export interface WorkerdRuntime {
    * absent; a provider may then refuse weighted publication before mutation.
    */
   publish?(name: string, publication: WorkerdDeploymentPublication | null): Promise<void>;
+  /** Atomically reserves Actor capacity, commits Provider state, and publishes. */
+  publishActorDeployment?(
+    name: string,
+    publication: WorkerdDeploymentPublication,
+    commitDesiredState: () => Promise<void>,
+  ): Promise<void>;
   /** Makes a published script's files present, replacing whatever was there. */
   write(
     name: string,
@@ -462,6 +468,9 @@ export interface WorkerdRuntimeOptions {
   /** Prepare sockets against the same closed graph this activation will render. */
   readonly actorForwardLifecycle?: {
     prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void>;
+    reserve?(publications: readonly WorkerdActorForwardPublication[]): Promise<{
+      release(): Promise<void>;
+    }>;
     /** Called only after the exact activation marker is committed. Must not throw. */
     activated(publications: readonly WorkerdActorForwardPublication[]): void;
     /** An unproved activation cannot authorize any new Actor calls. Must not throw. */
@@ -1278,9 +1287,15 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
         );
       });
     },
-    async publish(name, publication) {
+    async publish(name, publication, commitDesiredState?: () => Promise<void>) {
       requireCertainRuntime();
       const directory = scriptDirectory(name);
+      if (
+        commitDesiredState &&
+        (publication === null ||
+          !publication.versions.some((version) => version.site.actorForward !== undefined))
+      )
+        throw new Error("Actor-qualified publication has no Actor binding");
       const pointerPath = join(directory, MANIFEST);
       const removePointer = async (): Promise<void> => {
         await rm(pointerPath, { force: true });
@@ -1298,82 +1313,124 @@ export function createWorkerdRuntime(options: WorkerdRuntimeOptions): HostedWork
       // always serialized so two valid publishes cannot each render a graph
       // missing the other. Private staging also shares the uncertainty fence.
       const concurrentStaged =
-        publication === null || serviceSocketDirectory !== undefined
+        publication === null || serviceSocketDirectory !== undefined || commitDesiredState
           ? null
           : await stageDeployment(name, publication);
       await exclusiveActivation(async () => {
         requireCertainRuntime();
-        // Private publication staging shares the uncertain-state fence. It
-        // cannot keep writing after another activation invalidates this Host.
-        const staged =
-          serviceSocketDirectory !== undefined && publication !== null
-            ? await stageDeployment(name, publication)
-            : concurrentStaged;
         const previous = await readPublished(scriptsRoot, assetsRoot);
-        const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
-        const next = (
-          staged === null
-            ? previous.filter((entry) => entry.name !== name)
-            : [...previous.filter((entry) => entry.name !== name), staged.deployment]
-        ).sort((left, right) => left.name.localeCompare(right.name));
-        const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
-        const retiringScalar =
-          staged === null && previous.some((entry) => entry.name === name && !entry.weighted);
-        let retiredCarrier: string | undefined;
-        if (retiringScalar) {
-          // Only the fully validated runtime publication authorizes this move.
-          // Provider desired state may already have cleared its legacy scalar.
-          // Retain the modules for recovery; legacy assets keep their old path
-          // so an in-flight request can still read them after graph replacement.
-          const retainedRoot = join(scriptsRoot, ".retired");
-          await privateDirectory(retainedRoot);
-          retiredCarrier = join(await mkdtemp(join(retainedRoot, `${name}-`)), "publication");
+        let reservation: { release(): Promise<void> } | undefined;
+        if (commitDesiredState && publication) {
+          if (!options.actorForwardLifecycle?.reserve)
+            throw new Error("Actor forward capacity reservation unavailable");
+          const proposed = publication.versions.flatMap((version) =>
+            version.site.actorForward === undefined
+              ? []
+              : [
+                  {
+                    script: name,
+                    workerResourceUid: publication.workerResourceUid,
+                    versionId: version.versionId,
+                    workerVersionResourceUid: version.workerVersionUid,
+                    bindings: validActorForward(version.site.actorForward).bindings,
+                  },
+                ],
+          );
+          // The queue stays held from this complete-graph capacity proof
+          // through Provider CAS and exact publication. A competing Actor
+          // Deployment cannot replace the graph between qualification and
+          // desired-state mutation, and a failed proof writes no state.
+          reservation = await options.actorForwardLifecycle.reserve([
+            ...actorForwardPublications(previous).filter((item) => item.script !== name),
+            ...proposed,
+          ]);
         }
-        let retirementCommitted = false;
         try {
-          await activate(next, previous, {
-            ...(retiredCarrier === undefined ? {} : { commitAfterActivation: true }),
-            commit: async () => {
-              if (retiredCarrier !== undefined) {
-                await rename(directory, retiredCarrier);
-                retirementCommitted = true;
-                return;
-              }
-              if (pointerContents === null) {
-                await removePointer();
-              } else {
-                await privateDirectory(directory);
-                await writePrivate(pointerPath, pointerContents, "utf8");
-              }
-            },
-            rollback: async () => {
-              // A failed scalar retirement leaves its original carrier in place;
-              // no operation follows a successful rename that could need rollback.
-              if (retiredCarrier !== undefined) return;
-              if (beforePointer === null) {
-                await removePointer();
-              } else {
-                await privateDirectory(directory);
-                await writePrivate(pointerPath, beforePointer, "utf8");
-              }
-            },
-          });
-        } catch (failure) {
-          if (retiredCarrier !== undefined && !retirementCommitted) {
-            // This operation created the private staging parent. Failed
-            // attempts must not accumulate it; committed recovery bytes stay.
-            try {
-              await rm(dirname(retiredCarrier), { recursive: true, force: true });
-            } catch (cleanupFailure) {
-              throw new AggregateError(
-                [failure, cleanupFailure],
-                "worker retirement staging cleanup failed",
-              );
-            }
+          await commitDesiredState?.();
+          // Private publication staging shares the uncertain-state fence. It
+          // cannot keep writing after another activation invalidates this Host.
+          const staged =
+            (serviceSocketDirectory !== undefined || commitDesiredState) && publication !== null
+              ? await stageDeployment(name, publication)
+              : concurrentStaged;
+          const beforePointer = await readFile(pointerPath, "utf8").catch(() => null);
+          const next = (
+            staged === null
+              ? previous.filter((entry) => entry.name !== name)
+              : [...previous.filter((entry) => entry.name !== name), staged.deployment]
+          ).sort((left, right) => left.name.localeCompare(right.name));
+          const pointerContents = staged === null ? null : JSON.stringify(staged.pointer);
+          const retiringScalar =
+            staged === null && previous.some((entry) => entry.name === name && !entry.weighted);
+          let retiredCarrier: string | undefined;
+          if (retiringScalar) {
+            // Only the fully validated runtime publication authorizes this move.
+            // Provider desired state may already have cleared its legacy scalar.
+            // Retain the modules for recovery; legacy assets keep their old path
+            // so an in-flight request can still read them after graph replacement.
+            const retainedRoot = join(scriptsRoot, ".retired");
+            await privateDirectory(retainedRoot);
+            retiredCarrier = join(await mkdtemp(join(retainedRoot, `${name}-`)), "publication");
           }
-          throw failure;
+          let retirementCommitted = false;
+          try {
+            await activate(next, previous, {
+              ...(retiredCarrier === undefined ? {} : { commitAfterActivation: true }),
+              commit: async () => {
+                if (retiredCarrier !== undefined) {
+                  await rename(directory, retiredCarrier);
+                  retirementCommitted = true;
+                  return;
+                }
+                if (pointerContents === null) {
+                  await removePointer();
+                } else {
+                  await privateDirectory(directory);
+                  await writePrivate(pointerPath, pointerContents, "utf8");
+                }
+              },
+              rollback: async () => {
+                // A failed scalar retirement leaves its original carrier in place;
+                // no operation follows a successful rename that could need rollback.
+                if (retiredCarrier !== undefined) return;
+                if (beforePointer === null) {
+                  await removePointer();
+                } else {
+                  await privateDirectory(directory);
+                  await writePrivate(pointerPath, beforePointer, "utf8");
+                }
+              },
+            });
+          } catch (failure) {
+            if (retiredCarrier !== undefined && !retirementCommitted) {
+              // This operation created the private staging parent. Failed
+              // attempts must not accumulate it; committed recovery bytes stay.
+              try {
+                await rm(dirname(retiredCarrier), { recursive: true, force: true });
+              } catch (cleanupFailure) {
+                throw new AggregateError(
+                  [failure, cleanupFailure],
+                  "worker retirement staging cleanup failed",
+                );
+              }
+            }
+            throw failure;
+          }
+        } finally {
+          await reservation?.release();
         }
       });
+    },
+    async publishActorDeployment(name, publication, commitDesiredState) {
+      // The ordinary publish entry remains the same two-argument public port;
+      // only this qualified method can supply the private commit callback.
+      await (
+        this.publish as (
+          name: string,
+          publication: WorkerdDeploymentPublication,
+          commit: () => Promise<void>,
+        ) => Promise<void>
+      )(name, publication, commitDesiredState);
     },
     async write(name, site, modules, assets, hostModules) {
       requireCertainRuntime();
@@ -1804,7 +1861,7 @@ function validActorForward(value: unknown): WorkerdActorForward {
     candidate.schema !== ACTOR_FORWARD_SCHEMA ||
     !Array.isArray(candidate.bindings) ||
     candidate.bindings.length === 0 ||
-    candidate.bindings.length > 32
+    candidate.bindings.length > 64
   )
     throw new Error("unusable Actor forward graph");
   const names = new Set<string>();

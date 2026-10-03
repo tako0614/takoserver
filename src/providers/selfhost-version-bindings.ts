@@ -948,7 +948,7 @@ function normalizeActorBindings(
   if (
     !Array.isArray(bindings) ||
     bindings.length === 0 ||
-    bindings.length > 32 ||
+    bindings.length > 64 ||
     typeof versionUid !== "string" ||
     !RESOURCE_UID.test(versionUid)
   )

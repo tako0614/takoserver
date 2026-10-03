@@ -29,6 +29,7 @@ export async function openSelfhostActorForwardBrokers(options: {
   readonly executionHost: ExecutionHost;
 }): Promise<{
   readonly socketMapping: WorkerdActorForwardSocket;
+  retire(): Promise<void>;
   close(): Promise<void>;
 }> {
   if (
@@ -65,6 +66,9 @@ export async function openSelfhostActorForwardBrokers(options: {
       httpSocketPath: http.socketPath,
       upgradeSocketPath: upgrade.socketPath,
     }),
+    async retire() {
+      await Promise.all([upgrade.retire(), http.retire()]);
+    },
     async close() {
       await Promise.all([upgrade.close(), http.close()]);
     },

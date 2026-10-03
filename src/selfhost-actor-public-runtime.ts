@@ -73,6 +73,9 @@ export interface SelfhostActorPublicRuntime {
   >;
   readonly actorForwardLifecycle: {
     prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void>;
+    reserve(publications: readonly WorkerdActorForwardPublication[]): Promise<{
+      release(): Promise<void>;
+    }>;
     activated(publications: readonly WorkerdActorForwardPublication[]): void;
     uncertain(): void;
   };
@@ -141,9 +144,23 @@ export async function openSelfhostActorPublicRuntime(options: {
     root: selfhostVersionBindingsRoot(options.dataRoot),
   });
   const brokers = new Map<string, ForwardBrokers>();
+  const draining = new Set<{ readonly key: string; readonly pair: ForwardBrokers }>();
+  const reservations = new Map<string, number>();
+  const everAdmitted = new WeakSet<ForwardBrokers>();
   let admitted = new Set<string>();
   let closed = false;
   let restored = false;
+  let uncertain = false;
+  let brokerOrdinal = 0;
+  let brokerTail: Promise<void> = Promise.resolve();
+  const exclusiveBroker = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = brokerTail.then(operation, operation);
+    brokerTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  };
 
   const prove = async (publication: WorkerdActorForwardPublication): Promise<void> => {
     const stored = await versionBindings.read(publication.script, publication.versionId);
@@ -186,77 +203,155 @@ export async function openSelfhostActorPublicRuntime(options: {
     }
   };
 
-  const lifecycle = Object.freeze({
-    async prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void> {
-      if (closed) {
-        if (publications.length === 0) return;
-        throw new Error("Actor owner closed");
+  const prepareGraph = async (
+    publications: readonly WorkerdActorForwardPublication[],
+  ): Promise<Set<string>> => {
+    if (closed) {
+      if (publications.length === 0) return new Set();
+      throw new Error("Actor owner closed");
+    }
+    const requested = new Map<string, (typeof publications)[number]["bindings"][number]>();
+    for (const publication of publications) {
+      await prove(publication);
+      for (const binding of publication.bindings) {
+        const key = brokerKey(binding);
+        if (!requested.has(key)) requested.set(key, binding);
       }
-      const requested = new Map<string, (typeof publications)[number]["bindings"][number]>();
-      for (const publication of publications) {
-        await prove(publication);
-        for (const binding of publication.bindings) {
-          const key = brokerKey(binding);
-          if (requested.has(key)) continue;
-          requested.set(key, binding);
-        }
-      }
-      if (
-        requested.size + [...brokers.keys()].filter((key) => !requested.has(key)).length >
-        MAX_SOCKET_PAIRS
-      )
-        throw new Error("Actor forward socket capacity exceeded");
-      const opened: [string, ForwardBrokers][] = [];
-      try {
-        for (const [key, binding] of requested) {
-          if (brokers.has(key)) continue;
-          const hash = createHash("sha256").update(key).digest("hex").slice(0, 20);
-          const httpSocketPath = join(socketDirectory, `${hash}.h.sock`);
-          const upgradeSocketPath = join(socketDirectory, `${hash}.u.sock`);
-          if (Buffer.byteLength(upgradeSocketPath) >= 100)
-            throw new Error("Actor forward socket path unavailable");
-          const pair = await openSelfhostActorForwardBrokers({
-            tenantId: binding.tenantId,
-            namespaceResourceUid: binding.namespaceResourceUid,
-            token: binding.token,
-            httpSocketPath,
-            upgradeSocketPath,
-            executionHost: {
-              fetch(scope, request) {
-                if (!admitted.has(key)) throw new Error("Actor Version not active");
-                return host.fetch(scope, request);
-              },
-              reserveDuplex(scope, request) {
-                if (!admitted.has(key)) throw new Error("Actor Version not active");
-                return host.reserveDuplex(scope, request);
-              },
+    }
+    const newKeys = [...requested.keys()].filter((key) => !brokers.has(key));
+    if (brokers.size + draining.size + newKeys.length > MAX_SOCKET_PAIRS)
+      throw new Error("Actor forward socket capacity exceeded");
+    const opened: [string, ForwardBrokers][] = [];
+    try {
+      for (const [key, binding] of requested) {
+        if (brokers.has(key)) continue;
+        // A retired transport can still hold an old request on this token.
+        // A later reweight uses a distinct private pathname until it drains.
+        const overlapping = [...draining].some((entry) => entry.key === key);
+        const hash = createHash("sha256")
+          .update(key)
+          .update(overlapping ? `:${++brokerOrdinal}` : "")
+          .digest("hex")
+          .slice(0, 20);
+        const httpSocketPath = join(socketDirectory, `${hash}.h.sock`);
+        const upgradeSocketPath = join(socketDirectory, `${hash}.u.sock`);
+        if (Buffer.byteLength(upgradeSocketPath) >= 100)
+          throw new Error("Actor forward socket path unavailable");
+        const pair = await openSelfhostActorForwardBrokers({
+          tenantId: binding.tenantId,
+          namespaceResourceUid: binding.namespaceResourceUid,
+          token: binding.token,
+          httpSocketPath,
+          upgradeSocketPath,
+          executionHost: {
+            fetch(scope, request) {
+              if (!admitted.has(key)) throw new Error("Actor Version not active");
+              return host.fetch(scope, request);
             },
-          });
-          opened.push([key, pair]);
+            reserveDuplex(scope, request) {
+              if (!admitted.has(key)) throw new Error("Actor Version not active");
+              return host.reserveDuplex(scope, request);
+            },
+          },
+        });
+        opened.push([key, pair]);
+      }
+    } catch (error) {
+      await Promise.all(opened.map(([, pair]) => pair.close()));
+      throw error;
+    }
+    try {
+      for (const publication of publications) await prove(publication);
+    } catch (error) {
+      await Promise.all(opened.map(([, pair]) => pair.close()));
+      throw error;
+    }
+    for (const [key, pair] of opened) brokers.set(key, pair);
+    return new Set(requested.keys());
+  };
+
+  const cleanupInactive = async (): Promise<void> => {
+    if (uncertain || closed) return;
+    for (const [key, pair] of brokers) {
+      if (admitted.has(key) || (reservations.get(key) ?? 0) > 0) continue;
+      brokers.delete(key);
+      const entry = { key, pair };
+      draining.add(entry);
+      if (everAdmitted.has(pair)) {
+        // Accepted transports are not destroyed to reclaim a slot. The
+        // retirement promise removes the slot only after bodies, provisional
+        // upgrades and committed duplex sockets settle naturally.
+        void pair.retire().then(
+          () => draining.delete(entry),
+          () => {
+            uncertain = true;
+            admitted = new Set();
+            restored = false;
+          },
+        );
+      } else {
+        try {
+          await pair.close();
+          draining.delete(entry);
+        } catch (error) {
+          uncertain = true;
+          admitted = new Set();
+          restored = false;
+          throw error;
         }
-      } catch (error) {
-        await Promise.all(opened.map(([, pair]) => pair.close()));
-        throw error;
       }
-      // The registered relation is mutable. Before letting the render see new
-      // sockets, recheck its exact authority; any failure denies this render.
-      try {
-        for (const publication of publications) await prove(publication);
-      } catch (error) {
-        await Promise.all(opened.map(([, pair]) => pair.close()));
-        throw error;
-      }
-      for (const [key, pair] of opened) brokers.set(key, pair);
+    }
+  };
+
+  const lifecycle = Object.freeze({
+    prepare(publications: readonly WorkerdActorForwardPublication[]): Promise<void> {
+      return exclusiveBroker(async () => {
+        await prepareGraph(publications);
+      });
+    },
+    reserve(publications: readonly WorkerdActorForwardPublication[]) {
+      return exclusiveBroker(async () => {
+        const keys = await prepareGraph(publications);
+        for (const key of keys) reservations.set(key, (reservations.get(key) ?? 0) + 1);
+        let released = false;
+        return {
+          release(): Promise<void> {
+            return exclusiveBroker(async () => {
+              if (released) return;
+              released = true;
+              for (const key of keys) {
+                const remaining = (reservations.get(key) ?? 1) - 1;
+                if (remaining > 0) reservations.set(key, remaining);
+                else reservations.delete(key);
+              }
+              await cleanupInactive();
+            });
+          },
+        };
+      });
     },
     activated(publications: readonly WorkerdActorForwardPublication[]): void {
       if (closed) return;
       const next = new Set(publications.flatMap((item) => item.bindings.map(brokerKey)));
       restored = [...next].every((key) => brokers.has(key));
       admitted = restored ? next : new Set();
+      uncertain = !restored;
+      if (restored) {
+        for (const key of next) {
+          const pair = brokers.get(key);
+          if (pair) everAdmitted.add(pair);
+        }
+        void exclusiveBroker(cleanupInactive).catch(() => {
+          uncertain = true;
+          admitted = new Set();
+          restored = false;
+        });
+      }
     },
     uncertain(): void {
       admitted = new Set();
       restored = false;
+      uncertain = true;
     },
   });
 
@@ -273,7 +368,12 @@ export async function openSelfhostActorPublicRuntime(options: {
       closed = true;
       restored = false;
       admitted = new Set();
-      await Promise.all([...brokers.values()].map((pair) => pair.close()));
+      await brokerTail;
+      await Promise.all(
+        [...brokers.values(), ...[...draining].map((entry) => entry.pair)].map((pair) =>
+          pair.close(),
+        ),
+      );
       await host.close();
       await rm(socketDirectory, { recursive: true, force: true });
     },

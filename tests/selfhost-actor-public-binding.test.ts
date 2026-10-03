@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostProvider } from "../src/providers/selfhost.ts";
+import { createSelfhostScriptStateStore } from "../src/providers/selfhost-script-state.ts";
 import type { SelfhostVersionActorBinding } from "../src/providers/selfhost-version-bindings.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import { deriveSelfhostActorForwardToken } from "../src/selfhost-actor-public-runtime.ts";
@@ -19,6 +20,12 @@ if (!actorForm) throw new Error("released ActorNamespace Form missing");
 const runtime: WorkerdRuntime = {
   async inspectModule() {
     return { outcome: "valid", exportedHandlers: [] };
+  },
+  // This direct Provider relation test does not publish a Deployment. The
+  // qualified callback is a fixture; real capacity is proved separately.
+  async publish() {},
+  async publishActorDeployment(_name, _publication, commitDesiredState) {
+    await commitDesiredState();
   },
   async write() {},
   async remove() {},
@@ -246,6 +253,7 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
   };
   const actorOffering = offering("ActorNamespace");
   const versionOffering = offering("WorkerVersion");
+  const deploymentOffering = offering("WorkerDeployment");
   const tenantId = "tenant-one";
   const workerUid = "uid-worker-caller-one";
   const actorWorkerUid = "uid-worker-class-holder-one";
@@ -300,11 +308,20 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     updatedAt: "2026-10-03T00:00:00.000Z",
   });
   let ownerGraph: typeof graph | null = graph;
+  let rejectDeploymentPreflight = false;
+  let deploymentPreflightCalls = 0;
   const provider = createSelfhostProvider({
     id: "local.pack",
-    offerings: [actorOffering, versionOffering],
+    offerings: [actorOffering, versionOffering, deploymentOffering],
     dataRoot: root,
-    runtime,
+    runtime: {
+      ...runtime,
+      async publishActorDeployment(_name, _publication, commitDesiredState) {
+        deploymentPreflightCalls += 1;
+        if (rejectDeploymentPreflight) throw new Error("fixture Actor capacity exhausted");
+        await commitDesiredState();
+      },
+    },
     actorNamespace: {
       async readCurrentGraph() {
         return ownerGraph;
@@ -456,6 +473,64 @@ test("Worker Version pins an exact Actor relation in private v8 and projects onl
     });
     expect(token).toMatch(/^[0-9a-f]{64}$/u);
     expect(token).not.toBe(raw.eventToken);
+    const scriptState = createSelfhostScriptStateStore({ root: join(root, "selfhost", "scripts") });
+    const beforeDeployment = await scriptState.read(script);
+    rejectDeploymentPreflight = true;
+    const deploymentRequest = {
+      operationId: "op-actor-deployment-capacity",
+      offering: deploymentOffering,
+      identity: {
+        tenantRef: tenantId,
+        space: "default",
+        name: "caller-deployment",
+        uid: "uid-caller-deployment-one",
+      },
+      spec: {
+        worker: { apiVersion: "edge.forms.takoform.com", kind: "ModuleWorker", name: "caller" },
+        versions: [
+          {
+            workerVersion: {
+              apiVersion: "edge.forms.takoform.com",
+              kind: "WorkerVersion",
+              name: "caller-v1",
+            },
+            weight: 10000,
+          },
+        ],
+      },
+      relations: [
+        workerRelation,
+        {
+          pointer: "/versions/0/workerVersion",
+          relation: "/versions/*/workerVersion",
+          targetUid: versionUid,
+          resource: resource("WorkerVersion", versionUid, "caller-v1", request.spec),
+          deployment: deployed(
+            versionUid,
+            "WorkerVersion",
+            applied.result.nativeId,
+            applied.result.outputs,
+          ),
+        },
+      ],
+    };
+    const deploymentTicket = await provider.apply(deploymentRequest);
+    expect(deploymentTicket).toMatchObject({
+      phase: "failed",
+      failure: { code: "unavailable" },
+    });
+    expect(deploymentPreflightCalls).toBe(1);
+    expect(await scriptState.read(script)).toEqual(beforeDeployment);
+    rejectDeploymentPreflight = false;
+    const retryDeployment = await provider.apply({
+      ...deploymentRequest,
+      operationId: "op-actor-deployment-capacity-retry",
+    });
+    expect(retryDeployment).toMatchObject({ phase: "succeeded" });
+    expect(deploymentPreflightCalls).toBe(2);
+    expect((await scriptState.read(script)).state.deployment?.versions).toEqual([
+      { versionId, weight: 10000, workerVersionUid: versionUid },
+    ]);
     expect(
       deriveSelfhostActorForwardToken({
         eventToken: String(raw.eventToken),

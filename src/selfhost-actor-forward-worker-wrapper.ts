@@ -30,7 +30,7 @@ export function selfhostActorForwardEntrypointSource(input: {
     input.runtimeModule === input.innerModule ||
     !Array.isArray(input.bindings) ||
     input.bindings.length === 0 ||
-    input.bindings.length > 32 ||
+    input.bindings.length > 64 ||
     (input.queue !== undefined && typeof input.queue !== "boolean") ||
     (input.scheduled !== undefined && typeof input.scheduled !== "boolean") ||
     (input.events !== undefined && typeof input.events !== "boolean")
